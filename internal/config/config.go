@@ -151,6 +151,11 @@ type ContextFilesConfig struct {
 }
 
 type WorkspaceConfig struct {
+	// Root is the base directory for per-session state and workspace-relative
+	// docs/memory. "~" is expanded; an unset/invalid value falls back to
+	// <home>/.stardust (see sessionstate.ResolveWorkspaceRoot). DocsRoot and
+	// MemoryRoot are resolved relative to it.
+	Root       string `json:"root"`
 	DocsRoot   string `json:"docs_root"`
 	MemoryRoot string `json:"memory_root"`
 }
@@ -248,6 +253,7 @@ func defaultConfig() Config {
 			MaxFileChars: 20000,
 		},
 		Workspace: WorkspaceConfig{
+			Root:       "~/.stardust",
 			DocsRoot:   "docs",
 			MemoryRoot: "memory",
 		},
@@ -363,6 +369,9 @@ func applyEnv(cfg *Config) {
 	}
 	if value := os.Getenv("LEGION_AGENT_MEMORY_ROOT"); value != "" {
 		cfg.Workspace.MemoryRoot = value
+	}
+	if value := os.Getenv("LEGION_AGENT_WORKSPACE_ROOT"); value != "" {
+		cfg.Workspace.Root = value
 	}
 	if value := os.Getenv("LEGION_AGENT_TASKS_INDEX_PATH"); value != "" {
 		cfg.Tasks.IndexPath = value
