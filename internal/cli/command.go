@@ -1883,6 +1883,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	}
 	recovered, err := coordinator.RecoverSuspended(ctx, checkpointStore)
 	if err != nil {
+		_ = listener.Close()
 		closeStore()
 		return ServeResult{}, fmt.Errorf("recover suspended tasks: %w", err)
 	}

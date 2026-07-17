@@ -97,3 +97,52 @@ func TestRecoverSuspendedReRegistersTasks(t *testing.T) {
 		t.Errorf("recovered task status = %s, want %s", got.Status, domain.TaskSuspended)
 	}
 }
+
+func TestRecoverSuspendedFailsLoudOnCorruptCheckpoint(t *testing.T) {
+	dir := t.TempDir()
+	store := sessionstate.NewStore(dir)
+	// Seed a checkpoint with an unsupported schema version so ListSuspended fails loud.
+	if err := store.Save(sessionstate.Checkpoint{
+		SchemaVersion: sessionstate.CheckpointSchemaVersion + 99,
+		TaskID:        "task-bad",
+		SessionKey:    "sess-bad",
+	}); err != nil {
+		t.Fatalf("seed checkpoint: %v", err)
+	}
+	sched := task.NewScheduler()
+	coord := newTestCoordinator(t, sched, 4)
+	n, err := coord.RecoverSuspended(context.Background(), store)
+	if err == nil {
+		t.Fatal("RecoverSuspended err = nil, want fail-loud error on unsupported checkpoint schema")
+	}
+	if n != 0 {
+		t.Errorf("recovered = %d, want 0 on error", n)
+	}
+}
+
+func TestRecoverSuspendedSkipsTaskAlreadyPresent(t *testing.T) {
+	dir := t.TempDir()
+	store := sessionstate.NewStore(dir)
+	if err := store.Save(sessionstate.Checkpoint{
+		SchemaVersion: sessionstate.CheckpointSchemaVersion,
+		TaskID:        "task-dup",
+		AgentID:       "default-agent",
+		SessionKey:    "sess-dup",
+	}); err != nil {
+		t.Fatalf("seed checkpoint: %v", err)
+	}
+	sched := task.NewScheduler()
+	ctx := context.Background()
+	// Pre-register the same task id so RecoverSuspended must skip it (idempotent rescan).
+	if err := sched.Add(ctx, domain.Task{ID: "task-dup", AgentID: "default-agent", Status: domain.TaskSuspended}); err != nil {
+		t.Fatalf("pre-add: %v", err)
+	}
+	coord := newTestCoordinator(t, sched, 4)
+	n, err := coord.RecoverSuspended(ctx, store)
+	if err != nil {
+		t.Fatalf("RecoverSuspended err = %v, want nil (skip, not error)", err)
+	}
+	if n != 0 {
+		t.Errorf("recovered = %d, want 0 (task already present, skipped)", n)
+	}
+}
