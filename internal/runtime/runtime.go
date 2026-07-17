@@ -109,6 +109,21 @@ type Runtime struct {
 	toolGate           ToolGate
 }
 
+// loopState is the mutable state threaded through the tool-execution loop.
+// runToolLoop advances it; a suspend serialises the relevant fields to a
+// checkpoint and a resume rebuilds it from one.
+type loopState struct {
+	started          time.Time
+	basePrompt       string
+	round            int
+	toolCtx          []toolEntry
+	resp             port.InferenceResponse
+	promptTokens     int
+	completionTokens int
+	cachedTokens     int
+	totalTokens      int
+}
+
 func NewRuntime(cfg Config) *Runtime {
 	audit := cfg.Audit
 	if audit == nil {
@@ -184,6 +199,31 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonInferenceError, true)
 		return domain.TaskRun{}, ErrMaasUnavailable
 	}
+
+	// Resume path: a persisted checkpoint means this task previously suspended.
+	// Rebuild loop state from disk and re-enter the loop with the pending calls,
+	// skipping the initial prompt build + generate.
+	if r.checkpoints != nil {
+		cp, ok, err := r.checkpoints.Load(sessionKeyForTask(task))
+		if err != nil {
+			return domain.TaskRun{}, fmt.Errorf("load checkpoint for task %s: %w", task.ID, err)
+		}
+		if ok {
+			st := loopState{
+				started:          started,
+				basePrompt:       cp.BasePrompt,
+				round:            cp.Round,
+				toolCtx:          restoreToolEntries(cp.ToolEntries),
+				resp:             port.InferenceResponse{ToolCalls: cp.PendingCalls},
+				promptTokens:     cp.PromptTokens,
+				completionTokens: cp.CompletionTokens,
+				cachedTokens:     cp.CachedTokens,
+				totalTokens:      cp.TotalTokens,
+			}
+			return r.runToolLoop(ctx, requestID, agent, task, st)
+		}
+	}
+
 	prompt, err := r.buildPrompt(ctx, agent, task)
 	if err != nil {
 		return domain.TaskRun{}, err
@@ -192,39 +232,60 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	// as the head of every tool-round prompt, so it is the stable prefix that
 	// drives the provider prompt-cache breakpoint (InferenceRequest.StablePrefixLen).
 	basePrompt := prompt
-	var promptTokens, completionTokens, cachedTokens, totalTokens int
 	resp, err := r.generate(ctx, requestID, prompt, task.Images, len([]rune(basePrompt)))
 	if err != nil {
 		_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonInferenceError, true)
 		return domain.TaskRun{}, fmt.Errorf("generate inference: %w", err)
 	}
-	promptTokens += resp.PromptTokens
-	completionTokens += resp.CompletionTokens
-	cachedTokens += resp.CachedTokens
-	totalTokens += resp.TotalTokens
+	st := loopState{
+		started:          started,
+		basePrompt:       basePrompt,
+		round:            0,
+		resp:             resp,
+		promptTokens:     resp.PromptTokens,
+		completionTokens: resp.CompletionTokens,
+		cachedTokens:     resp.CachedTokens,
+		totalTokens:      resp.TotalTokens,
+	}
+	return r.runToolLoop(ctx, requestID, agent, task, st)
+}
+
+// runToolLoop advances the tool-execution loop from st until the model stops
+// requesting tools (or the round budget is exhausted), then finalises the run.
+// Before executing each round's tool calls it consults the ToolGate: if the gate
+// says suspend, it writes a checkpoint and returns ErrSuspended, releasing the
+// goroutine. A successfully completed run deletes any checkpoint.
+func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domain.Agent, task domain.Task, st loopState) (domain.TaskRun, error) {
 	// toolCtx accumulates tool results deduplicated by (tool, arguments), so
 	// re-reading the same file/URL keeps only the latest copy in context instead
 	// of stacking duplicates each round.
-	var toolCtx []toolEntry
-	for round := 0; round < r.maxToolRounds && len(resp.ToolCalls) > 0; round++ {
-		results, err := r.executeToolCalls(ctx, agent, task, resp.ToolCalls)
+	for st.round < r.maxToolRounds && len(st.resp.ToolCalls) > 0 {
+		suspend, err := r.checkSuspend(ctx, task, st)
+		if err != nil {
+			return domain.TaskRun{}, err
+		}
+		if suspend {
+			return domain.TaskRun{}, ErrSuspended
+		}
+		results, err := r.executeToolCalls(ctx, agent, task, st.resp.ToolCalls)
 		if err != nil {
 			_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonToolError, true)
 			return domain.TaskRun{}, fmt.Errorf("execute model tool calls: %w", err)
 		}
-		toolCtx = mergeToolResults(toolCtx, resp.ToolCalls, results, r.maxToolResultChars)
-		prompt = boundPrompt(basePrompt+renderToolEntries(toolCtx), r.maxPromptChars)
-		resp, err = r.generate(ctx, requestID, prompt, task.Images, stablePrefixRunes(prompt, basePrompt))
+		st.toolCtx = mergeToolResults(st.toolCtx, st.resp.ToolCalls, results, r.maxToolResultChars)
+		prompt := boundPrompt(st.basePrompt+renderToolEntries(st.toolCtx), r.maxPromptChars)
+		st.resp, err = r.generate(ctx, requestID, prompt, task.Images, stablePrefixRunes(prompt, st.basePrompt))
 		if err != nil {
 			_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonInferenceError, true)
 			return domain.TaskRun{}, fmt.Errorf("generate inference after tools: %w", err)
 		}
-		promptTokens += resp.PromptTokens
-		completionTokens += resp.CompletionTokens
-		cachedTokens += resp.CachedTokens
-		totalTokens += resp.TotalTokens
+		st.promptTokens += st.resp.PromptTokens
+		st.completionTokens += st.resp.CompletionTokens
+		st.cachedTokens += st.resp.CachedTokens
+		st.totalTokens += st.resp.TotalTokens
+		st.round++
 	}
-	if len(resp.ToolCalls) > 0 {
+	if len(st.resp.ToolCalls) > 0 {
 		// Tool-round budget exhausted but the model still wants tools. Rather
 		// than hard-failing the whole task (which discards every tool result
 		// gathered so far and surfaces as "任务执行失败" to the user), make a
@@ -232,18 +293,62 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		// model to answer rather than narrate another tool call — otherwise it
 		// tends to emit text like "list_files 参数: {...}" instead of a real
 		// answer when it is cut off mid-exploration.
+		prompt := boundPrompt(st.basePrompt+renderToolEntries(st.toolCtx), r.maxPromptChars)
 		finalPrompt := prompt + "\n\n[系统] 工具调用已达上限。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。"
-		final, err := r.generateNoTools(ctx, requestID, finalPrompt, task.Images, stablePrefixRunes(finalPrompt, basePrompt))
+		final, err := r.generateNoTools(ctx, requestID, finalPrompt, task.Images, stablePrefixRunes(finalPrompt, st.basePrompt))
 		if err != nil {
 			_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonInferenceError, true)
 			return domain.TaskRun{}, fmt.Errorf("generate final answer after tool budget exhausted: %w", err)
 		}
-		promptTokens += final.PromptTokens
-		completionTokens += final.CompletionTokens
-		cachedTokens += final.CachedTokens
-		totalTokens += final.TotalTokens
-		resp = final
+		st.promptTokens += final.PromptTokens
+		st.completionTokens += final.CompletionTokens
+		st.cachedTokens += final.CachedTokens
+		st.totalTokens += final.TotalTokens
+		st.resp = final
 	}
+	return r.finishRun(ctx, requestID, agent, task, st)
+}
+
+// checkSuspend consults the ToolGate for the current round's pending calls and,
+// when the gate says pause, persists a checkpoint so the run can resume later.
+// It returns true only after the checkpoint is safely on disk (fail-loud on
+// write error — never suspend with lost state). Nil gate or nil store → false.
+func (r *Runtime) checkSuspend(ctx context.Context, task domain.Task, st loopState) (bool, error) {
+	if r.toolGate == nil || r.checkpoints == nil {
+		return false, nil
+	}
+	suspend, err := r.toolGate.ShouldSuspend(ctx, task, st.resp.ToolCalls)
+	if err != nil {
+		return false, fmt.Errorf("tool gate decision for task %s: %w", task.ID, err)
+	}
+	if !suspend {
+		return false, nil
+	}
+	cp := sessionstate.Checkpoint{
+		SchemaVersion:    sessionstate.CheckpointSchemaVersion,
+		TaskID:           task.ID,
+		AgentID:          task.AgentID,
+		SessionKey:       sessionKeyForTask(task),
+		BasePrompt:       st.basePrompt,
+		Round:            st.round,
+		ToolEntries:      snapshotToolEntries(st.toolCtx),
+		PendingCalls:     st.resp.ToolCalls,
+		PromptTokens:     st.promptTokens,
+		CompletionTokens: st.completionTokens,
+		CachedTokens:     st.cachedTokens,
+		TotalTokens:      st.totalTokens,
+		Images:           task.Images,
+		CreatedAt:        time.Now(),
+	}
+	if err := r.checkpoints.Save(cp); err != nil {
+		return false, fmt.Errorf("save checkpoint for task %s: %w", task.ID, err)
+	}
+	return true, nil
+}
+
+// finishRun emits completion events/audit, deletes any checkpoint (the task is
+// done, not suspended), and returns the assembled TaskRun.
+func (r *Runtime) finishRun(ctx context.Context, requestID string, agent domain.Agent, task domain.Task, st loopState) (domain.TaskRun, error) {
 	if err := r.events.Publish(ctx, domain.RuntimeEvent{
 		Type:      "inference_completed",
 		TaskID:    task.ID,
@@ -268,14 +373,14 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		ID:               task.ID + ":run-1",
 		TaskID:           task.ID,
 		AgentID:          agent.ID,
-		StartedAt:        started,
+		StartedAt:        st.started,
 		EndedAt:          ended,
-		Result:           resp.Text,
-		ReasoningSummary: resp.ReasoningSummary,
-		PromptTokens:     promptTokens,
-		CompletionTokens: completionTokens,
-		CachedTokens:     cachedTokens,
-		TotalTokens:      totalTokens,
+		Result:           st.resp.Text,
+		ReasoningSummary: st.resp.ReasoningSummary,
+		PromptTokens:     st.promptTokens,
+		CompletionTokens: st.completionTokens,
+		CachedTokens:     st.cachedTokens,
+		TotalTokens:      st.totalTokens,
 	}
 	if err := r.audit.Append(ctx, domain.AuditEvent{
 		ID:          task.ID + ":audit-1",
@@ -291,15 +396,20 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	if err := r.events.Publish(ctx, domain.RuntimeEvent{
 		Type:             "task_completed",
 		TaskID:           task.ID,
-		Message:          resp.Text,
-		PromptTokens:     promptTokens,
-		CompletionTokens: completionTokens,
-		CachedTokens:     cachedTokens,
-		TotalTokens:      totalTokens,
-		ElapsedMs:        ended.Sub(started).Milliseconds(),
+		Message:          st.resp.Text,
+		PromptTokens:     st.promptTokens,
+		CompletionTokens: st.completionTokens,
+		CachedTokens:     st.cachedTokens,
+		TotalTokens:      st.totalTokens,
+		ElapsedMs:        ended.Sub(st.started).Milliseconds(),
 		CreatedAt:        time.Now(),
 	}); err != nil {
 		return domain.TaskRun{}, fmt.Errorf("publish task completed event: %w", err)
+	}
+	if r.checkpoints != nil {
+		if err := r.checkpoints.Delete(sessionKeyForTask(task)); err != nil {
+			return domain.TaskRun{}, fmt.Errorf("delete checkpoint after completion for task %s: %w", task.ID, err)
+		}
 	}
 	if err := r.publishLearning(ctx, agent, task, evolution.SignalSuccess, "", false); err != nil {
 		return domain.TaskRun{}, fmt.Errorf("publish learning success event: %w", err)
