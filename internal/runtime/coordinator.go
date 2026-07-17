@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/stardust/legion-agent/internal/approval"
@@ -41,6 +42,8 @@ type CoordinatorConfig struct {
 	Events             port.EventBus
 	TrustGate          TrustGate
 	LockTTL            time.Duration
+	// MaxWorkers caps concurrent task goroutines. 0 or negative → default 4.
+	MaxWorkers int
 }
 
 type Coordinator struct {
@@ -56,11 +59,16 @@ type Coordinator struct {
 	events             port.EventBus
 	trustGate          TrustGate
 	lockTTL            time.Duration
+	sem                chan struct{}
+	wg                 sync.WaitGroup
 }
 
 func NewCoordinator(cfg CoordinatorConfig) *Coordinator {
 	if cfg.LockTTL == 0 {
 		cfg.LockTTL = time.Minute
+	}
+	if cfg.MaxWorkers <= 0 {
+		cfg.MaxWorkers = 4
 	}
 	return &Coordinator{
 		agent:              cfg.Agent,
@@ -75,18 +83,50 @@ func NewCoordinator(cfg CoordinatorConfig) *Coordinator {
 		events:             cfg.Events,
 		trustGate:          cfg.TrustGate,
 		lockTTL:            cfg.LockTTL,
+		sem:                make(chan struct{}, cfg.MaxWorkers),
 	}
 }
 
+// Heartbeat dispatches as many pending tasks as there are free worker slots,
+// each on its own goroutine, then returns immediately. A slow or suspended task
+// no longer blocks others. The returned Task is always zero-valued now (work is
+// async); the bool reports whether at least one task was dispatched this tick.
 func (c *Coordinator) Heartbeat(ctx context.Context) (domain.Task, bool, error) {
-	taskToRun, ok, err := c.scheduler.Next(ctx, c.agent.ID)
-	if err != nil {
-		return domain.Task{}, false, fmt.Errorf("schedule next task: %w", err)
+	dispatched := false
+	for {
+		select {
+		case c.sem <- struct{}{}: // acquired a worker slot
+		default:
+			return domain.Task{}, dispatched, nil // all workers busy
+		}
+		taskToRun, ok, err := c.scheduler.Next(ctx, c.agent.ID)
+		if err != nil {
+			<-c.sem
+			return domain.Task{}, dispatched, fmt.Errorf("schedule next task: %w", err)
+		}
+		if !ok {
+			<-c.sem // no pending task; release the slot
+			return domain.Task{}, dispatched, nil
+		}
+		c.wg.Add(1)
+		go func(t domain.Task) {
+			defer c.wg.Done()
+			defer func() { <-c.sem }()
+			if _, _, err := c.runAssigned(ctx, t); err != nil {
+				// Goroutine top-level: never swallow. runAssigned already
+				// transitioned the task to Failed on error; record the reason so
+				// a failed run is diagnosable rather than vanishing.
+				_ = c.publishLearning(ctx, c.agent.ID, t.ID, evolution.SignalFailure, "task_run_error", true)
+			}
+		}(taskToRun)
+		dispatched = true
 	}
-	if !ok {
-		return domain.Task{}, false, nil
-	}
-	return c.runAssigned(ctx, taskToRun)
+}
+
+// Wait blocks until every in-flight task goroutine has finished. The serve
+// shutdown path calls it so tasks are not abandoned mid-run.
+func (c *Coordinator) Wait() {
+	c.wg.Wait()
 }
 
 // runAssigned executes the full pipeline for a task the scheduler has already

@@ -59,25 +59,24 @@ func TestCoordinatorSuspendsTrustBlockedTask(t *testing.T) {
 	runner := &recordingTaskRunner{result: "should not run"}
 	coordinator, scheduler, audit := newTrustCoordinator(t, stubTrustGate{decision: quality.TrustDecisionBlocked}, runner)
 
-	result, ok, err := coordinator.Heartbeat(context.Background())
+	_, ok, err := coordinator.Heartbeat(context.Background())
 	if err != nil {
 		t.Fatalf("Heartbeat() error = %v, want nil", err)
 	}
 	if !ok {
 		t.Fatal("Heartbeat() ok = false, want true")
 	}
-	if result.Status != domain.TaskSuspended {
-		t.Errorf("Heartbeat() status = %q, want %q", result.Status, domain.TaskSuspended)
+	// Block until the dispatched goroutine fully finishes (status transition,
+	// audit, learning events) before asserting on any of its side effects —
+	// awaiting only the terminal status is not enough, since audit/event
+	// writes happen after the transition inside the same goroutine.
+	coordinator.Wait()
+	stored := awaitTerminal(t, scheduler, "task-trust")
+	if stored.Status != domain.TaskSuspended {
+		t.Errorf("stored status = %q, want %q", stored.Status, domain.TaskSuspended)
 	}
 	if runner.calls != 0 {
 		t.Errorf("runner called %d times, want 0 (trust-blocked task must not run)", runner.calls)
-	}
-	stored, _, err := scheduler.Get(context.Background(), "task-trust")
-	if err != nil {
-		t.Fatalf("Get() error = %v", err)
-	}
-	if stored.Status != domain.TaskSuspended {
-		t.Errorf("stored status = %q, want %q", stored.Status, domain.TaskSuspended)
 	}
 	if !hasAuditAction(audit.Events(), "trust_blocked") {
 		t.Errorf("audit actions missing %q: %#v", "trust_blocked", audit.Events())
@@ -91,15 +90,21 @@ func TestCoordinatorRunsTaskWhenTrustAllows(t *testing.T) {
 
 	runner := &recordingTaskRunner{result: "ok"}
 	// Real manager, no negative events: default score sits in the allow band.
-	coordinator, _, _ := newTrustCoordinator(t, quality.NewTrustScoreManager(), runner)
+	coordinator, scheduler, _ := newTrustCoordinator(t, quality.NewTrustScoreManager(), runner)
 
-	result, ok, err := coordinator.Heartbeat(context.Background())
+	_, ok, err := coordinator.Heartbeat(context.Background())
 	if err != nil {
 		t.Fatalf("Heartbeat() error = %v, want nil", err)
 	}
 	if !ok {
 		t.Fatal("Heartbeat() ok = false, want true")
 	}
+	// Block until the dispatched goroutine fully finishes (status transition,
+	// audit, learning events) before asserting on any of its side effects —
+	// awaiting only the terminal status is not enough, since audit/event
+	// writes happen after the transition inside the same goroutine.
+	coordinator.Wait()
+	result := awaitTerminal(t, scheduler, "task-trust")
 	if runner.calls != 1 {
 		t.Errorf("runner called %d times, want 1 (trusted task should run)", runner.calls)
 	}

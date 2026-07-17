@@ -3,7 +3,6 @@ package runtime
 import (
 	"context"
 	"errors"
-	"strings"
 	"testing"
 	"time"
 
@@ -14,6 +13,29 @@ import (
 	"github.com/stardust/legion-agent/internal/quality"
 	"github.com/stardust/legion-agent/internal/task"
 )
+
+// awaitTerminal polls the scheduler until the task reaches a terminal or
+// suspended status (or times out), so tests can assert the async pipeline's
+// outcome after Heartbeat dispatches it.
+func awaitTerminal(t *testing.T, sched *task.Scheduler, id string) domain.Task {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		got, ok, err := sched.Get(context.Background(), id)
+		if err != nil {
+			t.Fatalf("scheduler.Get: %v", err)
+		}
+		if ok {
+			switch got.Status {
+			case domain.TaskDone, domain.TaskFailed, domain.TaskSuspended:
+				return got
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("task %s did not reach terminal state in time", id)
+	return domain.Task{}
+}
 
 func TestCoordinatorRunsPendingTaskToDone(t *testing.T) {
 	t.Parallel()
@@ -51,20 +73,19 @@ func TestCoordinatorRunsPendingTaskToDone(t *testing.T) {
 		LockTTL:   time.Minute,
 	})
 
-	result, ok, err := coordinator.Heartbeat(context.Background())
+	_, ok, err := coordinator.Heartbeat(context.Background())
 	if err != nil {
 		t.Fatalf("Heartbeat() error = %v, want nil", err)
 	}
 	if !ok {
 		t.Fatalf("Heartbeat() ok = false, want true")
 	}
-	if result.Status != domain.TaskDone {
-		t.Errorf("Heartbeat() status = %q, want %q", result.Status, domain.TaskDone)
-	}
-	stored, _, err := scheduler.Get(context.Background(), "task-1")
-	if err != nil {
-		t.Fatalf("Get(%q) error = %v, want nil", "task-1", err)
-	}
+	// Block until the dispatched goroutine fully finishes (status transition,
+	// audit, learning events) before asserting on any of its side effects —
+	// awaiting only the terminal status is not enough, since audit/event
+	// writes happen after the transition inside the same goroutine.
+	coordinator.Wait()
+	stored := awaitTerminal(t, scheduler, "task-1")
 	if stored.Status != domain.TaskDone {
 		t.Errorf("stored task status = %q, want %q", stored.Status, domain.TaskDone)
 	}
@@ -110,13 +131,19 @@ func TestCoordinatorSuspendsHardLoopAndCreatesApproval(t *testing.T) {
 		LockTTL:   time.Minute,
 	})
 
-	result, ok, err := coordinator.Heartbeat(context.Background())
+	_, ok, err := coordinator.Heartbeat(context.Background())
 	if err != nil {
 		t.Fatalf("Heartbeat() error = %v, want nil", err)
 	}
 	if !ok {
 		t.Fatalf("Heartbeat() ok = false, want true")
 	}
+	// Block until the dispatched goroutine fully finishes (status transition,
+	// audit, learning events) before asserting on any of its side effects —
+	// awaiting only the terminal status is not enough, since audit/event
+	// writes happen after the transition inside the same goroutine.
+	coordinator.Wait()
+	result := awaitTerminal(t, scheduler, "task-1")
 	if result.Status != domain.TaskSuspended {
 		t.Errorf("Heartbeat() status = %q, want %q", result.Status, domain.TaskSuspended)
 	}
@@ -177,13 +204,19 @@ func TestCoordinatorRoutesTaskToRegisteredAgentRunner(t *testing.T) {
 		LockTTL:            time.Minute,
 	})
 
-	current, ok, err := coordinator.Heartbeat(ctx)
+	_, ok, err := coordinator.Heartbeat(ctx)
 	if err != nil {
 		t.Fatalf("Heartbeat() error = %v, want nil", err)
 	}
 	if !ok {
 		t.Fatalf("Heartbeat() ok = false, want true")
 	}
+	// Block until the dispatched goroutine fully finishes (status transition,
+	// audit, learning events) before asserting on any of its side effects —
+	// awaiting only the terminal status is not enough, since audit/event
+	// writes happen after the transition inside the same goroutine.
+	coordinator.Wait()
+	current := awaitTerminal(t, scheduler, "task-1")
 	if current.AgentID != "researcher" {
 		t.Errorf("Heartbeat() current task AgentID = %q, want %q", current.AgentID, "researcher")
 	}
@@ -243,13 +276,19 @@ func TestCoordinatorPublishesHardLoopLearningForResolvedAgent(t *testing.T) {
 		LockTTL:   time.Minute,
 	})
 
-	current, ok, err := coordinator.Heartbeat(ctx)
+	_, ok, err := coordinator.Heartbeat(ctx)
 	if err != nil {
 		t.Fatalf("Heartbeat() error = %v, want nil", err)
 	}
 	if !ok {
 		t.Fatalf("Heartbeat() ok = false, want true")
 	}
+	// Block until the dispatched goroutine fully finishes (status transition,
+	// audit, learning events) before asserting on any of its side effects —
+	// awaiting only the terminal status is not enough, since audit/event
+	// writes happen after the transition inside the same goroutine.
+	coordinator.Wait()
+	current := awaitTerminal(t, scheduler, "task-1")
 	if current.Status != domain.TaskSuspended {
 		t.Fatalf("Heartbeat() status = %q, want %q", current.Status, domain.TaskSuspended)
 	}
@@ -291,13 +330,19 @@ func TestCoordinatorFallsBackToDefaultRuntimeWhenResolverMisses(t *testing.T) {
 		LockTTL:            time.Minute,
 	})
 
-	current, ok, err := coordinator.Heartbeat(ctx)
+	_, ok, err := coordinator.Heartbeat(ctx)
 	if err != nil {
 		t.Fatalf("Heartbeat() error = %v, want nil", err)
 	}
 	if !ok {
 		t.Fatalf("Heartbeat() ok = false, want true")
 	}
+	// Block until the dispatched goroutine fully finishes (status transition,
+	// audit, learning events) before asserting on any of its side effects —
+	// awaiting only the terminal status is not enough, since audit/event
+	// writes happen after the transition inside the same goroutine.
+	coordinator.Wait()
+	current := awaitTerminal(t, scheduler, "task-1")
 	if current.Status != domain.TaskDone {
 		t.Errorf("Heartbeat() status = %q, want %q", current.Status, domain.TaskDone)
 	}
@@ -343,20 +388,25 @@ func TestCoordinatorFailsTaskWhenResolvedRunnerIsNil(t *testing.T) {
 		LockTTL:            time.Minute,
 	})
 
+	// A nil resolved runner is now a per-task failure handled inside the
+	// dispatched goroutine (see runAssigned via Heartbeat), not a synchronous
+	// Heartbeat error: Heartbeat only reports dispatch-time failures (e.g.
+	// scheduler.Next erroring). runAssigned still fails loud internally and
+	// transitions the task to Failed; that must be observable via the async
+	// pipeline's outcome rather than Heartbeat's return value.
 	_, ok, err := coordinator.Heartbeat(ctx)
-	if err == nil {
-		t.Fatalf("Heartbeat() error = nil, want nil runner error")
+	if err != nil {
+		t.Fatalf("Heartbeat() error = %v, want nil", err)
 	}
-	if ok {
-		t.Fatalf("Heartbeat() ok = true, want false")
+	if !ok {
+		t.Fatalf("Heartbeat() ok = false, want true")
 	}
-	if !strings.Contains(err.Error(), "runner is nil") {
-		t.Fatalf("Heartbeat() error = %v, want runner is nil", err)
-	}
-	current, _, getErr := scheduler.Get(ctx, "task-1")
-	if getErr != nil {
-		t.Fatalf("Get(task-1) error = %v, want nil", getErr)
-	}
+	// Block until the dispatched goroutine fully finishes (status transition,
+	// audit, learning events) before asserting on any of its side effects —
+	// awaiting only the terminal status is not enough, since audit/event
+	// writes happen after the transition inside the same goroutine.
+	coordinator.Wait()
+	current := awaitTerminal(t, scheduler, "task-1")
 	if current.Status != domain.TaskFailed {
 		t.Fatalf("task status = %q, want %q", current.Status, domain.TaskFailed)
 	}
