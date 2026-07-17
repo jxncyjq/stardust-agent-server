@@ -25,9 +25,16 @@ func ResolveWorkspaceRoot(configured string) (root string, warning string) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		// UserHomeDir failing is an unrecoverable environment fault; surface it
-		// through the warning channel and fall back to a relative dir so the
-		// caller still gets a usable path but is told something is wrong.
-		return defaultRootName, fmt.Sprintf("cannot resolve user home dir: %v; using %q", err, defaultRootName)
+		// through the warning channel. Resolve defaultRootName to an absolute
+		// path via the process cwd so the "concrete absolute directory" promise
+		// in the doc comment above still holds even on this failure branch.
+		abs, absErr := filepath.Abs(defaultRootName)
+		if absErr != nil {
+			// Getwd itself failed — an unrecoverable environment fault. Return the
+			// bare name and shout about both failures; never pretend this is fine.
+			return defaultRootName, fmt.Sprintf("cannot resolve user home dir: %v; and cannot absolutize %q: %v", err, defaultRootName, absErr)
+		}
+		return abs, fmt.Sprintf("cannot resolve user home dir: %v; falling back to %q", err, abs)
 	}
 	fallback := filepath.Join(home, defaultRootName)
 
@@ -43,7 +50,11 @@ func ResolveWorkspaceRoot(configured string) (root string, warning string) {
 	// Use %s inside literal quotes (not %q) for the paths: %q would re-escape
 	// backslashes in Windows paths (each "\" becomes "\\" in the output),
 	// corrupting the path text embedded in the warning.
-	return fallback, fmt.Sprintf("configured workspace.root \"%s\" not a dir, falling back to \"%s\"", expanded, fallback)
+	detail := "not a directory"
+	if statErr != nil {
+		detail = statErr.Error()
+	}
+	return fallback, fmt.Sprintf("configured workspace.root \"%s\" unusable (%s), falling back to \"%s\"", expanded, detail, fallback)
 }
 
 // expandTilde replaces a leading "~" (optionally "~/") with the user home dir.

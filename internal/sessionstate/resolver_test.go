@@ -63,6 +63,25 @@ func TestResolveWorkspaceRootExpandsTilde(t *testing.T) {
 	}
 }
 
+func TestResolveWorkspaceRootFallsBackWhenConfiguredPathIsFile(t *testing.T) {
+	f := filepath.Join(t.TempDir(), "afile")
+	if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir: %v", err)
+	}
+	root, warning := ResolveWorkspaceRoot(f)
+	want := filepath.Join(home, ".stardust")
+	if root != want {
+		t.Errorf("root = %q, want fallback %q", root, want)
+	}
+	if warning == "" {
+		t.Error("warning empty, want non-empty for a file-not-dir configured path")
+	}
+}
+
 func TestSessionDirJoinsUnderSessionSegment(t *testing.T) {
 	got := SessionDir("/base", "sess-1")
 	want := filepath.Join("/base", "session", "sess-1")
