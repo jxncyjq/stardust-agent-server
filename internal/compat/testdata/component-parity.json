@@ -1,0 +1,148 @@
+{
+  "components": [
+    {
+      "id": "A00",
+      "name": "CognitiveCore",
+      "status": "done",
+      "packages": ["internal/cognitive"],
+      "required_tests": ["TestCoreBuildContextIncludesContextFilesBlock", "TestCoreBuildContextMountsTaskSkills"],
+      "degradation": "missing_optional_memory_or_skills_returns_empty_context_blocks"
+    },
+    {
+      "id": "A01",
+      "name": "AgentRuntime",
+      "status": "done",
+      "packages": ["internal/runtime", "internal/app"],
+      "required_tests": ["TestRuntimeRunTaskBuildsPromptWithCognitiveCore", "TestRuntimeInterruptStopsBeforeInference", "TestRuntimeUsesNoopPortsWhenAuditAndEventsMissing", "TestRuntimeMissingMaasReturnsErrMaasUnavailable", "TestRuntimeRunTaskCompletesThroughMaasPort"],
+      "degradation": "missing_cognitive_core_uses_task_input_or_legacy_context_prefix; interrupted_runtime_stops_before_inference; missing_optional_event_or_audit_ports_use_noop; missing_maas_returns_structured_error"
+    },
+    {
+      "id": "A03",
+      "name": "ContextCompressor",
+      "status": "done",
+      "packages": ["internal/cognitive"],
+      "required_tests": ["TestContextCompressorFourLayerStrategy", "TestContextCompressorForceCheckpoint"],
+      "degradation": "no_llm_trim_and_protect"
+    },
+    {
+      "id": "A20",
+      "name": "ToolRegistry",
+      "status": "done",
+      "packages": ["internal/tool"],
+      "required_tests": ["TestToolRegistryPipeline"],
+      "degradation": "unregistered_tool_returns_structured_error"
+    },
+    {
+      "id": "A21",
+      "name": "ExecutionPolicy",
+      "status": "done",
+      "packages": ["internal/tool"],
+      "required_tests": ["TestExecutionPolicyAutoAllow"],
+      "degradation": "deny_by_default_when_policy_missing"
+    },
+    {
+      "id": "A22",
+      "name": "PermissionEnforcer",
+      "status": "done",
+      "packages": ["internal/tool"],
+      "required_tests": ["TestPermissionEnforcerBatchRoleOverride"],
+      "degradation": "deny_unlisted_tools"
+    },
+    {
+      "id": "A23",
+      "name": "ToolGuardrails",
+      "status": "done",
+      "packages": ["internal/tool"],
+      "required_tests": ["TestToolGuardrailsTimeout"],
+      "degradation": "fail_closed_on_guardrail_error"
+    },
+    {
+      "id": "A30",
+      "name": "SkillSystem",
+      "status": "done",
+      "packages": ["internal/skill", "internal/cognitive"],
+      "required_tests": ["TestSkillEnableDisable"],
+      "degradation": "skip_disabled_or_unsafe_skills"
+    },
+    {
+      "id": "A31",
+      "name": "SkillSecurityScanner",
+      "status": "done",
+      "packages": ["internal/skill"],
+      "required_tests": ["TestSkillInstallQuarantine"],
+      "degradation": "quarantine_critical_findings"
+    },
+    {
+      "id": "A32",
+      "name": "SkillInstaller",
+      "status": "done",
+      "packages": ["internal/skill", "internal/storage"],
+      "required_tests": ["TestSkillInstallAudit"],
+      "degradation": "reject_unverified_install"
+    },
+    {
+      "id": "A52",
+      "name": "DistillationOperator",
+      "status": "done",
+      "packages": ["internal/evolution"],
+      "required_tests": ["TestDistillationGeneSixTuple"],
+      "degradation": "reject_invalid_gene"
+    },
+    {
+      "id": "A53",
+      "name": "SolidifyPipeline",
+      "status": "done",
+      "packages": ["internal/evolution", "internal/memory"],
+      "required_tests": ["TestSolidifyPipelineRequiresValidation"],
+      "degradation": "no_solidify_without_validation"
+    },
+    {
+      "id": "A54",
+      "name": "EvolutionEventLog",
+      "status": "done",
+      "packages": ["internal/evolution", "internal/storage"],
+      "required_tests": ["TestEvolutionEventSeal"],
+      "degradation": "append_only_without_mutation"
+    },
+    {
+      "id": "A60",
+      "name": "AegisReviewer",
+      "status": "done",
+      "packages": ["internal/quality", "internal/observability"],
+      "required_tests": ["TestDiagnosticsIncludesQualitySummary"],
+      "degradation": "unsafe_output_rejected_with_summary_only_diagnostics"
+    },
+    {
+      "id": "A61",
+      "name": "TrustScoreManager",
+      "status": "done",
+      "packages": ["internal/quality", "internal/storage"],
+      "required_tests": ["TestTrustScoreHistory"],
+      "degradation": "cautious_or_blocked_mode_when_score_declines"
+    },
+    {
+      "id": "A63",
+      "name": "EvalEngine",
+      "status": "done",
+      "packages": ["internal/quality", "internal/storage"],
+      "required_tests": ["TestEvalHistoryTrend"],
+      "degradation": "single_run_eval_still_available_when_history_store_missing"
+    },
+    {
+      "id": "A64",
+      "name": "EvolutionEvaluator",
+      "status": "done",
+      "packages": ["internal/quality", "internal/storage", "internal/observability"],
+      "required_tests": ["TestDiagnosticsIncludesQualitySummary"],
+      "degradation": "degradation_decision_history_preserves_summary_without_prompt"
+    },
+    {
+      "id": "A70",
+      "name": "WorkflowEngine",
+      "status": "done",
+      "packages": ["internal/workflow", "internal/server", "internal/storage"],
+      "required_tests": ["TestWorkflowLoopJoinQuorum", "TestHTTPWorkflowSubmitResume"],
+      "degradation": "existing_sequence_parallel_approval_wait_event_only"
+    }
+  ]
+}

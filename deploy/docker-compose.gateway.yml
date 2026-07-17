@@ -1,0 +1,14 @@
+services:
+  gateway:
+    image: legion-agent:latest
+    command: ["legion-gateway", "/etc/legion/gateway.json"]
+    environment:
+      - LEGION_ADMIN_TOKEN=${LEGION_ADMIN_TOKEN}
+      - LEGION_TELEGRAM_BOT_TOKEN=${LEGION_TELEGRAM_BOT_TOKEN}
+    volumes:
+      - ./configs/gateway.example.json:/etc/legion/gateway.json:ro
+      - gateway-data:/data
+    restart: unless-stopped
+
+volumes:
+  gateway-data:

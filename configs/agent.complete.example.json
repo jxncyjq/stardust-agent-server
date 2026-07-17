@@ -1,0 +1,118 @@
+{
+  "_comment": "Legion Agent 完整可运行配置样例。复制为 agent.json 后，把 api_key、base_url、model、admin_token 替换为你的真实值。",
+  "_comment_run_from": "建议在 legion/legionAgent 目录执行：go run ./cmd -- tui --config configs/agent.complete.example.json",
+  "agents": {
+    "_comment": "多 Agent 子配置。key 对应 workflow task.agent_id；value 相对于本配置文件所在目录解析。",
+    "researcher": "agents/researcher.example.json",
+    "writer": "agents/writer.example.json"
+  },
+  "maas": {
+    "_comment": "MaaS/模型配置。设置 model 时走 OpenAI-compatible /chat/completions；model 为空时走 Legion 内部 MaaS /v1/inference/generate。",
+    "base_url": "",
+    "api_key": "",
+    "default_profile": "deepseek",
+    "profiles": {
+      "deepseek": {
+        "_comment": "默认 TUI/CLI 对话模型。DeepSeek 官方兼容 OpenAI Chat Completions。",
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-chat",
+        "api_key": "replace-with-your-deepseek-api-key"
+      },
+      "fast": {
+        "_comment": "低延迟任务 profile，可给 writer 或普通自动化任务使用。",
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-chat",
+        "api_key": "replace-with-your-deepseek-api-key"
+      },
+      "review": {
+        "_comment": "高质量审查/研究 profile，可给 researcher、Aegis 或复杂任务使用。",
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-reasoner",
+        "api_key": "replace-with-your-deepseek-api-key"
+      },
+      "local-maas": {
+        "_comment": "如果后续启用 Legion 内部 MaaS 网关，可改用这个 profile，并将 model 留空。",
+        "base_url": "http://127.0.0.1:8090",
+        "model": "",
+        "api_key": "change-me-local-maas-token"
+      }
+    }
+  },
+  "storage": {
+    "_comment": "sqlite 会持久化 task、runtime event、audit、workflow state。开发临时运行可改为 memory。",
+    "driver": "sqlite",
+    "path": "agent.db"
+  },
+  "server": {
+    "_comment": "agent serve 的 HTTP 管理面配置。",
+    "listen_addr": "127.0.0.1:8080",
+    "admin_token": "change-me-admin-token",
+    "public_health_enabled": true,
+    "request_id_header": "X-Request-ID"
+  },
+  "service": {
+    "_comment": "后台 coordinator heartbeat 间隔。多 Agent workflow 任务由这个后台循环推进。",
+    "background_interval": "1s"
+  },
+  "runtime": {
+    "_comment": "demo_response 仅在没有真实 MaaS client 时作为降级演示；max_tool_rounds 控制模型工具调用闭环轮数。",
+    "demo_response": "task completed",
+    "max_tool_rounds": 4
+  },
+  "session": {
+    "_comment": "TUI 多轮会话连续性配置。开启后会把最近 N 轮 user/assistant turn 写入 SQLite，并在下一轮 prompt 中注入。",
+    "enabled": true,
+    "default_recent_turns": 6,
+    "max_turn_chars": 6000,
+    "restore_latest_on_tui_start": true
+  },
+  "tui": {
+    "_comment": "交互式 Bubble Tea TUI 配置。",
+    "show_prompt": true,
+    "show_thinking": true,
+    "color_profile": "truecolor",
+    "theme": {
+      "_comment": "支持 ANSI 色号或 truecolor hex。下面这组接近 DeepSeek-TUI 风格。",
+      "accent": "#00A6FF",
+      "accent2": "#2F6FEB",
+      "text": "#D6DEEB",
+      "dim": "#7F8EA3",
+      "error": "#FF5C57",
+      "status_fg": "#D6DEEB",
+      "status_bg": "#071426",
+      "shell_bg": "#00005F"
+    }
+  },
+  "context_files": {
+    "_comment": "运行时注入上下文。Root 建议保持为项目根；AGENTS/SOUL/TOOLS/USER/MEMORY 都会进入 prompt。",
+    "enabled": true,
+    "root": ".",
+    "agents_path": "AGENTS.md",
+    "soul_path": "configs/persona/SOUL.md",
+    "tools_path": "configs/persona/TOOLS.md",
+    "user_path": "configs/persona/USER.md",
+    "memory_path": "configs/persona/MEMORY.md",
+    "max_file_chars": 20000
+  },
+  "workspace": {
+    "_comment": "Agent 产出目录约定：docs 写经验/报告/runbook，memory 写长期记忆材料。",
+    "docs_root": "docs",
+    "memory_root": "memory"
+  },
+  "tasks": {
+    "_comment": "多 Agent 协作任务账本。tasks/events/*.jsonl 是唯一写入源；tasks.md 只放活跃任务摘要，tasks/TASK-*.md 是详情投影。",
+    "index_path": "tasks.md",
+    "root": "tasks",
+    "archive_root": "tasks/archive",
+    "max_index_lines": 500,
+    "max_task_lines": 300,
+    "max_message_chars": 300,
+    "active_statuses": ["planned", "ready", "in_progress", "blocked", "review"],
+    "done_statuses": ["done", "cancelled"]
+  },
+  "skills": {
+    "_comment": "远端 skill registry 可后续再配置；本地技能默认安装到 skills。",
+    "registry_url": "",
+    "install_root": "skills"
+  }
+}

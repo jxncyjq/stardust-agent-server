@@ -1,0 +1,398 @@
+package taskledger
+
+import (
+	"bufio"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+var (
+	ErrInvalidEvent      = errors.New("invalid task ledger event")
+	ErrDuplicateClaim    = errors.New("task owner already claimed")
+	ErrProjectionTooLong = errors.New("task ledger projection exceeds configured line limit")
+)
+
+var eventIDCounter uint64
+
+type Config struct {
+	WorkspaceRoot    string
+	IndexPath        string
+	Root             string
+	ArchiveRoot      string
+	MaxIndexLines    int
+	MaxTaskLines     int
+	MaxMessageChars  int
+	ActiveStatuses   []string
+	DoneStatuses     []string
+	AllowedAgentIDs  []string
+	Now              func() time.Time
+	EventIDGenerator func(time.Time) string
+}
+
+type Ledger struct {
+	cfg Config
+	mu  sync.Mutex
+}
+
+// New creates an event-backed task ledger rooted inside a workspace.
+func New(cfg Config) (*Ledger, error) {
+	if cfg.WorkspaceRoot == "" {
+		cfg.WorkspaceRoot = "."
+	}
+	workspaceRoot, err := filepath.Abs(cfg.WorkspaceRoot)
+	if err != nil {
+		return nil, fmt.Errorf("resolve workspace root: %w", err)
+	}
+	cfg.WorkspaceRoot = workspaceRoot
+	if cfg.IndexPath == "" {
+		cfg.IndexPath = "tasks.md"
+	}
+	if cfg.Root == "" {
+		cfg.Root = "tasks"
+	}
+	if cfg.ArchiveRoot == "" {
+		cfg.ArchiveRoot = filepath.Join(cfg.Root, "archive")
+	}
+	if cfg.MaxIndexLines <= 0 {
+		cfg.MaxIndexLines = 500
+	}
+	if cfg.MaxTaskLines <= 0 {
+		cfg.MaxTaskLines = 300
+	}
+	if cfg.MaxMessageChars <= 0 {
+		cfg.MaxMessageChars = 300
+	}
+	if len(cfg.ActiveStatuses) == 0 {
+		cfg.ActiveStatuses = []string{"planned", "ready", "in_progress", "blocked", "review"}
+	}
+	if len(cfg.DoneStatuses) == 0 {
+		cfg.DoneStatuses = []string{"done", "cancelled"}
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+	if cfg.EventIDGenerator == nil {
+		cfg.EventIDGenerator = defaultEventID
+	}
+	if _, err := resolveWithin(workspaceRoot, cfg.IndexPath); err != nil {
+		return nil, err
+	}
+	if _, err := resolveWithin(workspaceRoot, cfg.Root); err != nil {
+		return nil, err
+	}
+	if _, err := resolveWithin(workspaceRoot, cfg.ArchiveRoot); err != nil {
+		return nil, err
+	}
+	return &Ledger{cfg: cfg}, nil
+}
+
+func (l *Ledger) Append(ctx context.Context, event Event) (Event, error) {
+	if err := ctx.Err(); err != nil {
+		return Event{}, err
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	unlock, err := l.acquireLock(ctx)
+	if err != nil {
+		return Event{}, err
+	}
+	defer unlock()
+	event = l.normalizeEvent(event)
+	if err := l.validateEvent(event); err != nil {
+		return Event{}, err
+	}
+	path := l.eventPath(event.CreatedAt)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return Event{}, fmt.Errorf("create event directory: %w", err)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		return Event{}, fmt.Errorf("open event log: %w", err)
+	}
+	defer file.Close()
+	data, err := json.Marshal(event)
+	if err != nil {
+		return Event{}, fmt.Errorf("encode event: %w", err)
+	}
+	if _, err := file.Write(append(data, '\n')); err != nil {
+		return Event{}, fmt.Errorf("append event: %w", err)
+	}
+	return event, nil
+}
+
+func (l *Ledger) Rebuild(ctx context.Context) (Projection, error) {
+	if err := ctx.Err(); err != nil {
+		return Projection{}, err
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	unlock, err := l.acquireLock(ctx)
+	if err != nil {
+		return Projection{}, err
+	}
+	defer unlock()
+	events, err := l.ReadEvents(ctx)
+	if err != nil {
+		return Projection{}, err
+	}
+	projection := BuildProjection(events, l.cfg)
+	if err := l.writeProjection(ctx, projection); err != nil {
+		return Projection{}, err
+	}
+	return projection, nil
+}
+
+// Snapshot replays events into a projection without writing projection files.
+func (l *Ledger) Snapshot(ctx context.Context) (Projection, error) {
+	if err := ctx.Err(); err != nil {
+		return Projection{}, err
+	}
+	events, err := l.ReadEvents(ctx)
+	if err != nil {
+		return Projection{}, err
+	}
+	return BuildProjection(events, l.cfg), nil
+}
+
+func (l *Ledger) ReadEvents(ctx context.Context) ([]Event, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	eventsRoot := l.eventsRoot()
+	if _, err := os.Stat(eventsRoot); errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	var events []Event
+	err := filepath.WalkDir(eventsRoot, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return nil
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
+			return nil
+		}
+		fileEvents, err := readEventFile(path)
+		if err != nil {
+			return err
+		}
+		events = append(events, fileEvents...)
+		return nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("read events: %w", err)
+	}
+	sortEvents(events)
+	return dedupeEvents(events), nil
+}
+
+func (l *Ledger) normalizeEvent(event Event) Event {
+	if event.CreatedAt.IsZero() {
+		event.CreatedAt = l.cfg.Now()
+	}
+	if event.EventID == "" {
+		event.EventID = l.cfg.EventIDGenerator(event.CreatedAt)
+	}
+	if event.SchemaVersion == 0 {
+		event.SchemaVersion = schemaVersion
+	}
+	if event.ActorAgentID == "" {
+		event.ActorAgentID = event.From
+	}
+	event.Summary = truncateRunes(strings.TrimSpace(event.Summary), l.cfg.MaxMessageChars)
+	event.Title = strings.TrimSpace(event.Title)
+	event.Status = strings.TrimSpace(event.Status)
+	event.Owner = strings.TrimSpace(event.Owner)
+	event.Artifact = strings.TrimSpace(event.Artifact)
+	return event
+}
+
+func (l *Ledger) validateEvent(event Event) error {
+	if event.EventID == "" {
+		return fmt.Errorf("%w: event_id required", ErrInvalidEvent)
+	}
+	if event.TaskID == "" {
+		return fmt.Errorf("%w: task_id required", ErrInvalidEvent)
+	}
+	if event.Type == "" {
+		return fmt.Errorf("%w: type required", ErrInvalidEvent)
+	}
+	if event.SchemaVersion != schemaVersion {
+		return fmt.Errorf("%w: unsupported schema_version %d", ErrInvalidEvent, event.SchemaVersion)
+	}
+	if !validEventType(event.Type) {
+		return fmt.Errorf("%w: unsupported type %q", ErrInvalidEvent, event.Type)
+	}
+	if event.ActorAgentID != "" && !l.agentAllowed(event.ActorAgentID) {
+		return fmt.Errorf("%w: unknown actor_agent_id %q", ErrInvalidEvent, event.ActorAgentID)
+	}
+	if event.To != "" && !l.agentAllowed(event.To) {
+		return fmt.Errorf("%w: unknown to agent %q", ErrInvalidEvent, event.To)
+	}
+	if event.Artifact != "" {
+		if _, err := resolveWithin(l.cfg.WorkspaceRoot, event.Artifact); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (l *Ledger) agentAllowed(agentID string) bool {
+	if len(l.cfg.AllowedAgentIDs) == 0 {
+		return true
+	}
+	for _, allowed := range l.cfg.AllowedAgentIDs {
+		if agentID == allowed {
+			return true
+		}
+	}
+	return false
+}
+
+func (l *Ledger) writeProjection(ctx context.Context, projection Projection) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	index, err := l.indexPath()
+	if err != nil {
+		return err
+	}
+	if err := writeFileAtomic(index, projection.IndexMarkdown); err != nil {
+		return err
+	}
+	for taskID, content := range projection.TaskMarkdown {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		task := projection.Tasks[taskID]
+		activePath, err := l.taskPath(taskID)
+		if err != nil {
+			return err
+		}
+		if isTerminal(task.Status, l.cfg.DoneStatuses) {
+			path, err := l.archiveTaskPath(taskID)
+			if err != nil {
+				return err
+			}
+			if err := writeFileAtomic(path, content); err != nil {
+				return err
+			}
+			if err := os.Remove(activePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+				return fmt.Errorf("remove active task projection %q: %w", activePath, err)
+			}
+			continue
+		}
+		if err := writeFileAtomic(activePath, content); err != nil {
+			return err
+		}
+		archivePath, err := l.archiveTaskPath(taskID)
+		if err != nil {
+			return err
+		}
+		if err := os.Remove(archivePath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove archived task projection %q: %w", archivePath, err)
+		}
+	}
+	return nil
+}
+
+func (l *Ledger) acquireLock(ctx context.Context) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	lockPath := filepath.Join(l.rootPath(), ".lock")
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
+		return nil, fmt.Errorf("create lock directory: %w", err)
+	}
+	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return nil, fmt.Errorf("acquire task ledger lock: %w", err)
+		}
+		return nil, fmt.Errorf("acquire task ledger lock: %w", err)
+	}
+	_, _ = file.WriteString(time.Now().Format(time.RFC3339Nano))
+	_ = file.Close()
+	return func() {
+		_ = os.Remove(lockPath)
+	}, nil
+}
+
+func (l *Ledger) eventsRoot() string {
+	return filepath.Join(l.rootPath(), "events")
+}
+
+func (l *Ledger) eventPath(t time.Time) string {
+	return filepath.Join(l.eventsRoot(), t.Format("2006-01-02")+".jsonl")
+}
+
+func (l *Ledger) rootPath() string {
+	path, _ := resolveWithin(l.cfg.WorkspaceRoot, l.cfg.Root)
+	return path
+}
+
+func (l *Ledger) indexPath() (string, error) {
+	return resolveWithin(l.cfg.WorkspaceRoot, l.cfg.IndexPath)
+}
+
+func (l *Ledger) taskPath(taskID string) (string, error) {
+	if strings.Contains(taskID, string(filepath.Separator)) || strings.Contains(taskID, "/") || strings.Contains(taskID, "\\") {
+		return "", fmt.Errorf("%w: unsafe task_id %q", ErrInvalidEvent, taskID)
+	}
+	return resolveWithin(l.cfg.WorkspaceRoot, filepath.Join(l.cfg.Root, taskID+".md"))
+}
+
+func (l *Ledger) archiveTaskPath(taskID string) (string, error) {
+	if strings.Contains(taskID, string(filepath.Separator)) || strings.Contains(taskID, "/") || strings.Contains(taskID, "\\") {
+		return "", fmt.Errorf("%w: unsafe task_id %q", ErrInvalidEvent, taskID)
+	}
+	return resolveWithin(l.cfg.WorkspaceRoot, filepath.Join(l.cfg.ArchiveRoot, taskID+".md"))
+}
+
+func readEventFile(path string) ([]Event, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("open event file %q: %w", path, err)
+	}
+	defer file.Close()
+	var events []Event
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var event Event
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			return nil, fmt.Errorf("decode event file %q: %w", path, err)
+		}
+		events = append(events, event)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("scan event file %q: %w", path, err)
+	}
+	return events, nil
+}
+
+func validEventType(eventType string) bool {
+	switch eventType {
+	case EventTaskCreated, EventTaskClaimed, EventTaskStatusChanged, EventMessageAppended, EventResultAppended, EventHandoffAppended, EventReviewAppended:
+		return true
+	default:
+		return strings.HasPrefix(eventType, EventConflictPrefix)
+	}
+}
+
+func defaultEventID(t time.Time) string {
+	seq := atomic.AddUint64(&eventIDCounter, 1)
+	return fmt.Sprintf("evt-%s-%06d", t.UTC().Format("20060102-150405.000000000"), seq)
+}

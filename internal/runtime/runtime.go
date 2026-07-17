@@ -1,0 +1,602 @@
+package runtime
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/stardust/legion-agent/internal/cognitive"
+	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/evolution"
+	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/tool"
+)
+
+var (
+	ErrInterrupted     = errors.New("runtime interrupted")
+	ErrMaasUnavailable = errors.New("maas inference client unavailable")
+)
+
+const defaultMaxToolRounds = 4
+
+type ContextBuilder interface {
+	BuildContext(ctx context.Context, req cognitive.Request) (cognitive.BuiltContext, error)
+}
+
+type Config struct {
+	Maas           port.MaasInferenceClient
+	Audit          port.AuditLog
+	Events         port.EventBus
+	ContextBuilder ContextBuilder
+	ContextPrefix  string
+	Tools          *tool.Registry
+	MaxToolRounds  int
+	// LazyTools selects the on-demand meta-tool protocol. When true the model is
+	// offered only list_tools/call_tool and discovers/invokes real tools through
+	// them, keeping simple no-tool chats cheap. When false the full native tool
+	// schema is offered every round (legacy behaviour, safety rollback).
+	LazyTools bool
+	// MaxToolResultChars caps a single tool result before it is appended to the
+	// prompt; MaxPromptChars caps the whole accumulated tool-loop prompt. Zero
+	// falls back to safe defaults.
+	MaxToolResultChars int
+	MaxPromptChars     int
+	ConversationTurns  []domain.ConversationTurn
+	// Delegation controls. Role is "orchestrator" (may spawn sub-tasks) or "leaf"
+	// (may not); an empty Role at the root (Depth 0) defaults to orchestrator, and
+	// spawned children default to leaf. Depth is the current delegation depth (0
+	// at the root). MaxSpawnDepth caps how deep orchestrators may nest; MaxConcurrent
+	// bounds parallel sub-tasks in a batch. Zero MaxSpawnDepth/MaxConcurrent fall
+	// back to safe defaults.
+	Role          string
+	Depth         int
+	MaxSpawnDepth int
+	MaxConcurrent int
+}
+
+// Context-accumulation bounds for the tool-execution loop. Tool outputs are
+// appended to the prompt and re-sent on every round, so without caps a single
+// large tool result (e.g. a big file read) re-enters context every round and the
+// prompt grows unbounded across rounds.
+const (
+	defaultMaxToolResultChars = 4000  // per single tool result, before truncation
+	defaultMaxPromptChars     = 16000 // whole accumulated tool-loop prompt (re-sent each round)
+)
+
+type Runtime struct {
+	maas               port.MaasInferenceClient
+	audit              port.AuditLog
+	events             port.EventBus
+	contextBuilder     ContextBuilder
+	contextPrefix      string
+	tools              *tool.Registry
+	maxToolRounds      int
+	maxToolResultChars int
+	maxPromptChars     int
+	lazyTools          bool
+	conversationTurns  []domain.ConversationTurn
+	interrupted        atomic.Bool
+	role               string
+	depth              int
+	maxSpawnDepth      int
+	maxConcurrent      int
+	subTaskSeq         atomic.Uint64
+}
+
+func NewRuntime(cfg Config) *Runtime {
+	audit := cfg.Audit
+	if audit == nil {
+		audit = noopAuditLog{}
+	}
+	events := cfg.Events
+	if events == nil {
+		events = noopEventBus{}
+	}
+	role := cfg.Role
+	if role == "" {
+		if cfg.Depth == 0 {
+			role = roleOrchestrator
+		} else {
+			role = roleLeaf
+		}
+	}
+	return &Runtime{
+		maas:               cfg.Maas,
+		audit:              audit,
+		events:             events,
+		contextBuilder:     cfg.ContextBuilder,
+		contextPrefix:      strings.TrimSpace(cfg.ContextPrefix),
+		tools:              cfg.Tools,
+		maxToolRounds:      normalizeMaxToolRounds(cfg.MaxToolRounds),
+		maxToolResultChars: normalizePositive(cfg.MaxToolResultChars, defaultMaxToolResultChars),
+		maxPromptChars:     normalizePositive(cfg.MaxPromptChars, defaultMaxPromptChars),
+		lazyTools:          cfg.LazyTools,
+		conversationTurns:  append([]domain.ConversationTurn(nil), cfg.ConversationTurns...),
+		role:               role,
+		depth:              cfg.Depth,
+		maxSpawnDepth:      normalizePositive(cfg.MaxSpawnDepth, defaultMaxSpawnDepth),
+		maxConcurrent:      normalizePositive(cfg.MaxConcurrent, defaultMaxConcurrent),
+	}
+}
+
+func normalizeMaxToolRounds(rounds int) int {
+	if rounds <= 0 {
+		return defaultMaxToolRounds
+	}
+	return rounds
+}
+
+func normalizePositive(value, fallback int) int {
+	if value <= 0 {
+		return fallback
+	}
+	return value
+}
+
+func (r *Runtime) Interrupt() {
+	r.interrupted.Store(true)
+}
+
+func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.Task) (domain.TaskRun, error) {
+	started := time.Now()
+	requestID := task.ID + ":run"
+	if err := r.events.Publish(ctx, domain.RuntimeEvent{
+		Type:      "task_started",
+		TaskID:    task.ID,
+		Message:   "runtime started",
+		CreatedAt: started,
+	}); err != nil {
+		return domain.TaskRun{}, fmt.Errorf("publish task started event: %w", err)
+	}
+	if r.interrupted.Load() {
+		_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonInterrupted, true)
+		return domain.TaskRun{}, ErrInterrupted
+	}
+	if r.maas == nil {
+		_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonInferenceError, true)
+		return domain.TaskRun{}, ErrMaasUnavailable
+	}
+	prompt, err := r.buildPrompt(ctx, agent, task)
+	if err != nil {
+		return domain.TaskRun{}, err
+	}
+	// basePrompt is the fixed task framing (system + task). It is reused verbatim
+	// as the head of every tool-round prompt, so it is the stable prefix that
+	// drives the provider prompt-cache breakpoint (InferenceRequest.StablePrefixLen).
+	basePrompt := prompt
+	var promptTokens, completionTokens, cachedTokens, totalTokens int
+	resp, err := r.generate(ctx, requestID, prompt, task.Images, len([]rune(basePrompt)))
+	if err != nil {
+		_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonInferenceError, true)
+		return domain.TaskRun{}, fmt.Errorf("generate inference: %w", err)
+	}
+	promptTokens += resp.PromptTokens
+	completionTokens += resp.CompletionTokens
+	cachedTokens += resp.CachedTokens
+	totalTokens += resp.TotalTokens
+	// toolCtx accumulates tool results deduplicated by (tool, arguments), so
+	// re-reading the same file/URL keeps only the latest copy in context instead
+	// of stacking duplicates each round.
+	var toolCtx []toolEntry
+	for round := 0; round < r.maxToolRounds && len(resp.ToolCalls) > 0; round++ {
+		results, err := r.executeToolCalls(ctx, agent, task, resp.ToolCalls)
+		if err != nil {
+			_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonToolError, true)
+			return domain.TaskRun{}, fmt.Errorf("execute model tool calls: %w", err)
+		}
+		toolCtx = mergeToolResults(toolCtx, resp.ToolCalls, results, r.maxToolResultChars)
+		prompt = boundPrompt(basePrompt+renderToolEntries(toolCtx), r.maxPromptChars)
+		resp, err = r.generate(ctx, requestID, prompt, task.Images, stablePrefixRunes(prompt, basePrompt))
+		if err != nil {
+			_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonInferenceError, true)
+			return domain.TaskRun{}, fmt.Errorf("generate inference after tools: %w", err)
+		}
+		promptTokens += resp.PromptTokens
+		completionTokens += resp.CompletionTokens
+		cachedTokens += resp.CachedTokens
+		totalTokens += resp.TotalTokens
+	}
+	if len(resp.ToolCalls) > 0 {
+		// Tool-round budget exhausted but the model still wants tools. Rather
+		// than hard-failing the whole task (which discards every tool result
+		// gathered so far and surfaces as "任务执行失败" to the user), make a
+		// final inference with no tools offered, and explicitly instruct the
+		// model to answer rather than narrate another tool call — otherwise it
+		// tends to emit text like "list_files 参数: {...}" instead of a real
+		// answer when it is cut off mid-exploration.
+		finalPrompt := prompt + "\n\n[系统] 工具调用已达上限。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。"
+		final, err := r.generateNoTools(ctx, requestID, finalPrompt, task.Images, stablePrefixRunes(finalPrompt, basePrompt))
+		if err != nil {
+			_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonInferenceError, true)
+			return domain.TaskRun{}, fmt.Errorf("generate final answer after tool budget exhausted: %w", err)
+		}
+		promptTokens += final.PromptTokens
+		completionTokens += final.CompletionTokens
+		cachedTokens += final.CachedTokens
+		totalTokens += final.TotalTokens
+		resp = final
+	}
+	if err := r.events.Publish(ctx, domain.RuntimeEvent{
+		Type:      "inference_completed",
+		TaskID:    task.ID,
+		Message:   "model inference completed",
+		CreatedAt: time.Now(),
+	}); err != nil {
+		return domain.TaskRun{}, fmt.Errorf("publish inference completed event: %w", err)
+	}
+	if err := r.audit.Append(ctx, domain.AuditEvent{
+		ID:          task.ID + ":model-audit-1",
+		RequestID:   requestID,
+		SubjectType: "model",
+		SubjectID:   task.ID,
+		Action:      "model_inference_completed",
+		Hash:        "memory",
+		CreatedAt:   time.Now(),
+	}); err != nil {
+		return domain.TaskRun{}, fmt.Errorf("append model audit event: %w", err)
+	}
+	ended := time.Now()
+	run := domain.TaskRun{
+		ID:               task.ID + ":run-1",
+		TaskID:           task.ID,
+		AgentID:          agent.ID,
+		StartedAt:        started,
+		EndedAt:          ended,
+		Result:           resp.Text,
+		ReasoningSummary: resp.ReasoningSummary,
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		CachedTokens:     cachedTokens,
+		TotalTokens:      totalTokens,
+	}
+	if err := r.audit.Append(ctx, domain.AuditEvent{
+		ID:          task.ID + ":audit-1",
+		RequestID:   requestID,
+		SubjectType: "task",
+		SubjectID:   task.ID,
+		Action:      "task_completed",
+		Hash:        "memory",
+		CreatedAt:   time.Now(),
+	}); err != nil {
+		return domain.TaskRun{}, fmt.Errorf("append audit event: %w", err)
+	}
+	if err := r.events.Publish(ctx, domain.RuntimeEvent{
+		Type:             "task_completed",
+		TaskID:           task.ID,
+		Message:          resp.Text,
+		PromptTokens:     promptTokens,
+		CompletionTokens: completionTokens,
+		CachedTokens:     cachedTokens,
+		TotalTokens:      totalTokens,
+		ElapsedMs:        ended.Sub(started).Milliseconds(),
+		CreatedAt:        time.Now(),
+	}); err != nil {
+		return domain.TaskRun{}, fmt.Errorf("publish task completed event: %w", err)
+	}
+	if err := r.publishLearning(ctx, agent, task, evolution.SignalSuccess, "", false); err != nil {
+		return domain.TaskRun{}, fmt.Errorf("publish learning success event: %w", err)
+	}
+	return run, nil
+}
+
+func (r *Runtime) generate(ctx context.Context, requestID string, prompt string, images []string, stablePrefixLen int) (port.InferenceResponse, error) {
+	return r.maas.Generate(ctx, port.InferenceRequest{
+		RequestID:       requestID,
+		Prompt:          prompt,
+		Tools:           r.inferenceTools(),
+		Images:          images,
+		StablePrefixLen: stablePrefixLen,
+	})
+}
+
+// generateNoTools runs a final inference with no tools offered, so the model is
+// forced to produce a textual answer instead of requesting more tool calls. It
+// is used to gracefully finish a task that has exhausted its tool-round budget.
+func (r *Runtime) generateNoTools(ctx context.Context, requestID string, prompt string, images []string, stablePrefixLen int) (port.InferenceResponse, error) {
+	return r.maas.Generate(ctx, port.InferenceRequest{
+		RequestID:       requestID,
+		Prompt:          prompt,
+		Tools:           nil,
+		Images:          images,
+		StablePrefixLen: stablePrefixLen,
+	})
+}
+
+// stablePrefixRunes reports the rune length of base when base is a verbatim
+// prefix of sent, and 0 otherwise. Tool-round bounding (boundPrompt) can trim
+// the head once the accumulated prompt exceeds the char budget; when that
+// happens base is no longer a stable prefix and callers must not claim a cache
+// breakpoint (contract: 0 means "no known stable prefix").
+func stablePrefixRunes(sent, base string) int {
+	if strings.HasPrefix(sent, base) {
+		return len([]rune(base))
+	}
+	return 0
+}
+
+func (r *Runtime) inferenceTools() []port.InferenceTool {
+	if r.tools == nil {
+		return nil
+	}
+	// Lazy (on-demand) protocol: offer only the two meta tools so the model pays
+	// a tiny fixed schema cost per inference. It discovers real tools via
+	// list_tools and invokes them via call_tool, both handled in-runtime.
+	if r.lazyTools {
+		return metaInferenceTools()
+	}
+	descriptors := r.tools.Descriptors()
+	out := make([]port.InferenceTool, 0, len(descriptors))
+	for _, descriptor := range descriptors {
+		out = append(out, port.InferenceTool{
+			Name:        descriptor.Name,
+			Description: descriptor.Description,
+			InputSchema: descriptor.InputSchema,
+		})
+	}
+	return out
+}
+
+func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task domain.Task, calls []domain.ToolCall) ([]domain.ToolResult, error) {
+	if r.tools == nil {
+		return nil, fmt.Errorf("tool registry unavailable")
+	}
+	results := make([]domain.ToolResult, 0, len(calls))
+	for _, call := range calls {
+		if call.ID == "" {
+			call.ID = task.ID + ":" + call.Name
+		}
+		if err := r.events.Publish(ctx, domain.RuntimeEvent{
+			Type:      "tool_call_requested",
+			TaskID:    task.ID,
+			Message:   call.Name,
+			CreatedAt: time.Now(),
+		}); err != nil {
+			return nil, fmt.Errorf("publish tool request event: %w", err)
+		}
+		result, err := r.dispatchToolCall(ctx, agent, task, call)
+		if err != nil {
+			if pubErr := r.events.Publish(ctx, domain.RuntimeEvent{
+				Type:      "tool_failed",
+				TaskID:    task.ID,
+				Message:   call.Name,
+				CreatedAt: time.Now(),
+			}); pubErr != nil {
+				return nil, fmt.Errorf("publish tool failed event: %w", pubErr)
+			}
+			// Feed the tool error back to the model instead of failing the task.
+			// The error is already surfaced via the tool_failed event and is
+			// rendered into the next prompt by promptWithToolResults, so the
+			// model can recover or answer directly on the following round.
+			results = append(results, domain.ToolResult{CallID: call.ID, Success: false, Error: err.Error()})
+			continue
+		}
+		results = append(results, result)
+		if err := r.events.Publish(ctx, domain.RuntimeEvent{
+			Type:      "tool_result",
+			TaskID:    task.ID,
+			Message:   result.Output,
+			CreatedAt: time.Now(),
+		}); err != nil {
+			return nil, fmt.Errorf("publish tool result event: %w", err)
+		}
+		if err := r.events.Publish(ctx, domain.RuntimeEvent{
+			Type:      "tool_executed",
+			TaskID:    task.ID,
+			Message:   call.Name,
+			CreatedAt: time.Now(),
+		}); err != nil {
+			return nil, fmt.Errorf("publish tool executed event: %w", err)
+		}
+	}
+	return results, nil
+}
+
+// toolEntry is one tool result kept in the accumulated tool context, tagged with
+// a dedup key so repeated calls collapse to a single most-recent copy.
+type toolEntry struct {
+	key  string
+	text string
+}
+
+// dedupKey identifies a tool call by its name and arguments, so two reads of the
+// same file (or two fetches of the same URL) share a key and deduplicate.
+func dedupKey(call domain.ToolCall) string {
+	keys := make([]string, 0, len(call.Arguments))
+	for k := range call.Arguments {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	b.WriteString(call.Name)
+	for _, k := range keys {
+		b.WriteString("|")
+		b.WriteString(k)
+		b.WriteString("=")
+		b.WriteString(call.Arguments[k])
+	}
+	return b.String()
+}
+
+func renderToolResult(result domain.ToolResult, maxResultChars int) string {
+	var b strings.Builder
+	b.WriteString("- ")
+	b.WriteString(result.CallID)
+	if result.Success {
+		b.WriteString(" success: ")
+		b.WriteString(truncateText(result.Output, maxResultChars))
+	} else {
+		b.WriteString(" failed: ")
+		b.WriteString(truncateText(result.Error, maxResultChars))
+	}
+	return b.String()
+}
+
+// mergeToolResults folds this round's results into the accumulated tool context,
+// deduplicated by (tool, arguments): a repeated call replaces its earlier entry
+// and moves it to the end (most-recent-wins), so duplicate large outputs do not
+// pile up across rounds.
+func mergeToolResults(entries []toolEntry, calls []domain.ToolCall, results []domain.ToolResult, maxResultChars int) []toolEntry {
+	byID := make(map[string]domain.ToolResult, len(results))
+	for _, res := range results {
+		byID[res.CallID] = res
+	}
+	for _, call := range calls {
+		res, ok := byID[call.ID]
+		if !ok {
+			continue
+		}
+		key := dedupKey(call)
+		kept := make([]toolEntry, 0, len(entries)+1)
+		for _, e := range entries {
+			if e.key != key {
+				kept = append(kept, e)
+			}
+		}
+		entries = append(kept, toolEntry{key: key, text: renderToolResult(res, maxResultChars)})
+	}
+	return entries
+}
+
+func renderToolEntries(entries []toolEntry) string {
+	var b strings.Builder
+	b.WriteString("\n\nTool results:\n")
+	for _, e := range entries {
+		b.WriteString(e.text)
+		b.WriteString("\n")
+	}
+	b.WriteString("\nUse the tool results above to answer the original user request directly.")
+	return b.String()
+}
+
+// truncateText caps a single piece of text to maxChars runes, appending a marker
+// noting how much was dropped. maxChars <= 0 disables truncation.
+func truncateText(text string, maxChars int) string {
+	if maxChars <= 0 {
+		return text
+	}
+	runes := []rune(text)
+	if len(runes) <= maxChars {
+		return text
+	}
+	return string(runes[:maxChars]) + fmt.Sprintf("\n…[truncated %d chars]", len(runes)-maxChars)
+}
+
+// boundPrompt caps the whole accumulated tool-loop prompt to maxChars by keeping
+// the head (original task framing) and the most recent tail (latest tool
+// results), collapsing the older middle. This prevents the prompt from growing
+// unbounded across tool rounds without an extra LLM summarization call in the
+// hot loop. maxChars <= 0 disables bounding.
+func boundPrompt(prompt string, maxChars int) string {
+	if maxChars <= 0 {
+		return prompt
+	}
+	runes := []rune(prompt)
+	if len(runes) <= maxChars {
+		return prompt
+	}
+	headLen := maxChars / 3
+	tailLen := maxChars - headLen
+	head := string(runes[:headLen])
+	tail := string(runes[len(runes)-tailLen:])
+	dropped := len(runes) - headLen - tailLen
+	return head + fmt.Sprintf("\n\n…[older tool context trimmed: %d chars]…\n\n", dropped) + tail
+}
+
+func max(a int, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+type noopEventBus struct{}
+
+func (noopEventBus) Publish(ctx context.Context, _ domain.RuntimeEvent) error {
+	return ctx.Err()
+}
+
+func (noopEventBus) Events() []domain.RuntimeEvent {
+	return nil
+}
+
+type noopAuditLog struct{}
+
+func (noopAuditLog) Append(ctx context.Context, _ domain.AuditEvent) error {
+	return ctx.Err()
+}
+
+func (noopAuditLog) Events() []domain.AuditEvent {
+	return nil
+}
+
+func (r *Runtime) buildPrompt(ctx context.Context, agent domain.Agent, task domain.Task) (string, error) {
+	toolNames := r.toolNames()
+	if r.contextBuilder != nil {
+		built, err := r.contextBuilder.BuildContext(ctx, cognitive.Request{
+			Agent:             agent,
+			Task:              task,
+			ConversationTurns: append([]domain.ConversationTurn(nil), r.conversationTurns...),
+			Tools:             toolNames,
+		})
+		if err != nil {
+			return "", fmt.Errorf("build cognitive context: %w", err)
+		}
+		// The hint is only needed on the Core path: Core renders a "Tools:" line
+		// that, when empty under the lazy protocol, can mislead the model into
+		// believing no tools exist. The plain paths below carry no such line.
+		return built.Prompt + r.lazyToolHint(toolNames), nil
+	}
+	if r.contextPrefix != "" {
+		return r.contextPrefix + "\n\nTask input:\n" + task.Input, nil
+	}
+	return task.Input, nil
+}
+
+// toolNames lists the registered real tool names (excluding the lazy-protocol
+// meta tools), so the prompt can tell the model which tools exist even when the
+// full schemas are not offered up front.
+func (r *Runtime) toolNames() []string {
+	if r.tools == nil {
+		return nil
+	}
+	var names []string
+	for _, descriptor := range r.tools.Descriptors() {
+		if isMetaTool(descriptor.Name) {
+			continue
+		}
+		names = append(names, descriptor.Name)
+	}
+	return names
+}
+
+// lazyToolHint returns a short instruction, only under the lazy protocol, telling
+// the model that the named tools are available on demand via call_tool. Without
+// it the model can see an empty native tool list and wrongly conclude no tools
+// exist instead of discovering them.
+func (r *Runtime) lazyToolHint(names []string) string {
+	if !r.lazyTools || len(names) == 0 {
+		return ""
+	}
+	return fmt.Sprintf(
+		"\n\nAvailable tools (provided on demand, NOT empty): %s.\n"+
+			"To use any tool, call call_tool with its tool_name and an arguments_json string; "+
+			"call list_tools first if you need a tool's exact parameters. "+
+			"Never claim no tools are available — discover them with list_tools.\n",
+		strings.Join(names, ", "),
+	)
+}
+
+func (r *Runtime) publishLearning(ctx context.Context, agent domain.Agent, task domain.Task, signal evolution.SignalKind, reason string, lightweight bool) error {
+	return r.events.Publish(ctx, evolution.NewLearningRuntimeEvent(evolution.LearningEvent{
+		AgentID:       agent.ID,
+		TaskID:        task.ID,
+		Signal:        signal,
+		Reason:        reason,
+		IsLightweight: lightweight,
+		PublishedAt:   time.Now(),
+	}))
+}

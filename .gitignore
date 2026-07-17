@@ -1,0 +1,12 @@
+/logs
+**/logs/
+/.omc
+docs/
+dist/
+*.exe
+
+# 含实时 api_key 的运行配置与运行时 DB，不入库（保留在工作树）
+agent.json
+agent.db
+agent.db-shm
+agent.db-wal

@@ -1,0 +1,5 @@
+{
+  "task_response_required_fields": ["id", "status", "input"],
+  "waiting_workflow_required_fields": ["definition", "result", "updated_at"],
+  "metrics_required_fields": ["started_at", "tasks", "http_status", "model_calls", "approvals", "workflow_runs"]
+}

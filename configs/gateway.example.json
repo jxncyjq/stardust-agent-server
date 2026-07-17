@@ -1,0 +1,9 @@
+{
+  "core":     { "base_url": "http://127.0.0.1:8080", "token_env": "LEGION_ADMIN_TOKEN" },
+  "identity": { "agent_id": "im-agent", "company_id": "default-company" },
+  "binding":  { "sqlite_path": "/data/gateway.db" },
+  "delivery": { "retries": 3, "backoff_ms": 500 },
+  "platforms": {
+    "telegram": { "enabled": true, "token_env": "LEGION_TELEGRAM_BOT_TOKEN", "poll_timeout_s": 30 }
+  }
+}

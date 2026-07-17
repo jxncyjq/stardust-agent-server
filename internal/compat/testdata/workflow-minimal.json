@@ -1,0 +1,8 @@
+{
+  "ID": "compat-workflow",
+  "Root": {
+    "ID": "wait-node",
+    "Kind": "wait_event",
+    "EventType": "compat.ready"
+  }
+}

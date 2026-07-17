@@ -1,0 +1,22 @@
+{
+  "id": "writer",
+  "role": "writer",
+  "maas_profile": "fast",
+  "context_files": {
+    "enabled": true,
+    "root": ".",
+    "agents_path": "AGENTS.md",
+    "soul_path": "configs/persona/SOUL.md",
+    "tools_path": "configs/persona/TOOLS.md",
+    "user_path": "configs/persona/USER.md",
+    "memory_path": "configs/persona/MEMORY.md",
+    "max_file_chars": 20000
+  },
+  "workspace": {
+    "docs_root": "docs/writing",
+    "memory_root": "memory/writer"
+  },
+  "skills": {
+    "install_root": "skills/writer"
+  }
+}

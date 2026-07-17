@@ -1,0 +1,1 @@
+{"event_id":"evt-20260625-145035.837728200-000001","task_id":"hello-tok","type":"task.claimed","schema_version":1,"actor_agent_id":"default-agent","correlation_id":"call_00_o2hn3W0bBZWQvTbVXcsQ7703","idempotency_key":"call_00_o2hn3W0bBZWQvTbVXcsQ7703","owner":"default-agent","summary":"认领 hello-tok 任务，开始环境探索。","created_at":"2026-06-25T22:50:35.8377282+08:00"}

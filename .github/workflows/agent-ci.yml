@@ -1,0 +1,79 @@
+name: Legion Agent CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - "Makefile"
+      - "scripts/**"
+      - ".github/workflows/agent-ci.yml"
+  pull_request:
+    paths:
+      - "**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - "Makefile"
+      - "scripts/**"
+      - ".github/workflows/agent-ci.yml"
+  workflow_dispatch:
+
+jobs:
+  verify:
+    name: Test, vet, build, smoke
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Test
+        run: go test ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Build
+        run: go build ./cmd/agent
+
+      - name: Smoke
+        shell: pwsh
+        run: scripts/smoke.ps1
+
+      - name: Component parity
+        run: go test ./internal/compat -run TestComponentParityManifest -count=1
+
+      - name: OpenAPI compatibility
+        run: go test ./internal/compat -run TestOpenAPIGolden -count=1
+
+      - name: Platform integration checks
+        run: go test ./internal/server ./internal/storage -run "TestSSEEventsFiltersAndSanitizesPayload|TestHTTPRejectsCrossCompanyTaskAccess|TestMetricsPrometheusFormat|TestRetention" -count=1
+
+      - name: Enterprise governance checks
+        run: go test ./internal/security ./internal/server -run "TestRBAC|TestHTTPAuditEvents|TestHTTPQualityEvals|TestHTTPTraces" -count=1
+
+      - name: Ecosystem checks
+        run: go test ./internal/skill ./internal/adapter ./internal/config ./internal/cli -run "TestRegistrySync|TestNewMaasClientFromProfile|TestLoadMaasProfiles|TestRunCommandUsesMaasProfile|TestSkillSyncCommand" -count=1
+
+      - name: Runtime context file checks
+        run: go test ./internal/contextfiles ./internal/cognitive ./internal/runtime ./internal/app ./internal/cli -run "TestLoader|TestCoreBuildContextIncludesContextFilesBlock|TestRuntimeRunTaskIncludesContextPrefixInPrompt|TestRunTaskPassesContextPrefixToRuntime|TestRunCommandLoadsContextFilesFromConfig" -count=1
+
+      - name: OpenAPI error compatibility
+        run: go test ./internal/server ./internal/compat -run "TestOpenAPISpecIncludesErrorResponses|TestOpenAPIErrorContractGolden|TestOpenAPIGolden" -count=1
+
+      - name: Compatibility
+        run: go test ./internal/compat -count=1
+
+      - name: Release build
+        shell: pwsh
+        run: scripts/release.ps1 -Version 0.1.0-ci -Commit ${{ github.sha }} -OutDir dist

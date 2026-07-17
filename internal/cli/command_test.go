@@ -1,0 +1,1523 @@
+package cli
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stardust/legion-agent/internal/agentregistry"
+	"github.com/stardust/legion-agent/internal/app"
+	"github.com/stardust/legion-agent/internal/config"
+	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/quality"
+	"github.com/stardust/legion-agent/internal/sessioncache"
+	"github.com/stardust/legion-agent/internal/storage"
+	"github.com/stardust/legion-agent/internal/taskledger"
+)
+
+func TestRootAcceptsGoRunSeparator(t *testing.T) {
+	t.Parallel()
+
+	var out bytes.Buffer
+	if err := Execute(app.New(), &out, []string{"--", "run", "--demo", "--plain"}); err != nil {
+		t.Fatalf("Execute() error = %v, want nil", err)
+	}
+	if got := out.String(); got == "" {
+		t.Errorf("Execute() output = empty, want demo result")
+	}
+}
+
+func TestVersionCommand(t *testing.T) {
+	t.Parallel()
+	var out bytes.Buffer
+	err := Execute(app.New(), &out, []string{"version", "--plain"})
+	if err != nil {
+		t.Fatalf("Execute(version --plain) error = %v, want nil", err)
+	}
+	got := out.String()
+	for _, want := range []string{"version=dev", "commit=unknown", "build_time=unknown"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("Execute(version --plain) output = %q, want containing %q", got, want)
+		}
+	}
+}
+
+func TestRootIncludesTUICommand(t *testing.T) {
+	t.Parallel()
+
+	root := NewRoot(app.New(), &bytes.Buffer{})
+	cmd, _, err := root.Find([]string{"tui"})
+	if err != nil {
+		t.Fatalf("Root.Find(tui) error = %v, want nil", err)
+	}
+	if cmd == nil || cmd.Use != "tui" {
+		t.Fatalf("Root.Find(tui) = %#v, want tui command", cmd)
+	}
+}
+
+func TestTUIDisplayConfigUsesSelectedProfileModel(t *testing.T) {
+	t.Parallel()
+
+	display := tuiDisplayConfig(config.MaasConfig{
+		DefaultProfile: "planner",
+		Profiles: map[string]config.MaasProfile{
+			"planner": {Model: "planner-model"},
+			"review":  {Model: "review-model"},
+		},
+	}, "", "")
+	if display.AgentName != "planner" {
+		t.Fatalf("tuiDisplayConfig().AgentName = %q, want planner", display.AgentName)
+	}
+	if display.ModelName != "planner-model" {
+		t.Fatalf("tuiDisplayConfig().ModelName = %q, want planner-model", display.ModelName)
+	}
+
+	display = tuiDisplayConfig(config.MaasConfig{
+		DefaultProfile: "planner",
+		Profiles: map[string]config.MaasProfile{
+			"planner": {Model: "planner-model"},
+			"review":  {Model: "review-model"},
+		},
+	}, "review", "")
+	if display.AgentName != "review" || display.ModelName != "review-model" {
+		t.Fatalf("tuiDisplayConfig(review) = %#v, want review/review-model", display)
+	}
+}
+
+func TestDefaultLoggerWritesToLogFile(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "logs", "agent.log")
+
+	logger, err := newFileLogger(logPath)
+	if err != nil {
+		t.Fatalf("newFileLogger() error = %v, want nil", err)
+	}
+	logger.Info("file logger smoke", "task_id", "task-log-file")
+
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile(logs/agent.log) error = %v, want nil", err)
+	}
+	if !bytes.Contains(data, []byte("file logger smoke")) || !bytes.Contains(data, []byte("task-log-file")) {
+		t.Fatalf("logs/agent.log = %s, want structured log entry", data)
+	}
+}
+
+func TestNewCommandTaskIDUsesPrefixAndUniqueSuffix(t *testing.T) {
+	t.Parallel()
+
+	first := newCommandTaskID("tui-task")
+	second := newCommandTaskID("tui-task")
+	if !strings.HasPrefix(first, "tui-task-") {
+		t.Fatalf("newCommandTaskID() = %q, want tui-task prefix", first)
+	}
+	if !strings.HasPrefix(second, "tui-task-") {
+		t.Fatalf("newCommandTaskID() = %q, want tui-task prefix", second)
+	}
+	if first == second {
+		t.Fatalf("newCommandTaskID() returned duplicate ID %q", first)
+	}
+}
+
+func TestBuildRunContextPrefixLoadsAllConfiguredContextFiles(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeCLIFile(t, dir, "AGENTS.md", "agents rules")
+	writeCLIFile(t, dir, "configs/persona/SOUL.md", "soul identity")
+	writeCLIFile(t, dir, "configs/persona/TOOLS.md", "tool policy")
+	writeCLIFile(t, dir, "configs/persona/USER.md", "user preference")
+	writeCLIFile(t, dir, "configs/persona/MEMORY.md", "agent memory")
+	cfg := config.Config{
+		ContextFiles: config.ContextFilesConfig{
+			Enabled:      true,
+			Root:         dir,
+			AgentsPath:   "AGENTS.md",
+			SoulPath:     "configs/persona/SOUL.md",
+			ToolsPath:    "configs/persona/TOOLS.md",
+			UserPath:     "configs/persona/USER.md",
+			MemoryPath:   "configs/persona/MEMORY.md",
+			MaxFileChars: 20000,
+		},
+	}
+
+	prefix, err := buildRunContextPrefix(context.Background(), cfg, false, "")
+	if err != nil {
+		t.Fatalf("buildRunContextPrefix() error = %v, want nil", err)
+	}
+	for _, want := range []string{"agents rules", "soul identity", "tool policy", "user preference", "agent memory"} {
+		if !strings.Contains(prefix, want) {
+			t.Fatalf("buildRunContextPrefix() missing %q:\n%s", want, prefix)
+		}
+	}
+}
+
+func waitForPostTask(t *testing.T, url string, body string) (*http.Response, error) {
+	t.Helper()
+	var lastErr error
+	for range 100 {
+		resp, err := http.Post(url, "application/json", strings.NewReader(body))
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		time.Sleep(10 * time.Millisecond)
+	}
+	return nil, lastErr
+}
+
+func TestRunCommandUsesHTTPMaasForPrompt(t *testing.T) {
+	t.Parallel()
+	var gotPrompt string
+	var gotAuth string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		var req port.InferenceRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("Decode(request body) error = %v, want nil", err)
+		}
+		gotPrompt = req.Prompt
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(port.InferenceResponse{Text: "real result"}); err != nil {
+			t.Fatalf("Encode(response body) error = %v, want nil", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	var out bytes.Buffer
+	err := Execute(app.New(), &out, []string{
+		"run",
+		"--plain",
+		"--prompt", "Summarize Legion",
+		"--maas-url", server.URL,
+		"--maas-api-key", "secret-token",
+		"--no-context-files",
+	})
+	if err != nil {
+		t.Fatalf("Execute(run --prompt --maas-url) error = %v, want nil", err)
+	}
+	if gotPrompt != "Summarize Legion" {
+		t.Fatalf("HTTP MaaS prompt = %q, want %q", gotPrompt, "Summarize Legion")
+	}
+	if gotAuth != "Bearer secret-token" {
+		t.Fatalf("HTTP MaaS authorization = %q, want bearer token", gotAuth)
+	}
+	if got := out.String(); !bytes.Contains([]byte(got), []byte(`result="real result"`)) {
+		t.Fatalf("Execute(run --prompt --maas-url) output = %q, want real result", got)
+	}
+}
+
+func TestRunCommandLoadsHTTPMaasFromConfigFile(t *testing.T) {
+	t.Parallel()
+	var gotPrompt string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req port.InferenceRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("Decode(request body) error = %v, want nil", err)
+		}
+		gotPrompt = req.Prompt
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(port.InferenceResponse{Text: "configured result"}); err != nil {
+			t.Fatalf("Encode(response body) error = %v, want nil", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{"maas":{"base_url":"`+server.URL+`"}}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", configPath, err)
+	}
+
+	var out bytes.Buffer
+	err := Execute(app.New(), &out, []string{
+		"run",
+		"--plain",
+		"--config", configPath,
+		"--prompt", "Use config",
+		"--no-context-files",
+	})
+	if err != nil {
+		t.Fatalf("Execute(run --config --prompt) error = %v, want nil", err)
+	}
+	if gotPrompt != "Use config" {
+		t.Fatalf("HTTP MaaS prompt = %q, want %q", gotPrompt, "Use config")
+	}
+	if got := out.String(); !bytes.Contains([]byte(got), []byte(`result="configured result"`)) {
+		t.Fatalf("Execute(run --config --prompt) output = %q, want configured result", got)
+	}
+}
+
+func TestRunCommandLoadsContextFilesFromConfig(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	writeCLIFile(t, dir, "AGENTS.md", "project rule from agents")
+	writeCLIFile(t, dir, "configs/persona/SOUL.md", "soul identity from file")
+	writeCLIFile(t, dir, "configs/persona/TOOLS.md", "tool policy from file")
+	writeCLIFile(t, dir, "configs/persona/USER.md", "user preference from file")
+	writeCLIFile(t, dir, "configs/persona/MEMORY.md", "agent memory from file")
+
+	var gotPrompt string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req port.InferenceRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("Decode(request body) error = %v, want nil", err)
+		}
+		gotPrompt = req.Prompt
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(port.InferenceResponse{Text: "context ok"}); err != nil {
+			t.Fatalf("Encode(response body) error = %v, want nil", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	configPath := filepath.Join(dir, "agent.json")
+	body := `{
+		"maas": {"base_url": "` + server.URL + `"},
+		"context_files": {
+			"enabled": true,
+			"root": "` + filepath.ToSlash(dir) + `",
+			"agents_path": "AGENTS.md",
+			"soul_path": "configs/persona/SOUL.md",
+			"tools_path": "configs/persona/TOOLS.md",
+			"user_path": "configs/persona/USER.md",
+			"memory_path": "configs/persona/MEMORY.md",
+			"max_file_chars": 20000
+		}
+	}`
+	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", configPath, err)
+	}
+
+	var out bytes.Buffer
+	err := Execute(app.New(), &out, []string{
+		"run",
+		"--plain",
+		"--config", configPath,
+		"--prompt", "ship context",
+	})
+	if err != nil {
+		t.Fatalf("Execute(run context files) error = %v, want nil", err)
+	}
+	for _, want := range []string{
+		"project rule from agents",
+		"soul identity from file",
+		"tool policy from file",
+		"user preference from file",
+		"agent memory from file",
+		"ship context",
+	} {
+		if !strings.Contains(gotPrompt, want) {
+			t.Fatalf("MaaS prompt missing %q:\n%q", want, gotPrompt)
+		}
+	}
+}
+
+func TestRunCommandUsesMaasProfile(t *testing.T) {
+	t.Parallel()
+	var gotPrompt string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req port.InferenceRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("Decode(request body) error = %v, want nil", err)
+		}
+		gotPrompt = req.Prompt
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(port.InferenceResponse{Text: "profile result"}); err != nil {
+			t.Fatalf("Encode(response body) error = %v, want nil", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{
+		"maas": {
+			"default_profile": "fast",
+			"profiles": {
+				"review": {"base_url": "`+server.URL+`", "api_key": "profile-key"}
+			}
+		}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", configPath, err)
+	}
+
+	var out bytes.Buffer
+	err := Execute(app.New(), &out, []string{
+		"run",
+		"--plain",
+		"--config", configPath,
+		"--maas-profile", "review",
+		"--prompt", "Use profile",
+		"--no-context-files",
+	})
+	if err != nil {
+		t.Fatalf("Execute(run --maas-profile) error = %v, want nil", err)
+	}
+	if gotPrompt != "Use profile" {
+		t.Fatalf("HTTP MaaS profile prompt = %q, want %q", gotPrompt, "Use profile")
+	}
+	if got := out.String(); !bytes.Contains([]byte(got), []byte(`result="profile result"`)) {
+		t.Fatalf("Execute(run --maas-profile) output = %q, want profile result", got)
+	}
+}
+
+func TestRunCommandUsesDefaultMaasProfileBeforeTopLevelBaseURL(t *testing.T) {
+	t.Parallel()
+	var gotPrompt string
+	topLevelServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Fatalf("top-level MaaS server called, want default profile server")
+	}))
+	t.Cleanup(topLevelServer.Close)
+	profileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req port.InferenceRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("Decode(request body) error = %v, want nil", err)
+		}
+		gotPrompt = req.Prompt
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(port.InferenceResponse{Text: "profile default result"}); err != nil {
+			t.Fatalf("Encode(response body) error = %v, want nil", err)
+		}
+	}))
+	t.Cleanup(profileServer.Close)
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{
+		"maas": {
+			"base_url": "`+topLevelServer.URL+`",
+			"default_profile": "dev",
+			"profiles": {
+				"dev": {"base_url": "`+profileServer.URL+`", "api_key": "profile-key"}
+			}
+		}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", configPath, err)
+	}
+
+	var out bytes.Buffer
+	err := Execute(app.New(), &out, []string{
+		"run",
+		"--plain",
+		"--config", configPath,
+		"--prompt", "Use default profile",
+		"--no-context-files",
+	})
+	if err != nil {
+		t.Fatalf("Execute(run default profile) error = %v, want nil", err)
+	}
+	if gotPrompt != "Use default profile" {
+		t.Fatalf("default profile prompt = %q, want Use default profile", gotPrompt)
+	}
+	if got := out.String(); !bytes.Contains([]byte(got), []byte(`result="profile default result"`)) {
+		t.Fatalf("Execute(run default profile) output = %q, want profile result", got)
+	}
+}
+
+func TestParseTUIAgentPrompt(t *testing.T) {
+	t.Parallel()
+
+	parsed := parseTUIAgentPrompt("@researcher 调研一下当前实现")
+	if !parsed.Mentioned || parsed.AgentID != "researcher" || parsed.Prompt != "调研一下当前实现" {
+		t.Fatalf("parseTUIAgentPrompt(@researcher) = %#v, want researcher mention", parsed)
+	}
+	bound := parseTUIAgentPrompt("@writer --task TASK-20260523-001 整理成说明")
+	if !bound.Mentioned || bound.AgentID != "writer" || bound.TaskID != "TASK-20260523-001" || bound.Prompt != "整理成说明" {
+		t.Fatalf("parseTUIAgentPrompt(@writer --task) = %#v, want task-bound writer mention", bound)
+	}
+	inbox := parseTUIAgentPrompt("@writer --inbox 根据最新消息整理")
+	if !inbox.Mentioned || inbox.AgentID != "writer" || !inbox.IncludeInbox || inbox.Prompt != "根据最新消息整理" {
+		t.Fatalf("parseTUIAgentPrompt(@writer --inbox) = %#v, want inbox-bound writer mention", inbox)
+	}
+	plain := parseTUIAgentPrompt("普通问题")
+	if plain.Mentioned || plain.AgentID != "" || plain.Prompt != "普通问题" {
+		t.Fatalf("parseTUIAgentPrompt(plain) = %#v, want plain prompt", plain)
+	}
+}
+
+func TestRunTUITaskRoutesMentionToConfiguredAgent(t *testing.T) {
+	t.Parallel()
+
+	var gotPrompt string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []struct {
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("Decode(request body) error = %v, want nil", err)
+		}
+		if len(req.Messages) > 0 {
+			gotPrompt = req.Messages[0].Content
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{
+				{"message": map[string]any{"content": "research result"}},
+			},
+		}); err != nil {
+			t.Fatalf("Encode(response body) error = %v, want nil", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+	root := t.TempDir()
+	writeCLIFile(t, root, "AGENTS.md", "project rules")
+	writeCLIFile(t, root, "researcher/SOUL.md", "researcher soul")
+	cfg := config.Config{
+		Maas: config.MaasConfig{
+			Profiles: map[string]config.MaasProfile{
+				"review": {BaseURL: server.URL, Model: "deepseek-reasoner"},
+			},
+		},
+		Runtime: config.RuntimeConfig{MaxToolRounds: 1},
+	}
+	registry := agentregistry.New(map[string]agentregistry.AgentConfig{
+		"researcher": {
+			ID:          "researcher",
+			Role:        "researcher",
+			MaasProfile: "review",
+			ContextFiles: config.ContextFilesConfig{
+				Enabled:      true,
+				Root:         root,
+				AgentsPath:   "AGENTS.md",
+				SoulPath:     "researcher/SOUL.md",
+				MaxFileChars: 20000,
+			},
+		},
+	})
+
+	result, err := runTUITask(context.Background(), app.New(), tuiTaskRunConfig{
+		Config:   cfg,
+		Registry: registry,
+		Prompt:   "@researcher 调研一下当前实现",
+	})
+	if err != nil {
+		t.Fatalf("runTUITask(@researcher) error = %v, want nil", err)
+	}
+	if result.Result != "research result" {
+		t.Fatalf("runTUITask(@researcher).Result = %q, want research result", result.Result)
+	}
+	for _, want := range []string{"researcher soul", "调研一下当前实现"} {
+		if !strings.Contains(gotPrompt, want) {
+			t.Fatalf("MaaS prompt missing %q:\n%q", want, gotPrompt)
+		}
+	}
+}
+
+func TestRunTUITaskBindsMentionedAgentToTaskLedgerTask(t *testing.T) {
+	t.Parallel()
+
+	var gotPrompt string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []struct {
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("Decode(request body) error = %v, want nil", err)
+		}
+		if len(req.Messages) > 0 {
+			gotPrompt = req.Messages[0].Content
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{
+				{"message": map[string]any{"content": "整理后的任务说明"}},
+			},
+		}); err != nil {
+			t.Fatalf("Encode(response body) error = %v, want nil", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	root := t.TempDir()
+	ledger, err := taskledger.New(taskledger.Config{
+		WorkspaceRoot:   root,
+		AllowedAgentIDs: []string{"cli-agent", "researcher", "writer"},
+	})
+	if err != nil {
+		t.Fatalf("taskledger.New() error = %v, want nil", err)
+	}
+	if _, err := ledger.Append(context.Background(), taskledger.Event{
+		TaskID:       "TASK-20260523-001",
+		Type:         taskledger.EventTaskCreated,
+		ActorAgentID: "cli-agent",
+		Title:        "调研缓存实现",
+		Status:       "planned",
+		Summary:      "确认 cache 包的数据结构与淘汰策略",
+	}); err != nil {
+		t.Fatalf("Ledger.Append(task.created) error = %v, want nil", err)
+	}
+	registry := agentregistry.New(map[string]agentregistry.AgentConfig{
+		"researcher": {
+			ID:           "researcher",
+			Role:         "researcher",
+			MaasProfile:  "review",
+			ContextFiles: config.ContextFilesConfig{Root: root},
+		},
+	})
+	cfg := config.Config{
+		Maas: config.MaasConfig{
+			Profiles: map[string]config.MaasProfile{
+				"review": {BaseURL: server.URL, Model: "deepseek-reasoner"},
+			},
+		},
+		Runtime: config.RuntimeConfig{MaxToolRounds: 1},
+		ContextFiles: config.ContextFilesConfig{
+			Root: root,
+		},
+	}
+
+	result, err := runTUITask(context.Background(), app.New(), tuiTaskRunConfig{
+		Config:     cfg,
+		Registry:   registry,
+		Prompt:     "@researcher --task TASK-20260523-001 请继续调研",
+		TaskLedger: ledger,
+	})
+	if err != nil {
+		t.Fatalf("runTUITask(@researcher --task) error = %v, want nil", err)
+	}
+	if result.Result != "整理后的任务说明" {
+		t.Fatalf("runTUITask(@researcher --task).Result = %q, want model response", result.Result)
+	}
+	for _, want := range []string{"TaskLedger task context:", "TASK-20260523-001", "调研缓存实现", "确认 cache 包的数据结构与淘汰策略", "请继续调研"} {
+		if !strings.Contains(gotPrompt, want) {
+			t.Fatalf("MaaS prompt missing %q:\n%s", want, gotPrompt)
+		}
+	}
+	projection, err := ledger.Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Ledger.Snapshot() error = %v, want nil", err)
+	}
+	task := projection.Tasks["TASK-20260523-001"]
+	if len(task.Messages) != 1 || task.Messages[0].Type != taskledger.EventResultAppended {
+		t.Fatalf("TaskLedger messages = %#v, want one result.appended", task.Messages)
+	}
+	if task.Messages[0].From != "researcher" || task.Messages[0].Summary != "整理后的任务说明" {
+		t.Fatalf("TaskLedger result message = %#v, want researcher result", task.Messages[0])
+	}
+}
+
+func TestRunTUITaskInjectsMentionedAgentInboxAndMarksRead(t *testing.T) {
+	t.Parallel()
+
+	var gotPrompt string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Messages []struct {
+				Content string `json:"content"`
+			} `json:"messages"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("Decode(request body) error = %v, want nil", err)
+		}
+		if len(req.Messages) > 0 {
+			gotPrompt = req.Messages[0].Content
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{
+				{"message": map[string]any{"content": "writer summary"}},
+			},
+		}); err != nil {
+			t.Fatalf("Encode(response body) error = %v, want nil", err)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	repo := openCLITestSQLiteRepository(t)
+	if err := repo.SaveAgentMessage(context.Background(), domain.AgentMessage{
+		ID:          "msg-research-1",
+		FromAgentID: "researcher",
+		ToAgentID:   "writer",
+		Type:        domain.AgentMessageTypeResult,
+		Status:      domain.AgentMessageUnread,
+		Summary:     "缓存实现位于 internal/cache，结论已整理",
+		CreatedAt:   time.Date(2026, 5, 25, 10, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("SaveAgentMessage() error = %v, want nil", err)
+	}
+	root := t.TempDir()
+	registry := agentregistry.New(map[string]agentregistry.AgentConfig{
+		"writer": {
+			ID:           "writer",
+			Role:         "writer",
+			MaasProfile:  "review",
+			ContextFiles: config.ContextFilesConfig{Root: root},
+		},
+	})
+	cfg := config.Config{
+		Maas: config.MaasConfig{
+			Profiles: map[string]config.MaasProfile{
+				"review": {BaseURL: server.URL, Model: "deepseek-reasoner"},
+			},
+		},
+		Runtime:      config.RuntimeConfig{MaxToolRounds: 1},
+		ContextFiles: config.ContextFilesConfig{Root: root},
+	}
+
+	result, err := runTUITask(context.Background(), app.New(), tuiTaskRunConfig{
+		Config:       cfg,
+		Registry:     registry,
+		Prompt:       "@writer --inbox 根据最新消息整理成说明",
+		MessageStore: repo,
+	})
+	if err != nil {
+		t.Fatalf("runTUITask(@writer --inbox) error = %v, want nil", err)
+	}
+	if result.Result != "writer summary" {
+		t.Fatalf("runTUITask(@writer --inbox).Result = %q, want writer summary", result.Result)
+	}
+	for _, want := range []string{"AgentMessage inbox context:", "msg-research-1", "researcher -> writer", "缓存实现位于 internal/cache", "根据最新消息整理成说明"} {
+		if !strings.Contains(gotPrompt, want) {
+			t.Fatalf("MaaS prompt missing %q:\n%s", want, gotPrompt)
+		}
+	}
+	messages, err := repo.ListAgentMessages(context.Background(), domain.AgentMessageQuery{ToAgentID: "writer"})
+	if err != nil {
+		t.Fatalf("ListAgentMessages() error = %v, want nil", err)
+	}
+	if len(messages) != 1 || messages[0].Status != domain.AgentMessageRead || messages[0].ReadAt.IsZero() {
+		t.Fatalf("message after @writer --inbox = %#v, want read with read_at", messages)
+	}
+}
+
+func TestRunTUITaskKeepsMentionedAgentInboxUnreadWhenRunFails(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "model unavailable", http.StatusBadGateway)
+	}))
+	t.Cleanup(server.Close)
+
+	repo := openCLITestSQLiteRepository(t)
+	if err := repo.SaveAgentMessage(context.Background(), domain.AgentMessage{
+		ID:          "msg-retry-1",
+		FromAgentID: "researcher",
+		ToAgentID:   "writer",
+		Type:        domain.AgentMessageTypeMessage,
+		Status:      domain.AgentMessageUnread,
+		Summary:     "失败后需要保留未读",
+		CreatedAt:   time.Date(2026, 5, 25, 12, 0, 0, 0, time.UTC),
+	}); err != nil {
+		t.Fatalf("SaveAgentMessage() error = %v, want nil", err)
+	}
+	root := t.TempDir()
+	registry := agentregistry.New(map[string]agentregistry.AgentConfig{
+		"writer": {
+			ID:           "writer",
+			Role:         "writer",
+			MaasProfile:  "review",
+			ContextFiles: config.ContextFilesConfig{Root: root},
+		},
+	})
+	cfg := config.Config{
+		Maas: config.MaasConfig{Profiles: map[string]config.MaasProfile{
+			"review": {BaseURL: server.URL, Model: "deepseek-reasoner"},
+		}},
+		Runtime:      config.RuntimeConfig{MaxToolRounds: 1},
+		ContextFiles: config.ContextFilesConfig{Root: root},
+	}
+
+	_, err := runTUITask(context.Background(), app.New(), tuiTaskRunConfig{
+		Config:       cfg,
+		Registry:     registry,
+		Prompt:       "@writer --inbox 根据最新消息整理成说明",
+		MessageStore: repo,
+	})
+	if err == nil {
+		t.Fatalf("runTUITask(@writer --inbox failed model) error = nil, want error")
+	}
+	messages, listErr := repo.ListAgentMessages(context.Background(), domain.AgentMessageQuery{ToAgentID: "writer"})
+	if listErr != nil {
+		t.Fatalf("ListAgentMessages() error = %v, want nil", listErr)
+	}
+	if len(messages) != 1 || messages[0].Status != domain.AgentMessageUnread || !messages[0].ReadAt.IsZero() {
+		t.Fatalf("message after failed @writer --inbox = %#v, want still unread", messages)
+	}
+}
+
+func TestRunTUITaskReturnsErrorForUnknownMentionedAgent(t *testing.T) {
+	t.Parallel()
+
+	_, err := runTUITask(context.Background(), app.New(), tuiTaskRunConfig{
+		Config:   config.Config{},
+		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{}),
+		Prompt:   "@unknown 做事",
+	})
+	if err == nil {
+		t.Fatalf("runTUITask(@unknown) error = nil, want error")
+	}
+	if !strings.Contains(err.Error(), `agent "unknown" not configured`) {
+		t.Fatalf("runTUITask(@unknown) error = %v, want not configured", err)
+	}
+}
+
+func TestRunTUITaskInjectsAndPersistsSessionTurns(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo := openCLITestSQLiteRepository(t)
+	session := newTUISessionController(tuiSessionControllerConfig{
+		Store:        repo,
+		Enabled:      true,
+		CompanyID:    "cli-company",
+		AgentID:      "cli-agent",
+		ModelProfile: "dev",
+		RecentTurns:  4,
+		MaxTurnChars: 6000,
+	})
+	if _, err := session.NewSession(ctx); err != nil {
+		t.Fatalf("NewSession() error = %v, want nil", err)
+	}
+	if err := session.recordTurn(ctx, domain.ConversationRoleUser, "task-old", "cli-agent", "dev", "你是什么模型"); err != nil {
+		t.Fatalf("record previous user turn error = %v, want nil", err)
+	}
+	if err := session.recordTurn(ctx, domain.ConversationRoleAssistant, "task-old", "cli-agent", "dev", "我是 Legion Agent"); err != nil {
+		t.Fatalf("record previous assistant turn error = %v, want nil", err)
+	}
+	maas := &cliCaptureMaas{response: "第三点是上下文连续性"}
+	result, err := runTUITask(ctx, app.New(), tuiTaskRunConfig{
+		Config: config.Config{
+			Runtime: config.RuntimeConfig{MaxToolRounds: 1},
+			Session: config.SessionConfig{Enabled: true, DefaultRecentTurns: 4, MaxTurnChars: 6000},
+		},
+		Prompt:      "展开刚才的第三点",
+		DefaultMaas: maas,
+		Session:     session,
+	})
+	if err != nil {
+		t.Fatalf("runTUITask(session) error = %v, want nil", err)
+	}
+	if result.Result != "第三点是上下文连续性" {
+		t.Fatalf("runTUITask(session).Result = %q, want model response", result.Result)
+	}
+	for _, want := range []string{"Recent conversation:", "你是什么模型", "我是 Legion Agent", "展开刚才的第三点"} {
+		if !strings.Contains(maas.prompt, want) {
+			t.Fatalf("MaaS prompt missing %q:\n%s", want, maas.prompt)
+		}
+	}
+	turns, err := repo.ListConversationTurns(ctx, session.CurrentSessionID(), 0)
+	if err != nil {
+		t.Fatalf("ListConversationTurns() error = %v, want nil", err)
+	}
+	if len(turns) != 4 {
+		t.Fatalf("ListConversationTurns() len = %d, want 4 turns: %#v", len(turns), turns)
+	}
+	if turns[2].Role != domain.ConversationRoleUser || turns[2].Content != "展开刚才的第三点" {
+		t.Fatalf("new user turn = %#v, want current prompt", turns[2])
+	}
+	if turns[3].Role != domain.ConversationRoleAssistant || turns[3].Content != "第三点是上下文连续性" {
+		t.Fatalf("new assistant turn = %#v, want current response", turns[3])
+	}
+}
+
+func TestTUISessionControllerCachesRecentTurnsAndInvalidatesAfterRecord(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo := openCLITestSQLiteRepository(t)
+	store := &countingConversationStore{delegate: repo}
+	session := newTUISessionController(tuiSessionControllerConfig{
+		Store:        store,
+		Enabled:      true,
+		CompanyID:    "cli-company",
+		AgentID:      "cli-agent",
+		ModelProfile: "dev",
+		RecentTurns:  4,
+		MaxTurnChars: 6000,
+		Cache:        sessioncache.NewMemoryCache(8),
+	})
+	if _, err := session.NewSession(ctx); err != nil {
+		t.Fatalf("NewSession() error = %v, want nil", err)
+	}
+	if err := session.recordTurn(ctx, domain.ConversationRoleUser, "task-1", "cli-agent", "dev", "first"); err != nil {
+		t.Fatalf("recordTurn(first) error = %v, want nil", err)
+	}
+
+	if _, err := session.RecentTurns(ctx); err != nil {
+		t.Fatalf("RecentTurns(first) error = %v, want nil", err)
+	}
+	if _, err := session.RecentTurns(ctx); err != nil {
+		t.Fatalf("RecentTurns(second) error = %v, want nil", err)
+	}
+	if store.listConversationTurnsCalls != 1 {
+		t.Fatalf("ListConversationTurns calls = %d, want 1 after cache hit", store.listConversationTurnsCalls)
+	}
+	if err := session.recordTurn(ctx, domain.ConversationRoleAssistant, "task-1", "cli-agent", "dev", "second"); err != nil {
+		t.Fatalf("recordTurn(second) error = %v, want nil", err)
+	}
+	if _, err := session.RecentTurns(ctx); err != nil {
+		t.Fatalf("RecentTurns(after record) error = %v, want nil", err)
+	}
+	if store.listConversationTurnsCalls != 2 {
+		t.Fatalf("ListConversationTurns calls = %d, want 2 after invalidation", store.listConversationTurnsCalls)
+	}
+}
+
+func TestLoadServeAgentRegistryReturnsMissingChildError(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{
+		"agents": {"researcher": "agents/missing.json"}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", configPath, err)
+	}
+	cfg, err := config.Load(context.Background(), config.Options{Path: configPath})
+	if err != nil {
+		t.Fatalf("Load(%q) error = %v, want nil", configPath, err)
+	}
+
+	_, err = loadServeAgentRegistry(context.Background(), cfg, configPath)
+	if err == nil {
+		t.Fatalf("loadServeAgentRegistry() error = nil, want missing agent config")
+	}
+	if !strings.Contains(err.Error(), "agent config not found") {
+		t.Fatalf("loadServeAgentRegistry() error = %v, want agent config not found", err)
+	}
+}
+
+func TestRunCommandMaasURLOverridesProfile(t *testing.T) {
+	t.Parallel()
+	profileServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		t.Fatalf("profile server called, want explicit --maas-url override")
+	}))
+	t.Cleanup(profileServer.Close)
+	overrideCalled := false
+	overrideServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		overrideCalled = true
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(port.InferenceResponse{Text: "override result"}); err != nil {
+			t.Fatalf("Encode(response body) error = %v, want nil", err)
+		}
+	}))
+	t.Cleanup(overrideServer.Close)
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{
+		"maas": {
+			"default_profile": "review",
+			"profiles": {
+				"review": {"base_url": "`+profileServer.URL+`", "api_key": "profile-key"}
+			}
+		}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", configPath, err)
+	}
+
+	var out bytes.Buffer
+	err := Execute(app.New(), &out, []string{
+		"run",
+		"--plain",
+		"--config", configPath,
+		"--maas-profile", "review",
+		"--maas-url", overrideServer.URL,
+		"--prompt", "Use override",
+		"--no-context-files",
+	})
+	if err != nil {
+		t.Fatalf("Execute(run --maas-url --maas-profile) error = %v, want nil", err)
+	}
+	if !overrideCalled {
+		t.Fatalf("override MaaS server called = false, want true")
+	}
+	if got := out.String(); !bytes.Contains([]byte(got), []byte(`result="override result"`)) {
+		t.Fatalf("Execute(run --maas-url --maas-profile) output = %q, want override result", got)
+	}
+}
+
+func TestRunCommandPersistsToSQLiteWhenConfigured(t *testing.T) {
+	t.Parallel()
+	dbPath := filepath.Join(t.TempDir(), "agent.db")
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{
+		"storage": {"driver": "sqlite", "path": "`+filepath.ToSlash(dbPath)+`"}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", configPath, err)
+	}
+
+	var out bytes.Buffer
+	err := Execute(app.New(), &out, []string{
+		"run",
+		"--plain",
+		"--config", configPath,
+		"--prompt", "Persist from CLI",
+	})
+	if err != nil {
+		t.Fatalf("Execute(run --config sqlite --prompt) error = %v, want nil", err)
+	}
+	repo, err := storage.OpenSQLite(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite(%q) error = %v, want nil", dbPath, err)
+	}
+	t.Cleanup(func() {
+		if err := repo.Close(); err != nil {
+			t.Errorf("Close() error = %v, want nil", err)
+		}
+	})
+	audits, err := repo.ListAuditEvents(context.Background())
+	if err != nil {
+		t.Fatalf("ListAuditEvents() error = %v, want nil", err)
+	}
+	if len(audits) == 0 {
+		t.Fatalf("ListAuditEvents() len = 0, want persisted audit events")
+	}
+	task, ok, err := repo.GetTask(context.Background(), audits[0].SubjectID)
+	if err != nil {
+		t.Fatalf("GetTask(%q) error = %v, want nil", audits[0].SubjectID, err)
+	}
+	if !ok || task.Input != "Persist from CLI" {
+		t.Fatalf("GetTask(%q) = %#v, %t, want persisted CLI task", audits[0].SubjectID, task, ok)
+	}
+	events, err := repo.ListRuntimeEvents(context.Background())
+	if err != nil {
+		t.Fatalf("ListRuntimeEvents() error = %v, want nil", err)
+	}
+	if len(events) == 0 {
+		t.Fatalf("ListRuntimeEvents() len = 0, want persisted events")
+	}
+}
+
+func TestRunCommandUsesUniqueTaskIDsForPersistentRuns(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "agent.db")
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{
+		"storage": {"driver": "sqlite", "path": "`+filepath.ToSlash(dbPath)+`"}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", configPath, err)
+	}
+
+	for _, prompt := range []string{"First persistent CLI run", "Second persistent CLI run"} {
+		var out bytes.Buffer
+		err := Execute(app.New(), &out, []string{
+			"run",
+			"--plain",
+			"--config", configPath,
+			"--prompt", prompt,
+		})
+		if err != nil {
+			t.Fatalf("Execute(run --config sqlite --prompt %q) error = %v, want nil", prompt, err)
+		}
+	}
+
+	repo, err := storage.OpenSQLite(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite(%q) error = %v, want nil", dbPath, err)
+	}
+	t.Cleanup(func() {
+		if err := repo.Close(); err != nil {
+			t.Errorf("Close() error = %v, want nil", err)
+		}
+	})
+	audits, err := repo.ListAuditEvents(context.Background())
+	if err != nil {
+		t.Fatalf("ListAuditEvents() error = %v, want nil", err)
+	}
+	taskIDs := make(map[string]struct{})
+	for _, event := range audits {
+		if event.Action == "model_inference_completed" {
+			taskIDs[event.SubjectID] = struct{}{}
+		}
+	}
+	if len(taskIDs) != 2 {
+		t.Fatalf("model audit task IDs = %#v, want 2 unique task IDs", taskIDs)
+	}
+}
+
+func TestServeCommandUsesSQLiteForHTTPTaskState(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dbPath := filepath.Join(t.TempDir(), "agent.db")
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{
+		"storage": {"driver": "sqlite", "path": "`+filepath.ToSlash(dbPath)+`"},
+		"service": {"background_interval": "1h"}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", configPath, err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error = %v, want nil", err)
+	}
+	addr := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("listener.Close() error = %v, want nil", err)
+	}
+
+	var out bytes.Buffer
+	root := NewRoot(app.New(), &out)
+	root.SetContext(ctx)
+	root.SetArgs([]string{"serve", "--config", configPath, "--addr", addr})
+	done := make(chan error, 1)
+	go func() {
+		done <- root.Execute()
+	}()
+	postURL := "http://" + addr + "/v1/tasks"
+	resp, err := waitForPostTask(t, postURL, `{"id":"task-api-1","company_id":"company-1","input":"persist api"}`)
+	if err != nil {
+		cancel()
+		t.Fatalf("POST /v1/tasks error = %v, want nil", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		cancel()
+		t.Fatalf("Body.Close() error = %v, want nil", err)
+	}
+	if resp.StatusCode != http.StatusCreated {
+		cancel()
+		t.Fatalf("POST /v1/tasks status = %d, want %d", resp.StatusCode, http.StatusCreated)
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Execute(serve sqlite) error = %v, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Execute(serve sqlite) did not stop")
+	}
+	repo, err := storage.OpenSQLite(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite(%q) error = %v, want nil", dbPath, err)
+	}
+	t.Cleanup(func() {
+		if err := repo.Close(); err != nil {
+			t.Errorf("Close() error = %v, want nil", err)
+		}
+	})
+	task, ok, err := repo.GetTask(context.Background(), "task-api-1")
+	if err != nil {
+		t.Fatalf("GetTask(task-api-1) error = %v, want nil", err)
+	}
+	if !ok || task.Input != "persist api" {
+		t.Fatalf("GetTask(task-api-1) = %#v, %t, want persisted API task", task, ok)
+	}
+}
+
+func TestServeCommandStartsAndStopsWithContext(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	var out bytes.Buffer
+	root := NewRoot(app.New(), &out)
+	root.SetContext(ctx)
+	root.SetArgs([]string{"serve"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("Execute(serve canceled context) error = %v, want nil", err)
+	}
+	if got := out.String(); !bytes.Contains([]byte(got), []byte("agent service stopped")) {
+		t.Fatalf("Execute(serve canceled context) output = %q, want stopped message", got)
+	}
+}
+
+func TestServeCommandRejectsInvalidServerAddress(t *testing.T) {
+	t.Parallel()
+	var out bytes.Buffer
+	root := NewRoot(app.New(), &out)
+	root.SetArgs([]string{"serve", "--addr", "bad address"})
+	if err := root.Execute(); err == nil {
+		t.Fatalf("Execute(serve --addr bad address) error = nil, want error")
+	}
+}
+
+func TestBackupAndRestoreCommandsUseSQLiteConfig(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "agent.db")
+	backupPath := filepath.Join(dir, "agent.db.bak")
+	configPath := filepath.Join(dir, "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{
+		"storage": {"driver": "sqlite", "path": "`+filepath.ToSlash(dbPath)+`"}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", configPath, err)
+	}
+	repo, err := storage.OpenSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite(%q) error = %v, want nil", dbPath, err)
+	}
+	if err := repo.SaveTask(ctx, storageTestTask("cli-backup-task", "before backup")); err != nil {
+		t.Fatalf("SaveTask(cli-backup-task) error = %v, want nil", err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatalf("Close(source repo) error = %v, want nil", err)
+	}
+
+	var out bytes.Buffer
+	if err := Execute(app.New(), &out, []string{"backup", "--config", configPath, "--out", backupPath}); err != nil {
+		t.Fatalf("Execute(backup) error = %v, want nil", err)
+	}
+	if !strings.Contains(out.String(), "backup=") || !strings.Contains(out.String(), "checksum=") {
+		t.Fatalf("Execute(backup) output = %q, want backup and checksum", out.String())
+	}
+	repo, err = storage.OpenSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite(%q) after backup error = %v, want nil", dbPath, err)
+	}
+	if err := repo.SaveTask(ctx, storageTestTask("cli-backup-task", "after backup")); err != nil {
+		t.Fatalf("SaveTask(modified cli-backup-task) error = %v, want nil", err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatalf("Close(modified repo) error = %v, want nil", err)
+	}
+
+	out.Reset()
+	if err := Execute(app.New(), &out, []string{"restore", "--config", configPath, "--in", backupPath}); err != nil {
+		t.Fatalf("Execute(restore) error = %v, want nil", err)
+	}
+	if !strings.Contains(out.String(), "restored=") || !strings.Contains(out.String(), "pre_restore=") {
+		t.Fatalf("Execute(restore) output = %q, want restored and pre_restore", out.String())
+	}
+	repo, err = storage.OpenSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite(%q) after restore error = %v, want nil", dbPath, err)
+	}
+	t.Cleanup(func() {
+		if err := repo.Close(); err != nil {
+			t.Errorf("Close(restored repo) error = %v, want nil", err)
+		}
+	})
+	task, ok, err := repo.GetTask(ctx, "cli-backup-task")
+	if err != nil {
+		t.Fatalf("GetTask(cli-backup-task) error = %v, want nil", err)
+	}
+	if !ok || task.Input != "before backup" {
+		t.Fatalf("GetTask(cli-backup-task) = %#v, %t, want restored task before backup", task, ok)
+	}
+}
+
+func TestDataRetentionCommandUsesSQLiteConfig(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "agent.db")
+	configPath := filepath.Join(dir, "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{
+		"storage": {"driver": "sqlite", "path": "`+filepath.ToSlash(dbPath)+`"}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", configPath, err)
+	}
+	repo, err := storage.OpenSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite(%q) error = %v, want nil", dbPath, err)
+	}
+	now := time.Now()
+	if err := repo.AppendQualityEvalRun(ctx, quality.EvalRunRecord{
+		ID:        "eval-old",
+		AgentID:   "agent-1",
+		TaskID:    "task-old",
+		Component: "planner",
+		Status:    quality.EvalComponentDegraded,
+		Score:     0.2,
+		CreatedAt: now.Add(-30 * 24 * time.Hour),
+	}); err != nil {
+		t.Fatalf("AppendQualityEvalRun(eval-old) error = %v, want nil", err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatalf("Close(source repo) error = %v, want nil", err)
+	}
+
+	var out bytes.Buffer
+	err = Execute(app.New(), &out, []string{
+		"data",
+		"retention",
+		"--config", configPath,
+		"--quality-days", "7",
+		"--apply",
+	})
+	if err != nil {
+		t.Fatalf("Execute(data retention) error = %v, want nil", err)
+	}
+	if got := out.String(); !strings.Contains(got, "quality_history_deleted=1") || !strings.Contains(got, "dry_run=false") {
+		t.Fatalf("Execute(data retention) output = %q, want applied quality deletion", got)
+	}
+	repo, err = storage.OpenSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite(%q) after retention error = %v, want nil", dbPath, err)
+	}
+	t.Cleanup(func() {
+		if err := repo.Close(); err != nil {
+			t.Errorf("Close(retained repo) error = %v, want nil", err)
+		}
+	})
+	records, err := repo.ListQualityEvalRuns(ctx, quality.TrendQuery{})
+	if err != nil {
+		t.Fatalf("ListQualityEvalRuns() error = %v, want nil", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("ListQualityEvalRuns() len = %d, want 0", len(records))
+	}
+	audits, err := repo.ListAuditEvents(ctx)
+	if err != nil {
+		t.Fatalf("ListAuditEvents() error = %v, want nil", err)
+	}
+	if len(audits) != 1 || audits[0].Action != "storage.retention.apply" {
+		t.Fatalf("ListAuditEvents() = %#v, want retention audit", audits)
+	}
+}
+
+func TestDataExportCommandWritesSnapshot(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "agent.db")
+	exportPath := filepath.Join(dir, "agent-export.json")
+	configPath := filepath.Join(dir, "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{
+		"storage": {"driver": "sqlite", "path": "`+filepath.ToSlash(dbPath)+`"}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", configPath, err)
+	}
+	repo, err := storage.OpenSQLite(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite(%q) error = %v, want nil", dbPath, err)
+	}
+	if err := repo.AppendRuntimeEvent(ctx, domain.RuntimeEvent{
+		Type:      "task.completed",
+		TaskID:    "task-1",
+		Message:   "done",
+		CreatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("AppendRuntimeEvent(task.completed) error = %v, want nil", err)
+	}
+	if err := repo.Close(); err != nil {
+		t.Fatalf("Close(source repo) error = %v, want nil", err)
+	}
+
+	var out bytes.Buffer
+	err = Execute(app.New(), &out, []string{
+		"data",
+		"export",
+		"--config", configPath,
+		"--out", exportPath,
+	})
+	if err != nil {
+		t.Fatalf("Execute(data export) error = %v, want nil", err)
+	}
+	if got := out.String(); !strings.Contains(got, "export=") || !strings.Contains(got, "runtime_events=1") {
+		t.Fatalf("Execute(data export) output = %q, want export summary", got)
+	}
+	contents, err := os.ReadFile(exportPath)
+	if err != nil {
+		t.Fatalf("ReadFile(%q) error = %v, want nil", exportPath, err)
+	}
+	if !bytes.Contains(contents, []byte(`"runtime_events"`)) || !bytes.Contains(contents, []byte(`"task.completed"`)) {
+		t.Fatalf("ReadFile(%q) = %s, want runtime event snapshot", exportPath, contents)
+	}
+}
+
+func TestSkillSyncCommand(t *testing.T) {
+	t.Parallel()
+	content := `---
+id: go-testing
+name: Go Testing
+version: 1.0.0
+source: registry
+risk_level: safe
+status: active
+tags: go,test
+---
+Use Go tests.
+`
+	sha := sha256String(content)
+	var baseURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/index.json":
+			_, _ = w.Write([]byte(`{"skills":[{"manifest_url":"` + baseURL + `/go-testing.json"}]}`))
+		case "/go-testing.json":
+			_, _ = w.Write([]byte(`{"id":"go-testing","name":"Go Testing","version":"1.0.0","content_path":"` + baseURL + `/go-testing/SKILL.md","sha256":"` + sha + `"}`))
+		case "/go-testing/SKILL.md":
+			_, _ = w.Write([]byte(content))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	baseURL = server.URL
+	t.Cleanup(server.Close)
+
+	dir := t.TempDir()
+	installRoot := filepath.Join(dir, "skills")
+	configPath := filepath.Join(dir, "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{
+		"skills": {
+			"registry_url": "`+server.URL+`/index.json",
+			"install_root": "`+filepath.ToSlash(installRoot)+`"
+		}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", configPath, err)
+	}
+
+	var out bytes.Buffer
+	err := Execute(app.New(), &out, []string{"skill", "sync", "--config", configPath})
+	if err != nil {
+		t.Fatalf("Execute(skill sync) error = %v, want nil", err)
+	}
+	if got := out.String(); !strings.Contains(got, "skill_sync installed=1 quarantined=0 failed=0") {
+		t.Fatalf("Execute(skill sync) output = %q, want sync summary", got)
+	}
+	if _, err := os.Stat(filepath.Join(installRoot, "go-testing", "SKILL.md")); err != nil {
+		t.Fatalf("Stat(installed SKILL.md) error = %v, want nil", err)
+	}
+}
+
+func TestSkillSyncCommandUsesAgentInstallRoot(t *testing.T) {
+	t.Parallel()
+	content := `---
+id: writer-style
+name: Writer Style
+version: 1.0.0
+source: registry
+risk_level: safe
+status: active
+tags: write
+---
+Write with structure.
+`
+	sha := sha256String(content)
+	var baseURL string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/index.json":
+			_, _ = w.Write([]byte(`{"skills":[{"manifest_url":"` + baseURL + `/writer-style.json"}]}`))
+		case "/writer-style.json":
+			_, _ = w.Write([]byte(`{"id":"writer-style","name":"Writer Style","version":"1.0.0","content_path":"` + baseURL + `/writer-style/SKILL.md","sha256":"` + sha + `"}`))
+		case "/writer-style/SKILL.md":
+			_, _ = w.Write([]byte(content))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	baseURL = server.URL
+	t.Cleanup(server.Close)
+
+	dir := t.TempDir()
+	globalRoot := filepath.Join(dir, "skills", "global")
+	writerRoot := filepath.Join(dir, "skills", "writer")
+	agentsDir := filepath.Join(dir, "agents")
+	if err := os.MkdirAll(agentsDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v, want nil", agentsDir, err)
+	}
+	if err := os.WriteFile(filepath.Join(agentsDir, "writer.json"), []byte(`{
+		"id": "writer",
+		"role": "writer",
+		"skills": {"install_root": "`+filepath.ToSlash(writerRoot)+`"}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(writer.json) error = %v, want nil", err)
+	}
+	configPath := filepath.Join(dir, "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{
+		"agents": {"writer": "agents/writer.json"},
+		"skills": {
+			"registry_url": "`+server.URL+`/index.json",
+			"install_root": "`+filepath.ToSlash(globalRoot)+`"
+		}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", configPath, err)
+	}
+
+	var out bytes.Buffer
+	err := Execute(app.New(), &out, []string{"skill", "sync", "--config", configPath, "--agent", "writer"})
+	if err != nil {
+		t.Fatalf("Execute(skill sync --agent writer) error = %v, want nil", err)
+	}
+	if _, err := os.Stat(filepath.Join(writerRoot, "writer-style", "SKILL.md")); err != nil {
+		t.Fatalf("Stat(writer skill) error = %v, want installed in writer root", err)
+	}
+	if _, err := os.Stat(filepath.Join(globalRoot, "writer-style", "SKILL.md")); !os.IsNotExist(err) {
+		t.Fatalf("Stat(global skill) error = %v, want not installed in global root", err)
+	}
+}
+
+func storageTestTask(id string, input string) domain.Task {
+	return domain.Task{
+		ID:        id,
+		CompanyID: "company-1",
+		AgentID:   "agent-1",
+		Status:    domain.TaskDone,
+		Input:     input,
+		CreatedAt: time.Now(),
+	}
+}
+
+func sha256String(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
+}
+
+func writeCLIFile(t *testing.T, root string, rel string, content string) {
+	t.Helper()
+
+	path := filepath.Join(root, rel)
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v, want nil", filepath.Dir(path), err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", path, err)
+	}
+}
+
+func openCLITestSQLiteRepository(t *testing.T) *storage.SQLiteRepository {
+	t.Helper()
+	repo, err := storage.OpenSQLite(context.Background(), filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v, want nil", err)
+	}
+	t.Cleanup(func() {
+		if err := repo.Close(); err != nil {
+			t.Errorf("Close() error = %v, want nil", err)
+		}
+	})
+	return repo
+}
+
+type countingConversationStore struct {
+	delegate                   conversationStore
+	listConversationTurnsCalls int
+}
+
+func (s *countingConversationStore) SaveAgentSession(ctx context.Context, session domain.AgentSession) error {
+	return s.delegate.SaveAgentSession(ctx, session)
+}
+
+func (s *countingConversationStore) LatestAgentSession(ctx context.Context, companyID string, agentID string) (domain.AgentSession, bool, error) {
+	return s.delegate.LatestAgentSession(ctx, companyID, agentID)
+}
+
+func (s *countingConversationStore) ListAgentSessions(ctx context.Context, companyID string, agentID string) ([]domain.AgentSession, error) {
+	return s.delegate.ListAgentSessions(ctx, companyID, agentID)
+}
+
+func (s *countingConversationStore) AppendConversationTurn(ctx context.Context, turn domain.ConversationTurn) error {
+	return s.delegate.AppendConversationTurn(ctx, turn)
+}
+
+func (s *countingConversationStore) ListConversationTurns(ctx context.Context, sessionID string, limit int) ([]domain.ConversationTurn, error) {
+	s.listConversationTurnsCalls++
+	return s.delegate.ListConversationTurns(ctx, sessionID, limit)
+}
+
+type cliCaptureMaas struct {
+	response string
+	prompt   string
+}
+
+func (m *cliCaptureMaas) Generate(ctx context.Context, req port.InferenceRequest) (port.InferenceResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return port.InferenceResponse{}, err
+	}
+	m.prompt = req.Prompt
+	return port.InferenceResponse{Text: m.response}, nil
+}

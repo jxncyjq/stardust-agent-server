@@ -1,0 +1,13 @@
+{
+  "storage": {
+    "driver": "memory"
+  },
+  "server": {
+    "listen_addr": ":8080",
+    "public_health_enabled": true,
+    "request_id_header": "X-Request-ID"
+  },
+  "service": {
+    "background_interval": "1s"
+  }
+}

@@ -1,0 +1,155 @@
+{
+  "_comment": "Legion Agent 完整配置示例。所有 _comment_* 字段都是说明字段，当前 Go JSON loader 会忽略它们。",
+  "agents": {
+    "_comment": "多 Agent 子配置映射。key 对应 workflow task.agent_id；value 是相对于本配置文件目录的子 agent 配置路径。",
+    "researcher": "agents/researcher.example.json",
+    "writer": "agents/writer.example.json"
+  },
+  "maas": {
+    "_comment": "MaaS 推理服务配置。旧版单 endpoint 与 P12 多 profile 可以并存。",
+    "_comment_base_url": "旧版单 MaaS endpoint。未指定 profile 且 default_profile 为空时使用。",
+    "base_url": "https://maas.example.test",
+    "_comment_api_key": "旧版单 endpoint API key。生产环境建议用环境变量 LEGION_AGENT_MAAS_API_KEY 覆盖。",
+    "api_key": "change-me",
+    "_comment_default_profile": "默认模型 profile 名称。agent run 未传 --maas-profile 时优先使用该 profile。",
+    "default_profile": "fast",
+    "_comment_profiles": "多模型 profile 映射。不同场景可选择 fast、review 等 profile，Runtime 仍只依赖 C70 MaaS 端口。",
+    "profiles": {
+      "fast": {
+        "_comment": "低延迟或普通任务使用的模型 profile。",
+        "_comment_base_url": "fast profile 的 MaaS endpoint。",
+        "base_url": "https://maas-fast.example.test",
+        "_comment_model": "可选。配置后使用 OpenAI-compatible chat completions 协议，适合 DeepSeek/OpenAI 兼容接口。",
+        "model": "",
+        "_comment_api_key": "fast profile 的 API key。",
+        "api_key": "change-me-fast"
+      },
+      "review": {
+        "_comment": "质量评审、审查或更高可靠性任务使用的模型 profile。",
+        "_comment_base_url": "review profile 的 MaaS endpoint。",
+        "base_url": "https://maas-review.example.test",
+        "_comment_model": "可选。配置后使用 OpenAI-compatible chat completions 协议。",
+        "model": "",
+        "_comment_api_key": "review profile 的 API key。",
+        "api_key": "change-me-review"
+      }
+    }
+  },
+  "storage": {
+    "_comment": "本地持久化配置。memory 适合开发演示，sqlite 适合服务模式和恢复验证。",
+    "_comment_driver": "存储驱动。支持 memory 或 sqlite。",
+    "driver": "sqlite",
+    "_comment_path": "SQLite 数据库文件路径。若使用子目录，需要先创建父目录。",
+    "path": "agent.db"
+  },
+  "server": {
+    "_comment": "HTTP 服务配置，对应 agent serve。",
+    "_comment_listen_addr": "监听地址。:8080 表示监听所有网卡的 8080 端口。",
+    "listen_addr": ":8080",
+    "_comment_admin_token": "管理接口 token。生产环境必须设置非空值，请用 Authorization: Bearer <token> 访问受保护接口。",
+    "admin_token": "change-me-admin-token",
+    "_comment_public_health_enabled": "是否允许匿名访问 /healthz 和 /readyz。其他管理接口仍受 admin_token 保护。",
+    "public_health_enabled": true,
+    "_comment_request_id_header": "请求追踪 header 名称。客户端传入时服务端原样回传，未传时自动生成。",
+    "request_id_header": "X-Request-ID"
+  },
+  "service": {
+    "_comment": "后台服务调度配置。",
+    "_comment_background_interval": "后台调度间隔，使用 Go duration 格式，例如 1s、30s、5m。",
+    "background_interval": "1s"
+  },
+  "runtime": {
+    "_comment": "Runtime 降级与本地演示配置。",
+    "_comment_demo_response": "未配置真实 MaaS 或显式使用 demo 路径时返回的演示响应。",
+    "demo_response": "task completed",
+    "_comment_max_tool_rounds": "模型真实工具调用的最大闭环轮数。默认 4；超过后 Runtime 会报错，防止无限工具循环。",
+    "max_tool_rounds": 4
+  },
+  "session": {
+    "_comment": "会话上下文连续性配置。仅在 sqlite 存储下可跨进程恢复；memory 存储下只适合临时演示。",
+    "_comment_enabled": "是否启用 TUI session。启用后每轮对话会保存 user/assistant turn，并将最近若干轮注入下一次模型调用。",
+    "enabled": true,
+    "_comment_default_recent_turns": "每次模型调用前注入最近多少条 conversation turn。建议 4-10，避免上下文膨胀。",
+    "default_recent_turns": 6,
+    "_comment_max_turn_chars": "单条 turn 注入和存储前的最大字符数，超出会追加 [truncated] 标记。",
+    "max_turn_chars": 6000,
+    "_comment_restore_latest_on_tui_start": "TUI 启动时是否自动恢复当前 agent 最近 session；false 时每次启动创建新 session。",
+    "restore_latest_on_tui_start": true
+  },
+  "tui": {
+    "_comment": "交互式 TUI 展示配置。thinking 优先显示 MaaS/OpenAI-compatible 响应中明确返回的 reasoning_summary/reasoning_content；没有公开 reasoning 字段时回落为 Agent 可观测运行过程摘要。",
+    "_comment_show_prompt": "是否在主会话区显示用户刚输入的问题。",
+    "show_prompt": true,
+    "_comment_show_thinking": "是否在主会话区显示 thinking。上游模型返回公开 reasoning 时显示模型 reasoning，否则显示接收 prompt、准备上下文、调用模型、收到事件等过程摘要。",
+    "show_thinking": true,
+    "_comment_color_profile": "TUI 配色方案，根据终端能力选择。可选值：truecolor（24 位真彩色，默认）、ansi256（256 色，兼容大多数终端）、ansi（16 色，ANSI 标准）、ascii（无颜色，适合 CI/日志/屏幕阅读器）。也可通过环境变量 LEGION_AGENT_TUI_COLOR_PROFILE 覆盖。",
+    "color_profile": "truecolor",
+    "_comment_theme": "TUI 颜色主题。支持 ANSI 索引色（\"39\"）和 24 位 hex 色（\"#00D7FF\"）。hex 颜色在 truecolor 终端有最佳效果，ansi/ansi256 终端会自动降采样为最近色。",
+    "theme": {
+      "_comment_accent": "主强调色：标题、活跃项、进度条。默认 \"39\"（ANSI 青色）。Charm 风格推荐 \"#00D7FF\"。",
+      "accent": "39",
+      "_comment_accent2": "次强调色：面板边框、次要高亮。默认 \"33\"。Charm 风格推荐 \"#FF79C6\"（品红）。",
+      "accent2": "33",
+      "_comment_text": "正文文本色：正文、次要内容。默认 \"250\"（浅灰）。Charm 风格推荐 \"#F8F8F2\"。",
+      "text": "250",
+      "_comment_dim": "淡化文本色：帮助文字、footer 提示。默认 \"245\"（中灰）。Charm 风格推荐 \"#6272A4\"（蓝灰）。",
+      "dim": "245",
+      "_comment_error": "错误提示色。默认 \"196\"（红色）。Charm 风格推荐 \"#FF5555\"。",
+      "error": "196",
+      "_comment_shell_bg": "主壳层背景色。默认 \"17\"（深海军蓝）。Charm 风格推荐 \"#282A36\"（深炭灰）。",
+      "shell_bg": "17"
+    }
+  },
+  "context_files": {
+    "_comment": "运行时上下文文件配置。AGENTS.md 是项目规则，SOUL.md 是身份，TOOLS.md 是工具策略，USER.md/MEMORY.md 是记忆快照。",
+    "_comment_enabled": "是否在 agent run 时读取上下文文件。可用 --no-context-files 临时关闭。",
+    "enabled": true,
+    "_comment_root": "上下文文件允许读取的根目录，所有相对路径都会基于此目录解析。",
+    "root": ".",
+    "_comment_agents_path": "项目级运行规则文件。",
+    "agents_path": "AGENTS.md",
+    "_comment_soul_path": "Agent 身份和人格配置文件。",
+    "soul_path": "configs/persona/SOUL.md",
+    "_comment_tools_path": "工具使用策略配置文件。",
+    "tools_path": "configs/persona/TOOLS.md",
+    "_comment_user_path": "用户偏好和画像快照文件。",
+    "user_path": "configs/persona/USER.md",
+    "_comment_memory_path": "Agent 长期经验记忆快照文件。",
+    "memory_path": "configs/persona/MEMORY.md",
+    "_comment_max_file_chars": "单个上下文文件最多注入字符数，超过后保留 head/tail 并写入截断标记。",
+    "max_file_chars": 20000
+  },
+  "workspace": {
+    "_comment": "运行时工作空间约定。docs_root 用于文档产出，memory_root 用于记忆材料沉淀。",
+    "_comment_docs_root": "Agent 运行时书写经验文档、报告、runbook 的目标目录。",
+    "docs_root": "docs",
+    "_comment_memory_root": "Agent 运行时输出记忆内容的目标目录。",
+    "memory_root": "memory"
+  },
+  "tasks": {
+    "_comment": "多 Agent 协作任务账本配置。tasks/events/*.jsonl 是唯一写入源，tasks.md 与 tasks/TASK-*.md 是 TaskLedger 生成投影。",
+    "_comment_index_path": "共享任务索引文件。多个 Agent 通过该文件发现活跃任务、owner、状态和最新摘要。",
+    "index_path": "tasks.md",
+    "_comment_root": "任务账本目录。events/*.jsonl 保存 append-only 事件，TASK-YYYYMMDD-NNN.md 由 TaskLedger 重建为消息线程、交接和验收投影。",
+    "root": "tasks",
+    "_comment_archive_root": "完成或取消任务的归档目录。",
+    "archive_root": "tasks/archive",
+    "_comment_max_index_lines": "tasks.md 最大建议行数。超过后应归档 done/cancelled 任务或拆分摘要。",
+    "max_index_lines": 500,
+    "_comment_max_task_lines": "单个任务详情文件最大建议行数。超过后应把长报告移到 docs/ 或 memory/ 并保留链接。",
+    "max_task_lines": 300,
+    "_comment_max_message_chars": "单条消息写入 tasks.md 前的最大建议字符数，长内容应摘要加链接。",
+    "max_message_chars": 300,
+    "_comment_active_statuses": "会保留在 tasks.md 看板中的状态。",
+    "active_statuses": ["planned", "ready", "in_progress", "blocked", "review"],
+    "_comment_done_statuses": "应从 tasks.md 移到 archive 的终态。",
+    "done_statuses": ["done", "cancelled"]
+  },
+  "skills": {
+    "_comment": "P12 远端 Skill registry 同步配置。",
+    "_comment_registry_url": "远端 registry index URL。agent skill sync 未传 --registry-url 时使用该值。",
+    "registry_url": "https://registry.example.test/index.json",
+    "_comment_install_root": "技能安装根目录。安装器会在该目录下写入技能内容和 manifest。",
+    "install_root": "skills"
+  }
+}

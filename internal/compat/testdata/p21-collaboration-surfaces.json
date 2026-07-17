@@ -1,0 +1,10 @@
+{
+  "surfaces": [
+    "runtime-routing",
+    "session-continuity",
+    "taskledger-file-collaboration",
+    "agent-message-bus",
+    "workflow-result-handoff",
+    "http-message-api"
+  ]
+}
