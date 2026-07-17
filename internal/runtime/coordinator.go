@@ -86,6 +86,14 @@ func (c *Coordinator) Heartbeat(ctx context.Context) (domain.Task, bool, error) 
 	if !ok {
 		return domain.Task{}, false, nil
 	}
+	return c.runAssigned(ctx, taskToRun)
+}
+
+// runAssigned executes the full pipeline for a task the scheduler has already
+// handed out: acquire its lock, mark it running, resolve its runner, run it,
+// then evaluate/review and land it in a terminal (or suspended) state. It is the
+// unit spawned per-task by Heartbeat.
+func (c *Coordinator) runAssigned(ctx context.Context, taskToRun domain.Task) (domain.Task, bool, error) {
 	locked, err := c.locks.TryLock(ctx, taskToRun.ID, c.agent.ID, c.lockTTL)
 	if err != nil {
 		return domain.Task{}, false, fmt.Errorf("lock task: %w", err)
