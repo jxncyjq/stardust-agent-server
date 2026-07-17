@@ -122,6 +122,10 @@ type loopState struct {
 	completionTokens int
 	cachedTokens     int
 	totalTokens      int
+	// images is checkpoint-consistent: on resume it comes from the loaded
+	// checkpoint (not the live task), so a resumed run keeps the images it
+	// was suspended with even if the reconstructed task no longer carries them.
+	images []string
 }
 
 func NewRuntime(cfg Config) *Runtime {
@@ -219,6 +223,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 				completionTokens: cp.CompletionTokens,
 				cachedTokens:     cp.CachedTokens,
 				totalTokens:      cp.TotalTokens,
+				images:           cp.Images,
 			}
 			return r.runToolLoop(ctx, requestID, agent, task, st)
 		}
@@ -246,6 +251,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		completionTokens: resp.CompletionTokens,
 		cachedTokens:     resp.CachedTokens,
 		totalTokens:      resp.TotalTokens,
+		images:           task.Images,
 	}
 	return r.runToolLoop(ctx, requestID, agent, task, st)
 }
@@ -274,7 +280,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		}
 		st.toolCtx = mergeToolResults(st.toolCtx, st.resp.ToolCalls, results, r.maxToolResultChars)
 		prompt := boundPrompt(st.basePrompt+renderToolEntries(st.toolCtx), r.maxPromptChars)
-		st.resp, err = r.generate(ctx, requestID, prompt, task.Images, stablePrefixRunes(prompt, st.basePrompt))
+		st.resp, err = r.generate(ctx, requestID, prompt, st.images, stablePrefixRunes(prompt, st.basePrompt))
 		if err != nil {
 			_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonInferenceError, true)
 			return domain.TaskRun{}, fmt.Errorf("generate inference after tools: %w", err)
@@ -295,7 +301,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// answer when it is cut off mid-exploration.
 		prompt := boundPrompt(st.basePrompt+renderToolEntries(st.toolCtx), r.maxPromptChars)
 		finalPrompt := prompt + "\n\n[系统] 工具调用已达上限。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。"
-		final, err := r.generateNoTools(ctx, requestID, finalPrompt, task.Images, stablePrefixRunes(finalPrompt, st.basePrompt))
+		final, err := r.generateNoTools(ctx, requestID, finalPrompt, st.images, stablePrefixRunes(finalPrompt, st.basePrompt))
 		if err != nil {
 			_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonInferenceError, true)
 			return domain.TaskRun{}, fmt.Errorf("generate final answer after tool budget exhausted: %w", err)
@@ -337,7 +343,7 @@ func (r *Runtime) checkSuspend(ctx context.Context, task domain.Task, st loopSta
 		CompletionTokens: st.completionTokens,
 		CachedTokens:     st.cachedTokens,
 		TotalTokens:      st.totalTokens,
-		Images:           task.Images,
+		Images:           st.images,
 		CreatedAt:        time.Now(),
 	}
 	if err := r.checkpoints.Save(cp); err != nil {
