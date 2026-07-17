@@ -1821,6 +1821,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		Audit:              auditLog,
 		Events:             workflowEvents,
 		TrustGate:          trustManager,
+		MaxWorkers:         cfg.Runtime.MaxConcurrentTasks,
 	})
 	background := task.NewBackgroundScheduler()
 	background.AddJob("agent-coordinator-heartbeat", func(ctx context.Context) error {
@@ -1931,6 +1932,15 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	return ServeResult{
 		Service:  svc,
 		Listener: listener,
-		Close:    closeStore,
+		// Close drains in-flight task goroutines before releasing storage.
+		// Service.Start only returns once the background scheduler (and thus
+		// task dispatch) has stopped, so by the time Close runs no new tasks
+		// can start; coordinator.Wait() blocks for the ones already running
+		// to finish, and only then does closeStore() tear down storage, so a
+		// task goroutine can never write to an already-closed store.
+		Close: func() {
+			coordinator.Wait()
+			closeStore()
+		},
 	}, nil
 }
