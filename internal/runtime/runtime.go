@@ -13,18 +13,32 @@ import (
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/evolution"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
 var (
 	ErrInterrupted     = errors.New("runtime interrupted")
 	ErrMaasUnavailable = errors.New("maas inference client unavailable")
+	// ErrSuspended is returned by RunTask when the ToolGate pauses execution at a
+	// tool-round boundary. The runtime has already written a checkpoint; the
+	// coordinator maps this to TaskSuspended (not TaskFailed) and the goroutine
+	// is released. A later run (this process or after restart) auto-resumes.
+	ErrSuspended = errors.New("runtime suspended pending decision")
 )
 
 const defaultMaxToolRounds = 4
 
 type ContextBuilder interface {
 	BuildContext(ctx context.Context, req cognitive.Request) (cognitive.BuiltContext, error)
+}
+
+// ToolGate decides, at each tool-round boundary, whether the runtime must
+// suspend before executing the given pending tool calls (e.g. awaiting human
+// approval in Manual mode). A nil gate never suspends — Auto behaviour. M1b ships
+// only the seam; the approval-backed implementation lands in M2.
+type ToolGate interface {
+	ShouldSuspend(ctx context.Context, task domain.Task, calls []domain.ToolCall) (bool, error)
 }
 
 type Config struct {
@@ -56,6 +70,12 @@ type Config struct {
 	Depth         int
 	MaxSpawnDepth int
 	MaxConcurrent int
+	// Checkpoints persists suspended tool-loop state so a task can resume after
+	// its goroutine is released (and after a process restart). Nil disables
+	// suspend/resume (the loop runs straight through, legacy behaviour).
+	Checkpoints *sessionstate.Store
+	// ToolGate gates each tool round for suspension. Nil never suspends.
+	ToolGate ToolGate
 }
 
 // Context-accumulation bounds for the tool-execution loop. Tool outputs are
@@ -85,6 +105,8 @@ type Runtime struct {
 	maxSpawnDepth      int
 	maxConcurrent      int
 	subTaskSeq         atomic.Uint64
+	checkpoints        *sessionstate.Store
+	toolGate           ToolGate
 }
 
 func NewRuntime(cfg Config) *Runtime {
@@ -120,6 +142,8 @@ func NewRuntime(cfg Config) *Runtime {
 		depth:              cfg.Depth,
 		maxSpawnDepth:      normalizePositive(cfg.MaxSpawnDepth, defaultMaxSpawnDepth),
 		maxConcurrent:      normalizePositive(cfg.MaxConcurrent, defaultMaxConcurrent),
+		checkpoints:        cfg.Checkpoints,
+		toolGate:           cfg.ToolGate,
 	}
 }
 
