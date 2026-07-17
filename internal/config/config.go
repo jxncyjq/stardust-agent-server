@@ -94,6 +94,9 @@ type RuntimeConfig struct {
 	// the ~1800-token schema overhead. Defaults to true; set false to fall back
 	// to offering the complete native tool schema every round (safety rollback).
 	LazyTools bool `json:"lazy_tools"`
+	// MaxConcurrentTasks caps how many tasks the coordinator runs simultaneously,
+	// each on its own goroutine. Defaults to 4; 0 or negative means the default.
+	MaxConcurrentTasks int `json:"max_concurrent_tasks"`
 }
 
 type SessionConfig struct {
@@ -204,9 +207,10 @@ func defaultConfig() Config {
 			BackgroundInterval: "1s",
 		},
 		Runtime: RuntimeConfig{
-			DemoResponse:  "task completed",
-			MaxToolRounds: 4,
-			LazyTools:     true,
+			DemoResponse:       "task completed",
+			MaxToolRounds:      4,
+			LazyTools:          true,
+			MaxConcurrentTasks: 4,
 		},
 		Session: SessionConfig{
 			Enabled:                 true,

@@ -397,3 +397,13 @@ func TestLoadMissingFileReturnsErrConfigNotFound(t *testing.T) {
 		t.Fatalf("Load(missing) error = %v, want ErrConfigNotFound", err)
 	}
 }
+
+func TestLoadMaxConcurrentTasksDefault(t *testing.T) {
+	cfg, err := Load(context.Background(), Options{Path: ""})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Runtime.MaxConcurrentTasks != 4 {
+		t.Fatalf("default MaxConcurrentTasks = %d, want 4", cfg.Runtime.MaxConcurrentTasks)
+	}
+}
