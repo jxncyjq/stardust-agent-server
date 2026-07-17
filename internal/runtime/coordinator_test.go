@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +14,34 @@ import (
 	"github.com/stardust/legion-agent/internal/quality"
 	"github.com/stardust/legion-agent/internal/task"
 )
+
+// newTestCoordinator builds a Coordinator wired with the same stubs the other
+// tests in this file use (recordingTaskRunner, quality.NewAegisReviewer,
+// quality.NewEvalEngine, a real task.NewLockStore), so concurrency tests can
+// reuse the exact same pipeline behavior under a configurable worker count.
+func newTestCoordinator(t *testing.T, sched *task.Scheduler, workers int) *Coordinator {
+	t.Helper()
+	audit := adapter.NewMemoryAuditLog()
+	events := adapter.NewMemoryEventBus()
+	return NewCoordinator(CoordinatorConfig{
+		Agent: domain.Agent{
+			ID:        "default-agent",
+			CompanyID: "company-1",
+			Role:      "developer",
+			Status:    domain.AgentActive,
+		},
+		Scheduler:  sched,
+		Locks:      task.NewLockStore(),
+		Runtime:    &recordingTaskRunner{result: "ok"},
+		Reviewer:   quality.NewAegisReviewer(),
+		Evaluator:  quality.NewEvalEngine(3),
+		Approvals:  approval.NewService(),
+		Audit:      audit,
+		Events:     events,
+		LockTTL:    time.Minute,
+		MaxWorkers: workers,
+	})
+}
 
 // awaitTerminal polls the scheduler until the task reaches a terminal or
 // suspended status (or times out), so tests can assert the async pipeline's
@@ -435,17 +464,25 @@ func hasLearningRuntimeEventForAgent(events []domain.RuntimeEvent, agentID strin
 }
 
 type recordingTaskRunner struct {
-	result    string
+	result string
+
+	mu        sync.Mutex
 	calls     int
 	lastAgent domain.Agent
 	lastTask  domain.Task
 	lastRun   domain.TaskRun
 }
 
+// RunTask is invoked from a per-task worker goroutine (Coordinator.Heartbeat
+// dispatches concurrently), so the recorded fields must be guarded by a mutex
+// rather than written bare; callers that read them after coordinator.Wait()
+// still see them safely thanks to the WaitGroup happens-before edge.
 func (r *recordingTaskRunner) RunTask(ctx context.Context, agent domain.Agent, task domain.Task) (domain.TaskRun, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.TaskRun{}, err
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.calls++
 	r.lastAgent = agent
 	r.lastTask = task
