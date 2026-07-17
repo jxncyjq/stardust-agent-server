@@ -37,6 +37,7 @@ import (
 	"github.com/stardust/legion-agent/internal/server"
 	"github.com/stardust/legion-agent/internal/service"
 	"github.com/stardust/legion-agent/internal/sessioncache"
+	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/skill"
 	"github.com/stardust/legion-agent/internal/storage"
 	"github.com/stardust/legion-agent/internal/task"
@@ -1727,6 +1728,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		closeStore()
 		return ServeResult{}, err
 	}
+	// TODO(M2): inject checkpoint store into resolver-built runtimes
 	resolver := agentruntime.NewAgentRuntimeResolver(agentruntime.AgentRuntimeResolverConfig{
 		Registry:     registry,
 		RootConfig:   cfg,
@@ -1791,6 +1793,9 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		}).WithUsage(skillUsage, time.Now))
 	}
 
+	workspaceRoot, workspaceRootWarning := sessionstate.ResolveWorkspaceRoot(cfg.Workspace.Root)
+	checkpointStore := sessionstate.NewStore(workspaceRoot)
+
 	// The default runtime is a root orchestrator, so it may delegate. Register
 	// delegate_task on its tool registry after construction (a leaf child would
 	// not register it, preventing unbounded recursion).
@@ -1802,6 +1807,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		Tools:          defaultTools,
 		MaxToolRounds:  cfg.Runtime.MaxToolRounds,
 		LazyTools:      cfg.Runtime.LazyTools,
+		Checkpoints:    checkpointStore,
 	})
 	defaultRuntime.RegisterDelegateTaskTool(defaultTools)
 	coordinator := agentruntime.NewCoordinator(agentruntime.CoordinatorConfig{
@@ -1871,6 +1877,17 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	logger := opts.Logger
 	if logger == nil {
 		logger = defaultLogger()
+	}
+	if workspaceRootWarning != "" {
+		logger.Warn("workspace root fallback", "detail", workspaceRootWarning)
+	}
+	recovered, err := coordinator.RecoverSuspended(ctx, checkpointStore)
+	if err != nil {
+		closeStore()
+		return ServeResult{}, fmt.Errorf("recover suspended tasks: %w", err)
+	}
+	if recovered > 0 {
+		logger.Info("recovered suspended tasks", "count", recovered)
 	}
 	// Surface background tick failures (e.g. a task failing in the coordinator
 	// heartbeat) instead of dropping them silently.

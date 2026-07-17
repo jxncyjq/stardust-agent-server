@@ -12,6 +12,7 @@ import (
 	"github.com/stardust/legion-agent/internal/evolution"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/quality"
+	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/task"
 )
 
@@ -263,6 +264,42 @@ func (c *Coordinator) runAssigned(ctx context.Context, taskToRun domain.Task) (d
 		return domain.Task{}, false, err
 	}
 	return c.currentTask(ctx, taskToRun.ID)
+}
+
+// RecoverSuspended re-registers every task that has a persisted checkpoint into
+// the scheduler in TaskSuspended state, so suspends survive a process restart and
+// remain visible/decidable. It does not resume them — resume is driven by a
+// Suspended→Running decision. Returns the number of tasks recovered. A task that
+// is already present in the scheduler is skipped (idempotent re-scan).
+func (c *Coordinator) RecoverSuspended(ctx context.Context, store *sessionstate.Store) (int, error) {
+	if store == nil {
+		return 0, nil
+	}
+	checkpoints, err := store.ListSuspended()
+	if err != nil {
+		return 0, fmt.Errorf("list suspended checkpoints: %w", err)
+	}
+	recovered := 0
+	for _, cp := range checkpoints {
+		if _, ok, err := c.scheduler.Get(ctx, cp.TaskID); err != nil {
+			return recovered, fmt.Errorf("check task %s presence: %w", cp.TaskID, err)
+		} else if ok {
+			continue
+		}
+		if err := c.scheduler.Add(ctx, domain.Task{
+			ID:        cp.TaskID,
+			AgentID:   cp.AgentID,
+			SessionID: cp.SessionKey,
+			Status:    domain.TaskSuspended,
+		}); err != nil {
+			return recovered, fmt.Errorf("re-register suspended task %s: %w", cp.TaskID, err)
+		}
+		if err := c.appendAudit(ctx, cp.TaskID, "task_recovered_suspended"); err != nil {
+			return recovered, err
+		}
+		recovered++
+	}
+	return recovered, nil
 }
 
 func (c *Coordinator) currentTask(ctx context.Context, taskID string) (domain.Task, bool, error) {
