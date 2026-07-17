@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -194,6 +195,19 @@ func (c *Coordinator) runAssigned(ctx context.Context, taskToRun domain.Task) (d
 	}
 	run, err := runner.RunTask(ctx, runnerAgent, taskToRun)
 	if err != nil {
+		if errors.Is(err, ErrSuspended) {
+			// The runtime checkpointed and paused (e.g. awaiting approval). Land
+			// the task in Suspended — NOT Failed — and release the goroutine. A
+			// later decision (or restart recovery) transitions it back to Running
+			// and the runtime auto-resumes from its checkpoint.
+			if txErr := c.scheduler.Transition(ctx, taskToRun.ID, domain.TaskSuspended); txErr != nil {
+				return domain.Task{}, false, fmt.Errorf("suspend checkpointed task %s: %w", taskToRun.ID, txErr)
+			}
+			if auErr := c.appendAudit(ctx, taskToRun.ID, "task_suspended"); auErr != nil {
+				return domain.Task{}, false, auErr
+			}
+			return c.currentTask(ctx, taskToRun.ID)
+		}
 		_ = c.scheduler.Transition(ctx, taskToRun.ID, domain.TaskFailed)
 		return domain.Task{}, false, fmt.Errorf("run task: %w", err)
 	}
