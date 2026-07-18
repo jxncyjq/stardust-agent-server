@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -1002,5 +1003,63 @@ func TestCreateTaskInheritsSessionMode(t *testing.T) {
 	}
 	if created.Mode != domain.ModePlan {
 		t.Fatalf("POST /v1/tasks mode = %q, want inherited %q", created.Mode, domain.ModePlan)
+	}
+}
+
+type stubDecider struct {
+	gotTask, gotTicket string
+	gotStatus          approval.ApprovalStatus
+	err                error
+}
+
+func (s *stubDecider) Decide(_ context.Context, taskID, ticketID string, status approval.ApprovalStatus) (approval.ToolApproval, error) {
+	s.gotTask, s.gotTicket, s.gotStatus = taskID, ticketID, status
+	if s.err != nil {
+		return approval.ToolApproval{}, s.err
+	}
+	return approval.ToolApproval{TicketID: ticketID, TaskID: taskID, Status: status}, nil
+}
+
+func TestDecideApprovalRoutesApprove(t *testing.T) {
+	dec := &stubDecider{}
+	srv := NewHTTPServer(Config{ToolApprovals: dec})
+	req := httptest.NewRequest(http.MethodPost, "/v1/tasks/t1/approvals/t1__c1", strings.NewReader(`{"decision":"approve"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if dec.gotTask != "t1" || dec.gotTicket != "t1__c1" || dec.gotStatus != approval.ApprovalApproved {
+		t.Fatalf("decider got task=%q ticket=%q status=%q", dec.gotTask, dec.gotTicket, dec.gotStatus)
+	}
+}
+
+func TestDecideApprovalInvalidDecision400(t *testing.T) {
+	srv := NewHTTPServer(Config{ToolApprovals: &stubDecider{}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/tasks/t1/approvals/tk1", strings.NewReader(`{"decision":"maybe"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestDecideApprovalUnknownTicket404(t *testing.T) {
+	srv := NewHTTPServer(Config{ToolApprovals: &stubDecider{err: approval.ErrTicketNotFound}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/tasks/t1/approvals/nope", strings.NewReader(`{"decision":"deny"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestDecideApprovalNilStore503(t *testing.T) {
+	srv := NewHTTPServer(Config{})
+	req := httptest.NewRequest(http.MethodPost, "/v1/tasks/t1/approvals/tk1", strings.NewReader(`{"decision":"approve"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
 	}
 }
