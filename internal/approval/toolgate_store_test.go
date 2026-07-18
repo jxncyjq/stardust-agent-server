@@ -104,3 +104,45 @@ func TestToolGateStoreCorruptJSONFailsLoud(t *testing.T) {
 		t.Fatal("Get on corrupt JSON: want fail-loud error, got nil")
 	}
 }
+
+func TestToolGateStoreListForTaskCorruptFileFailsLoud(t *testing.T) {
+	dir := t.TempDir()
+	s := NewToolGateStore(dir)
+	a, _ := s.Open(newRec("t1", "c1", "write_file"))
+	path := filepath.Join(sessionstate.SessionDir(dir, "s1"), "approvals", a.TicketID+".json")
+	if err := writeFileHelper(path, "{ not json"); err != nil { // helper: os.WriteFile
+		t.Fatal(err)
+	}
+	if _, err := s.ListForTask("s1", "t1"); err == nil {
+		t.Fatal("ListForTask on corrupt JSON: want fail-loud error, got nil")
+	}
+}
+
+func TestToolGateStoreListPendingCorruptFileFailsLoud(t *testing.T) {
+	dir := t.TempDir()
+	s := NewToolGateStore(dir)
+	a, _ := s.Open(newRec("t1", "c1", "write_file"))
+	path := filepath.Join(sessionstate.SessionDir(dir, "s1"), "approvals", a.TicketID+".json")
+	if err := writeFileHelper(path, "{ not json"); err != nil { // helper: os.WriteFile
+		t.Fatal(err)
+	}
+	if _, err := s.ListPending(); err == nil {
+		t.Fatal("ListPending on corrupt JSON: want fail-loud error, got nil")
+	}
+}
+
+func TestToolGateStoreDecideRejectsInvalidStatus(t *testing.T) {
+	dir := t.TempDir()
+	s := NewToolGateStore(dir)
+	a, _ := s.Open(newRec("t1", "c1", "write_file"))
+	if _, err := s.Decide("s1", a.TicketID, ApprovalStatus("bogus")); err == nil {
+		t.Fatal("Decide with invalid status: want error, got nil")
+	}
+	got, ok, err := s.Get("s1", a.TicketID)
+	if err != nil || !ok {
+		t.Fatalf("Get: ok=%v err=%v", ok, err)
+	}
+	if got.Status != ApprovalPending {
+		t.Fatalf("status after rejected Decide = %q, want pending", got.Status)
+	}
+}
