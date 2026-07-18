@@ -123,3 +123,99 @@ func TestResolveReadOnlyAlwaysAllows(t *testing.T) {
 		t.Fatalf("read-only: allow=%v err=%v, want true,nil", allow, err)
 	}
 }
+
+// TestResolveUndecidedSensitiveFailsLoud covers the invariant-3 default branch
+// of Resolve: a sensitive call reaching dispatch with no recorded decision
+// (no ticket at all, or a ticket still pending) must fail loud — never allow
+// — because the round-level gate should already have suspended it.
+func TestResolveUndecidedSensitiveFailsLoud(t *testing.T) {
+	t.Run("no ticket on disk", func(t *testing.T) {
+		g := New(approval.NewToolGateStore(t.TempDir()))
+		call := domain.ToolCall{ID: "c1", Name: "write_file"}
+		allow, err := g.Resolve(context.Background(), manualTask(), call, gateRegistry())
+		if err == nil {
+			t.Fatal("want error for sensitive call with no ticket, got nil")
+		}
+		if allow {
+			t.Fatal("want allow=false for sensitive call with no ticket")
+		}
+	})
+
+	t.Run("ticket pending", func(t *testing.T) {
+		store := approval.NewToolGateStore(t.TempDir())
+		g := New(store)
+		reg := gateRegistry()
+		call := domain.ToolCall{ID: "c1", Name: "write_file"}
+		// Open a ticket via ShouldSuspend but never decide it.
+		if _, err := g.ShouldSuspend(context.Background(), manualTask(), []domain.ToolCall{call}, reg); err != nil {
+			t.Fatal(err)
+		}
+		allow, err := g.Resolve(context.Background(), manualTask(), call, reg)
+		if err == nil {
+			t.Fatal("want error for sensitive call with pending ticket, got nil")
+		}
+		if allow {
+			t.Fatal("want allow=false for sensitive call with pending ticket")
+		}
+	})
+}
+
+// TestShouldSuspendMultiCallPartialDecision covers a round with two sensitive
+// calls where only one has been decided: ShouldSuspend must still report
+// suspend=true (the other call is still pending), the decided call's ticket
+// must not be reset to pending by the second ShouldSuspend pass (idempotent
+// Open), and Resolve must allow the decided call while failing loud on the
+// undecided one.
+func TestShouldSuspendMultiCallPartialDecision(t *testing.T) {
+	store := approval.NewToolGateStore(t.TempDir())
+	g := New(store)
+	reg := gateRegistry()
+	task := manualTask()
+	calls := []domain.ToolCall{
+		{ID: "c1", Name: "write_file"},
+		{ID: "c2", Name: "write_file"},
+	}
+
+	suspend, err := g.ShouldSuspend(context.Background(), task, calls, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !suspend {
+		t.Fatal("want suspend=true when both calls are pending")
+	}
+
+	if _, err := store.Decide("s1", approval.TicketID("t1", "c1"), approval.ApprovalApproved); err != nil {
+		t.Fatal(err)
+	}
+
+	suspend, err = g.ShouldSuspend(context.Background(), task, calls, reg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !suspend {
+		t.Fatal("want suspend=true when c2 is still pending")
+	}
+
+	// c1's ticket must remain approved — Open must be idempotent and must not
+	// reset an already-decided ticket back to pending.
+	c1, ok, err := store.Get("s1", approval.TicketID("t1", "c1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || c1.Status != approval.ApprovalApproved {
+		t.Fatalf("c1 ticket = %+v, ok=%v, want status=approved", c1, ok)
+	}
+
+	allow, err := g.Resolve(context.Background(), task, calls[0], reg)
+	if err != nil || !allow {
+		t.Fatalf("Resolve(c1): allow=%v err=%v, want true,nil", allow, err)
+	}
+
+	allow, err = g.Resolve(context.Background(), task, calls[1], reg)
+	if err == nil {
+		t.Fatal("Resolve(c2): want error for undecided ticket, got nil")
+	}
+	if allow {
+		t.Fatal("Resolve(c2): want allow=false for undecided ticket")
+	}
+}
