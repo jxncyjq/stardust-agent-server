@@ -256,7 +256,8 @@ func (s *ToolGateStore) ListPending() ([]ToolApproval, error) {
 // leaves a half-written ticket file behind. It is stored under
 // sessionstate.SessionBase(s.workspaceRoot, rec.WorkingDir). Callers must hold
 // s.mu: the rename must not race a concurrent read of the same path
-// (Get/ListForTask/ListPending), which on Windows NTFS collides with a
+// (Get/ListForTask/ListPendingIn — including via ListPending, which is
+// ListPendingIn(s.workspaceRoot)), which on Windows NTFS collides with a
 // sharing violation.
 func (s *ToolGateStore) writeLocked(rec ToolApproval) error {
 	base := sessionstate.SessionBase(s.workspaceRoot, rec.WorkingDir)

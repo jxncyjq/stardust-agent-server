@@ -45,7 +45,7 @@ func NewTimeoutSweepJob(store *approval.ToolGateStore, dec *ApprovalCoordinator,
 			}
 			if _, err := dec.Decide(ctx, rec.TaskID, rec.TicketID, approval.ApprovalDenied); err != nil {
 				// Benign race: a human (or another sweep pass) decided this
-				// ticket between ListPending above and this Decide. The winning
+				// ticket between ListPendingIn above and this Decide. The winning
 				// decision is authoritative and the task resumes correctly, so
 				// this is the intended outcome, not a fault — skip the ticket
 				// instead of bubbling it up as a background-scheduler Error. Only
