@@ -66,15 +66,63 @@ func writeSSEEvent(w io.Writer, event observability.EventEnvelope) error {
 	return err
 }
 
+// maxEventStringLen bounds any single string value emitted over SSE. Larger
+// values (e.g. a write_file content argument) are truncated with a marker so a
+// pending-approval event cannot ship an unbounded/secret-laden payload.
+const maxEventStringLen = 512
+
+// sanitizeEventData strips sensitive keys and truncates large string values from
+// an event payload before it leaves the process, recursing into nested maps so a
+// sensitive sub-key (e.g. arguments.api_key) or a huge sub-value cannot slip
+// through under a benign top-level key like "arguments".
 func sanitizeEventData(data map[string]any) map[string]any {
 	sanitized := make(map[string]any, len(data))
 	for key, value := range data {
 		if isSensitiveEventField(key) {
 			continue
 		}
-		sanitized[key] = value
+		sanitized[key] = sanitizeEventValue(value)
 	}
 	return sanitized
+}
+
+// sanitizeEventValue recurses into nested maps and truncates strings so
+// sanitizeEventData's guarantees hold at every depth, not just the top level.
+func sanitizeEventValue(value any) any {
+	switch v := value.(type) {
+	case map[string]any:
+		return sanitizeEventData(v)
+	case map[string]string:
+		return sanitizeStringMap(v)
+	case string:
+		return truncateEventString(v)
+	default:
+		return v
+	}
+}
+
+// sanitizeStringMap strips sensitive keys and truncates values of a string map
+// (e.g. an approval ticket's Arguments). It returns a map[string]any so nested
+// results compose with sanitizeEventValue. Exported-within-package for reuse by
+// the /v1/approvals list handler.
+func sanitizeStringMap(m map[string]string) map[string]any {
+	out := make(map[string]any, len(m))
+	for key, value := range m {
+		if isSensitiveEventField(key) {
+			continue
+		}
+		out[key] = truncateEventString(value)
+	}
+	return out
+}
+
+// truncateEventString bounds s to maxEventStringLen, appending a marker noting
+// how many bytes were dropped so truncation is visible rather than silent.
+func truncateEventString(s string) string {
+	if len(s) <= maxEventStringLen {
+		return s
+	}
+	return s[:maxEventStringLen] + fmt.Sprintf("…[truncated %d bytes]", len(s)-maxEventStringLen)
 }
 
 func isSensitiveEventField(key string) bool {

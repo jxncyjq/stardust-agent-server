@@ -31,8 +31,8 @@ func newPlatformApprovalSink(platform *observability.EventBus, logger *slog.Logg
 }
 
 // ApprovalPending publishes an approval_pending envelope. arguments are carried
-// as-is; the SSE write boundary (sanitizeEventData) truncates and strips
-// sensitive sub-keys before they leave the process.
+// as-is; the SSE write boundary (sanitizeEventData) recursively truncates large
+// values and strips sensitive sub-keys before they leave the process.
 func (s *platformApprovalSink) ApprovalPending(ctx context.Context, taskID, ticketID, tool string, args map[string]string) {
 	data := map[string]any{"task_id": taskID, "ticket_id": ticketID, "tool": tool}
 	if args != nil {

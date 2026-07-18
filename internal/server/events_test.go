@@ -57,3 +57,56 @@ func TestSSEEventsFiltersAndSanitizesPayload(t *testing.T) {
 		t.Fatalf("GET /v1/events body leaked prompt content: %q", body)
 	}
 }
+
+func TestSSEEventsSanitizesNestedArgumentsAndTruncates(t *testing.T) {
+	bus := observability.NewEventBus(8)
+	srv := NewHTTPServer(Config{AdminToken: "token", PlatformEvents: bus})
+	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
+	req.Header.Set("Authorization", "Bearer token")
+	rec := httptest.NewRecorder()
+
+	big := strings.Repeat("A", 2000)
+	go func() {
+		// Give ServeHTTP time to Subscribe before we Publish/Close: EventBus
+		// replays its event history to new subscribers, but only if they
+		// subscribe before Close (internal/observability/eventbus.go), so
+		// publishing too early here would race the handler and drop the
+		// event entirely rather than testing sanitization.
+		time.Sleep(10 * time.Millisecond)
+		if err := bus.Publish(context.Background(), observability.EventEnvelope{
+			Type:      "approval_pending",
+			SubjectID: "task-1",
+			Data: map[string]any{
+				"task_id":   "task-1",
+				"ticket_id": "ticket-1",
+				"tool":      "write_file",
+				"arguments": map[string]string{
+					"path":    "/tmp/x",
+					"api_key": "SUPER-SECRET-KEY",
+					"content": big,
+				},
+			},
+		}); err != nil {
+			t.Errorf("Publish(approval_pending) error = %v, want nil", err)
+		}
+		if err := bus.Close(); err != nil {
+			t.Errorf("Close() error = %v, want nil", err)
+		}
+	}()
+
+	srv.ServeHTTP(rec, req)
+	body := rec.Body.String()
+
+	if !strings.Contains(body, "/tmp/x") {
+		t.Fatalf("body = %q, want non-sensitive arg path present", body)
+	}
+	if strings.Contains(body, "SUPER-SECRET-KEY") || strings.Contains(body, "api_key") {
+		t.Fatalf("body leaked sensitive nested arg: %q", body)
+	}
+	if strings.Contains(body, big) {
+		t.Fatalf("body carried untruncated 2000-byte content")
+	}
+	if !strings.Contains(body, "truncated") {
+		t.Fatalf("body = %q, want truncation marker for large content", body)
+	}
+}
