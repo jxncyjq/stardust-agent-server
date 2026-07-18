@@ -1054,6 +1054,16 @@ func TestDecideApprovalUnknownTicket404(t *testing.T) {
 	}
 }
 
+func TestDecideApprovalAlreadyDecided409(t *testing.T) {
+	srv := NewHTTPServer(Config{ToolApprovals: &stubDecider{err: approval.ErrTicketAlreadyDecided}})
+	req := httptest.NewRequest(http.MethodPost, "/v1/tasks/t1/approvals/tk1", strings.NewReader(`{"decision":"deny"}`))
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409", rec.Code)
+	}
+}
+
 func TestDecideApprovalNilStore503(t *testing.T) {
 	srv := NewHTTPServer(Config{})
 	req := httptest.NewRequest(http.MethodPost, "/v1/tasks/t1/approvals/tk1", strings.NewReader(`{"decision":"approve"}`))

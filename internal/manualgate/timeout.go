@@ -2,6 +2,7 @@ package manualgate
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -28,6 +29,15 @@ func NewTimeoutSweepJob(store *approval.ToolGateStore, dec *ApprovalCoordinator,
 				continue
 			}
 			if _, err := dec.Decide(ctx, rec.TaskID, rec.TicketID, approval.ApprovalDenied); err != nil {
+				// Benign race: a human (or another sweep pass) decided this
+				// ticket between ListPending above and this Decide. The winning
+				// decision is authoritative and the task resumes correctly, so
+				// this is the intended outcome, not a fault — skip the ticket
+				// instead of bubbling it up as a background-scheduler Error. Only
+				// a genuinely unexpected failure still fails loud.
+				if errors.Is(err, approval.ErrTicketAlreadyDecided) {
+					continue
+				}
 				return fmt.Errorf("timeout-deny ticket %s: %w", rec.TicketID, err)
 			}
 			if logger != nil {

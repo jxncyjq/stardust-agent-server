@@ -157,7 +157,10 @@ func (s *ToolGateStore) getLocked(sessionKey, ticketID string) (ToolApproval, bo
 // ApprovalApproved or ApprovalDenied. An unknown ticketID returns an error
 // wrapping ErrTicketNotFound (so callers can errors.Is-match it, e.g. an HTTP
 // layer mapping it to 404). A ticket that is not currently ApprovalPending —
-// already decided — is rejected fail-loud rather than silently overwritten.
+// already decided — is rejected fail-loud with an error wrapping
+// ErrTicketAlreadyDecided (so callers can errors.Is-match it, e.g. an HTTP
+// layer mapping it to 409, or a concurrent sweep tolerating the race) rather
+// than silently overwritten.
 func (s *ToolGateStore) Decide(sessionKey, ticketID string, status ApprovalStatus) (ToolApproval, error) {
 	if status != ApprovalApproved && status != ApprovalDenied {
 		return ToolApproval{}, fmt.Errorf("decide approval: invalid status %q (want approved|denied)", status)
@@ -172,7 +175,7 @@ func (s *ToolGateStore) Decide(sessionKey, ticketID string, status ApprovalStatu
 		return ToolApproval{}, fmt.Errorf("decide approval: ticket %s not found: %w", ticketID, ErrTicketNotFound)
 	}
 	if rec.Status != ApprovalPending {
-		return ToolApproval{}, fmt.Errorf("decide approval: ticket %s already decided (%s)", ticketID, rec.Status)
+		return ToolApproval{}, fmt.Errorf("decide approval: ticket %s already decided (%s): %w", ticketID, rec.Status, ErrTicketAlreadyDecided)
 	}
 	rec.Status = status
 	rec.UpdatedAt = time.Now()

@@ -69,6 +69,25 @@ func TestToolGateStoreDecideUnknownTicketWrapsErrTicketNotFound(t *testing.T) {
 	}
 }
 
+// TestToolGateStoreDecideAlreadyDecidedWrapsErrTicketAlreadyDecided asserts the
+// "already decided" rejection wraps the ErrTicketAlreadyDecided sentinel, so a
+// caller can errors.Is-match it (the HTTP layer maps it to 409; the timeout
+// sweep tolerates it as a benign race) rather than only reading the message.
+func TestToolGateStoreDecideAlreadyDecidedWrapsErrTicketAlreadyDecided(t *testing.T) {
+	s := NewToolGateStore(t.TempDir())
+	a, _ := s.Open(newRec("t1", "c1", "write_file"))
+	if _, err := s.Decide("s1", a.TicketID, ApprovalApproved); err != nil {
+		t.Fatal(err)
+	}
+	_, err := s.Decide("s1", a.TicketID, ApprovalDenied)
+	if err == nil {
+		t.Fatal("re-decide decided ticket: want error, got nil")
+	}
+	if !errors.Is(err, ErrTicketAlreadyDecided) {
+		t.Fatalf("re-decide: err = %v, want wrapping ErrTicketAlreadyDecided", err)
+	}
+}
+
 func TestToolGateStoreListForTaskAndPending(t *testing.T) {
 	s := NewToolGateStore(t.TempDir())
 	_, _ = s.Open(newRec("t1", "c1", "write_file"))

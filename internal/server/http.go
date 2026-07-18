@@ -1302,6 +1302,10 @@ func (s *HTTPServer) handleDecideApproval(w http.ResponseWriter, r *http.Request
 			writeError(w, http.StatusNotFound, "approval ticket not found")
 			return
 		}
+		if errors.Is(err, approval.ErrTicketAlreadyDecided) {
+			writeError(w, http.StatusConflict, "approval ticket already decided")
+			return
+		}
 		writeError(w, http.StatusInternalServerError, "decide approval failed")
 		return
 	}

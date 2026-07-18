@@ -147,6 +147,62 @@ func TestTimeoutSweepDecideErrorPropagates(t *testing.T) {
 	}
 }
 
+// TestTimeoutSweepToleratesConcurrentDecision covers the benign race: a ticket
+// the sweep captured as pending is decided by someone else (a human, or another
+// pass) in the window between ListPending and the sweep's own Decide. The now
+// hook fires exactly in that window — the loop's age check calls it before
+// Decide — so injecting the competing approval there reproduces the race
+// deterministically. The sweep must treat the resulting ErrTicketAlreadyDecided
+// as the intended outcome and return nil (the winning decision stands, the task
+// still resumes), not bubble it up as a background-scheduler Error.
+func TestTimeoutSweepToleratesConcurrentDecision(t *testing.T) {
+	dir := t.TempDir()
+	store := approval.NewToolGateStore(dir)
+	sched := task.NewScheduler()
+	if err := sched.Add(context.Background(), domain.Task{ID: "t1", SessionID: "s1", Status: domain.TaskRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sched.Transition(context.Background(), "t1", domain.TaskSuspended); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Open(approval.ToolApproval{SessionKey: "s1", TaskID: "t1", ToolCallID: "c1", ToolName: "write_file"}); err != nil {
+		t.Fatal(err)
+	}
+
+	dec := NewApprovalCoordinator(store, sched)
+	// Fire once, in the loop's age check, i.e. exactly in the list→decide window:
+	// inject a competing human approval so the sweep's own deny then loses the
+	// race and hits "already decided".
+	var raced bool
+	racingNow := func() time.Time {
+		if !raced {
+			raced = true
+			if _, err := dec.Decide(context.Background(), "t1", approval.TicketID("t1", "c1"), approval.ApprovalApproved); err != nil {
+				t.Fatalf("inject competing decision: %v", err)
+			}
+		}
+		return time.Now().Add(10 * time.Minute) // far future -> stale, so the sweep tries to deny
+	}
+	job := NewTimeoutSweepJob(store, dec, 5*time.Minute, racingNow, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err := job(context.Background()); err != nil {
+		t.Fatalf("sweep racing a concurrent decision: want nil (benign already-decided), got %v", err)
+	}
+
+	// The competing approval stands — the sweep must not have overwritten it to
+	// denied.
+	got, _, err := store.Get("s1", approval.TicketID("t1", "c1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != approval.ApprovalApproved {
+		t.Fatalf("ticket status = %s, want approved (competing decision preserved)", got.Status)
+	}
+	// And the winning decision resumed the task, exactly as intended.
+	if st, _, err := sched.Get(context.Background(), "t1"); err != nil || st.Status != domain.TaskRunning {
+		t.Fatalf("task after tolerated race = %v (err=%v), want running", st.Status, err)
+	}
+}
+
 // TestTimeoutSweepDisabledWhenTTLNonPositive covers the documented "ttl<=0
 // disables the sweep" contract: the job must return nil immediately without
 // listing or deciding anything, leaving pending tickets untouched.
