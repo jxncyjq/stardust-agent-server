@@ -14,7 +14,7 @@ import (
 // CheckpointSchemaVersion versions the on-disk checkpoint format. Load rejects a
 // checkpoint whose version it does not recognise (fail-loud) rather than
 // half-decoding a future/older layout and resuming a task from wrong state.
-const CheckpointSchemaVersion = 1
+const CheckpointSchemaVersion = 2
 
 // checkpointFileName is the single per-session checkpoint file, per design §4.0.
 const checkpointFileName = "task-state.json"
@@ -32,10 +32,14 @@ type ToolEntrySnapshot struct {
 // boundary — PendingCalls are the tool calls not yet executed when the runtime
 // suspended.
 type Checkpoint struct {
-	SchemaVersion    int                 `json:"schema_version"`
-	TaskID           string              `json:"task_id"`
-	AgentID          string              `json:"agent_id"`
-	SessionKey       string              `json:"session_key"`
+	SchemaVersion int    `json:"schema_version"`
+	TaskID        string `json:"task_id"`
+	AgentID       string `json:"agent_id"`
+	SessionKey    string `json:"session_key"`
+	// Mode is the task's working mode (manual|plan|auto) captured at suspend time,
+	// so a resumed run re-applies the same gating (e.g. Manual still gates sensitive
+	// tools) instead of losing it and executing side effects unguarded.
+	Mode             string              `json:"mode,omitempty"`
 	BasePrompt       string              `json:"base_prompt"`
 	Round            int                 `json:"round"`
 	ToolEntries      []ToolEntrySnapshot `json:"tool_entries"`

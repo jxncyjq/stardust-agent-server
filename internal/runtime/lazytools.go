@@ -158,6 +158,15 @@ func stringifyArgument(value any) string {
 // ToolResult so the model can see and correct them, rather than a Go error that
 // would abort the task.
 func (r *Runtime) dispatchToolCall(ctx context.Context, agent domain.Agent, task domain.Task, call domain.ToolCall, tools *tool.Registry) (domain.ToolResult, error) {
+	if r.toolGate != nil {
+		allow, err := r.toolGate.Resolve(ctx, task, call, tools)
+		if err != nil {
+			return domain.ToolResult{}, fmt.Errorf("gate resolve for task %s call %s: %w", task.ID, call.ID, err)
+		}
+		if !allow {
+			return domain.ToolResult{CallID: call.ID, Success: false, Error: "tool call denied by human approver"}, nil
+		}
+	}
 	if !r.lazyTools || !isMetaTool(call.Name) {
 		return tools.Execute(ctx, agent, call)
 	}

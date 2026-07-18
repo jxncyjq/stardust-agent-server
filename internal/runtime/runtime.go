@@ -25,6 +25,15 @@ var (
 	// coordinator maps this to TaskSuspended (not TaskFailed) and the goroutine
 	// is released. A later run (this process or after restart) auto-resumes.
 	ErrSuspended = errors.New("runtime suspended pending decision")
+	// ErrManualGateMissing is returned by RunTask when a Manual-mode task reaches a
+	// runtime whose approval gate is not wired (nil toolGate or nil checkpoints).
+	// Manual mode's entire safety guarantee is that sensitive tool calls suspend for
+	// human approval; a nil gate never suspends and a nil checkpoint store cannot
+	// persist a suspension, so either would let the task silently execute sensitive
+	// tools and bypass approval. This is an invariant violation (a misconfigured
+	// runtime path), not a task-content failure: we fail loud here rather than
+	// degrade to Auto behaviour. See CLAUDE.md §0 fail-loud.
+	ErrManualGateMissing = errors.New("manual mode requires an approval gate: runtime has nil toolGate or nil checkpoints")
 )
 
 const defaultMaxToolRounds = 4
@@ -38,7 +47,11 @@ type ContextBuilder interface {
 // approval in Manual mode). A nil gate never suspends — Auto behaviour. M1b ships
 // only the seam; the approval-backed implementation lands in M2.
 type ToolGate interface {
-	ShouldSuspend(ctx context.Context, task domain.Task, calls []domain.ToolCall) (bool, error)
+	// ShouldSuspend reports whether the runtime must suspend before executing this
+	// round's calls. tools is the run's effective registry (for sensitivity lookup).
+	ShouldSuspend(ctx context.Context, task domain.Task, calls []domain.ToolCall, tools *tool.Registry) (bool, error)
+	// Resolve reports, at dispatch time for one call, whether it may execute.
+	Resolve(ctx context.Context, task domain.Task, call domain.ToolCall, tools *tool.Registry) (allow bool, err error)
 }
 
 type Config struct {
@@ -227,6 +240,16 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		return domain.TaskRun{}, ErrMaasUnavailable
 	}
 
+	// Manual-mode invariant: the approval gate must be wired before we run a single
+	// round. Today every runtime that can carry a Manual task (default + resolver-built
+	// per-agent) wires both, and delegated children are always Auto — but that safety is
+	// implicit. Assert it loudly so any future path (a child inheriting Mode=manual, a new
+	// runtime constructor) that reaches here without a gate fails fast instead of silently
+	// executing sensitive tools and bypassing human approval.
+	if task.Mode == domain.ModeManual && (r.toolGate == nil || r.checkpoints == nil) {
+		return domain.TaskRun{}, fmt.Errorf("run task %s: %w", task.ID, ErrManualGateMissing)
+	}
+
 	// Resume path: a persisted checkpoint means this task previously suspended.
 	// Rebuild loop state from disk and re-enter the loop with the pending calls,
 	// skipping the initial prompt build + generate.
@@ -236,6 +259,10 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 			return domain.TaskRun{}, fmt.Errorf("load checkpoint for task %s: %w", task.ID, err)
 		}
 		if ok {
+			// The checkpoint is authoritative for the resumed run's mode: a caller
+			// (coordinator resume) may hand us a task rebuilt from the scheduler; the
+			// mode captured at suspend time must win so gating stays consistent.
+			task.Mode = cp.Mode
 			st := loopState{
 				started:          started,
 				basePrompt:       cp.BasePrompt,
@@ -352,7 +379,7 @@ func (r *Runtime) checkSuspend(ctx context.Context, task domain.Task, st loopSta
 	if r.toolGate == nil || r.checkpoints == nil {
 		return false, nil
 	}
-	suspend, err := r.toolGate.ShouldSuspend(ctx, task, st.resp.ToolCalls)
+	suspend, err := r.toolGate.ShouldSuspend(ctx, task, st.resp.ToolCalls, st.tools)
 	if err != nil {
 		return false, fmt.Errorf("tool gate decision for task %s: %w", task.ID, err)
 	}
@@ -364,6 +391,7 @@ func (r *Runtime) checkSuspend(ctx context.Context, task domain.Task, st loopSta
 		TaskID:           task.ID,
 		AgentID:          task.AgentID,
 		SessionKey:       sessionKeyForTask(task),
+		Mode:             task.Mode,
 		BasePrompt:       st.basePrompt,
 		Round:            st.round,
 		ToolEntries:      snapshotToolEntries(st.toolCtx),

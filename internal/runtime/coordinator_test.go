@@ -12,6 +12,7 @@ import (
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/evolution"
 	"github.com/stardust/legion-agent/internal/quality"
+	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/task"
 )
 
@@ -541,3 +542,26 @@ func (r *staticTaskRunnerResolver) ResolveTaskRunner(ctx context.Context, task d
 }
 
 var errStaticResolver = errors.New("static resolver error")
+
+func TestRecoverSuspendedRestoresMode(t *testing.T) {
+	dir := t.TempDir()
+	store := sessionstate.NewStore(dir)
+	if err := store.Save(sessionstate.Checkpoint{
+		SchemaVersion: sessionstate.CheckpointSchemaVersion,
+		TaskID:        "t1", AgentID: "a1", SessionKey: "s1", Mode: domain.ModeManual,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	sched := task.NewScheduler()
+	c := NewCoordinator(CoordinatorConfig{Agent: domain.Agent{ID: "a1"}, Scheduler: sched, Locks: task.NewLockStore()})
+	if _, err := c.RecoverSuspended(context.Background(), store); err != nil {
+		t.Fatalf("RecoverSuspended: %v", err)
+	}
+	got, ok, err := sched.Get(context.Background(), "t1")
+	if err != nil || !ok {
+		t.Fatalf("Get: ok=%v err=%v", ok, err)
+	}
+	if got.Mode != domain.ModeManual {
+		t.Fatalf("recovered task Mode = %q, want manual", got.Mode)
+	}
+}

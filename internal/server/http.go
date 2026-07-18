@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/stardust/legion-agent/internal/approval"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/observability"
 	"github.com/stardust/legion-agent/internal/port"
@@ -72,6 +73,14 @@ type SkillManager interface {
 	Uninstall(ctx context.Context, name string) error
 }
 
+// ApprovalDecider records a human approve/deny decision on a Manual-mode tool
+// approval ticket and returns the updated ticket. It is satisfied by
+// manualgate.ApprovalCoordinator; the server package depends only on this
+// narrow interface to stay decoupled from the manualgate implementation.
+type ApprovalDecider interface {
+	Decide(ctx context.Context, taskID, ticketID string, status approval.ApprovalStatus) (approval.ToolApproval, error)
+}
+
 type Config struct {
 	Tasks               TaskStore
 	Agents              AgentCatalog
@@ -85,6 +94,7 @@ type Config struct {
 	Sessions            SessionStore
 	Messages            MessageStore
 	Skills              SkillManager
+	ToolApprovals       ApprovalDecider
 	Readiness           ReadinessChecker
 	AdminToken          string
 	PublicHealthEnabled bool
@@ -108,6 +118,7 @@ type HTTPServer struct {
 	sessions            SessionStore
 	messages            MessageStore
 	skills              SkillManager
+	toolApprovals       ApprovalDecider
 	readiness           ReadinessChecker
 	adminToken          string
 	publicHealthEnabled bool
@@ -148,6 +159,7 @@ func NewHTTPServer(cfg Config) *HTTPServer {
 		sessions:            cfg.Sessions,
 		messages:            cfg.Messages,
 		skills:              cfg.Skills,
+		toolApprovals:       cfg.ToolApprovals,
 		readiness:           cfg.Readiness,
 		adminToken:          cfg.AdminToken,
 		publicHealthEnabled: cfg.PublicHealthEnabled,
@@ -224,6 +236,8 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleListTasks(rec, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/tasks/") && strings.HasSuffix(r.URL.Path, "/result"):
 		s.handleGetTaskResult(rec, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/tasks/") && strings.Contains(r.URL.Path, "/approvals/"):
+		s.handleDecideApproval(rec, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/tasks/"):
 		s.handleGetTask(rec, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/workflows":
@@ -1248,6 +1262,54 @@ func firstNonEmptyString(values ...string) string {
 
 func newAgentMessageID() string {
 	return "http-msg-" + time.Now().UTC().Format("20060102-150405.000000000")
+}
+
+// handleDecideApproval records a human approve/deny on a Manual-mode tool
+// approval ticket and lets the coordinator resume the task. Path:
+// POST /v1/tasks/{taskID}/approvals/{ticketID}, body {"decision":"approve"|"deny"}.
+func (s *HTTPServer) handleDecideApproval(w http.ResponseWriter, r *http.Request) {
+	if s.toolApprovals == nil {
+		writeError(w, http.StatusServiceUnavailable, "approval store is unavailable")
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, "/v1/tasks/")
+	parts := strings.SplitN(rest, "/approvals/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		writeError(w, http.StatusBadRequest, "malformed approval path")
+		return
+	}
+	taskID, ticketID := parts[0], parts[1]
+	var req struct {
+		Decision string `json:"decision"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid approval request")
+		return
+	}
+	var status approval.ApprovalStatus
+	switch req.Decision {
+	case "approve":
+		status = approval.ApprovalApproved
+	case "deny":
+		status = approval.ApprovalDenied
+	default:
+		writeError(w, http.StatusBadRequest, "decision must be approve or deny")
+		return
+	}
+	decided, err := s.toolApprovals.Decide(r.Context(), taskID, ticketID, status)
+	if err != nil {
+		if errors.Is(err, approval.ErrTicketNotFound) {
+			writeError(w, http.StatusNotFound, "approval ticket not found")
+			return
+		}
+		if errors.Is(err, approval.ErrTicketAlreadyDecided) {
+			writeError(w, http.StatusConflict, "approval ticket already decided")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "decide approval failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, decided)
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

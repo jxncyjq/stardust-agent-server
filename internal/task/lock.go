@@ -39,6 +39,24 @@ func (s *LockStore) TryLock(ctx context.Context, taskID string, ownerID string, 
 	return true, nil
 }
 
+// Unlock releases a task lock iff ownerID currently holds it, returning whether a
+// release happened. A lock held by someone else (or already expired/absent) is
+// left untouched and reported as (false, nil): releasing another owner's lock
+// would let two workers run the same task.
+func (s *LockStore) Unlock(ctx context.Context, taskID string, ownerID string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	lock, ok := s.locks[taskID]
+	if !ok || lock.OwnerID != ownerID {
+		return false, nil
+	}
+	delete(s.locks, taskID)
+	return true, nil
+}
+
 func (s *LockStore) ReapExpired(ctx context.Context, now time.Time) (int, error) {
 	if err := ctx.Err(); err != nil {
 		return 0, err
