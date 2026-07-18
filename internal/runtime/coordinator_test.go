@@ -43,6 +43,30 @@ func newTestCoordinator(t *testing.T, sched *task.Scheduler, workers int) *Coord
 	})
 }
 
+// newTestCoordinatorWithRunner is like newTestCoordinator but lets a test inject
+// a specific TaskRunner (e.g. one that returns ErrSuspended).
+func newTestCoordinatorWithRunner(t *testing.T, sched *task.Scheduler, runner TaskRunner) *Coordinator {
+	t.Helper()
+	return NewCoordinator(CoordinatorConfig{
+		Agent: domain.Agent{
+			ID:        "default-agent",
+			CompanyID: "company-1",
+			Role:      "developer",
+			Status:    domain.AgentActive,
+		},
+		Scheduler:  sched,
+		Locks:      task.NewLockStore(),
+		Runtime:    runner,
+		Reviewer:   quality.NewAegisReviewer(),
+		Evaluator:  quality.NewEvalEngine(3),
+		Approvals:  approval.NewService(),
+		Audit:      adapter.NewMemoryAuditLog(),
+		Events:     adapter.NewMemoryEventBus(),
+		LockTTL:    time.Minute,
+		MaxWorkers: 4,
+	})
+}
+
 // awaitTerminal polls the scheduler until the task reaches a terminal or
 // suspended status (or times out), so tests can assert the async pipeline's
 // outcome after Heartbeat dispatches it.
