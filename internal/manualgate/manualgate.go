@@ -113,7 +113,7 @@ func (g *ManualToolGate) ShouldSuspend(ctx context.Context, task domain.Task, ca
 		}); err != nil {
 			return false, fmt.Errorf("open approval for task %s call %s: %w", task.ID, call.ID, err)
 		}
-		if g.sink != nil {
+		if !found && g.sink != nil {
 			g.sink.ApprovalPending(ctx, task.ID, ticketID, name, call.Arguments)
 		}
 		needApproval = true

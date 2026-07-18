@@ -65,6 +65,35 @@ func TestShouldSuspendEmitsApprovalPending(t *testing.T) {
 	}
 }
 
+// TestShouldSuspendDoesNotReEmitForExistingPendingTicket covers T3 Minor#2:
+// store.Open is idempotent and returns success for an already-open pending
+// ticket, so guarding the sink notification on "Open succeeded" (rather than
+// on "found" reporting no prior ticket) re-fires approval_pending for a call
+// ID that was already pending — the GUI would show the approval prompt
+// twice for one ticket. ApprovalEventSink's contract says ApprovalPending
+// "fires once per newly opened pending ticket", so two ShouldSuspend passes
+// over the same task/call ID must record the notification only once.
+func TestShouldSuspendDoesNotReEmitForExistingPendingTicket(t *testing.T) {
+	store := approval.NewToolGateStore(t.TempDir())
+	sink := &spyApprovalSink{}
+	gate := New(store, WithApprovalSink(sink))
+	tools := gateRegistry()
+	task := domain.Task{ID: "task-1", SessionID: "s1", Mode: domain.ModeManual}
+	call := domain.ToolCall{ID: "call-1", Name: "write_file", Arguments: map[string]string{"path": "/tmp/x"}}
+
+	if _, err := gate.ShouldSuspend(context.Background(), task, []domain.ToolCall{call}, tools); err != nil {
+		t.Fatalf("ShouldSuspend() #1 error = %v, want nil", err)
+	}
+	if _, err := gate.ShouldSuspend(context.Background(), task, []domain.ToolCall{call}, tools); err != nil {
+		t.Fatalf("ShouldSuspend() #2 error = %v, want nil", err)
+	}
+
+	wantTicket := approval.TicketID("task-1", "call-1")
+	if len(sink.pending) != 1 || sink.pending[0] != wantTicket {
+		t.Fatalf("sink.pending = %v, want exactly one [%s] (no re-emit for existing pending ticket)", sink.pending, wantTicket)
+	}
+}
+
 func TestShouldSuspendOnSensitiveDirectCall(t *testing.T) {
 	store := approval.NewToolGateStore(t.TempDir())
 	g := New(store)
