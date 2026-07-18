@@ -20,6 +20,7 @@ import (
 	"github.com/stardust/legion-agent/internal/observability"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/quality"
+	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/skill"
 	"github.com/stardust/legion-agent/internal/storage"
 	"github.com/stardust/legion-agent/internal/workflow"
@@ -101,10 +102,15 @@ type Config struct {
 	AdminToken          string
 	PublicHealthEnabled bool
 	RequestIDHeader     string
-	Logger              *slog.Logger
-	Metrics             *observability.MetricsRecorder
-	Diagnostics         *observability.Diagnostics
-	Traces              *observability.TraceRecorder
+	// WorkspaceRoot is the base directory for a session's on-disk state when
+	// the session carries no working_dir (sessionstate.SessionBase's
+	// workspaceRoot argument). Session deletion joins it with the session key
+	// to locate the directory to remove alongside the DB row (spec §4.0).
+	WorkspaceRoot string
+	Logger        *slog.Logger
+	Metrics       *observability.MetricsRecorder
+	Diagnostics   *observability.Diagnostics
+	Traces        *observability.TraceRecorder
 }
 
 type HTTPServer struct {
@@ -126,6 +132,7 @@ type HTTPServer struct {
 	adminToken          string
 	publicHealthEnabled bool
 	requestIDHeader     string
+	workspaceRoot       string
 	logger              *slog.Logger
 	metrics             *observability.MetricsRecorder
 	diagnostics         *observability.Diagnostics
@@ -168,6 +175,7 @@ func NewHTTPServer(cfg Config) *HTTPServer {
 		adminToken:          cfg.AdminToken,
 		publicHealthEnabled: cfg.PublicHealthEnabled,
 		requestIDHeader:     requestIDHeader,
+		workspaceRoot:       cfg.WorkspaceRoot,
 		logger:              observability.WithComponent(logger, "server"),
 		metrics:             cfg.Metrics,
 		diagnostics:         cfg.Diagnostics,
@@ -441,10 +449,11 @@ func (s *HTTPServer) handlePatchSession(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, session)
 }
 
-// handleDeleteSession removes a session and its conversation turns. A session id
-// that does not exist maps to a 404 via storage.ErrAgentSessionNotFound rather
-// than being reported as a no-op success, so the client learns the delete had no
-// target. Success returns 204 No Content.
+// handleDeleteSession removes a session, its conversation turns, and the
+// on-disk session directory (spec §4.0: DELETE cascades to the state a session
+// left under sessionstate.SessionBase). A session id that does not exist maps
+// to a 404 rather than being reported as a no-op success, so the client learns
+// the delete had no target. Success returns 204 No Content.
 func (s *HTTPServer) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	if s.sessions == nil {
 		writeError(w, http.StatusServiceUnavailable, "session store is unavailable")
@@ -455,6 +464,18 @@ func (s *HTTPServer) handleDeleteSession(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "session id is required")
 		return
 	}
+	// The session's working_dir determines where its directory lives
+	// (sessionstate.SessionBase), and it is only readable before the DB row is
+	// gone, so it must be fetched ahead of the delete.
+	session, ok, err := s.sessions.GetAgentSession(r.Context(), sessionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("load session: %v", err))
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", sessionID))
+		return
+	}
 	if err := s.sessions.DeleteAgentSession(r.Context(), sessionID); err != nil {
 		if errors.Is(err, storage.ErrAgentSessionNotFound) {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", sessionID))
@@ -463,8 +484,18 @@ func (s *HTTPServer) handleDeleteSession(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("delete session: %v", err))
 		return
 	}
+	sessionDir := sessionstate.SessionDir(sessionstate.SessionBase(s.workspaceRoot, session.WorkingDir), sessionID)
+	if err := os.RemoveAll(sessionDir); err != nil {
+		// Fail-loud: the DB row is already gone, but a directory the delete
+		// promised to remove is still on disk. Do not report success — log
+		// and return 500 rather than silently leaving orphaned state.
+		observability.WithRequestID(s.logger, requestIDFromContext(r.Context())).Error("delete session directory failed",
+			"session_id", sessionID, "dir", sessionDir, "error", err)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("delete session directory %q: %v", sessionDir, err))
+		return
+	}
 	observability.WithRequestID(s.logger, requestIDFromContext(r.Context())).Info("session deleted",
-		"session_id", sessionID)
+		"session_id", sessionID, "dir", sessionDir)
 	w.WriteHeader(http.StatusNoContent)
 }
 

@@ -2115,6 +2115,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		WorkflowEvents:      workflowEvents,
 		PlatformEvents:      platformEvents,
 		Readiness:           readiness,
+		WorkspaceRoot:       workspaceRoot,
 		AdminToken:          cfg.Server.AdminToken,
 		PublicHealthEnabled: cfg.Server.PublicHealthEnabled,
 		RequestIDHeader:     cfg.Server.RequestIDHeader,

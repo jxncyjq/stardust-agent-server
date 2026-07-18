@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,6 +15,7 @@ import (
 	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/approval"
 	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/storage"
 	"github.com/stardust/legion-agent/internal/task"
 	"github.com/stardust/legion-agent/internal/workflow"
@@ -546,6 +548,49 @@ func TestHTTPServerDeleteMissingSessionReturns404(t *testing.T) {
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusNotFound {
 		t.Fatalf("DELETE missing session status = %d, want %d body=%s", rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+}
+
+func TestDeleteSessionRemovesSessionDir(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := openServerTestRepo(t)
+	workingDir := t.TempDir()
+	session := domain.AgentSession{
+		ID:         "session-delete-dir-1",
+		CompanyID:  "company-1",
+		AgentID:    "agent-1",
+		WorkingDir: workingDir,
+		CreatedAt:  time.Now(),
+		UpdatedAt:  time.Now(),
+	}
+	if err := repo.SaveAgentSession(ctx, session); err != nil {
+		t.Fatalf("SaveAgentSession error = %v, want nil", err)
+	}
+
+	// Populate the session's on-disk directory (spec §4.0: working_dir-bound
+	// sessions keep state under <working_dir>/.stardust/session/<id>) with a
+	// marker file, so the assertion proves an actual directory removal rather
+	// than a no-op against a directory that never existed.
+	sessionDir := sessionstate.SessionDir(sessionstate.SessionBase("", session.WorkingDir), session.ID)
+	if err := os.MkdirAll(sessionDir, 0o755); err != nil {
+		t.Fatalf("MkdirAll(%q) error = %v, want nil", sessionDir, err)
+	}
+	marker := filepath.Join(sessionDir, "marker.txt")
+	if err := os.WriteFile(marker, []byte("x"), 0o644); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", marker, err)
+	}
+
+	srv := NewHTTPServer(Config{Sessions: repo})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodDelete, "/v1/sessions/"+session.ID, nil)
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE session status = %d, want %d body=%s", rec.Code, http.StatusNoContent, rec.Body.String())
+	}
+
+	if _, err := os.Stat(sessionDir); !os.IsNotExist(err) {
+		t.Fatalf("session dir %q still exists after delete (stat err = %v), want removed", sessionDir, err)
 	}
 }
 
