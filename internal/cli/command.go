@@ -1633,6 +1633,68 @@ type ServeResult struct {
 	Close    func()
 }
 
+// defaultTaskRunner is the agentruntime.TaskRunner the coordinator dispatches
+// a task to when no per-agent resolver runner is resolved for it (an empty
+// task.AgentID, or an AgentID missing from the registry — see
+// AgentRuntimeResolver.ResolveTaskRunner). Before Task 7 (M3a) this path used
+// a single *agentruntime.Runtime whose tool registry (and thus its
+// WorkspacePathGuard sandbox root) was built once, at serve assembly time,
+// rooted at cfg.ContextFiles.Root. That pinned every default-agent task to
+// one fixed sandbox regardless of task.WorkingDir, unlike the per-agent path
+// (agentToolRoot in the runtime package), which already re-resolves the
+// sandbox root on every ResolveTaskRunner call.
+//
+// defaultTaskRunner closes that gap: RunTask rebuilds the tool registry fresh
+// on every call, rooted at task.WorkingDir when the task carries one
+// (falling back to contextRoot otherwise) — the same task.WorkingDir-first
+// priority as agentToolRoot. Every other runtime setting (model, audit,
+// events, cognitive context builder, tool-round budget, checkpoints, tool
+// gate) is fixed at serve assembly and reused unchanged across calls via
+// runtimeCfg; only Tools is overwritten per call.
+type defaultTaskRunner struct {
+	// runtimeCfg is the template runtime configuration shared by every call;
+	// its Tools field is always overwritten with the freshly built per-task
+	// registry before constructing the runtime for that call.
+	runtimeCfg agentruntime.Config
+	// contextRoot is the sandbox root used when a task has no WorkingDir
+	// (cfg.ContextFiles.Root at serve assembly).
+	contextRoot     string
+	audit           port.AuditLog
+	taskLedger      *taskledger.Ledger
+	messageStore    tool.AgentMessageStore
+	sessionSearcher tool.MessageSearcher
+	webOptions      tool.WebToolOptions
+	maasResolver    agentruntime.ModelResolver
+}
+
+// RunTask builds a fresh read-only workspace tool registry rooted at
+// task.WorkingDir (or contextRoot, when the task has none), registers on it
+// every tool the pre-M3a fixed default registry carried — task ledger, agent
+// messaging, web, session search, MoA consult — plus delegate_task (the
+// default runtime is always a root orchestrator), then runs the task on a
+// freshly constructed *agentruntime.Runtime built from runtimeCfg with that
+// registry. Constructing a fresh Runtime per call is cheap (a struct literal;
+// no I/O), so this trades a small per-call allocation for a per-task sandbox
+// root — an intentional trade given the tool sandbox is a security boundary
+// (CLAUDE.md fail-loud/security posture).
+func (d *defaultTaskRunner) RunTask(ctx context.Context, agent domain.Agent, task domain.Task) (domain.TaskRun, error) {
+	root := strings.TrimSpace(task.WorkingDir)
+	if root == "" {
+		root = d.contextRoot
+	}
+	tools := tool.NewReadOnlyWorkspaceRegistry(root, d.audit)
+	tool.RegisterTaskLedgerTools(tools, d.taskLedger)
+	tool.RegisterAgentMessageTools(tools, d.messageStore)
+	tool.RegisterWebTools(tools, d.webOptions)
+	tool.RegisterSessionSearchTool(tools, d.sessionSearcher)
+	agentruntime.RegisterMoAConsultTool(tools, d.maasResolver)
+	runtimeCfg := d.runtimeCfg
+	runtimeCfg.Tools = tools
+	rt := agentruntime.NewRuntime(runtimeCfg)
+	rt.RegisterDelegateTaskTool(tools)
+	return rt.RunTask(ctx, agent, task)
+}
+
 // webToolOptions maps the web config block onto the tool package options.
 func webToolOptions(cfg config.WebToolConfig) tool.WebToolOptions {
 	return tool.WebToolOptions{
@@ -1834,13 +1896,6 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		closeStore()
 		return ServeResult{}, err
 	}
-	defaultTools := tool.NewReadOnlyWorkspaceRegistry(cfg.ContextFiles.Root, auditLog)
-	tool.RegisterTaskLedgerTools(defaultTools, taskLedger)
-	tool.RegisterAgentMessageTools(defaultTools, messageStore)
-	tool.RegisterWebTools(defaultTools, webToolOptions(cfg.Web))
-	tool.RegisterSessionSearchTool(defaultTools, sessionSearcher)
-	agentruntime.RegisterMoAConsultTool(defaultTools, maasProfileResolver{cfg: cfg.Maas})
-
 	// Cognitive evolution wiring (L4 memory / L5 learning). The capability
 	// memory store is shared: the GEP cycle (L5) solidifies learned genes into
 	// it, and the cognitive Core (L4) reads them back when building context, so
@@ -1875,21 +1930,32 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		}).WithUsage(skillUsage, time.Now))
 	}
 
-	// The default runtime is a root orchestrator, so it may delegate. Register
-	// delegate_task on its tool registry after construction (a leaf child would
-	// not register it, preventing unbounded recursion).
-	defaultRuntime := agentruntime.NewRuntime(agentruntime.Config{
-		Maas:           defaultMaas,
-		Audit:          auditLog,
-		Events:         workflowEvents,
-		ContextBuilder: defaultCore,
-		Tools:          defaultTools,
-		MaxToolRounds:  cfg.Runtime.MaxToolRounds,
-		LazyTools:      cfg.Runtime.LazyTools,
-		Checkpoints:    checkpointStore,
-		ToolGate:       manualGate,
-	})
-	defaultRuntime.RegisterDelegateTaskTool(defaultTools)
+	// The default task runner rebuilds its tool registry (and thus the
+	// WorkspacePathGuard sandbox root) on every RunTask call, rooted at
+	// task.WorkingDir when the task carries one (falling back to
+	// cfg.ContextFiles.Root otherwise) — see defaultTaskRunner's doc comment
+	// for why (Task 7, M3a). Everything else (model, audit, events, cognitive
+	// context builder, checkpoints, tool gate) is fixed at serve assembly and
+	// shared across every call, same as before.
+	defaultRunner := &defaultTaskRunner{
+		runtimeCfg: agentruntime.Config{
+			Maas:           defaultMaas,
+			Audit:          auditLog,
+			Events:         workflowEvents,
+			ContextBuilder: defaultCore,
+			MaxToolRounds:  cfg.Runtime.MaxToolRounds,
+			LazyTools:      cfg.Runtime.LazyTools,
+			Checkpoints:    checkpointStore,
+			ToolGate:       manualGate,
+		},
+		contextRoot:     cfg.ContextFiles.Root,
+		audit:           auditLog,
+		taskLedger:      taskLedger,
+		messageStore:    messageStore,
+		sessionSearcher: sessionSearcher,
+		webOptions:      webToolOptions(cfg.Web),
+		maasResolver:    maasProfileResolver{cfg: cfg.Maas},
+	}
 	coordinator := agentruntime.NewCoordinator(agentruntime.CoordinatorConfig{
 		Agent: domain.Agent{
 			ID:        "default-agent",
@@ -1899,7 +1965,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		},
 		Scheduler:          liveTasks,
 		Locks:              task.NewLockStore(),
-		Runtime:            defaultRuntime,
+		Runtime:            defaultRunner,
 		TaskRunnerResolver: resolver,
 		Reviewer:           quality.NewAegisReviewer(),
 		Evaluator:          quality.NewEvalEngine(3),

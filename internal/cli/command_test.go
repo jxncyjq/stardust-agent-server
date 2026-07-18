@@ -16,16 +16,19 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/agentregistry"
 	"github.com/stardust/legion-agent/internal/app"
 	"github.com/stardust/legion-agent/internal/config"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/quality"
+	agentruntime "github.com/stardust/legion-agent/internal/runtime"
 	"github.com/stardust/legion-agent/internal/sessioncache"
 	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/storage"
 	"github.com/stardust/legion-agent/internal/taskledger"
+	"github.com/stardust/legion-agent/internal/tool"
 )
 
 func TestRootAcceptsGoRunSeparator(t *testing.T) {
@@ -1744,4 +1747,113 @@ func (m *cliCaptureMaas) Generate(ctx context.Context, req port.InferenceRequest
 	}
 	m.prompt = req.Prompt
 	return port.InferenceResponse{Text: m.response}, nil
+}
+
+// toolProbingMaas issues a single read_file tool call for path on its first
+// Generate call, then stops (no further tool calls), capturing the prompt the
+// runtime built for the following round — which renders the tool result
+// ("- <call> success: <content>" or "- <call> failed: <error>", see
+// runtime.renderToolResult) — so a test can observe whether the call actually
+// reached the file (sandbox allowed it) or was rejected by
+// WorkspacePathGuard, without a real inference backend.
+type toolProbingMaas struct {
+	path       string
+	rounds     int
+	lastPrompt string
+}
+
+func (m *toolProbingMaas) Generate(ctx context.Context, req port.InferenceRequest) (port.InferenceResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return port.InferenceResponse{}, err
+	}
+	m.rounds++
+	m.lastPrompt = req.Prompt
+	if m.rounds == 1 {
+		return port.InferenceResponse{ToolCalls: []domain.ToolCall{{
+			ID:        "probe-1",
+			Name:      "read_file",
+			Arguments: map[string]string{"path": m.path},
+		}}}, nil
+	}
+	return port.InferenceResponse{Text: "done"}, nil
+}
+
+// TestDefaultTaskRunnerSandboxesToolsToTaskWorkingDir guards Task 7's other
+// half (M3a): the default (no-agent) task path must rebuild its tool
+// registry per task, rooted at task.WorkingDir when set, instead of staying
+// pinned to the fixed contextRoot built once at serve assembly. It drives a
+// real read_file tool call through defaultTaskRunner.RunTask (no mocked tool
+// dispatch) and asserts on the WorkspacePathGuard outcome rendered into the
+// next-round prompt: a path inside task.WorkingDir must succeed even though
+// it is outside contextRoot, and a path inside contextRoot (but outside
+// task.WorkingDir) must be rejected — proving the sandbox root really moved
+// to task.WorkingDir rather than merely also allowing it.
+func TestDefaultTaskRunnerSandboxesToolsToTaskWorkingDir(t *testing.T) {
+	t.Parallel()
+
+	contextRoot := t.TempDir()
+	writeCLIFile(t, contextRoot, "root-only.txt", "root-content")
+	workingDir := t.TempDir()
+	writeCLIFile(t, workingDir, "task-only.txt", "task-content")
+
+	newRunner := func() *defaultTaskRunner {
+		return &defaultTaskRunner{
+			runtimeCfg: agentruntime.Config{
+				Events: adapter.NewMemoryEventBus(),
+			},
+			contextRoot: contextRoot,
+			audit:       adapter.NewMemoryAuditLog(),
+			webOptions:  tool.WebToolOptions{},
+		}
+	}
+
+	t.Run("task working dir file is reachable", func(t *testing.T) {
+		t.Parallel()
+		maas := &toolProbingMaas{path: filepath.Join(workingDir, "task-only.txt")}
+		runner := newRunner()
+		runner.runtimeCfg.Maas = maas
+		if _, err := runner.RunTask(context.Background(), domain.Agent{}, domain.Task{
+			ID:         "task-default-wd",
+			WorkingDir: workingDir,
+			Input:      "read the task file",
+		}); err != nil {
+			t.Fatalf("RunTask(task.WorkingDir set) error = %v, want nil", err)
+		}
+		if !strings.Contains(maas.lastPrompt, "success: task-content") {
+			t.Fatalf("RunTask(task.WorkingDir set) prompt = %q, want tool success reading task-only.txt", maas.lastPrompt)
+		}
+	})
+
+	t.Run("context root file is unreachable once working dir is set", func(t *testing.T) {
+		t.Parallel()
+		maas := &toolProbingMaas{path: filepath.Join(contextRoot, "root-only.txt")}
+		runner := newRunner()
+		runner.runtimeCfg.Maas = maas
+		if _, err := runner.RunTask(context.Background(), domain.Agent{}, domain.Task{
+			ID:         "task-default-wd-escape",
+			WorkingDir: workingDir,
+			Input:      "try to read outside the sandbox",
+		}); err != nil {
+			t.Fatalf("RunTask(escape attempt) error = %v, want nil", err)
+		}
+		if !strings.Contains(maas.lastPrompt, "failed: "+port.ErrPathOutsideWorkspace.Error()) {
+			t.Fatalf("RunTask(escape attempt) prompt = %q, want tool call rejected as outside workspace", maas.lastPrompt)
+		}
+	})
+
+	t.Run("falls back to contextRoot when task has no working dir", func(t *testing.T) {
+		t.Parallel()
+		maas := &toolProbingMaas{path: filepath.Join(contextRoot, "root-only.txt")}
+		runner := newRunner()
+		runner.runtimeCfg.Maas = maas
+		if _, err := runner.RunTask(context.Background(), domain.Agent{}, domain.Task{
+			ID:    "task-default-no-wd",
+			Input: "read the default root file",
+		}); err != nil {
+			t.Fatalf("RunTask(no working dir) error = %v, want nil", err)
+		}
+		if !strings.Contains(maas.lastPrompt, "success: root-content") {
+			t.Fatalf("RunTask(no working dir) prompt = %q, want tool success reading root-only.txt", maas.lastPrompt)
+		}
+	})
 }
