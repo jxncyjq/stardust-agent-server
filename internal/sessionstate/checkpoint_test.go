@@ -32,7 +32,7 @@ func TestStoreSaveLoadRoundTrip(t *testing.T) {
 	if err := store.Save(cp); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	got, ok, err := store.Load("sess-1")
+	got, ok, err := store.Load("sess-1", "")
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
@@ -52,7 +52,7 @@ func TestStoreSaveLoadRoundTrip(t *testing.T) {
 
 func TestStoreLoadAbsentReturnsFalseNoError(t *testing.T) {
 	store := NewStore(t.TempDir())
-	_, ok, err := store.Load("nope")
+	_, ok, err := store.Load("nope", "")
 	if err != nil {
 		t.Fatalf("Load absent error = %v, want nil (absence is legitimate, not a fault)", err)
 	}
@@ -71,7 +71,7 @@ func TestStoreLoadCorruptJSONFailsLoud(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, checkpointFileName), []byte("{not json"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
 	}
-	_, ok, err := store.Load("sess-bad")
+	_, ok, err := store.Load("sess-bad", "")
 	if err == nil {
 		t.Fatal("Load corrupt error = nil, want fail-loud error")
 	}
@@ -89,7 +89,7 @@ func TestStoreLoadVersionMismatchFailsLoud(t *testing.T) {
 	if err := store.Save(cp); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	_, _, err := store.Load("sess-v")
+	_, _, err := store.Load("sess-v", "")
 	if err == nil {
 		t.Fatal("Load version-mismatch error = nil, want fail-loud error")
 	}
@@ -101,10 +101,10 @@ func TestStoreDeleteRemovesCheckpoint(t *testing.T) {
 	if err := store.Save(cp); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	if err := store.Delete("sess-del"); err != nil {
+	if err := store.Delete("sess-del", ""); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
-	_, ok, err := store.Load("sess-del")
+	_, ok, err := store.Load("sess-del", "")
 	if err != nil {
 		t.Fatalf("Load after delete: %v", err)
 	}
@@ -115,7 +115,7 @@ func TestStoreDeleteRemovesCheckpoint(t *testing.T) {
 
 func TestStoreDeleteAbsentIsNoError(t *testing.T) {
 	store := NewStore(t.TempDir())
-	if err := store.Delete("never-existed"); err != nil {
+	if err := store.Delete("never-existed", ""); err != nil {
 		t.Fatalf("Delete absent = %v, want nil (idempotent)", err)
 	}
 }
@@ -162,12 +162,68 @@ func TestCheckpointRoundTripPreservesMode(t *testing.T) {
 	if err := store.Save(cp); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
-	got, ok, err := store.Load("s1")
+	got, ok, err := store.Load("s1", "")
 	if err != nil || !ok {
 		t.Fatalf("Load: ok=%v err=%v", ok, err)
 	}
 	if got.Mode != "manual" {
 		t.Fatalf("Mode = %q, want manual", got.Mode)
+	}
+}
+
+func TestCheckpointSaveLoadUnderWorkingDir(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	workingDir := t.TempDir()
+	s := NewStore(workspaceRoot)
+	cp := Checkpoint{
+		SchemaVersion: CheckpointSchemaVersion, TaskID: "t1", SessionKey: "s1",
+		WorkingDir: workingDir, BasePrompt: "p", CreatedAt: time.Unix(1, 0),
+	}
+	if err := s.Save(cp); err != nil {
+		t.Fatalf("Save error = %v, want nil", err)
+	}
+	// Physically under <workingDir>/.stardust/session/s1, NOT workspaceRoot.
+	want := filepath.Join(workingDir, ".stardust", "session", "s1", "task-state.json")
+	if _, err := os.Stat(want); err != nil {
+		t.Fatalf("checkpoint not at %q: %v", want, err)
+	}
+	got, ok, err := s.Load("s1", workingDir)
+	if err != nil || !ok {
+		t.Fatalf("Load = _, %v, %v; want found", ok, err)
+	}
+	if got.TaskID != "t1" {
+		t.Fatalf("Load TaskID = %q, want t1", got.TaskID)
+	}
+}
+
+func TestCheckpointSaveLoadWorkspaceRootWhenNoWorkingDir(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	s := NewStore(workspaceRoot)
+	cp := Checkpoint{SchemaVersion: CheckpointSchemaVersion, TaskID: "t2", SessionKey: "s2", CreatedAt: time.Unix(1, 0)}
+	if err := s.Save(cp); err != nil {
+		t.Fatalf("Save error = %v, want nil", err)
+	}
+	want := filepath.Join(workspaceRoot, "session", "s2", "task-state.json")
+	if _, err := os.Stat(want); err != nil {
+		t.Fatalf("checkpoint not at workspaceRoot %q: %v", want, err)
+	}
+	if _, ok, _ := s.Load("s2", ""); !ok {
+		t.Fatal("Load(s2, \"\") not found, want found")
+	}
+}
+
+func TestListSuspendedInScansGivenBase(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	workingDir := t.TempDir()
+	s := NewStore(workspaceRoot)
+	_ = s.Save(Checkpoint{SchemaVersion: CheckpointSchemaVersion, TaskID: "t1", SessionKey: "s1", WorkingDir: workingDir, CreatedAt: time.Unix(1, 0)})
+	base := SessionBase(workspaceRoot, workingDir)
+	got, err := s.ListSuspendedIn(base)
+	if err != nil {
+		t.Fatalf("ListSuspendedIn error = %v", err)
+	}
+	if len(got) != 1 || got[0].TaskID != "t1" {
+		t.Fatalf("ListSuspendedIn = %#v, want 1 checkpoint t1", got)
 	}
 }
 
@@ -182,7 +238,7 @@ func TestLoadRejectsV1Checkpoint(t *testing.T) {
 		[]byte(`{"schema_version":1,"task_id":"t1","session_key":"s1"}`), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := NewStore(dir).Load("s1"); err == nil {
+	if _, _, err := NewStore(dir).Load("s1", ""); err == nil {
 		t.Fatal("Load of v1 checkpoint: want fail-loud error, got nil")
 	}
 }

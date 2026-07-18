@@ -62,7 +62,7 @@ func TestSuspendRestartResumeEndToEnd(t *testing.T) {
 	if run.Result != "final answer" {
 		t.Errorf("resumed result = %q, want %q", run.Result, "final answer")
 	}
-	if _, ok, _ := store2.Load("sess-1"); ok {
+	if _, ok, _ := store2.Load("sess-1", ""); ok {
 		t.Error("checkpoint not cleaned after resume completion")
 	}
 }

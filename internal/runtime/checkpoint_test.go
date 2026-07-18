@@ -92,7 +92,7 @@ func TestRunTaskSuspendsAndWritesCheckpoint(t *testing.T) {
 	if !errors.Is(err, ErrSuspended) {
 		t.Fatalf("RunTask err = %v, want ErrSuspended", err)
 	}
-	cp, ok, err := store.Load("sess-1")
+	cp, ok, err := store.Load("sess-1", "")
 	if err != nil {
 		t.Fatalf("Load checkpoint: %v", err)
 	}
@@ -132,7 +132,7 @@ func TestRunTaskResumesFromCheckpointToCompletion(t *testing.T) {
 		t.Errorf("resume result = %q, want %q", run.Result, "final answer")
 	}
 	// Checkpoint deleted after successful completion.
-	_, ok, err := store.Load("sess-1")
+	_, ok, err := store.Load("sess-1", "")
 	if err != nil {
 		t.Fatalf("Load after completion: %v", err)
 	}

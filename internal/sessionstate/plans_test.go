@@ -10,7 +10,7 @@ import (
 func TestWritePlanCreatesFileUnderPlansDir(t *testing.T) {
 	base := t.TempDir()
 	store := NewStore(base)
-	path, err := store.WritePlan("sess-1", "plan-1.md", "# hi\n")
+	path, err := store.WritePlan("sess-1", "", "plan-1.md", "# hi\n")
 	if err != nil {
 		t.Fatalf("WritePlan: %v", err)
 	}
@@ -29,7 +29,7 @@ func TestWritePlanCreatesFileUnderPlansDir(t *testing.T) {
 
 func TestWritePlanEmptyKeyFailsLoud(t *testing.T) {
 	store := NewStore(t.TempDir())
-	if _, err := store.WritePlan("", "p.md", "x"); err == nil {
+	if _, err := store.WritePlan("", "", "p.md", "x"); err == nil {
 		t.Fatal("WritePlan empty key err = nil, want error")
 	}
 }

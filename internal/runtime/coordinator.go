@@ -352,7 +352,7 @@ func (c *Coordinator) resumeScan(ctx context.Context) error {
 		if t.Status != domain.TaskRunning {
 			continue
 		}
-		_, hasCP, err := c.checkpoints.Load(sessionKeyForTask(t))
+		_, hasCP, err := c.checkpoints.Load(sessionKeyForTask(t), t.WorkingDir)
 		if err != nil {
 			return fmt.Errorf("load checkpoint for resume of task %s: %w", t.ID, err)
 		}

@@ -254,7 +254,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	// Rebuild loop state from disk and re-enter the loop with the pending calls,
 	// skipping the initial prompt build + generate.
 	if r.checkpoints != nil {
-		cp, ok, err := r.checkpoints.Load(sessionKeyForTask(task))
+		cp, ok, err := r.checkpoints.Load(sessionKeyForTask(task), task.WorkingDir)
 		if err != nil {
 			return domain.TaskRun{}, fmt.Errorf("load checkpoint for task %s: %w", task.ID, err)
 		}
@@ -402,6 +402,7 @@ func (r *Runtime) checkSuspend(ctx context.Context, task domain.Task, st loopSta
 		TotalTokens:      st.totalTokens,
 		Images:           st.images,
 		CreatedAt:        time.Now(),
+		WorkingDir:       task.WorkingDir,
 	}
 	if err := r.checkpoints.Save(cp); err != nil {
 		return false, fmt.Errorf("save checkpoint for task %s: %w", task.ID, err)
@@ -475,7 +476,7 @@ func (r *Runtime) finishRun(ctx context.Context, requestID string, agent domain.
 		}
 	}
 	if r.checkpoints != nil {
-		if err := r.checkpoints.Delete(sessionKeyForTask(task)); err != nil {
+		if err := r.checkpoints.Delete(sessionKeyForTask(task), task.WorkingDir); err != nil {
 			return domain.TaskRun{}, fmt.Errorf("delete checkpoint after completion for task %s: %w", task.ID, err)
 		}
 	}
@@ -507,7 +508,7 @@ resource: %q
 %s
 `, title, task.ID, ts, task.ID, result)
 	filename := fmt.Sprintf("plan-%d.md", now.UnixNano())
-	if _, err := r.checkpoints.WritePlan(sessionKeyForTask(task), filename, content); err != nil {
+	if _, err := r.checkpoints.WritePlan(sessionKeyForTask(task), task.WorkingDir, filename, content); err != nil {
 		return err
 	}
 	return nil
