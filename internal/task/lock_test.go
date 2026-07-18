@@ -41,3 +41,23 @@ func TestLockStoreTryLockAllowsOnlyOneOwner(t *testing.T) {
 		t.Errorf("successful TryLock calls = %d, want 1", locked)
 	}
 }
+
+func TestUnlockReleasesOnlyForOwner(t *testing.T) {
+	s := NewLockStore()
+	ctx := context.Background()
+	if ok, _ := s.TryLock(ctx, "t1", "owner-a", time.Minute); !ok {
+		t.Fatal("initial lock failed")
+	}
+	// wrong owner cannot release
+	if ok, err := s.Unlock(ctx, "t1", "owner-b"); err != nil || ok {
+		t.Fatalf("Unlock wrong owner: ok=%v err=%v, want false,nil", ok, err)
+	}
+	// right owner releases
+	if ok, err := s.Unlock(ctx, "t1", "owner-a"); err != nil || !ok {
+		t.Fatalf("Unlock owner: ok=%v err=%v, want true,nil", ok, err)
+	}
+	// now re-lockable by anyone
+	if ok, _ := s.TryLock(ctx, "t1", "owner-b", time.Minute); !ok {
+		t.Fatal("re-lock after unlock failed")
+	}
+}

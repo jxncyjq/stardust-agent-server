@@ -46,6 +46,11 @@ type CoordinatorConfig struct {
 	LockTTL            time.Duration
 	// MaxWorkers caps concurrent task goroutines. 0 or negative → default 4.
 	MaxWorkers int
+	// Checkpoints, when set, enables Heartbeat's resume scan: a Running task
+	// with a persisted checkpoint (flipped Suspended→Running by a human
+	// decision) is re-dispatched from where it left off. Nil disables the scan
+	// (a valid "no manual-mode resume support configured" deployment).
+	Checkpoints *sessionstate.Store
 }
 
 type Coordinator struct {
@@ -61,6 +66,7 @@ type Coordinator struct {
 	events             port.EventBus
 	trustGate          TrustGate
 	lockTTL            time.Duration
+	checkpoints        *sessionstate.Store
 	sem                chan struct{}
 	wg                 sync.WaitGroup
 }
@@ -85,6 +91,7 @@ func NewCoordinator(cfg CoordinatorConfig) *Coordinator {
 		events:             cfg.Events,
 		trustGate:          cfg.TrustGate,
 		lockTTL:            cfg.LockTTL,
+		checkpoints:        cfg.Checkpoints,
 		sem:                make(chan struct{}, cfg.MaxWorkers),
 	}
 }
@@ -94,6 +101,9 @@ func NewCoordinator(cfg CoordinatorConfig) *Coordinator {
 // no longer blocks others. The returned Task is always zero-valued now (work is
 // async); the bool reports whether at least one task was dispatched this tick.
 func (c *Coordinator) Heartbeat(ctx context.Context) (domain.Task, bool, error) {
+	if err := c.resumeScan(ctx); err != nil {
+		return domain.Task{}, false, fmt.Errorf("resume scan: %w", err)
+	}
 	dispatched := false
 	for {
 		select {
@@ -207,11 +217,22 @@ func (c *Coordinator) runAssigned(ctx context.Context, taskToRun domain.Task) (d
 			if auErr := c.appendAudit(ctx, taskToRun.ID, "task_suspended"); auErr != nil {
 				return domain.Task{}, false, auErr
 			}
+			if _, err := c.locks.Unlock(ctx, taskToRun.ID, c.agent.ID); err != nil {
+				return domain.Task{}, false, fmt.Errorf("release lock on suspend for task %s: %w", taskToRun.ID, err)
+			}
 			return c.currentTask(ctx, taskToRun.ID)
 		}
 		_ = c.scheduler.Transition(ctx, taskToRun.ID, domain.TaskFailed)
 		return domain.Task{}, false, fmt.Errorf("run task: %w", err)
 	}
+	return c.afterRun(ctx, taskToRun, runnerAgent, run)
+}
+
+// afterRun finishes a task after its runner has produced a result: evaluate the
+// trace for a hard loop, gate through quality review, and land the task in a
+// terminal (or suspended, for hard-loop human review) state. It is the shared
+// tail for both a fresh dispatch (runAssigned) and a resumed one (runResume).
+func (c *Coordinator) afterRun(ctx context.Context, taskToRun domain.Task, runnerAgent domain.Agent, run domain.TaskRun) (domain.Task, bool, error) {
 	eval, err := c.evaluator.EvaluateTrace(ctx, []string{run.Result, run.Result})
 	if err != nil {
 		return domain.Task{}, false, fmt.Errorf("evaluate task trace: %w", err)
@@ -264,6 +285,105 @@ func (c *Coordinator) runAssigned(ctx context.Context, taskToRun domain.Task) (d
 		return domain.Task{}, false, err
 	}
 	return c.currentTask(ctx, taskToRun.ID)
+}
+
+// resumeScan dispatches suspended tasks whose human decision has landed (they
+// were flipped to Running by ApprovalCoordinator.Decide) and that carry a
+// persisted checkpoint. It claims each via TryLock so only one worker resumes
+// a task; an actively-running fresh task holds its lock, and a Running task
+// without a checkpoint (mid fresh run, never yet suspended) is skipped —
+// together these rule out double-dispatch of the same task. Called from
+// Heartbeat each tick, before the pending-dispatch loop.
+func (c *Coordinator) resumeScan(ctx context.Context) error {
+	if c.checkpoints == nil {
+		return nil
+	}
+	tasks, err := c.scheduler.List(ctx)
+	if err != nil {
+		return fmt.Errorf("list tasks for resume scan: %w", err)
+	}
+	for _, t := range tasks {
+		if t.Status != domain.TaskRunning {
+			continue
+		}
+		_, hasCP, err := c.checkpoints.Load(sessionKeyForTask(t))
+		if err != nil {
+			return fmt.Errorf("load checkpoint for resume of task %s: %w", t.ID, err)
+		}
+		if !hasCP {
+			continue // fresh Running task mid-flight, not a resume candidate
+		}
+		select {
+		case c.sem <- struct{}{}:
+		default:
+			return nil // no worker slots; try next tick
+		}
+		locked, err := c.locks.TryLock(ctx, t.ID, c.agent.ID, c.lockTTL)
+		if err != nil {
+			<-c.sem
+			return fmt.Errorf("lock task %s for resume: %w", t.ID, err)
+		}
+		if !locked {
+			<-c.sem
+			continue // an active worker already holds it
+		}
+		c.wg.Add(1)
+		go func(rt domain.Task) {
+			defer c.wg.Done()
+			defer func() { <-c.sem }()
+			if _, _, err := c.runResume(ctx, rt); err != nil {
+				// Goroutine top-level: never swallow. runResume already transitioned
+				// the task to Failed (or re-suspended it) on error; record the reason
+				// so a failed resume is diagnosable rather than vanishing.
+				_ = c.publishLearning(ctx, c.agent.ID, rt.ID, evolution.SignalFailure, "task_resume_error", true)
+			}
+		}(t)
+	}
+	return nil
+}
+
+// runResume runs a task that is already Running and lock-held (claimed by
+// resumeScan) from its checkpoint. Unlike runAssigned it skips the
+// Pending→Running transition (the task is already Running) and re-enters the
+// runner, which auto-resumes from the checkpoint. On ErrSuspended it
+// re-suspends (another undecided call surfaced) and releases the lock so a
+// later decision can reclaim it; otherwise it finalises via afterRun.
+func (c *Coordinator) runResume(ctx context.Context, t domain.Task) (domain.Task, bool, error) {
+	runnerAgent := c.agent
+	runner := c.runtime
+	if c.taskRunnerResolver != nil {
+		resolvedAgent, resolvedRunner, resolved, err := c.taskRunnerResolver.ResolveTaskRunner(ctx, t)
+		if err != nil {
+			_ = c.scheduler.Transition(ctx, t.ID, domain.TaskFailed)
+			return domain.Task{}, false, fmt.Errorf("resolve runner for resume of task %s: %w", t.ID, err)
+		}
+		if resolved {
+			if resolvedRunner == nil {
+				_ = c.scheduler.Transition(ctx, t.ID, domain.TaskFailed)
+				return domain.Task{}, false, fmt.Errorf("resolve runner for resume of task %s: runner is nil", t.ID)
+			}
+			runnerAgent, runner = resolvedAgent, resolvedRunner
+		}
+	}
+	if runner == nil {
+		_ = c.scheduler.Transition(ctx, t.ID, domain.TaskFailed)
+		return domain.Task{}, false, fmt.Errorf("resume task %s: runtime is nil", t.ID)
+	}
+	run, err := runner.RunTask(ctx, runnerAgent, t)
+	if err != nil {
+		if errors.Is(err, ErrSuspended) {
+			if txErr := c.scheduler.Transition(ctx, t.ID, domain.TaskSuspended); txErr != nil {
+				return domain.Task{}, false, fmt.Errorf("re-suspend task %s: %w", t.ID, txErr)
+			}
+			if _, err := c.locks.Unlock(ctx, t.ID, c.agent.ID); err != nil {
+				return domain.Task{}, false, fmt.Errorf("release lock on re-suspend for task %s: %w", t.ID, err)
+			}
+			return c.currentTask(ctx, t.ID)
+		}
+		_ = c.scheduler.Transition(ctx, t.ID, domain.TaskFailed)
+		return domain.Task{}, false, fmt.Errorf("resume run task %s: %w", t.ID, err)
+	}
+	return c.afterRun(ctx, t, runnerAgent, run)
 }
 
 // RecoverSuspended re-registers every task that has a persisted checkpoint into
