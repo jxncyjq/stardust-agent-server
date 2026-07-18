@@ -147,3 +147,42 @@ func TestStoreListSuspendedEmptyIsEmptyNoError(t *testing.T) {
 		t.Fatalf("ListSuspended empty len = %d, want 0", len(got))
 	}
 }
+
+func TestCheckpointRoundTripPreservesMode(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+	cp := Checkpoint{
+		SchemaVersion: CheckpointSchemaVersion,
+		TaskID:        "t1",
+		SessionKey:    "s1",
+		Mode:          "manual",
+		BasePrompt:    "p",
+		Round:         1,
+	}
+	if err := store.Save(cp); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	got, ok, err := store.Load("s1")
+	if err != nil || !ok {
+		t.Fatalf("Load: ok=%v err=%v", ok, err)
+	}
+	if got.Mode != "manual" {
+		t.Fatalf("Mode = %q, want manual", got.Mode)
+	}
+}
+
+func TestLoadRejectsV1Checkpoint(t *testing.T) {
+	dir := t.TempDir()
+	sessDir := SessionDir(dir, "s1")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A v1 checkpoint on disk must fail loud, not half-decode into a modeless task.
+	if err := os.WriteFile(filepath.Join(sessDir, "task-state.json"),
+		[]byte(`{"schema_version":1,"task_id":"t1","session_key":"s1"}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := NewStore(dir).Load("s1"); err == nil {
+		t.Fatal("Load of v1 checkpoint: want fail-loud error, got nil")
+	}
+}

@@ -291,6 +291,7 @@ func (c *Coordinator) RecoverSuspended(ctx context.Context, store *sessionstate.
 			AgentID:   cp.AgentID,
 			SessionID: cp.SessionKey,
 			Status:    domain.TaskSuspended,
+			Mode:      cp.Mode,
 		}); err != nil {
 			return recovered, fmt.Errorf("re-register suspended task %s: %w", cp.TaskID, err)
 		}

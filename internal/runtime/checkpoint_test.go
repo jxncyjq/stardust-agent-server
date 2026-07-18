@@ -43,7 +43,7 @@ type gateOnce struct {
 	suspended bool
 }
 
-func (g *gateOnce) ShouldSuspend(_ context.Context, _ domain.Task, _ []domain.ToolCall) (bool, error) {
+func (g *gateOnce) ShouldSuspend(_ context.Context, _ domain.Task, _ []domain.ToolCall, _ *tool.Registry) (bool, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if !g.suspended {
@@ -51,6 +51,10 @@ func (g *gateOnce) ShouldSuspend(_ context.Context, _ domain.Task, _ []domain.To
 		return true, nil
 	}
 	return false, nil
+}
+
+func (g *gateOnce) Resolve(context.Context, domain.Task, domain.ToolCall, *tool.Registry) (bool, error) {
+	return true, nil
 }
 
 // echoRegistry returns a registry with a single auto-allowed "echo" tool, so

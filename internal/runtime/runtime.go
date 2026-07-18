@@ -38,7 +38,11 @@ type ContextBuilder interface {
 // approval in Manual mode). A nil gate never suspends — Auto behaviour. M1b ships
 // only the seam; the approval-backed implementation lands in M2.
 type ToolGate interface {
-	ShouldSuspend(ctx context.Context, task domain.Task, calls []domain.ToolCall) (bool, error)
+	// ShouldSuspend reports whether the runtime must suspend before executing this
+	// round's calls. tools is the run's effective registry (for sensitivity lookup).
+	ShouldSuspend(ctx context.Context, task domain.Task, calls []domain.ToolCall, tools *tool.Registry) (bool, error)
+	// Resolve reports, at dispatch time for one call, whether it may execute.
+	Resolve(ctx context.Context, task domain.Task, call domain.ToolCall, tools *tool.Registry) (allow bool, err error)
 }
 
 type Config struct {
@@ -236,6 +240,10 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 			return domain.TaskRun{}, fmt.Errorf("load checkpoint for task %s: %w", task.ID, err)
 		}
 		if ok {
+			// The checkpoint is authoritative for the resumed run's mode: a caller
+			// (coordinator resume) may hand us a task rebuilt from the scheduler; the
+			// mode captured at suspend time must win so gating stays consistent.
+			task.Mode = cp.Mode
 			st := loopState{
 				started:          started,
 				basePrompt:       cp.BasePrompt,
@@ -352,7 +360,7 @@ func (r *Runtime) checkSuspend(ctx context.Context, task domain.Task, st loopSta
 	if r.toolGate == nil || r.checkpoints == nil {
 		return false, nil
 	}
-	suspend, err := r.toolGate.ShouldSuspend(ctx, task, st.resp.ToolCalls)
+	suspend, err := r.toolGate.ShouldSuspend(ctx, task, st.resp.ToolCalls, st.tools)
 	if err != nil {
 		return false, fmt.Errorf("tool gate decision for task %s: %w", task.ID, err)
 	}
@@ -364,6 +372,7 @@ func (r *Runtime) checkSuspend(ctx context.Context, task domain.Task, st loopSta
 		TaskID:           task.ID,
 		AgentID:          task.AgentID,
 		SessionKey:       sessionKeyForTask(task),
+		Mode:             task.Mode,
 		BasePrompt:       st.basePrompt,
 		Round:            st.round,
 		ToolEntries:      snapshotToolEntries(st.toolCtx),
