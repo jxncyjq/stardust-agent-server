@@ -2,11 +2,15 @@ package runtime
 
 import (
 	"context"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
@@ -156,5 +160,56 @@ func TestAutoModeOffersAllTools(t *testing.T) {
 	}
 	if !has("write_x") || !has("read_x") {
 		t.Errorf("auto mode should offer all tools; offered=%v", maas.offeredTools)
+	}
+}
+
+func TestPlanModeWritesOKFPlanFile(t *testing.T) {
+	dir := t.TempDir()
+	store := sessionstate.NewStore(dir)
+	maas := &planProbeMaas{}
+	runner := NewRuntime(Config{
+		Maas: maas, Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
+		Tools: planRegistry(t), LazyTools: false, Checkpoints: store,
+	})
+	_, err := runner.RunTask(context.Background(), domain.Agent{ID: "a1"}, domain.Task{
+		ID: "t1", SessionID: "sess-1", AgentID: "a1", Status: domain.TaskRunning, Input: "plan it", Mode: domain.ModePlan,
+	})
+	if err != nil {
+		t.Fatalf("RunTask: %v", err)
+	}
+	plansDir := filepath.Join(sessionstate.SessionDir(dir, "sess-1"), "plans")
+	entries, err := os.ReadDir(plansDir)
+	if err != nil {
+		t.Fatalf("read plans dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("plans written = %d, want 1", len(entries))
+	}
+	data, _ := os.ReadFile(filepath.Join(plansDir, entries[0].Name()))
+	body := string(data)
+	if !strings.Contains(body, "type: Plan") {
+		t.Errorf("plan file missing OKF frontmatter 'type: Plan':\n%s", body)
+	}
+	if !strings.Contains(body, "plan text") {
+		t.Errorf("plan file missing model result 'plan text':\n%s", body)
+	}
+}
+
+func TestAutoModeWritesNoPlanFile(t *testing.T) {
+	dir := t.TempDir()
+	store := sessionstate.NewStore(dir)
+	runner := NewRuntime(Config{
+		Maas: &planProbeMaas{}, Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
+		Tools: planRegistry(t), LazyTools: false, Checkpoints: store,
+	})
+	_, err := runner.RunTask(context.Background(), domain.Agent{ID: "a1"}, domain.Task{
+		ID: "t2", SessionID: "sess-2", AgentID: "a1", Status: domain.TaskRunning, Input: "do it", Mode: domain.ModeAuto,
+	})
+	if err != nil {
+		t.Fatalf("RunTask: %v", err)
+	}
+	plansDir := filepath.Join(sessionstate.SessionDir(dir, "sess-2"), "plans")
+	if entries, err := os.ReadDir(plansDir); err == nil && len(entries) > 0 {
+		t.Errorf("auto mode wrote %d plan files, want 0", len(entries))
 	}
 }

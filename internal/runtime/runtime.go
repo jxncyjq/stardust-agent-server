@@ -441,6 +441,11 @@ func (r *Runtime) finishRun(ctx context.Context, requestID string, agent domain.
 	}); err != nil {
 		return domain.TaskRun{}, fmt.Errorf("publish task completed event: %w", err)
 	}
+	if task.Mode == domain.ModePlan && r.checkpoints != nil {
+		if err := r.writePlanArtifact(task, st.resp.Text); err != nil {
+			return domain.TaskRun{}, fmt.Errorf("write plan artifact for task %s: %w", task.ID, err)
+		}
+	}
 	if r.checkpoints != nil {
 		if err := r.checkpoints.Delete(sessionKeyForTask(task)); err != nil {
 			return domain.TaskRun{}, fmt.Errorf("delete checkpoint after completion for task %s: %w", task.ID, err)
@@ -450,6 +455,45 @@ func (r *Runtime) finishRun(ctx context.Context, requestID string, agent domain.
 		return domain.TaskRun{}, fmt.Errorf("publish learning success event: %w", err)
 	}
 	return run, nil
+}
+
+// writePlanArtifact frames the model's plan result as OKF markdown (YAML
+// frontmatter with type: Plan plus title/description/tags/timestamp, then the
+// body) and writes it to the session's plans/ directory. Design §4.2.
+func (r *Runtime) writePlanArtifact(task domain.Task, result string) error {
+	now := time.Now().UTC()
+	ts := now.Format(time.RFC3339)
+	title := firstNonEmptyLine(result)
+	if title == "" {
+		title = "Plan for task " + task.ID
+	}
+	content := fmt.Sprintf(`---
+type: Plan
+title: %q
+description: "Plan produced in Plan mode for task %s"
+tags: [plan, agent]
+timestamp: %q
+resource: %q
+---
+
+%s
+`, title, task.ID, ts, task.ID, result)
+	filename := fmt.Sprintf("plan-%d.md", now.UnixNano())
+	if _, err := r.checkpoints.WritePlan(sessionKeyForTask(task), filename, content); err != nil {
+		return err
+	}
+	return nil
+}
+
+// firstNonEmptyLine returns the first non-empty (trimmed) line of s, used as a
+// readable plan title.
+func firstNonEmptyLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if t := strings.TrimSpace(line); t != "" {
+			return t
+		}
+	}
+	return ""
 }
 
 func (r *Runtime) generate(ctx context.Context, requestID string, prompt string, images []string, stablePrefixLen int, tools *tool.Registry) (port.InferenceResponse, error) {

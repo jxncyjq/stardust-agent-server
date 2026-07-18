@@ -118,6 +118,25 @@ func (s *Store) Delete(sessionKey string) error {
 	return nil
 }
 
+// WritePlan writes a Plan-mode artifact to <base>/session/<sessionKey>/plans/<filename>,
+// creating the directory. It returns the absolute path written. An empty
+// sessionKey or filename is rejected (fail-loud — never write to a malformed
+// path). This is where an OKF "one concept, one file" plan lands (design §4.2).
+func (s *Store) WritePlan(sessionKey, filename, content string) (string, error) {
+	if sessionKey == "" || filename == "" {
+		return "", fmt.Errorf("write plan: empty sessionKey or filename (key=%q file=%q)", sessionKey, filename)
+	}
+	dir := filepath.Join(SessionDir(s.base, sessionKey), "plans")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create plans dir %q: %w", dir, err)
+	}
+	path := filepath.Join(dir, filename)
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return "", fmt.Errorf("write plan %q: %w", path, err)
+	}
+	return path, nil
+}
+
 // ListSuspended loads every checkpoint under <base>/session/*/task-state.json.
 // A missing base dir yields an empty slice (no sessions yet). A corrupt or
 // version-mismatched checkpoint fails loud — recovery must not silently skip a
