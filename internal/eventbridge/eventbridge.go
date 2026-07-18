@@ -11,6 +11,7 @@ import (
 
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/observability"
+	"github.com/stardust/legion-agent/internal/port"
 )
 
 // Bridge is a port.EventBus that tees every RuntimeEvent two ways: it appends to
@@ -25,6 +26,11 @@ type Bridge struct {
 	platform *observability.EventBus
 	logger   *slog.Logger
 }
+
+// var _ port.EventBus = (*Bridge)(nil) pins *Bridge to the port.EventBus
+// contract at compile time, so a signature drift on either side fails the
+// build here instead of surfacing only at the wiring call site.
+var _ port.EventBus = (*Bridge)(nil)
 
 // New returns a Bridge teeing to platform. platform must not be nil (SSE wiring
 // is the whole point of this type). logger records tee failures; a nil logger

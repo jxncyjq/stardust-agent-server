@@ -1,7 +1,10 @@
 package eventbridge
 
 import (
+	"bytes"
 	"context"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -82,5 +85,31 @@ func TestBridgePublishSurvivesClosedPlatform(t *testing.T) {
 	}
 	if got := b.Events(); len(got) != 1 {
 		t.Fatalf("Events() len = %d, want 1 (append half unaffected by tee failure)", len(got))
+	}
+}
+
+func TestBridgePublishLogsWarnOnTeeFailure(t *testing.T) {
+	platform := observability.NewEventBus(8)
+	if err := platform.Close(); err != nil {
+		t.Fatalf("platform.Close() error = %v, want nil", err)
+	}
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	b := New(platform, logger)
+
+	if err := b.Publish(context.Background(), domain.RuntimeEvent{Type: "task_completed", TaskID: "t1"}); err != nil {
+		t.Fatalf("Publish() after platform close error = %v, want nil", err)
+	}
+
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") {
+		t.Fatalf("log output = %q, want a WARN-level record for the tee failure", out)
+	}
+	if !strings.Contains(out, "type=task_completed") {
+		t.Fatalf("log output = %q, want type=task_completed field", out)
+	}
+	if !strings.Contains(out, "task_id=t1") {
+		t.Fatalf("log output = %q, want task_id=t1 field", out)
 	}
 }
