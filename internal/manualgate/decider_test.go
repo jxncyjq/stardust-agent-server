@@ -179,7 +179,7 @@ func TestReconcileResumeFlipsWhenAllTicketsAlreadyDecided(t *testing.T) {
 	if _, err := store.Open(approval.ToolApproval{SessionKey: "s1", TaskID: "t1", ToolCallID: "c1", ToolName: "write_file"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Decide("s1", approval.TicketID("t1", "c1"), approval.ApprovalApproved); err != nil {
+	if _, err := store.Decide("s1", approval.TicketID("t1", "c1"), approval.ApprovalApproved, ""); err != nil {
 		t.Fatal(err)
 	}
 	ac := NewApprovalCoordinator(store, sched)

@@ -60,14 +60,14 @@ func (a *ApprovalCoordinator) Decide(ctx context.Context, taskID, ticketID strin
 		return approval.ToolApproval{}, fmt.Errorf("decide approval: task %s not found", taskID)
 	}
 	sessionKey := sessionKeyForTask(t)
-	rec, err := a.store.Decide(sessionKey, ticketID, status)
+	rec, err := a.store.Decide(sessionKey, ticketID, status, t.WorkingDir)
 	if err != nil {
 		return approval.ToolApproval{}, fmt.Errorf("record decision for ticket %s: %w", ticketID, err)
 	}
 	if a.sink != nil {
 		a.sink.ApprovalResolved(ctx, taskID, ticketID, string(status))
 	}
-	remaining, err := a.store.ListForTask(sessionKey, taskID)
+	remaining, err := a.store.ListForTask(sessionKey, taskID, t.WorkingDir)
 	if err != nil {
 		return approval.ToolApproval{}, fmt.Errorf("list tickets for task %s: %w", taskID, err)
 	}
@@ -134,7 +134,7 @@ func (a *ApprovalCoordinator) ReconcileResume(ctx context.Context, taskID string
 		return nil
 	}
 	sessionKey := sessionKeyForTask(t)
-	tickets, err := a.store.ListForTask(sessionKey, taskID)
+	tickets, err := a.store.ListForTask(sessionKey, taskID, t.WorkingDir)
 	if err != nil {
 		return fmt.Errorf("list tickets for task %s approval reconcile: %w", taskID, err)
 	}

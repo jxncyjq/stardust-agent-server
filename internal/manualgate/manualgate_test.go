@@ -108,7 +108,7 @@ func TestShouldSuspendOnSensitiveDirectCall(t *testing.T) {
 	}
 	// A pending ticket must exist for the call.
 	tid := approval.TicketID("t1", "c1")
-	if a, ok, _ := store.Get("s1", tid); !ok || a.Status != approval.ApprovalPending {
+	if a, ok, _ := store.Get("s1", tid, ""); !ok || a.Status != approval.ApprovalPending {
 		t.Fatalf("expected pending ticket, ok=%v a=%+v", ok, a)
 	}
 }
@@ -157,7 +157,7 @@ func TestResolveDeniedReturnsDisallow(t *testing.T) {
 	if _, err := g.ShouldSuspend(context.Background(), manualTask(), []domain.ToolCall{call}, reg); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Decide("s1", approval.TicketID("t1", "c1"), approval.ApprovalDenied); err != nil {
+	if _, err := store.Decide("s1", approval.TicketID("t1", "c1"), approval.ApprovalDenied, ""); err != nil {
 		t.Fatal(err)
 	}
 	allow, err := g.Resolve(context.Background(), manualTask(), call, reg)
@@ -175,7 +175,7 @@ func TestResolveApprovedAllows(t *testing.T) {
 	reg := gateRegistry()
 	call := domain.ToolCall{ID: "c1", Name: "write_file"}
 	_, _ = g.ShouldSuspend(context.Background(), manualTask(), []domain.ToolCall{call}, reg)
-	_, _ = store.Decide("s1", approval.TicketID("t1", "c1"), approval.ApprovalApproved)
+	_, _ = store.Decide("s1", approval.TicketID("t1", "c1"), approval.ApprovalApproved, "")
 	allow, err := g.Resolve(context.Background(), manualTask(), call, reg)
 	if err != nil || !allow {
 		t.Fatalf("approved: allow=%v err=%v, want true,nil", allow, err)
@@ -251,7 +251,7 @@ func TestShouldSuspendMultiCallPartialDecision(t *testing.T) {
 		t.Fatal("want suspend=true when both calls are pending")
 	}
 
-	if _, err := store.Decide("s1", approval.TicketID("t1", "c1"), approval.ApprovalApproved); err != nil {
+	if _, err := store.Decide("s1", approval.TicketID("t1", "c1"), approval.ApprovalApproved, ""); err != nil {
 		t.Fatal(err)
 	}
 
@@ -265,7 +265,7 @@ func TestShouldSuspendMultiCallPartialDecision(t *testing.T) {
 
 	// c1's ticket must remain approved — Open must be idempotent and must not
 	// reset an already-decided ticket back to pending.
-	c1, ok, err := store.Get("s1", approval.TicketID("t1", "c1"))
+	c1, ok, err := store.Get("s1", approval.TicketID("t1", "c1"), "")
 	if err != nil {
 		t.Fatal(err)
 	}

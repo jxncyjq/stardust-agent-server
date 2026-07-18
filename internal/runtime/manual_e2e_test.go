@@ -34,7 +34,7 @@ func TestManualGateDenyThenResume(t *testing.T) {
 	if _, err := r.RunTask(context.Background(), domain.Agent{ID: "a1"}, task); err != ErrSuspended {
 		t.Fatalf("first run err = %v, want ErrSuspended", err)
 	}
-	if _, err := apStore.Decide("s1", approval.TicketID("t1", "c1"), approval.ApprovalDenied); err != nil {
+	if _, err := apStore.Decide("s1", approval.TicketID("t1", "c1"), approval.ApprovalDenied, ""); err != nil {
 		t.Fatal(err)
 	}
 	run, err := r.RunTask(context.Background(), domain.Agent{ID: "a1"}, task)
@@ -70,7 +70,7 @@ func TestManualGateApproveThenResume(t *testing.T) {
 	if _, err := r.RunTask(context.Background(), domain.Agent{ID: "a1"}, task); err != ErrSuspended {
 		t.Fatalf("first run err = %v, want ErrSuspended", err)
 	}
-	if _, err := apStore.Decide("s1", approval.TicketID("t1", "c1"), approval.ApprovalApproved); err != nil {
+	if _, err := apStore.Decide("s1", approval.TicketID("t1", "c1"), approval.ApprovalApproved, ""); err != nil {
 		t.Fatal(err)
 	}
 	run, err := r.RunTask(context.Background(), domain.Agent{ID: "a1"}, task)

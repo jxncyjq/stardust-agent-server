@@ -100,7 +100,7 @@ func (g *ManualToolGate) ShouldSuspend(ctx context.Context, task domain.Task, ca
 		}
 		sessionKey := sessionKeyForTask(task)
 		ticketID := approval.TicketID(task.ID, call.ID)
-		existing, found, err := g.store.Get(sessionKey, ticketID)
+		existing, found, err := g.store.Get(sessionKey, ticketID, task.WorkingDir)
 		if err != nil {
 			return false, fmt.Errorf("check approval for task %s call %s: %w", task.ID, call.ID, err)
 		}
@@ -109,7 +109,7 @@ func (g *ManualToolGate) ShouldSuspend(ctx context.Context, task domain.Task, ca
 		}
 		if _, err := g.store.Open(approval.ToolApproval{
 			SessionKey: sessionKey, TaskID: task.ID, ToolCallID: call.ID,
-			ToolName: name, Arguments: call.Arguments,
+			ToolName: name, Arguments: call.Arguments, WorkingDir: task.WorkingDir,
 		}); err != nil {
 			return false, fmt.Errorf("open approval for task %s call %s: %w", task.ID, call.ID, err)
 		}
@@ -135,7 +135,7 @@ func (g *ManualToolGate) Resolve(ctx context.Context, task domain.Task, call dom
 	if !ok || !sensitive {
 		return true, nil
 	}
-	rec, found, err := g.store.Get(sessionKeyForTask(task), approval.TicketID(task.ID, call.ID))
+	rec, found, err := g.store.Get(sessionKeyForTask(task), approval.TicketID(task.ID, call.ID), task.WorkingDir)
 	if err != nil {
 		return false, fmt.Errorf("resolve approval for task %s call %s: %w", task.ID, call.ID, err)
 	}

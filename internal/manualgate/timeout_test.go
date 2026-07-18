@@ -54,7 +54,7 @@ func TestTimeoutSweepDeniesStalePending(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, _, err := store.Get("s1", approval.TicketID("t1", "c1"))
+	got, _, err := store.Get("s1", approval.TicketID("t1", "c1"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +65,7 @@ func TestTimeoutSweepDeniesStalePending(t *testing.T) {
 		t.Fatalf("task after timeout-deny = %v (err=%v), want running", st.Status, err)
 	}
 
-	got2, _, err := store.Get("s2", approval.TicketID("t2", "c1"))
+	got2, _, err := store.Get("s2", approval.TicketID("t2", "c1"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +98,7 @@ func TestTimeoutSweepSkipsFreshPending(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, _, err := store.Get("s1", approval.TicketID("t1", "c1"))
+	got, _, err := store.Get("s1", approval.TicketID("t1", "c1"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestTimeoutSweepDecideErrorPropagates(t *testing.T) {
 
 	// The ticket must remain untouched (still pending) since the deny was
 	// never actually recorded — Decide failed before any write.
-	got, _, err := store.Get("sghost", approval.TicketID("ghost", "c1"))
+	got, _, err := store.Get("sghost", approval.TicketID("ghost", "c1"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,7 +190,7 @@ func TestTimeoutSweepToleratesConcurrentDecision(t *testing.T) {
 
 	// The competing approval stands — the sweep must not have overwritten it to
 	// denied.
-	got, _, err := store.Get("s1", approval.TicketID("t1", "c1"))
+	got, _, err := store.Get("s1", approval.TicketID("t1", "c1"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -227,7 +227,7 @@ func TestTimeoutSweepDisabledWhenTTLNonPositive(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	got, _, err := store.Get("s1", approval.TicketID("t1", "c1"))
+	got, _, err := store.Get("s1", approval.TicketID("t1", "c1"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
