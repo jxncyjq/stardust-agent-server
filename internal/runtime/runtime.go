@@ -25,6 +25,15 @@ var (
 	// coordinator maps this to TaskSuspended (not TaskFailed) and the goroutine
 	// is released. A later run (this process or after restart) auto-resumes.
 	ErrSuspended = errors.New("runtime suspended pending decision")
+	// ErrManualGateMissing is returned by RunTask when a Manual-mode task reaches a
+	// runtime whose approval gate is not wired (nil toolGate or nil checkpoints).
+	// Manual mode's entire safety guarantee is that sensitive tool calls suspend for
+	// human approval; a nil gate never suspends and a nil checkpoint store cannot
+	// persist a suspension, so either would let the task silently execute sensitive
+	// tools and bypass approval. This is an invariant violation (a misconfigured
+	// runtime path), not a task-content failure: we fail loud here rather than
+	// degrade to Auto behaviour. See CLAUDE.md §0 fail-loud.
+	ErrManualGateMissing = errors.New("manual mode requires an approval gate: runtime has nil toolGate or nil checkpoints")
 )
 
 const defaultMaxToolRounds = 4
@@ -229,6 +238,16 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	if r.maas == nil {
 		_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonInferenceError, true)
 		return domain.TaskRun{}, ErrMaasUnavailable
+	}
+
+	// Manual-mode invariant: the approval gate must be wired before we run a single
+	// round. Today every runtime that can carry a Manual task (default + resolver-built
+	// per-agent) wires both, and delegated children are always Auto — but that safety is
+	// implicit. Assert it loudly so any future path (a child inheriting Mode=manual, a new
+	// runtime constructor) that reaches here without a gate fails fast instead of silently
+	// executing sensitive tools and bypassing human approval.
+	if task.Mode == domain.ModeManual && (r.toolGate == nil || r.checkpoints == nil) {
+		return domain.TaskRun{}, fmt.Errorf("run task %s: %w", task.ID, ErrManualGateMissing)
 	}
 
 	// Resume path: a persisted checkpoint means this task previously suspended.
