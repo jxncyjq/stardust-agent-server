@@ -24,6 +24,7 @@ import (
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/quality"
 	agentruntime "github.com/stardust/legion-agent/internal/runtime"
+	"github.com/stardust/legion-agent/internal/server"
 	"github.com/stardust/legion-agent/internal/sessioncache"
 	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/storage"
@@ -1253,6 +1254,143 @@ func TestServeCommandStreamsLifecycleEventsOverSSE(t *testing.T) {
 	if !found {
 		t.Fatal("GET /v1/events never streamed task_completed, want lifecycle event bridged to SSE")
 	}
+}
+
+// TestServeCommandSandboxesTaskToolsToSessionWorkingDir is the M3a Task 9
+// integration gate. It was originally written as a full network e2e (spin up
+// `serve`, POST /v1/sessions and /v1/tasks over real HTTP, wait for the
+// background scheduler to dispatch and complete the task). That version
+// reliably passed standalone but proved flaky under the same load this
+// package's own parallel test suite creates: repeated full-package runs
+// intermittently hit a transient 500 from session/task creation (SQLite
+// under concurrent access from this test's own goroutines plus every other
+// parallel *_test.go server in the package — internal/storage/sqlite.go
+// opens no busy_timeout, a pre-existing gap unrelated to working_dir) and, in
+// one run, a task not completing inside a 15s deadline. Per the brief's
+// explicit "若 serve 级 e2e 过重/易 flaky,退化为 runtime 层集成测试" escape
+// hatch, this test now drives the real HTTP handlers synchronously (no
+// listener, no coordinator/background-scheduler timing, no goroutines) and
+// then feeds the resulting HTTP+SQLite-round-tripped domain.Task straight
+// into the exact TaskRunner the coordinator would have dispatched to
+// (defaultTaskRunner, Task 7), closing the loop deterministically:
+//
+//  1. POST /v1/sessions with working_dir (server.NewHTTPServer's real
+//     handleCreateSession, Task 6) -> session.WorkingDir persisted.
+//  2. POST /v1/tasks with session_id (real handleCreateTask, Task 6) ->
+//     task.WorkingDir inherited from the session and validated to exist.
+//  3. That real, HTTP-created-and-SQLite-persisted domain.Task is handed to
+//     defaultTaskRunner.RunTask (the same TaskRunner coordinator.go dispatches
+//     a task with no agent_id to) with a scripted MaaS issuing a read_file
+//     call — proving the sandbox root really is the session's working_dir:
+//     a file inside it is readable, and a `../` escape from it is rejected
+//     with port.ErrPathOutsideWorkspace (Task 7).
+//
+// TestCreateTaskInheritsSessionWorkingDir (internal/server/http_test.go, Task
+// 6) already covers step 1-2 in isolation, and
+// TestDefaultTaskRunnerSandboxesToolsToTaskWorkingDir (this package, Task 7)
+// already covers step 3 with a hand-built task. What only this test proves is
+// that the two halves compose: the exact task object that flowed through the
+// real HTTP + storage layer is the one the sandbox enforces against.
+//
+// It exercises read_file rather than write_file: both the HTTP/coordinator
+// task path (defaultTaskRunner.RunTask) and the per-agent path
+// (agent_resolver.go's ResolveTaskRunner) build
+// tool.NewReadOnlyWorkspaceRegistry — write_file is wired only into the CLI
+// `run`/`tui` one-off path (internal/app.go's tool.NewWorkspaceRegistry), not
+// into serve. Adding write capability to the HTTP path would be a feature
+// change outside this task's scope (整合 + 门禁).
+func TestServeCommandSandboxesTaskToolsToSessionWorkingDir(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	writeCLIFile(t, workingDir, "inside.txt", "inside-content")
+	// A real file at the `../` escape target proves the rejection is an actual
+	// sandbox-boundary check, not merely "the file happens not to exist".
+	writeCLIFile(t, filepath.Dir(workingDir), "outside.txt", "outside-content")
+
+	repo, err := storage.OpenSQLite(context.Background(), filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v, want nil", err)
+	}
+	t.Cleanup(func() {
+		if err := repo.Close(); err != nil {
+			t.Errorf("Close() error = %v, want nil", err)
+		}
+	})
+	srv := server.NewHTTPServer(server.Config{Sessions: repo, Tasks: repo})
+
+	sessionRec := httptest.NewRecorder()
+	sessionReq := httptest.NewRequest(http.MethodPost, "/v1/sessions", strings.NewReader(
+		`{"company_id":"c1","agent_id":"a1","working_dir":"`+filepath.ToSlash(workingDir)+`"}`))
+	srv.ServeHTTP(sessionRec, sessionReq)
+	if sessionRec.Code != http.StatusCreated {
+		t.Fatalf("POST /v1/sessions status = %d, want %d body=%s", sessionRec.Code, http.StatusCreated, sessionRec.Body.String())
+	}
+	var session domain.AgentSession
+	if err := json.Unmarshal(sessionRec.Body.Bytes(), &session); err != nil {
+		t.Fatalf("Decode(session) error = %v, want nil, body=%s", err, sessionRec.Body.String())
+	}
+	if session.WorkingDir != filepath.ToSlash(workingDir) {
+		t.Fatalf("session.WorkingDir = %q, want %q", session.WorkingDir, filepath.ToSlash(workingDir))
+	}
+
+	createTask := func(taskID string) domain.Task {
+		t.Helper()
+		body := `{"id":"` + taskID + `","company_id":"c1","agent_id":"a1","session_id":"` + session.ID + `","input":"read a file"}`
+		rec := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/v1/tasks", strings.NewReader(body))
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("POST /v1/tasks(%s) status = %d, want %d body=%s", taskID, rec.Code, http.StatusCreated, rec.Body.String())
+		}
+		var task domain.Task
+		if err := json.Unmarshal(rec.Body.Bytes(), &task); err != nil {
+			t.Fatalf("Decode(task %s) error = %v, want nil, body=%s", taskID, err, rec.Body.String())
+		}
+		if task.WorkingDir != filepath.ToSlash(workingDir) {
+			t.Fatalf("task(%s).WorkingDir = %q, want inherited %q", taskID, task.WorkingDir, filepath.ToSlash(workingDir))
+		}
+		return task
+	}
+
+	insideTask := createTask("wd-e2e-inside")
+	escapeTask := createTask("wd-e2e-escape")
+
+	newRunner := func() *defaultTaskRunner {
+		return &defaultTaskRunner{
+			runtimeCfg: agentruntime.Config{Events: adapter.NewMemoryEventBus()},
+			// contextRoot is never consulted here: both tasks above carry a
+			// non-empty WorkingDir (inherited from the session), and
+			// defaultTaskRunner.RunTask prioritizes task.WorkingDir over it.
+			contextRoot: t.TempDir(),
+			audit:       adapter.NewMemoryAuditLog(),
+			webOptions:  tool.WebToolOptions{},
+		}
+	}
+
+	t.Run("read_file inside the HTTP-inherited working_dir succeeds", func(t *testing.T) {
+		maas := &toolProbingMaas{path: filepath.Join(workingDir, "inside.txt")}
+		runner := newRunner()
+		runner.runtimeCfg.Maas = maas
+		if _, err := runner.RunTask(context.Background(), domain.Agent{}, insideTask); err != nil {
+			t.Fatalf("RunTask(inside) error = %v, want nil", err)
+		}
+		if !strings.Contains(maas.lastPrompt, "success: inside-content") {
+			t.Fatalf("RunTask(inside) prompt = %q, want tool success reading inside.txt", maas.lastPrompt)
+		}
+	})
+
+	t.Run("`../` escape from the HTTP-inherited working_dir is rejected", func(t *testing.T) {
+		maas := &toolProbingMaas{path: filepath.Join(workingDir, "..", "outside.txt")}
+		runner := newRunner()
+		runner.runtimeCfg.Maas = maas
+		if _, err := runner.RunTask(context.Background(), domain.Agent{}, escapeTask); err != nil {
+			t.Fatalf("RunTask(escape) error = %v, want nil", err)
+		}
+		if !strings.Contains(maas.lastPrompt, "failed: "+port.ErrPathOutsideWorkspace.Error()) {
+			t.Fatalf("RunTask(escape) prompt = %q, want tool call rejected as outside workspace", maas.lastPrompt)
+		}
+	})
 }
 
 func TestServeCommandStartsAndStopsWithContext(t *testing.T) {
