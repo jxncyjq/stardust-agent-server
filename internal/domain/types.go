@@ -23,6 +23,33 @@ const (
 	TaskSuspended     TaskStatus = "suspended"
 )
 
+// 会话/任务工作模式。Manual 把有副作用工具挡在人工审批后；Plan 只提供只读工具、
+// 产出计划而无副作用；Auto 是默认的不受限行为。以裸 string 存在 Session/Task 上，
+// 便于 JSON/DB 平凡往返。
+const (
+	ModeManual = "manual"
+	ModePlan   = "plan"
+	ModeAuto   = "auto"
+)
+
+// NormalizeMode 校验并规范化一个原始 mode 字符串。空/空白值是合法默认（auto）。
+// 已识别值原样返回。其余任何值被拒绝（ok=false），使调用方 fail-loud 而非把未知
+// mode 静默转成 auto。
+func NormalizeMode(raw string) (mode string, ok bool) {
+	switch strings.TrimSpace(raw) {
+	case "":
+		return ModeAuto, true
+	case ModeManual:
+		return ModeManual, true
+	case ModePlan:
+		return ModePlan, true
+	case ModeAuto:
+		return ModeAuto, true
+	default:
+		return "", false
+	}
+}
+
 type Agent struct {
 	ID               string      `json:"id"`
 	CompanyID        string      `json:"company_id"`
@@ -37,6 +64,7 @@ type Task struct {
 	CompanyID     string     `json:"company_id"`
 	AgentID       string     `json:"agent_id"`
 	SessionID     string     `json:"session_id"`
+	Mode          string     `json:"mode,omitempty"`
 	Status        TaskStatus `json:"status"`
 	Input         string     `json:"input"`
 	MaxIterations int        `json:"max_iterations"`
@@ -122,6 +150,7 @@ type AgentSession struct {
 	AgentID   string    `json:"agent_id"`
 	Project   string    `json:"project"`
 	Title     string    `json:"title"`
+	Mode      string    `json:"mode"`
 	Archived  bool      `json:"archived"`
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
