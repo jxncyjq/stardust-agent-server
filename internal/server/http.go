@@ -503,7 +503,23 @@ func (s *HTTPServer) handleDeleteSession(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("delete session: %v", err))
 		return
 	}
-	sessionDir := sessionstate.SessionDir(sessionstate.SessionBase(s.workspaceRoot, session.WorkingDir), sessionID)
+	base := sessionstate.SessionBase(s.workspaceRoot, session.WorkingDir)
+	if base == "" {
+		// Only reachable when both s.workspaceRoot and the session's working_dir
+		// are empty (an unconfigured production deployment always resolves
+		// workspaceRoot to a non-empty absolute path via
+		// sessionstate.ResolveWorkspaceRoot, so this is test/misconfiguration
+		// territory, not a production path). SessionDir(base, id) would then
+		// join onto "" and yield a bare "session/<id>" relative to the process
+		// cwd -- os.RemoveAll on that is not the directory this delete promised
+		// to remove, so skip it rather than risk deleting the wrong thing. This
+		// is a defensive guard, not a silent skip: it is logged at Warn.
+		observability.WithRequestID(s.logger, requestIDFromContext(r.Context())).Warn("delete session: skipping on-disk cleanup, empty session base",
+			"session_id", sessionID)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	sessionDir := sessionstate.SessionDir(base, sessionID)
 	if err := os.RemoveAll(sessionDir); err != nil {
 		// Fail-loud: the DB row is already gone, but a directory the delete
 		// promised to remove is still on disk. Do not report success — log
