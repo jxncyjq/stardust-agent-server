@@ -60,11 +60,16 @@ type Agent struct {
 }
 
 type Task struct {
-	ID            string     `json:"id"`
-	CompanyID     string     `json:"company_id"`
-	AgentID       string     `json:"agent_id"`
-	SessionID     string     `json:"session_id"`
-	Mode          string     `json:"mode,omitempty"`
+	ID        string `json:"id"`
+	CompanyID string `json:"company_id"`
+	AgentID   string `json:"agent_id"`
+	SessionID string `json:"session_id"`
+	Mode      string `json:"mode,omitempty"`
+	// WorkingDir is the host filesystem directory this task's session is bound
+	// to, if any. When set, session state lives under <WorkingDir>/.stardust
+	// (see sessionstate.SessionBase) instead of the workspace root. Empty means
+	// unbound (uses the workspace root).
+	WorkingDir    string     `json:"working_dir,omitempty"`
 	Status        TaskStatus `json:"status"`
 	Input         string     `json:"input"`
 	MaxIterations int        `json:"max_iterations"`
@@ -145,15 +150,20 @@ const (
 )
 
 type AgentSession struct {
-	ID        string    `json:"id"`
-	CompanyID string    `json:"company_id"`
-	AgentID   string    `json:"agent_id"`
-	Project   string    `json:"project"`
-	Title     string    `json:"title"`
-	Mode      string    `json:"mode"`
-	Archived  bool      `json:"archived"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ID        string `json:"id"`
+	CompanyID string `json:"company_id"`
+	AgentID   string `json:"agent_id"`
+	Project   string `json:"project"`
+	Title     string `json:"title"`
+	Mode      string `json:"mode"`
+	// WorkingDir is the host filesystem directory this session is bound to, if
+	// any. When set, session state lives under <WorkingDir>/.stardust (see
+	// sessionstate.SessionBase) instead of the workspace root. Empty means
+	// unbound (uses the workspace root).
+	WorkingDir string    `json:"working_dir,omitempty"`
+	Archived   bool      `json:"archived"`
+	CreatedAt  time.Time `json:"created_at"`
+	UpdatedAt  time.Time `json:"updated_at"`
 }
 
 type ConversationTurn struct {
