@@ -126,7 +126,30 @@ type loopState struct {
 	// checkpoint (not the live task), so a resumed run keeps the images it
 	// was suspended with even if the reconstructed task no longer carries them.
 	images []string
+	// tools is the per-call effective tool registry resolved once at RunTask
+	// entry via effectiveTools. It must be used for both offering tools to the
+	// model (inferenceTools) and dispatching them (dispatchToolCall), so a run
+	// never dispatches against a broader set than it offered.
+	tools *tool.Registry
 }
+
+// effectiveTools returns the tool registry a run should use: in Plan mode only
+// the non-sensitive (read-only) subset, so a planning run can research but never
+// cause side effects; every other mode uses the full registry unchanged. It never
+// mutates r.tools and returns a fresh per-call Registry, safe under concurrent
+// tasks sharing this Runtime.
+func (r *Runtime) effectiveTools(task domain.Task) *tool.Registry {
+	if r.tools != nil && task.Mode == domain.ModePlan {
+		return r.tools.Subset(r.tools.SafeToolNames()...)
+	}
+	return r.tools
+}
+
+// planInstruction is appended to the base prompt in Plan mode, directing the
+// model to research and produce a structured plan instead of taking any
+// side-effecting action; it pairs with effectiveTools restricting the actually
+// offered/dispatched tools to the read-only subset.
+const planInstruction = "\n\n[系统] 当前为 Plan 模式：只做调研与分析，产出一份结构化的执行计划（步骤、涉及文件、验证方式），不要执行任何有副作用的操作。只可使用只读工具。"
 
 func NewRuntime(cfg Config) *Runtime {
 	audit := cfg.Audit
@@ -224,20 +247,25 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 				cachedTokens:     cp.CachedTokens,
 				totalTokens:      cp.TotalTokens,
 				images:           cp.Images,
+				tools:            r.effectiveTools(task),
 			}
 			return r.runToolLoop(ctx, requestID, agent, task, st)
 		}
 	}
 
+	effTools := r.effectiveTools(task)
 	prompt, err := r.buildPrompt(ctx, agent, task)
 	if err != nil {
 		return domain.TaskRun{}, err
+	}
+	if task.Mode == domain.ModePlan {
+		prompt += planInstruction
 	}
 	// basePrompt is the fixed task framing (system + task). It is reused verbatim
 	// as the head of every tool-round prompt, so it is the stable prefix that
 	// drives the provider prompt-cache breakpoint (InferenceRequest.StablePrefixLen).
 	basePrompt := prompt
-	resp, err := r.generate(ctx, requestID, prompt, task.Images, len([]rune(basePrompt)))
+	resp, err := r.generate(ctx, requestID, prompt, task.Images, len([]rune(basePrompt)), effTools)
 	if err != nil {
 		_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonInferenceError, true)
 		return domain.TaskRun{}, fmt.Errorf("generate inference: %w", err)
@@ -252,6 +280,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		cachedTokens:     resp.CachedTokens,
 		totalTokens:      resp.TotalTokens,
 		images:           task.Images,
+		tools:            effTools,
 	}
 	return r.runToolLoop(ctx, requestID, agent, task, st)
 }
@@ -273,14 +302,14 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		if suspend {
 			return domain.TaskRun{}, ErrSuspended
 		}
-		results, err := r.executeToolCalls(ctx, agent, task, st.resp.ToolCalls)
+		results, err := r.executeToolCalls(ctx, agent, task, st.resp.ToolCalls, st.tools)
 		if err != nil {
 			_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonToolError, true)
 			return domain.TaskRun{}, fmt.Errorf("execute model tool calls: %w", err)
 		}
 		st.toolCtx = mergeToolResults(st.toolCtx, st.resp.ToolCalls, results, r.maxToolResultChars)
 		prompt := boundPrompt(st.basePrompt+renderToolEntries(st.toolCtx), r.maxPromptChars)
-		st.resp, err = r.generate(ctx, requestID, prompt, st.images, stablePrefixRunes(prompt, st.basePrompt))
+		st.resp, err = r.generate(ctx, requestID, prompt, st.images, stablePrefixRunes(prompt, st.basePrompt), st.tools)
 		if err != nil {
 			_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonInferenceError, true)
 			return domain.TaskRun{}, fmt.Errorf("generate inference after tools: %w", err)
@@ -423,11 +452,11 @@ func (r *Runtime) finishRun(ctx context.Context, requestID string, agent domain.
 	return run, nil
 }
 
-func (r *Runtime) generate(ctx context.Context, requestID string, prompt string, images []string, stablePrefixLen int) (port.InferenceResponse, error) {
+func (r *Runtime) generate(ctx context.Context, requestID string, prompt string, images []string, stablePrefixLen int, tools *tool.Registry) (port.InferenceResponse, error) {
 	return r.maas.Generate(ctx, port.InferenceRequest{
 		RequestID:       requestID,
 		Prompt:          prompt,
-		Tools:           r.inferenceTools(),
+		Tools:           r.inferenceTools(tools),
 		Images:          images,
 		StablePrefixLen: stablePrefixLen,
 	})
@@ -458,8 +487,8 @@ func stablePrefixRunes(sent, base string) int {
 	return 0
 }
 
-func (r *Runtime) inferenceTools() []port.InferenceTool {
-	if r.tools == nil {
+func (r *Runtime) inferenceTools(tools *tool.Registry) []port.InferenceTool {
+	if tools == nil {
 		return nil
 	}
 	// Lazy (on-demand) protocol: offer only the two meta tools so the model pays
@@ -468,7 +497,7 @@ func (r *Runtime) inferenceTools() []port.InferenceTool {
 	if r.lazyTools {
 		return metaInferenceTools()
 	}
-	descriptors := r.tools.Descriptors()
+	descriptors := tools.Descriptors()
 	out := make([]port.InferenceTool, 0, len(descriptors))
 	for _, descriptor := range descriptors {
 		out = append(out, port.InferenceTool{
@@ -480,8 +509,8 @@ func (r *Runtime) inferenceTools() []port.InferenceTool {
 	return out
 }
 
-func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task domain.Task, calls []domain.ToolCall) ([]domain.ToolResult, error) {
-	if r.tools == nil {
+func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task domain.Task, calls []domain.ToolCall, tools *tool.Registry) ([]domain.ToolResult, error) {
+	if tools == nil {
 		return nil, fmt.Errorf("tool registry unavailable")
 	}
 	results := make([]domain.ToolResult, 0, len(calls))
@@ -497,7 +526,7 @@ func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task
 		}); err != nil {
 			return nil, fmt.Errorf("publish tool request event: %w", err)
 		}
-		result, err := r.dispatchToolCall(ctx, agent, task, call)
+		result, err := r.dispatchToolCall(ctx, agent, task, call, tools)
 		if err != nil {
 			if pubErr := r.events.Publish(ctx, domain.RuntimeEvent{
 				Type:      "tool_failed",
