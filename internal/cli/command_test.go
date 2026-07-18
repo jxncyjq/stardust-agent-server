@@ -1105,6 +1105,151 @@ func TestServeCommandUsesSQLiteForHTTPTaskState(t *testing.T) {
 	}
 }
 
+func TestServeCommandEventsEndpointNotUnavailable(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{"service": {"background_interval": "1h"}}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", configPath, err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error = %v, want nil", err)
+	}
+	addr := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("listener.Close() error = %v, want nil", err)
+	}
+
+	var out bytes.Buffer
+	root := NewRoot(app.New(), &out)
+	root.SetContext(ctx)
+	root.SetArgs([]string{"serve", "--config", configPath, "--addr", addr})
+	done := make(chan error, 1)
+	go func() { done <- root.Execute() }()
+
+	// Poll until the server is listening, then open the SSE stream.
+	streamCtx, streamCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer streamCancel()
+	var status int
+	var contentType string
+	for i := 0; i < 100; i++ {
+		req, reqErr := http.NewRequestWithContext(streamCtx, http.MethodGet, "http://"+addr+"/v1/events", nil)
+		if reqErr != nil {
+			t.Fatalf("NewRequest(/v1/events) error = %v, want nil", reqErr)
+		}
+		resp, doErr := http.DefaultClient.Do(req)
+		if doErr != nil {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		status = resp.StatusCode
+		contentType = resp.Header.Get("Content-Type")
+		_ = resp.Body.Close()
+		break
+	}
+	cancel()
+	select {
+	case execErr := <-done:
+		if execErr != nil {
+			t.Fatalf("Execute(serve) error = %v, want nil", execErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Execute(serve) did not stop")
+	}
+	if status == http.StatusServiceUnavailable {
+		t.Fatal("GET /v1/events status = 503, want SSE wired (503 death-code regression)")
+	}
+	if status != http.StatusOK {
+		t.Fatalf("GET /v1/events status = %d, want 200", status)
+	}
+	if !strings.Contains(contentType, "text/event-stream") {
+		t.Fatalf("GET /v1/events Content-Type = %q, want text/event-stream", contentType)
+	}
+}
+
+func TestServeCommandStreamsLifecycleEventsOverSSE(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	// A short background_interval (matching TestTaskSubmitEmitsCompletedEvent
+	// in gateway_contract_test.go) is required so the coordinator heartbeat
+	// actually runs and dispatches the posted task within the test window;
+	// the service.BackgroundScheduler ticker (internal/task/background_scheduler.go)
+	// fires no immediate tick, so background_interval: "1h" would never
+	// process the task inside this test's 5s deadline.
+	if err := os.WriteFile(configPath, []byte(`{"service": {"background_interval": "20ms"}}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", configPath, err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error = %v, want nil", err)
+	}
+	addr := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("listener.Close() error = %v, want nil", err)
+	}
+
+	var out bytes.Buffer
+	root := NewRoot(app.New(), &out)
+	root.SetContext(ctx)
+	root.SetArgs([]string{"serve", "--config", configPath, "--addr", addr})
+	done := make(chan error, 1)
+	go func() { done <- root.Execute() }()
+
+	// Drive one task to completion (demo maas), so task_started/task_completed
+	// are buffered on the platform bus.
+	resp, err := waitForPostTask(t, "http://"+addr+"/v1/tasks",
+		`{"id":"sse-task-1","company_id":"c1","input":"hello sse"}`)
+	if err != nil {
+		cancel()
+		t.Fatalf("POST /v1/tasks error = %v, want nil", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		cancel()
+		t.Fatalf("Body.Close() error = %v, want nil", err)
+	}
+
+	// Subscribe AFTER the task ran; buffered events are replayed to new
+	// subscribers, so task_completed is deterministically available.
+	streamCtx, streamCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer streamCancel()
+	found := false
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) && !found {
+		req, reqErr := http.NewRequestWithContext(streamCtx, http.MethodGet,
+			"http://"+addr+"/v1/events?type=task_completed", nil)
+		if reqErr != nil {
+			t.Fatalf("NewRequest error = %v, want nil", reqErr)
+		}
+		sseResp, doErr := http.DefaultClient.Do(req)
+		if doErr != nil {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		buf := make([]byte, 4096)
+		n, _ := sseResp.Body.Read(buf) // one read is enough; replay is immediate
+		_ = sseResp.Body.Close()
+		if n > 0 && strings.Contains(string(buf[:n]), "event: task_completed") {
+			found = true
+		}
+	}
+	cancel()
+	select {
+	case execErr := <-done:
+		if execErr != nil {
+			t.Fatalf("Execute(serve) error = %v, want nil", execErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Execute(serve) did not stop")
+	}
+	if !found {
+		t.Fatal("GET /v1/events never streamed task_completed, want lifecycle event bridged to SSE")
+	}
+}
+
 func TestServeCommandStartsAndStopsWithContext(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())

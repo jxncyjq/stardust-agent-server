@@ -95,6 +95,7 @@ type Config struct {
 	Messages            MessageStore
 	Skills              SkillManager
 	ToolApprovals       ApprovalDecider
+	ApprovalTickets     ApprovalLister
 	Readiness           ReadinessChecker
 	AdminToken          string
 	PublicHealthEnabled bool
@@ -119,6 +120,7 @@ type HTTPServer struct {
 	messages            MessageStore
 	skills              SkillManager
 	toolApprovals       ApprovalDecider
+	approvalTickets     ApprovalLister
 	readiness           ReadinessChecker
 	adminToken          string
 	publicHealthEnabled bool
@@ -160,6 +162,7 @@ func NewHTTPServer(cfg Config) *HTTPServer {
 		messages:            cfg.Messages,
 		skills:              cfg.Skills,
 		toolApprovals:       cfg.ToolApprovals,
+		approvalTickets:     cfg.ApprovalTickets,
 		readiness:           cfg.Readiness,
 		adminToken:          cfg.AdminToken,
 		publicHealthEnabled: cfg.PublicHealthEnabled,
@@ -210,6 +213,8 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(rec, http.StatusOK, BuildOpenAPISpec())
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/events":
 		s.handleEvents(rec, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/approvals":
+		s.handleListApprovals(rec, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/audit-events":
 		s.handleAuditEvents(rec, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/runtime-events":
@@ -1347,4 +1352,19 @@ func (r *statusRecorder) WriteHeader(status int) {
 
 func (r *statusRecorder) Write(data []byte) (int, error) {
 	return r.ResponseWriter.Write(data)
+}
+
+// Flush forwards to the wrapped ResponseWriter's Flush when it implements
+// http.Flusher. statusRecorder embeds http.ResponseWriter as an interface
+// field, so Go's method promotion only exposes the interface's own methods
+// (Header/Write/WriteHeader) -- Flush is not part of that interface and is
+// therefore never promoted, even though the concrete ResponseWriter beneath
+// it (e.g. the stdlib http.response) implements it. Without this passthrough,
+// streaming handlers (SSE endpoints) that type-assert w.(http.Flusher) after
+// statusRecorder wraps w would always fail the assertion and could never
+// push partial writes to the client before the handler returns.
+func (r *statusRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }

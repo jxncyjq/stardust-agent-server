@@ -36,6 +36,42 @@ func TestDecideFlipsTaskToRunningWhenAllDecided(t *testing.T) {
 	}
 }
 
+// TestDecideEmitsApprovalResolved covers the sink emission added on top of
+// Decide's on-disk commit: once store.Decide records the decision, the
+// coordinator must notify its ApprovalEventSink with the ticket and decision,
+// regardless of any subsequent transition outcome. spyApprovalSink is defined
+// in manualgate_test.go (same package) and reused by ShouldSuspend's
+// approval_pending test. There is no existing SchedulerGate fake in this
+// package — every other Decide test here drives a real *task.Scheduler — so
+// this test does the same rather than inventing a fake construction.
+func TestDecideEmitsApprovalResolved(t *testing.T) {
+	dir := t.TempDir()
+	store := approval.NewToolGateStore(dir)
+	rec, err := store.Open(approval.ToolApproval{
+		SessionKey: "s1", TaskID: "task-1", ToolCallID: "call-1", ToolName: "write_file",
+	})
+	if err != nil {
+		t.Fatalf("store.Open() error = %v, want nil", err)
+	}
+	sched := task.NewScheduler()
+	if err := sched.Add(context.Background(), domain.Task{ID: "task-1", SessionID: "s1", Status: domain.TaskRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sched.Transition(context.Background(), "task-1", domain.TaskSuspended); err != nil {
+		t.Fatal(err)
+	}
+	sink := &spyApprovalSink{}
+	coord := NewApprovalCoordinator(store, sched, WithCoordinatorSink(sink))
+
+	if _, err := coord.Decide(context.Background(), "task-1", rec.TicketID, approval.ApprovalApproved); err != nil {
+		t.Fatalf("Decide() error = %v, want nil", err)
+	}
+	want := rec.TicketID + ":approved"
+	if len(sink.resolved) != 1 || sink.resolved[0] != want {
+		t.Fatalf("sink.resolved = %v, want [%s]", sink.resolved, want)
+	}
+}
+
 // TestDecideUnknownTaskFailsLoud guards the fail-loud contract: deciding on a
 // ticket whose task the scheduler doesn't know about must error, never
 // silently no-op.
