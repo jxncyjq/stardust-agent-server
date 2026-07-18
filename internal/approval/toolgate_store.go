@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/stardust/legion-agent/internal/sessionstate"
@@ -52,6 +53,16 @@ type ToolApproval struct {
 // tickets.
 type ToolGateStore struct {
 	base string
+
+	// mu serializes all disk I/O (temp-file+rename writes and reads) against
+	// this store's ticket files. Without it, a concurrent Decide racing
+	// another Decide or a ListForTask/ListPending read can observe a file
+	// mid-rename: on Windows NTFS, os.Rename and os.ReadFile on the same path
+	// collide with a sharing violation (the rename is atomic on Linux, which
+	// masks the same underlying lack of serialization). A single coarse lock
+	// is deliberate: approval I/O is rare and cheap, so correctness and
+	// portability matter far more than fine-grained concurrency here.
+	mu sync.Mutex
 }
 
 // NewToolGateStore returns a ToolGateStore rooted at base, the resolved
@@ -94,8 +105,10 @@ func (s *ToolGateStore) Open(rec ToolApproval) (ToolApproval, error) {
 	if rec.SessionKey == "" || rec.TaskID == "" || rec.ToolCallID == "" {
 		return ToolApproval{}, fmt.Errorf("open approval: empty SessionKey/TaskID/ToolCallID (session=%q task=%q call=%q)", rec.SessionKey, rec.TaskID, rec.ToolCallID)
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	ticketID := TicketID(rec.TaskID, rec.ToolCallID)
-	existing, ok, err := s.Get(rec.SessionKey, ticketID)
+	existing, ok, err := s.getLocked(rec.SessionKey, ticketID)
 	if err != nil {
 		return ToolApproval{}, fmt.Errorf("open approval: check existing ticket %s: %w", ticketID, err)
 	}
@@ -107,7 +120,7 @@ func (s *ToolGateStore) Open(rec ToolApproval) (ToolApproval, error) {
 	rec.Status = ApprovalPending
 	rec.CreatedAt = now
 	rec.UpdatedAt = now
-	if err := s.write(rec); err != nil {
+	if err := s.writeLocked(rec); err != nil {
 		return ToolApproval{}, fmt.Errorf("open approval: %w", err)
 	}
 	return rec, nil
@@ -118,6 +131,13 @@ func (s *ToolGateStore) Open(rec ToolApproval) (ToolApproval, error) {
 // fault — an unreadable file or corrupt JSON — returns a fail-loud error;
 // Get never treats a decode failure as "not found".
 func (s *ToolGateStore) Get(sessionKey, ticketID string) (ToolApproval, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.getLocked(sessionKey, ticketID)
+}
+
+// getLocked is Get's implementation. Callers must hold s.mu.
+func (s *ToolGateStore) getLocked(sessionKey, ticketID string) (ToolApproval, bool, error) {
 	path := s.ticketPath(sessionKey, ticketID)
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
@@ -142,7 +162,9 @@ func (s *ToolGateStore) Decide(sessionKey, ticketID string, status ApprovalStatu
 	if status != ApprovalApproved && status != ApprovalDenied {
 		return ToolApproval{}, fmt.Errorf("decide approval: invalid status %q (want approved|denied)", status)
 	}
-	rec, ok, err := s.Get(sessionKey, ticketID)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	rec, ok, err := s.getLocked(sessionKey, ticketID)
 	if err != nil {
 		return ToolApproval{}, fmt.Errorf("decide approval: %w", err)
 	}
@@ -154,7 +176,7 @@ func (s *ToolGateStore) Decide(sessionKey, ticketID string, status ApprovalStatu
 	}
 	rec.Status = status
 	rec.UpdatedAt = time.Now()
-	if err := s.write(rec); err != nil {
+	if err := s.writeLocked(rec); err != nil {
 		return ToolApproval{}, fmt.Errorf("decide approval: %w", err)
 	}
 	return rec, nil
@@ -164,6 +186,8 @@ func (s *ToolGateStore) Decide(sessionKey, ticketID string, status ApprovalStatu
 // matches taskID. A session with no approvals directory yet is a legitimate
 // empty result. A corrupt ticket file inside the directory fails loud.
 func (s *ToolGateStore) ListForTask(sessionKey, taskID string) ([]ToolApproval, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	dir := filepath.Join(sessionstate.SessionDir(s.base, sessionKey), approvalsDirName)
 	recs, err := readApprovalsDir(dir)
 	if err != nil {
@@ -182,6 +206,8 @@ func (s *ToolGateStore) ListForTask(sessionKey, taskID string) ([]ToolApproval, 
 // base, for the timeout sweep. A corrupt ticket file anywhere in the tree
 // fails loud rather than being silently skipped.
 func (s *ToolGateStore) ListPending() ([]ToolApproval, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	pattern := filepath.Join(s.base, "session", "*", approvalsDirName, "*.json")
 	paths, err := filepath.Glob(pattern)
 	if err != nil {
@@ -200,10 +226,12 @@ func (s *ToolGateStore) ListPending() ([]ToolApproval, error) {
 	return out, nil
 }
 
-// write atomically persists rec to its ticket path (temp file + rename),
-// mirroring sessionstate.Store.Save so a crash mid-write never leaves a
-// half-written ticket file behind.
-func (s *ToolGateStore) write(rec ToolApproval) error {
+// writeLocked atomically persists rec to its ticket path (temp file +
+// rename), mirroring sessionstate.Store.Save so a crash mid-write never
+// leaves a half-written ticket file behind. Callers must hold s.mu: the
+// rename must not race a concurrent read of the same path (Get/ListForTask/
+// ListPending), which on Windows NTFS collides with a sharing violation.
+func (s *ToolGateStore) writeLocked(rec ToolApproval) error {
 	dir := filepath.Join(sessionstate.SessionDir(s.base, rec.SessionKey), approvalsDirName)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create approvals dir %q: %w", dir, err)
