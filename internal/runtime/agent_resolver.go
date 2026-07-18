@@ -11,6 +11,7 @@ import (
 	"github.com/stardust/legion-agent/internal/contextfiles"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/skill"
 	"github.com/stardust/legion-agent/internal/taskledger"
 	"github.com/stardust/legion-agent/internal/tool"
@@ -31,6 +32,13 @@ type AgentRuntimeResolverConfig struct {
 	TaskLedger   *taskledger.Ledger
 	MessageStore tool.AgentMessageStore
 	MaasFactory  MaasRunnerFactory
+	// Checkpoints persists suspended tool-loop state for resolver-built (per-agent)
+	// runtimes, mirroring Config.Checkpoints on the default runtime. Nil disables
+	// suspend/resume for those runtimes (legacy behaviour).
+	Checkpoints *sessionstate.Store
+	// ToolGate gates each tool round for resolver-built runtimes, mirroring
+	// Config.ToolGate on the default runtime. Nil never suspends.
+	ToolGate ToolGate
 }
 
 type AgentRuntimeResolver struct {
@@ -41,6 +49,8 @@ type AgentRuntimeResolver struct {
 	taskLedger   *taskledger.Ledger
 	messageStore tool.AgentMessageStore
 	maasFactory  MaasRunnerFactory
+	checkpoints  *sessionstate.Store
+	toolGate     ToolGate
 }
 
 func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolver {
@@ -52,6 +62,8 @@ func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolv
 		taskLedger:   cfg.TaskLedger,
 		messageStore: cfg.MessageStore,
 		maasFactory:  cfg.MaasFactory,
+		checkpoints:  cfg.Checkpoints,
+		toolGate:     cfg.ToolGate,
 	}
 }
 
@@ -99,6 +111,8 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		Tools:          tools,
 		MaxToolRounds:  r.rootConfig.Runtime.MaxToolRounds,
 		LazyTools:      r.rootConfig.Runtime.LazyTools,
+		Checkpoints:    r.checkpoints,
+		ToolGate:       r.toolGate,
 	})
 	return agent, runner, true, nil
 }

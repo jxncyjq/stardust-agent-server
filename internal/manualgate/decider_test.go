@@ -124,3 +124,131 @@ func TestDecideConcurrentFinalDecisionsNoSpuriousError(t *testing.T) {
 		t.Fatalf("t1 status = %v (ok=%v), want running", got.Status, ok)
 	}
 }
+
+// TestReconcileResumeFlipsWhenAllTicketsAlreadyDecided covers the restart
+// path: a task suspended before a crash whose ticket was approved (but the
+// resume dispatch never ran) must flip Suspended->Running when
+// ReconcileResume runs at the next startup.
+func TestReconcileResumeFlipsWhenAllTicketsAlreadyDecided(t *testing.T) {
+	dir := t.TempDir()
+	store := approval.NewToolGateStore(dir)
+	sched := task.NewScheduler()
+	ctx := context.Background()
+	if err := sched.Add(ctx, domain.Task{ID: "t1", SessionID: "s1", Status: domain.TaskRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sched.Transition(ctx, "t1", domain.TaskSuspended); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Open(approval.ToolApproval{SessionKey: "s1", TaskID: "t1", ToolCallID: "c1", ToolName: "write_file"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Decide("s1", approval.TicketID("t1", "c1"), approval.ApprovalApproved); err != nil {
+		t.Fatal(err)
+	}
+	ac := NewApprovalCoordinator(store, sched)
+	if err := ac.ReconcileResume(ctx, "t1"); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := sched.Get(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != domain.TaskRunning {
+		t.Fatalf("status = %s, want running", got.Status)
+	}
+}
+
+// TestReconcileResumeNoTicketsStaysSuspended covers the "suspended for a
+// different reason" case: a task with no recorded approval tickets at all
+// must NOT be resumed by ReconcileResume — it is not this coordinator's
+// decision to make.
+func TestReconcileResumeNoTicketsStaysSuspended(t *testing.T) {
+	dir := t.TempDir()
+	store := approval.NewToolGateStore(dir)
+	sched := task.NewScheduler()
+	ctx := context.Background()
+	if err := sched.Add(ctx, domain.Task{ID: "t1", SessionID: "s1", Status: domain.TaskRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sched.Transition(ctx, "t1", domain.TaskSuspended); err != nil {
+		t.Fatal(err)
+	}
+	ac := NewApprovalCoordinator(store, sched)
+	if err := ac.ReconcileResume(ctx, "t1"); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := sched.Get(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != domain.TaskSuspended {
+		t.Fatalf("status = %s, want still suspended (no tickets)", got.Status)
+	}
+}
+
+// TestReconcileResumePendingTicketStaysSuspended covers the "still waiting on
+// a human" case: a task with at least one ApprovalPending ticket must stay
+// Suspended.
+func TestReconcileResumePendingTicketStaysSuspended(t *testing.T) {
+	dir := t.TempDir()
+	store := approval.NewToolGateStore(dir)
+	sched := task.NewScheduler()
+	ctx := context.Background()
+	if err := sched.Add(ctx, domain.Task{ID: "t1", SessionID: "s1", Status: domain.TaskRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sched.Transition(ctx, "t1", domain.TaskSuspended); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Open(approval.ToolApproval{SessionKey: "s1", TaskID: "t1", ToolCallID: "c1", ToolName: "write_file"}); err != nil {
+		t.Fatal(err)
+	}
+	ac := NewApprovalCoordinator(store, sched)
+	if err := ac.ReconcileResume(ctx, "t1"); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := sched.Get(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != domain.TaskSuspended {
+		t.Fatalf("status = %s, want still suspended (pending ticket)", got.Status)
+	}
+}
+
+// TestReconcileResumeUnknownTaskFailsLoud guards the fail-loud contract for
+// the reconcile path: an unknown task must error, not silently no-op.
+func TestReconcileResumeUnknownTaskFailsLoud(t *testing.T) {
+	dir := t.TempDir()
+	store := approval.NewToolGateStore(dir)
+	sched := task.NewScheduler()
+	ac := NewApprovalCoordinator(store, sched)
+	if err := ac.ReconcileResume(context.Background(), "ghost"); err == nil {
+		t.Fatal("ReconcileResume on unknown task: err = nil, want error")
+	}
+}
+
+// TestReconcileResumeNonSuspendedTaskIsNoop covers a task that is not
+// Suspended at all (e.g. already Running or Done): ReconcileResume must not
+// attempt any transition.
+func TestReconcileResumeNonSuspendedTaskIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	store := approval.NewToolGateStore(dir)
+	sched := task.NewScheduler()
+	ctx := context.Background()
+	if err := sched.Add(ctx, domain.Task{ID: "t1", SessionID: "s1", Status: domain.TaskRunning}); err != nil {
+		t.Fatal(err)
+	}
+	ac := NewApprovalCoordinator(store, sched)
+	if err := ac.ReconcileResume(ctx, "t1"); err != nil {
+		t.Fatal(err)
+	}
+	got, _, err := sched.Get(ctx, "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != domain.TaskRunning {
+		t.Fatalf("status = %s, want unchanged running", got.Status)
+	}
+}

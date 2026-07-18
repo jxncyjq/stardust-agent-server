@@ -54,14 +54,7 @@ func (a *ApprovalCoordinator) Decide(ctx context.Context, taskID, ticketID strin
 	if err != nil {
 		return approval.ToolApproval{}, fmt.Errorf("list tickets for task %s: %w", taskID, err)
 	}
-	allDecided := true
-	for _, r := range remaining {
-		if r.Status == approval.ApprovalPending {
-			allDecided = false
-			break
-		}
-	}
-	if allDecided && t.Status == domain.TaskSuspended {
+	if ticketsAllDecided(remaining) && t.Status == domain.TaskSuspended {
 		if err := a.sched.Transition(ctx, taskID, domain.TaskRunning); err != nil {
 			// Two concurrent Decide calls on the final tickets of the same task
 			// can both observe Suspended+allDecided (the Status read above and
@@ -83,4 +76,61 @@ func (a *ApprovalCoordinator) Decide(ctx context.Context, taskID, ticketID strin
 		}
 	}
 	return rec, nil
+}
+
+// ticketsAllDecided reports whether none of tickets is still ApprovalPending.
+// An empty slice is vacuously "all decided" by this predicate alone — callers
+// that must distinguish "no tickets at all" from "every ticket resolved"
+// (ReconcileResume) check len(tickets) themselves before calling this.
+func ticketsAllDecided(tickets []approval.ToolApproval) bool {
+	for _, t := range tickets {
+		if t.Status == approval.ApprovalPending {
+			return false
+		}
+	}
+	return true
+}
+
+// ReconcileResume resumes a Suspended task at process startup if every
+// approval ticket recorded for it was already decided before the restart
+// (e.g. a human approved the last ticket but the process died before the
+// resume dispatch ran). It is the startup counterpart to Decide's
+// Suspended->Running flip.
+//
+// A task that is not currently Suspended is left untouched (nothing to
+// reconcile). A Suspended task with NO recorded tickets is also left
+// untouched — it is suspended for a reason other than a tool-approval
+// decision (e.g. a plain checkpoint), and ReconcileResume must not guess at
+// resuming it. A Suspended task with any ticket still ApprovalPending is left
+// untouched — it is still waiting on a human. Only when every ticket has
+// moved past ApprovalPending does ReconcileResume flip the task to Running so
+// the coordinator's resume scan picks it up.
+func (a *ApprovalCoordinator) ReconcileResume(ctx context.Context, taskID string) error {
+	t, ok, err := a.sched.Get(ctx, taskID)
+	if err != nil {
+		return fmt.Errorf("lookup task %s for approval reconcile: %w", taskID, err)
+	}
+	if !ok {
+		return fmt.Errorf("reconcile approval resume: task %s not found", taskID)
+	}
+	if t.Status != domain.TaskSuspended {
+		return nil
+	}
+	sessionKey := sessionKeyForTask(t)
+	tickets, err := a.store.ListForTask(sessionKey, taskID)
+	if err != nil {
+		return fmt.Errorf("list tickets for task %s approval reconcile: %w", taskID, err)
+	}
+	if len(tickets) == 0 {
+		// Suspended for a reason other than a tool-approval ticket; not ours to
+		// resume.
+		return nil
+	}
+	if !ticketsAllDecided(tickets) {
+		return nil
+	}
+	if err := a.sched.Transition(ctx, taskID, domain.TaskRunning); err != nil {
+		return fmt.Errorf("resume task %s on approval reconcile: %w", taskID, err)
+	}
+	return nil
 }

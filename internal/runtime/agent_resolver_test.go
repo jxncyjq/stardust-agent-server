@@ -10,10 +10,64 @@ import (
 
 	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/agentregistry"
+	"github.com/stardust/legion-agent/internal/approval"
 	"github.com/stardust/legion-agent/internal/config"
 	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/manualgate"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/sessionstate"
 )
+
+// TestResolverInjectsCheckpointsAndGate guards Task 7's resolver wiring: a
+// resolver constructed with Checkpoints/ToolGate must pass both through to
+// every per-agent *Runtime it builds (not just the default runtime), so
+// Manual-mode suspend/resume works for delegated/child agents too.
+func TestResolverInjectsCheckpointsAndGate(t *testing.T) {
+	t.Parallel()
+
+	cfgStore := sessionstate.NewStore(t.TempDir())
+	gate := manualgate.New(approval.NewToolGateStore(t.TempDir()))
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
+			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep"},
+		}),
+		RootConfig: config.Config{Runtime: config.RuntimeConfig{MaxToolRounds: 1}},
+		Audit:      adapter.NewMemoryAuditLog(),
+		Events:     adapter.NewMemoryEventBus(),
+		MaasFactory: func(string) (MaasRunnerFactoryResult, error) {
+			return MaasRunnerFactoryResult{Client: &resolverCaptureMaas{response: "ok"}}, nil
+		},
+		Checkpoints: cfgStore,
+		ToolGate:    gate,
+	})
+
+	_, runner, ok, err := resolver.ResolveTaskRunner(context.Background(), domain.Task{
+		ID:      "task-gate",
+		AgentID: "researcher",
+	})
+	if err != nil {
+		t.Fatalf("ResolveTaskRunner error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatalf("ResolveTaskRunner ok = false, want true")
+	}
+	rt, isRuntime := runner.(*Runtime)
+	if !isRuntime {
+		t.Fatalf("runner type = %T, want *Runtime", runner)
+	}
+	if rt.checkpoints == nil {
+		t.Fatalf("resolver runtime missing checkpoints, want non-nil (cfgStore)")
+	}
+	if rt.checkpoints != cfgStore {
+		t.Fatalf("resolver runtime checkpoints = %p, want the same store %p", rt.checkpoints, cfgStore)
+	}
+	if rt.toolGate == nil {
+		t.Fatalf("resolver runtime missing toolGate, want non-nil (gate)")
+	}
+	if rt.toolGate != ToolGate(gate) {
+		t.Fatalf("resolver runtime toolGate = %v, want the same gate %v", rt.toolGate, gate)
+	}
+}
 
 func TestAgentRuntimeResolverUsesRegisteredAgentMaasProfileAndContextFiles(t *testing.T) {
 	t.Parallel()

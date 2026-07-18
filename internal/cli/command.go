@@ -29,6 +29,7 @@ import (
 	"github.com/stardust/legion-agent/internal/contextfiles"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/evolution"
+	"github.com/stardust/legion-agent/internal/manualgate"
 	"github.com/stardust/legion-agent/internal/memory"
 	"github.com/stardust/legion-agent/internal/observability"
 	"github.com/stardust/legion-agent/internal/port"
@@ -1728,7 +1729,20 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		closeStore()
 		return ServeResult{}, err
 	}
-	// TODO(M2): inject checkpoint store into resolver-built runtimes
+	// Manual-mode approval gate wiring (M2b). A single ToolGateStore persists
+	// approval tickets under the workspace root (the same base checkpointStore
+	// uses), and one ManualToolGate instance is shared by the default runtime
+	// and every resolver-built per-agent runtime, so Manual-mode suspend/resume
+	// behaves identically regardless of which runtime dispatches the tool call.
+	workspaceRoot, workspaceRootWarning := sessionstate.ResolveWorkspaceRoot(cfg.Workspace.Root)
+	checkpointStore := sessionstate.NewStore(workspaceRoot)
+	toolGateStore := approval.NewToolGateStore(workspaceRoot)
+	manualGate := manualgate.New(toolGateStore)
+	// approvalCoordinator applies a human's approve/deny decision (HTTP handler
+	// below) and, once every ticket for a task is decided, flips the task
+	// Suspended->Running so the coordinator's resume scan re-dispatches it. It
+	// also drives the background timeout sweep and the restart reconcile below.
+	approvalCoordinator := manualgate.NewApprovalCoordinator(toolGateStore, liveTasks)
 	resolver := agentruntime.NewAgentRuntimeResolver(agentruntime.AgentRuntimeResolverConfig{
 		Registry:     registry,
 		RootConfig:   cfg,
@@ -1737,6 +1751,8 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		TaskLedger:   taskLedger,
 		MessageStore: messageStore,
 		MaasFactory:  maasFactoryFromConfig(cfg.Maas),
+		Checkpoints:  checkpointStore,
+		ToolGate:     manualGate,
 	})
 	defaultMaas, err := adapter.NewMaasClientFromProfile(cfg.Maas, "")
 	if err != nil {
@@ -1793,9 +1809,6 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		}).WithUsage(skillUsage, time.Now))
 	}
 
-	workspaceRoot, workspaceRootWarning := sessionstate.ResolveWorkspaceRoot(cfg.Workspace.Root)
-	checkpointStore := sessionstate.NewStore(workspaceRoot)
-
 	// The default runtime is a root orchestrator, so it may delegate. Register
 	// delegate_task on its tool registry after construction (a leaf child would
 	// not register it, preventing unbounded recursion).
@@ -1808,6 +1821,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		MaxToolRounds:  cfg.Runtime.MaxToolRounds,
 		LazyTools:      cfg.Runtime.LazyTools,
 		Checkpoints:    checkpointStore,
+		ToolGate:       manualGate,
 	})
 	defaultRuntime.RegisterDelegateTaskTool(defaultTools)
 	coordinator := agentruntime.NewCoordinator(agentruntime.CoordinatorConfig{
@@ -1828,6 +1842,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		Events:             workflowEvents,
 		TrustGate:          trustManager,
 		MaxWorkers:         cfg.Runtime.MaxConcurrentTasks,
+		Checkpoints:        checkpointStore,
 	})
 	background := task.NewBackgroundScheduler()
 	background.AddJob("agent-coordinator-heartbeat", func(ctx context.Context) error {
@@ -1890,9 +1905,45 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	if recovered > 0 {
 		logger.Info("recovered suspended tasks", "count", recovered)
 	}
+	// Restart reconcile: a task suspended awaiting Manual-mode tool approval
+	// whose ticket(s) were all decided before the process died (approved, but
+	// the resume dispatch never ran) must resume now rather than wait for a
+	// fresh decision that will never come. ReconcileResume leaves untouched a
+	// Suspended task with no tickets (suspended for another reason) or with
+	// any ticket still pending (still waiting on a human).
+	suspendCandidates, err := liveTasks.List(ctx)
+	if err != nil {
+		_ = listener.Close()
+		closeStore()
+		return ServeResult{}, fmt.Errorf("list tasks for approval reconcile: %w", err)
+	}
+	for _, st := range suspendCandidates {
+		if st.Status != domain.TaskSuspended {
+			continue
+		}
+		if err := approvalCoordinator.ReconcileResume(ctx, st.ID); err != nil {
+			_ = listener.Close()
+			closeStore()
+			return ServeResult{}, fmt.Errorf("reconcile approval resume for task %s: %w", st.ID, err)
+		}
+	}
 	// Surface background tick failures (e.g. a task failing in the coordinator
 	// heartbeat) instead of dropping them silently.
 	background.SetLogger(logger)
+	// Manual-mode approval timeout sweep: auto-deny any ApprovalPending ticket
+	// older than the configured TTL so a human's silence does not wedge a task
+	// forever. Registered here (not with the other AddJob calls above) because
+	// NewTimeoutSweepJob needs logger, which is not constructed until this
+	// point in serve assembly.
+	approvalTTL := time.Duration(cfg.Runtime.ApprovalTimeoutSeconds) * time.Second
+	if cfg.Runtime.ApprovalTimeoutSeconds <= 0 {
+		// Documented contract default (config.RuntimeConfig.ApprovalTimeoutSeconds
+		// doc comment), not a silent fallback: an explicit 0/negative value in a
+		// loaded config still means "use the 5-minute default" — the same default
+		// defaultConfig() sets for an omitted field.
+		approvalTTL = 300 * time.Second
+	}
+	background.AddJob("approval-timeout-sweep", manualgate.NewTimeoutSweepJob(toolGateStore, approvalCoordinator, approvalTTL, time.Now, logger))
 
 	// Skill management endpoints (/v1/skills/*) back the GUI's /skill commands.
 	// The disk manager is constructed whenever an install root is configured;
@@ -1920,6 +1971,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		Skills:              skillManager,
 		Logger:              logger,
 		Metrics:             metrics,
+		ToolApprovals:       approvalCoordinator,
 		Diagnostics: observability.NewDiagnostics(observability.DiagnosticsConfig{
 			Version:             "dev",
 			StorageDriver:       cfg.Storage.Driver,

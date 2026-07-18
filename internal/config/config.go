@@ -97,6 +97,11 @@ type RuntimeConfig struct {
 	// MaxConcurrentTasks caps how many tasks the coordinator runs simultaneously,
 	// each on its own goroutine. Defaults to 4; 0 or negative means the default.
 	MaxConcurrentTasks int `json:"max_concurrent_tasks"`
+	// ApprovalTimeoutSeconds bounds how long a Manual-mode tool-approval ticket
+	// may sit ApprovalPending before the background timeout sweep auto-denies it
+	// (a contract outcome — a reject result to the model — not a silent drop).
+	// Defaults to 300 (5 minutes) when 0 or negative.
+	ApprovalTimeoutSeconds int `json:"approval_timeout_seconds"`
 }
 
 type SessionConfig struct {
@@ -212,10 +217,11 @@ func defaultConfig() Config {
 			BackgroundInterval: "1s",
 		},
 		Runtime: RuntimeConfig{
-			DemoResponse:       "task completed",
-			MaxToolRounds:      4,
-			LazyTools:          true,
-			MaxConcurrentTasks: 4,
+			DemoResponse:           "task completed",
+			MaxToolRounds:          4,
+			LazyTools:              true,
+			MaxConcurrentTasks:     4,
+			ApprovalTimeoutSeconds: 300,
 		},
 		Session: SessionConfig{
 			Enabled:                 true,

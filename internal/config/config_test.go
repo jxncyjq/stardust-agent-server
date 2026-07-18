@@ -407,3 +407,13 @@ func TestLoadMaxConcurrentTasksDefault(t *testing.T) {
 		t.Fatalf("default MaxConcurrentTasks = %d, want 4", cfg.Runtime.MaxConcurrentTasks)
 	}
 }
+
+func TestLoadApprovalTimeoutSecondsDefault(t *testing.T) {
+	cfg, err := Load(context.Background(), Options{Path: ""})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Runtime.ApprovalTimeoutSeconds != 300 {
+		t.Fatalf("default ApprovalTimeoutSeconds = %d, want 300", cfg.Runtime.ApprovalTimeoutSeconds)
+	}
+}
