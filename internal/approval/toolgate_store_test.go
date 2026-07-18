@@ -2,8 +2,10 @@ package approval
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/stardust/legion-agent/internal/sessionstate"
@@ -128,6 +130,80 @@ func TestToolGateStoreListPendingCorruptFileFailsLoud(t *testing.T) {
 	}
 	if _, err := s.ListPending(); err == nil {
 		t.Fatal("ListPending on corrupt JSON: want fail-loud error, got nil")
+	}
+}
+
+// TestToolGateStoreConcurrentAccessNoRace exercises ToolGateStore's mutex
+// directly, in-package: several tickets are opened up front in one session,
+// then N goroutines concurrently mix Decide (each on its own distinct
+// ticket, so no goroutine can observe another's "already decided" race),
+// Get, ListForTask, and ListPending against that same session. It must
+// complete without any goroutine returning an unexpected error, and must be
+// race-clean under `go test -race` — regressions in s.mu's coverage of
+// reads (Get/ListForTask/ListPending) racing writes (Decide) should surface
+// here, not only via manualgate's decider test.
+func TestToolGateStoreConcurrentAccessNoRace(t *testing.T) {
+	dir := t.TempDir()
+	s := NewToolGateStore(dir)
+
+	const n = 8
+	tickets := make([]ToolApproval, n)
+	for i := 0; i < n; i++ {
+		rec, err := s.Open(newRec("t1", fmt.Sprintf("c%d", i), "write_file"))
+		if err != nil {
+			t.Fatalf("Open ticket %d: %v", i, err)
+		}
+		tickets[i] = rec
+	}
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, n*4)
+
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+
+			// Each goroutine decides its own distinct ticket — no two
+			// goroutines target the same ticket, so a re-decide error here
+			// would always be unexpected.
+			if _, err := s.Decide("s1", tickets[i].TicketID, ApprovalApproved); err != nil {
+				errCh <- fmt.Errorf("goroutine %d Decide: %w", i, err)
+			}
+
+			if _, _, err := s.Get("s1", tickets[i].TicketID); err != nil {
+				errCh <- fmt.Errorf("goroutine %d Get: %w", i, err)
+			}
+
+			if _, err := s.ListForTask("s1", "t1"); err != nil {
+				errCh <- fmt.Errorf("goroutine %d ListForTask: %w", i, err)
+			}
+
+			if _, err := s.ListPending(); err != nil {
+				errCh <- fmt.Errorf("goroutine %d ListPending: %w", i, err)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Error(err)
+	}
+
+	// Sanity: every ticket must have landed Approved — no lost writes.
+	forT1, err := s.ListForTask("s1", "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(forT1) != n {
+		t.Fatalf("ListForTask t1 after concurrent access = %d, want %d", len(forT1), n)
+	}
+	for _, rec := range forT1 {
+		if rec.Status != ApprovalApproved {
+			t.Fatalf("ticket %s status = %q, want approved", rec.TicketID, rec.Status)
+		}
 	}
 }
 

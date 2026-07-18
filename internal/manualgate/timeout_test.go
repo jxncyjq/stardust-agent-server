@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -106,6 +107,43 @@ func TestTimeoutSweepSkipsFreshPending(t *testing.T) {
 	}
 	if st, _, err := sched.Get(context.Background(), "t1"); err != nil || st.Status != domain.TaskSuspended {
 		t.Fatalf("task after no-op sweep = %v (err=%v), want still suspended", st.Status, err)
+	}
+}
+
+// TestTimeoutSweepDecideErrorPropagates covers the fail-loud wrap path: when
+// dec.Decide fails on a stale pending ticket (here, because the ticket's
+// TaskID refers to a task the scheduler has never heard of), the sweep job
+// must not swallow the error — it must return it wrapped with the ticket ID,
+// per the "timeout-deny ticket %s: %w" wrap in NewTimeoutSweepJob.
+func TestTimeoutSweepDecideErrorPropagates(t *testing.T) {
+	dir := t.TempDir()
+	store := approval.NewToolGateStore(dir)
+	sched := task.NewScheduler() // deliberately empty: "ghost" task is never added
+
+	if _, err := store.Open(approval.ToolApproval{SessionKey: "sghost", TaskID: "ghost", ToolCallID: "c1", ToolName: "write_file"}); err != nil {
+		t.Fatal(err)
+	}
+
+	dec := NewApprovalCoordinator(store, sched)
+	fixedNow := func() time.Time { return time.Now().Add(10 * time.Minute) } // far future -> stale
+	job := NewTimeoutSweepJob(store, dec, 5*time.Minute, fixedNow, slog.New(slog.NewTextHandler(io.Discard, nil)))
+
+	err := job(context.Background())
+	if err == nil {
+		t.Fatal("job with Decide failure on unknown task: want error, got nil")
+	}
+	if !strings.Contains(err.Error(), "timeout-deny ticket") {
+		t.Fatalf("job error = %q, want it to contain %q", err.Error(), "timeout-deny ticket")
+	}
+
+	// The ticket must remain untouched (still pending) since the deny was
+	// never actually recorded — Decide failed before any write.
+	got, _, err := store.Get("sghost", approval.TicketID("ghost", "c1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != approval.ApprovalPending {
+		t.Fatalf("ticket status after failed sweep = %s, want still pending", got.Status)
 	}
 }
 
