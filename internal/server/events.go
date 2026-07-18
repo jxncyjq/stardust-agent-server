@@ -31,15 +31,28 @@ func (s *HTTPServer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	eventType := r.URL.Query().Get("type")
 	events, cancel := s.platformEvents.Subscribe(r.Context())
 	defer cancel()
-	for event := range events {
-		if eventType != "" && event.Type != eventType {
-			continue
-		}
-		if err := writeSSEEvent(w, event); err != nil {
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return
+			}
+			if eventType != "" && event.Type != eventType {
+				continue
+			}
+			if err := writeSSEEvent(w, event); err != nil {
+				return
+			}
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+		case <-r.Context().Done():
+			// Client disconnected (or the request context was otherwise
+			// cancelled). Return so the deferred cancel() above unsubscribes
+			// from the bus — without this case, a bare `range events` blocks
+			// forever on an idle bus, leaking this goroutine, the bus's
+			// subscriber map entry, and its buffered channel.
 			return
-		}
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
 		}
 	}
 }
@@ -96,6 +109,11 @@ func sanitizeEventValue(value any) any {
 		return sanitizeStringMap(v)
 	case string:
 		return truncateEventString(v)
+	// NOTE: slice carriers ([]any / []map[string]any / []string) are not
+	// recursed today because no current SSE Data producer emits them
+	// (eventbridge.translate = scalars; approval arguments = map[string]string).
+	// If a future producer puts a slice in Data, extend this switch or its
+	// sensitive sub-keys/large values will bypass sanitization.
 	default:
 		return v
 	}
