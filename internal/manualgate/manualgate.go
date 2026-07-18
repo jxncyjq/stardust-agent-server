@@ -29,11 +29,39 @@ const (
 // call, and enforces the recorded human decision at dispatch time.
 type ManualToolGate struct {
 	store *approval.ToolGateStore
+	sink  ApprovalEventSink
 }
 
-// New returns a ManualToolGate persisting its approval tickets to store.
-func New(store *approval.ToolGateStore) *ManualToolGate {
-	return &ManualToolGate{store: store}
+// ApprovalEventSink receives best-effort notifications when a Manual-mode tool
+// approval ticket is opened or resolved. It is error-less by contract: SSE is a
+// notification layer, not the source of truth (the on-disk ticket is), so an
+// implementation must log-and-swallow its own delivery failures rather than
+// signal them back — a notification fault must never abort suspend/resume.
+type ApprovalEventSink interface {
+	// ApprovalPending fires once per newly opened pending ticket.
+	ApprovalPending(ctx context.Context, taskID, ticketID, tool string, args map[string]string)
+	// ApprovalResolved fires once a ticket is approved or denied (decision is
+	// "approved" or "denied").
+	ApprovalResolved(ctx context.Context, taskID, ticketID, decision string)
+}
+
+// Option configures a ManualToolGate.
+type Option func(*ManualToolGate)
+
+// WithApprovalSink attaches an optional ApprovalEventSink. A nil gate.sink means
+// notifications are disabled (the gate still gates correctly).
+func WithApprovalSink(sink ApprovalEventSink) Option {
+	return func(g *ManualToolGate) { g.sink = sink }
+}
+
+// New returns a ManualToolGate persisting its approval tickets to store,
+// configured by opts.
+func New(store *approval.ToolGateStore, opts ...Option) *ManualToolGate {
+	g := &ManualToolGate{store: store}
+	for _, o := range opts {
+		o(g)
+	}
+	return g
 }
 
 // resolveRealTool unwraps a lazy call_tool meta call to the underlying real tool
@@ -84,6 +112,9 @@ func (g *ManualToolGate) ShouldSuspend(ctx context.Context, task domain.Task, ca
 			ToolName: name, Arguments: call.Arguments,
 		}); err != nil {
 			return false, fmt.Errorf("open approval for task %s call %s: %w", task.ID, call.ID, err)
+		}
+		if g.sink != nil {
+			g.sink.ApprovalPending(ctx, task.ID, ticketID, name, call.Arguments)
 		}
 		needApproval = true
 	}

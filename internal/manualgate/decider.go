@@ -26,12 +26,26 @@ type SchedulerGate interface {
 type ApprovalCoordinator struct {
 	store *approval.ToolGateStore
 	sched SchedulerGate
+	sink  ApprovalEventSink
+}
+
+// CoordinatorOption configures an ApprovalCoordinator.
+type CoordinatorOption func(*ApprovalCoordinator)
+
+// WithCoordinatorSink attaches an optional ApprovalEventSink so Decide (and the
+// timeout sweep that routes through it) emits approval_resolved notifications.
+func WithCoordinatorSink(sink ApprovalEventSink) CoordinatorOption {
+	return func(a *ApprovalCoordinator) { a.sink = sink }
 }
 
 // NewApprovalCoordinator returns an ApprovalCoordinator recording decisions to
-// store and resuming tasks through sched.
-func NewApprovalCoordinator(store *approval.ToolGateStore, sched SchedulerGate) *ApprovalCoordinator {
-	return &ApprovalCoordinator{store: store, sched: sched}
+// store and resuming tasks through sched, configured by opts.
+func NewApprovalCoordinator(store *approval.ToolGateStore, sched SchedulerGate, opts ...CoordinatorOption) *ApprovalCoordinator {
+	a := &ApprovalCoordinator{store: store, sched: sched}
+	for _, o := range opts {
+		o(a)
+	}
+	return a
 }
 
 // Decide records the decision on disk and, when every ticket for the task is
@@ -49,6 +63,9 @@ func (a *ApprovalCoordinator) Decide(ctx context.Context, taskID, ticketID strin
 	rec, err := a.store.Decide(sessionKey, ticketID, status)
 	if err != nil {
 		return approval.ToolApproval{}, fmt.Errorf("record decision for ticket %s: %w", ticketID, err)
+	}
+	if a.sink != nil {
+		a.sink.ApprovalResolved(ctx, taskID, ticketID, string(status))
 	}
 	remaining, err := a.store.ListForTask(sessionKey, taskID)
 	if err != nil {

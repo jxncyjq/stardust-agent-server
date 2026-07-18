@@ -1755,12 +1755,17 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	workspaceRoot, workspaceRootWarning := sessionstate.ResolveWorkspaceRoot(cfg.Workspace.Root)
 	checkpointStore := sessionstate.NewStore(workspaceRoot)
 	toolGateStore := approval.NewToolGateStore(workspaceRoot)
-	manualGate := manualgate.New(toolGateStore)
+	// approvalSink translates ShouldSuspend/Decide notifications into
+	// approval_pending/approval_resolved envelopes on platformEvents (the
+	// /v1/events SSE stream). It is best-effort and error-less by contract: the
+	// on-disk ticket in toolGateStore is the source of truth.
+	approvalSink := newPlatformApprovalSink(platformEvents, logger)
+	manualGate := manualgate.New(toolGateStore, manualgate.WithApprovalSink(approvalSink))
 	// approvalCoordinator applies a human's approve/deny decision (HTTP handler
 	// below) and, once every ticket for a task is decided, flips the task
 	// Suspended->Running so the coordinator's resume scan re-dispatches it. It
 	// also drives the background timeout sweep and the restart reconcile below.
-	approvalCoordinator := manualgate.NewApprovalCoordinator(toolGateStore, liveTasks)
+	approvalCoordinator := manualgate.NewApprovalCoordinator(toolGateStore, liveTasks, manualgate.WithCoordinatorSink(approvalSink))
 	resolver := agentruntime.NewAgentRuntimeResolver(agentruntime.AgentRuntimeResolverConfig{
 		Registry:     registry,
 		RootConfig:   cfg,

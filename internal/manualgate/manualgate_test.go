@@ -27,6 +27,44 @@ func manualTask() domain.Task {
 	return domain.Task{ID: "t1", SessionID: "s1", AgentID: "a1", Mode: domain.ModeManual}
 }
 
+// spyApprovalSink is a test double for ApprovalEventSink that records every
+// notification it receives, for both ShouldSuspend's approval_pending
+// emission (this file) and Decide's approval_resolved emission
+// (decider_test.go).
+type spyApprovalSink struct {
+	pending  []string // ticketIDs
+	resolved []string // ticketID:decision
+}
+
+func (s *spyApprovalSink) ApprovalPending(_ context.Context, _, ticketID, _ string, _ map[string]string) {
+	s.pending = append(s.pending, ticketID)
+}
+
+func (s *spyApprovalSink) ApprovalResolved(_ context.Context, _, ticketID, decision string) {
+	s.resolved = append(s.resolved, ticketID+":"+decision)
+}
+
+func TestShouldSuspendEmitsApprovalPending(t *testing.T) {
+	store := approval.NewToolGateStore(t.TempDir())
+	sink := &spyApprovalSink{}
+	gate := New(store, WithApprovalSink(sink))
+	tools := gateRegistry() // existing helper: registers write_file with Sensitive:true
+	task := domain.Task{ID: "task-1", SessionID: "s1", Mode: domain.ModeManual}
+	call := domain.ToolCall{ID: "call-1", Name: "write_file", Arguments: map[string]string{"path": "/tmp/x"}}
+
+	suspend, err := gate.ShouldSuspend(context.Background(), task, []domain.ToolCall{call}, tools)
+	if err != nil {
+		t.Fatalf("ShouldSuspend() error = %v, want nil", err)
+	}
+	if !suspend {
+		t.Fatal("ShouldSuspend() = false, want true for Manual+sensitive")
+	}
+	wantTicket := approval.TicketID("task-1", "call-1")
+	if len(sink.pending) != 1 || sink.pending[0] != wantTicket {
+		t.Fatalf("sink.pending = %v, want [%s]", sink.pending, wantTicket)
+	}
+}
+
 func TestShouldSuspendOnSensitiveDirectCall(t *testing.T) {
 	store := approval.NewToolGateStore(t.TempDir())
 	g := New(store)
