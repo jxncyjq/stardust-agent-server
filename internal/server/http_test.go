@@ -866,3 +866,141 @@ func TestHTTPServerTaskWithoutImagesLeavesTurnUnannotated(t *testing.T) {
 		t.Fatalf("userTurnContent(empty input, 3 images) = %q, want bare marker", got)
 	}
 }
+
+func TestCreateSessionStoresValidMode(t *testing.T) {
+	t.Parallel()
+	repo := openServerTestRepo(t)
+	srv := NewHTTPServer(Config{Sessions: repo})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/sessions", bytes.NewBufferString(`{
+		"company_id": "c1",
+		"agent_id": "a1",
+		"mode": "manual"
+	}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /v1/sessions status = %d, want %d body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var session domain.AgentSession
+	if err := json.Unmarshal(rec.Body.Bytes(), &session); err != nil {
+		t.Fatalf("Decode(session) error = %v, want nil", err)
+	}
+	if session.Mode != domain.ModeManual {
+		t.Fatalf("POST /v1/sessions mode = %q, want %q", session.Mode, domain.ModeManual)
+	}
+}
+
+func TestCreateSessionRejectsInvalidMode(t *testing.T) {
+	t.Parallel()
+	repo := openServerTestRepo(t)
+	srv := NewHTTPServer(Config{Sessions: repo})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/sessions", bytes.NewBufferString(`{
+		"company_id": "c1",
+		"agent_id": "a1",
+		"mode": "bogus"
+	}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST /v1/sessions with invalid mode status = %d, want %d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
+func TestCreateSessionDefaultsAutoWhenModeOmitted(t *testing.T) {
+	t.Parallel()
+	repo := openServerTestRepo(t)
+	srv := NewHTTPServer(Config{Sessions: repo})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/sessions", bytes.NewBufferString(`{
+		"company_id": "c1",
+		"agent_id": "a1"
+	}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /v1/sessions status = %d, want %d body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var session domain.AgentSession
+	if err := json.Unmarshal(rec.Body.Bytes(), &session); err != nil {
+		t.Fatalf("Decode(session) error = %v, want nil", err)
+	}
+	if session.Mode != domain.ModeAuto {
+		t.Fatalf("POST /v1/sessions mode = %q, want default %q", session.Mode, domain.ModeAuto)
+	}
+}
+
+func TestPatchSessionUpdatesMode(t *testing.T) {
+	t.Parallel()
+	repo := openServerTestRepo(t)
+	srv := NewHTTPServer(Config{Sessions: repo})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/sessions", bytes.NewBufferString(`{
+		"company_id": "c1",
+		"agent_id": "a1"
+	}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /v1/sessions status = %d, want %d body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var created domain.AgentSession
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("Decode(created session) error = %v, want nil", err)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPatch, "/v1/sessions/"+created.ID, bytes.NewBufferString(`{"mode":"plan"}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH mode status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var updated domain.AgentSession
+	if err := json.Unmarshal(rec.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("Decode(patched session) error = %v, want nil", err)
+	}
+	if updated.Mode != domain.ModePlan {
+		t.Fatalf("PATCH mode = %q, want %q", updated.Mode, domain.ModePlan)
+	}
+}
+
+func TestCreateTaskInheritsSessionMode(t *testing.T) {
+	t.Parallel()
+	repo := openServerTestRepo(t)
+	scheduler := task.NewScheduler()
+	srv := NewHTTPServer(Config{Sessions: repo, Tasks: scheduler})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/sessions", bytes.NewBufferString(`{
+		"company_id": "c1",
+		"agent_id": "a1",
+		"mode": "plan"
+	}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /v1/sessions status = %d, want %d body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var session domain.AgentSession
+	if err := json.Unmarshal(rec.Body.Bytes(), &session); err != nil {
+		t.Fatalf("Decode(session) error = %v, want nil", err)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/v1/tasks", bytes.NewBufferString(`{
+		"id": "task-mode-1",
+		"input": "do the thing",
+		"session_id": "`+session.ID+`"
+	}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /v1/tasks status = %d, want %d body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var created domain.Task
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("Decode(task) error = %v, want nil", err)
+	}
+	if created.Mode != domain.ModePlan {
+		t.Fatalf("POST /v1/tasks mode = %q, want inherited %q", created.Mode, domain.ModePlan)
+	}
+}
