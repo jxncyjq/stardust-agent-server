@@ -443,19 +443,20 @@ func (c *Coordinator) runResume(ctx context.Context, t domain.Task) (domain.Task
 	return c.afterRun(ctx, t, runnerAgent, run)
 }
 
-// RecoverSuspended re-registers every task that has a persisted checkpoint into
-// the scheduler in TaskSuspended state, so suspends survive a process restart and
+// RecoverSuspended re-registers every task named by checkpoints into the
+// scheduler in TaskSuspended state, so suspends survive a process restart and
 // remain visible/decidable. It does not resume them — resume is driven by a
-// Suspended→Running decision. Returns the number of tasks recovered. A task that
-// is already present in the scheduler is skipped (idempotent re-scan).
-func (c *Coordinator) RecoverSuspended(ctx context.Context, store *sessionstate.Store) (int, error) {
-	if store == nil {
-		return 0, nil
-	}
-	checkpoints, err := store.ListSuspended()
-	if err != nil {
-		return 0, fmt.Errorf("list suspended checkpoints: %w", err)
-	}
+// Suspended→Running decision. checkpoints is caller-assembled: a caller
+// scanning multiple session-state bases (workspace root plus every
+// working_dir base in use — see distinctSessionBases in the cli package)
+// unions each base's ListSuspendedIn result before calling this, so a task
+// suspended under a working_dir-bound session is recovered exactly like one
+// suspended under the workspace root. Each recovered task carries
+// cp.WorkingDir forward so a later resumeScan resolves the same session base
+// via checkpoints.Load(key, task.WorkingDir) instead of silently defaulting
+// back to the workspace root. Returns the number of tasks recovered. A task
+// that is already present in the scheduler is skipped (idempotent re-scan).
+func (c *Coordinator) RecoverSuspended(ctx context.Context, checkpoints []sessionstate.Checkpoint) (int, error) {
 	recovered := 0
 	for _, cp := range checkpoints {
 		if _, ok, err := c.scheduler.Get(ctx, cp.TaskID); err != nil {
@@ -464,11 +465,12 @@ func (c *Coordinator) RecoverSuspended(ctx context.Context, store *sessionstate.
 			continue
 		}
 		if err := c.scheduler.Add(ctx, domain.Task{
-			ID:        cp.TaskID,
-			AgentID:   cp.AgentID,
-			SessionID: cp.SessionKey,
-			Status:    domain.TaskSuspended,
-			Mode:      cp.Mode,
+			ID:         cp.TaskID,
+			AgentID:    cp.AgentID,
+			SessionID:  cp.SessionKey,
+			Status:     domain.TaskSuspended,
+			Mode:       cp.Mode,
+			WorkingDir: cp.WorkingDir,
 		}); err != nil {
 			return recovered, fmt.Errorf("re-register suspended task %s: %w", cp.TaskID, err)
 		}

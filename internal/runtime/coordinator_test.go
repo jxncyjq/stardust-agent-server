@@ -554,7 +554,11 @@ func TestRecoverSuspendedRestoresMode(t *testing.T) {
 	}
 	sched := task.NewScheduler()
 	c := NewCoordinator(CoordinatorConfig{Agent: domain.Agent{ID: "a1"}, Scheduler: sched, Locks: task.NewLockStore()})
-	if _, err := c.RecoverSuspended(context.Background(), store); err != nil {
+	checkpoints, err := store.ListSuspended()
+	if err != nil {
+		t.Fatalf("ListSuspended: %v", err)
+	}
+	if _, err := c.RecoverSuspended(context.Background(), checkpoints); err != nil {
 		t.Fatalf("RecoverSuspended: %v", err)
 	}
 	got, ok, err := sched.Get(context.Background(), "t1")

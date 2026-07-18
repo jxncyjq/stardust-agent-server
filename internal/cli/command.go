@@ -1667,6 +1667,49 @@ func skillsRootAvailable(root string) bool {
 // keeps up; a stalled client still drops rather than blocking publishers.
 const serveEventBusBuffer = 256
 
+// SessionLister enumerates persisted agent sessions so distinctSessionBases
+// can discover every working_dir a session has ever been bound to.
+// server.SessionStore satisfies it: ListAgentSessions with an empty
+// companyID/agentID lists every session (SQLiteRepository treats an empty
+// filter argument as "match all", not "match none"). A nil lister is a valid
+// "non-persistent storage.Driver" deployment (serviceStores returns a nil
+// server.SessionStore in that mode) — there is no session history to
+// enumerate working_dir bases from, not an error.
+type SessionLister interface {
+	ListAgentSessions(ctx context.Context, companyID, agentID string) ([]domain.AgentSession, error)
+}
+
+// distinctSessionBases returns the deduplicated set of session-state bases
+// currently in use: workspaceRoot (the default base for a session with no
+// working_dir) union sessionstate.SessionBase(workspaceRoot, s.WorkingDir) for
+// every persisted session's working_dir. Restart recovery and the approval
+// timeout sweep (BuildServeService below) scan every base this returns, so a
+// suspended checkpoint or pending approval ticket filed under a
+// working_dir-bound session is not silently missed just because it is not
+// under the workspace root. Fail-loud: an error from
+// sessions.ListAgentSessions aborts rather than returning a partial,
+// silently-incomplete base set.
+func distinctSessionBases(ctx context.Context, sessions SessionLister, workspaceRoot string) ([]string, error) {
+	bases := []string{workspaceRoot}
+	if sessions == nil {
+		return bases, nil
+	}
+	all, err := sessions.ListAgentSessions(ctx, "", "")
+	if err != nil {
+		return nil, fmt.Errorf("list agent sessions for base enumeration: %w", err)
+	}
+	seen := map[string]struct{}{workspaceRoot: {}}
+	for _, s := range all {
+		base := sessionstate.SessionBase(workspaceRoot, s.WorkingDir)
+		if _, ok := seen[base]; ok {
+			continue
+		}
+		seen[base] = struct{}{}
+		bases = append(bases, base)
+	}
+	return bases, nil
+}
+
 // BuildServeService constructs and returns a ready-to-Start service from the
 // same dependency wiring as newServeCommand, but without cobra.
 func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, error) {
@@ -1915,7 +1958,27 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	if workspaceRootWarning != "" {
 		logger.Warn("workspace root fallback", "detail", workspaceRootWarning)
 	}
-	recovered, err := coordinator.RecoverSuspended(ctx, checkpointStore)
+	// Restart recovery must scan every session-state base in use, not just the
+	// workspace root: a task suspended under a working_dir-bound session (M3)
+	// files its checkpoint under SessionBase(workspaceRoot, workingDir), which
+	// checkpointStore.ListSuspended (workspace-root-only) never sees.
+	recoveryBases, err := distinctSessionBases(ctx, sessionStore, workspaceRoot)
+	if err != nil {
+		_ = listener.Close()
+		closeStore()
+		return ServeResult{}, fmt.Errorf("enumerate session bases for restart recovery: %w", err)
+	}
+	var suspendedCheckpoints []sessionstate.Checkpoint
+	for _, base := range recoveryBases {
+		cps, err := checkpointStore.ListSuspendedIn(base)
+		if err != nil {
+			_ = listener.Close()
+			closeStore()
+			return ServeResult{}, fmt.Errorf("list suspended checkpoints in base %q: %w", base, err)
+		}
+		suspendedCheckpoints = append(suspendedCheckpoints, cps...)
+	}
+	recovered, err := coordinator.RecoverSuspended(ctx, suspendedCheckpoints)
 	if err != nil {
 		_ = listener.Close()
 		closeStore()
@@ -1962,7 +2025,12 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		// defaultConfig() sets for an omitted field.
 		approvalTTL = 300 * time.Second
 	}
-	background.AddJob("approval-timeout-sweep", manualgate.NewTimeoutSweepJob(toolGateStore, approvalCoordinator, approvalTTL, time.Now, logger))
+	// basesFn re-enumerates session bases on every sweep tick (not once at
+	// startup) so a session bound to a new working_dir after serve starts is
+	// still covered by the next sweep pass.
+	background.AddJob("approval-timeout-sweep", manualgate.NewTimeoutSweepJob(toolGateStore, approvalCoordinator, approvalTTL, time.Now, logger, func(ctx context.Context) ([]string, error) {
+		return distinctSessionBases(ctx, sessionStore, workspaceRoot)
+	}))
 
 	// Skill management endpoints (/v1/skills/*) back the GUI's /skill commands.
 	// The disk manager is constructed whenever an install root is configured;

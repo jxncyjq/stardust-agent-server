@@ -15,14 +15,29 @@ import (
 // ApprovalCoordinator so the owning task resumes down the deny branch. A denied-
 // on-timeout ticket is a contract outcome (reject result to the model), not a
 // silent drop — the job logs a warn per timeout. ttl<=0 disables the sweep.
-func NewTimeoutSweepJob(store *approval.ToolGateStore, dec *ApprovalCoordinator, ttl time.Duration, now func() time.Time, logger *slog.Logger) func(context.Context) error {
+//
+// basesFn enumerates every session-state base to scan (the workspace root plus
+// every working_dir base currently in use — see distinctSessionBases in the
+// cli package); the sweep unions ListPendingIn(base) across all of them so a
+// ticket filed under a working_dir-bound session is not silently skipped just
+// because it is not under the workspace root. basesFn erroring aborts the
+// sweep (fail-loud) rather than scanning a partial base set.
+func NewTimeoutSweepJob(store *approval.ToolGateStore, dec *ApprovalCoordinator, ttl time.Duration, now func() time.Time, logger *slog.Logger, basesFn func(context.Context) ([]string, error)) func(context.Context) error {
 	return func(ctx context.Context) error {
 		if ttl <= 0 {
 			return nil
 		}
-		pending, err := store.ListPending()
+		bases, err := basesFn(ctx)
 		if err != nil {
-			return fmt.Errorf("list pending approvals for timeout sweep: %w", err)
+			return fmt.Errorf("enumerate session bases for timeout sweep: %w", err)
+		}
+		var pending []approval.ToolApproval
+		for _, base := range bases {
+			p, err := store.ListPendingIn(base)
+			if err != nil {
+				return fmt.Errorf("list pending approvals in base %q for timeout sweep: %w", base, err)
+			}
+			pending = append(pending, p...)
 		}
 		for _, rec := range pending {
 			if now().Sub(rec.CreatedAt) <= ttl {

@@ -82,7 +82,11 @@ func TestRecoverSuspendedReRegistersTasks(t *testing.T) {
 	coord := newTestCoordinator(t, sched, 4)
 	ctx := context.Background()
 
-	n, err := coord.RecoverSuspended(ctx, store)
+	checkpoints, err := store.ListSuspended()
+	if err != nil {
+		t.Fatalf("ListSuspended: %v", err)
+	}
+	n, err := coord.RecoverSuspended(ctx, checkpoints)
 	if err != nil {
 		t.Fatalf("RecoverSuspended: %v", err)
 	}
@@ -109,14 +113,13 @@ func TestRecoverSuspendedFailsLoudOnCorruptCheckpoint(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("seed checkpoint: %v", err)
 	}
-	sched := task.NewScheduler()
-	coord := newTestCoordinator(t, sched, 4)
-	n, err := coord.RecoverSuspended(context.Background(), store)
-	if err == nil {
-		t.Fatal("RecoverSuspended err = nil, want fail-loud error on unsupported checkpoint schema")
-	}
-	if n != 0 {
-		t.Errorf("recovered = %d, want 0 on error", n)
+	// The fail-loud check on an unsupported checkpoint schema now lives in
+	// ListSuspended (the enumeration step callers run before assembling the
+	// checkpoints slice RecoverSuspended consumes) — see
+	// sessionstate.Store.ListSuspendedIn. A corrupt checkpoint must abort
+	// enumeration rather than let RecoverSuspended silently skip it.
+	if _, err := store.ListSuspended(); err == nil {
+		t.Fatal("ListSuspended err = nil, want fail-loud error on unsupported checkpoint schema")
 	}
 }
 
@@ -138,11 +141,91 @@ func TestRecoverSuspendedSkipsTaskAlreadyPresent(t *testing.T) {
 		t.Fatalf("pre-add: %v", err)
 	}
 	coord := newTestCoordinator(t, sched, 4)
-	n, err := coord.RecoverSuspended(ctx, store)
+	checkpoints, err := store.ListSuspended()
+	if err != nil {
+		t.Fatalf("ListSuspended: %v", err)
+	}
+	n, err := coord.RecoverSuspended(ctx, checkpoints)
 	if err != nil {
 		t.Fatalf("RecoverSuspended err = %v, want nil (skip, not error)", err)
 	}
 	if n != 0 {
 		t.Errorf("recovered = %d, want 0 (task already present, skipped)", n)
+	}
+}
+
+// TestRecoverSuspendedAcrossBasesBackfillsWorkingDir guards the M3a Task 5
+// must-fix: RecoverSuspended must carry cp.WorkingDir onto the reconstructed
+// domain.Task. A caller that scans multiple session-state bases (workspace
+// root plus every working_dir base in use) and unions the checkpoints before
+// calling RecoverSuspended relies on this — otherwise a task recovered from a
+// working_dir-bound checkpoint would come back with WorkingDir == "", and the
+// next resumeScan's checkpoints.Load(key, "") would look in the workspace
+// root and silently miss the checkpoint actually filed under
+// SessionBase(workspaceRoot, workingDir).
+func TestRecoverSuspendedAcrossBasesBackfillsWorkingDir(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	workingDir := t.TempDir()
+	store := sessionstate.NewStore(workspaceRoot)
+
+	if err := store.Save(sessionstate.Checkpoint{
+		SchemaVersion: sessionstate.CheckpointSchemaVersion,
+		TaskID:        "task-root",
+		AgentID:       "default-agent",
+		SessionKey:    "sess-root",
+	}); err != nil {
+		t.Fatalf("seed root checkpoint: %v", err)
+	}
+	if err := store.Save(sessionstate.Checkpoint{
+		SchemaVersion: sessionstate.CheckpointSchemaVersion,
+		TaskID:        "task-wd",
+		AgentID:       "default-agent",
+		SessionKey:    "sess-wd",
+		WorkingDir:    workingDir,
+	}); err != nil {
+		t.Fatalf("seed working-dir checkpoint: %v", err)
+	}
+
+	// Simulate the caller-side multi-base scan: union ListSuspendedIn across
+	// workspaceRoot and SessionBase(workspaceRoot, workingDir).
+	rootCPs, err := store.ListSuspendedIn(workspaceRoot)
+	if err != nil {
+		t.Fatalf("ListSuspendedIn(workspaceRoot): %v", err)
+	}
+	wdBase := sessionstate.SessionBase(workspaceRoot, workingDir)
+	wdCPs, err := store.ListSuspendedIn(wdBase)
+	if err != nil {
+		t.Fatalf("ListSuspendedIn(wdBase): %v", err)
+	}
+	all := append(append([]sessionstate.Checkpoint{}, rootCPs...), wdCPs...)
+	if len(all) != 2 {
+		t.Fatalf("union of both bases = %d checkpoints, want 2 (got %#v)", len(all), all)
+	}
+
+	sched := task.NewScheduler()
+	coord := newTestCoordinator(t, sched, 4)
+	ctx := context.Background()
+
+	n, err := coord.RecoverSuspended(ctx, all)
+	if err != nil {
+		t.Fatalf("RecoverSuspended: %v", err)
+	}
+	if n != 2 {
+		t.Fatalf("recovered = %d, want 2", n)
+	}
+
+	got, ok, err := sched.Get(ctx, "task-wd")
+	if err != nil || !ok {
+		t.Fatalf("get task-wd: ok=%v err=%v", ok, err)
+	}
+	if got.WorkingDir != workingDir {
+		t.Fatalf("recovered task-wd WorkingDir = %q, want %q (must backfill from checkpoint)", got.WorkingDir, workingDir)
+	}
+
+	// The exact bug this guards: resumeScan calls
+	// checkpoints.Load(sessionKeyForTask(t), t.WorkingDir). With WorkingDir
+	// correctly backfilled, Load must find the checkpoint filed under wdBase.
+	if _, ok, err := store.Load("sess-wd", got.WorkingDir); err != nil || !ok {
+		t.Fatalf("Load(sess-wd, %q): ok=%v err=%v, want the working-dir checkpoint to resolve", got.WorkingDir, ok, err)
 	}
 }

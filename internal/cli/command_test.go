@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -22,6 +23,7 @@ import (
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/quality"
 	"github.com/stardust/legion-agent/internal/sessioncache"
+	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/storage"
 	"github.com/stardust/legion-agent/internal/taskledger"
 )
@@ -1652,6 +1654,83 @@ func (s *countingConversationStore) AppendConversationTurn(ctx context.Context, 
 func (s *countingConversationStore) ListConversationTurns(ctx context.Context, sessionID string, limit int) ([]domain.ConversationTurn, error) {
 	s.listConversationTurnsCalls++
 	return s.delegate.ListConversationTurns(ctx, sessionID, limit)
+}
+
+// fakeSessionLister is a minimal SessionLister test double: it returns items
+// (or err, if set) regardless of the companyID/agentID filter arguments,
+// mirroring distinctSessionBases' actual usage (ListAgentSessions(ctx, "",
+// "") — no filtering).
+type fakeSessionLister struct {
+	items []domain.AgentSession
+	err   error
+}
+
+func (f fakeSessionLister) ListAgentSessions(context.Context, string, string) ([]domain.AgentSession, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.items, nil
+}
+
+func assertContains(t *testing.T, got []string, want string) {
+	t.Helper()
+	for _, g := range got {
+		if g == want {
+			return
+		}
+	}
+	t.Fatalf("bases = %v, want to contain %q", got, want)
+}
+
+// TestDistinctSessionBasesUnionsWorkspaceRootAndWorkingDirs covers the core
+// M3a Task 5 contract: the base set is workspaceRoot (always present, even
+// with no sessions) union SessionBase(workspaceRoot, s.WorkingDir) for every
+// session, deduplicated — a session with no working_dir resolves to
+// workspaceRoot itself and must not appear as a separate entry.
+func TestDistinctSessionBasesUnionsWorkspaceRootAndWorkingDirs(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	wd1 := t.TempDir()
+	sessions := fakeSessionLister{items: []domain.AgentSession{
+		{ID: "s1", WorkingDir: wd1},
+		{ID: "s2", WorkingDir: ""}, // no working_dir -> workspaceRoot
+	}}
+	bases, err := distinctSessionBases(context.Background(), sessions, workspaceRoot)
+	if err != nil {
+		t.Fatalf("distinctSessionBases error = %v", err)
+	}
+	assertContains(t, bases, workspaceRoot)
+	assertContains(t, bases, sessionstate.SessionBase(workspaceRoot, wd1))
+	if len(bases) != 2 {
+		t.Fatalf("bases = %v, want 2 distinct", bases)
+	}
+}
+
+// TestDistinctSessionBasesNilListerYieldsWorkspaceRootOnly covers the
+// non-persistent storage.Driver deployment: serviceStores returns a nil
+// server.SessionStore in that mode, which is a valid "no session history"
+// state, not an error — distinctSessionBases must still return workspaceRoot
+// so restart recovery and the timeout sweep keep scanning it.
+func TestDistinctSessionBasesNilListerYieldsWorkspaceRootOnly(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	bases, err := distinctSessionBases(context.Background(), nil, workspaceRoot)
+	if err != nil {
+		t.Fatalf("distinctSessionBases error = %v", err)
+	}
+	if len(bases) != 1 || bases[0] != workspaceRoot {
+		t.Fatalf("bases = %v, want exactly [%q]", bases, workspaceRoot)
+	}
+}
+
+// TestDistinctSessionBasesFailsLoudOnListError covers the fail-loud contract:
+// distinctSessionBases must not swallow a ListAgentSessions error and return a
+// partial (silently-incomplete) base set — it must propagate the error.
+func TestDistinctSessionBasesFailsLoudOnListError(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	wantErr := errors.New("list agent sessions boom")
+	_, err := distinctSessionBases(context.Background(), fakeSessionLister{err: wantErr}, workspaceRoot)
+	if err == nil || !errors.Is(err, wantErr) {
+		t.Fatalf("distinctSessionBases error = %v, want wrapped %v", err, wantErr)
+	}
 }
 
 type cliCaptureMaas struct {
