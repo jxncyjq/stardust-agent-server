@@ -34,7 +34,9 @@ var ErrAgentSessionNotFound = errors.New("agent session not found")
 // the agent_sessions.archived column for archiving sessions and projects. Version
 // 4 added the conversation_turns_fts FTS5 virtual table backing session_search.
 // Version 5 added the agent_sessions.mode column for persisting manual/auto mode.
-const CurrentSchemaVersion = 5
+// Version 6 added the agent_sessions.working_dir column for persisting the host
+// filesystem directory a session is bound to.
+const CurrentSchemaVersion = 6
 
 type WorkflowState struct {
 	Definition workflow.Definition `json:"definition"`
@@ -215,8 +217,8 @@ func (r *SQLiteRepository) SaveAgentSession(ctx context.Context, session domain.
 	}
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO agent_sessions (
-			id, company_id, agent_id, project, title, mode, archived, created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			id, company_id, agent_id, project, title, mode, archived, working_dir, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			company_id = excluded.company_id,
 			agent_id = excluded.agent_id,
@@ -224,9 +226,10 @@ func (r *SQLiteRepository) SaveAgentSession(ctx context.Context, session domain.
 			title = excluded.title,
 			mode = excluded.mode,
 			archived = excluded.archived,
+			working_dir = excluded.working_dir,
 			created_at = excluded.created_at,
 			updated_at = excluded.updated_at
-	`, session.ID, session.CompanyID, session.AgentID, session.Project, session.Title, mode, boolToInt(session.Archived), formatTime(session.CreatedAt), formatTime(session.UpdatedAt))
+	`, session.ID, session.CompanyID, session.AgentID, session.Project, session.Title, mode, boolToInt(session.Archived), session.WorkingDir, formatTime(session.CreatedAt), formatTime(session.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("save agent session %q: %w", session.ID, err)
 	}
@@ -271,7 +274,7 @@ func (r *SQLiteRepository) DeleteAgentSession(ctx context.Context, sessionID str
 
 func (r *SQLiteRepository) LatestAgentSession(ctx context.Context, companyID string, agentID string) (domain.AgentSession, bool, error) {
 	row := r.db.QueryRowContext(ctx, `
-		SELECT id, company_id, agent_id, project, title, mode, archived, created_at, updated_at
+		SELECT id, company_id, agent_id, project, title, mode, archived, working_dir, created_at, updated_at
 		FROM agent_sessions
 		WHERE company_id = ? AND agent_id = ?
 		ORDER BY updated_at DESC, id DESC
@@ -292,7 +295,7 @@ func (r *SQLiteRepository) LatestAgentSession(ctx context.Context, companyID str
 // must handle; any other failure is returned as a wrapped error.
 func (r *SQLiteRepository) GetAgentSession(ctx context.Context, sessionID string) (domain.AgentSession, bool, error) {
 	row := r.db.QueryRowContext(ctx, `
-		SELECT id, company_id, agent_id, project, title, mode, archived, created_at, updated_at
+		SELECT id, company_id, agent_id, project, title, mode, archived, working_dir, created_at, updated_at
 		FROM agent_sessions
 		WHERE id = ?
 	`, sessionID)
@@ -308,7 +311,7 @@ func (r *SQLiteRepository) GetAgentSession(ctx context.Context, sessionID string
 
 func (r *SQLiteRepository) ListAgentSessions(ctx context.Context, companyID string, agentID string) ([]domain.AgentSession, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, company_id, agent_id, project, title, mode, archived, created_at, updated_at
+		SELECT id, company_id, agent_id, project, title, mode, archived, working_dir, created_at, updated_at
 		FROM agent_sessions
 		WHERE (? = '' OR company_id = ?) AND (? = '' OR agent_id = ?)
 		ORDER BY updated_at DESC, id DESC
@@ -548,7 +551,7 @@ func (r *SQLiteRepository) BrowseSessions(ctx context.Context, limit int) ([]dom
 		limit = 20
 	}
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, company_id, agent_id, project, title, mode, archived, created_at, updated_at
+		SELECT id, company_id, agent_id, project, title, mode, archived, working_dir, created_at, updated_at
 		FROM agent_sessions
 		ORDER BY updated_at DESC, id DESC
 		LIMIT ?
@@ -1434,6 +1437,11 @@ var columnMigrations = []columnMigration{
 		column: "mode",
 		stmt:   `ALTER TABLE agent_sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'auto'`,
 	},
+	{
+		table:  "agent_sessions",
+		column: "working_dir",
+		stmt:   `ALTER TABLE agent_sessions ADD COLUMN working_dir TEXT NOT NULL DEFAULT ''`,
+	},
 }
 
 // applyColumnMigrations runs the additive ALTER TABLE migrations idempotently.
@@ -1508,7 +1516,7 @@ func scanAgentSession(row scanner) (domain.AgentSession, error) {
 	var archived int
 	var createdAt string
 	var updatedAt string
-	if err := row.Scan(&session.ID, &session.CompanyID, &session.AgentID, &session.Project, &session.Title, &session.Mode, &archived, &createdAt, &updatedAt); err != nil {
+	if err := row.Scan(&session.ID, &session.CompanyID, &session.AgentID, &session.Project, &session.Title, &session.Mode, &archived, &session.WorkingDir, &createdAt, &updatedAt); err != nil {
 		return domain.AgentSession{}, err
 	}
 	session.Archived = archived != 0
@@ -1656,6 +1664,7 @@ var schemaStatements = []string{
 		title TEXT NOT NULL,
 		mode TEXT NOT NULL DEFAULT 'auto',
 		archived INTEGER NOT NULL DEFAULT 0,
+		working_dir TEXT NOT NULL DEFAULT '',
 		created_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL
 	)`,
