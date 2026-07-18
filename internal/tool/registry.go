@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/stardust/legion-agent/internal/domain"
@@ -101,6 +102,23 @@ func (r *Registry) Descriptors() []Descriptor {
 		descriptors = append(descriptors, descriptor)
 	}
 	return descriptors
+}
+
+// SafeToolNames 返回已注册工具中 NOT 敏感（且非 lazy 协议 meta 工具）的排序名。
+// Plan 模式恰好提供这个集合，使规划运行无法触及有副作用工具。
+func (r *Registry) SafeToolNames() []string {
+	names := make([]string, 0, len(r.describes))
+	for name, descriptor := range r.describes {
+		if descriptor.Sensitive {
+			continue
+		}
+		if name == "list_tools" || name == "call_tool" {
+			continue
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func (r *Registry) WithAuditLog(audit port.AuditLog) *Registry {

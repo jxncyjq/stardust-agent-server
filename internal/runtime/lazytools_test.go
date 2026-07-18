@@ -41,7 +41,7 @@ func TestInferenceToolsLazyOffersOnlyMetaTools(t *testing.T) {
 		Tools:     newLazyTestRegistry(adapter.NewMemoryAuditLog()),
 		LazyTools: true,
 	})
-	tools := runner.inferenceTools()
+	tools := runner.inferenceTools(runner.tools)
 	if len(tools) != 2 {
 		t.Fatalf("lazy inferenceTools() = %d tools, want 2 meta tools: %#v", len(tools), tools)
 	}
@@ -64,7 +64,7 @@ func TestInferenceToolsEagerOffersFullSchema(t *testing.T) {
 		Tools:     newLazyTestRegistry(adapter.NewMemoryAuditLog()),
 		LazyTools: false,
 	})
-	tools := runner.inferenceTools()
+	tools := runner.inferenceTools(runner.tools)
 	if len(tools) != 1 || tools[0].Name != "lookup" {
 		t.Fatalf("eager inferenceTools() = %#v, want full native lookup descriptor", tools)
 	}
@@ -156,7 +156,7 @@ func TestRuntimeListToolsCatalogExcludesMetaToolsAndFilters(t *testing.T) {
 		Tools:     newLazyTestRegistry(adapter.NewMemoryAuditLog()),
 		LazyTools: true,
 	})
-	catalog, err := runner.listToolsCatalog("")
+	catalog, err := runner.listToolsCatalog("", runner.tools)
 	if err != nil {
 		t.Fatalf("listToolsCatalog() error = %v, want nil", err)
 	}
@@ -175,7 +175,7 @@ func TestRuntimeListToolsCatalogExcludesMetaToolsAndFilters(t *testing.T) {
 		}
 	}
 	// A non-matching query filters everything out.
-	filtered, err := runner.listToolsCatalog("nonexistent")
+	filtered, err := runner.listToolsCatalog("nonexistent", runner.tools)
 	if err != nil {
 		t.Fatalf("listToolsCatalog(query) error = %v, want nil", err)
 	}
@@ -224,7 +224,7 @@ func TestRuntimeCallToolFailLoudOnBadInput(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			call := domain.ToolCall{ID: "meta-call", Name: metaToolCallTool, Arguments: tc.args}
-			result, err := runner.dispatchToolCall(context.Background(), agent, task, call)
+			result, err := runner.dispatchToolCall(context.Background(), agent, task, call, runner.tools)
 			if err != nil {
 				t.Fatalf("dispatchToolCall(%s) returned Go error = %v, want fail-loud ToolResult", tc.name, err)
 			}

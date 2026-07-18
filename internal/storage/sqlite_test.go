@@ -907,6 +907,55 @@ func TestSQLiteBackfillConversationTurnsFTS(t *testing.T) {
 	}
 }
 
+func TestAgentSessionModeRoundTrips(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := openTestSQLiteRepository(t)
+	createdAt := time.Date(2026, 7, 18, 9, 0, 0, 0, time.UTC)
+	sess := domain.AgentSession{
+		ID:        "sess-mode-1",
+		CompanyID: "c1",
+		AgentID:   "a1",
+		Mode:      domain.ModeManual,
+		CreatedAt: createdAt,
+		UpdatedAt: createdAt,
+	}
+	if err := repo.SaveAgentSession(ctx, sess); err != nil {
+		t.Fatalf("SaveAgentSession: %v", err)
+	}
+	got, ok, err := repo.GetAgentSession(ctx, "sess-mode-1")
+	if err != nil || !ok {
+		t.Fatalf("GetAgentSession ok=%v err=%v", ok, err)
+	}
+	if got.Mode != domain.ModeManual {
+		t.Errorf("Mode = %q, want %q", got.Mode, domain.ModeManual)
+	}
+}
+
+func TestAgentSessionModeDefaultsAutoWhenEmpty(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := openTestSQLiteRepository(t)
+	createdAt := time.Date(2026, 7, 18, 9, 0, 0, 0, time.UTC)
+	sess := domain.AgentSession{
+		ID:        "sess-legacy",
+		CompanyID: "c1",
+		AgentID:   "a1",
+		CreatedAt: createdAt,
+		UpdatedAt: createdAt,
+	}
+	if err := repo.SaveAgentSession(ctx, sess); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	got, _, err := repo.GetAgentSession(ctx, "sess-legacy")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Mode != domain.ModeAuto {
+		t.Errorf("empty Mode read back = %q, want %q", got.Mode, domain.ModeAuto)
+	}
+}
+
 func TestSQLiteListSkillsRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	repo := openTestSQLiteRepository(t)

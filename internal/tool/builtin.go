@@ -88,6 +88,7 @@ func NewWorkspaceRegistry(root string, audit port.AuditLog, opts ...WorkspaceReg
 		Description: fmt.Sprintf("Write content to a file inside the workspace root (%s). Arguments: path, content, optional overwrite (default false). Fails if the file exists and overwrite is not true.", absRoot),
 		RiskLevel:   "medium",
 		Timeout:     5 * time.Second,
+		Sensitive:   true, // writes to the filesystem
 		InputSchema: map[string]any{
 			"type":     "object",
 			"required": []string{"path", "content"},

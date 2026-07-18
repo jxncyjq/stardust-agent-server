@@ -11,6 +11,7 @@ import (
 
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/tool"
 )
 
 // Meta-tool names for the lazy (on-demand) tool protocol. The model sees only
@@ -77,8 +78,8 @@ type toolCatalogEntry struct {
 // listToolsCatalog renders the real-tool directory (excluding the meta tools
 // themselves) as JSON, optionally filtered by a case-insensitive query that
 // matches tool name or description.
-func (r *Runtime) listToolsCatalog(query string) (string, error) {
-	descriptors := r.tools.Descriptors()
+func (r *Runtime) listToolsCatalog(query string, tools *tool.Registry) (string, error) {
+	descriptors := tools.Descriptors()
 	query = strings.ToLower(strings.TrimSpace(query))
 	entries := make([]toolCatalogEntry, 0, len(descriptors))
 	for _, descriptor := range descriptors {
@@ -156,19 +157,19 @@ func stringifyArgument(value any) string {
 // malformed arguments_json, unknown target tool) return an unsuccessful
 // ToolResult so the model can see and correct them, rather than a Go error that
 // would abort the task.
-func (r *Runtime) dispatchToolCall(ctx context.Context, agent domain.Agent, task domain.Task, call domain.ToolCall) (domain.ToolResult, error) {
+func (r *Runtime) dispatchToolCall(ctx context.Context, agent domain.Agent, task domain.Task, call domain.ToolCall, tools *tool.Registry) (domain.ToolResult, error) {
 	if !r.lazyTools || !isMetaTool(call.Name) {
-		return r.tools.Execute(ctx, agent, call)
+		return tools.Execute(ctx, agent, call)
 	}
 	switch call.Name {
 	case metaToolListTools:
-		catalog, err := r.listToolsCatalog(call.Arguments["query"])
+		catalog, err := r.listToolsCatalog(call.Arguments["query"], tools)
 		if err != nil {
 			return domain.ToolResult{}, err
 		}
 		return domain.ToolResult{CallID: call.ID, Success: true, Output: catalog}, nil
 	case metaToolCallTool:
-		return r.dispatchCallTool(ctx, agent, task, call)
+		return r.dispatchCallTool(ctx, agent, task, call, tools)
 	default:
 		return domain.ToolResult{}, fmt.Errorf("unhandled meta tool %q", call.Name)
 	}
@@ -177,7 +178,7 @@ func (r *Runtime) dispatchToolCall(ctx context.Context, agent domain.Agent, task
 // dispatchCallTool unpacks a call_tool meta call and forwards it to the named
 // real tool, publishing the inner tool's request/result/executed events so the
 // event stream reflects which real tool actually ran.
-func (r *Runtime) dispatchCallTool(ctx context.Context, agent domain.Agent, task domain.Task, call domain.ToolCall) (domain.ToolResult, error) {
+func (r *Runtime) dispatchCallTool(ctx context.Context, agent domain.Agent, task domain.Task, call domain.ToolCall, tools *tool.Registry) (domain.ToolResult, error) {
 	toolName := strings.TrimSpace(call.Arguments["tool_name"])
 	if toolName == "" {
 		return domain.ToolResult{CallID: call.ID, Success: false, Error: "call_tool requires a non-empty tool_name"}, nil
@@ -202,7 +203,7 @@ func (r *Runtime) dispatchCallTool(ctx context.Context, agent domain.Agent, task
 	}); err != nil {
 		return domain.ToolResult{}, fmt.Errorf("publish lazy tool request event: %w", err)
 	}
-	result, err := r.tools.Execute(ctx, agent, realCall)
+	result, err := tools.Execute(ctx, agent, realCall)
 	if err != nil {
 		if pubErr := r.events.Publish(ctx, domain.RuntimeEvent{
 			Type:      "tool_failed",

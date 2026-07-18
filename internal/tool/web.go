@@ -87,6 +87,7 @@ func fetchURLDescriptor(timeout time.Duration) Descriptor {
 		Description: "Fetch a public http/https URL with GET and return its content. HTML is extracted to readable text by default; JSON and plain text are returned as-is. Private/internal addresses are blocked by SSRF protection.",
 		RiskLevel:   "medium",
 		Timeout:     timeout,
+		Sensitive:   true, // outbound network access
 		InputSchema: map[string]any{
 			"type":     "object",
 			"required": []string{"url"},

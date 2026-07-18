@@ -283,6 +283,11 @@ func (s *HTTPServer) handleCreateSession(w http.ResponseWriter, r *http.Request)
 	if agentID == "" {
 		agentID = "default-agent"
 	}
+	mode, ok := domain.NormalizeMode(req.Mode)
+	if !ok {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid mode %q (want manual|plan|auto)", req.Mode))
+		return
+	}
 	now := time.Now()
 	session := domain.AgentSession{
 		ID:        fmt.Sprintf("session-%d", now.UTC().UnixNano()),
@@ -290,6 +295,7 @@ func (s *HTTPServer) handleCreateSession(w http.ResponseWriter, r *http.Request)
 		AgentID:   agentID,
 		Project:   strings.TrimSpace(req.Project),
 		Title:     strings.TrimSpace(req.Title),
+		Mode:      mode,
 		CreatedAt: now,
 		UpdatedAt: now,
 	}
@@ -392,6 +398,14 @@ func (s *HTTPServer) handlePatchSession(w http.ResponseWriter, r *http.Request) 
 	}
 	if req.Archived != nil {
 		session.Archived = *req.Archived
+	}
+	if req.Mode != nil {
+		mode, ok := domain.NormalizeMode(*req.Mode)
+		if !ok {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid mode %q (want manual|plan|auto)", *req.Mode))
+			return
+		}
+		session.Mode = mode
 	}
 	session.UpdatedAt = time.Now()
 	if err := s.sessions.SaveAgentSession(r.Context(), session); err != nil {
@@ -651,11 +665,44 @@ func (s *HTTPServer) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	}
 	sessionID := strings.TrimSpace(req.SessionID)
 	now := time.Now()
+	// A task's mode is inherited from its owning session (or "auto" for a
+	// one-off task with no session_id). The session is loaded once here — both
+	// to resolve the mode and, further down, to record the user turn — rather
+	// than queried twice.
+	taskMode := domain.ModeAuto
+	var session domain.AgentSession
+	haveSession := false
+	if sessionID != "" {
+		if s.sessions == nil {
+			writeError(w, http.StatusServiceUnavailable, "session store is unavailable")
+			return
+		}
+		loaded, ok, err := s.sessions.GetAgentSession(r.Context(), sessionID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("load session: %v", err))
+			return
+		}
+		if !ok {
+			writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", sessionID))
+			return
+		}
+		resolved, ok := domain.NormalizeMode(loaded.Mode)
+		if !ok {
+			// An invalid mode stored on disk is corrupt state, not client input —
+			// fail loud with a 500 rather than silently coercing to auto.
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("session %q has invalid stored mode %q", sessionID, loaded.Mode))
+			return
+		}
+		taskMode = resolved
+		session = loaded
+		haveSession = true
+	}
 	task := domain.Task{
 		ID:        req.ID,
 		CompanyID: req.CompanyID,
 		AgentID:   req.AgentID,
 		SessionID: sessionID,
+		Mode:      taskMode,
 		Status:    domain.TaskPending,
 		Input:     req.Input,
 		CreatedAt: now,
@@ -666,8 +713,8 @@ func (s *HTTPServer) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	// an optional field (a one-off task may carry none), but when it is present
 	// the session must exist — a missing session is a client error, not a state
 	// we silently paper over.
-	if sessionID != "" {
-		if err := s.recordUserTurn(r.Context(), w, task); err != nil {
+	if haveSession {
+		if err := s.recordUserTurn(r.Context(), w, task, session); err != nil {
 			return
 		}
 	}
@@ -698,26 +745,14 @@ func userTurnContent(input string, imageCount int) string {
 }
 
 // recordUserTurn persists the user prompt as a conversation turn and refreshes
-// the owning session's updated_at. It writes a 4xx/5xx response and returns a
-// non-nil error when the session store is unavailable, the session does not
-// exist, or the write fails, so the caller aborts loudly instead of enqueuing a
-// task whose history was lost. The turn id is deterministic ("<taskID>:user") so
-// a retried submission cannot duplicate it.
-func (s *HTTPServer) recordUserTurn(ctx context.Context, w http.ResponseWriter, task domain.Task) error {
-	if s.sessions == nil {
-		err := fmt.Errorf("session store is unavailable")
-		writeError(w, http.StatusServiceUnavailable, err.Error())
-		return err
-	}
-	session, ok, err := s.sessions.GetAgentSession(ctx, task.SessionID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("load session: %v", err))
-		return err
-	}
-	if !ok {
-		writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", task.SessionID))
-		return fmt.Errorf("session %q not found", task.SessionID)
-	}
+// the owning session's updated_at. The session must already be loaded by the
+// caller (handleCreateTask resolves it once, to derive the task's mode, and
+// passes it here rather than querying it a second time). It writes a 5xx
+// response and returns a non-nil error when the write fails, so the caller
+// aborts loudly instead of enqueuing a task whose history was lost. The turn
+// id is deterministic ("<taskID>:user") so a retried submission cannot
+// duplicate it.
+func (s *HTTPServer) recordUserTurn(ctx context.Context, w http.ResponseWriter, task domain.Task, session domain.AgentSession) error {
 	turn := domain.ConversationTurn{
 		ID:        task.ID + ":user",
 		SessionID: task.SessionID,
@@ -1115,6 +1150,7 @@ type createSessionRequest struct {
 	CompanyID string `json:"company_id"`
 	AgentID   string `json:"agent_id"`
 	Title     string `json:"title"`
+	Mode      string `json:"mode"`
 }
 
 // patchSessionRequest carries the optional, mutable fields of a session update.
@@ -1126,6 +1162,7 @@ type patchSessionRequest struct {
 	Title    *string `json:"title"`
 	Project  *string `json:"project"`
 	Archived *bool   `json:"archived"`
+	Mode     *string `json:"mode"`
 }
 
 type createTaskRequest struct {
