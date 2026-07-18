@@ -1006,6 +1006,158 @@ func TestCreateTaskInheritsSessionMode(t *testing.T) {
 	}
 }
 
+func TestCreateSessionStoresWorkingDir(t *testing.T) {
+	t.Parallel()
+	repo := openServerTestRepo(t)
+	srv := NewHTTPServer(Config{Sessions: repo})
+	workingDir := t.TempDir()
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/sessions", bytes.NewBufferString(`{
+		"company_id": "c1",
+		"agent_id": "a1",
+		"working_dir": "`+filepath.ToSlash(workingDir)+`"
+	}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /v1/sessions status = %d, want %d body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var session domain.AgentSession
+	if err := json.Unmarshal(rec.Body.Bytes(), &session); err != nil {
+		t.Fatalf("Decode(session) error = %v, want nil", err)
+	}
+	if session.WorkingDir != filepath.ToSlash(workingDir) {
+		t.Fatalf("POST /v1/sessions working_dir = %q, want %q", session.WorkingDir, filepath.ToSlash(workingDir))
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/v1/sessions?company_id=c1&agent_id=a1", nil)
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/sessions status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var listed []domain.AgentSession
+	if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("Decode(sessions) error = %v, want nil", err)
+	}
+	if len(listed) != 1 || listed[0].WorkingDir != filepath.ToSlash(workingDir) {
+		t.Fatalf("GET /v1/sessions listed = %#v, want single session with working_dir %q", listed, filepath.ToSlash(workingDir))
+	}
+}
+
+func TestPatchSessionUpdatesWorkingDir(t *testing.T) {
+	t.Parallel()
+	repo := openServerTestRepo(t)
+	srv := NewHTTPServer(Config{Sessions: repo})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/sessions", bytes.NewBufferString(`{
+		"company_id": "c1",
+		"agent_id": "a1"
+	}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /v1/sessions status = %d, want %d body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var created domain.AgentSession
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("Decode(created session) error = %v, want nil", err)
+	}
+	if created.WorkingDir != "" {
+		t.Fatalf("POST /v1/sessions working_dir = %q, want empty when omitted", created.WorkingDir)
+	}
+
+	workingDir := filepath.ToSlash(t.TempDir())
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPatch, "/v1/sessions/"+created.ID, bytes.NewBufferString(`{"working_dir":"`+workingDir+`"}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH working_dir status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var updated domain.AgentSession
+	if err := json.Unmarshal(rec.Body.Bytes(), &updated); err != nil {
+		t.Fatalf("Decode(patched session) error = %v, want nil", err)
+	}
+	if updated.WorkingDir != workingDir {
+		t.Fatalf("PATCH working_dir = %q, want %q", updated.WorkingDir, workingDir)
+	}
+}
+
+func TestCreateTaskInheritsSessionWorkingDir(t *testing.T) {
+	t.Parallel()
+	repo := openServerTestRepo(t)
+	scheduler := task.NewScheduler()
+	srv := NewHTTPServer(Config{Sessions: repo, Tasks: scheduler})
+	workingDir := filepath.ToSlash(t.TempDir())
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/sessions", bytes.NewBufferString(`{
+		"company_id": "c1",
+		"agent_id": "a1",
+		"working_dir": "`+workingDir+`"
+	}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /v1/sessions status = %d, want %d body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var session domain.AgentSession
+	if err := json.Unmarshal(rec.Body.Bytes(), &session); err != nil {
+		t.Fatalf("Decode(session) error = %v, want nil", err)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/v1/tasks", bytes.NewBufferString(`{
+		"id": "task-workingdir-1",
+		"input": "do the thing",
+		"session_id": "`+session.ID+`"
+	}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /v1/tasks status = %d, want %d body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var created domain.Task
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("Decode(task) error = %v, want nil", err)
+	}
+	if created.WorkingDir != workingDir {
+		t.Fatalf("POST /v1/tasks working_dir = %q, want inherited %q", created.WorkingDir, workingDir)
+	}
+}
+
+func TestCreateTaskRejectsNonDirWorkingDir(t *testing.T) {
+	t.Parallel()
+	repo := openServerTestRepo(t)
+	scheduler := task.NewScheduler()
+	srv := NewHTTPServer(Config{Sessions: repo, Tasks: scheduler})
+	missingDir := filepath.ToSlash(filepath.Join(t.TempDir(), "does-not-exist"))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/sessions", bytes.NewBufferString(`{
+		"company_id": "c1",
+		"agent_id": "a1",
+		"working_dir": "`+missingDir+`"
+	}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /v1/sessions status = %d, want %d body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var session domain.AgentSession
+	if err := json.Unmarshal(rec.Body.Bytes(), &session); err != nil {
+		t.Fatalf("Decode(session) error = %v, want nil", err)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/v1/tasks", bytes.NewBufferString(`{
+		"id": "task-workingdir-baddir",
+		"input": "do the thing",
+		"session_id": "`+session.ID+`"
+	}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST /v1/tasks with non-dir session working_dir status = %d, want %d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+}
+
 type stubDecider struct {
 	gotTask, gotTicket string
 	gotStatus          approval.ApprovalStatus

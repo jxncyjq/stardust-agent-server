@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -309,14 +310,15 @@ func (s *HTTPServer) handleCreateSession(w http.ResponseWriter, r *http.Request)
 	}
 	now := time.Now()
 	session := domain.AgentSession{
-		ID:        fmt.Sprintf("session-%d", now.UTC().UnixNano()),
-		CompanyID: companyID,
-		AgentID:   agentID,
-		Project:   strings.TrimSpace(req.Project),
-		Title:     strings.TrimSpace(req.Title),
-		Mode:      mode,
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:         fmt.Sprintf("session-%d", now.UTC().UnixNano()),
+		CompanyID:  companyID,
+		AgentID:    agentID,
+		Project:    strings.TrimSpace(req.Project),
+		Title:      strings.TrimSpace(req.Title),
+		Mode:       mode,
+		WorkingDir: strings.TrimSpace(req.WorkingDir),
+		CreatedAt:  now,
+		UpdatedAt:  now,
 	}
 	if err := s.sessions.SaveAgentSession(r.Context(), session); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("create session: %v", err))
@@ -425,6 +427,9 @@ func (s *HTTPServer) handlePatchSession(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 		session.Mode = mode
+	}
+	if req.WorkingDir != nil {
+		session.WorkingDir = strings.TrimSpace(*req.WorkingDir)
 	}
 	session.UpdatedAt = time.Now()
 	if err := s.sessions.SaveAgentSession(r.Context(), session); err != nil {
@@ -716,16 +721,34 @@ func (s *HTTPServer) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		session = loaded
 		haveSession = true
 	}
+	// A session's working_dir is inherited onto every task it spawns (mirrors
+	// the mode inheritance above). An empty working_dir is a legal "use the
+	// workspace root" state, but a non-empty one that does not resolve to an
+	// existing directory is corrupt session state — fail loud with a 400
+	// rather than enqueuing a task whose tool calls would silently resolve to
+	// the wrong base directory.
+	taskWorkingDir := ""
+	if haveSession {
+		taskWorkingDir = session.WorkingDir
+		if wd := strings.TrimSpace(taskWorkingDir); wd != "" {
+			info, err := os.Stat(wd)
+			if err != nil || !info.IsDir() {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("session %q working_dir %q is not an existing directory", sessionID, wd))
+				return
+			}
+		}
+	}
 	task := domain.Task{
-		ID:        req.ID,
-		CompanyID: req.CompanyID,
-		AgentID:   req.AgentID,
-		SessionID: sessionID,
-		Mode:      taskMode,
-		Status:    domain.TaskPending,
-		Input:     req.Input,
-		CreatedAt: now,
-		Images:    req.Images,
+		ID:         req.ID,
+		CompanyID:  req.CompanyID,
+		AgentID:    req.AgentID,
+		SessionID:  sessionID,
+		Mode:       taskMode,
+		WorkingDir: taskWorkingDir,
+		Status:     domain.TaskPending,
+		Input:      req.Input,
+		CreatedAt:  now,
+		Images:     req.Images,
 	}
 	// Record the user turn before the task is enqueued so the conversation
 	// history exists even if the runtime never produces an answer. session_id is
@@ -1165,11 +1188,12 @@ func (s *HTTPServer) handleTraces(w http.ResponseWriter, _ *http.Request) {
 }
 
 type createSessionRequest struct {
-	Project   string `json:"project"`
-	CompanyID string `json:"company_id"`
-	AgentID   string `json:"agent_id"`
-	Title     string `json:"title"`
-	Mode      string `json:"mode"`
+	Project    string `json:"project"`
+	CompanyID  string `json:"company_id"`
+	AgentID    string `json:"agent_id"`
+	Title      string `json:"title"`
+	Mode       string `json:"mode"`
+	WorkingDir string `json:"working_dir"`
 }
 
 // patchSessionRequest carries the optional, mutable fields of a session update.
@@ -1178,10 +1202,11 @@ type createSessionRequest struct {
 // which is what lets a rename touch only the title and an archive touch only the
 // archived flag.
 type patchSessionRequest struct {
-	Title    *string `json:"title"`
-	Project  *string `json:"project"`
-	Archived *bool   `json:"archived"`
-	Mode     *string `json:"mode"`
+	Title      *string `json:"title"`
+	Project    *string `json:"project"`
+	Archived   *bool   `json:"archived"`
+	Mode       *string `json:"mode"`
+	WorkingDir *string `json:"working_dir"`
 }
 
 type createTaskRequest struct {
