@@ -28,6 +28,7 @@ import (
 	"github.com/stardust/legion-agent/internal/config"
 	"github.com/stardust/legion-agent/internal/contextfiles"
 	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/eventbridge"
 	"github.com/stardust/legion-agent/internal/evolution"
 	"github.com/stardust/legion-agent/internal/manualgate"
 	"github.com/stardust/legion-agent/internal/memory"
@@ -1661,6 +1662,11 @@ func skillsRootAvailable(root string) bool {
 	return info.IsDir()
 }
 
+// serveEventBusBuffer is the per-subscriber channel buffer for the platform
+// event bus backing /v1/events. Large enough that a normally-paced SSE client
+// keeps up; a stalled client still drops rather than blocking publishers.
+const serveEventBusBuffer = 256
+
 // BuildServeService constructs and returns a ready-to-Start service from the
 // same dependency wiring as newServeCommand, but without cobra.
 func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, error) {
@@ -1706,7 +1712,19 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		auditLog = adapter.NewMemoryAuditLog()
 	}
 
-	workflowEvents := adapter.NewMemoryEventBus()
+	logger := opts.Logger
+	if logger == nil {
+		logger = defaultLogger()
+	}
+
+	// platformEvents backs the /v1/events SSE stream (push/subscribe). The
+	// bridge tees every RuntimeEvent the runtime/coordinator/workflow engine
+	// already publishes into it, so lifecycle events reach SSE with zero changes
+	// to any publisher. Buffer sized generously: a slow SSE subscriber drops
+	// events (at-most-once, design §3.4.2), and the /v1/approvals list endpoint
+	// (Task 5) is the reconcile path for missed approval prompts.
+	platformEvents := observability.NewEventBus(serveEventBusBuffer)
+	workflowEvents := eventbridge.New(platformEvents, logger)
 	liveTasks := task.NewScheduler()
 	httpTasks := server.TaskStore(liveTasks)
 	if taskStore != nil {
@@ -1889,10 +1907,6 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		return ServeResult{}, fmt.Errorf("listen on %q: %w", addr, err)
 	}
 
-	logger := opts.Logger
-	if logger == nil {
-		logger = defaultLogger()
-	}
 	if workspaceRootWarning != "" {
 		logger.Warn("workspace root fallback", "detail", workspaceRootWarning)
 	}
@@ -1960,6 +1974,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		Workflows:           workflowStore,
 		WorkflowEngine:      workflowEngine,
 		WorkflowEvents:      workflowEvents,
+		PlatformEvents:      platformEvents,
 		Readiness:           readiness,
 		AdminToken:          cfg.Server.AdminToken,
 		PublicHealthEnabled: cfg.Server.PublicHealthEnabled,
@@ -2010,6 +2025,9 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		// task goroutine can never write to an already-closed store.
 		Close: func() {
 			coordinator.Wait()
+			if err := platformEvents.Close(); err != nil {
+				logger.Warn("close platform event bus", "error", err)
+			}
 			closeStore()
 		},
 	}, nil

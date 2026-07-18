@@ -18,6 +18,16 @@ func (s *HTTPServer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
+	// Send the response headers immediately, before subscribing/waiting for
+	// the first event. Without this, net/http withholds any bytes from the
+	// client until the handler's first Write, so a subscriber connecting to
+	// an idle bus would see the connection hang (indistinguishable from a
+	// dead server) instead of getting the 200 + text/event-stream contract
+	// the SSE endpoint promises.
+	w.WriteHeader(http.StatusOK)
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
 	eventType := r.URL.Query().Get("type")
 	events, cancel := s.platformEvents.Subscribe(r.Context())
 	defer cancel()

@@ -1348,3 +1348,18 @@ func (r *statusRecorder) WriteHeader(status int) {
 func (r *statusRecorder) Write(data []byte) (int, error) {
 	return r.ResponseWriter.Write(data)
 }
+
+// Flush forwards to the wrapped ResponseWriter's Flush when it implements
+// http.Flusher. statusRecorder embeds http.ResponseWriter as an interface
+// field, so Go's method promotion only exposes the interface's own methods
+// (Header/Write/WriteHeader) -- Flush is not part of that interface and is
+// therefore never promoted, even though the concrete ResponseWriter beneath
+// it (e.g. the stdlib http.response) implements it. Without this passthrough,
+// streaming handlers (SSE endpoints) that type-assert w.(http.Flusher) after
+// statusRecorder wraps w would always fail the assertion and could never
+// push partial writes to the client before the handler returns.
+func (r *statusRecorder) Flush() {
+	if flusher, ok := r.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
