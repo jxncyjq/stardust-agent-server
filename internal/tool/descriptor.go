@@ -12,6 +12,9 @@ type Descriptor struct {
 	InputSchema map[string]any
 	RiskLevel   string
 	Timeout     time.Duration
+	// Sensitive 标记一个工具为有副作用：Manual 模式下对它的调用被挡在人工审批后
+	// （M2b），Plan 模式把它排除出所提供的工具集。只读工具（read/search/list）非敏感。
+	Sensitive bool `json:"sensitive,omitempty"`
 }
 
 func validateInputSchema(schema map[string]any, args map[string]string) error {

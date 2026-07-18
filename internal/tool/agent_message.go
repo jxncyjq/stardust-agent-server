@@ -78,7 +78,7 @@ func RegisterAgentMessageTools(registry *Registry, store AgentMessageStore) {
 }
 
 func sendMessageDescriptor() Descriptor {
-	return messageDescriptor("send_message", "Send an AgentMessage to another agent inbox.", "medium",
+	return messageDescriptor("send_message", "Send an AgentMessage to another agent inbox.", "medium", true, // sends a message to another agent
 		[]string{"to", "summary"}, map[string]any{
 			"message_id":      messageString("Optional stable message id."),
 			"company_id":      messageString("Company id. Defaults to runtime company when omitted by caller."),
@@ -94,7 +94,7 @@ func sendMessageDescriptor() Descriptor {
 }
 
 func readMessagesDescriptor() Descriptor {
-	return messageDescriptor("read_messages", "Read AgentMessage inbox/outbox messages.", "low",
+	return messageDescriptor("read_messages", "Read AgentMessage inbox/outbox messages.", "low", false,
 		nil, map[string]any{
 			"company_id":      messageString("Company id filter."),
 			"task_id":         messageString("Task id filter."),
@@ -108,7 +108,7 @@ func readMessagesDescriptor() Descriptor {
 		})
 }
 
-func messageDescriptor(name, description, risk string, required []string, properties map[string]any) Descriptor {
+func messageDescriptor(name, description, risk string, sensitive bool, required []string, properties map[string]any) Descriptor {
 	schema := map[string]any{
 		"type":       "object",
 		"properties": properties,
@@ -122,6 +122,7 @@ func messageDescriptor(name, description, risk string, required []string, proper
 		RiskLevel:   risk,
 		Timeout:     5 * time.Second,
 		InputSchema: schema,
+		Sensitive:   sensitive,
 	}
 }
 

@@ -41,6 +41,11 @@ func moaConsultDescriptor() tool.Descriptor {
 			"it costs N+1 model calls, so it is explicit and one-shot, not a per-round default.",
 		RiskLevel: "high",
 		Timeout:   5 * time.Minute,
+		// Not in the M2a task-2 brief's classification table; fail-safe per the
+		// brief's own rule (unlisted registered tool -> mark sensitive). It fans
+		// out N+1 costly model calls per invocation, an effect worth gating behind
+		// approval even though it has no filesystem/network/task-ledger writes.
+		Sensitive: true,
 		InputSchema: map[string]any{
 			"type":     "object",
 			"required": []string{"task", "reference_profiles", "aggregator_profile"},
