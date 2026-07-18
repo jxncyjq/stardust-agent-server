@@ -437,7 +437,26 @@ func (s *HTTPServer) handlePatchSession(w http.ResponseWriter, r *http.Request) 
 		session.Mode = mode
 	}
 	if req.WorkingDir != nil {
-		session.WorkingDir = strings.TrimSpace(*req.WorkingDir)
+		newWorkingDir := strings.TrimSpace(*req.WorkingDir)
+		currentWorkingDir := strings.TrimSpace(session.WorkingDir)
+		// A session's on-disk state (checkpoints, approval tickets, plans) is
+		// filed under sessionstate.SessionBase(workspaceRoot, working_dir), and
+		// that base is derived from whatever working_dir the session carries at
+		// the moment of the write -- there is no record of a session's *former*
+		// bases. Recovery after a restart only enumerates the bases in current
+		// use (distinctSessionBases in the cli package), so once a session has a
+		// non-empty working_dir, silently repointing it to a different value
+		// would strand any state already filed under the old base: it would
+		// never again be scanned, and a pending checkpoint would be lost without
+		// so much as a log line. Fail loud instead: reject the change outright.
+		// Setting it for the first time (currentWorkingDir == "") is safe --
+		// with no working_dir yet, state lives under workspaceRoot, which is
+		// always in the base set -- and re-PATCHing the same value is a no-op.
+		if currentWorkingDir != "" && newWorkingDir != currentWorkingDir {
+			writeError(w, http.StatusBadRequest, "working_dir cannot be changed once set")
+			return
+		}
+		session.WorkingDir = newWorkingDir
 	}
 	session.UpdatedAt = time.Now()
 	if err := s.sessions.SaveAgentSession(r.Context(), session); err != nil {

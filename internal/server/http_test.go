@@ -1128,6 +1128,88 @@ func TestPatchSessionUpdatesWorkingDir(t *testing.T) {
 	}
 }
 
+// TestPatchSessionRejectsWorkingDirChangeOnceSet guards against silently
+// stranding a session's checkpoints: sessionstate.SessionBase derives a
+// session's on-disk base from its *current* working_dir, so once a session has
+// a non-empty working_dir, changing it to a different value would leave any
+// checkpoint filed under the old base unreachable to future restarts (which
+// only enumerate the *current* set of bases). A same-value PATCH is a no-op
+// and must still succeed; a PATCH on a session whose working_dir is still
+// empty must be allowed to set it for the first time.
+func TestPatchSessionRejectsWorkingDirChangeOnceSet(t *testing.T) {
+	t.Parallel()
+	repo := openServerTestRepo(t)
+	srv := NewHTTPServer(Config{Sessions: repo})
+
+	dirA := filepath.ToSlash(t.TempDir())
+	dirB := filepath.ToSlash(t.TempDir())
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/sessions", bytes.NewBufferString(`{
+		"company_id": "c1",
+		"agent_id": "a1",
+		"working_dir": "`+dirA+`"
+	}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /v1/sessions status = %d, want %d body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var created domain.AgentSession
+	if err := json.Unmarshal(rec.Body.Bytes(), &created); err != nil {
+		t.Fatalf("Decode(created session) error = %v, want nil", err)
+	}
+
+	// Changing an already-set working_dir to a different value must be
+	// rejected fail-loud (400), not silently applied.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPatch, "/v1/sessions/"+created.ID, bytes.NewBufferString(`{"working_dir":"`+dirB+`"}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("PATCH working_dir (change) status = %d, want %d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+
+	// PATCHing the same value back is a no-op and must succeed.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPatch, "/v1/sessions/"+created.ID, bytes.NewBufferString(`{"working_dir":"`+dirA+`"}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH working_dir (same value) status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	// A session created with no working_dir may still have one set for the
+	// first time.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPost, "/v1/sessions", bytes.NewBufferString(`{
+		"company_id": "c1",
+		"agent_id": "a1"
+	}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /v1/sessions (no working_dir) status = %d, want %d body=%s", rec.Code, http.StatusCreated, rec.Body.String())
+	}
+	var createdBare domain.AgentSession
+	if err := json.Unmarshal(rec.Body.Bytes(), &createdBare); err != nil {
+		t.Fatalf("Decode(created bare session) error = %v, want nil", err)
+	}
+	if createdBare.WorkingDir != "" {
+		t.Fatalf("POST /v1/sessions (no working_dir) working_dir = %q, want empty", createdBare.WorkingDir)
+	}
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodPatch, "/v1/sessions/"+createdBare.ID, bytes.NewBufferString(`{"working_dir":"`+dirA+`"}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("PATCH working_dir (first set) status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var updatedBare domain.AgentSession
+	if err := json.Unmarshal(rec.Body.Bytes(), &updatedBare); err != nil {
+		t.Fatalf("Decode(patched bare session) error = %v, want nil", err)
+	}
+	if updatedBare.WorkingDir != dirA {
+		t.Fatalf("PATCH working_dir (first set) = %q, want %q", updatedBare.WorkingDir, dirA)
+	}
+}
+
 func TestCreateTaskInheritsSessionWorkingDir(t *testing.T) {
 	t.Parallel()
 	repo := openServerTestRepo(t)
