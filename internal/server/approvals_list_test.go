@@ -2,6 +2,7 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -64,6 +65,22 @@ func TestListApprovalsRejectsUnsupportedStatus(t *testing.T) {
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 for unsupported status filter", rec.Code)
+	}
+}
+
+// TestListApprovalsListPendingErrorReturns500 covers T5 Minor#1: the
+// fakeApprovalLister.err field was defined but never exercised by a test, so
+// the fail-loud branch in handleListApprovals (ListPending error -> 500,
+// approvals_list.go:29-32) had no assertion. CLAUDE.md testing standards
+// require fail-loud branches to be asserted, not just happy paths.
+func TestListApprovalsListPendingErrorReturns500(t *testing.T) {
+	srv := NewHTTPServer(Config{AdminToken: "token", ApprovalTickets: fakeApprovalLister{err: errors.New("boom")}})
+	req := httptest.NewRequest(http.MethodGet, "/v1/approvals", nil)
+	req.Header.Set("Authorization", "Bearer token")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 when ListPending errors; body=%s", rec.Code, rec.Body.String())
 	}
 }
 
