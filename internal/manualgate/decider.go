@@ -63,7 +63,23 @@ func (a *ApprovalCoordinator) Decide(ctx context.Context, taskID, ticketID strin
 	}
 	if allDecided && t.Status == domain.TaskSuspended {
 		if err := a.sched.Transition(ctx, taskID, domain.TaskRunning); err != nil {
-			return approval.ToolApproval{}, fmt.Errorf("resume task %s after decision: %w", taskID, err)
+			// Two concurrent Decide calls on the final tickets of the same task
+			// can both observe Suspended+allDecided (the Status read above and
+			// this Transition are not atomic together) and both attempt the
+			// Suspended->Running flip; the loser gets ErrInvalidTransition for a
+			// decision that WAS validly recorded above. Re-check the task's
+			// current state: if someone else already flipped it to Running,
+			// this decision still succeeded and there is nothing more to do —
+			// only an unexpected state propagates the error.
+			now, ok, getErr := a.sched.Get(ctx, taskID)
+			if getErr != nil {
+				return approval.ToolApproval{}, fmt.Errorf("resume task %s after decision: %w", taskID, err)
+			}
+			if !ok || now.Status != domain.TaskRunning {
+				return approval.ToolApproval{}, fmt.Errorf("resume task %s after decision: %w", taskID, err)
+			}
+			// Concurrent flip already landed the task in Running; treat this
+			// decision as successfully recorded, not an error.
 		}
 	}
 	return rec, nil

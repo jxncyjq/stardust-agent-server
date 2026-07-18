@@ -2,6 +2,7 @@ package manualgate
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/stardust/legion-agent/internal/approval"
@@ -65,5 +66,61 @@ func TestDecideDoesNotFlipNonSuspendedTask(t *testing.T) {
 	got, _, _ := sched.Get(context.Background(), "t1")
 	if got.Status != domain.TaskRunning {
 		t.Fatalf("status = %s, want unchanged running", got.Status)
+	}
+}
+
+// TestDecideConcurrentFinalDecisionsNoSpuriousError guards the fix for the
+// race in Decide's Suspended->Running flip: the task's Status is read once
+// (via sched.Get, above) before store.Decide/ListForTask run, so two
+// concurrent Decide calls on the two tickets of the same task can both
+// observe Suspended+allDecided and both attempt the Suspended->Running
+// transition. Without tolerance for the "someone else already flipped it"
+// case, the loser would get ErrInvalidTransition for a decision that WAS
+// validly recorded — a legitimate decision spuriously erroring. Both
+// goroutines here must return no error, and the task must end Running.
+func TestDecideConcurrentFinalDecisionsNoSpuriousError(t *testing.T) {
+	dir := t.TempDir()
+	store := approval.NewToolGateStore(dir)
+	sched := task.NewScheduler()
+	if err := sched.Add(context.Background(), domain.Task{ID: "t1", SessionID: "s1", Status: domain.TaskRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sched.Transition(context.Background(), "t1", domain.TaskSuspended); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Open(approval.ToolApproval{SessionKey: "s1", TaskID: "t1", ToolCallID: "c1", ToolName: "write_file"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Open(approval.ToolApproval{SessionKey: "s1", TaskID: "t1", ToolCallID: "c2", ToolName: "send_message"}); err != nil {
+		t.Fatal(err)
+	}
+	ac := NewApprovalCoordinator(store, sched)
+
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		_, err := ac.Decide(context.Background(), "t1", approval.TicketID("t1", "c1"), approval.ApprovalApproved)
+		errs[0] = err
+	}()
+	go func() {
+		defer wg.Done()
+		_, err := ac.Decide(context.Background(), "t1", approval.TicketID("t1", "c2"), approval.ApprovalDenied)
+		errs[1] = err
+	}()
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("Decide goroutine %d: err = %v, want nil", i, err)
+		}
+	}
+	got, ok, err := sched.Get(context.Background(), "t1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || got.Status != domain.TaskRunning {
+		t.Fatalf("t1 status = %v (ok=%v), want running", got.Status, ok)
 	}
 }
