@@ -205,6 +205,26 @@ func newTUICommand(application *app.App, out io.Writer) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Manual-mode approval wiring for the TUI (方案 Y): pendingCh/decisionCh
+			// and the approvalGate they back are created once, here, and shared by
+			// every task the session runs — both TUI entry points (runTUITask and
+			// runMentionedTUIAgentTask, via tuiTaskRunConfig.ToolGate below) and the
+			// InteractiveModel (via InteractiveConfig.ApprovalCh/DecisionCh) hold the
+			// opposing ends of the same pair for the lifetime of the program. This is
+			// safe to share because the TUI only ever runs one task at a time (see
+			// InteractiveModel.running), so at most one approvalGate.Resolve call is
+			// ever blocked waiting on decisionCh. checkpointStore is required
+			// alongside the gate by the runtime's Manual-mode invariant (see
+			// runtime.ErrManualGateMissing) even though 方案 Y's gate never actually
+			// suspends a round — see tuiTaskRunConfig.Checkpoints's doc comment.
+			pendingApprovalCh := make(chan tui.PendingApproval)
+			approvalDecisionCh := make(chan tui.ApprovalDecision)
+			approvalGate := tui.NewApprovalGate(pendingApprovalCh, approvalDecisionCh)
+			workspaceRoot, workspaceRootWarning := sessionstate.ResolveWorkspaceRoot(cfg.Workspace.Root)
+			if workspaceRootWarning != "" {
+				defaultLogger().Warn("workspace root fallback", "detail", workspaceRootWarning)
+			}
+			checkpointStore := sessionstate.NewStore(workspaceRoot)
 			session := newTUISessionController(tuiSessionControllerConfig{
 				Store:         persistent.sessionStore,
 				Enabled:       cfg.Session.Enabled,
@@ -234,6 +254,8 @@ func newTUICommand(application *app.App, out io.Writer) *cobra.Command {
 					MessageStore:         persistent.messageStore,
 					Emit:                 emit,
 					Session:              session,
+					ToolGate:             approvalGate,
+					Checkpoints:          checkpointStore,
 				})
 			}
 			colorProfile := parseTUIColorProfile(cfg.TUI.ColorProfile)
@@ -263,6 +285,8 @@ func newTUICommand(application *app.App, out io.Writer) *cobra.Command {
 				HideThinking:    !cfg.TUI.ShowThinking,
 				Renderer:        renderer,
 				Theme:           tuiTheme,
+				ApprovalCh:      pendingApprovalCh,
+				DecisionCh:      approvalDecisionCh,
 			}), tea.WithOutput(out), tea.WithAltScreen(), tea.WithMouseCellMotion())
 			_, err = program.Run()
 			return err
@@ -387,6 +411,21 @@ type tuiTaskRunConfig struct {
 	ConversationTurns    []domain.ConversationTurn
 	TaskLedger           *taskledger.Ledger
 	MessageStore         tool.AgentMessageStore
+	// ToolGate gates Manual-mode sensitive tool calls for both TUI task
+	// entry points (runTUITask and runMentionedTUIAgentTask must both wire
+	// it — an @mention path that skipped it would let a Manual-mode agent
+	// bypass approval). Wired once at `tui` command startup to the TUI's
+	// 方案 Y in-process approval gate (see tui.NewApprovalGate); nil for the
+	// plain `run`/demo paths, which never construct a tuiTaskRunConfig.
+	ToolGate agentruntime.ToolGate
+	// Checkpoints satisfies the runtime's Manual-mode invariant (see
+	// runtime.ErrManualGateMissing): a Manual task requires it non-nil
+	// alongside ToolGate even though 方案 Y's gate never actually suspends a
+	// round (ShouldSuspend always false), because the runtime cannot tell
+	// "no gate wired" apart from "gate that never suspends" from the Config
+	// alone. It shares the same on-disk store the `serve` command's
+	// manualgate flow uses, so it is otherwise inert here.
+	Checkpoints *sessionstate.Store
 }
 
 func parseTUIAgentPrompt(input string) tuiAgentPrompt {
@@ -487,6 +526,8 @@ func runTUITask(ctx context.Context, application *app.App, cfg tuiTaskRunConfig)
 		LazyTools:         cfg.Config.Runtime.LazyTools,
 		ConversationTurns: cfg.ConversationTurns,
 		WebTools:          webToolOptions(cfg.Config.Web),
+		ToolGate:          cfg.ToolGate,
+		Checkpoints:       cfg.Checkpoints,
 	})
 	if err != nil {
 		return app.DemoResult{}, err
@@ -570,6 +611,8 @@ func runMentionedTUIAgentTask(ctx context.Context, application *app.App, cfg tui
 		LazyTools:         cfg.Config.Runtime.LazyTools,
 		ConversationTurns: cfg.ConversationTurns,
 		WebTools:          webToolOptions(cfg.Config.Web),
+		ToolGate:          cfg.ToolGate,
+		Checkpoints:       cfg.Checkpoints,
 	})
 	if err != nil {
 		return app.DemoResult{}, err

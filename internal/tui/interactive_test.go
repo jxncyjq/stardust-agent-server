@@ -251,6 +251,129 @@ func TestInteractiveModelStreamsToolEventsWhileRunning(t *testing.T) {
 	}
 }
 
+// TestInteractiveModelApprovalPromptShowsToolAndSendsDecision drives the
+// bubbletea side of 方案 Y directly (no real gate/runtime involved, per the
+// task-5 brief): inject a pending-approval message as if it arrived from
+// waitApproval, assert the rendered View shows the tool name and its
+// argument, then press "y" and assert the resulting decision reaches
+// decisionCh with Allow: true.
+func TestInteractiveModelApprovalPromptShowsToolAndSendsDecision(t *testing.T) {
+	t.Parallel()
+
+	pendingCh := make(chan PendingApproval)
+	decisionCh := make(chan ApprovalDecision)
+	model := NewInteractiveModel(InteractiveConfig{
+		ApprovalCh: pendingCh,
+		DecisionCh: decisionCh,
+	})
+
+	next, cmd := model.Update(interactivePendingApprovalMsg{
+		Tool: "write_file",
+		Args: map[string]string{"path": "notes.md"},
+	})
+	model = next.(InteractiveModel)
+	if cmd != nil {
+		t.Fatalf("Update(pendingApproval) cmd = non-nil, want nil")
+	}
+	if !model.approvalActive {
+		t.Fatalf("Update(pendingApproval) approvalActive = false, want true")
+	}
+
+	view := model.View()
+	if !strings.Contains(view, "write_file") {
+		t.Fatalf("View() after pending approval missing tool name:\n%s", view)
+	}
+	if !strings.Contains(view, "notes.md") {
+		t.Fatalf("View() after pending approval missing arg value:\n%s", view)
+	}
+
+	next, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	model = next.(InteractiveModel)
+	if model.approvalActive {
+		t.Fatalf("Update(KeyMsg y) approvalActive = true, want false")
+	}
+	if cmd == nil {
+		t.Fatalf("Update(KeyMsg y) cmd = nil, want a batch (send decision + re-listen)")
+	}
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Update(KeyMsg y) cmd() = %T, want tea.BatchMsg", msg)
+	}
+	for _, batchCmd := range batch {
+		if batchCmd != nil {
+			go batchCmd()
+		}
+	}
+
+	select {
+	case decision := <-decisionCh:
+		if !decision.Allow {
+			t.Fatalf("decisionCh received Allow = false, want true")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("decisionCh received nothing within 2s after Update(KeyMsg y)")
+	}
+}
+
+// TestInteractiveModelApprovalPromptDenyBlocksTypingAndSendsDenial covers the
+// deny path and the composer-lock invariant: while an approval is pending,
+// unrelated keys (e.g. typing a reply) must not reach m.input, and must not
+// clear approvalActive.
+func TestInteractiveModelApprovalPromptDenyBlocksTypingAndSendsDenial(t *testing.T) {
+	t.Parallel()
+
+	pendingCh := make(chan PendingApproval)
+	decisionCh := make(chan ApprovalDecision)
+	model := NewInteractiveModel(InteractiveConfig{
+		ApprovalCh: pendingCh,
+		DecisionCh: decisionCh,
+	})
+
+	next, _ := model.Update(interactivePendingApprovalMsg{Tool: "shell_exec"})
+	model = next.(InteractiveModel)
+
+	next, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("z")})
+	model = next.(InteractiveModel)
+	if cmd != nil {
+		t.Fatalf("Update('z' while approval pending) cmd = non-nil, want nil")
+	}
+	if model.input != "" {
+		t.Fatalf("Update('z' while approval pending) input = %q, want empty (composer locked)", model.input)
+	}
+	if !model.approvalActive {
+		t.Fatalf("approvalActive flipped false by an unrelated key, want still true")
+	}
+
+	next, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	model = next.(InteractiveModel)
+	if model.approvalActive {
+		t.Fatalf("Update(KeyMsg n) approvalActive = true, want false")
+	}
+	if cmd == nil {
+		t.Fatalf("Update(KeyMsg n) cmd = nil, want a batch (send decision + re-listen)")
+	}
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Update(KeyMsg n) cmd() = %T, want tea.BatchMsg", msg)
+	}
+	for _, batchCmd := range batch {
+		if batchCmd != nil {
+			go batchCmd()
+		}
+	}
+
+	select {
+	case decision := <-decisionCh:
+		if decision.Allow {
+			t.Fatalf("decisionCh received Allow = true, want false")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("decisionCh received nothing within 2s after Update(KeyMsg n)")
+	}
+}
+
 func TestInteractiveModelConversationMetadataCanBeHidden(t *testing.T) {
 	t.Parallel()
 

@@ -17,6 +17,7 @@ import (
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/quality"
 	"github.com/stardust/legion-agent/internal/runtime"
+	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/taskledger"
 	"github.com/stardust/legion-agent/internal/tool"
 )
@@ -65,6 +66,21 @@ type RunTaskOptions struct {
 	LazyTools         bool
 	ConversationTurns []domain.ConversationTurn
 	WebTools          tool.WebToolOptions
+	// ToolGate gates each tool call for this run's runtime (approval flows,
+	// e.g. the TUI's in-process synchronous 方案 Y gate — see
+	// internal/tui.NewApprovalGate). Nil never suspends or blocks (Auto
+	// behaviour): the runtime enforces at RunTask entry that a Manual-mode
+	// task never reaches a nil gate (see runtime.ErrManualGateMissing), so
+	// Mode == domain.ModeManual requires both ToolGate and Checkpoints set.
+	ToolGate runtime.ToolGate
+	// Checkpoints persists suspended tool-loop state so a task can resume
+	// after a suspend. Manual mode requires it set even when ToolGate never
+	// actually suspends (e.g. 方案 Y's ShouldSuspend is always false): the
+	// runtime's Manual-mode invariant check (RunTask, see
+	// runtime.ErrManualGateMissing) treats a nil checkpoint store as an
+	// unwired gate regardless of whether that particular gate would ever use
+	// it, because it cannot tell the two cases apart from the Config alone.
+	Checkpoints *sessionstate.Store
 }
 
 type TaskSink interface {
@@ -210,6 +226,8 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 		MaxToolRounds:     opts.MaxToolRounds,
 		LazyTools:         opts.LazyTools,
 		ConversationTurns: opts.ConversationTurns,
+		ToolGate:          opts.ToolGate,
+		Checkpoints:       opts.Checkpoints,
 	})
 	task := domain.Task{
 		ID:         opts.TaskID,
