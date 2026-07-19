@@ -558,6 +558,8 @@ func runMentionedTUIAgentTask(ctx context.Context, application *app.App, cfg tui
 		ContextPrefix:     contextPrefix,
 		AgentID:           firstNonEmpty(agentCfg.ID, parsed.AgentID),
 		Role:              firstNonEmpty(agentCfg.Role, "developer"),
+		Mode:              cfg.Session.CurrentMode(),
+		WorkingDir:        cfg.Session.CurrentWorkingDir(),
 		Logger:            defaultLogger(),
 		Metrics:           observability.NewMetricsRecorder(nil),
 		ToolRoot:          toolRoot,
