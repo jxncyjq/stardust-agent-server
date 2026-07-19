@@ -1359,6 +1359,56 @@ func TestTUISessionControllerWorkingDirSetOnce(t *testing.T) {
 	}
 }
 
+// TestTUISessionControllerSetModeWhenDisabledFailsLoud verifies that when the
+// session feature is disabled (cfg.Session.Enabled == false), SetMode and
+// SetWorkingDir fail loudly with an error instead of silently no-op'ing.
+// Previously both returned nil when disabled, so a user typing "/mode
+// manual" or "/cwd <dir>" saw no error and no state change -- their explicit
+// intent was silently swallowed (violates the fail-loud rule: CLAUDE.md
+// section 0). CurrentMode/CurrentWorkingDir (the read paths) are unaffected
+// by this fix: returning defaults when disabled remains legitimate, since
+// there is no session to read from.
+func TestTUISessionControllerSetModeWhenDisabledFailsLoud(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	session := newTUISessionController(tuiSessionControllerConfig{
+		Enabled:      false,
+		CompanyID:    "cli-company",
+		AgentID:      "cli-agent",
+		ModelProfile: "dev",
+	})
+
+	if err := session.SetMode(ctx, "manual"); err == nil {
+		t.Fatalf("SetMode(manual) on disabled session error = nil, want error")
+	}
+	if got := session.CurrentMode(); got != domain.ModeAuto {
+		t.Fatalf("CurrentMode() after rejected SetMode = %q, want unchanged %q", got, domain.ModeAuto)
+	}
+}
+
+// TestTUISessionControllerSetWorkingDirWhenDisabledFailsLoud is the
+// SetWorkingDir counterpart to TestTUISessionControllerSetModeWhenDisabledFailsLoud.
+func TestTUISessionControllerSetWorkingDirWhenDisabledFailsLoud(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	session := newTUISessionController(tuiSessionControllerConfig{
+		Enabled:      false,
+		CompanyID:    "cli-company",
+		AgentID:      "cli-agent",
+		ModelProfile: "dev",
+	})
+
+	dir := t.TempDir()
+	if err := session.SetWorkingDir(ctx, dir); err == nil {
+		t.Fatalf("SetWorkingDir(%q) on disabled session error = nil, want error", dir)
+	}
+	if got := session.CurrentWorkingDir(); got != "" {
+		t.Fatalf("CurrentWorkingDir() after rejected SetWorkingDir = %q, want unchanged empty", got)
+	}
+}
+
 func TestLoadServeAgentRegistryReturnsMissingChildError(t *testing.T) {
 	t.Parallel()
 

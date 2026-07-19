@@ -1191,7 +1191,7 @@ func (c *tuiSessionController) CurrentMode() string {
 // SetMode implements SessionManager. See SessionManager.SetMode.
 func (c *tuiSessionController) SetMode(ctx context.Context, mode string) error {
 	if c == nil || !c.enabled {
-		return nil
+		return fmt.Errorf("会话未启用，无法设置工作模式")
 	}
 	normalized, ok := domain.NormalizeMode(mode)
 	if !ok {
@@ -1238,7 +1238,7 @@ func (c *tuiSessionController) CurrentWorkingDir() string {
 // re-setting the same value (no-op) both remain allowed.
 func (c *tuiSessionController) SetWorkingDir(ctx context.Context, dir string) error {
 	if c == nil || !c.enabled {
-		return nil
+		return fmt.Errorf("会话未启用，无法设置工作目录")
 	}
 	dir = strings.TrimSpace(dir)
 	if dir != "" {
