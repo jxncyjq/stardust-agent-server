@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stardust/legion-agent/internal/observability"
 )
@@ -108,6 +109,62 @@ func TestSSEEventsSanitizesNestedArgumentsAndTruncates(t *testing.T) {
 	}
 	if !strings.Contains(body, "truncated") {
 		t.Fatalf("body = %q, want truncation marker for large content", body)
+	}
+}
+
+// TestTruncateEventStringKeepsValidUTF8 covers M2c final-review T4 Minor#2:
+// truncateEventString used to slice at a fixed byte offset, which could cut a
+// multi-byte rune in half and emit invalid UTF-8 over SSE. Each case is sized
+// so the 512-byte limit lands strictly inside a rune.
+func TestTruncateEventStringKeepsValidUTF8(t *testing.T) {
+	cases := []struct {
+		name string
+		char string // repeated to build the oversized input
+	}{
+		{name: "three byte cjk", char: "中"},  // 3 bytes, 512 % 3 != 0
+		{name: "four byte emoji", char: "😀"}, // 4 bytes, needs an ASCII pad to misalign
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runeLen := len(tc.char)
+			// Pad with ASCII when the rune width divides the limit evenly, so
+			// the cut point always lands strictly inside a multi-byte rune.
+			pad := 0
+			if maxEventStringLen%runeLen == 0 {
+				pad = 1
+			}
+			if (maxEventStringLen-pad)%runeLen == 0 {
+				t.Fatalf("case does not exercise a split rune: (%d-%d) %% %d == 0", maxEventStringLen, pad, runeLen)
+			}
+			in := strings.Repeat("a", pad) + strings.Repeat(tc.char, maxEventStringLen/runeLen+10)
+			got := truncateEventString(in)
+
+			if !utf8.ValidString(got) {
+				t.Fatalf("truncateEventString(%s...) = invalid UTF-8: %q", tc.name, got)
+			}
+			if !strings.Contains(got, "truncated") {
+				t.Fatalf("got = %q, want truncation marker", got)
+			}
+			// The kept prefix must be whole runes of the original, and shorter
+			// than the limit (the straddling rune is dropped, not halved).
+			prefix := got[:strings.Index(got, "…[truncated")]
+			if len(prefix) >= maxEventStringLen {
+				t.Fatalf("prefix len = %d, want < %d (straddling rune dropped)", len(prefix), maxEventStringLen)
+			}
+			if !strings.HasPrefix(in, prefix) {
+				t.Fatalf("prefix %q is not a prefix of the input", prefix)
+			}
+		})
+	}
+}
+
+// TestTruncateEventStringPassesShortValues guards the non-truncating path so
+// the rune back-off cannot regress into trimming values under the limit.
+func TestTruncateEventStringPassesShortValues(t *testing.T) {
+	for _, in := range []string{"", "plain ascii", "中文与 emoji 😀 混排"} {
+		if got := truncateEventString(in); got != in {
+			t.Fatalf("truncateEventString(%q) = %q, want unchanged", in, got)
+		}
 	}
 }
 

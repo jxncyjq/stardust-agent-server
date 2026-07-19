@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/stardust/legion-agent/internal/observability"
 )
@@ -135,12 +136,19 @@ func sanitizeStringMap(m map[string]string) map[string]any {
 }
 
 // truncateEventString bounds s to maxEventStringLen, appending a marker noting
-// how many bytes were dropped so truncation is visible rather than silent.
+// how many bytes were dropped so truncation is visible rather than silent. The
+// cut point backs off to the nearest rune boundary so a multi-byte character
+// (中文 / emoji) straddling the limit is dropped whole instead of emitting a
+// half rune, which would make the SSE payload invalid UTF-8.
 func truncateEventString(s string) string {
 	if len(s) <= maxEventStringLen {
 		return s
 	}
-	return s[:maxEventStringLen] + fmt.Sprintf("…[truncated %d bytes]", len(s)-maxEventStringLen)
+	cut := maxEventStringLen
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + fmt.Sprintf("…[truncated %d bytes]", len(s)-cut)
 }
 
 func isSensitiveEventField(key string) bool {
