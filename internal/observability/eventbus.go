@@ -26,6 +26,10 @@ type EventBus struct {
 	subscribers map[chan EventEnvelope]struct{}
 }
 
+// NewEventBus creates an EventBus whose per-subscriber channel capacity is
+// buffer (minimum 1). buffer also bounds retained history: Publish keeps at
+// most the most recent buffer events, and Subscribe replays exactly that
+// retained history into every new subscriber without dropping any of it.
 func NewEventBus(buffer int) *EventBus {
 	if buffer < 1 {
 		buffer = 1
@@ -36,6 +40,16 @@ func NewEventBus(buffer int) *EventBus {
 	}
 }
 
+// Publish appends event to the bus history and fans it out to all current
+// subscribers. History is retained as a ring bounded to the bus's buffer
+// size (see NewEventBus): once more than buffer events have been published,
+// the oldest entries are dropped so only the most recent buffer events are
+// kept. This keeps memory usage bounded for long-running processes.
+//
+// Live delivery to subscribers remains non-blocking: a subscriber whose
+// channel is already full drops that event (existing contract, unchanged
+// here) — this only affects live fan-out, not what gets retained in history
+// for future subscribers.
 func (b *EventBus) Publish(ctx context.Context, event EventEnvelope) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -52,6 +66,11 @@ func (b *EventBus) Publish(ctx context.Context, event EventEnvelope) error {
 		event.Data = map[string]any{}
 	}
 	b.events = append(b.events, event)
+	if len(b.events) > b.buffer {
+		overflow := len(b.events) - b.buffer
+		copy(b.events, b.events[overflow:])
+		b.events = b.events[:b.buffer]
+	}
 	for subscriber := range b.subscribers {
 		select {
 		case subscriber <- event:
@@ -61,6 +80,12 @@ func (b *EventBus) Publish(ctx context.Context, event EventEnvelope) error {
 	return nil
 }
 
+// Subscribe registers a new subscriber and replays the retained history
+// (the most recent up to buffer events, see Publish) into its channel
+// before returning it. Because the channel's capacity equals the bus's
+// buffer size and history is bounded to that same size, the full replay is
+// guaranteed to fit without dropping anything — late subscribers always
+// receive the most recent events, including the latest one published.
 func (b *EventBus) Subscribe(ctx context.Context) (<-chan EventEnvelope, func()) {
 	if err := ctx.Err(); err != nil {
 		ch := make(chan EventEnvelope)
@@ -75,10 +100,7 @@ func (b *EventBus) Subscribe(ctx context.Context) (<-chan EventEnvelope, func())
 		return ch, func() {}
 	}
 	for _, event := range b.events {
-		select {
-		case ch <- event:
-		default:
-		}
+		ch <- event
 	}
 	b.subscribers[ch] = struct{}{}
 	b.mu.Unlock()
