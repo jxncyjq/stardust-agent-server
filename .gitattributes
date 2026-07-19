@@ -1,5 +1,50 @@
-# Golden fixtures are compared byte-for-byte against generated output, which
-# always uses LF. Without this, a Windows checkout with core.autocrlf=true
-# rewrites them to CRLF and the golden tests fail with a diff that renders
-# identically in the failure message.
+# 行尾策略：索引统一 LF，且 checkout 时不做平台转换。
+#
+# 此前仓库无本文件，Windows 上 core.autocrlf=true 会在 checkout 时把文本文件
+# 改写成 CRLF，索引却始终是 LF。由此产生三类问题：
+#   1. `gofmt -l .` 在 Windows 检出上列出全仓库每一个 .go 文件（gofmt 要求 LF）；
+#   2. golden 逐字节比对出现假阳性，且失败信息里 want/got 看起来完全一样，
+#      因为 \r 不可见（参见 internal/compat 的 OpenAPI golden 测试）；
+#   3. 跨平台协作时出现无内容变化的伪 diff。
+#
+# 注意：本次归一化不改动任何文件内容 —— 索引本就全是 LF，改的只是 checkout
+# 行为。因此没有全量行尾提交，git blame 不受影响。
+
+* text=auto
+
+# 源码与文本资产强制 LF，不随平台变化。
+*.go       text eol=lf
+*.mod      text eol=lf
+*.sum      text eol=lf
+*.json     text eol=lf
+*.jsonl    text eol=lf
+*.md       text eol=lf
+*.yml      text eol=lf
+*.yaml     text eol=lf
+*.ps1      text eol=lf
+*.sh       text eol=lf
+Makefile   text eol=lf
+
+# 无扩展名的点文件只会匹配到 `* text=auto`，那样仍跟随 core.autocrlf。
+# 显式列出，让规则文件自身也遵守规则。
+.gitattributes text eol=lf
+.gitignore     text eol=lf
+
+# Windows 批处理依赖 CRLF，若将来新增须保持。
+*.bat      text eol=crlf
+*.cmd      text eol=crlf
+
+# Golden fixtures 与生成输出逐字节比对，生成侧永远是 LF。
+# 上面的 *.json / *.md 已覆盖，这里显式重申以固定意图：不要放松此目录。
 internal/compat/testdata/** text eol=lf
+
+# 二进制，禁止任何行尾或编码转换。
+*.png      binary
+*.jpg      binary
+*.gif      binary
+*.ico      binary
+*.pdf      binary
+*.zip      binary
+*.gz       binary
+*.db       binary
+*.sqlite   binary
