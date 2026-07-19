@@ -143,7 +143,7 @@ func TestHeartbeatResumeNoDoubleDispatchUnderRace(t *testing.T) {
 	sched := task.NewScheduler()
 
 	counts := make(map[string]*int64, numTasks)
-	for i := 0; i < numTasks; i++ {
+	for i := range numTasks {
 		id := taskIDForIndex(i)
 		if err := store.Save(sessionstate.Checkpoint{
 			SchemaVersion: sessionstate.CheckpointSchemaVersion,
@@ -181,7 +181,7 @@ func TestHeartbeatResumeNoDoubleDispatchUnderRace(t *testing.T) {
 	})
 
 	var wg sync.WaitGroup
-	for i := 0; i < numHeartbeats; i++ {
+	for range numHeartbeats {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()

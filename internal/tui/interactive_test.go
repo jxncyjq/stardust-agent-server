@@ -1238,7 +1238,7 @@ func TestInteractiveModelMouseWheelScrollsMainOutput(t *testing.T) {
 		t.Fatalf("InteractiveModel.View(initial scroll) missing first output line:\n%s", initial)
 	}
 
-	next, cmd := model.Update(tea.MouseMsg{Type: tea.MouseWheelDown, Button: tea.MouseButtonWheelDown, Y: 2})
+	next, cmd := model.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown, Y: 2})
 	model = next.(InteractiveModel)
 	if cmd != nil {
 		t.Fatalf("InteractiveModel.Update(mouse wheel down) cmd = non-nil, want nil")
@@ -1254,7 +1254,7 @@ func TestInteractiveModelMouseWheelScrollsMainOutput(t *testing.T) {
 		t.Fatalf("InteractiveModel.View(after wheel down) missing scrolled line:\n%s", scrolled)
 	}
 
-	next, cmd = model.Update(tea.MouseMsg{Type: tea.MouseWheelUp, Button: tea.MouseButtonWheelUp, Y: 2})
+	next, cmd = model.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp, Y: 2})
 	model = next.(InteractiveModel)
 	if cmd != nil {
 		t.Fatalf("InteractiveModel.Update(mouse wheel up) cmd = non-nil, want nil")
@@ -1282,7 +1282,7 @@ func TestInteractiveModelMouseWheelOutsideMainDoesNotScrollOutput(t *testing.T) 
 		}, "\n"),
 	}
 
-	next, cmd := model.Update(tea.MouseMsg{Type: tea.MouseWheelDown, Button: tea.MouseButtonWheelDown, Y: 22})
+	next, cmd := model.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelDown, Y: 22})
 	model = next.(InteractiveModel)
 	if cmd != nil {
 		t.Fatalf("InteractiveModel.Update(mouse wheel outside main) cmd = non-nil, want nil")
@@ -1334,7 +1334,7 @@ func visibleWidth(line string) int {
 }
 
 func findLineContaining(text string, needle string) string {
-	for _, line := range strings.Split(text, "\n") {
+	for line := range strings.SplitSeq(text, "\n") {
 		if strings.Contains(line, needle) {
 			return line
 		}

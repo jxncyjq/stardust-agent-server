@@ -328,11 +328,13 @@ func buildRunContextPrefix(ctx context.Context, cfg config.Config, noContextFile
 		if absErr == nil {
 			wsRoot = absWS
 		}
-		ctxNote := "\n\n当前工作目录 (workspace root): " + wsRoot +
-			"\n使用 read_file / write_file / list_files / search_content 时，请使用相对路径（相对于 workspace root），或确认使用的绝对路径在 workspace root 之内。"
+		var ctxNote strings.Builder
+		ctxNote.WriteString("\n\n当前工作目录 (workspace root): ")
+		ctxNote.WriteString(wsRoot)
+		ctxNote.WriteString("\n使用 read_file / write_file / list_files / search_content 时，请使用相对路径（相对于 workspace root），或确认使用的绝对路径在 workspace root 之内。")
 		// Tell the model the exact paths of every context file so it doesn't guess.
-		ctxNote += "\n\n上下文文件实际路径（如需读取或更新这些文件，请使用以下路径）："
-		ctxNote += "\n- agents.md 常驻位置(按优先级): ~/.stardust/agents.md, <workspace>/agents.md, <workspace>/.stardust/agents.md"
+		ctxNote.WriteString("\n\n上下文文件实际路径（如需读取或更新这些文件，请使用以下路径）：")
+		ctxNote.WriteString("\n- agents.md 常驻位置(按优先级): ~/.stardust/agents.md, <workspace>/agents.md, <workspace>/.stardust/agents.md")
 		for _, pair := range []struct{ label, path string }{
 			{"SOUL.md", cfg.ContextFiles.SoulPath},
 			{"TOOLS.md", cfg.ContextFiles.ToolsPath},
@@ -340,10 +342,13 @@ func buildRunContextPrefix(ctx context.Context, cfg config.Config, noContextFile
 			{"MEMORY.md", cfg.ContextFiles.MemoryPath},
 		} {
 			if strings.TrimSpace(pair.path) != "" {
-				ctxNote += "\n- " + pair.label + ": " + pair.path
+				ctxNote.WriteString("\n- ")
+				ctxNote.WriteString(pair.label)
+				ctxNote.WriteString(": ")
+				ctxNote.WriteString(pair.path)
 			}
 		}
-		rendered = rendered + ctxNote
+		rendered = rendered + ctxNote.String()
 	}
 	if model := strings.TrimSpace(modelName); model != "" && model != "recording" {
 		rendered = rendered + "\n\n当前模型 (model): " + model
@@ -651,18 +656,20 @@ func buildTUIAgentMessageInboxContext(ctx context.Context, store tool.AgentMessa
 	b.WriteString("AgentMessage inbox context:")
 	for _, message := range messages {
 		messageIDs = append(messageIDs, message.ID)
-		b.WriteString(fmt.Sprintf("\n- `%s` `%s` %s -> %s: %s",
+		fmt.Fprintf(&b, "\n- `%s` `%s` %s -> %s: %s",
 			message.ID,
 			message.Type,
 			message.FromAgentID,
 			message.ToAgentID,
 			message.Summary,
-		))
+		)
 		if message.TaskID != "" {
-			b.WriteString(" task=" + message.TaskID)
+			b.WriteString(" task=")
+			b.WriteString(message.TaskID)
 		}
 		if message.Artifact != "" {
-			b.WriteString(" artifact=" + message.Artifact)
+			b.WriteString(" artifact=")
+			b.WriteString(message.Artifact)
 		}
 	}
 	return b.String(), messageIDs, nil

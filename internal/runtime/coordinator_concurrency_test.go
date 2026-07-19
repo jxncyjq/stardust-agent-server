@@ -20,7 +20,7 @@ func TestCoordinatorRunsTasksConcurrently(t *testing.T) {
 
 	const n = 50
 	ctx := context.Background()
-	for i := 0; i < n; i++ {
+	for i := range n {
 		id := fmt.Sprintf("t-%d", i)
 		if err := sched.Add(ctx, domain.Task{ID: id, AgentID: "default-agent", Status: domain.TaskPending, Input: "x"}); err != nil {
 			t.Fatalf("add %s: %v", id, err)

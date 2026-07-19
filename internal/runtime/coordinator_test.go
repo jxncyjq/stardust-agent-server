@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -540,8 +539,6 @@ func (r *staticTaskRunnerResolver) ResolveTaskRunner(ctx context.Context, task d
 	r.lastTask = task
 	return r.agent, r.runner, r.ok, nil
 }
-
-var errStaticResolver = errors.New("static resolver error")
 
 func TestRecoverSuspendedRestoresMode(t *testing.T) {
 	dir := t.TempDir()
