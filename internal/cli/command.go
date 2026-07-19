@@ -287,6 +287,12 @@ func newTUICommand(application *app.App, out io.Writer) *cobra.Command {
 				Theme:           tuiTheme,
 				ApprovalCh:      pendingApprovalCh,
 				DecisionCh:      approvalDecisionCh,
+				// Parent of every per-task context the model creates: a
+				// cancelled command context (Ctrl-C / shutdown) unwinds the
+				// in-flight task and any Manual-mode approval blocked in
+				// approvalGate.Resolve, instead of leaving them parked on a
+				// keypress that will never come.
+				Context: cmd.Context(),
 			}), tea.WithOutput(out), tea.WithAltScreen(), tea.WithMouseCellMotion())
 			_, err = program.Run()
 			return err

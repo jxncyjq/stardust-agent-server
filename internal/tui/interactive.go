@@ -55,6 +55,14 @@ type InteractiveConfig struct {
 	// passed to the tui.NewApprovalGate that feeds ApprovalCh, or a decision
 	// has nowhere to go.
 	DecisionCh chan<- ApprovalDecision
+	// Context is the parent context of everything the model drives: task runs
+	// (Runner/StreamingRunner), skill commands, and the session/mode/cwd/task
+	// command handlers. Every task run derives a cancellable child from it
+	// (see InteractiveModel.beginTask), so cancelling Context unwinds an
+	// in-flight task and any Manual-mode approval blocked inside its gate.
+	// Nil is an explicitly allowed "no external parent" and is treated as
+	// context.Background() — the demo/test paths that never cancel anything.
+	Context context.Context
 }
 
 type InteractiveModel struct {
@@ -106,6 +114,15 @@ type InteractiveModel struct {
 	approvalActive bool
 	approvalTool   string
 	approvalArgs   map[string]string
+	// baseCtx is InteractiveConfig.Context (never nil after construction).
+	baseCtx context.Context
+	// taskCtx / taskCancel are the in-flight task's cancellable context, set
+	// by beginTask and released by endTask; nil when no task is running.
+	// taskSeq identifies the current task so a cancellation watcher issued
+	// for an earlier task cannot clobber a later one's state.
+	taskCtx    context.Context
+	taskCancel context.CancelFunc
+	taskSeq    uint64
 }
 
 type interactiveViewMode string
@@ -261,7 +278,12 @@ func NewInteractiveModel(cfg InteractiveConfig) InteractiveModel {
 	if theme.Accent == "" {
 		theme = defaultThemeColors()
 	}
+	baseCtx := cfg.Context
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
 	return InteractiveModel{
+		baseCtx:        baseCtx,
 		runner:         cfg.Runner,
 		streamRunner:   cfg.StreamingRunner,
 		sanitizer:      sanitizer,
@@ -350,7 +372,22 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.approvalTool = msg.Tool
 		m.approvalArgs = msg.Args
 		return m, nil
+	case interactiveTaskCancelledMsg:
+		// A watcher from an already-replaced task must not touch the current
+		// one's state; endTask cancels the old context, which is exactly how
+		// a stale watcher wakes up.
+		if msg.seq != m.taskSeq || !m.approvalActive {
+			return m, nil
+		}
+		m = m.clearApproval()
+		m.err = fmt.Sprintf("审批已中止(任务上下文取消): %v", msg.err)
+		return m, nil
+	case interactiveApprovalAbortedMsg:
+		m = m.clearApproval()
+		m.err = fmt.Sprintf("审批决定未送达(任务上下文取消): %v", msg.err)
+		return m, nil
 	case interactiveRunDoneMsg:
+		m = m.endTask()
 		m.running = false
 		m.err = ""
 		m.result = msg.result
@@ -403,6 +440,7 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		switch msg.Type {
 		case tea.KeyCtrlC, tea.KeyEsc:
+			m = m.endTask()
 			m.quitting = true
 			return m, tea.Quit
 		case tea.KeyCtrlY:
@@ -439,19 +477,19 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.mainScroll = 0
 				return m, nil
 			}
-			if handled, next := m.handleSessionCommand(context.Background(), prompt); handled {
+			if handled, next := m.handleSessionCommand(m.baseContext(), prompt); handled {
 				return next, nil
 			}
-			if handled, next := m.handleModeCommand(context.Background(), prompt); handled {
+			if handled, next := m.handleModeCommand(m.baseContext(), prompt); handled {
 				return next, nil
 			}
-			if handled, next := m.handleCwdCommand(context.Background(), prompt); handled {
+			if handled, next := m.handleCwdCommand(m.baseContext(), prompt); handled {
 				return next, nil
 			}
-			if handled, next := m.handleTaskCommand(context.Background(), prompt); handled {
+			if handled, next := m.handleTaskCommand(m.baseContext(), prompt); handled {
 				return next, nil
 			}
-			if handled, next := m.handleMessageCommand(context.Background(), prompt); handled {
+			if handled, next := m.handleMessageCommand(m.baseContext(), prompt); handled {
 				return next, nil
 			}
 			if fields := strings.Fields(prompt); len(fields) >= 1 && strings.EqualFold(fields[0], "/skill") {
@@ -466,15 +504,7 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.progressFrame = 0
 				return m, tea.Batch(m.runSkill(fields[1], strings.Join(fields[2:], " ")), interactiveProgressTick())
 			}
-			m.activePrompt = prompt
-			m.input = ""
-			m.viewMode = interactiveViewResult
-			m.running = true
-			m.progressFrame = 0
-			m.mainScroll = 0
-			m.liveEvents = nil
-			m.streamCh = make(chan domain.RuntimeEvent, 256)
-			return m, tea.Batch(m.run(prompt), m.waitStream(), interactiveProgressTick())
+			return m.beginTask(prompt)
 		case tea.KeyBackspace:
 			if m.running {
 				return m, nil
@@ -510,6 +540,7 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		case tea.KeyRunes:
 			if string(msg.Runes) == "q" && strings.TrimSpace(m.input) == "" {
+				m = m.endTask()
 				m.quitting = true
 				return m, tea.Quit
 			}
@@ -1623,6 +1654,23 @@ type interactiveSkillDoneMsg struct {
 	err    error
 }
 
+// interactiveTaskCancelledMsg reports that the in-flight task's context was
+// cancelled (external shutdown via InteractiveConfig.Context, or endTask).
+// seq identifies the task the watcher was issued for; a mismatch means the
+// watcher belongs to an already-replaced task and must be ignored.
+type interactiveTaskCancelledMsg struct {
+	seq uint64
+	err error
+}
+
+// interactiveApprovalAbortedMsg reports that a human's approve/deny answer
+// could not be handed to the gate because the task context was cancelled
+// first — the gate has already left its decisionCh receive. Surfaced in the
+// error line rather than dropped silently (CLAUDE.md §0 fail-loud).
+type interactiveApprovalAbortedMsg struct {
+	err error
+}
+
 type interactiveProgressTickMsg struct{}
 type interactiveStreamEventMsg domain.RuntimeEvent
 type interactiveStreamClosedMsg struct{}
@@ -1637,11 +1685,93 @@ func interactiveProgressTick() tea.Cmd {
 	})
 }
 
+// baseContext returns the model's parent context, defaulting to
+// context.Background() for zero-value models built outside
+// NewInteractiveModel (tests).
+func (m InteractiveModel) baseContext() context.Context {
+	if m.baseCtx == nil {
+		return context.Background()
+	}
+	return m.baseCtx
+}
+
+// approvalContext returns the context that governs an outstanding approval
+// handoff: the in-flight task's context while a task is running (the gate
+// blocked in Resolve was handed that same context), else the parent context.
+func (m InteractiveModel) approvalContext() context.Context {
+	if m.taskCtx != nil {
+		return m.taskCtx
+	}
+	return m.baseContext()
+}
+
+// beginTask installs a fresh cancellable per-task context derived from the
+// parent, resets the run-scoped view state, and returns the commands that
+// drive the run: the runner itself, the stream pump, the task-cancellation
+// watcher, and the progress ticker.
+func (m InteractiveModel) beginTask(prompt string) (InteractiveModel, tea.Cmd) {
+	m = m.endTask()
+	ctx, cancel := context.WithCancel(m.baseContext())
+	m.taskCtx = ctx
+	m.taskCancel = cancel
+	m.taskSeq++
+	m.activePrompt = prompt
+	m.input = ""
+	m.viewMode = interactiveViewResult
+	m.running = true
+	m.progressFrame = 0
+	m.mainScroll = 0
+	m.liveEvents = nil
+	m.streamCh = make(chan domain.RuntimeEvent, 256)
+	return m, tea.Batch(m.run(prompt), m.waitStream(), m.watchTaskCancel(), interactiveProgressTick())
+}
+
+// endTask releases the finished (or abandoned) task's context and clears any
+// approval prompt still on screen: once that task is gone its gate is no
+// longer parked waiting for an answer, so leaving the prompt up would invite
+// a keypress with nowhere to go. Safe to call with no task running.
+func (m InteractiveModel) endTask() InteractiveModel {
+	if m.taskCancel != nil {
+		m.taskCancel()
+	}
+	m.taskCtx = nil
+	m.taskCancel = nil
+	return m.clearApproval()
+}
+
+// clearApproval drops the pending-approval display state.
+func (m InteractiveModel) clearApproval() InteractiveModel {
+	m.approvalActive = false
+	m.approvalTool = ""
+	m.approvalArgs = nil
+	return m
+}
+
+// watchTaskCancel waits for the current task's context to be cancelled and
+// reports it to Update, so a cancellation that arrives while an approval
+// prompt is displayed clears that prompt instead of leaving a dead question
+// on screen.
+func (m InteractiveModel) watchTaskCancel() tea.Cmd {
+	ctx := m.taskCtx
+	seq := m.taskSeq
+	return func() tea.Msg {
+		if ctx == nil {
+			return nil
+		}
+		<-ctx.Done()
+		return interactiveTaskCancelledMsg{seq: seq, err: ctx.Err()}
+	}
+}
+
 func (m InteractiveModel) run(prompt string) tea.Cmd {
 	streamCh := m.streamCh
+	ctx := m.taskCtx
 	return func() tea.Msg {
 		if streamCh != nil {
 			defer close(streamCh)
+		}
+		if ctx == nil {
+			return interactiveRunDoneMsg{err: fmt.Errorf("interactive task context is not initialised")}
 		}
 		if m.streamRunner != nil {
 			emit := func(event domain.RuntimeEvent) {
@@ -1650,13 +1780,13 @@ func (m InteractiveModel) run(prompt string) tea.Cmd {
 				}
 				streamCh <- event
 			}
-			result, err := m.streamRunner(context.Background(), prompt, emit)
+			result, err := m.streamRunner(ctx, prompt, emit)
 			return interactiveRunDoneMsg{result: result, err: err}
 		}
 		if m.runner == nil {
 			return interactiveRunDoneMsg{err: fmt.Errorf("interactive runner is not configured")}
 		}
-		result, err := m.runner(context.Background(), prompt)
+		result, err := m.runner(ctx, prompt)
 		return interactiveRunDoneMsg{result: result, err: err}
 	}
 }
@@ -1704,6 +1834,10 @@ func (m InteractiveModel) waitApproval() tea.Cmd {
 func (m InteractiveModel) updateApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.Type {
 	case tea.KeyCtrlC, tea.KeyEsc:
+		// Quitting with an approval outstanding: cancel the task context so
+		// the gate parked in Resolve unblocks with ctx.Err() instead of
+		// waiting on an answer this program will never deliver.
+		m = m.endTask()
 		m.quitting = true
 		return m, tea.Quit
 	case tea.KeyRunes:
@@ -1724,25 +1858,32 @@ func (m InteractiveModel) updateApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd)
 // next approval — in this same task run (a multi-round Manual task) or a
 // later one.
 func (m InteractiveModel) resolveApproval(allow bool) (tea.Model, tea.Cmd) {
-	m.approvalActive = false
-	m.approvalTool = ""
-	m.approvalArgs = nil
+	m = m.clearApproval()
 	return m, tea.Batch(m.sendApprovalDecision(allow), m.waitApproval())
 }
 
 // sendApprovalDecision returns a tea.Cmd that delivers allow to the blocked
-// gate over decisionCh. The gate is guaranteed to already be parked in its
-// receive select by the time a decision can be sent (it only publishes the
-// PendingApproval that put the model into approvalActive after it starts
-// waiting for the answer), so this send completes promptly rather than
-// blocking the cmd goroutine indefinitely.
+// gate over decisionCh. In the normal case the gate is already parked in its
+// receive select (it only publishes the PendingApproval that put the model
+// into approvalActive after it starts waiting for the answer), so the send
+// completes at once. The ctx.Done() arm covers the one case where it is not:
+// the task context was cancelled while the approval was displayed, so the
+// gate left its receive via its own ctx.Done() arm and nothing will ever take
+// this value — a bare send would park this cmd goroutine forever. The abort
+// is reported, never swallowed (CLAUDE.md §0 fail-loud).
 func (m InteractiveModel) sendApprovalDecision(allow bool) tea.Cmd {
 	decisionCh := m.decisionCh
+	ctx := m.approvalContext()
 	return func() tea.Msg {
-		if decisionCh != nil {
-			decisionCh <- ApprovalDecision{Allow: allow}
+		if decisionCh == nil {
+			return nil
 		}
-		return nil
+		select {
+		case decisionCh <- ApprovalDecision{Allow: allow}:
+			return nil
+		case <-ctx.Done():
+			return interactiveApprovalAbortedMsg{err: ctx.Err()}
+		}
 	}
 }
 
@@ -1752,6 +1893,7 @@ func (m InteractiveModel) runSkill(sub, arg string) tea.Cmd {
 	if agentName != "" {
 		mgr = m.skillManagers[agentName]
 	}
+	baseCtx := m.baseContext()
 	return func() tea.Msg {
 		if mgr == nil {
 			if agentName != "" {
@@ -1759,7 +1901,7 @@ func (m InteractiveModel) runSkill(sub, arg string) tea.Cmd {
 			}
 			return interactiveSkillDoneMsg{err: fmt.Errorf("skill manager not configured; start the agent with a skills install root")}
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		ctx, cancel := context.WithTimeout(baseCtx, 60*time.Second)
 		defer cancel()
 		switch strings.ToLower(sub) {
 		case "install":
