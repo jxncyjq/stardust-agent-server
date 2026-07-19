@@ -801,6 +801,66 @@ func TestInteractiveModelCwdCommandSetsWorkingDir(t *testing.T) {
 	}
 }
 
+func TestInteractiveModelModeCommandMissingArg(t *testing.T) {
+	t.Parallel()
+
+	manager := &fakeSessionManager{current: "session-1"}
+	model := NewInteractiveModel(InteractiveConfig{SessionManager: manager})
+	next, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 36})
+	model = next.(InteractiveModel)
+
+	model = typeInteractiveText(t, model, "/mode")
+	next, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = next.(InteractiveModel)
+	if cmd != nil {
+		t.Fatalf("InteractiveModel.Update(/mode) cmd = non-nil, want local command")
+	}
+	if model.err == "" {
+		t.Fatalf("InteractiveModel.err = empty, want usage hint for /mode without arg")
+	}
+	if manager.setModeCalls != 0 {
+		t.Fatalf("fakeSessionManager.setModeCalls = %d, want 0 for /mode without arg", manager.setModeCalls)
+	}
+	if manager.mode != "" {
+		t.Fatalf("fakeSessionManager.mode = %q, want unchanged empty after /mode without arg", manager.mode)
+	}
+	if model.mode != domain.ModeAuto {
+		t.Fatalf("InteractiveModel.mode = %q, want unchanged %q after /mode without arg", model.mode, domain.ModeAuto)
+	}
+	if model.input != "" {
+		t.Fatalf("InteractiveModel.input = %q, want cleared after /mode without arg", model.input)
+	}
+}
+
+func TestInteractiveModelCwdCommandMissingArg(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	manager := &fakeSessionManager{current: "session-1", workingDir: dir}
+	model := NewInteractiveModel(InteractiveConfig{SessionManager: manager})
+	next, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 36})
+	model = next.(InteractiveModel)
+
+	model = typeInteractiveText(t, model, "/cwd")
+	next, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = next.(InteractiveModel)
+	if cmd != nil {
+		t.Fatalf("InteractiveModel.Update(/cwd) cmd = non-nil, want local command")
+	}
+	if model.err == "" {
+		t.Fatalf("InteractiveModel.err = empty, want usage hint for /cwd without arg")
+	}
+	if manager.setWorkingDirCall != 0 {
+		t.Fatalf("fakeSessionManager.setWorkingDirCall = %d, want 0 for /cwd without arg", manager.setWorkingDirCall)
+	}
+	if manager.workingDir != dir {
+		t.Fatalf("fakeSessionManager.workingDir = %q, want unchanged %q after /cwd without arg", manager.workingDir, dir)
+	}
+	if model.input != "" {
+		t.Fatalf("InteractiveModel.input = %q, want cleared after /cwd without arg", model.input)
+	}
+}
+
 func TestInteractiveModelShowsSlashCommandSuggestions(t *testing.T) {
 	t.Parallel()
 
@@ -1438,10 +1498,12 @@ func (f *fakeSkillManager) Uninstall(_ context.Context, name string) error {
 }
 
 type fakeSessionManager struct {
-	current    string
-	sessions   []string
-	mode       string
-	workingDir string
+	current           string
+	sessions          []string
+	mode              string
+	workingDir        string
+	setModeCalls      int
+	setWorkingDirCall int
 }
 
 func (f *fakeSessionManager) CurrentSessionID() string {
@@ -1476,6 +1538,7 @@ func (f *fakeSessionManager) CurrentMode() string {
 }
 
 func (f *fakeSessionManager) SetMode(_ context.Context, mode string) error {
+	f.setModeCalls++
 	normalized, ok := domain.NormalizeMode(mode)
 	if !ok {
 		return fmt.Errorf("invalid mode %q", mode)
@@ -1489,6 +1552,7 @@ func (f *fakeSessionManager) CurrentWorkingDir() string {
 }
 
 func (f *fakeSessionManager) SetWorkingDir(_ context.Context, dir string) error {
+	f.setWorkingDirCall++
 	if dir != "" {
 		info, err := os.Stat(dir)
 		if err != nil {
