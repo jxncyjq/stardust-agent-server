@@ -182,13 +182,11 @@ func TestHeartbeatResumeNoDoubleDispatchUnderRace(t *testing.T) {
 
 	var wg sync.WaitGroup
 	for range numHeartbeats {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			if _, _, err := c.Heartbeat(context.Background()); err != nil {
 				t.Errorf("Heartbeat: %v", err)
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	c.Wait()
@@ -309,15 +307,15 @@ type blockingTaskRunner struct {
 
 	enteredOnce sync.Once
 	entered     chan struct{}
-	calls       int64
+	calls       atomic.Int64
 }
 
 func (r *blockingTaskRunner) callCount() int64 {
-	return atomic.LoadInt64(&r.calls)
+	return r.calls.Load()
 }
 
 func (r *blockingTaskRunner) RunTask(ctx context.Context, agent domain.Agent, t domain.Task) (domain.TaskRun, error) {
-	atomic.AddInt64(&r.calls, 1)
+	r.calls.Add(1)
 	r.enteredOnce.Do(func() {
 		close(r.entered)
 	})

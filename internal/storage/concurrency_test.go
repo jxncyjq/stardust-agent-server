@@ -30,11 +30,11 @@ func TestSQLiteRepositoryConcurrentWritersNoBusy(t *testing.T) {
 
 	var wg sync.WaitGroup
 	errs := make(chan error, writers*perWriter*2)
-	for w := 0; w < writers; w++ {
+	for w := range writers {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
-			for i := 0; i < perWriter; i++ {
+			for i := range perWriter {
 				sessionID := fmt.Sprintf("sess-%d-%d", w, i)
 				session := domain.AgentSession{
 					ID:        sessionID,

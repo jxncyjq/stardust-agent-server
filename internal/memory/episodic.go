@@ -129,9 +129,7 @@ func cosineSimilarity(left, right []float64) float64 {
 		return 0
 	}
 	n := len(left)
-	if len(right) < n {
-		n = len(right)
-	}
+	n = min(n, len(right))
 	var dot, leftNorm, rightNorm float64
 	for idx := range n {
 		dot += left[idx] * right[idx]

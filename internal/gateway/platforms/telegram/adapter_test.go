@@ -24,8 +24,7 @@ func TestTelegramStartReceivesUpdate(t *testing.T) {
 	t.Cleanup(server.Close)
 
 	adapter := newForTest("tok", server.URL, 0)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	inbound := make(chan gateway.InboundMessage, 1)
 	go func() { _ = adapter.Start(ctx, inbound) }()
 

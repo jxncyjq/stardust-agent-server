@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -717,9 +718,7 @@ func (m InteractiveModel) nextHistory() InteractiveModel {
 func (m InteractiveModel) View() string {
 	width, planWidth, mainHeight := m.layoutDimensions()
 	mainWidth := width - planWidth - 2
-	if mainWidth < 40 {
-		mainWidth = 40
-	}
+	mainWidth = max(mainWidth, 40)
 
 	var b strings.Builder
 	b.WriteString(m.renderHeader(width))
@@ -742,10 +741,7 @@ func (m InteractiveModel) layoutDimensions() (int, int, int) {
 	if width < 100 {
 		planWidth = 38
 	}
-	mainHeight := m.normalizedHeight() - 8
-	if mainHeight < 10 {
-		mainHeight = 10
-	}
+	mainHeight := max(m.normalizedHeight()-8, 10)
 	return width, planWidth, mainHeight
 }
 
@@ -768,9 +764,7 @@ func (m InteractiveModel) renderHeader(width int) string {
 	left := m.styles.title.Render("Agent") + "  " + m.clean(m.agentName) + " · " + m.clean(m.modelName)
 	right := m.styles.title.Render("max") + "  0%"
 	gap := width - lipgloss.Width(left) - lipgloss.Width(right)
-	if gap < 1 {
-		gap = 1
-	}
+	gap = max(gap, 1)
 	return left + strings.Repeat(" ", gap) + right
 }
 
@@ -793,10 +787,7 @@ func (m InteractiveModel) renderMainBody(width int, height int) string {
 		parts = append(parts, m.styles.err.Render("ERROR")+" "+m.clean(m.err))
 	}
 	if !m.running && m.result.TaskID == "" && m.result.Result == "" && m.err == "" && m.skillMsg == "" && m.sessionMsg == "" && m.taskMsg == "" && m.messageMsg == "" {
-		topPad := height / 3
-		if topPad < 2 {
-			topPad = 2
-		}
+		topPad := max(height/3, 2)
 		title := centerLine(width, m.styles.title.Render("Legion Agent TUI"))
 		subtitle := centerLine(width, m.styles.title.Render(m.clean(m.agentName)+"  ·  "+m.clean(m.modelName)))
 		parts = append(parts,
@@ -805,23 +796,24 @@ func (m InteractiveModel) renderMainBody(width int, height int) string {
 				subtitle,
 		)
 	} else {
-		if m.viewMode == interactiveViewAudit {
+		switch m.viewMode {
+		case interactiveViewAudit:
 			parts = append(parts, m.styles.label.Render("AUDIT")+"\n"+m.renderAudit())
-		} else if m.viewMode == interactiveViewEvent {
+		case interactiveViewEvent:
 			parts = append(parts, m.styles.label.Render("EVENT")+"\n"+m.renderEvents())
-		} else if m.viewMode == interactiveViewSkill {
+		case interactiveViewSkill:
 			parts = append(parts, m.styles.label.Render("SKILL")+"\n"+m.clean(m.skillMsg))
-		} else if m.viewMode == interactiveViewHistory {
+		case interactiveViewHistory:
 			parts = append(parts, m.styles.label.Render("HISTORY")+"\n"+m.renderHistory(width))
-		} else if m.viewMode == interactiveViewSession {
+		case interactiveViewSession:
 			parts = append(parts, m.styles.label.Render("SESSION")+"\n"+m.clean(m.sessionMsg))
-		} else if m.viewMode == interactiveViewTasks {
+		case interactiveViewTasks:
 			parts = append(parts, m.styles.label.Render("TASKS")+"\n"+m.formatMarkdownBlock(m.taskMsg, width))
-		} else if m.viewMode == interactiveViewTask {
+		case interactiveViewTask:
 			parts = append(parts, m.styles.label.Render("TASK")+"\n"+m.formatMarkdownBlock(m.taskMsg, width))
-		} else if m.viewMode == interactiveViewInbox {
+		case interactiveViewInbox:
 			parts = append(parts, m.styles.label.Render("INBOX")+"\n"+m.formatMarkdownBlock(m.messageMsg, width))
-		} else {
+		default:
 			parts = append(parts,
 				m.renderConversation(width),
 			)
@@ -833,9 +825,7 @@ func (m InteractiveModel) renderMainBody(width int, height int) string {
 func (m InteractiveModel) clampMainScroll(offset int) int {
 	_, planWidth, mainHeight := m.layoutDimensions()
 	mainWidth := m.width - planWidth - 2
-	if mainWidth < 40 {
-		mainWidth = 40
-	}
+	mainWidth = max(mainWidth, 40)
 	body := m.renderMainBody(mainWidth, mainHeight)
 	maxOffset := max(0, len(strings.Split(body, "\n"))-mainHeight)
 	if offset < 0 {
@@ -951,10 +941,7 @@ func (m InteractiveModel) renderFooter(width int) string {
 	left += m.styles.dim.Render(" · " + m.clean(m.footerWorkingDir()))
 	if m.copyNotice != "" {
 		notice := m.styles.title.Render(" ✓ " + m.copyNotice)
-		gap := width - lipgloss.Width(left) - lipgloss.Width(notice)
-		if gap < 1 {
-			gap = 1
-		}
+		gap := max(width-lipgloss.Width(left)-lipgloss.Width(notice), 1)
 		return left + strings.Repeat(" ", gap) + notice
 	}
 	if m.running {
@@ -968,9 +955,7 @@ func (m InteractiveModel) renderFooter(width int) string {
 	}
 	right := m.styles.help.Render("Enter Run | Ctrl+Y 复制 | Shift+拖拽 选择 | Esc/Ctrl+C Quit")
 	gap := width - lipgloss.Width(left) - lipgloss.Width(right)
-	if gap < 1 {
-		gap = 1
-	}
+	gap = max(gap, 1)
 	return left + strings.Repeat(" ", gap) + right
 }
 
@@ -1327,10 +1312,7 @@ func (m InteractiveModel) renderWorkingProgressBar(width int, frame int) string 
 	}
 	marker := "╯╰"
 	markerWidth := lipgloss.Width(marker)
-	span := width - markerWidth + 1
-	if span < 1 {
-		span = 1
-	}
+	span := max(width-markerWidth+1, 1)
 	leftWidth := frame % span
 	rightWidth := width - markerWidth - leftWidth
 	bar := strings.Repeat("─", leftWidth) + marker + strings.Repeat("─", rightWidth)
@@ -1341,10 +1323,7 @@ func (m InteractiveModel) renderResult(width int) string {
 	if m.result.TaskID == "" && m.result.Result == "" {
 		return "No result yet."
 	}
-	bodyWidth := width - 2
-	if bodyWidth < 20 {
-		bodyWidth = 20
-	}
+	bodyWidth := max(width-2, 20)
 	lines := []string{
 		m.styles.dim.Render("Task " + m.clean(m.result.TaskID)),
 		"",
@@ -1355,10 +1334,7 @@ func (m InteractiveModel) renderResult(width int) string {
 }
 
 func (m InteractiveModel) renderConversation(width int) string {
-	bodyWidth := width - 2
-	if bodyWidth < 20 {
-		bodyWidth = 20
-	}
+	bodyWidth := max(width-2, 20)
 	sep := m.styles.dim.Render(strings.Repeat("─", min(bodyWidth, 60)))
 	var lines []string
 
@@ -1518,10 +1494,7 @@ func (m InteractiveModel) thinkingSteps() []string {
 		return steps
 	}
 	if len(m.result.EventStream) > 0 {
-		limit := len(m.result.EventStream)
-		if limit > 3 {
-			limit = 3
-		}
+		limit := min(len(m.result.EventStream), 3)
 		for _, event := range m.result.EventStream[:limit] {
 			eventType := strings.TrimSpace(m.clean(event.Type))
 			message := strings.TrimSpace(m.clean(event.Message))
@@ -1574,10 +1547,7 @@ func (m InteractiveModel) renderHistory(width int) string {
 	if len(m.turns) == 0 {
 		return m.styles.dim.Italic(true).Render("暂无对话历史。")
 	}
-	bodyWidth := width - 2
-	if bodyWidth < 20 {
-		bodyWidth = 20
-	}
+	bodyWidth := max(width-2, 20)
 	var lines []string
 	for i, t := range m.turns {
 		lines = append(lines, m.styles.title.Render(fmt.Sprintf("▌ [%d] %s", i+1, m.clean(t.Prompt))))
@@ -1935,9 +1905,7 @@ func copySkillManagers(in map[string]skill.Manager) map[string]skill.Manager {
 		return nil
 	}
 	out := make(map[string]skill.Manager, len(in))
-	for name, manager := range in {
-		out[name] = manager
-	}
+	maps.Copy(out, in)
 	return out
 }
 
@@ -1955,8 +1923,8 @@ func parseSkillAgentArg(arg string) (string, string) {
 			idx++
 			continue
 		}
-		if strings.HasPrefix(field, "--agent=") {
-			agentName = strings.TrimPrefix(field, "--agent=")
+		if name, ok := strings.CutPrefix(field, "--agent="); ok {
+			agentName = name
 			continue
 		}
 		cleaned = append(cleaned, field)
@@ -1989,10 +1957,7 @@ func (m InteractiveModel) formatMarkdownBlock(text string, width int) string {
 
 		// Horizontal rule: ---, ***, ___ (must check before stripMarkdownMarkers which would eat ***)
 		if isHorizontalRule(trimmedRaw) {
-			ruleWidth := width
-			if ruleWidth > 60 {
-				ruleWidth = 60
-			}
+			ruleWidth := min(width, 60)
 			out = append(out, m.styles.dim.Render(strings.Repeat("─", ruleWidth)))
 			i++
 			continue

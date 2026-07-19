@@ -2,6 +2,7 @@ package taskledger
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -116,14 +117,14 @@ func renderIndex(tasks map[string]Task, cfg Config) string {
 		if isTerminal(task.Status, cfg.DoneStatuses) {
 			continue
 		}
-		b.WriteString(fmt.Sprintf("| %s | %s | %s | %s | %s | [[tasks/%s]] |\n",
+		fmt.Fprintf(&b, "| %s | %s | %s | %s | %s | [[tasks/%s]] |\n",
 			escapeCell(task.ID),
 			escapeCell(task.Status),
 			escapeCell(task.Owner),
 			escapeCell(strings.Join(sortedParticipants(task.Participants), ", ")),
 			escapeCell(task.Summary),
 			escapeCell(task.ID),
-		))
+		)
 	}
 	return enforceIndexLineLimit(b.String(), cfg.MaxIndexLines)
 }
@@ -132,43 +133,47 @@ func renderTasks(tasks map[string]Task, cfg Config) map[string]string {
 	rendered := make(map[string]string, len(tasks))
 	for _, task := range sortedTasks(tasks) {
 		var b strings.Builder
-		b.WriteString("# " + task.ID + "\n\n")
+		b.WriteString("# ")
+		b.WriteString(task.ID)
+		b.WriteString("\n\n")
 		b.WriteString("| Field | Value |\n")
 		b.WriteString("|-------|-------|\n")
-		b.WriteString(fmt.Sprintf("| Title | %s |\n", escapeCell(task.Title)))
-		b.WriteString(fmt.Sprintf("| Status | %s |\n", escapeCell(task.Status)))
-		b.WriteString(fmt.Sprintf("| Owner | %s |\n", escapeCell(task.Owner)))
-		b.WriteString(fmt.Sprintf("| Participants | %s |\n", escapeCell(strings.Join(sortedParticipants(task.Participants), ", "))))
-		b.WriteString(fmt.Sprintf("| Summary | %s |\n", escapeCell(task.Summary)))
+		fmt.Fprintf(&b, "| Title | %s |\n", escapeCell(task.Title))
+		fmt.Fprintf(&b, "| Status | %s |\n", escapeCell(task.Status))
+		fmt.Fprintf(&b, "| Owner | %s |\n", escapeCell(task.Owner))
+		fmt.Fprintf(&b, "| Participants | %s |\n", escapeCell(strings.Join(sortedParticipants(task.Participants), ", ")))
+		fmt.Fprintf(&b, "| Summary | %s |\n", escapeCell(task.Summary))
 		if task.Artifact != "" {
-			b.WriteString(fmt.Sprintf("| Artifact | %s |\n", escapeCell(task.Artifact)))
+			fmt.Fprintf(&b, "| Artifact | %s |\n", escapeCell(task.Artifact))
 		}
 		b.WriteString("\n## Messages\n\n")
 		if len(task.Messages) == 0 {
 			b.WriteString("- No messages yet.\n")
 		}
 		for _, message := range task.Messages {
-			b.WriteString(fmt.Sprintf("- `%s` `%s` %s -> %s: %s",
+			fmt.Fprintf(&b, "- `%s` `%s` %s -> %s: %s",
 				message.CreatedAt.Format(time.RFC3339),
 				message.Type,
 				emptyDash(message.From),
 				emptyDash(message.To),
 				message.Summary,
-			))
+			)
 			if message.Artifact != "" {
-				b.WriteString(" (" + message.Artifact + ")")
+				b.WriteString(" (")
+				b.WriteString(message.Artifact)
+				b.WriteString(")")
 			}
 			b.WriteString("\n")
 		}
 		if len(task.Conflicts) > 0 {
 			b.WriteString("\n## Conflicts\n\n")
 			for _, conflict := range task.Conflicts {
-				b.WriteString(fmt.Sprintf("- `%s` `%s` %s: %s\n",
+				fmt.Fprintf(&b, "- `%s` `%s` %s: %s\n",
 					conflict.CreatedAt.Format(time.RFC3339),
 					conflict.Type,
 					conflictMetadata(conflict),
 					conflict.Summary,
-				))
+				)
 			}
 		}
 		rendered[task.ID] = enforceLineLimit(b.String(), cfg.MaxTaskLines)
@@ -236,12 +241,7 @@ func addParticipant(participants map[string]bool, participant string) {
 }
 
 func isTerminal(status string, doneStatuses []string) bool {
-	for _, done := range doneStatuses {
-		if status == done {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(doneStatuses, status)
 }
 
 func escapeCell(value string) string {

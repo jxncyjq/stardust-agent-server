@@ -215,7 +215,7 @@ func TestBuildProjectionAddsSplitHintWhenTaskDetailIsTruncated(t *testing.T) {
 func TestBuildProjectionAddsArchiveHintWhenIndexIsTruncated(t *testing.T) {
 	base := time.Date(2026, 5, 23, 11, 0, 0, 0, time.UTC)
 	var events []Event
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		events = append(events, Event{
 			EventID:       "evt-index-" + string(rune('a'+i)),
 			TaskID:        "TASK-20260523-10" + string(rune('0'+i)),
@@ -246,11 +246,8 @@ func TestLedgerConcurrentAppendKeepsAllEvents(t *testing.T) {
 	const total = 12
 	var wg sync.WaitGroup
 	errs := make(chan error, total)
-	for i := 0; i < total; i++ {
-		i := i
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for i := range total {
+		wg.Go(func() {
 			_, err := ledger.Append(ctx, Event{
 				EventID:       "evt-concurrent-" + string(rune('a'+i)),
 				TaskID:        "TASK-20260521-001",
@@ -261,7 +258,7 @@ func TestLedgerConcurrentAppendKeepsAllEvents(t *testing.T) {
 				SchemaVersion: schemaVersion,
 			})
 			errs <- err
-		}()
+		})
 	}
 	wg.Wait()
 	close(errs)

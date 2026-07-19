@@ -301,7 +301,7 @@ func IsInjectable(s Skill) bool {
 
 func parseTags(value string) []string {
 	var tags []string
-	for _, tag := range strings.Split(value, ",") {
+	for tag := range strings.SplitSeq(value, ",") {
 		tag = strings.ToLower(strings.TrimSpace(tag))
 		if tag == "" {
 			continue

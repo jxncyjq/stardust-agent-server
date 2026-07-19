@@ -67,7 +67,7 @@ func TestDeliveryTrackerGetAndMarkAttempt(t *testing.T) {
 func TestDeliveryTrackerConcurrent(t *testing.T) {
 	tr := NewDeliveryTracker()
 	var wg sync.WaitGroup
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()

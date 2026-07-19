@@ -12,7 +12,7 @@ import (
 	"github.com/stardust/legion-agent/internal/taskledger"
 )
 
-var taskToolIDCounter uint64
+var taskToolIDCounter atomic.Uint64
 
 // RegisterTaskLedgerTools adds event-backed task collaboration tools to registry.
 func RegisterTaskLedgerTools(registry *Registry, ledger *taskledger.Ledger) {
@@ -235,7 +235,7 @@ func firstTaskArgument(values ...string) string {
 }
 
 func nextTaskID() string {
-	seq := atomic.AddUint64(&taskToolIDCounter, 1)
+	seq := taskToolIDCounter.Add(1)
 	return "TASK-" + time.Now().Format("20060102") + "-" + strings.Repeat("0", max(0, 3-len(strconv.FormatUint(seq, 10)))) + strconv.FormatUint(seq, 10)
 }
 

@@ -2,6 +2,7 @@ package cognitive
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -192,10 +193,5 @@ func (c *recordingInferenceClient) Generate(ctx context.Context, req port.Infere
 }
 
 func containsInt(values []int, target int) bool {
-	for _, value := range values {
-		if value == target {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(values, target)
 }

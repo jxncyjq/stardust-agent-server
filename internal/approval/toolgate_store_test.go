@@ -167,7 +167,7 @@ func TestToolGateStoreConcurrentAccessNoRace(t *testing.T) {
 
 	const n = 8
 	tickets := make([]ToolApproval, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		rec, err := s.Open(newRec("t1", fmt.Sprintf("c%d", i), "write_file"))
 		if err != nil {
 			t.Fatalf("Open ticket %d: %v", i, err)
@@ -178,7 +178,7 @@ func TestToolGateStoreConcurrentAccessNoRace(t *testing.T) {
 	var wg sync.WaitGroup
 	errCh := make(chan error, n*4)
 
-	for i := 0; i < n; i++ {
+	for i := range n {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()

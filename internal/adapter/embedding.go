@@ -21,7 +21,7 @@ func (KeywordEmbeddingProvider) Embed(ctx context.Context, text string) ([]float
 		}
 	}
 	if isZeroVector(vector) {
-		for _, field := range strings.Fields(lower) {
+		for field := range strings.FieldsSeq(lower) {
 			bucket := len(field) % len(vector)
 			vector[bucket]++
 		}

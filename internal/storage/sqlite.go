@@ -561,13 +561,9 @@ func (r *SQLiteRepository) ScrollMessages(ctx context.Context, sessionID string,
 		return nil, fmt.Errorf("scroll messages: anchor %q not found in session %q", aroundID, sessionID)
 	}
 	start := anchor - window
-	if start < 0 {
-		start = 0
-	}
+	start = max(start, 0)
 	end := anchor + window + 1
-	if end > len(turns) {
-		end = len(turns)
-	}
+	end = min(end, len(turns))
 	return turns[start:end], nil
 }
 

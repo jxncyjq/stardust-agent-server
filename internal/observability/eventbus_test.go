@@ -14,7 +14,7 @@ func TestPublishBoundsHistoryToBuffer(t *testing.T) {
 	bus := NewEventBus(4)
 	ctx := context.Background()
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		if err := bus.Publish(ctx, EventEnvelope{Type: fmt.Sprintf("e%d", i)}); err != nil {
 			t.Fatalf("Publish(%d): unexpected error: %v", i, err)
 		}
@@ -37,7 +37,7 @@ func TestSubscribeReplaysMostRecentNotOldest(t *testing.T) {
 	bus := NewEventBus(4)
 	ctx := context.Background()
 
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		if err := bus.Publish(ctx, EventEnvelope{Type: fmt.Sprintf("e%d", i)}); err != nil {
 			t.Fatalf("Publish(%d): unexpected error: %v", i, err)
 		}
