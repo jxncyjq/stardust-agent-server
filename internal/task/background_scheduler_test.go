@@ -183,6 +183,75 @@ func TestGepFailureScanJobIgnoresSuccessAndProcessedEvents(t *testing.T) {
 	}
 }
 
+// Regression: a single failed run publishes more than one failure learning
+// event (inference_error, then task_run_error), typically within the same
+// second. Dedup keyed on the event itself let both through, but
+// ExtractionInput.Cycle is PublishedAt.Unix(), so both map to the SAME GEP
+// cycle id — and the cycle writes an audit entry keyed by that id. The second
+// run therefore died on "UNIQUE constraint failed: audit_events.id", surfacing
+// as a recurring background-scheduler error in the logs.
+func TestGepFailureScanJobRunsOnceForSameCycle(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	events := adapter.NewMemoryEventBus()
+	runner := &recordingGepRunner{}
+	job := NewGepFailureScanJob(events, runner)
+
+	publishedAt := time.Now()
+	for _, reason := range []string{evolution.FailureReasonInferenceError, "task_run_error"} {
+		if err := events.Publish(ctx, evolution.NewLearningRuntimeEvent(evolution.LearningEvent{
+			AgentID:       "agent-1",
+			TaskID:        "task-fail",
+			Signal:        evolution.SignalFailure,
+			Reason:        reason,
+			IsLightweight: true,
+			PublishedAt:   publishedAt,
+		})); err != nil {
+			t.Fatalf("Publish(%s learning event) error = %v, want nil", reason, err)
+		}
+	}
+
+	if err := job(ctx); err != nil {
+		t.Fatalf("GepFailureScanJob() error = %v, want nil", err)
+	}
+	if got := runner.calls.Load(); got != 1 {
+		t.Fatalf("GepRunner calls = %d, want 1 (both events belong to the same GEP cycle)", got)
+	}
+}
+
+// A later failure of the same task is a new cycle (Cycle is a second-resolution
+// timestamp) and must still be scanned — the dedup must not swallow it.
+func TestGepFailureScanJobRunsAgainForLaterCycle(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	events := adapter.NewMemoryEventBus()
+	runner := &recordingGepRunner{}
+	job := NewGepFailureScanJob(events, runner)
+
+	first := time.Now()
+	for _, at := range []time.Time{first, first.Add(2 * time.Second)} {
+		if err := events.Publish(ctx, evolution.NewLearningRuntimeEvent(evolution.LearningEvent{
+			AgentID:       "agent-1",
+			TaskID:        "task-fail",
+			Signal:        evolution.SignalFailure,
+			Reason:        evolution.FailureReasonInferenceError,
+			IsLightweight: true,
+			PublishedAt:   at,
+		})); err != nil {
+			t.Fatalf("Publish(learning event at %s) error = %v, want nil", at, err)
+		}
+	}
+
+	if err := job(ctx); err != nil {
+		t.Fatalf("GepFailureScanJob() error = %v, want nil", err)
+	}
+	if got := runner.calls.Load(); got != 2 {
+		t.Fatalf("GepRunner calls = %d, want 2 (distinct cycles)", got)
+	}
+}
+
 type recordingGepRunner struct {
 	calls     atomic.Int32
 	lastInput evolution.ExtractionInput

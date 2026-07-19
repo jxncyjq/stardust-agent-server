@@ -139,7 +139,7 @@ func (c *GepCycle) Run(ctx context.Context, input ExtractionInput) (GepResult, e
 	if err := ctx.Err(); err != nil {
 		return GepResult{}, err
 	}
-	cycleID := gepCycleID(input)
+	cycleID := CycleID(input)
 	result := GepResult{
 		CycleID:  cycleID,
 		Decision: DecisionRecorded,
@@ -336,7 +336,13 @@ func signalsEvidence(signals []LearningSignal) string {
 	return strings.Join(parts, "\n")
 }
 
-func gepCycleID(input ExtractionInput) string {
+// CycleID is the stable identity of one GEP cycle: the agent, the task and the
+// cycle counter. Run writes its audit entries under this id, so a caller that
+// must not execute the same cycle twice has to dedup on this exact value —
+// deriving its own key risks drifting from the id the audit write uses, which
+// surfaces as a UNIQUE constraint failure on audit_events.id rather than as a
+// skipped run.
+func CycleID(input ExtractionInput) string {
 	return "gep-" + contentHash(fmt.Sprintf("%s:%s:%d", input.AgentID, input.Task.ID, input.Cycle))[:12]
 }
 
