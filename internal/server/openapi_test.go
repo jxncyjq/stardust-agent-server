@@ -29,6 +29,33 @@ func TestOpenAPISpecIncludesCorePlatformRoutes(t *testing.T) {
 			t.Errorf("BuildOpenAPISpec().Paths missing %q", path)
 		}
 	}
+	// Every route served by ServeHTTP must be documented with its verb, so the
+	// spec stays in lockstep with the router switch.
+	requiredOps := []struct {
+		path   string
+		method string
+		op     func(OpenAPIPathItem) *OpenAPIOperation
+	}{
+		{"/v1/approvals", "GET", func(i OpenAPIPathItem) *OpenAPIOperation { return i.Get }},
+		{"/v1/sessions", "POST", func(i OpenAPIPathItem) *OpenAPIOperation { return i.Post }},
+		{"/v1/sessions/{id}", "PATCH", func(i OpenAPIPathItem) *OpenAPIOperation { return i.Patch }},
+		{"/v1/sessions/{id}", "DELETE", func(i OpenAPIPathItem) *OpenAPIOperation { return i.Delete }},
+		{"/v1/agents", "GET", func(i OpenAPIPathItem) *OpenAPIOperation { return i.Get }},
+		{"/v1/tasks/{id}/approvals/{ticketID}", "POST", func(i OpenAPIPathItem) *OpenAPIOperation { return i.Post }},
+		{"/v1/skills/install", "POST", func(i OpenAPIPathItem) *OpenAPIOperation { return i.Post }},
+		{"/v1/skills/update", "POST", func(i OpenAPIPathItem) *OpenAPIOperation { return i.Post }},
+		{"/v1/skills/uninstall", "POST", func(i OpenAPIPathItem) *OpenAPIOperation { return i.Post }},
+	}
+	for _, want := range requiredOps {
+		item, ok := spec.Paths[want.path]
+		if !ok {
+			t.Errorf("BuildOpenAPISpec().Paths missing %q", want.path)
+			continue
+		}
+		if want.op(item) == nil {
+			t.Errorf("BuildOpenAPISpec().Paths[%q] missing %s operation", want.path, want.method)
+		}
+	}
 	if _, ok := spec.Components.Schemas["DiagnosticsSnapshot"]; !ok {
 		t.Errorf("BuildOpenAPISpec().Components.Schemas missing DiagnosticsSnapshot")
 	}
