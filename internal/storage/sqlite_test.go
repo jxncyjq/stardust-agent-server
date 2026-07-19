@@ -956,6 +956,32 @@ func TestAgentSessionModeDefaultsAutoWhenEmpty(t *testing.T) {
 	}
 }
 
+func TestSaveGetAgentSessionPreservesWorkingDir(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := openTestSQLiteRepository(t)
+	createdAt := time.Date(2026, 7, 18, 9, 0, 0, 0, time.UTC)
+	sess := domain.AgentSession{
+		ID:         "sess-workdir-1",
+		CompanyID:  "c1",
+		AgentID:    "a1",
+		Mode:       domain.ModeManual,
+		WorkingDir: filepath.Join("/proj", "app"),
+		CreatedAt:  createdAt,
+		UpdatedAt:  createdAt,
+	}
+	if err := repo.SaveAgentSession(ctx, sess); err != nil {
+		t.Fatalf("SaveAgentSession error = %v, want nil", err)
+	}
+	got, ok, err := repo.GetAgentSession(ctx, "sess-workdir-1")
+	if err != nil || !ok {
+		t.Fatalf("GetAgentSession = _, %v, %v", ok, err)
+	}
+	if got.WorkingDir != sess.WorkingDir {
+		t.Fatalf("WorkingDir = %q, want %q", got.WorkingDir, sess.WorkingDir)
+	}
+}
+
 func TestSQLiteListSkillsRoundTrip(t *testing.T) {
 	ctx := context.Background()
 	repo := openTestSQLiteRepository(t)

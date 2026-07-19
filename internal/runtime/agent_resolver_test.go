@@ -69,6 +69,41 @@ func TestResolverInjectsCheckpointsAndGate(t *testing.T) {
 	}
 }
 
+// TestAgentToolRootPrefersTaskWorkingDir guards Task 7's sandbox-root
+// priority: a task carrying a non-empty WorkingDir always wins over both the
+// agent's and the root config's configured ContextFiles.Root, since the
+// task's working directory is the security boundary the tool sandbox
+// (WorkspacePathGuard) must be confined to.
+func TestAgentToolRootPrefersTaskWorkingDir(t *testing.T) {
+	t.Parallel()
+
+	wd := t.TempDir()
+	got := agentToolRoot(rootCfgWithContextRoot("/ctx"), agentCfgWithContextRoot(""), domain.Task{WorkingDir: wd})
+	if got != wd {
+		t.Fatalf("agentToolRoot = %q, want task.WorkingDir %q", got, wd)
+	}
+}
+
+// TestAgentToolRootFallsBackWhenNoWorkingDir guards the pre-M3 fallback: an
+// empty task.WorkingDir must not disturb the existing agent-then-root
+// ContextFiles.Root resolution.
+func TestAgentToolRootFallsBackWhenNoWorkingDir(t *testing.T) {
+	t.Parallel()
+
+	got := agentToolRoot(rootCfgWithContextRoot("/ctx"), agentCfgWithContextRoot(""), domain.Task{})
+	if got != "/ctx" {
+		t.Fatalf("agentToolRoot = %q, want /ctx fallback", got)
+	}
+}
+
+func rootCfgWithContextRoot(root string) config.Config {
+	return config.Config{ContextFiles: config.ContextFilesConfig{Root: root}}
+}
+
+func agentCfgWithContextRoot(root string) agentregistry.AgentConfig {
+	return agentregistry.AgentConfig{ContextFiles: config.ContextFilesConfig{Root: root}}
+}
+
 func TestAgentRuntimeResolverUsesRegisteredAgentMaasProfileAndContextFiles(t *testing.T) {
 	t.Parallel()
 

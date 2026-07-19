@@ -1633,6 +1633,68 @@ type ServeResult struct {
 	Close    func()
 }
 
+// defaultTaskRunner is the agentruntime.TaskRunner the coordinator dispatches
+// a task to when no per-agent resolver runner is resolved for it (an empty
+// task.AgentID, or an AgentID missing from the registry — see
+// AgentRuntimeResolver.ResolveTaskRunner). Before Task 7 (M3a) this path used
+// a single *agentruntime.Runtime whose tool registry (and thus its
+// WorkspacePathGuard sandbox root) was built once, at serve assembly time,
+// rooted at cfg.ContextFiles.Root. That pinned every default-agent task to
+// one fixed sandbox regardless of task.WorkingDir, unlike the per-agent path
+// (agentToolRoot in the runtime package), which already re-resolves the
+// sandbox root on every ResolveTaskRunner call.
+//
+// defaultTaskRunner closes that gap: RunTask rebuilds the tool registry fresh
+// on every call, rooted at task.WorkingDir when the task carries one
+// (falling back to contextRoot otherwise) — the same task.WorkingDir-first
+// priority as agentToolRoot. Every other runtime setting (model, audit,
+// events, cognitive context builder, tool-round budget, checkpoints, tool
+// gate) is fixed at serve assembly and reused unchanged across calls via
+// runtimeCfg; only Tools is overwritten per call.
+type defaultTaskRunner struct {
+	// runtimeCfg is the template runtime configuration shared by every call;
+	// its Tools field is always overwritten with the freshly built per-task
+	// registry before constructing the runtime for that call.
+	runtimeCfg agentruntime.Config
+	// contextRoot is the sandbox root used when a task has no WorkingDir
+	// (cfg.ContextFiles.Root at serve assembly).
+	contextRoot     string
+	audit           port.AuditLog
+	taskLedger      *taskledger.Ledger
+	messageStore    tool.AgentMessageStore
+	sessionSearcher tool.MessageSearcher
+	webOptions      tool.WebToolOptions
+	maasResolver    agentruntime.ModelResolver
+}
+
+// RunTask builds a fresh read-only workspace tool registry rooted at
+// task.WorkingDir (or contextRoot, when the task has none), registers on it
+// every tool the pre-M3a fixed default registry carried — task ledger, agent
+// messaging, web, session search, MoA consult — plus delegate_task (the
+// default runtime is always a root orchestrator), then runs the task on a
+// freshly constructed *agentruntime.Runtime built from runtimeCfg with that
+// registry. Constructing a fresh Runtime per call is cheap (a struct literal;
+// no I/O), so this trades a small per-call allocation for a per-task sandbox
+// root — an intentional trade given the tool sandbox is a security boundary
+// (CLAUDE.md fail-loud/security posture).
+func (d *defaultTaskRunner) RunTask(ctx context.Context, agent domain.Agent, task domain.Task) (domain.TaskRun, error) {
+	root := strings.TrimSpace(task.WorkingDir)
+	if root == "" {
+		root = d.contextRoot
+	}
+	tools := tool.NewReadOnlyWorkspaceRegistry(root, d.audit)
+	tool.RegisterTaskLedgerTools(tools, d.taskLedger)
+	tool.RegisterAgentMessageTools(tools, d.messageStore)
+	tool.RegisterWebTools(tools, d.webOptions)
+	tool.RegisterSessionSearchTool(tools, d.sessionSearcher)
+	agentruntime.RegisterMoAConsultTool(tools, d.maasResolver)
+	runtimeCfg := d.runtimeCfg
+	runtimeCfg.Tools = tools
+	rt := agentruntime.NewRuntime(runtimeCfg)
+	rt.RegisterDelegateTaskTool(tools)
+	return rt.RunTask(ctx, agent, task)
+}
+
 // webToolOptions maps the web config block onto the tool package options.
 func webToolOptions(cfg config.WebToolConfig) tool.WebToolOptions {
 	return tool.WebToolOptions{
@@ -1666,6 +1728,49 @@ func skillsRootAvailable(root string) bool {
 // event bus backing /v1/events. Large enough that a normally-paced SSE client
 // keeps up; a stalled client still drops rather than blocking publishers.
 const serveEventBusBuffer = 256
+
+// SessionLister enumerates persisted agent sessions so distinctSessionBases
+// can discover every working_dir a session has ever been bound to.
+// server.SessionStore satisfies it: ListAgentSessions with an empty
+// companyID/agentID lists every session (SQLiteRepository treats an empty
+// filter argument as "match all", not "match none"). A nil lister is a valid
+// "non-persistent storage.Driver" deployment (serviceStores returns a nil
+// server.SessionStore in that mode) — there is no session history to
+// enumerate working_dir bases from, not an error.
+type SessionLister interface {
+	ListAgentSessions(ctx context.Context, companyID, agentID string) ([]domain.AgentSession, error)
+}
+
+// distinctSessionBases returns the deduplicated set of session-state bases
+// currently in use: workspaceRoot (the default base for a session with no
+// working_dir) union sessionstate.SessionBase(workspaceRoot, s.WorkingDir) for
+// every persisted session's working_dir. Restart recovery and the approval
+// timeout sweep (BuildServeService below) scan every base this returns, so a
+// suspended checkpoint or pending approval ticket filed under a
+// working_dir-bound session is not silently missed just because it is not
+// under the workspace root. Fail-loud: an error from
+// sessions.ListAgentSessions aborts rather than returning a partial,
+// silently-incomplete base set.
+func distinctSessionBases(ctx context.Context, sessions SessionLister, workspaceRoot string) ([]string, error) {
+	bases := []string{workspaceRoot}
+	if sessions == nil {
+		return bases, nil
+	}
+	all, err := sessions.ListAgentSessions(ctx, "", "")
+	if err != nil {
+		return nil, fmt.Errorf("list agent sessions for base enumeration: %w", err)
+	}
+	seen := map[string]struct{}{workspaceRoot: {}}
+	for _, s := range all {
+		base := sessionstate.SessionBase(workspaceRoot, s.WorkingDir)
+		if _, ok := seen[base]; ok {
+			continue
+		}
+		seen[base] = struct{}{}
+		bases = append(bases, base)
+	}
+	return bases, nil
+}
 
 // BuildServeService constructs and returns a ready-to-Start service from the
 // same dependency wiring as newServeCommand, but without cobra.
@@ -1791,13 +1896,6 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		closeStore()
 		return ServeResult{}, err
 	}
-	defaultTools := tool.NewReadOnlyWorkspaceRegistry(cfg.ContextFiles.Root, auditLog)
-	tool.RegisterTaskLedgerTools(defaultTools, taskLedger)
-	tool.RegisterAgentMessageTools(defaultTools, messageStore)
-	tool.RegisterWebTools(defaultTools, webToolOptions(cfg.Web))
-	tool.RegisterSessionSearchTool(defaultTools, sessionSearcher)
-	agentruntime.RegisterMoAConsultTool(defaultTools, maasProfileResolver{cfg: cfg.Maas})
-
 	// Cognitive evolution wiring (L4 memory / L5 learning). The capability
 	// memory store is shared: the GEP cycle (L5) solidifies learned genes into
 	// it, and the cognitive Core (L4) reads them back when building context, so
@@ -1832,21 +1930,32 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		}).WithUsage(skillUsage, time.Now))
 	}
 
-	// The default runtime is a root orchestrator, so it may delegate. Register
-	// delegate_task on its tool registry after construction (a leaf child would
-	// not register it, preventing unbounded recursion).
-	defaultRuntime := agentruntime.NewRuntime(agentruntime.Config{
-		Maas:           defaultMaas,
-		Audit:          auditLog,
-		Events:         workflowEvents,
-		ContextBuilder: defaultCore,
-		Tools:          defaultTools,
-		MaxToolRounds:  cfg.Runtime.MaxToolRounds,
-		LazyTools:      cfg.Runtime.LazyTools,
-		Checkpoints:    checkpointStore,
-		ToolGate:       manualGate,
-	})
-	defaultRuntime.RegisterDelegateTaskTool(defaultTools)
+	// The default task runner rebuilds its tool registry (and thus the
+	// WorkspacePathGuard sandbox root) on every RunTask call, rooted at
+	// task.WorkingDir when the task carries one (falling back to
+	// cfg.ContextFiles.Root otherwise) — see defaultTaskRunner's doc comment
+	// for why (Task 7, M3a). Everything else (model, audit, events, cognitive
+	// context builder, checkpoints, tool gate) is fixed at serve assembly and
+	// shared across every call, same as before.
+	defaultRunner := &defaultTaskRunner{
+		runtimeCfg: agentruntime.Config{
+			Maas:           defaultMaas,
+			Audit:          auditLog,
+			Events:         workflowEvents,
+			ContextBuilder: defaultCore,
+			MaxToolRounds:  cfg.Runtime.MaxToolRounds,
+			LazyTools:      cfg.Runtime.LazyTools,
+			Checkpoints:    checkpointStore,
+			ToolGate:       manualGate,
+		},
+		contextRoot:     cfg.ContextFiles.Root,
+		audit:           auditLog,
+		taskLedger:      taskLedger,
+		messageStore:    messageStore,
+		sessionSearcher: sessionSearcher,
+		webOptions:      webToolOptions(cfg.Web),
+		maasResolver:    maasProfileResolver{cfg: cfg.Maas},
+	}
 	coordinator := agentruntime.NewCoordinator(agentruntime.CoordinatorConfig{
 		Agent: domain.Agent{
 			ID:        "default-agent",
@@ -1856,7 +1965,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		},
 		Scheduler:          liveTasks,
 		Locks:              task.NewLockStore(),
-		Runtime:            defaultRuntime,
+		Runtime:            defaultRunner,
 		TaskRunnerResolver: resolver,
 		Reviewer:           quality.NewAegisReviewer(),
 		Evaluator:          quality.NewEvalEngine(3),
@@ -1915,7 +2024,27 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	if workspaceRootWarning != "" {
 		logger.Warn("workspace root fallback", "detail", workspaceRootWarning)
 	}
-	recovered, err := coordinator.RecoverSuspended(ctx, checkpointStore)
+	// Restart recovery must scan every session-state base in use, not just the
+	// workspace root: a task suspended under a working_dir-bound session (M3)
+	// files its checkpoint under SessionBase(workspaceRoot, workingDir), which
+	// checkpointStore.ListSuspended (workspace-root-only) never sees.
+	recoveryBases, err := distinctSessionBases(ctx, sessionStore, workspaceRoot)
+	if err != nil {
+		_ = listener.Close()
+		closeStore()
+		return ServeResult{}, fmt.Errorf("enumerate session bases for restart recovery: %w", err)
+	}
+	var suspendedCheckpoints []sessionstate.Checkpoint
+	for _, base := range recoveryBases {
+		cps, err := checkpointStore.ListSuspendedIn(base)
+		if err != nil {
+			_ = listener.Close()
+			closeStore()
+			return ServeResult{}, fmt.Errorf("list suspended checkpoints in base %q: %w", base, err)
+		}
+		suspendedCheckpoints = append(suspendedCheckpoints, cps...)
+	}
+	recovered, err := coordinator.RecoverSuspended(ctx, suspendedCheckpoints)
 	if err != nil {
 		_ = listener.Close()
 		closeStore()
@@ -1962,7 +2091,12 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		// defaultConfig() sets for an omitted field.
 		approvalTTL = 300 * time.Second
 	}
-	background.AddJob("approval-timeout-sweep", manualgate.NewTimeoutSweepJob(toolGateStore, approvalCoordinator, approvalTTL, time.Now, logger))
+	// basesFn re-enumerates session bases on every sweep tick (not once at
+	// startup) so a session bound to a new working_dir after serve starts is
+	// still covered by the next sweep pass.
+	background.AddJob("approval-timeout-sweep", manualgate.NewTimeoutSweepJob(toolGateStore, approvalCoordinator, approvalTTL, time.Now, logger, func(ctx context.Context) ([]string, error) {
+		return distinctSessionBases(ctx, sessionStore, workspaceRoot)
+	}))
 
 	// Skill management endpoints (/v1/skills/*) back the GUI's /skill commands.
 	// The disk manager is constructed whenever an install root is configured;
@@ -1981,6 +2115,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		WorkflowEvents:      workflowEvents,
 		PlatformEvents:      platformEvents,
 		Readiness:           readiness,
+		WorkspaceRoot:       workspaceRoot,
 		AdminToken:          cfg.Server.AdminToken,
 		PublicHealthEnabled: cfg.Server.PublicHealthEnabled,
 		RequestIDHeader:     cfg.Server.RequestIDHeader,

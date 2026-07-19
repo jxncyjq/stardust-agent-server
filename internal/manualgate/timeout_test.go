@@ -10,8 +10,19 @@ import (
 
 	"github.com/stardust/legion-agent/internal/approval"
 	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/task"
 )
+
+// singleBaseFn returns a basesFn that always enumerates exactly one base —
+// the fixture helper used by every single-base sweep test in this file, so
+// each keeps testing NewTimeoutSweepJob's per-base ListPendingIn/deny loop
+// without needing to know about multi-base enumeration.
+func singleBaseFn(base string) func(context.Context) ([]string, error) {
+	return func(context.Context) ([]string, error) {
+		return []string{base}, nil
+	}
+}
 
 // TestTimeoutSweepDeniesStalePending covers the happy path: a pending ticket
 // older than ttl is denied and its owning Suspended task flips to Running,
@@ -49,12 +60,12 @@ func TestTimeoutSweepDeniesStalePending(t *testing.T) {
 
 	dec := NewApprovalCoordinator(store, sched)
 	fixedNow := func() time.Time { return time.Now().Add(10 * time.Minute) } // far future -> everything stale
-	job := NewTimeoutSweepJob(store, dec, 5*time.Minute, fixedNow, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	job := NewTimeoutSweepJob(store, dec, 5*time.Minute, fixedNow, slog.New(slog.NewTextHandler(io.Discard, nil)), singleBaseFn(dir))
 	if err := job(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
-	got, _, err := store.Get("s1", approval.TicketID("t1", "c1"))
+	got, _, err := store.Get("s1", approval.TicketID("t1", "c1"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -65,7 +76,7 @@ func TestTimeoutSweepDeniesStalePending(t *testing.T) {
 		t.Fatalf("task after timeout-deny = %v (err=%v), want running", st.Status, err)
 	}
 
-	got2, _, err := store.Get("s2", approval.TicketID("t2", "c1"))
+	got2, _, err := store.Get("s2", approval.TicketID("t2", "c1"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,12 +104,12 @@ func TestTimeoutSweepSkipsFreshPending(t *testing.T) {
 
 	dec := NewApprovalCoordinator(store, sched)
 	nearNow := func() time.Time { return time.Now() }
-	job := NewTimeoutSweepJob(store, dec, time.Hour, nearNow, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	job := NewTimeoutSweepJob(store, dec, time.Hour, nearNow, slog.New(slog.NewTextHandler(io.Discard, nil)), singleBaseFn(dir))
 	if err := job(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
-	got, _, err := store.Get("s1", approval.TicketID("t1", "c1"))
+	got, _, err := store.Get("s1", approval.TicketID("t1", "c1"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +137,7 @@ func TestTimeoutSweepDecideErrorPropagates(t *testing.T) {
 
 	dec := NewApprovalCoordinator(store, sched)
 	fixedNow := func() time.Time { return time.Now().Add(10 * time.Minute) } // far future -> stale
-	job := NewTimeoutSweepJob(store, dec, 5*time.Minute, fixedNow, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	job := NewTimeoutSweepJob(store, dec, 5*time.Minute, fixedNow, slog.New(slog.NewTextHandler(io.Discard, nil)), singleBaseFn(dir))
 
 	err := job(context.Background())
 	if err == nil {
@@ -138,7 +149,7 @@ func TestTimeoutSweepDecideErrorPropagates(t *testing.T) {
 
 	// The ticket must remain untouched (still pending) since the deny was
 	// never actually recorded — Decide failed before any write.
-	got, _, err := store.Get("sghost", approval.TicketID("ghost", "c1"))
+	got, _, err := store.Get("sghost", approval.TicketID("ghost", "c1"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,14 +194,14 @@ func TestTimeoutSweepToleratesConcurrentDecision(t *testing.T) {
 		}
 		return time.Now().Add(10 * time.Minute) // far future -> stale, so the sweep tries to deny
 	}
-	job := NewTimeoutSweepJob(store, dec, 5*time.Minute, racingNow, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	job := NewTimeoutSweepJob(store, dec, 5*time.Minute, racingNow, slog.New(slog.NewTextHandler(io.Discard, nil)), singleBaseFn(dir))
 	if err := job(context.Background()); err != nil {
 		t.Fatalf("sweep racing a concurrent decision: want nil (benign already-decided), got %v", err)
 	}
 
 	// The competing approval stands — the sweep must not have overwritten it to
 	// denied.
-	got, _, err := store.Get("s1", approval.TicketID("t1", "c1"))
+	got, _, err := store.Get("s1", approval.TicketID("t1", "c1"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -222,16 +233,76 @@ func TestTimeoutSweepDisabledWhenTTLNonPositive(t *testing.T) {
 
 	dec := NewApprovalCoordinator(store, sched)
 	fixedNow := func() time.Time { return time.Now().Add(24 * time.Hour) }
-	job := NewTimeoutSweepJob(store, dec, 0, fixedNow, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	job := NewTimeoutSweepJob(store, dec, 0, fixedNow, slog.New(slog.NewTextHandler(io.Discard, nil)), singleBaseFn(dir))
 	if err := job(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 
-	got, _, err := store.Get("s1", approval.TicketID("t1", "c1"))
+	got, _, err := store.Get("s1", approval.TicketID("t1", "c1"), "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.Status != approval.ApprovalPending {
 		t.Fatalf("ticket status with ttl<=0 = %s, want still pending (sweep disabled)", got.Status)
+	}
+}
+
+// TestTimeoutSweepScansAllBases is the M3a Task 5 regression: a pending ticket
+// filed under a working_dir-bound session base (not the workspace root) must
+// still be swept and denied when basesFn enumerates that base too. Before this
+// change the sweep only ever scanned a single hard-coded base
+// (store.ListPending() == ListPendingIn(workspaceRoot)), so a ticket under
+// SessionBase(workspaceRoot, workingDir) would be silently skipped forever.
+func TestTimeoutSweepScansAllBases(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	workingDir := t.TempDir()
+	store := approval.NewToolGateStore(workspaceRoot)
+	sched := task.NewScheduler()
+
+	if err := sched.Add(context.Background(), domain.Task{ID: "t-root", SessionID: "s-root", Status: domain.TaskRunning}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sched.Transition(context.Background(), "t-root", domain.TaskSuspended); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Open(approval.ToolApproval{SessionKey: "s-root", TaskID: "t-root", ToolCallID: "c1", ToolName: "write_file"}); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := sched.Add(context.Background(), domain.Task{ID: "t-wd", SessionID: "s-wd", Status: domain.TaskRunning, WorkingDir: workingDir}); err != nil {
+		t.Fatal(err)
+	}
+	if err := sched.Transition(context.Background(), "t-wd", domain.TaskSuspended); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Open(approval.ToolApproval{SessionKey: "s-wd", TaskID: "t-wd", ToolCallID: "c1", ToolName: "write_file", WorkingDir: workingDir}); err != nil {
+		t.Fatal(err)
+	}
+
+	dec := NewApprovalCoordinator(store, sched)
+	fixedNow := func() time.Time { return time.Now().Add(10 * time.Minute) } // far future -> everything stale
+	wdBase := sessionstate.SessionBase(workspaceRoot, workingDir)
+	basesFn := func(context.Context) ([]string, error) {
+		return []string{workspaceRoot, wdBase}, nil
+	}
+	job := NewTimeoutSweepJob(store, dec, 5*time.Minute, fixedNow, slog.New(slog.NewTextHandler(io.Discard, nil)), basesFn)
+	if err := job(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	gotRoot, _, err := store.Get("s-root", approval.TicketID("t-root", "c1"), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotRoot.Status != approval.ApprovalDenied {
+		t.Fatalf("root-base ticket status = %s, want denied", gotRoot.Status)
+	}
+
+	gotWD, _, err := store.Get("s-wd", approval.TicketID("t-wd", "c1"), workingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotWD.Status != approval.ApprovalDenied {
+		t.Fatalf("working_dir-base ticket status = %s, want denied (must not be skipped by single-base scan)", gotWD.Status)
 	}
 }

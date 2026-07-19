@@ -10,6 +10,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +20,7 @@ import (
 	"github.com/stardust/legion-agent/internal/observability"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/quality"
+	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/skill"
 	"github.com/stardust/legion-agent/internal/storage"
 	"github.com/stardust/legion-agent/internal/workflow"
@@ -100,10 +102,15 @@ type Config struct {
 	AdminToken          string
 	PublicHealthEnabled bool
 	RequestIDHeader     string
-	Logger              *slog.Logger
-	Metrics             *observability.MetricsRecorder
-	Diagnostics         *observability.Diagnostics
-	Traces              *observability.TraceRecorder
+	// WorkspaceRoot is the base directory for a session's on-disk state when
+	// the session carries no working_dir (sessionstate.SessionBase's
+	// workspaceRoot argument). Session deletion joins it with the session key
+	// to locate the directory to remove alongside the DB row (spec §4.0).
+	WorkspaceRoot string
+	Logger        *slog.Logger
+	Metrics       *observability.MetricsRecorder
+	Diagnostics   *observability.Diagnostics
+	Traces        *observability.TraceRecorder
 }
 
 type HTTPServer struct {
@@ -125,6 +132,7 @@ type HTTPServer struct {
 	adminToken          string
 	publicHealthEnabled bool
 	requestIDHeader     string
+	workspaceRoot       string
 	logger              *slog.Logger
 	metrics             *observability.MetricsRecorder
 	diagnostics         *observability.Diagnostics
@@ -167,6 +175,7 @@ func NewHTTPServer(cfg Config) *HTTPServer {
 		adminToken:          cfg.AdminToken,
 		publicHealthEnabled: cfg.PublicHealthEnabled,
 		requestIDHeader:     requestIDHeader,
+		workspaceRoot:       cfg.WorkspaceRoot,
 		logger:              observability.WithComponent(logger, "server"),
 		metrics:             cfg.Metrics,
 		diagnostics:         cfg.Diagnostics,
@@ -309,14 +318,15 @@ func (s *HTTPServer) handleCreateSession(w http.ResponseWriter, r *http.Request)
 	}
 	now := time.Now()
 	session := domain.AgentSession{
-		ID:        fmt.Sprintf("session-%d", now.UTC().UnixNano()),
-		CompanyID: companyID,
-		AgentID:   agentID,
-		Project:   strings.TrimSpace(req.Project),
-		Title:     strings.TrimSpace(req.Title),
-		Mode:      mode,
-		CreatedAt: now,
-		UpdatedAt: now,
+		ID:         fmt.Sprintf("session-%d", now.UTC().UnixNano()),
+		CompanyID:  companyID,
+		AgentID:    agentID,
+		Project:    strings.TrimSpace(req.Project),
+		Title:      strings.TrimSpace(req.Title),
+		Mode:       mode,
+		WorkingDir: strings.TrimSpace(req.WorkingDir),
+		CreatedAt:  now,
+		UpdatedAt:  now,
 	}
 	if err := s.sessions.SaveAgentSession(r.Context(), session); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("create session: %v", err))
@@ -426,6 +436,28 @@ func (s *HTTPServer) handlePatchSession(w http.ResponseWriter, r *http.Request) 
 		}
 		session.Mode = mode
 	}
+	if req.WorkingDir != nil {
+		newWorkingDir := strings.TrimSpace(*req.WorkingDir)
+		currentWorkingDir := strings.TrimSpace(session.WorkingDir)
+		// A session's on-disk state (checkpoints, approval tickets, plans) is
+		// filed under sessionstate.SessionBase(workspaceRoot, working_dir), and
+		// that base is derived from whatever working_dir the session carries at
+		// the moment of the write -- there is no record of a session's *former*
+		// bases. Recovery after a restart only enumerates the bases in current
+		// use (distinctSessionBases in the cli package), so once a session has a
+		// non-empty working_dir, silently repointing it to a different value
+		// would strand any state already filed under the old base: it would
+		// never again be scanned, and a pending checkpoint would be lost without
+		// so much as a log line. Fail loud instead: reject the change outright.
+		// Setting it for the first time (currentWorkingDir == "") is safe --
+		// with no working_dir yet, state lives under workspaceRoot, which is
+		// always in the base set -- and re-PATCHing the same value is a no-op.
+		if currentWorkingDir != "" && newWorkingDir != currentWorkingDir {
+			writeError(w, http.StatusBadRequest, "working_dir cannot be changed once set")
+			return
+		}
+		session.WorkingDir = newWorkingDir
+	}
 	session.UpdatedAt = time.Now()
 	if err := s.sessions.SaveAgentSession(r.Context(), session); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("update session: %v", err))
@@ -436,10 +468,11 @@ func (s *HTTPServer) handlePatchSession(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, session)
 }
 
-// handleDeleteSession removes a session and its conversation turns. A session id
-// that does not exist maps to a 404 via storage.ErrAgentSessionNotFound rather
-// than being reported as a no-op success, so the client learns the delete had no
-// target. Success returns 204 No Content.
+// handleDeleteSession removes a session, its conversation turns, and the
+// on-disk session directory (spec §4.0: DELETE cascades to the state a session
+// left under sessionstate.SessionBase). A session id that does not exist maps
+// to a 404 rather than being reported as a no-op success, so the client learns
+// the delete had no target. Success returns 204 No Content.
 func (s *HTTPServer) handleDeleteSession(w http.ResponseWriter, r *http.Request) {
 	if s.sessions == nil {
 		writeError(w, http.StatusServiceUnavailable, "session store is unavailable")
@@ -450,6 +483,18 @@ func (s *HTTPServer) handleDeleteSession(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, "session id is required")
 		return
 	}
+	// The session's working_dir determines where its directory lives
+	// (sessionstate.SessionBase), and it is only readable before the DB row is
+	// gone, so it must be fetched ahead of the delete.
+	session, ok, err := s.sessions.GetAgentSession(r.Context(), sessionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("load session: %v", err))
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", sessionID))
+		return
+	}
 	if err := s.sessions.DeleteAgentSession(r.Context(), sessionID); err != nil {
 		if errors.Is(err, storage.ErrAgentSessionNotFound) {
 			writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", sessionID))
@@ -458,8 +503,34 @@ func (s *HTTPServer) handleDeleteSession(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("delete session: %v", err))
 		return
 	}
+	base := sessionstate.SessionBase(s.workspaceRoot, session.WorkingDir)
+	if base == "" {
+		// Only reachable when both s.workspaceRoot and the session's working_dir
+		// are empty (an unconfigured production deployment always resolves
+		// workspaceRoot to a non-empty absolute path via
+		// sessionstate.ResolveWorkspaceRoot, so this is test/misconfiguration
+		// territory, not a production path). SessionDir(base, id) would then
+		// join onto "" and yield a bare "session/<id>" relative to the process
+		// cwd -- os.RemoveAll on that is not the directory this delete promised
+		// to remove, so skip it rather than risk deleting the wrong thing. This
+		// is a defensive guard, not a silent skip: it is logged at Warn.
+		observability.WithRequestID(s.logger, requestIDFromContext(r.Context())).Warn("delete session: skipping on-disk cleanup, empty session base",
+			"session_id", sessionID)
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	sessionDir := sessionstate.SessionDir(base, sessionID)
+	if err := os.RemoveAll(sessionDir); err != nil {
+		// Fail-loud: the DB row is already gone, but a directory the delete
+		// promised to remove is still on disk. Do not report success — log
+		// and return 500 rather than silently leaving orphaned state.
+		observability.WithRequestID(s.logger, requestIDFromContext(r.Context())).Error("delete session directory failed",
+			"session_id", sessionID, "dir", sessionDir, "error", err)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("delete session directory %q: %v", sessionDir, err))
+		return
+	}
 	observability.WithRequestID(s.logger, requestIDFromContext(r.Context())).Info("session deleted",
-		"session_id", sessionID)
+		"session_id", sessionID, "dir", sessionDir)
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -716,16 +787,34 @@ func (s *HTTPServer) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		session = loaded
 		haveSession = true
 	}
+	// A session's working_dir is inherited onto every task it spawns (mirrors
+	// the mode inheritance above). An empty working_dir is a legal "use the
+	// workspace root" state, but a non-empty one that does not resolve to an
+	// existing directory is corrupt session state — fail loud with a 400
+	// rather than enqueuing a task whose tool calls would silently resolve to
+	// the wrong base directory.
+	taskWorkingDir := ""
+	if haveSession {
+		taskWorkingDir = session.WorkingDir
+		if wd := strings.TrimSpace(taskWorkingDir); wd != "" {
+			info, err := os.Stat(wd)
+			if err != nil || !info.IsDir() {
+				writeError(w, http.StatusBadRequest, fmt.Sprintf("session %q working_dir %q is not an existing directory", sessionID, wd))
+				return
+			}
+		}
+	}
 	task := domain.Task{
-		ID:        req.ID,
-		CompanyID: req.CompanyID,
-		AgentID:   req.AgentID,
-		SessionID: sessionID,
-		Mode:      taskMode,
-		Status:    domain.TaskPending,
-		Input:     req.Input,
-		CreatedAt: now,
-		Images:    req.Images,
+		ID:         req.ID,
+		CompanyID:  req.CompanyID,
+		AgentID:    req.AgentID,
+		SessionID:  sessionID,
+		Mode:       taskMode,
+		WorkingDir: taskWorkingDir,
+		Status:     domain.TaskPending,
+		Input:      req.Input,
+		CreatedAt:  now,
+		Images:     req.Images,
 	}
 	// Record the user turn before the task is enqueued so the conversation
 	// history exists even if the runtime never produces an answer. session_id is
@@ -1165,11 +1254,12 @@ func (s *HTTPServer) handleTraces(w http.ResponseWriter, _ *http.Request) {
 }
 
 type createSessionRequest struct {
-	Project   string `json:"project"`
-	CompanyID string `json:"company_id"`
-	AgentID   string `json:"agent_id"`
-	Title     string `json:"title"`
-	Mode      string `json:"mode"`
+	Project    string `json:"project"`
+	CompanyID  string `json:"company_id"`
+	AgentID    string `json:"agent_id"`
+	Title      string `json:"title"`
+	Mode       string `json:"mode"`
+	WorkingDir string `json:"working_dir"`
 }
 
 // patchSessionRequest carries the optional, mutable fields of a session update.
@@ -1178,10 +1268,11 @@ type createSessionRequest struct {
 // which is what lets a rename touch only the title and an archive touch only the
 // archived flag.
 type patchSessionRequest struct {
-	Title    *string `json:"title"`
-	Project  *string `json:"project"`
-	Archived *bool   `json:"archived"`
-	Mode     *string `json:"mode"`
+	Title      *string `json:"title"`
+	Project    *string `json:"project"`
+	Archived   *bool   `json:"archived"`
+	Mode       *string `json:"mode"`
+	WorkingDir *string `json:"working_dir"`
 }
 
 type createTaskRequest struct {

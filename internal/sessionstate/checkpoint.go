@@ -50,27 +50,38 @@ type Checkpoint struct {
 	TotalTokens      int                 `json:"total_tokens"`
 	Images           []string            `json:"images,omitempty"`
 	CreatedAt        time.Time           `json:"created_at"`
+	// WorkingDir captures the task's working_dir at suspend time, so a resumed
+	// run resolves the same session base (SessionBase(workspaceRoot, WorkingDir))
+	// to locate this checkpoint's session directory rather than defaulting back
+	// to the workspace root.
+	WorkingDir string `json:"working_dir,omitempty"`
 }
 
 // Store persists task checkpoints under a base directory, one file per session
-// (SessionDir(base, key)/task-state.json).
+// (SessionDir(base, key)/task-state.json). base is resolved per call via
+// SessionBase(workspaceRoot, workingDir): workspaceRoot is used when working_dir
+// is empty.
 type Store struct {
-	base string
+	workspaceRoot string
 }
 
-// NewStore returns a checkpoint store rooted at base (the resolved workspace
-// root, or <working_dir>/.stardust once working_dir lands).
-func NewStore(base string) *Store {
-	return &Store{base: base}
+// NewStore returns a checkpoint store rooted at workspaceRoot, the base used
+// when a checkpoint carries no working_dir.
+func NewStore(workspaceRoot string) *Store {
+	return &Store{workspaceRoot: workspaceRoot}
 }
 
 // Save writes the checkpoint atomically (temp file + rename) so a crash mid-write
-// never leaves a half-written task-state.json that Load would reject.
+// never leaves a half-written task-state.json that Load would reject. It is
+// stored under SessionBase(s.workspaceRoot, cp.WorkingDir), so a session bound
+// to a working_dir persists alongside that directory rather than the workspace
+// root.
 func (s *Store) Save(cp Checkpoint) error {
 	if cp.SessionKey == "" {
 		return errors.New("save checkpoint: empty SessionKey")
 	}
-	dir := SessionDir(s.base, cp.SessionKey)
+	base := SessionBase(s.workspaceRoot, cp.WorkingDir)
+	dir := SessionDir(base, cp.SessionKey)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create session dir %q: %w", dir, err)
 	}
@@ -89,12 +100,14 @@ func (s *Store) Save(cp Checkpoint) error {
 	return nil
 }
 
-// Load reads the checkpoint for sessionKey. Absence is legitimate (fresh task):
-// it returns (zero, false, nil). Any other fault — unreadable file, corrupt JSON,
-// or an unrecognised schema version — returns a fail-loud error rather than
-// pretending the task has no prior state.
-func (s *Store) Load(sessionKey string) (Checkpoint, bool, error) {
-	path := filepath.Join(SessionDir(s.base, sessionKey), checkpointFileName)
+// Load reads the checkpoint for sessionKey under SessionBase(s.workspaceRoot,
+// workingDir). Absence is legitimate (fresh task): it returns (zero, false,
+// nil). Any other fault — unreadable file, corrupt JSON, or an unrecognised
+// schema version — returns a fail-loud error rather than pretending the task
+// has no prior state.
+func (s *Store) Load(sessionKey, workingDir string) (Checkpoint, bool, error) {
+	base := SessionBase(s.workspaceRoot, workingDir)
+	path := filepath.Join(SessionDir(base, sessionKey), checkpointFileName)
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return Checkpoint{}, false, nil
@@ -112,25 +125,29 @@ func (s *Store) Load(sessionKey string) (Checkpoint, bool, error) {
 	return cp, true, nil
 }
 
-// Delete removes a session's checkpoint. A missing file is not an error (delete
-// is idempotent — a completed or already-cleaned task is the normal case).
-func (s *Store) Delete(sessionKey string) error {
-	path := filepath.Join(SessionDir(s.base, sessionKey), checkpointFileName)
+// Delete removes a session's checkpoint under SessionBase(s.workspaceRoot,
+// workingDir). A missing file is not an error (delete is idempotent — a
+// completed or already-cleaned task is the normal case).
+func (s *Store) Delete(sessionKey, workingDir string) error {
+	base := SessionBase(s.workspaceRoot, workingDir)
+	path := filepath.Join(SessionDir(base, sessionKey), checkpointFileName)
 	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return fmt.Errorf("remove checkpoint %q: %w", path, err)
 	}
 	return nil
 }
 
-// WritePlan writes a Plan-mode artifact to <base>/session/<sessionKey>/plans/<filename>,
+// WritePlan writes a Plan-mode artifact to
+// <SessionBase(workspaceRoot, workingDir)>/session/<sessionKey>/plans/<filename>,
 // creating the directory. It returns the absolute path written. An empty
 // sessionKey or filename is rejected (fail-loud — never write to a malformed
 // path). This is where an OKF "one concept, one file" plan lands (design §4.2).
-func (s *Store) WritePlan(sessionKey, filename, content string) (string, error) {
+func (s *Store) WritePlan(sessionKey, workingDir, filename, content string) (string, error) {
 	if sessionKey == "" || filename == "" {
 		return "", fmt.Errorf("write plan: empty sessionKey or filename (key=%q file=%q)", sessionKey, filename)
 	}
-	dir := filepath.Join(SessionDir(s.base, sessionKey), "plans")
+	base := SessionBase(s.workspaceRoot, workingDir)
+	dir := filepath.Join(SessionDir(base, sessionKey), "plans")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("create plans dir %q: %w", dir, err)
 	}
@@ -141,12 +158,12 @@ func (s *Store) WritePlan(sessionKey, filename, content string) (string, error) 
 	return path, nil
 }
 
-// ListSuspended loads every checkpoint under <base>/session/*/task-state.json.
+// ListSuspendedIn loads every checkpoint under <base>/session/*/task-state.json.
 // A missing base dir yields an empty slice (no sessions yet). A corrupt or
 // version-mismatched checkpoint fails loud — recovery must not silently skip a
 // task it cannot restore.
-func (s *Store) ListSuspended() ([]Checkpoint, error) {
-	sessionsRoot := filepath.Join(s.base, "session")
+func (s *Store) ListSuspendedIn(base string) ([]Checkpoint, error) {
+	sessionsRoot := filepath.Join(base, "session")
 	entries, err := os.ReadDir(sessionsRoot)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -159,14 +176,29 @@ func (s *Store) ListSuspended() ([]Checkpoint, error) {
 		if !entry.IsDir() {
 			continue
 		}
-		cp, ok, err := s.Load(entry.Name())
-		if err != nil {
-			return nil, fmt.Errorf("load suspended checkpoint for %q: %w", entry.Name(), err)
-		}
-		if !ok {
+		path := filepath.Join(sessionsRoot, entry.Name(), checkpointFileName)
+		data, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
 			continue // session dir without a checkpoint (e.g. only plans/) — legitimate
+		}
+		if err != nil {
+			return nil, fmt.Errorf("read suspended checkpoint %q: %w", path, err)
+		}
+		var cp Checkpoint
+		if err := json.Unmarshal(data, &cp); err != nil {
+			return nil, fmt.Errorf("decode suspended checkpoint %q: %w", path, err)
+		}
+		if cp.SchemaVersion != CheckpointSchemaVersion {
+			return nil, fmt.Errorf("checkpoint %q schema version %d unsupported (want %d)", path, cp.SchemaVersion, CheckpointSchemaVersion)
 		}
 		out = append(out, cp)
 	}
 	return out, nil
+}
+
+// ListSuspended loads every checkpoint under the workspace root
+// (ListSuspendedIn(s.workspaceRoot)). It does not see checkpoints filed under a
+// working_dir base; enumerating across working_dir bases is Task 5's concern.
+func (s *Store) ListSuspended() ([]Checkpoint, error) {
+	return s.ListSuspendedIn(s.workspaceRoot)
 }

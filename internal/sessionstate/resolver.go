@@ -76,3 +76,16 @@ func expandTilde(path, home string) string {
 func SessionDir(base, sessionKey string) string {
 	return filepath.Join(base, "session", sessionKey)
 }
+
+// SessionBase returns the base directory under which a session's state
+// (checkpoints, approval tickets, plans) lives. When workingDir is non-empty the
+// base is <workingDir>/.stardust (design §4.0: a session bound to a working dir
+// keeps its state alongside that dir); otherwise it is the workspace root. This
+// is the single resolver for the base — callers must never hand-join it
+// elsewhere. SessionDir(SessionBase(root, wd), key) yields the full session dir.
+func SessionBase(workspaceRoot, workingDir string) string {
+	if strings.TrimSpace(workingDir) == "" {
+		return workspaceRoot
+	}
+	return filepath.Join(workingDir, defaultRootName)
+}

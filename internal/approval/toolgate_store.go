@@ -43,16 +43,24 @@ type ToolApproval struct {
 	Status     ApprovalStatus    `json:"status"`
 	CreatedAt  time.Time         `json:"created_at"`
 	UpdatedAt  time.Time         `json:"updated_at"`
+	// WorkingDir is the host filesystem directory the owning task's session is
+	// bound to, if any. When set, the ticket resolves its session base to
+	// <WorkingDir>/.stardust (sessionstate.SessionBase) rather than the
+	// workspace root, so approvals for a working_dir-scoped session live
+	// alongside that directory.
+	WorkingDir string `json:"working_dir,omitempty"`
 }
 
 // ToolGateStore persists ToolApproval tickets under a session directory tree:
-// <base>/session/<sessionKey>/approvals/<ticketID>.json. It is a separate type
-// from Service (internal/approval/service.go) because it serves a different
-// schema and lifecycle — Manual-mode tool gating, disk-backed, keyed by
-// (taskID, toolCallID) — rather than Service's in-memory workflow/hard-loop
-// tickets.
+// <base>/session/<sessionKey>/approvals/<ticketID>.json, where base is
+// resolved per call via sessionstate.SessionBase(workspaceRoot, workingDir):
+// workspaceRoot is used when a ticket (or lookup) carries no working_dir. It
+// is a separate type from Service (internal/approval/service.go) because it
+// serves a different schema and lifecycle — Manual-mode tool gating,
+// disk-backed, keyed by (taskID, toolCallID) — rather than Service's
+// in-memory workflow/hard-loop tickets.
 type ToolGateStore struct {
-	base string
+	workspaceRoot string
 
 	// mu serializes all disk I/O (temp-file+rename writes and reads) against
 	// this store's ticket files. Without it, a concurrent Decide racing
@@ -65,10 +73,11 @@ type ToolGateStore struct {
 	mu sync.Mutex
 }
 
-// NewToolGateStore returns a ToolGateStore rooted at base, the resolved
-// workspace root (the same base a sessionstate.Store uses).
-func NewToolGateStore(base string) *ToolGateStore {
-	return &ToolGateStore{base: base}
+// NewToolGateStore returns a ToolGateStore rooted at workspaceRoot, the base
+// used when a ticket (or lookup) carries no working_dir (the same root a
+// sessionstate.Store uses).
+func NewToolGateStore(workspaceRoot string) *ToolGateStore {
+	return &ToolGateStore{workspaceRoot: workspaceRoot}
 }
 
 // ticketIDReplacer sanitizes filesystem-hostile characters out of a derived
@@ -92,15 +101,17 @@ func TicketID(taskID, toolCallID string) string {
 	return ticketIDReplacer.Replace(taskID + "__" + toolCallID)
 }
 
-func (s *ToolGateStore) ticketPath(sessionKey, ticketID string) string {
-	return filepath.Join(sessionstate.SessionDir(s.base, sessionKey), approvalsDirName, ticketID+".json")
+func (s *ToolGateStore) ticketPath(workingDir, sessionKey, ticketID string) string {
+	base := sessionstate.SessionBase(s.workspaceRoot, workingDir)
+	return filepath.Join(sessionstate.SessionDir(base, sessionKey), approvalsDirName, ticketID+".json")
 }
 
 // Open creates (or, if the same (TaskID, ToolCallID) call already has a
 // ticket, idempotently returns) a pending ToolApproval for rec. rec must carry
 // a non-empty SessionKey, TaskID, and ToolCallID; anything else is rejected
 // fail-loud. The returned ticket's TicketID, Status, CreatedAt, and UpdatedAt
-// are always populated by Open, overriding whatever rec supplied.
+// are always populated by Open, overriding whatever rec supplied. The ticket
+// is filed under sessionstate.SessionBase(s.workspaceRoot, rec.WorkingDir).
 func (s *ToolGateStore) Open(rec ToolApproval) (ToolApproval, error) {
 	if rec.SessionKey == "" || rec.TaskID == "" || rec.ToolCallID == "" {
 		return ToolApproval{}, fmt.Errorf("open approval: empty SessionKey/TaskID/ToolCallID (session=%q task=%q call=%q)", rec.SessionKey, rec.TaskID, rec.ToolCallID)
@@ -108,7 +119,7 @@ func (s *ToolGateStore) Open(rec ToolApproval) (ToolApproval, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ticketID := TicketID(rec.TaskID, rec.ToolCallID)
-	existing, ok, err := s.getLocked(rec.SessionKey, ticketID)
+	existing, ok, err := s.getLocked(rec.SessionKey, ticketID, rec.WorkingDir)
 	if err != nil {
 		return ToolApproval{}, fmt.Errorf("open approval: check existing ticket %s: %w", ticketID, err)
 	}
@@ -126,19 +137,20 @@ func (s *ToolGateStore) Open(rec ToolApproval) (ToolApproval, error) {
 	return rec, nil
 }
 
-// Get reads the ticket ticketID under sessionKey. A ticket that does not exist
-// is a legitimate absence: it returns (zero, false, nil). Any other read
-// fault — an unreadable file or corrupt JSON — returns a fail-loud error;
-// Get never treats a decode failure as "not found".
-func (s *ToolGateStore) Get(sessionKey, ticketID string) (ToolApproval, bool, error) {
+// Get reads the ticket ticketID under sessionKey, resolved via
+// sessionstate.SessionBase(s.workspaceRoot, workingDir). A ticket that does
+// not exist is a legitimate absence: it returns (zero, false, nil). Any other
+// read fault — an unreadable file or corrupt JSON — returns a fail-loud
+// error; Get never treats a decode failure as "not found".
+func (s *ToolGateStore) Get(sessionKey, ticketID, workingDir string) (ToolApproval, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.getLocked(sessionKey, ticketID)
+	return s.getLocked(sessionKey, ticketID, workingDir)
 }
 
 // getLocked is Get's implementation. Callers must hold s.mu.
-func (s *ToolGateStore) getLocked(sessionKey, ticketID string) (ToolApproval, bool, error) {
-	path := s.ticketPath(sessionKey, ticketID)
+func (s *ToolGateStore) getLocked(sessionKey, ticketID, workingDir string) (ToolApproval, bool, error) {
+	path := s.ticketPath(workingDir, sessionKey, ticketID)
 	data, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return ToolApproval{}, false, nil
@@ -153,7 +165,8 @@ func (s *ToolGateStore) getLocked(sessionKey, ticketID string) (ToolApproval, bo
 	return rec, true, nil
 }
 
-// Decide records a human decision on ticketID: status must be
+// Decide records a human decision on ticketID (looked up under
+// sessionstate.SessionBase(s.workspaceRoot, workingDir)): status must be
 // ApprovalApproved or ApprovalDenied. An unknown ticketID returns an error
 // wrapping ErrTicketNotFound (so callers can errors.Is-match it, e.g. an HTTP
 // layer mapping it to 404). A ticket that is not currently ApprovalPending —
@@ -161,13 +174,13 @@ func (s *ToolGateStore) getLocked(sessionKey, ticketID string) (ToolApproval, bo
 // ErrTicketAlreadyDecided (so callers can errors.Is-match it, e.g. an HTTP
 // layer mapping it to 409, or a concurrent sweep tolerating the race) rather
 // than silently overwritten.
-func (s *ToolGateStore) Decide(sessionKey, ticketID string, status ApprovalStatus) (ToolApproval, error) {
+func (s *ToolGateStore) Decide(sessionKey, ticketID string, status ApprovalStatus, workingDir string) (ToolApproval, error) {
 	if status != ApprovalApproved && status != ApprovalDenied {
 		return ToolApproval{}, fmt.Errorf("decide approval: invalid status %q (want approved|denied)", status)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	rec, ok, err := s.getLocked(sessionKey, ticketID)
+	rec, ok, err := s.getLocked(sessionKey, ticketID, workingDir)
 	if err != nil {
 		return ToolApproval{}, fmt.Errorf("decide approval: %w", err)
 	}
@@ -186,12 +199,14 @@ func (s *ToolGateStore) Decide(sessionKey, ticketID string, status ApprovalStatu
 }
 
 // ListForTask returns every ticket recorded under sessionKey whose TaskID
-// matches taskID. A session with no approvals directory yet is a legitimate
+// matches taskID, resolved via sessionstate.SessionBase(s.workspaceRoot,
+// workingDir). A session with no approvals directory yet is a legitimate
 // empty result. A corrupt ticket file inside the directory fails loud.
-func (s *ToolGateStore) ListForTask(sessionKey, taskID string) ([]ToolApproval, error) {
+func (s *ToolGateStore) ListForTask(sessionKey, taskID, workingDir string) ([]ToolApproval, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	dir := filepath.Join(sessionstate.SessionDir(s.base, sessionKey), approvalsDirName)
+	base := sessionstate.SessionBase(s.workspaceRoot, workingDir)
+	dir := filepath.Join(sessionstate.SessionDir(base, sessionKey), approvalsDirName)
 	recs, err := readApprovalsDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("list approvals for task %s: %w", taskID, err)
@@ -205,13 +220,13 @@ func (s *ToolGateStore) ListForTask(sessionKey, taskID string) ([]ToolApproval, 
 	return out, nil
 }
 
-// ListPending returns every ApprovalPending ticket across all sessions under
-// base, for the timeout sweep. A corrupt ticket file anywhere in the tree
-// fails loud rather than being silently skipped.
-func (s *ToolGateStore) ListPending() ([]ToolApproval, error) {
+// ListPendingIn returns every ApprovalPending ticket across all sessions
+// under base, for the timeout sweep. A corrupt ticket file anywhere in the
+// tree fails loud rather than being silently skipped.
+func (s *ToolGateStore) ListPendingIn(base string) ([]ToolApproval, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	pattern := filepath.Join(s.base, "session", "*", approvalsDirName, "*.json")
+	pattern := filepath.Join(base, "session", "*", approvalsDirName, "*.json")
 	paths, err := filepath.Glob(pattern)
 	if err != nil {
 		return nil, fmt.Errorf("list pending approvals: glob %q: %w", pattern, err)
@@ -229,13 +244,24 @@ func (s *ToolGateStore) ListPending() ([]ToolApproval, error) {
 	return out, nil
 }
 
+// ListPending returns every ApprovalPending ticket under the workspace root
+// (ListPendingIn(s.workspaceRoot)). It does not see tickets filed under a
+// working_dir base; enumerating across working_dir bases is Task 5's concern.
+func (s *ToolGateStore) ListPending() ([]ToolApproval, error) {
+	return s.ListPendingIn(s.workspaceRoot)
+}
+
 // writeLocked atomically persists rec to its ticket path (temp file +
 // rename), mirroring sessionstate.Store.Save so a crash mid-write never
-// leaves a half-written ticket file behind. Callers must hold s.mu: the
-// rename must not race a concurrent read of the same path (Get/ListForTask/
-// ListPending), which on Windows NTFS collides with a sharing violation.
+// leaves a half-written ticket file behind. It is stored under
+// sessionstate.SessionBase(s.workspaceRoot, rec.WorkingDir). Callers must hold
+// s.mu: the rename must not race a concurrent read of the same path
+// (Get/ListForTask/ListPendingIn — including via ListPending, which is
+// ListPendingIn(s.workspaceRoot)), which on Windows NTFS collides with a
+// sharing violation.
 func (s *ToolGateStore) writeLocked(rec ToolApproval) error {
-	dir := filepath.Join(sessionstate.SessionDir(s.base, rec.SessionKey), approvalsDirName)
+	base := sessionstate.SessionBase(s.workspaceRoot, rec.WorkingDir)
+	dir := filepath.Join(sessionstate.SessionDir(base, rec.SessionKey), approvalsDirName)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("create approvals dir %q: %w", dir, err)
 	}

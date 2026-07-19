@@ -58,7 +58,7 @@ func TestCheckSuspendPersistsMode(t *testing.T) {
 	if err != ErrSuspended {
 		t.Fatalf("RunTask err = %v, want ErrSuspended", err)
 	}
-	cp, ok, err := store.Load("s1")
+	cp, ok, err := store.Load("s1", "")
 	if err != nil || !ok {
 		t.Fatalf("Load: ok=%v err=%v", ok, err)
 	}

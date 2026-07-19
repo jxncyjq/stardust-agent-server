@@ -89,3 +89,18 @@ func TestSessionDirJoinsUnderSessionSegment(t *testing.T) {
 		t.Errorf("SessionDir = %q, want %q", got, want)
 	}
 }
+
+func TestSessionBaseUsesWorkspaceRootWhenNoWorkingDir(t *testing.T) {
+	got := SessionBase("/ws/root", "")
+	if got != "/ws/root" {
+		t.Fatalf("SessionBase(root, \"\") = %q, want /ws/root", got)
+	}
+}
+
+func TestSessionBaseUsesWorkingDirDotStardustWhenSet(t *testing.T) {
+	got := SessionBase("/ws/root", filepath.Join("/proj", "app"))
+	want := filepath.Join("/proj", "app", ".stardust")
+	if got != want {
+		t.Fatalf("SessionBase(root, /proj/app) = %q, want %q", got, want)
+	}
+}

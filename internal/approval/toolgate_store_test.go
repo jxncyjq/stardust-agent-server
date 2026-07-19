@@ -41,11 +41,11 @@ func TestToolGateStoreDecidePersists(t *testing.T) {
 	dir := t.TempDir()
 	s := NewToolGateStore(dir)
 	a, _ := s.Open(newRec("t1", "c1", "write_file"))
-	if _, err := s.Decide("s1", a.TicketID, ApprovalApproved); err != nil {
+	if _, err := s.Decide("s1", a.TicketID, ApprovalApproved, ""); err != nil {
 		t.Fatal(err)
 	}
 	// Re-read from a fresh store: disk is the source of truth.
-	got, ok, err := NewToolGateStore(dir).Get("s1", a.TicketID)
+	got, ok, err := NewToolGateStore(dir).Get("s1", a.TicketID, "")
 	if err != nil || !ok {
 		t.Fatalf("Get: ok=%v err=%v", ok, err)
 	}
@@ -53,14 +53,14 @@ func TestToolGateStoreDecidePersists(t *testing.T) {
 		t.Fatalf("status = %q, want approved", got.Status)
 	}
 	// Deciding an already-decided ticket must fail loud.
-	if _, err := s.Decide("s1", a.TicketID, ApprovalDenied); err == nil {
+	if _, err := s.Decide("s1", a.TicketID, ApprovalDenied, ""); err == nil {
 		t.Fatal("re-decide: want error, got nil")
 	}
 }
 
 func TestToolGateStoreDecideUnknownTicketWrapsErrTicketNotFound(t *testing.T) {
 	s := NewToolGateStore(t.TempDir())
-	_, err := s.Decide("s1", "does-not-exist", ApprovalApproved)
+	_, err := s.Decide("s1", "does-not-exist", ApprovalApproved, "")
 	if err == nil {
 		t.Fatal("decide unknown ticket: want error, got nil")
 	}
@@ -76,10 +76,10 @@ func TestToolGateStoreDecideUnknownTicketWrapsErrTicketNotFound(t *testing.T) {
 func TestToolGateStoreDecideAlreadyDecidedWrapsErrTicketAlreadyDecided(t *testing.T) {
 	s := NewToolGateStore(t.TempDir())
 	a, _ := s.Open(newRec("t1", "c1", "write_file"))
-	if _, err := s.Decide("s1", a.TicketID, ApprovalApproved); err != nil {
+	if _, err := s.Decide("s1", a.TicketID, ApprovalApproved, ""); err != nil {
 		t.Fatal(err)
 	}
-	_, err := s.Decide("s1", a.TicketID, ApprovalDenied)
+	_, err := s.Decide("s1", a.TicketID, ApprovalDenied, "")
 	if err == nil {
 		t.Fatal("re-decide decided ticket: want error, got nil")
 	}
@@ -93,14 +93,14 @@ func TestToolGateStoreListForTaskAndPending(t *testing.T) {
 	_, _ = s.Open(newRec("t1", "c1", "write_file"))
 	a2, _ := s.Open(newRec("t1", "c2", "send_message"))
 	_, _ = s.Open(ToolApproval{SessionKey: "s2", TaskID: "t2", ToolCallID: "c9", ToolName: "fetch_url"})
-	forT1, err := s.ListForTask("s1", "t1")
+	forT1, err := s.ListForTask("s1", "t1", "")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(forT1) != 2 {
 		t.Fatalf("ListForTask t1 = %d, want 2", len(forT1))
 	}
-	if _, err := s.Decide("s1", a2.TicketID, ApprovalApproved); err != nil {
+	if _, err := s.Decide("s1", a2.TicketID, ApprovalApproved, ""); err != nil {
 		t.Fatal(err)
 	}
 	pending, err := s.ListPending()
@@ -121,7 +121,7 @@ func TestToolGateStoreCorruptJSONFailsLoud(t *testing.T) {
 	if err := writeFileHelper(path, "{ not json"); err != nil { // helper: os.WriteFile
 		t.Fatal(err)
 	}
-	if _, _, err := s.Get("s1", a.TicketID); err == nil {
+	if _, _, err := s.Get("s1", a.TicketID, ""); err == nil {
 		t.Fatal("Get on corrupt JSON: want fail-loud error, got nil")
 	}
 }
@@ -134,7 +134,7 @@ func TestToolGateStoreListForTaskCorruptFileFailsLoud(t *testing.T) {
 	if err := writeFileHelper(path, "{ not json"); err != nil { // helper: os.WriteFile
 		t.Fatal(err)
 	}
-	if _, err := s.ListForTask("s1", "t1"); err == nil {
+	if _, err := s.ListForTask("s1", "t1", ""); err == nil {
 		t.Fatal("ListForTask on corrupt JSON: want fail-loud error, got nil")
 	}
 }
@@ -186,15 +186,15 @@ func TestToolGateStoreConcurrentAccessNoRace(t *testing.T) {
 			// Each goroutine decides its own distinct ticket — no two
 			// goroutines target the same ticket, so a re-decide error here
 			// would always be unexpected.
-			if _, err := s.Decide("s1", tickets[i].TicketID, ApprovalApproved); err != nil {
+			if _, err := s.Decide("s1", tickets[i].TicketID, ApprovalApproved, ""); err != nil {
 				errCh <- fmt.Errorf("goroutine %d Decide: %w", i, err)
 			}
 
-			if _, _, err := s.Get("s1", tickets[i].TicketID); err != nil {
+			if _, _, err := s.Get("s1", tickets[i].TicketID, ""); err != nil {
 				errCh <- fmt.Errorf("goroutine %d Get: %w", i, err)
 			}
 
-			if _, err := s.ListForTask("s1", "t1"); err != nil {
+			if _, err := s.ListForTask("s1", "t1", ""); err != nil {
 				errCh <- fmt.Errorf("goroutine %d ListForTask: %w", i, err)
 			}
 
@@ -212,7 +212,7 @@ func TestToolGateStoreConcurrentAccessNoRace(t *testing.T) {
 	}
 
 	// Sanity: every ticket must have landed Approved — no lost writes.
-	forT1, err := s.ListForTask("s1", "t1")
+	forT1, err := s.ListForTask("s1", "t1", "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,14 +230,61 @@ func TestToolGateStoreDecideRejectsInvalidStatus(t *testing.T) {
 	dir := t.TempDir()
 	s := NewToolGateStore(dir)
 	a, _ := s.Open(newRec("t1", "c1", "write_file"))
-	if _, err := s.Decide("s1", a.TicketID, ApprovalStatus("bogus")); err == nil {
+	if _, err := s.Decide("s1", a.TicketID, ApprovalStatus("bogus"), ""); err == nil {
 		t.Fatal("Decide with invalid status: want error, got nil")
 	}
-	got, ok, err := s.Get("s1", a.TicketID)
+	got, ok, err := s.Get("s1", a.TicketID, "")
 	if err != nil || !ok {
 		t.Fatalf("Get: ok=%v err=%v", ok, err)
 	}
 	if got.Status != ApprovalPending {
 		t.Fatalf("status after rejected Decide = %q, want pending", got.Status)
+	}
+}
+
+// TestToolGateStoreTicketUnderWorkingDir covers the working_dir-aware base
+// resolution (design §4.0, mirroring sessionstate.Store's checkpoint
+// resolution): a ticket opened with a non-empty WorkingDir must be filed
+// under <WorkingDir>/.stardust rather than the workspace root, and Get must
+// resolve the same base to find it again.
+func TestToolGateStoreTicketUnderWorkingDir(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	workingDir := t.TempDir()
+	s := NewToolGateStore(workspaceRoot)
+	rec, err := s.Open(ToolApproval{
+		SessionKey: "s1", TaskID: "t1", ToolCallID: "c1", ToolName: "write_file",
+		WorkingDir: workingDir,
+	})
+	if err != nil {
+		t.Fatalf("Open error = %v, want nil", err)
+	}
+	want := filepath.Join(workingDir, ".stardust", "session", "s1", "approvals", rec.TicketID+".json")
+	if _, err := os.Stat(want); err != nil {
+		t.Fatalf("ticket not at %q: %v", want, err)
+	}
+	got, ok, err := s.Get("s1", rec.TicketID, workingDir) // Get 签名加 workingDir
+	if err != nil || !ok {
+		t.Fatalf("Get = _, %v, %v; want found", ok, err)
+	}
+	if got.ToolName != "write_file" {
+		t.Fatalf("Get ToolName = %q, want write_file", got.ToolName)
+	}
+}
+
+// TestListPendingInScansGivenBase covers ListPendingIn's explicit-base
+// contract: it must scan exactly the base sessionstate.SessionBase resolves
+// to for a given (workspaceRoot, workingDir) pair, not the store's
+// workspaceRoot (that is what the parameterless ListPending covers).
+func TestListPendingInScansGivenBase(t *testing.T) {
+	workspaceRoot := t.TempDir()
+	workingDir := t.TempDir()
+	s := NewToolGateStore(workspaceRoot)
+	_, _ = s.Open(ToolApproval{SessionKey: "s1", TaskID: "t1", ToolCallID: "c1", ToolName: "write_file", WorkingDir: workingDir})
+	got, err := s.ListPendingIn(sessionstate.SessionBase(workspaceRoot, workingDir))
+	if err != nil {
+		t.Fatalf("ListPendingIn error = %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("ListPendingIn = %d tickets, want 1", len(got))
 	}
 }

@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/stardust/legion-agent/internal/agentregistry"
@@ -99,7 +100,7 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		Role:      agentCfg.Role,
 		Status:    domain.AgentActive,
 	}
-	tools := tool.NewReadOnlyWorkspaceRegistry(agentToolRoot(r.rootConfig, agentCfg), r.audit)
+	tools := tool.NewReadOnlyWorkspaceRegistry(agentToolRoot(r.rootConfig, agentCfg, task), r.audit)
 	tool.RegisterTaskLedgerTools(tools, r.taskLedger)
 	tool.RegisterAgentMessageTools(tools, r.messageStore)
 	tool.RegisterWebTools(tools, webToolOptions(r.rootConfig.Web))
@@ -147,7 +148,18 @@ func loadAgentContextFiles(ctx context.Context, rootCfg config.Config, childCfg 
 	return block.Render(), nil
 }
 
-func agentToolRoot(rootCfg config.Config, agentCfg agentregistry.AgentConfig) string {
+// agentToolRoot resolves the tool-sandbox root (the WorkspacePathGuard root
+// every read-only workspace tool built for this run is confined to). It
+// prioritizes task.WorkingDir: when a task carries a non-empty working_dir
+// (M3 per-task working directory), the agent's tools are sandboxed to that
+// directory regardless of the agent's or root config's configured context
+// root — the task's own working directory is the security boundary. Only
+// when the task has no working_dir does it fall back to the pre-M3
+// resolution: the agent's own ContextFiles.Root, else the root config's.
+func agentToolRoot(rootCfg config.Config, agentCfg agentregistry.AgentConfig, task domain.Task) string {
+	if wd := strings.TrimSpace(task.WorkingDir); wd != "" {
+		return wd
+	}
 	if agentCfg.ContextFiles.Root != "" {
 		return agentCfg.ContextFiles.Root
 	}

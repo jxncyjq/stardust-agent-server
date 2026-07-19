@@ -30,7 +30,7 @@ func TestDispatchDeniedSensitiveReturnsRejectResult(t *testing.T) {
 	if _, err := gate.ShouldSuspend(context.Background(), task, []domain.ToolCall{call}, reg); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Decide("s1", approval.TicketID("t1", "c1"), approval.ApprovalDenied); err != nil {
+	if _, err := store.Decide("s1", approval.TicketID("t1", "c1"), approval.ApprovalDenied, ""); err != nil {
 		t.Fatal(err)
 	}
 	res, err := r.dispatchToolCall(context.Background(), domain.Agent{ID: "a1"}, task, call, reg)
@@ -70,7 +70,7 @@ func TestDispatchDeniedLazyCallToolReturnsRejectResult(t *testing.T) {
 	if _, err := gate.ShouldSuspend(context.Background(), task, []domain.ToolCall{call}, reg); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Decide("s1", approval.TicketID("t1", "c1"), approval.ApprovalDenied); err != nil {
+	if _, err := store.Decide("s1", approval.TicketID("t1", "c1"), approval.ApprovalDenied, ""); err != nil {
 		t.Fatal(err)
 	}
 	res, err := r.dispatchToolCall(context.Background(), domain.Agent{ID: "a1"}, task, call, reg)
