@@ -374,6 +374,61 @@ func TestInteractiveModelApprovalPromptDenyBlocksTypingAndSendsDenial(t *testing
 	}
 }
 
+// TestInteractiveModelApprovalPromptLocksMouseScroll covers the composer-lock
+// invariant for the mouse path: renderMainBody pins the approval prompt to the
+// top of the main body, so a wheel scroll while an approval is pending would
+// push the tool name and its arguments out of view even though only y/n can
+// resolve it. While approvalActive, wheel events must leave mainScroll alone.
+func TestInteractiveModelApprovalPromptLocksMouseScroll(t *testing.T) {
+	t.Parallel()
+
+	model := NewInteractiveModel(InteractiveConfig{
+		ApprovalCh: make(chan PendingApproval),
+		DecisionCh: make(chan ApprovalDecision),
+	})
+	model.width = 120
+	model.height = 40
+	// Long enough that clampMainScroll allows a non-zero offset; otherwise the
+	// assertion below would pass for the wrong reason.
+	model.result = app.DemoResult{
+		TaskID: "task-1",
+		Result: strings.Repeat("scrollable line\n", 200),
+	}
+
+	if got := model.clampMainScroll(3); got == 0 {
+		t.Fatalf("clampMainScroll(3) = 0, want > 0 (test fixture must be scrollable)")
+	}
+
+	next, _ := model.Update(interactivePendingApprovalMsg{
+		Tool: "write_file",
+		Args: map[string]string{"path": "notes.md"},
+	})
+	model = next.(InteractiveModel)
+	if !model.approvalActive {
+		t.Fatalf("Update(pendingApproval) approvalActive = false, want true")
+	}
+
+	before := model.mainScroll
+	for _, wheel := range []tea.MouseEventType{tea.MouseWheelDown, tea.MouseWheelUp} {
+		next, cmd := model.Update(tea.MouseMsg{Type: wheel, Y: 5})
+		model = next.(InteractiveModel)
+		if cmd != nil {
+			t.Fatalf("Update(%v while approval pending) cmd = non-nil, want nil", wheel)
+		}
+		if model.mainScroll != before {
+			t.Fatalf("Update(%v while approval pending) mainScroll = %d, want %d (scroll locked)", wheel, model.mainScroll, before)
+		}
+		if !model.approvalActive {
+			t.Fatalf("approvalActive flipped false by a mouse event, want still true")
+		}
+	}
+
+	view := model.View()
+	if !strings.Contains(view, "write_file") {
+		t.Fatalf("View() after wheel events missing tool name:\n%s", view)
+	}
+}
+
 func TestInteractiveModelConversationMetadataCanBeHidden(t *testing.T) {
 	t.Parallel()
 

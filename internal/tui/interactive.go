@@ -529,6 +529,12 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m InteractiveModel) updateMouse(msg tea.MouseMsg) InteractiveModel {
+	// While an approval is pending the main body is locked: renderMainBody pins
+	// the prompt to the top, so scrolling would push the tool name and its
+	// arguments out of view while only y/n can resolve the gate.
+	if m.approvalActive {
+		return m
+	}
 	if !m.mouseInMainArea(msg) {
 		return m
 	}
