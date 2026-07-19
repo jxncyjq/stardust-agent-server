@@ -977,6 +977,75 @@ func TestTUISessionControllerSetAndGetWorkingDir(t *testing.T) {
 	}
 }
 
+// TestTUISessionControllerWorkingDirSetOnce verifies the TUI session
+// controller enforces the same set-once-then-immutable WorkingDir semantics
+// as the HTTP server's handlePatchSession (server/http.go): once a session's
+// working_dir is non-empty, changing it to a different directory must be
+// rejected, because on-disk session state (checkpoints, approval tickets) is
+// filed under whatever working_dir was in effect at write time, and
+// repointing it would silently strand that state.
+func TestTUISessionControllerWorkingDirSetOnce(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo := openCLITestSQLiteRepository(t)
+	session := newTUISessionController(tuiSessionControllerConfig{
+		Store:        repo,
+		Enabled:      true,
+		CompanyID:    "cli-company",
+		AgentID:      "cli-agent",
+		ModelProfile: "dev",
+	})
+	if _, err := session.NewSession(ctx); err != nil {
+		t.Fatalf("NewSession() error = %v, want nil", err)
+	}
+
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+
+	// First set: working_dir is currently empty, so this must succeed.
+	if err := session.SetWorkingDir(ctx, dirA); err != nil {
+		t.Fatalf("SetWorkingDir(%q) (first set) error = %v, want nil", dirA, err)
+	}
+	if got := session.CurrentWorkingDir(); got != dirA {
+		t.Fatalf("CurrentWorkingDir() = %q, want %q", got, dirA)
+	}
+
+	// Changing to a different directory once set must be rejected.
+	if err := session.SetWorkingDir(ctx, dirB); err == nil {
+		t.Fatalf("SetWorkingDir(%q) (change after set) error = nil, want error", dirB)
+	}
+	if got := session.CurrentWorkingDir(); got != dirA {
+		t.Fatalf("CurrentWorkingDir() after rejected change = %q, want unchanged %q", got, dirA)
+	}
+
+	// Persisted state must remain dirA, not dirB.
+	sessions, err := repo.ListAgentSessions(ctx, "cli-company", "cli-agent")
+	if err != nil {
+		t.Fatalf("ListAgentSessions() error = %v, want nil", err)
+	}
+	var found bool
+	for _, s := range sessions {
+		if s.ID == session.CurrentSessionID() {
+			found = true
+			if s.WorkingDir != dirA {
+				t.Fatalf("persisted AgentSession.WorkingDir = %q, want unchanged %q", s.WorkingDir, dirA)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("session %q not found in store", session.CurrentSessionID())
+	}
+
+	// Re-setting the same value is a no-op and must succeed.
+	if err := session.SetWorkingDir(ctx, dirA); err != nil {
+		t.Fatalf("SetWorkingDir(%q) (same value, no-op) error = %v, want nil", dirA, err)
+	}
+	if got := session.CurrentWorkingDir(); got != dirA {
+		t.Fatalf("CurrentWorkingDir() after no-op set = %q, want %q", got, dirA)
+	}
+}
+
 func TestLoadServeAgentRegistryReturnsMissingChildError(t *testing.T) {
 	t.Parallel()
 

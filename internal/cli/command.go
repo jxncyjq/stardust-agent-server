@@ -1179,15 +1179,16 @@ func (c *tuiSessionController) CurrentWorkingDir() string {
 
 // SetWorkingDir implements SessionManager. See SessionManager.SetWorkingDir.
 //
-// Unlike the HTTP server's PATCH /v1/sessions handler (server/http.go), this
-// does not enforce set-once-then-immutable semantics on WorkingDir: it always
-// persists whatever valid directory (or empty, to clear) is given. That
-// invariant exists server-side because session on-disk state
-// (sessionstate.SessionBase) is filed under whatever working_dir a session
-// carries at write time, and repointing it strands previously-filed state.
-// The same risk applies here since the TUI writes the same conversationStore
-// record; this is a deliberate scope limit for the initial TUI cwd binding
-// (tracked for follow-up), not a fallback for an error condition.
+// This mirrors the HTTP server's PATCH /v1/sessions handler
+// (handlePatchSession in server/http.go): set-once-then-immutable semantics
+// on WorkingDir. Session on-disk state (sessionstate.SessionBase) is filed
+// under whatever working_dir a session carries at write time, and repointing
+// it strands previously-filed state -- silently, since recovery after a
+// restart only enumerates bases currently in use. The TUI writes the same
+// conversationStore record the HTTP server does, so it must enforce the same
+// guard: once WorkingDir is non-empty, changing it to a different directory
+// is rejected outright. Setting it for the first time (currently empty) and
+// re-setting the same value (no-op) both remain allowed.
 func (c *tuiSessionController) SetWorkingDir(ctx context.Context, dir string) error {
 	if c == nil || !c.enabled {
 		return nil
@@ -1210,6 +1211,10 @@ func (c *tuiSessionController) SetWorkingDir(ctx context.Context, dir string) er
 	session, err := c.currentAgentSession(ctx)
 	if err != nil {
 		return err
+	}
+	currentWorkingDir := strings.TrimSpace(session.WorkingDir)
+	if currentWorkingDir != "" && dir != currentWorkingDir {
+		return fmt.Errorf("working_dir cannot be changed once set")
 	}
 	session.WorkingDir = dir
 	session.UpdatedAt = time.Now()
