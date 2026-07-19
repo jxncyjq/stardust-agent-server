@@ -47,10 +47,16 @@ type Definition struct {
 }
 
 type Node struct {
-	ID                   string        `json:"id"`
-	Kind                 NodeKind      `json:"kind"`
-	Children             []Node        `json:"children,omitempty"`
-	Task                 TaskSpec      `json:"task,omitempty"`
+	ID       string   `json:"id"`
+	Kind     NodeKind `json:"kind"`
+	Children []Node   `json:"children,omitempty"`
+	// Task carries no omitempty: encoding/json ignores it on struct types, so
+	// every node marshals a "task" object even when Kind is not NodeTask. The
+	// zero TaskSpec is the "no task" signal (executeNode checks Task.ID == "").
+	// Making the key genuinely optional requires *TaskSpec, which is both a
+	// wire-contract change and a nil-deref risk on the template-substitution
+	// path that assigns to node.Task fields.
+	Task                 TaskSpec      `json:"task"`
 	Subject              string        `json:"subject,omitempty"`
 	Reason               string        `json:"reason,omitempty"`
 	EventType            string        `json:"event_type,omitempty"`
