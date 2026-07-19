@@ -155,8 +155,14 @@ func (a *App) RunDemo(ctx context.Context) (DemoResult, error) {
 	}); err != nil {
 		return DemoResult{}, fmt.Errorf("publish tool event: %w", err)
 	}
-	auditEvents := audit.Events()
-	runtimeEvents := events.Events()
+	auditEvents, err := audit.Events()
+	if err != nil {
+		return DemoResult{}, fmt.Errorf("read audit events: %w", err)
+	}
+	runtimeEvents, err := events.Events()
+	if err != nil {
+		return DemoResult{}, fmt.Errorf("read runtime events: %w", err)
+	}
 	return DemoResult{
 		TaskID:           task.ID,
 		Result:           quality.SanitizeModelOutput(run.Result),
@@ -271,8 +277,14 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 			return DemoResult{}, fmt.Errorf("save completed task: %w", err)
 		}
 	}
-	auditEvents := audit.Events()
-	runtimeEvents := events.Events()
+	auditEvents, err := audit.Events()
+	if err != nil {
+		return DemoResult{}, fmt.Errorf("read audit events: %w", err)
+	}
+	runtimeEvents, err := events.Events()
+	if err != nil {
+		return DemoResult{}, fmt.Errorf("read runtime events: %w", err)
+	}
 	return DemoResult{
 		TaskID:           task.ID,
 		Result:           quality.SanitizeModelOutput(run.Result),

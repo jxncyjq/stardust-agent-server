@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
@@ -24,12 +25,12 @@ func (b *SQLiteEventBus) Publish(ctx context.Context, event domain.RuntimeEvent)
 	return b.repo.AppendRuntimeEvent(ctx, event)
 }
 
-func (b *SQLiteEventBus) Events() []domain.RuntimeEvent {
+func (b *SQLiteEventBus) Events() ([]domain.RuntimeEvent, error) {
 	events, err := b.repo.ListRuntimeEvents(context.Background())
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("list runtime events: %w", err)
 	}
-	return events
+	return events, nil
 }
 
 type SQLiteAuditLog struct {
@@ -44,10 +45,10 @@ func (l *SQLiteAuditLog) Append(ctx context.Context, event domain.AuditEvent) er
 	return l.repo.AppendAuditEvent(ctx, event)
 }
 
-func (l *SQLiteAuditLog) Events() []domain.AuditEvent {
+func (l *SQLiteAuditLog) Events() ([]domain.AuditEvent, error) {
 	events, err := l.repo.ListAuditEvents(context.Background())
 	if err != nil {
-		return nil
+		return nil, fmt.Errorf("list audit events: %w", err)
 	}
-	return events
+	return events, nil
 }

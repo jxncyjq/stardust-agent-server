@@ -53,11 +53,17 @@ func TestSQLiteAdaptersRecoverEventsAndAuditAfterReopen(t *testing.T) {
 			t.Errorf("Close() reopened error = %v, want nil", err)
 		}
 	})
-	recoveredEvents := NewSQLiteEventBus(reopened).Events()
+	recoveredEvents, err := NewSQLiteEventBus(reopened).Events()
+	if err != nil {
+		t.Fatalf("SQLiteEventBus.Events() error = %v, want nil", err)
+	}
 	if len(recoveredEvents) != 1 || recoveredEvents[0].Type != runtimeEvent.Type || recoveredEvents[0].TaskID != runtimeEvent.TaskID {
 		t.Fatalf("SQLiteEventBus.Events() = %#v, want recovered event %#v", recoveredEvents, runtimeEvent)
 	}
-	recoveredAudit := NewSQLiteAuditLog(reopened).Events()
+	recoveredAudit, err := NewSQLiteAuditLog(reopened).Events()
+	if err != nil {
+		t.Fatalf("SQLiteAuditLog.Events() error = %v, want nil", err)
+	}
 	if len(recoveredAudit) != 1 || recoveredAudit[0].ID != audit.ID || recoveredAudit[0].Action != audit.Action {
 		t.Fatalf("SQLiteAuditLog.Events() = %#v, want recovered audit %#v", recoveredAudit, audit)
 	}

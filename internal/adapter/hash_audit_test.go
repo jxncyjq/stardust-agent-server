@@ -23,7 +23,10 @@ func TestHashChainAuditLogAppendsVerifiableChain(t *testing.T) {
 		t.Fatalf("Append(%q) error = %v, want nil", second.ID, err)
 	}
 
-	events := log.Events()
+	events, err := log.Events()
+	if err != nil {
+		t.Fatalf("Events() error = %v, want nil", err)
+	}
 	if len(events) != 2 {
 		t.Fatalf("Events() len = %d, want 2", len(events))
 	}
@@ -55,7 +58,10 @@ func TestHashChainAuditLogIsIdempotentByID(t *testing.T) {
 		t.Fatalf("Append(%q retry) error = %v, want nil", retry.ID, err)
 	}
 
-	events := log.Events()
+	events, err := log.Events()
+	if err != nil {
+		t.Fatalf("Events() error = %v, want nil", err)
+	}
 	if len(events) != 1 {
 		t.Fatalf("Events() len = %d, want 1", len(events))
 	}
@@ -78,9 +84,12 @@ func TestVerifyAuditEventsDetectsTampering(t *testing.T) {
 		t.Fatalf("Append(%q) error = %v, want nil", second.ID, err)
 	}
 
-	events := log.Events()
+	events, err := log.Events()
+	if err != nil {
+		t.Fatalf("Events() error = %v, want nil", err)
+	}
 	events[0].Action = "task_deleted"
-	err := VerifyAuditEvents(events)
+	err = VerifyAuditEvents(events)
 	if !errors.Is(err, ErrAuditChainInvalid) {
 		t.Fatalf("VerifyAuditEvents(tampered) error = %v, want %v", err, ErrAuditChainInvalid)
 	}
@@ -95,13 +104,20 @@ func TestHashChainAuditLogEventsReturnsCopy(t *testing.T) {
 	if err := log.Append(ctx, event); err != nil {
 		t.Fatalf("Append(%q) error = %v, want nil", event.ID, err)
 	}
-	events := log.Events()
+	events, err := log.Events()
+	if err != nil {
+		t.Fatalf("Events() error = %v, want nil", err)
+	}
 	events[0].Action = "changed outside"
 
 	if err := log.VerifyChain(ctx); err != nil {
 		t.Fatalf("VerifyChain() after external mutation error = %v, want nil", err)
 	}
-	got := log.Events()[0]
+	afterEvents, err := log.Events()
+	if err != nil {
+		t.Fatalf("Events() error = %v, want nil", err)
+	}
+	got := afterEvents[0]
 	if got.Action != event.Action {
 		t.Fatalf("Events()[0].Action = %q, want %q", got.Action, event.Action)
 	}

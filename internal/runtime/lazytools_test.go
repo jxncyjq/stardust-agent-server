@@ -143,8 +143,9 @@ func TestRuntimeLazyListToolsAndCallToolDispatch(t *testing.T) {
 	if !strings.Contains(maas.prompts[2], "cache is implemented by map") {
 		t.Fatalf("round 3 prompt missing real tool output:\n%s", maas.prompts[2])
 	}
-	if !hasRuntimeEvent(events.Events(), "tool_executed") {
-		t.Fatalf("runtime events missing tool_executed for real tool: %#v", events.Events())
+	runtimeEvents := mustRuntimeEvents(t, events)
+	if !hasRuntimeEvent(runtimeEvents, "tool_executed") {
+		t.Fatalf("runtime events missing tool_executed for real tool: %#v", runtimeEvents)
 	}
 }
 

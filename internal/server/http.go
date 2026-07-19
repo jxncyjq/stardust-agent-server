@@ -975,7 +975,12 @@ func (s *HTTPServer) handleGetTaskResult(w http.ResponseWriter, r *http.Request)
 	if !s.requireCompanyAccess(w, r, task.CompanyID, "task", task.ID) {
 		return
 	}
-	result, usage := s.taskResult(taskID)
+	result, usage, err := s.taskResult(taskID)
+	if err != nil {
+		observability.WithRequestID(s.logger, requestIDFromContext(r.Context())).Error("read task result failed", "task_id", taskID, "error", err)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("task result: %v", err))
+		return
+	}
 	// On a completed task tied to a session, persist the assistant answer as a
 	// conversation turn so the GUI can reload the full history. The turn id is
 	// deterministic ("<taskID>:assistant"), and the insert is exactly-once, so
@@ -1024,12 +1029,19 @@ func (s *HTTPServer) recordAssistantTurn(ctx context.Context, task domain.Task, 
 // taskResult scans the runtime event bus for the task_completed event of the
 // given task and returns its answer text, total token usage, and elapsed time
 // in milliseconds. The task_completed event is the only place these values are
-// exposed because TaskRun is not persisted.
-func (s *HTTPServer) taskResult(taskID string) (result string, usage taskUsage) {
+// exposed because TaskRun is not persisted. A failure to read the event bus is
+// returned rather than reported as an empty result: an empty answer on a done
+// task is indistinguishable from "the task produced nothing", which would let a
+// backing-store outage surface to the GUI as a silently truncated answer.
+func (s *HTTPServer) taskResult(taskID string) (result string, usage taskUsage, err error) {
 	if s.workflowEvents == nil {
-		return "", taskUsage{}
+		return "", taskUsage{}, nil
 	}
-	for _, event := range s.workflowEvents.Events() {
+	events, err := s.workflowEvents.Events()
+	if err != nil {
+		return "", taskUsage{}, fmt.Errorf("read runtime events for task %q: %w", taskID, err)
+	}
+	for _, event := range events {
 		if event.TaskID == taskID && event.Type == "task_completed" {
 			result = event.Message
 			usage = taskUsage{
@@ -1041,7 +1053,7 @@ func (s *HTTPServer) taskResult(taskID string) (result string, usage taskUsage) 
 			}
 		}
 	}
-	return result, usage
+	return result, usage, nil
 }
 
 // runtimeEventsLimit caps how many of the most recent runtime events are
@@ -1054,12 +1066,17 @@ const runtimeEventsLimit = 200
 // workflow event bus is an optional dependency: when it is absent the panel has
 // nothing to show, so an empty list is the contractually correct response, not a
 // silent error.
-func (s *HTTPServer) handleRuntimeEvents(w http.ResponseWriter, _ *http.Request) {
+func (s *HTTPServer) handleRuntimeEvents(w http.ResponseWriter, r *http.Request) {
 	if s.workflowEvents == nil {
 		writeJSON(w, http.StatusOK, []domain.RuntimeEvent{})
 		return
 	}
-	events := s.workflowEvents.Events()
+	events, err := s.workflowEvents.Events()
+	if err != nil {
+		observability.WithRequestID(s.logger, requestIDFromContext(r.Context())).Error("list runtime events failed", "error", err)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("list runtime events: %v", err))
+		return
+	}
 	if len(events) > runtimeEventsLimit {
 		events = events[len(events)-runtimeEventsLimit:]
 	}

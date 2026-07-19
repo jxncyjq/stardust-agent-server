@@ -866,13 +866,17 @@ func (b *streamingEventBus) Publish(ctx context.Context, event domain.RuntimeEve
 	return nil
 }
 
-func (b *streamingEventBus) Events() []domain.RuntimeEvent {
+func (b *streamingEventBus) Events() ([]domain.RuntimeEvent, error) {
 	if b.primary != nil {
-		return b.primary.Events()
+		events, err := b.primary.Events()
+		if err != nil {
+			return nil, fmt.Errorf("read primary event bus: %w", err)
+		}
+		return events, nil
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return append([]domain.RuntimeEvent(nil), b.events...)
+	return append([]domain.RuntimeEvent(nil), b.events...), nil
 }
 
 func persistentRunPorts(ctx context.Context, cfg config.Config) (runPorts, func(), error) {

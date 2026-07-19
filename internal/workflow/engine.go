@@ -230,7 +230,10 @@ func (e *Engine) executeAgentTask(ctx context.Context, def Definition, node Node
 	if e.scheduler == nil {
 		return StatusFailed, fmt.Errorf("%w: scheduler is required", ErrInvalidNode)
 	}
-	input := e.renderTaskInput(node.Task.Input)
+	input, err := e.renderTaskInput(node.Task.Input)
+	if err != nil {
+		return StatusFailed, fmt.Errorf("render input for workflow task %q: %w", node.Task.ID, err)
+	}
 	if err := e.scheduler.Add(ctx, domain.Task{
 		ID:        node.Task.ID,
 		CompanyID: node.Task.CompanyID,
@@ -244,27 +247,33 @@ func (e *Engine) executeAgentTask(ctx context.Context, def Definition, node Node
 	return e.completeNode(ctx, def.ID, node.ID, result)
 }
 
-func (e *Engine) renderTaskInput(input string) string {
+// renderTaskInput substitutes {{tasks.<id>.result}} placeholders with the latest
+// matching task_completed message. The event-bus read can fail, and rendering an
+// input against an unreadable event stream would silently schedule a task with
+// its placeholders left literal, so the read error is returned rather than
+// swallowed. An unresolved placeholder (no matching event yet) is a different
+// case: it is a legal not-yet state and keeps the literal placeholder.
+func (e *Engine) renderTaskInput(input string) (string, error) {
 	if e.events == nil || input == "" {
-		return input
+		return input, nil
+	}
+	events, err := e.events.Events()
+	if err != nil {
+		return "", fmt.Errorf("read runtime events: %w", err)
 	}
 	return taskResultPlaceholderRE.ReplaceAllStringFunc(input, func(match string) string {
 		parts := taskResultPlaceholderRE.FindStringSubmatch(match)
 		if len(parts) != 2 {
 			return match
 		}
-		if result, ok := e.latestTaskResult(parts[1]); ok {
+		if result, ok := latestTaskResult(events, parts[1]); ok {
 			return result
 		}
 		return match
-	})
+	}), nil
 }
 
-func (e *Engine) latestTaskResult(taskID string) (string, bool) {
-	if e.events == nil {
-		return "", false
-	}
-	events := e.events.Events()
+func latestTaskResult(events []domain.RuntimeEvent, taskID string) (string, bool) {
 	for i := len(events) - 1; i >= 0; i-- {
 		event := events[i]
 		if event.Type == "task_completed" && event.TaskID == taskID {
@@ -300,7 +309,11 @@ func (e *Engine) executeWaitEvent(ctx context.Context, def Definition, node Node
 	if e.events == nil {
 		return StatusFailed, fmt.Errorf("%w: event bus is required", ErrInvalidNode)
 	}
-	for _, event := range e.events.Events() {
+	events, err := e.events.Events()
+	if err != nil {
+		return StatusFailed, fmt.Errorf("read runtime events for wait_event node %q: %w", node.ID, err)
+	}
+	for _, event := range events {
 		if eventMatchesWaitNode(event, node) {
 			return e.completeNode(ctx, def.ID, node.ID, result)
 		}

@@ -7,6 +7,7 @@ import (
 	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/approval"
 	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/task"
 )
 
@@ -52,11 +53,13 @@ func TestEngineRunsSequenceAgentTasks(t *testing.T) {
 			t.Errorf("Get(%q) status = %s, want %s", taskID, got.Status, domain.TaskPending)
 		}
 	}
-	if !hasWorkflowEvent(events.Events(), "workflow_completed") {
-		t.Errorf("events missing workflow_completed: %#v", events.Events())
+	gotEvents := mustEvents(t, events)
+	if !hasWorkflowEvent(gotEvents, "workflow_completed") {
+		t.Errorf("events missing workflow_completed: %#v", gotEvents)
 	}
-	if !hasWorkflowAudit(audit.Events(), "workflow_completed") {
-		t.Errorf("audit missing workflow_completed: %#v", audit.Events())
+	gotAudit := mustAuditEvents(t, audit)
+	if !hasWorkflowAudit(gotAudit, "workflow_completed") {
+		t.Errorf("audit missing workflow_completed: %#v", gotAudit)
 	}
 }
 
@@ -225,8 +228,9 @@ func TestEngineWaitEventPausesWhenEventIsMissing(t *testing.T) {
 	if !hasNodeStatus(result.Nodes, "wait-missing", StatusWaitingEvent) {
 		t.Fatalf("Execute(wait_event missing) nodes = %#v, want wait-missing waiting_event", result.Nodes)
 	}
-	if !hasWorkflowEvent(events.Events(), "workflow_waiting_event") {
-		t.Fatalf("events missing workflow_waiting_event: %#v", events.Events())
+	gotEvents := mustEvents(t, events)
+	if !hasWorkflowEvent(gotEvents, "workflow_waiting_event") {
+		t.Fatalf("events missing workflow_waiting_event: %#v", gotEvents)
 	}
 }
 
@@ -428,6 +432,24 @@ func TestWorkflowLoopJoinQuorum(t *testing.T) {
 	if !hasNodeStatus(result.Nodes, "join-1", StatusCompleted) {
 		t.Fatalf("Execute(loop join quorum) nodes = %#v, want join completed", result.Nodes)
 	}
+}
+
+func mustEvents(t *testing.T, bus port.EventBus) []domain.RuntimeEvent {
+	t.Helper()
+	events, err := bus.Events()
+	if err != nil {
+		t.Fatalf("Events() error = %v, want nil", err)
+	}
+	return events
+}
+
+func mustAuditEvents(t *testing.T, log port.AuditLog) []domain.AuditEvent {
+	t.Helper()
+	events, err := log.Events()
+	if err != nil {
+		t.Fatalf("Events() error = %v, want nil", err)
+	}
+	return events
 }
 
 func hasWorkflowEvent(events []domain.RuntimeEvent, eventType string) bool {

@@ -60,10 +60,18 @@ type OutputSanitizer interface {
 
 type EventBus interface {
 	Publish(ctx context.Context, event domain.RuntimeEvent) error
-	Events() []domain.RuntimeEvent
+	// Events returns the recorded runtime events. Backing stores can fail
+	// (a SQLite query error, a closed handle); the error is part of the
+	// contract so a read failure surfaces as a failure instead of being
+	// indistinguishable from "no events have been published yet".
+	Events() ([]domain.RuntimeEvent, error)
 }
 
 type AuditLog interface {
 	Append(ctx context.Context, event domain.AuditEvent) error
-	Events() []domain.AuditEvent
+	// Events returns the recorded audit events. As with EventBus.Events, a
+	// backing-store failure is reported rather than collapsed into an empty
+	// slice — an audit trail that reads as empty because the query failed is
+	// worse than one that reads as broken.
+	Events() ([]domain.AuditEvent, error)
 }

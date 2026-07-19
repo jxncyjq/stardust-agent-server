@@ -64,8 +64,9 @@ func TestToolRegistryPipeline(t *testing.T) {
 	if result.Output == "ok\n<script>" {
 		t.Errorf("Registry.Execute(echo) output = %q, want sanitized output", result.Output)
 	}
-	if !hasAuditAction(audit.Events(), "tool_executed") {
-		t.Errorf("Registry.Execute(echo) audit events = %#v, want tool_executed", audit.Events())
+	auditEvents := mustAuditEvents(t, audit)
+	if !hasAuditAction(auditEvents, "tool_executed") {
+		t.Errorf("Registry.Execute(echo) audit events = %#v, want tool_executed", auditEvents)
 	}
 }
 

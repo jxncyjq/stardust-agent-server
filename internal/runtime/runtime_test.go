@@ -47,11 +47,13 @@ func TestRuntimeRunTaskCompletesThroughMaasPort(t *testing.T) {
 	if maas.CallCount() != 1 {
 		t.Errorf("MaasInferenceClient calls = %d, want 1", maas.CallCount())
 	}
-	if len(audit.Events()) == 0 {
+	auditEvents := mustAuditEvents(t, audit)
+	if len(auditEvents) == 0 {
 		t.Errorf("AuditLog events = 0, want at least 1")
 	}
-	if !hasLearningRuntimeEvent(events.Events(), evolution.SignalSuccess) {
-		t.Errorf("Runtime events missing learning success event: %#v", events.Events())
+	runtimeEvents := mustRuntimeEvents(t, events)
+	if !hasLearningRuntimeEvent(runtimeEvents, evolution.SignalSuccess) {
+		t.Errorf("Runtime events missing learning success event: %#v", runtimeEvents)
 	}
 }
 
@@ -73,11 +75,12 @@ func TestRuntimeRunTaskPublishesLightweightFailureLearningEvent(t *testing.T) {
 	if err == nil {
 		t.Fatalf("RunTask() error = nil, want error")
 	}
-	if !hasLearningRuntimeEvent(events.Events(), evolution.SignalFailure) {
-		t.Fatalf("Runtime events missing learning failure event: %#v", events.Events())
+	runtimeEvents := mustRuntimeEvents(t, events)
+	if !hasLearningRuntimeEvent(runtimeEvents, evolution.SignalFailure) {
+		t.Fatalf("Runtime events missing learning failure event: %#v", runtimeEvents)
 	}
-	if !hasLearningMessagePart(events.Events(), "lightweight=true") {
-		t.Fatalf("Runtime learning failure event missing lightweight=true: %#v", events.Events())
+	if !hasLearningMessagePart(runtimeEvents, "lightweight=true") {
+		t.Fatalf("Runtime learning failure event missing lightweight=true: %#v", runtimeEvents)
 	}
 }
 
@@ -245,11 +248,13 @@ func TestRuntimeExecutesModelToolCallsAndContinuesInference(t *testing.T) {
 	if !strings.Contains(maas.prompts[1], "cache is implemented by map") {
 		t.Fatalf("second inference prompt missing tool result:\n%s", maas.prompts[1])
 	}
-	if !hasRuntimeEvent(events.Events(), "tool_executed") {
-		t.Fatalf("runtime events missing tool_executed: %#v", events.Events())
+	runtimeEvents := mustRuntimeEvents(t, events)
+	if !hasRuntimeEvent(runtimeEvents, "tool_executed") {
+		t.Fatalf("runtime events missing tool_executed: %#v", runtimeEvents)
 	}
-	if !hasRuntimeAuditAction(audit.Events(), "tool_executed") {
-		t.Fatalf("audit events missing tool_executed: %#v", audit.Events())
+	auditEvents := mustAuditEvents(t, audit)
+	if !hasRuntimeAuditAction(auditEvents, "tool_executed") {
+		t.Fatalf("audit events missing tool_executed: %#v", auditEvents)
 	}
 }
 
@@ -352,8 +357,9 @@ func TestRuntimeFeedsToolExecuteErrorBackToModel(t *testing.T) {
 	if !strings.Contains(maas.prompts[1], "failed: task \"task-tool-error\" not found") {
 		t.Fatalf("second inference prompt missing tool failure text:\n%s", maas.prompts[1])
 	}
-	if !hasRuntimeEvent(events.Events(), "tool_failed") {
-		t.Fatalf("runtime events missing tool_failed: %#v", events.Events())
+	runtimeEvents := mustRuntimeEvents(t, events)
+	if !hasRuntimeEvent(runtimeEvents, "tool_failed") {
+		t.Fatalf("runtime events missing tool_failed: %#v", runtimeEvents)
 	}
 }
 
@@ -379,14 +385,15 @@ func TestRuntimeInterruptStopsBeforeInference(t *testing.T) {
 	if maas.prompt != "" {
 		t.Fatalf("RunTask(interrupted) MaaS prompt = %q, want no inference call", maas.prompt)
 	}
-	if !hasLearningRuntimeEvent(events.Events(), evolution.SignalFailure) {
-		t.Fatalf("RunTask(interrupted) events missing failure learning event: %#v", events.Events())
+	runtimeEvents := mustRuntimeEvents(t, events)
+	if !hasLearningRuntimeEvent(runtimeEvents, evolution.SignalFailure) {
+		t.Fatalf("RunTask(interrupted) events missing failure learning event: %#v", runtimeEvents)
 	}
-	if !hasLearningMessagePart(events.Events(), "reason="+evolution.FailureReasonInterrupted) {
-		t.Fatalf("RunTask(interrupted) learning event missing interrupted reason: %#v", events.Events())
+	if !hasLearningMessagePart(runtimeEvents, "reason="+evolution.FailureReasonInterrupted) {
+		t.Fatalf("RunTask(interrupted) learning event missing interrupted reason: %#v", runtimeEvents)
 	}
-	if !hasLearningMessagePart(events.Events(), "lightweight=true") {
-		t.Fatalf("RunTask(interrupted) learning event missing lightweight=true: %#v", events.Events())
+	if !hasLearningMessagePart(runtimeEvents, "lightweight=true") {
+		t.Fatalf("RunTask(interrupted) learning event missing lightweight=true: %#v", runtimeEvents)
 	}
 }
 
@@ -462,6 +469,29 @@ func (m *captureMaas) Generate(ctx context.Context, req port.InferenceRequest) (
 	}
 	m.prompt = req.Prompt
 	return port.InferenceResponse{Text: m.response, ReasoningSummary: m.reasoning}, nil
+}
+
+// mustAuditEvents reads the audit log's events, failing the test immediately
+// if the read itself errors (fail-loud: never silently substitute an empty
+// slice for a read failure).
+func mustAuditEvents(t *testing.T, log port.AuditLog) []domain.AuditEvent {
+	t.Helper()
+	events, err := log.Events()
+	if err != nil {
+		t.Fatalf("AuditLog.Events() error = %v", err)
+	}
+	return events
+}
+
+// mustRuntimeEvents reads the event bus's events, failing the test immediately
+// if the read itself errors.
+func mustRuntimeEvents(t *testing.T, bus port.EventBus) []domain.RuntimeEvent {
+	t.Helper()
+	events, err := bus.Events()
+	if err != nil {
+		t.Fatalf("EventBus.Events() error = %v", err)
+	}
+	return events
 }
 
 func hasLearningRuntimeEvent(events []domain.RuntimeEvent, signal evolution.SignalKind) bool {
@@ -548,8 +578,9 @@ func TestRuntimeGracefullyAnswersWhenToolBudgetExhausted(t *testing.T) {
 	if run.Result != "best-effort answer from gathered info" {
 		t.Fatalf("RunTask().Result = %q, want the forced final answer", run.Result)
 	}
-	if !hasRuntimeEvent(events.Events(), "task_completed") {
-		t.Fatalf("runtime events missing task_completed: %#v", events.Events())
+	runtimeEvents := mustRuntimeEvents(t, events)
+	if !hasRuntimeEvent(runtimeEvents, "task_completed") {
+		t.Fatalf("runtime events missing task_completed: %#v", runtimeEvents)
 	}
 }
 

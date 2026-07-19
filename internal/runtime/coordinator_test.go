@@ -143,8 +143,9 @@ func TestCoordinatorRunsPendingTaskToDone(t *testing.T) {
 	if stored.Status != domain.TaskDone {
 		t.Errorf("stored task status = %q, want %q", stored.Status, domain.TaskDone)
 	}
-	if !hasAuditAction(audit.Events(), "quality_approved") {
-		t.Errorf("audit actions missing %q: %#v", "quality_approved", audit.Events())
+	auditEvents := mustAuditEvents(t, audit)
+	if !hasAuditAction(auditEvents, "quality_approved") {
+		t.Errorf("audit actions missing %q: %#v", "quality_approved", auditEvents)
 	}
 }
 
@@ -208,11 +209,13 @@ func TestCoordinatorSuspendsHardLoopAndCreatesApproval(t *testing.T) {
 	if tickets[0].Type != approval.TicketHardLoop {
 		t.Errorf("approval ticket type = %q, want %q", tickets[0].Type, approval.TicketHardLoop)
 	}
-	if !hasAuditAction(audit.Events(), "approval_opened") {
-		t.Errorf("audit actions missing %q: %#v", "approval_opened", audit.Events())
+	auditEvents := mustAuditEvents(t, audit)
+	if !hasAuditAction(auditEvents, "approval_opened") {
+		t.Errorf("audit actions missing %q: %#v", "approval_opened", auditEvents)
 	}
-	if !hasLearningRuntimeEvent(events.Events(), evolution.SignalHardLoopFailure) {
-		t.Errorf("runtime events missing hard loop learning event: %#v", events.Events())
+	runtimeEvents := mustRuntimeEvents(t, events)
+	if !hasLearningRuntimeEvent(runtimeEvents, evolution.SignalHardLoopFailure) {
+		t.Errorf("runtime events missing hard loop learning event: %#v", runtimeEvents)
 	}
 }
 
@@ -346,8 +349,9 @@ func TestCoordinatorPublishesHardLoopLearningForResolvedAgent(t *testing.T) {
 	if current.Status != domain.TaskSuspended {
 		t.Fatalf("Heartbeat() status = %q, want %q", current.Status, domain.TaskSuspended)
 	}
-	if !hasLearningRuntimeEventForAgent(events.Events(), "researcher", evolution.SignalHardLoopFailure) {
-		t.Fatalf("runtime events missing researcher hard loop learning event: %#v", events.Events())
+	runtimeEvents := mustRuntimeEvents(t, events)
+	if !hasLearningRuntimeEventForAgent(runtimeEvents, "researcher", evolution.SignalHardLoopFailure) {
+		t.Fatalf("runtime events missing researcher hard loop learning event: %#v", runtimeEvents)
 	}
 }
 
