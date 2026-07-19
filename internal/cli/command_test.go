@@ -826,6 +826,110 @@ func TestRunTUITaskInjectsAndPersistsSessionTurns(t *testing.T) {
 	}
 }
 
+// TestRunTUITaskAppliesSessionModeAndWorkingDir guards Task 4's runTUITask
+// wiring: the default (non-mentioned-agent) task path must read
+// SessionManager.CurrentMode/CurrentWorkingDir and forward them into
+// app.RunTaskOptions, so the session's bound working_dir becomes the tool
+// sandbox root and the session's Plan mode restricts the model to read-only
+// tools — end to end, driven through runTUITask exactly as the TUI calls it,
+// with real tool dispatch (toolProbingMaas, defined above for
+// TestDefaultTaskRunnerSandboxesToolsToTaskWorkingDir) instead of a mocked
+// tool layer.
+func TestRunTUITaskAppliesSessionModeAndWorkingDir(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo := openCLITestSQLiteRepository(t)
+	session := newTUISessionController(tuiSessionControllerConfig{
+		Store:     repo,
+		Enabled:   true,
+		CompanyID: "cli-company",
+		AgentID:   "cli-agent",
+	})
+	if _, err := session.NewSession(ctx); err != nil {
+		t.Fatalf("NewSession() error = %v, want nil", err)
+	}
+	workingDir := t.TempDir()
+	if err := session.SetWorkingDir(ctx, workingDir); err != nil {
+		t.Fatalf("SetWorkingDir(%q) error = %v, want nil", workingDir, err)
+	}
+	writeCLIFile(t, workingDir, "inside.txt", "inside-content")
+
+	// The two subtests intentionally run sequentially (no t.Parallel()): they
+	// share the single session/store above, and the second subtest depends on
+	// SetMode(plan) applied only after the first subtest observes auto mode.
+	t.Run("session working_dir sandboxes the tool root", func(t *testing.T) {
+		maas := &toolProbingMaas{path: filepath.Join(workingDir, "inside.txt")}
+		result, err := runTUITask(ctx, app.New(), tuiTaskRunConfig{
+			Config:      config.Config{Runtime: config.RuntimeConfig{MaxToolRounds: 2}},
+			Prompt:      "read the session working dir file",
+			DefaultMaas: maas,
+			Session:     session,
+		})
+		if err != nil {
+			t.Fatalf("runTUITask(session working_dir) error = %v, want nil", err)
+		}
+		if result.Result != "done" {
+			t.Fatalf("runTUITask(session working_dir).Result = %q, want %q", result.Result, "done")
+		}
+		if !strings.Contains(maas.lastPrompt, "success: inside-content") {
+			t.Fatalf("runTUITask(session working_dir) prompt = %q, want tool success reading inside.txt", maas.lastPrompt)
+		}
+	})
+
+	t.Run("session Plan mode blocks write_file", func(t *testing.T) {
+		if err := session.SetMode(ctx, domain.ModePlan); err != nil {
+			t.Fatalf("SetMode(plan) error = %v, want nil", err)
+		}
+		target := filepath.Join(workingDir, "should-not-exist.txt")
+		maas := &appPlanWriteFileMaas{path: target}
+		result, err := runTUITask(ctx, app.New(), tuiTaskRunConfig{
+			Config:      config.Config{Runtime: config.RuntimeConfig{MaxToolRounds: 2}},
+			Prompt:      "写一个文件",
+			DefaultMaas: maas,
+			Session:     session,
+		})
+		if err != nil {
+			t.Fatalf("runTUITask(session plan mode) error = %v, want nil", err)
+		}
+		if result.Result != "写不了" {
+			t.Fatalf("runTUITask(session plan mode).Result = %q, want final answer text", result.Result)
+		}
+		if !strings.Contains(maas.lastPrompt, "failed: "+tool.ErrToolNotFound.Error()) {
+			t.Fatalf("runTUITask(session plan mode) prompt = %q, want write_file rejected as tool not found", maas.lastPrompt)
+		}
+		if _, statErr := os.Stat(target); !os.IsNotExist(statErr) {
+			t.Fatalf("runTUITask(session plan mode) created %q on disk, want Plan mode to block the write", target)
+		}
+	})
+}
+
+// appPlanWriteFileMaas emits a single write_file tool call on the first
+// inference, then returns a final text answer, capturing the last prompt so
+// a test can assert whether the write reached the tool registry (see
+// toolProbingMaas above for the same pattern applied to read_file).
+type appPlanWriteFileMaas struct {
+	path       string
+	rounds     int
+	lastPrompt string
+}
+
+func (m *appPlanWriteFileMaas) Generate(ctx context.Context, req port.InferenceRequest) (port.InferenceResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return port.InferenceResponse{}, err
+	}
+	m.rounds++
+	m.lastPrompt = req.Prompt
+	if m.rounds == 1 {
+		return port.InferenceResponse{ToolCalls: []domain.ToolCall{{
+			ID:        "plan-write-1",
+			Name:      "write_file",
+			Arguments: map[string]string{"path": m.path, "content": "package foo\n"},
+		}}}, nil
+	}
+	return port.InferenceResponse{Text: "写不了"}, nil
+}
+
 func TestTUISessionControllerCachesRecentTurnsAndInvalidatesAfterRecord(t *testing.T) {
 	t.Parallel()
 

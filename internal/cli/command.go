@@ -475,6 +475,8 @@ func runTUITask(ctx context.Context, application *app.App, cfg tuiTaskRunConfig)
 		Audit:             cfg.Audit,
 		TaskSink:          cfg.TaskSink,
 		ContextPrefix:     cfg.DefaultContextPrefix,
+		Mode:              cfg.Session.CurrentMode(),
+		WorkingDir:        cfg.Session.CurrentWorkingDir(),
 		Logger:            defaultLogger(),
 		Metrics:           observability.NewMetricsRecorder(nil),
 		ToolRoot:          cfg.Config.ContextFiles.Root,

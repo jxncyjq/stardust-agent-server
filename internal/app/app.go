@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/stardust/legion-agent/internal/adapter"
@@ -32,17 +33,28 @@ type DemoResult struct {
 type App struct{}
 
 type RunTaskOptions struct {
-	TaskID            string
-	Prompt            string
-	Plain             bool
-	Maas              port.MaasInferenceClient
-	Events            port.EventBus
-	Audit             port.AuditLog
-	TaskSink          TaskSink
-	ContextPrefix     string
-	AgentID           string
-	Role              string
-	CompanyID         string
+	TaskID        string
+	Prompt        string
+	Plain         bool
+	Maas          port.MaasInferenceClient
+	Events        port.EventBus
+	Audit         port.AuditLog
+	TaskSink      TaskSink
+	ContextPrefix string
+	AgentID       string
+	Role          string
+	CompanyID     string
+	// Mode is the task's working mode (domain.ModeManual/ModePlan/ModeAuto).
+	// It is carried onto the constructed domain.Task so the runtime can apply
+	// Mode-specific behavior (e.g. Plan mode's read-only tool subset via
+	// Runtime.effectiveTools). Empty means the runtime's own default applies.
+	Mode string
+	// WorkingDir is the host filesystem directory this task's tools are
+	// sandboxed to. When non-empty it takes priority over ToolRoot as the
+	// WorkspacePathGuard root (mirrors agentToolRoot's task.WorkingDir
+	// priority in internal/runtime/agent_resolver.go), confining every tool
+	// call to this directory. Empty falls back to ToolRoot.
+	WorkingDir        string
 	Logger            *slog.Logger
 	Metrics           *observability.MetricsRecorder
 	ToolRoot          string
@@ -177,7 +189,10 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 	if opts.ContextPrefix != "" || len(opts.ConversationTurns) > 0 {
 		contextBuilder = cognitive.NewCore(cognitive.NoopCompressor{}).WithContextFiles(opts.ContextPrefix)
 	}
-	toolRoot := opts.ToolRoot
+	toolRoot := strings.TrimSpace(opts.WorkingDir)
+	if toolRoot == "" {
+		toolRoot = opts.ToolRoot
+	}
 	if toolRoot == "" {
 		toolRoot = "."
 	}
@@ -197,12 +212,14 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 		ConversationTurns: opts.ConversationTurns,
 	})
 	task := domain.Task{
-		ID:        opts.TaskID,
-		CompanyID: opts.CompanyID,
-		AgentID:   opts.AgentID,
-		Status:    domain.TaskRunning,
-		Input:     opts.Prompt,
-		CreatedAt: time.Now(),
+		ID:         opts.TaskID,
+		CompanyID:  opts.CompanyID,
+		AgentID:    opts.AgentID,
+		Mode:       opts.Mode,
+		WorkingDir: opts.WorkingDir,
+		Status:     domain.TaskRunning,
+		Input:      opts.Prompt,
+		CreatedAt:  time.Now(),
 	}
 	if opts.Metrics != nil {
 		opts.Metrics.IncTaskStatus("running")
