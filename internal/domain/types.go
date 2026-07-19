@@ -206,7 +206,12 @@ type AgentMessage struct {
 	Summary       string             `json:"summary"`
 	Artifact      string             `json:"artifact,omitempty"`
 	CreatedAt     time.Time          `json:"created_at"`
-	ReadAt        time.Time          `json:"read_at,omitempty"`
+	// ReadAt carries no omitempty: encoding/json ignores it on struct types, so
+	// an unread message still marshals as "0001-01-01T00:00:00Z" rather than
+	// dropping the key. Consumers must treat the zero time as "unread" — use
+	// ReadAt.IsZero(), not the key's absence. Making the key genuinely optional
+	// requires changing the field to *time.Time, which is a wire-contract change.
+	ReadAt time.Time `json:"read_at"`
 }
 
 type AgentMessageQuery struct {
