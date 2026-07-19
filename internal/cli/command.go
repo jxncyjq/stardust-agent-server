@@ -205,6 +205,26 @@ func newTUICommand(application *app.App, out io.Writer) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			// Manual-mode approval wiring for the TUI (方案 Y): pendingCh/decisionCh
+			// and the approvalGate they back are created once, here, and shared by
+			// every task the session runs — both TUI entry points (runTUITask and
+			// runMentionedTUIAgentTask, via tuiTaskRunConfig.ToolGate below) and the
+			// InteractiveModel (via InteractiveConfig.ApprovalCh/DecisionCh) hold the
+			// opposing ends of the same pair for the lifetime of the program. This is
+			// safe to share because the TUI only ever runs one task at a time (see
+			// InteractiveModel.running), so at most one approvalGate.Resolve call is
+			// ever blocked waiting on decisionCh. checkpointStore is required
+			// alongside the gate by the runtime's Manual-mode invariant (see
+			// runtime.ErrManualGateMissing) even though 方案 Y's gate never actually
+			// suspends a round — see tuiTaskRunConfig.Checkpoints's doc comment.
+			pendingApprovalCh := make(chan tui.PendingApproval)
+			approvalDecisionCh := make(chan tui.ApprovalDecision)
+			approvalGate := tui.NewApprovalGate(pendingApprovalCh, approvalDecisionCh)
+			workspaceRoot, workspaceRootWarning := sessionstate.ResolveWorkspaceRoot(cfg.Workspace.Root)
+			if workspaceRootWarning != "" {
+				defaultLogger().Warn("workspace root fallback", "detail", workspaceRootWarning)
+			}
+			checkpointStore := sessionstate.NewStore(workspaceRoot)
 			session := newTUISessionController(tuiSessionControllerConfig{
 				Store:         persistent.sessionStore,
 				Enabled:       cfg.Session.Enabled,
@@ -234,6 +254,8 @@ func newTUICommand(application *app.App, out io.Writer) *cobra.Command {
 					MessageStore:         persistent.messageStore,
 					Emit:                 emit,
 					Session:              session,
+					ToolGate:             approvalGate,
+					Checkpoints:          checkpointStore,
 				})
 			}
 			colorProfile := parseTUIColorProfile(cfg.TUI.ColorProfile)
@@ -263,6 +285,8 @@ func newTUICommand(application *app.App, out io.Writer) *cobra.Command {
 				HideThinking:    !cfg.TUI.ShowThinking,
 				Renderer:        renderer,
 				Theme:           tuiTheme,
+				ApprovalCh:      pendingApprovalCh,
+				DecisionCh:      approvalDecisionCh,
 			}), tea.WithOutput(out), tea.WithAltScreen(), tea.WithMouseCellMotion())
 			_, err = program.Run()
 			return err
@@ -387,6 +411,21 @@ type tuiTaskRunConfig struct {
 	ConversationTurns    []domain.ConversationTurn
 	TaskLedger           *taskledger.Ledger
 	MessageStore         tool.AgentMessageStore
+	// ToolGate gates Manual-mode sensitive tool calls for both TUI task
+	// entry points (runTUITask and runMentionedTUIAgentTask must both wire
+	// it — an @mention path that skipped it would let a Manual-mode agent
+	// bypass approval). Wired once at `tui` command startup to the TUI's
+	// 方案 Y in-process approval gate (see tui.NewApprovalGate); nil for the
+	// plain `run`/demo paths, which never construct a tuiTaskRunConfig.
+	ToolGate agentruntime.ToolGate
+	// Checkpoints satisfies the runtime's Manual-mode invariant (see
+	// runtime.ErrManualGateMissing): a Manual task requires it non-nil
+	// alongside ToolGate even though 方案 Y's gate never actually suspends a
+	// round (ShouldSuspend always false), because the runtime cannot tell
+	// "no gate wired" apart from "gate that never suspends" from the Config
+	// alone. It shares the same on-disk store the `serve` command's
+	// manualgate flow uses, so it is otherwise inert here.
+	Checkpoints *sessionstate.Store
 }
 
 func parseTUIAgentPrompt(input string) tuiAgentPrompt {
@@ -475,6 +514,8 @@ func runTUITask(ctx context.Context, application *app.App, cfg tuiTaskRunConfig)
 		Audit:             cfg.Audit,
 		TaskSink:          cfg.TaskSink,
 		ContextPrefix:     cfg.DefaultContextPrefix,
+		Mode:              cfg.Session.CurrentMode(),
+		WorkingDir:        cfg.Session.CurrentWorkingDir(),
 		Logger:            defaultLogger(),
 		Metrics:           observability.NewMetricsRecorder(nil),
 		ToolRoot:          cfg.Config.ContextFiles.Root,
@@ -485,6 +526,8 @@ func runTUITask(ctx context.Context, application *app.App, cfg tuiTaskRunConfig)
 		LazyTools:         cfg.Config.Runtime.LazyTools,
 		ConversationTurns: cfg.ConversationTurns,
 		WebTools:          webToolOptions(cfg.Config.Web),
+		ToolGate:          cfg.ToolGate,
+		Checkpoints:       cfg.Checkpoints,
 	})
 	if err != nil {
 		return app.DemoResult{}, err
@@ -556,6 +599,8 @@ func runMentionedTUIAgentTask(ctx context.Context, application *app.App, cfg tui
 		ContextPrefix:     contextPrefix,
 		AgentID:           firstNonEmpty(agentCfg.ID, parsed.AgentID),
 		Role:              firstNonEmpty(agentCfg.Role, "developer"),
+		Mode:              cfg.Session.CurrentMode(),
+		WorkingDir:        cfg.Session.CurrentWorkingDir(),
 		Logger:            defaultLogger(),
 		Metrics:           observability.NewMetricsRecorder(nil),
 		ToolRoot:          toolRoot,
@@ -566,6 +611,8 @@ func runMentionedTUIAgentTask(ctx context.Context, application *app.App, cfg tui
 		LazyTools:         cfg.Config.Runtime.LazyTools,
 		ConversationTurns: cfg.ConversationTurns,
 		WebTools:          webToolOptions(cfg.Config.Web),
+		ToolGate:          cfg.ToolGate,
+		Checkpoints:       cfg.Checkpoints,
 	})
 	if err != nil {
 		return app.DemoResult{}, err
@@ -878,6 +925,12 @@ type tuiSessionController struct {
 	restoreLatest bool
 	cache         sessionContextCache
 	currentID     string
+	// currentMode and currentWorkingDir mirror the AgentSession.Mode/WorkingDir
+	// of the session identified by currentID, kept in sync by NewSession,
+	// Initialize, SwitchSession, SetMode and SetWorkingDir so CurrentMode/
+	// CurrentWorkingDir can answer without a store round trip.
+	currentMode       string
+	currentWorkingDir string
 }
 
 type sessionContextCache interface {
@@ -918,6 +971,7 @@ func (c *tuiSessionController) Initialize(ctx context.Context) error {
 		}
 		if ok {
 			c.currentID = session.ID
+			c.applySessionState(session)
 			return nil
 		}
 	}
@@ -951,6 +1005,7 @@ func (c *tuiSessionController) NewSession(ctx context.Context) (string, error) {
 	}
 	c.invalidateCurrentSessionCache()
 	c.currentID = id
+	c.applySessionState(session)
 	return id, nil
 }
 
@@ -989,6 +1044,7 @@ func (c *tuiSessionController) SwitchSession(ctx context.Context, id string) err
 		if session.ID == id {
 			c.invalidateCurrentSessionCache()
 			c.currentID = id
+			c.applySessionState(session)
 			return nil
 		}
 	}
@@ -1085,6 +1141,136 @@ func (c *tuiSessionController) invalidateCurrentSessionCache() {
 		return
 	}
 	c.cache.InvalidateSession(c.currentID)
+}
+
+// applySessionState mirrors session's Mode/WorkingDir onto currentMode /
+// currentWorkingDir. It normalizes Mode via domain.NormalizeMode so an empty
+// persisted value reads back as domain.ModeAuto, matching NormalizeMode's own
+// "empty is a legitimate default" contract; a value NormalizeMode rejects (should
+// not occur for state this controller itself wrote) is kept as-is rather than
+// silently coerced, so a caller inspecting CurrentMode still sees the raw data.
+func (c *tuiSessionController) applySessionState(session domain.AgentSession) {
+	mode, ok := domain.NormalizeMode(session.Mode)
+	if !ok {
+		mode = session.Mode
+	}
+	c.currentMode = mode
+	c.currentWorkingDir = session.WorkingDir
+}
+
+// currentAgentSession loads the full AgentSession record for currentID from
+// the store. SaveAgentSession persists whole records (see
+// storage.SQLiteRepository.SaveAgentSession), so mutating a single field
+// requires reading the current record first or every other field would be
+// clobbered back to a stale/zero value.
+func (c *tuiSessionController) currentAgentSession(ctx context.Context) (domain.AgentSession, error) {
+	sessions, err := c.store.ListAgentSessions(ctx, c.companyID, c.agentID)
+	if err != nil {
+		return domain.AgentSession{}, err
+	}
+	for _, session := range sessions {
+		if session.ID == c.currentID {
+			return session, nil
+		}
+	}
+	return domain.AgentSession{}, fmt.Errorf("session %q not found", c.currentID)
+}
+
+// CurrentMode implements SessionManager. See SessionManager.CurrentMode.
+func (c *tuiSessionController) CurrentMode() string {
+	if c == nil {
+		return domain.ModeAuto
+	}
+	mode, ok := domain.NormalizeMode(c.currentMode)
+	if !ok {
+		return c.currentMode
+	}
+	return mode
+}
+
+// SetMode implements SessionManager. See SessionManager.SetMode.
+func (c *tuiSessionController) SetMode(ctx context.Context, mode string) error {
+	if c == nil || !c.enabled {
+		return fmt.Errorf("会话未启用，无法设置工作模式")
+	}
+	normalized, ok := domain.NormalizeMode(mode)
+	if !ok {
+		return fmt.Errorf("invalid mode %q (want manual|plan|auto)", mode)
+	}
+	if c.currentID == "" {
+		if err := c.Initialize(ctx); err != nil {
+			return err
+		}
+	}
+	session, err := c.currentAgentSession(ctx)
+	if err != nil {
+		return err
+	}
+	session.Mode = normalized
+	session.UpdatedAt = time.Now()
+	if err := c.store.SaveAgentSession(ctx, session); err != nil {
+		return err
+	}
+	c.invalidateCurrentSessionCache()
+	c.currentMode = normalized
+	return nil
+}
+
+// CurrentWorkingDir implements SessionManager. See SessionManager.CurrentWorkingDir.
+func (c *tuiSessionController) CurrentWorkingDir() string {
+	if c == nil {
+		return ""
+	}
+	return c.currentWorkingDir
+}
+
+// SetWorkingDir implements SessionManager. See SessionManager.SetWorkingDir.
+//
+// This mirrors the HTTP server's PATCH /v1/sessions handler
+// (handlePatchSession in server/http.go): set-once-then-immutable semantics
+// on WorkingDir. Session on-disk state (sessionstate.SessionBase) is filed
+// under whatever working_dir a session carries at write time, and repointing
+// it strands previously-filed state -- silently, since recovery after a
+// restart only enumerates bases currently in use. The TUI writes the same
+// conversationStore record the HTTP server does, so it must enforce the same
+// guard: once WorkingDir is non-empty, changing it to a different directory
+// is rejected outright. Setting it for the first time (currently empty) and
+// re-setting the same value (no-op) both remain allowed.
+func (c *tuiSessionController) SetWorkingDir(ctx context.Context, dir string) error {
+	if c == nil || !c.enabled {
+		return fmt.Errorf("会话未启用，无法设置工作目录")
+	}
+	dir = strings.TrimSpace(dir)
+	if dir != "" {
+		info, err := os.Stat(dir)
+		if err != nil {
+			return fmt.Errorf("stat working dir %q: %w", dir, err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("working dir %q is not a directory", dir)
+		}
+	}
+	if c.currentID == "" {
+		if err := c.Initialize(ctx); err != nil {
+			return err
+		}
+	}
+	session, err := c.currentAgentSession(ctx)
+	if err != nil {
+		return err
+	}
+	currentWorkingDir := strings.TrimSpace(session.WorkingDir)
+	if currentWorkingDir != "" && dir != currentWorkingDir {
+		return fmt.Errorf("working_dir cannot be changed once set")
+	}
+	session.WorkingDir = dir
+	session.UpdatedAt = time.Now()
+	if err := c.store.SaveAgentSession(ctx, session); err != nil {
+		return err
+	}
+	c.invalidateCurrentSessionCache()
+	c.currentWorkingDir = dir
+	return nil
 }
 
 func normalizeRecentTurns(turns int) int {

@@ -3,7 +3,9 @@ package tui
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -42,6 +44,17 @@ type InteractiveConfig struct {
 	HideThinking    bool
 	Renderer        *lipgloss.Renderer
 	Theme           ThemeColors
+	// ApprovalCh delivers Manual-mode sensitive-tool approval requests
+	// published by a tui.NewApprovalGate wired into the current task's
+	// runtime.ToolGate (方案 Y). Nil disables the approval prompt entirely
+	// (waitApproval becomes a no-op) — the plain, gate-less `run`/demo paths
+	// never set this.
+	ApprovalCh <-chan PendingApproval
+	// DecisionCh carries the human's approve/deny answer back to the
+	// blocked gate. Must be the opposing end of the same channel pair
+	// passed to the tui.NewApprovalGate that feeds ApprovalCh, or a decision
+	// has nowhere to go.
+	DecisionCh chan<- ApprovalDecision
 }
 
 type InteractiveModel struct {
@@ -86,6 +99,13 @@ type InteractiveModel struct {
 	messageMsg     string
 	agentID        string
 	turns          []conversationTurn
+	mode           string
+	workingDir     string
+	approvalCh     <-chan PendingApproval
+	decisionCh     chan<- ApprovalDecision
+	approvalActive bool
+	approvalTool   string
+	approvalArgs   map[string]string
 }
 
 type interactiveViewMode string
@@ -108,6 +128,20 @@ type SessionManager interface {
 	ListSessions(context.Context) ([]string, error)
 	SwitchSession(context.Context, string) error
 	ClearSession(context.Context) error
+	// CurrentMode returns the working mode bound to the current session
+	// ("manual"/"plan"/"auto"), normalized per domain.NormalizeMode (empty
+	// state reads back as "auto").
+	CurrentMode() string
+	// SetMode validates mode via domain.NormalizeMode (fail-loud on an
+	// unrecognized value) and persists it onto the current session.
+	SetMode(context.Context, string) error
+	// CurrentWorkingDir returns the host filesystem directory bound to the
+	// current session, or "" if the session is unbound.
+	CurrentWorkingDir() string
+	// SetWorkingDir validates dir exists and is a directory (fail-loud
+	// otherwise; an empty dir clears the binding) and persists it onto the
+	// current session.
+	SetWorkingDir(context.Context, string) error
 }
 
 type AgentMessageStore interface {
@@ -149,6 +183,8 @@ var interactiveCommands = []interactiveCommand{
 	{Name: "/skill install ", Description: "安装技能 <github:owner/repo | https://...>"},
 	{Name: "/skill update ", Description: "更新技能 <name>"},
 	{Name: "/skill uninstall ", Description: "卸载技能 <name>"},
+	{Name: "/mode ", Description: "设置工作模式 manual|plan|auto"},
+	{Name: "/cwd ", Description: "设置工作目录 <path>"},
 }
 
 // ThemeColors defines the color palette for the TUI.
@@ -246,6 +282,10 @@ func NewInteractiveModel(cfg InteractiveConfig) InteractiveModel {
 		agentID:        agentID,
 		showPrompt:     !cfg.HidePrompt,
 		showThinking:   !cfg.HideThinking,
+		mode:           currentMode(cfg.SessionManager),
+		workingDir:     currentWorkingDir(cfg.SessionManager),
+		approvalCh:     cfg.ApprovalCh,
+		decisionCh:     cfg.DecisionCh,
 	}
 }
 
@@ -254,6 +294,24 @@ func currentSessionID(manager SessionManager) string {
 		return ""
 	}
 	return strings.TrimSpace(manager.CurrentSessionID())
+}
+
+// currentMode returns the session manager's current mode, or
+// domain.ModeAuto when manager is nil (no session binding available yet).
+func currentMode(manager SessionManager) string {
+	if manager == nil {
+		return domain.ModeAuto
+	}
+	return manager.CurrentMode()
+}
+
+// currentWorkingDir returns the session manager's current working
+// directory, or "" when manager is nil (no session binding available yet).
+func currentWorkingDir(manager SessionManager) string {
+	if manager == nil {
+		return ""
+	}
+	return manager.CurrentWorkingDir()
 }
 
 func normalizedAgentNames(names []string) []string {
@@ -273,12 +331,25 @@ func normalizedAgentNames(names []string) []string {
 	return out
 }
 
+// Init starts the model's persistent listener for Manual-mode approval
+// requests. It runs for the lifetime of the bubbletea program (waitApproval
+// re-issues itself after every resolved approval — see the
+// interactivePendingApprovalMsg case in Update), not just for one task run:
+// approvalCh is wired once, at TUI startup, to the single shared gate every
+// runTUITask/runMentionedTUIAgentTask call reuses, and at most one Resolve
+// call is ever blocked at a time (the TUI only runs one task at a time — see
+// m.running).
 func (m InteractiveModel) Init() tea.Cmd {
-	return nil
+	return m.waitApproval()
 }
 
 func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case interactivePendingApprovalMsg:
+		m.approvalActive = true
+		m.approvalTool = msg.Tool
+		m.approvalArgs = msg.Args
+		return m, nil
 	case interactiveRunDoneMsg:
 		m.running = false
 		m.err = ""
@@ -327,6 +398,9 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.MouseMsg:
 		return m.updateMouse(msg), nil
 	case tea.KeyMsg:
+		if m.approvalActive {
+			return m.updateApprovalKey(msg)
+		}
 		switch msg.Type {
 		case tea.KeyCtrlC, tea.KeyEsc:
 			m.quitting = true
@@ -366,6 +440,12 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if handled, next := m.handleSessionCommand(context.Background(), prompt); handled {
+				return next, nil
+			}
+			if handled, next := m.handleModeCommand(context.Background(), prompt); handled {
+				return next, nil
+			}
+			if handled, next := m.handleCwdCommand(context.Background(), prompt); handled {
 				return next, nil
 			}
 			if handled, next := m.handleTaskCommand(context.Background(), prompt); handled {
@@ -676,6 +756,9 @@ func (m InteractiveModel) renderMain(width int, height int) string {
 
 func (m InteractiveModel) renderMainBody(width int, height int) string {
 	var parts []string
+	if m.approvalActive {
+		parts = append(parts, m.renderApprovalPrompt())
+	}
 	if m.err != "" {
 		parts = append(parts, m.styles.err.Render("ERROR")+" "+m.clean(m.err))
 	}
@@ -834,6 +917,8 @@ func (m InteractiveModel) renderFooter(width int) string {
 	if m.sessionID != "" {
 		left += m.styles.dim.Render(" · " + m.clean(m.sessionID))
 	}
+	left += m.styles.dim.Render(" · " + m.clean(m.footerMode()))
+	left += m.styles.dim.Render(" · " + m.clean(m.footerWorkingDir()))
 	if m.copyNotice != "" {
 		notice := m.styles.title.Render(" ✓ " + m.copyNotice)
 		gap := width - lipgloss.Width(left) - lipgloss.Width(notice)
@@ -857,6 +942,28 @@ func (m InteractiveModel) renderFooter(width int) string {
 		gap = 1
 	}
 	return left + strings.Repeat(" ", gap) + right
+}
+
+// footerMode returns the mode label for the status bar, defaulting to
+// domain.ModeAuto when the model has no mode bound yet (mirrors
+// currentMode's nil-manager default).
+func (m InteractiveModel) footerMode() string {
+	mode := strings.TrimSpace(m.mode)
+	if mode == "" {
+		return domain.ModeAuto
+	}
+	return mode
+}
+
+// footerWorkingDir returns a status-bar-safe label for the current working
+// directory: "(default)" when unset, otherwise the directory's basename so a
+// long path can't overflow the footer.
+func (m InteractiveModel) footerWorkingDir() string {
+	dir := strings.TrimSpace(m.workingDir)
+	if dir == "" {
+		return "(default)"
+	}
+	return filepath.Base(dir)
 }
 
 func (m InteractiveModel) handleSessionCommand(ctx context.Context, prompt string) (bool, InteractiveModel) {
@@ -886,6 +993,8 @@ func (m InteractiveModel) handleSessionCommand(ctx context.Context, prompt strin
 		m.err = ""
 		m.sessionID = id
 		m.turns = nil
+		m.mode = currentMode(m.sessionManager)
+		m.workingDir = currentWorkingDir(m.sessionManager)
 		m.sessionMsg = "created " + id
 	case "/sessions":
 		ids, err := m.sessionManager.ListSessions(ctx)
@@ -911,6 +1020,8 @@ func (m InteractiveModel) handleSessionCommand(ctx context.Context, prompt strin
 		m.err = ""
 		m.sessionID = fields[1]
 		m.turns = nil
+		m.mode = currentMode(m.sessionManager)
+		m.workingDir = currentWorkingDir(m.sessionManager)
 		m.sessionMsg = "switched to " + fields[1]
 	case "/clear-session":
 		if err := m.sessionManager.ClearSession(ctx); err != nil {
@@ -920,8 +1031,65 @@ func (m InteractiveModel) handleSessionCommand(ctx context.Context, prompt strin
 		m.err = ""
 		m.sessionID = currentSessionID(m.sessionManager)
 		m.turns = nil
+		m.mode = currentMode(m.sessionManager)
+		m.workingDir = currentWorkingDir(m.sessionManager)
 		m.sessionMsg = "session cleared"
 	}
+	return true, m
+}
+
+// handleModeCommand handles the "/mode <manual|plan|auto>" command. It
+// delegates validation to SessionManager.SetMode (fail-loud on an
+// unrecognized mode via domain.NormalizeMode) and, on success, refreshes
+// model.mode from SessionManager.CurrentMode so the status bar reflects the
+// normalized, persisted value.
+func (m InteractiveModel) handleModeCommand(ctx context.Context, prompt string) (bool, InteractiveModel) {
+	fields := strings.Fields(prompt)
+	if len(fields) == 0 || !strings.EqualFold(fields[0], "/mode") {
+		return false, m
+	}
+	m.input = ""
+	if m.sessionManager == nil {
+		m.err = "session manager unavailable"
+		return true, m
+	}
+	if len(fields) < 2 {
+		m.err = "usage: /mode manual|plan|auto"
+		return true, m
+	}
+	if err := m.sessionManager.SetMode(ctx, fields[1]); err != nil {
+		m.err = err.Error()
+		return true, m
+	}
+	m.err = ""
+	m.mode = m.sessionManager.CurrentMode()
+	return true, m
+}
+
+// handleCwdCommand handles the "/cwd <path>" command. It delegates
+// validation to SessionManager.SetWorkingDir (fail-loud when path does not
+// resolve to an existing directory) and, on success, refreshes
+// model.workingDir from SessionManager.CurrentWorkingDir.
+func (m InteractiveModel) handleCwdCommand(ctx context.Context, prompt string) (bool, InteractiveModel) {
+	fields := strings.Fields(prompt)
+	if len(fields) == 0 || !strings.EqualFold(fields[0], "/cwd") {
+		return false, m
+	}
+	m.input = ""
+	if m.sessionManager == nil {
+		m.err = "session manager unavailable"
+		return true, m
+	}
+	if len(fields) < 2 {
+		m.err = "usage: /cwd <path>"
+		return true, m
+	}
+	if err := m.sessionManager.SetWorkingDir(ctx, fields[1]); err != nil {
+		m.err = err.Error()
+		return true, m
+	}
+	m.err = ""
+	m.workingDir = m.sessionManager.CurrentWorkingDir()
 	return true, m
 }
 
@@ -1409,6 +1577,31 @@ func (m InteractiveModel) renderHistory(width int) string {
 	return strings.Join(lines, "\n")
 }
 
+// renderApprovalPrompt renders the terminal approval box for a pending
+// Manual-mode sensitive tool call: the tool name, its arguments (sorted by
+// key for stable output), and the approve/deny keys. It is shown whenever
+// m.approvalActive is true, ahead of every other view-mode content, so it
+// can never be scrolled or navigated away from unanswered.
+func (m InteractiveModel) renderApprovalPrompt() string {
+	var b strings.Builder
+	b.WriteString(m.styles.label.Render("APPROVAL REQUIRED"))
+	b.WriteString("\n")
+	b.WriteString(m.styles.title.Render("工具: ") + m.clean(m.approvalTool))
+	if len(m.approvalArgs) > 0 {
+		b.WriteString("\n" + m.styles.dim.Render("参数:"))
+		keys := make([]string, 0, len(m.approvalArgs))
+		for k := range m.approvalArgs {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			b.WriteString("\n  " + m.clean(k) + " = " + m.clean(m.approvalArgs[k]))
+		}
+	}
+	b.WriteString("\n\n" + m.styles.err.Render("批准(y) / 拒绝(n)"))
+	return b.String()
+}
+
 func (m InteractiveModel) renderAudit() string {
 	if len(m.result.AuditActions) == 0 {
 		return "No audit actions yet."
@@ -1433,6 +1626,10 @@ type interactiveSkillDoneMsg struct {
 type interactiveProgressTickMsg struct{}
 type interactiveStreamEventMsg domain.RuntimeEvent
 type interactiveStreamClosedMsg struct{}
+
+// interactivePendingApprovalMsg wraps a PendingApproval delivered from
+// waitApproval so it can flow through bubbletea's Update as a tea.Msg.
+type interactivePendingApprovalMsg PendingApproval
 
 func interactiveProgressTick() tea.Cmd {
 	return tea.Tick(120*time.Millisecond, func(time.Time) tea.Msg {
@@ -1475,6 +1672,77 @@ func (m InteractiveModel) waitStream() tea.Cmd {
 			return interactiveStreamClosedMsg{}
 		}
 		return interactiveStreamEventMsg(event)
+	}
+}
+
+// waitApproval listens for the next Manual-mode approval request on
+// approvalCh. It is issued once from Init (see Init's doc comment) and
+// re-issued every time the current approval is resolved (see
+// resolveApproval), forming a self-perpetuating chain for the life of the
+// program — exactly one instance is ever in flight, mirroring waitStream's
+// per-event re-issue pattern. A nil approvalCh (no gate wired — the plain
+// `run`/demo paths) makes this a one-shot no-op.
+func (m InteractiveModel) waitApproval() tea.Cmd {
+	approvalCh := m.approvalCh
+	return func() tea.Msg {
+		if approvalCh == nil {
+			return nil
+		}
+		pending, ok := <-approvalCh
+		if !ok {
+			return nil
+		}
+		return interactivePendingApprovalMsg(pending)
+	}
+}
+
+// updateApprovalKey handles a keypress while a Manual-mode sensitive tool
+// call is awaiting a human decision (m.approvalActive). Only y (approve), n
+// (deny), and the quit keys are meaningful; every other key is swallowed so
+// the composer can't be typed into (and the pending call can't be silently
+// bypassed) while a decision is outstanding.
+func (m InteractiveModel) updateApprovalKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyCtrlC, tea.KeyEsc:
+		m.quitting = true
+		return m, tea.Quit
+	case tea.KeyRunes:
+		switch strings.ToLower(string(msg.Runes)) {
+		case "y":
+			return m.resolveApproval(true)
+		case "n":
+			return m.resolveApproval(false)
+		}
+	}
+	return m, nil
+}
+
+// resolveApproval clears the pending-approval display state and answers it:
+// the decision is sent asynchronously via a tea.Cmd (never an inline channel
+// send from within Update, which must never block the bubbletea main loop),
+// and waitApproval is re-issued in the same batch to keep listening for the
+// next approval — in this same task run (a multi-round Manual task) or a
+// later one.
+func (m InteractiveModel) resolveApproval(allow bool) (tea.Model, tea.Cmd) {
+	m.approvalActive = false
+	m.approvalTool = ""
+	m.approvalArgs = nil
+	return m, tea.Batch(m.sendApprovalDecision(allow), m.waitApproval())
+}
+
+// sendApprovalDecision returns a tea.Cmd that delivers allow to the blocked
+// gate over decisionCh. The gate is guaranteed to already be parked in its
+// receive select by the time a decision can be sent (it only publishes the
+// PendingApproval that put the model into approvalActive after it starts
+// waiting for the answer), so this send completes promptly rather than
+// blocking the cmd goroutine indefinitely.
+func (m InteractiveModel) sendApprovalDecision(allow bool) tea.Cmd {
+	decisionCh := m.decisionCh
+	return func() tea.Msg {
+		if decisionCh != nil {
+			decisionCh <- ApprovalDecision{Allow: allow}
+		}
+		return nil
 	}
 }
 

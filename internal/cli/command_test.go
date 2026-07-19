@@ -767,6 +767,215 @@ func TestRunTUITaskReturnsErrorForUnknownMentionedAgent(t *testing.T) {
 	}
 }
 
+// TestRunMentionedTUIAgentTaskAppliesSessionModeAndWorkingDir closes a
+// cross-entry-point gap found in review of Task 4: runMentionedTUIAgentTask
+// is a second TUI task execution path (reached whenever the prompt starts
+// with "@agent"), and it built its own app.RunTaskOptions literal without
+// the Mode/WorkingDir fields Task 4 added to the default runTUITask path.
+// That let an @mention task bypass both the session's working_dir sandbox
+// and Plan mode's read-only tool subset. This test drives the exact same
+// scenarios as TestRunTUITaskAppliesSessionModeAndWorkingDir (session
+// working_dir sandboxes the tool root; session Plan mode blocks
+// write_file), but through the @mention path. Unlike the default path,
+// runMentionedTUIAgentTask always builds its MaaS client from config via
+// maasFactoryFromConfig (never accepts cfg.DefaultMaas directly), so the
+// tool-call round trip is driven through a real HTTP-backed MaaS profile
+// (mirroring the openai-chat-shaped mock servers used by the other
+// @mention tests above) instead of an in-process fake like
+// toolProbingMaas.
+func TestRunMentionedTUIAgentTaskAppliesSessionModeAndWorkingDir(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo := openCLITestSQLiteRepository(t)
+	session := newTUISessionController(tuiSessionControllerConfig{
+		Store:     repo,
+		Enabled:   true,
+		CompanyID: "cli-company",
+		AgentID:   "cli-agent",
+	})
+	if _, err := session.NewSession(ctx); err != nil {
+		t.Fatalf("NewSession() error = %v, want nil", err)
+	}
+	workingDir := t.TempDir()
+	if err := session.SetWorkingDir(ctx, workingDir); err != nil {
+		t.Fatalf("SetWorkingDir(%q) error = %v, want nil", workingDir, err)
+	}
+	writeCLIFile(t, workingDir, "inside.txt", "inside-content")
+
+	// The agent's own ContextFiles.Root is a different directory than the
+	// session working_dir, so a tool call reaching workingDir only succeeds
+	// once RunTaskOptions.WorkingDir (sourced from the session, taking
+	// priority over ToolRoot per app.RunTaskOptions.WorkingDir's contract)
+	// is actually wired through.
+	agentContextRoot := t.TempDir()
+	registry := agentregistry.New(map[string]agentregistry.AgentConfig{
+		"researcher": {
+			ID:          "researcher",
+			Role:        "researcher",
+			MaasProfile: "review",
+			ContextFiles: config.ContextFilesConfig{
+				Root: agentContextRoot,
+			},
+		},
+	})
+
+	// The two subtests intentionally run sequentially (no t.Parallel()):
+	// they share the single session/store above, mirroring
+	// TestRunTUITaskAppliesSessionModeAndWorkingDir's sequencing (the
+	// second subtest depends on SetMode(plan) applied only after the first
+	// subtest observes auto mode).
+	t.Run("session working_dir sandboxes the mentioned agent's tool root", func(t *testing.T) {
+		requestCount := 0
+		var lastPrompt string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requestCount++
+			var req struct {
+				Messages []struct {
+					Content string `json:"content"`
+				} `json:"messages"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("Decode(request body) error = %v, want nil", err)
+			}
+			if len(req.Messages) > 0 {
+				lastPrompt = req.Messages[0].Content
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if requestCount == 1 {
+				argsJSON, err := json.Marshal(map[string]string{"path": filepath.Join(workingDir, "inside.txt")})
+				if err != nil {
+					t.Fatalf("Marshal(read_file args) error = %v, want nil", err)
+				}
+				if err := json.NewEncoder(w).Encode(map[string]any{
+					"choices": []map[string]any{
+						{"message": map[string]any{"tool_calls": []map[string]any{
+							{"id": "call-1", "type": "function", "function": map[string]any{
+								"name":      "read_file",
+								"arguments": string(argsJSON),
+							}},
+						}}},
+					},
+				}); err != nil {
+					t.Fatalf("Encode(tool_calls response) error = %v, want nil", err)
+				}
+				return
+			}
+			if err := json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{
+					{"message": map[string]any{"content": "mention-done"}},
+				},
+			}); err != nil {
+				t.Fatalf("Encode(final response) error = %v, want nil", err)
+			}
+		}))
+		t.Cleanup(server.Close)
+
+		cfg := config.Config{
+			Maas: config.MaasConfig{
+				Profiles: map[string]config.MaasProfile{
+					"review": {BaseURL: server.URL, Model: "deepseek-reasoner"},
+				},
+			},
+			Runtime: config.RuntimeConfig{MaxToolRounds: 2},
+		}
+		result, err := runTUITask(ctx, app.New(), tuiTaskRunConfig{
+			Config:   cfg,
+			Registry: registry,
+			Prompt:   "@researcher read the session working dir file",
+			Session:  session,
+		})
+		if err != nil {
+			t.Fatalf("runTUITask(@researcher, session working_dir) error = %v, want nil", err)
+		}
+		if result.Result != "mention-done" {
+			t.Fatalf("runTUITask(@researcher, session working_dir).Result = %q, want %q", result.Result, "mention-done")
+		}
+		if !strings.Contains(lastPrompt, "success: inside-content") {
+			t.Fatalf("runTUITask(@researcher, session working_dir) prompt = %q, want tool success reading inside.txt", lastPrompt)
+		}
+	})
+
+	t.Run("session Plan mode blocks the mentioned agent's write_file", func(t *testing.T) {
+		if err := session.SetMode(ctx, domain.ModePlan); err != nil {
+			t.Fatalf("SetMode(plan) error = %v, want nil", err)
+		}
+		target := filepath.Join(workingDir, "should-not-exist.txt")
+
+		requestCount := 0
+		var lastPrompt string
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			requestCount++
+			var req struct {
+				Messages []struct {
+					Content string `json:"content"`
+				} `json:"messages"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Fatalf("Decode(request body) error = %v, want nil", err)
+			}
+			if len(req.Messages) > 0 {
+				lastPrompt = req.Messages[0].Content
+			}
+			w.Header().Set("Content-Type", "application/json")
+			if requestCount == 1 {
+				argsJSON, err := json.Marshal(map[string]string{"path": target, "content": "package foo\n"})
+				if err != nil {
+					t.Fatalf("Marshal(write_file args) error = %v, want nil", err)
+				}
+				if err := json.NewEncoder(w).Encode(map[string]any{
+					"choices": []map[string]any{
+						{"message": map[string]any{"tool_calls": []map[string]any{
+							{"id": "call-1", "type": "function", "function": map[string]any{
+								"name":      "write_file",
+								"arguments": string(argsJSON),
+							}},
+						}}},
+					},
+				}); err != nil {
+					t.Fatalf("Encode(tool_calls response) error = %v, want nil", err)
+				}
+				return
+			}
+			if err := json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{
+					{"message": map[string]any{"content": "写不了"}},
+				},
+			}); err != nil {
+				t.Fatalf("Encode(final response) error = %v, want nil", err)
+			}
+		}))
+		t.Cleanup(server.Close)
+
+		cfg := config.Config{
+			Maas: config.MaasConfig{
+				Profiles: map[string]config.MaasProfile{
+					"review": {BaseURL: server.URL, Model: "deepseek-reasoner"},
+				},
+			},
+			Runtime: config.RuntimeConfig{MaxToolRounds: 2},
+		}
+		result, err := runTUITask(ctx, app.New(), tuiTaskRunConfig{
+			Config:   cfg,
+			Registry: registry,
+			Prompt:   "@researcher 写一个文件",
+			Session:  session,
+		})
+		if err != nil {
+			t.Fatalf("runTUITask(@researcher, session plan mode) error = %v, want nil", err)
+		}
+		if result.Result != "写不了" {
+			t.Fatalf("runTUITask(@researcher, session plan mode).Result = %q, want final answer text", result.Result)
+		}
+		if !strings.Contains(lastPrompt, "failed: "+tool.ErrToolNotFound.Error()) {
+			t.Fatalf("runTUITask(@researcher, session plan mode) prompt = %q, want write_file rejected as tool not found", lastPrompt)
+		}
+		if _, statErr := os.Stat(target); !os.IsNotExist(statErr) {
+			t.Fatalf("runTUITask(@researcher, session plan mode) created %q on disk, want Plan mode to block the write", target)
+		}
+	})
+}
+
 func TestRunTUITaskInjectsAndPersistsSessionTurns(t *testing.T) {
 	t.Parallel()
 
@@ -826,6 +1035,110 @@ func TestRunTUITaskInjectsAndPersistsSessionTurns(t *testing.T) {
 	}
 }
 
+// TestRunTUITaskAppliesSessionModeAndWorkingDir guards Task 4's runTUITask
+// wiring: the default (non-mentioned-agent) task path must read
+// SessionManager.CurrentMode/CurrentWorkingDir and forward them into
+// app.RunTaskOptions, so the session's bound working_dir becomes the tool
+// sandbox root and the session's Plan mode restricts the model to read-only
+// tools — end to end, driven through runTUITask exactly as the TUI calls it,
+// with real tool dispatch (toolProbingMaas, defined above for
+// TestDefaultTaskRunnerSandboxesToolsToTaskWorkingDir) instead of a mocked
+// tool layer.
+func TestRunTUITaskAppliesSessionModeAndWorkingDir(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo := openCLITestSQLiteRepository(t)
+	session := newTUISessionController(tuiSessionControllerConfig{
+		Store:     repo,
+		Enabled:   true,
+		CompanyID: "cli-company",
+		AgentID:   "cli-agent",
+	})
+	if _, err := session.NewSession(ctx); err != nil {
+		t.Fatalf("NewSession() error = %v, want nil", err)
+	}
+	workingDir := t.TempDir()
+	if err := session.SetWorkingDir(ctx, workingDir); err != nil {
+		t.Fatalf("SetWorkingDir(%q) error = %v, want nil", workingDir, err)
+	}
+	writeCLIFile(t, workingDir, "inside.txt", "inside-content")
+
+	// The two subtests intentionally run sequentially (no t.Parallel()): they
+	// share the single session/store above, and the second subtest depends on
+	// SetMode(plan) applied only after the first subtest observes auto mode.
+	t.Run("session working_dir sandboxes the tool root", func(t *testing.T) {
+		maas := &toolProbingMaas{path: filepath.Join(workingDir, "inside.txt")}
+		result, err := runTUITask(ctx, app.New(), tuiTaskRunConfig{
+			Config:      config.Config{Runtime: config.RuntimeConfig{MaxToolRounds: 2}},
+			Prompt:      "read the session working dir file",
+			DefaultMaas: maas,
+			Session:     session,
+		})
+		if err != nil {
+			t.Fatalf("runTUITask(session working_dir) error = %v, want nil", err)
+		}
+		if result.Result != "done" {
+			t.Fatalf("runTUITask(session working_dir).Result = %q, want %q", result.Result, "done")
+		}
+		if !strings.Contains(maas.lastPrompt, "success: inside-content") {
+			t.Fatalf("runTUITask(session working_dir) prompt = %q, want tool success reading inside.txt", maas.lastPrompt)
+		}
+	})
+
+	t.Run("session Plan mode blocks write_file", func(t *testing.T) {
+		if err := session.SetMode(ctx, domain.ModePlan); err != nil {
+			t.Fatalf("SetMode(plan) error = %v, want nil", err)
+		}
+		target := filepath.Join(workingDir, "should-not-exist.txt")
+		maas := &appPlanWriteFileMaas{path: target}
+		result, err := runTUITask(ctx, app.New(), tuiTaskRunConfig{
+			Config:      config.Config{Runtime: config.RuntimeConfig{MaxToolRounds: 2}},
+			Prompt:      "写一个文件",
+			DefaultMaas: maas,
+			Session:     session,
+		})
+		if err != nil {
+			t.Fatalf("runTUITask(session plan mode) error = %v, want nil", err)
+		}
+		if result.Result != "写不了" {
+			t.Fatalf("runTUITask(session plan mode).Result = %q, want final answer text", result.Result)
+		}
+		if !strings.Contains(maas.lastPrompt, "failed: "+tool.ErrToolNotFound.Error()) {
+			t.Fatalf("runTUITask(session plan mode) prompt = %q, want write_file rejected as tool not found", maas.lastPrompt)
+		}
+		if _, statErr := os.Stat(target); !os.IsNotExist(statErr) {
+			t.Fatalf("runTUITask(session plan mode) created %q on disk, want Plan mode to block the write", target)
+		}
+	})
+}
+
+// appPlanWriteFileMaas emits a single write_file tool call on the first
+// inference, then returns a final text answer, capturing the last prompt so
+// a test can assert whether the write reached the tool registry (see
+// toolProbingMaas above for the same pattern applied to read_file).
+type appPlanWriteFileMaas struct {
+	path       string
+	rounds     int
+	lastPrompt string
+}
+
+func (m *appPlanWriteFileMaas) Generate(ctx context.Context, req port.InferenceRequest) (port.InferenceResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return port.InferenceResponse{}, err
+	}
+	m.rounds++
+	m.lastPrompt = req.Prompt
+	if m.rounds == 1 {
+		return port.InferenceResponse{ToolCalls: []domain.ToolCall{{
+			ID:        "plan-write-1",
+			Name:      "write_file",
+			Arguments: map[string]string{"path": m.path, "content": "package foo\n"},
+		}}}, nil
+	}
+	return port.InferenceResponse{Text: "写不了"}, nil
+}
+
 func TestTUISessionControllerCachesRecentTurnsAndInvalidatesAfterRecord(t *testing.T) {
 	t.Parallel()
 
@@ -866,6 +1179,233 @@ func TestTUISessionControllerCachesRecentTurnsAndInvalidatesAfterRecord(t *testi
 	}
 	if store.listConversationTurnsCalls != 2 {
 		t.Fatalf("ListConversationTurns calls = %d, want 2 after invalidation", store.listConversationTurnsCalls)
+	}
+}
+
+func TestTUISessionControllerSetAndGetMode(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo := openCLITestSQLiteRepository(t)
+	session := newTUISessionController(tuiSessionControllerConfig{
+		Store:        repo,
+		Enabled:      true,
+		CompanyID:    "cli-company",
+		AgentID:      "cli-agent",
+		ModelProfile: "dev",
+	})
+	if _, err := session.NewSession(ctx); err != nil {
+		t.Fatalf("NewSession() error = %v, want nil", err)
+	}
+	if got := session.CurrentMode(); got != domain.ModeAuto {
+		t.Fatalf("CurrentMode() (fresh session) = %q, want %q", got, domain.ModeAuto)
+	}
+
+	if err := session.SetMode(ctx, "manual"); err != nil {
+		t.Fatalf("SetMode(manual) error = %v, want nil", err)
+	}
+	if got := session.CurrentMode(); got != "manual" {
+		t.Fatalf("CurrentMode() = %q, want %q", got, "manual")
+	}
+
+	// Persistence: re-fetch the session from the store directly.
+	sessions, err := repo.ListAgentSessions(ctx, "cli-company", "cli-agent")
+	if err != nil {
+		t.Fatalf("ListAgentSessions() error = %v, want nil", err)
+	}
+	var found bool
+	for _, s := range sessions {
+		if s.ID == session.CurrentSessionID() {
+			found = true
+			if s.Mode != "manual" {
+				t.Fatalf("persisted AgentSession.Mode = %q, want %q", s.Mode, "manual")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("session %q not found in store", session.CurrentSessionID())
+	}
+
+	if err := session.SetMode(ctx, "bogus"); err == nil {
+		t.Fatalf("SetMode(bogus) error = nil, want error")
+	}
+	if got := session.CurrentMode(); got != "manual" {
+		t.Fatalf("CurrentMode() after rejected SetMode = %q, want unchanged %q", got, "manual")
+	}
+}
+
+func TestTUISessionControllerSetAndGetWorkingDir(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo := openCLITestSQLiteRepository(t)
+	session := newTUISessionController(tuiSessionControllerConfig{
+		Store:        repo,
+		Enabled:      true,
+		CompanyID:    "cli-company",
+		AgentID:      "cli-agent",
+		ModelProfile: "dev",
+	})
+	if _, err := session.NewSession(ctx); err != nil {
+		t.Fatalf("NewSession() error = %v, want nil", err)
+	}
+	if got := session.CurrentWorkingDir(); got != "" {
+		t.Fatalf("CurrentWorkingDir() (fresh session) = %q, want empty", got)
+	}
+
+	dir := t.TempDir()
+	if err := session.SetWorkingDir(ctx, dir); err != nil {
+		t.Fatalf("SetWorkingDir(%q) error = %v, want nil", dir, err)
+	}
+	if got := session.CurrentWorkingDir(); got != dir {
+		t.Fatalf("CurrentWorkingDir() = %q, want %q", got, dir)
+	}
+
+	sessions, err := repo.ListAgentSessions(ctx, "cli-company", "cli-agent")
+	if err != nil {
+		t.Fatalf("ListAgentSessions() error = %v, want nil", err)
+	}
+	var found bool
+	for _, s := range sessions {
+		if s.ID == session.CurrentSessionID() {
+			found = true
+			if s.WorkingDir != dir {
+				t.Fatalf("persisted AgentSession.WorkingDir = %q, want %q", s.WorkingDir, dir)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("session %q not found in store", session.CurrentSessionID())
+	}
+
+	notDir := filepath.Join(dir, "not-a-dir.txt")
+	if err := os.WriteFile(notDir, []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", notDir, err)
+	}
+	if err := session.SetWorkingDir(ctx, notDir); err == nil {
+		t.Fatalf("SetWorkingDir(%q) error = nil, want error (not a directory)", notDir)
+	}
+	if got := session.CurrentWorkingDir(); got != dir {
+		t.Fatalf("CurrentWorkingDir() after rejected SetWorkingDir = %q, want unchanged %q", got, dir)
+	}
+}
+
+// TestTUISessionControllerWorkingDirSetOnce verifies the TUI session
+// controller enforces the same set-once-then-immutable WorkingDir semantics
+// as the HTTP server's handlePatchSession (server/http.go): once a session's
+// working_dir is non-empty, changing it to a different directory must be
+// rejected, because on-disk session state (checkpoints, approval tickets) is
+// filed under whatever working_dir was in effect at write time, and
+// repointing it would silently strand that state.
+func TestTUISessionControllerWorkingDirSetOnce(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo := openCLITestSQLiteRepository(t)
+	session := newTUISessionController(tuiSessionControllerConfig{
+		Store:        repo,
+		Enabled:      true,
+		CompanyID:    "cli-company",
+		AgentID:      "cli-agent",
+		ModelProfile: "dev",
+	})
+	if _, err := session.NewSession(ctx); err != nil {
+		t.Fatalf("NewSession() error = %v, want nil", err)
+	}
+
+	dirA := t.TempDir()
+	dirB := t.TempDir()
+
+	// First set: working_dir is currently empty, so this must succeed.
+	if err := session.SetWorkingDir(ctx, dirA); err != nil {
+		t.Fatalf("SetWorkingDir(%q) (first set) error = %v, want nil", dirA, err)
+	}
+	if got := session.CurrentWorkingDir(); got != dirA {
+		t.Fatalf("CurrentWorkingDir() = %q, want %q", got, dirA)
+	}
+
+	// Changing to a different directory once set must be rejected.
+	if err := session.SetWorkingDir(ctx, dirB); err == nil {
+		t.Fatalf("SetWorkingDir(%q) (change after set) error = nil, want error", dirB)
+	}
+	if got := session.CurrentWorkingDir(); got != dirA {
+		t.Fatalf("CurrentWorkingDir() after rejected change = %q, want unchanged %q", got, dirA)
+	}
+
+	// Persisted state must remain dirA, not dirB.
+	sessions, err := repo.ListAgentSessions(ctx, "cli-company", "cli-agent")
+	if err != nil {
+		t.Fatalf("ListAgentSessions() error = %v, want nil", err)
+	}
+	var found bool
+	for _, s := range sessions {
+		if s.ID == session.CurrentSessionID() {
+			found = true
+			if s.WorkingDir != dirA {
+				t.Fatalf("persisted AgentSession.WorkingDir = %q, want unchanged %q", s.WorkingDir, dirA)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("session %q not found in store", session.CurrentSessionID())
+	}
+
+	// Re-setting the same value is a no-op and must succeed.
+	if err := session.SetWorkingDir(ctx, dirA); err != nil {
+		t.Fatalf("SetWorkingDir(%q) (same value, no-op) error = %v, want nil", dirA, err)
+	}
+	if got := session.CurrentWorkingDir(); got != dirA {
+		t.Fatalf("CurrentWorkingDir() after no-op set = %q, want %q", got, dirA)
+	}
+}
+
+// TestTUISessionControllerSetModeWhenDisabledFailsLoud verifies that when the
+// session feature is disabled (cfg.Session.Enabled == false), SetMode and
+// SetWorkingDir fail loudly with an error instead of silently no-op'ing.
+// Previously both returned nil when disabled, so a user typing "/mode
+// manual" or "/cwd <dir>" saw no error and no state change -- their explicit
+// intent was silently swallowed (violates the fail-loud rule: CLAUDE.md
+// section 0). CurrentMode/CurrentWorkingDir (the read paths) are unaffected
+// by this fix: returning defaults when disabled remains legitimate, since
+// there is no session to read from.
+func TestTUISessionControllerSetModeWhenDisabledFailsLoud(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	session := newTUISessionController(tuiSessionControllerConfig{
+		Enabled:      false,
+		CompanyID:    "cli-company",
+		AgentID:      "cli-agent",
+		ModelProfile: "dev",
+	})
+
+	if err := session.SetMode(ctx, "manual"); err == nil {
+		t.Fatalf("SetMode(manual) on disabled session error = nil, want error")
+	}
+	if got := session.CurrentMode(); got != domain.ModeAuto {
+		t.Fatalf("CurrentMode() after rejected SetMode = %q, want unchanged %q", got, domain.ModeAuto)
+	}
+}
+
+// TestTUISessionControllerSetWorkingDirWhenDisabledFailsLoud is the
+// SetWorkingDir counterpart to TestTUISessionControllerSetModeWhenDisabledFailsLoud.
+func TestTUISessionControllerSetWorkingDirWhenDisabledFailsLoud(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	session := newTUISessionController(tuiSessionControllerConfig{
+		Enabled:      false,
+		CompanyID:    "cli-company",
+		AgentID:      "cli-agent",
+		ModelProfile: "dev",
+	})
+
+	dir := t.TempDir()
+	if err := session.SetWorkingDir(ctx, dir); err == nil {
+		t.Fatalf("SetWorkingDir(%q) on disabled session error = nil, want error", dir)
+	}
+	if got := session.CurrentWorkingDir(); got != "" {
+		t.Fatalf("CurrentWorkingDir() after rejected SetWorkingDir = %q, want unchanged empty", got)
 	}
 }
 

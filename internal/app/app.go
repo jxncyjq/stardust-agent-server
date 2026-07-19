@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/stardust/legion-agent/internal/adapter"
@@ -16,6 +17,7 @@ import (
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/quality"
 	"github.com/stardust/legion-agent/internal/runtime"
+	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/taskledger"
 	"github.com/stardust/legion-agent/internal/tool"
 )
@@ -32,17 +34,28 @@ type DemoResult struct {
 type App struct{}
 
 type RunTaskOptions struct {
-	TaskID            string
-	Prompt            string
-	Plain             bool
-	Maas              port.MaasInferenceClient
-	Events            port.EventBus
-	Audit             port.AuditLog
-	TaskSink          TaskSink
-	ContextPrefix     string
-	AgentID           string
-	Role              string
-	CompanyID         string
+	TaskID        string
+	Prompt        string
+	Plain         bool
+	Maas          port.MaasInferenceClient
+	Events        port.EventBus
+	Audit         port.AuditLog
+	TaskSink      TaskSink
+	ContextPrefix string
+	AgentID       string
+	Role          string
+	CompanyID     string
+	// Mode is the task's working mode (domain.ModeManual/ModePlan/ModeAuto).
+	// It is carried onto the constructed domain.Task so the runtime can apply
+	// Mode-specific behavior (e.g. Plan mode's read-only tool subset via
+	// Runtime.effectiveTools). Empty means the runtime's own default applies.
+	Mode string
+	// WorkingDir is the host filesystem directory this task's tools are
+	// sandboxed to. When non-empty it takes priority over ToolRoot as the
+	// WorkspacePathGuard root (mirrors agentToolRoot's task.WorkingDir
+	// priority in internal/runtime/agent_resolver.go), confining every tool
+	// call to this directory. Empty falls back to ToolRoot.
+	WorkingDir        string
 	Logger            *slog.Logger
 	Metrics           *observability.MetricsRecorder
 	ToolRoot          string
@@ -53,6 +66,21 @@ type RunTaskOptions struct {
 	LazyTools         bool
 	ConversationTurns []domain.ConversationTurn
 	WebTools          tool.WebToolOptions
+	// ToolGate gates each tool call for this run's runtime (approval flows,
+	// e.g. the TUI's in-process synchronous 方案 Y gate — see
+	// internal/tui.NewApprovalGate). Nil never suspends or blocks (Auto
+	// behaviour): the runtime enforces at RunTask entry that a Manual-mode
+	// task never reaches a nil gate (see runtime.ErrManualGateMissing), so
+	// Mode == domain.ModeManual requires both ToolGate and Checkpoints set.
+	ToolGate runtime.ToolGate
+	// Checkpoints persists suspended tool-loop state so a task can resume
+	// after a suspend. Manual mode requires it set even when ToolGate never
+	// actually suspends (e.g. 方案 Y's ShouldSuspend is always false): the
+	// runtime's Manual-mode invariant check (RunTask, see
+	// runtime.ErrManualGateMissing) treats a nil checkpoint store as an
+	// unwired gate regardless of whether that particular gate would ever use
+	// it, because it cannot tell the two cases apart from the Config alone.
+	Checkpoints *sessionstate.Store
 }
 
 type TaskSink interface {
@@ -177,7 +205,10 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 	if opts.ContextPrefix != "" || len(opts.ConversationTurns) > 0 {
 		contextBuilder = cognitive.NewCore(cognitive.NoopCompressor{}).WithContextFiles(opts.ContextPrefix)
 	}
-	toolRoot := opts.ToolRoot
+	toolRoot := strings.TrimSpace(opts.WorkingDir)
+	if toolRoot == "" {
+		toolRoot = opts.ToolRoot
+	}
 	if toolRoot == "" {
 		toolRoot = "."
 	}
@@ -195,14 +226,18 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 		MaxToolRounds:     opts.MaxToolRounds,
 		LazyTools:         opts.LazyTools,
 		ConversationTurns: opts.ConversationTurns,
+		ToolGate:          opts.ToolGate,
+		Checkpoints:       opts.Checkpoints,
 	})
 	task := domain.Task{
-		ID:        opts.TaskID,
-		CompanyID: opts.CompanyID,
-		AgentID:   opts.AgentID,
-		Status:    domain.TaskRunning,
-		Input:     opts.Prompt,
-		CreatedAt: time.Now(),
+		ID:         opts.TaskID,
+		CompanyID:  opts.CompanyID,
+		AgentID:    opts.AgentID,
+		Mode:       opts.Mode,
+		WorkingDir: opts.WorkingDir,
+		Status:     domain.TaskRunning,
+		Input:      opts.Prompt,
+		CreatedAt:  time.Now(),
 	}
 	if opts.Metrics != nil {
 		opts.Metrics.IncTaskStatus("running")

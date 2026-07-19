@@ -16,6 +16,7 @@ import (
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/storage"
 	"github.com/stardust/legion-agent/internal/taskledger"
+	"github.com/stardust/legion-agent/internal/tool"
 )
 
 func TestRunDemoIncludesModelAndToolAudit(t *testing.T) {
@@ -105,6 +106,121 @@ func TestRunTaskExecutesBuiltInReadOnlyToolCalls(t *testing.T) {
 	}
 	if !bytes.Contains([]byte(maas.prompts[1]), []byte("cache.go")) {
 		t.Fatalf("second prompt missing search result:\n%s", maas.prompts[1])
+	}
+}
+
+// toolRootProbingMaas issues a single read_file tool call for path on its
+// first Generate call, then returns a final text answer, capturing every
+// prompt the runtime built. Round 2's prompt renders the tool result
+// ("- <call> success: <content>" or "- <call> failed: <error>", see
+// runtime.renderToolResult), so a test can observe whether the call actually
+// reached the file (sandbox allowed it) or was rejected by
+// WorkspacePathGuard, without a real inference backend. Mirrors
+// cli.toolProbingMaas (internal/cli/command_test.go).
+type toolRootProbingMaas struct {
+	path    string
+	prompts []string
+}
+
+func (m *toolRootProbingMaas) Generate(ctx context.Context, req port.InferenceRequest) (port.InferenceResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return port.InferenceResponse{}, err
+	}
+	m.prompts = append(m.prompts, req.Prompt)
+	if len(m.prompts) == 1 {
+		return port.InferenceResponse{ToolCalls: []domain.ToolCall{{
+			ID:        "probe-1",
+			Name:      "read_file",
+			Arguments: map[string]string{"path": m.path},
+		}}}, nil
+	}
+	return port.InferenceResponse{Text: "done"}, nil
+}
+
+// TestRunTaskSandboxesToolsToWorkingDir guards Task 4's WorkingDir wiring:
+// RunTaskOptions.WorkingDir must become the WorkspacePathGuard root, taking
+// priority over ToolRoot (mirroring agentToolRoot's task.WorkingDir priority
+// in internal/runtime/agent_resolver.go), so a tool call reaching a path
+// inside WorkingDir succeeds while a path only inside the fallback ToolRoot
+// is rejected as outside the workspace.
+func TestRunTaskSandboxesToolsToWorkingDir(t *testing.T) {
+	t.Parallel()
+
+	toolRoot := t.TempDir()
+	if err := os.WriteFile(filepath.Join(toolRoot, "root-only.txt"), []byte("root-content"), 0o600); err != nil {
+		t.Fatalf("WriteFile(root-only.txt) error = %v, want nil", err)
+	}
+	workingDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workingDir, "inside.txt"), []byte("inside-content"), 0o600); err != nil {
+		t.Fatalf("WriteFile(inside.txt) error = %v, want nil", err)
+	}
+
+	t.Run("path inside working_dir succeeds", func(t *testing.T) {
+		t.Parallel()
+		maas := &toolRootProbingMaas{path: filepath.Join(workingDir, "inside.txt")}
+		if _, err := New().RunTask(context.Background(), RunTaskOptions{
+			TaskID:     "wd-sandbox-inside",
+			Prompt:     "read inside file",
+			Maas:       maas,
+			ToolRoot:   toolRoot,
+			WorkingDir: workingDir,
+		}); err != nil {
+			t.Fatalf("RunTask(inside) error = %v, want nil", err)
+		}
+		if len(maas.prompts) != 2 || !bytes.Contains([]byte(maas.prompts[1]), []byte("success: inside-content")) {
+			t.Fatalf("RunTask(inside) prompts = %#v, want tool success reading inside.txt", maas.prompts)
+		}
+	})
+
+	t.Run("path outside working_dir (inside fallback ToolRoot) is rejected", func(t *testing.T) {
+		t.Parallel()
+		maas := &toolRootProbingMaas{path: filepath.Join(toolRoot, "root-only.txt")}
+		if _, err := New().RunTask(context.Background(), RunTaskOptions{
+			TaskID:     "wd-sandbox-escape",
+			Prompt:     "try to read outside working_dir",
+			Maas:       maas,
+			ToolRoot:   toolRoot,
+			WorkingDir: workingDir,
+		}); err != nil {
+			t.Fatalf("RunTask(escape) error = %v, want nil", err)
+		}
+		if len(maas.prompts) != 2 || !bytes.Contains([]byte(maas.prompts[1]), []byte("failed: "+port.ErrPathOutsideWorkspace.Error())) {
+			t.Fatalf("RunTask(escape) prompts = %#v, want tool call rejected as outside workspace", maas.prompts)
+		}
+	})
+}
+
+// TestRunTaskPlanModeRestrictsToReadOnlyTools guards Task 4's Mode wiring:
+// RunTaskOptions.Mode must land on the constructed domain.Task.Mode, which
+// Runtime.effectiveTools (internal/runtime/runtime.go) already keys off of to
+// swap in the read-only tool subset whenever task.Mode == domain.ModePlan —
+// so passing Mode through is sufficient and app.RunTask needs no separate
+// Subset application. A write_file call issued in Plan mode must therefore
+// miss the effective tool set (tool.ErrToolNotFound) and never touch disk.
+func TestRunTaskPlanModeRestrictsToReadOnlyTools(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	target := filepath.Join(dir, "created.go")
+	maas := &appWriteFileMaas{path: target}
+	result, err := New().RunTask(context.Background(), RunTaskOptions{
+		TaskID:   "plan-mode-write-blocked",
+		Prompt:   "写一个文件",
+		Maas:     maas,
+		ToolRoot: dir,
+		Mode:     domain.ModePlan,
+	})
+	if err != nil {
+		t.Fatalf("RunTask(plan mode write) error = %v, want nil", err)
+	}
+	if result.Result != "已创建文件。" {
+		t.Fatalf("RunTask(plan mode write).Result = %q, want final answer text", result.Result)
+	}
+	if len(maas.prompts) != 2 || !bytes.Contains([]byte(maas.prompts[1]), []byte("failed: "+tool.ErrToolNotFound.Error())) {
+		t.Fatalf("RunTask(plan mode write) prompts = %#v, want write_file rejected as tool not found", maas.prompts)
+	}
+	if _, statErr := os.Stat(target); !os.IsNotExist(statErr) {
+		t.Fatalf("RunTask(plan mode write) created %q on disk, want Plan mode to block the write", target)
 	}
 }
 

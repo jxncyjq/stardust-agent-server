@@ -3,6 +3,8 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -249,6 +251,129 @@ func TestInteractiveModelStreamsToolEventsWhileRunning(t *testing.T) {
 	}
 }
 
+// TestInteractiveModelApprovalPromptShowsToolAndSendsDecision drives the
+// bubbletea side of 方案 Y directly (no real gate/runtime involved, per the
+// task-5 brief): inject a pending-approval message as if it arrived from
+// waitApproval, assert the rendered View shows the tool name and its
+// argument, then press "y" and assert the resulting decision reaches
+// decisionCh with Allow: true.
+func TestInteractiveModelApprovalPromptShowsToolAndSendsDecision(t *testing.T) {
+	t.Parallel()
+
+	pendingCh := make(chan PendingApproval)
+	decisionCh := make(chan ApprovalDecision)
+	model := NewInteractiveModel(InteractiveConfig{
+		ApprovalCh: pendingCh,
+		DecisionCh: decisionCh,
+	})
+
+	next, cmd := model.Update(interactivePendingApprovalMsg{
+		Tool: "write_file",
+		Args: map[string]string{"path": "notes.md"},
+	})
+	model = next.(InteractiveModel)
+	if cmd != nil {
+		t.Fatalf("Update(pendingApproval) cmd = non-nil, want nil")
+	}
+	if !model.approvalActive {
+		t.Fatalf("Update(pendingApproval) approvalActive = false, want true")
+	}
+
+	view := model.View()
+	if !strings.Contains(view, "write_file") {
+		t.Fatalf("View() after pending approval missing tool name:\n%s", view)
+	}
+	if !strings.Contains(view, "notes.md") {
+		t.Fatalf("View() after pending approval missing arg value:\n%s", view)
+	}
+
+	next, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("y")})
+	model = next.(InteractiveModel)
+	if model.approvalActive {
+		t.Fatalf("Update(KeyMsg y) approvalActive = true, want false")
+	}
+	if cmd == nil {
+		t.Fatalf("Update(KeyMsg y) cmd = nil, want a batch (send decision + re-listen)")
+	}
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Update(KeyMsg y) cmd() = %T, want tea.BatchMsg", msg)
+	}
+	for _, batchCmd := range batch {
+		if batchCmd != nil {
+			go batchCmd()
+		}
+	}
+
+	select {
+	case decision := <-decisionCh:
+		if !decision.Allow {
+			t.Fatalf("decisionCh received Allow = false, want true")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("decisionCh received nothing within 2s after Update(KeyMsg y)")
+	}
+}
+
+// TestInteractiveModelApprovalPromptDenyBlocksTypingAndSendsDenial covers the
+// deny path and the composer-lock invariant: while an approval is pending,
+// unrelated keys (e.g. typing a reply) must not reach m.input, and must not
+// clear approvalActive.
+func TestInteractiveModelApprovalPromptDenyBlocksTypingAndSendsDenial(t *testing.T) {
+	t.Parallel()
+
+	pendingCh := make(chan PendingApproval)
+	decisionCh := make(chan ApprovalDecision)
+	model := NewInteractiveModel(InteractiveConfig{
+		ApprovalCh: pendingCh,
+		DecisionCh: decisionCh,
+	})
+
+	next, _ := model.Update(interactivePendingApprovalMsg{Tool: "shell_exec"})
+	model = next.(InteractiveModel)
+
+	next, cmd := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("z")})
+	model = next.(InteractiveModel)
+	if cmd != nil {
+		t.Fatalf("Update('z' while approval pending) cmd = non-nil, want nil")
+	}
+	if model.input != "" {
+		t.Fatalf("Update('z' while approval pending) input = %q, want empty (composer locked)", model.input)
+	}
+	if !model.approvalActive {
+		t.Fatalf("approvalActive flipped false by an unrelated key, want still true")
+	}
+
+	next, cmd = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("n")})
+	model = next.(InteractiveModel)
+	if model.approvalActive {
+		t.Fatalf("Update(KeyMsg n) approvalActive = true, want false")
+	}
+	if cmd == nil {
+		t.Fatalf("Update(KeyMsg n) cmd = nil, want a batch (send decision + re-listen)")
+	}
+	msg := cmd()
+	batch, ok := msg.(tea.BatchMsg)
+	if !ok {
+		t.Fatalf("Update(KeyMsg n) cmd() = %T, want tea.BatchMsg", msg)
+	}
+	for _, batchCmd := range batch {
+		if batchCmd != nil {
+			go batchCmd()
+		}
+	}
+
+	select {
+	case decision := <-decisionCh:
+		if decision.Allow {
+			t.Fatalf("decisionCh received Allow = true, want false")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("decisionCh received nothing within 2s after Update(KeyMsg n)")
+	}
+}
+
 func TestInteractiveModelConversationMetadataCanBeHidden(t *testing.T) {
 	t.Parallel()
 
@@ -370,6 +495,42 @@ func TestInteractiveModelFooterShowsWorkingProgressBar(t *testing.T) {
 	animated := model.renderFooter(100)
 	if footer == animated {
 		t.Fatalf("renderFooter(running animated) did not change across frames:\n%s", footer)
+	}
+}
+
+func TestInteractiveModelFooterShowsModeAndCwd(t *testing.T) {
+	t.Parallel()
+
+	model := NewInteractiveModel(InteractiveConfig{
+		AgentName: "agent",
+		ModelName: "deepseek-v4-pro",
+	})
+	model.mode = "manual"
+	model.workingDir = filepath.Join("proj", "app")
+	next, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 36})
+	model = next.(InteractiveModel)
+
+	view := model.View()
+	for _, want := range []string{"manual", "app"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("InteractiveModel.View() missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestInteractiveModelFooterDefaultsModeAndCwd(t *testing.T) {
+	t.Parallel()
+
+	model := NewInteractiveModel(InteractiveConfig{
+		AgentName: "agent",
+		ModelName: "deepseek-v4-pro",
+	})
+
+	footer := model.renderFooter(100)
+	for _, want := range []string{"auto", "(default)"} {
+		if !strings.Contains(footer, want) {
+			t.Fatalf("renderFooter() missing default %q:\n%s", want, footer)
+		}
 	}
 }
 
@@ -549,6 +710,94 @@ func TestInteractiveModelSessionCommandsUseSessionManager(t *testing.T) {
 	model = next.(InteractiveModel)
 	if manager.current != "session-2" || model.sessionID != "session-2" {
 		t.Fatalf("/switch current = %q model.sessionID = %q, want session-2", manager.current, model.sessionID)
+	}
+}
+
+func TestInteractiveModelModeCommandSetsMode(t *testing.T) {
+	t.Parallel()
+
+	manager := &fakeSessionManager{current: "session-1"}
+	model := NewInteractiveModel(InteractiveConfig{SessionManager: manager})
+	next, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 36})
+	model = next.(InteractiveModel)
+
+	model = typeInteractiveText(t, model, "/mode manual")
+	next, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = next.(InteractiveModel)
+	if cmd != nil {
+		t.Fatalf("InteractiveModel.Update(/mode manual) cmd = non-nil, want local command")
+	}
+	if manager.mode != "manual" {
+		t.Fatalf("fakeSessionManager.mode = %q, want manual", manager.mode)
+	}
+	if model.mode != "manual" {
+		t.Fatalf("InteractiveModel.mode = %q, want manual", model.mode)
+	}
+	if model.err != "" {
+		t.Fatalf("InteractiveModel.err = %q, want empty after valid /mode", model.err)
+	}
+}
+
+func TestInteractiveModelModeCommandRejectsInvalid(t *testing.T) {
+	t.Parallel()
+
+	manager := &fakeSessionManager{current: "session-1"}
+	model := NewInteractiveModel(InteractiveConfig{SessionManager: manager})
+	next, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 36})
+	model = next.(InteractiveModel)
+
+	model = typeInteractiveText(t, model, "/mode bogus")
+	next, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = next.(InteractiveModel)
+	if model.err == "" {
+		t.Fatalf("InteractiveModel.err = empty, want non-empty for invalid /mode")
+	}
+	if manager.mode != "" {
+		t.Fatalf("fakeSessionManager.mode = %q, want unchanged empty after invalid /mode", manager.mode)
+	}
+	if model.mode != domain.ModeAuto {
+		t.Fatalf("InteractiveModel.mode = %q, want unchanged %q after invalid /mode", model.mode, domain.ModeAuto)
+	}
+}
+
+func TestInteractiveModelCwdCommandSetsWorkingDir(t *testing.T) {
+	t.Parallel()
+
+	manager := &fakeSessionManager{current: "session-1"}
+	model := NewInteractiveModel(InteractiveConfig{SessionManager: manager})
+	next, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 36})
+	model = next.(InteractiveModel)
+
+	dir := t.TempDir()
+	model = typeInteractiveText(t, model, "/cwd "+dir)
+	next, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = next.(InteractiveModel)
+	if cmd != nil {
+		t.Fatalf("InteractiveModel.Update(/cwd) cmd = non-nil, want local command")
+	}
+	if manager.workingDir != dir {
+		t.Fatalf("fakeSessionManager.workingDir = %q, want %q", manager.workingDir, dir)
+	}
+	if model.workingDir != dir {
+		t.Fatalf("InteractiveModel.workingDir = %q, want %q", model.workingDir, dir)
+	}
+	if model.err != "" {
+		t.Fatalf("InteractiveModel.err = %q, want empty after valid /cwd", model.err)
+	}
+
+	model.input = ""
+	missing := dir + string(os.PathSeparator) + "does-not-exist"
+	model = typeInteractiveText(t, model, "/cwd "+missing)
+	next, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = next.(InteractiveModel)
+	if model.err == "" {
+		t.Fatalf("InteractiveModel.err = empty, want non-empty for nonexistent /cwd path")
+	}
+	if manager.workingDir != dir {
+		t.Fatalf("fakeSessionManager.workingDir = %q, want unchanged %q after invalid /cwd", manager.workingDir, dir)
+	}
+	if model.workingDir != dir {
+		t.Fatalf("InteractiveModel.workingDir = %q, want unchanged %q after invalid /cwd", model.workingDir, dir)
 	}
 }
 
@@ -1189,8 +1438,10 @@ func (f *fakeSkillManager) Uninstall(_ context.Context, name string) error {
 }
 
 type fakeSessionManager struct {
-	current  string
-	sessions []string
+	current    string
+	sessions   []string
+	mode       string
+	workingDir string
 }
 
 func (f *fakeSessionManager) CurrentSessionID() string {
@@ -1214,6 +1465,40 @@ func (f *fakeSessionManager) SwitchSession(_ context.Context, id string) error {
 
 func (f *fakeSessionManager) ClearSession(context.Context) error {
 	f.current = ""
+	return nil
+}
+
+func (f *fakeSessionManager) CurrentMode() string {
+	if f.mode == "" {
+		return domain.ModeAuto
+	}
+	return f.mode
+}
+
+func (f *fakeSessionManager) SetMode(_ context.Context, mode string) error {
+	normalized, ok := domain.NormalizeMode(mode)
+	if !ok {
+		return fmt.Errorf("invalid mode %q", mode)
+	}
+	f.mode = normalized
+	return nil
+}
+
+func (f *fakeSessionManager) CurrentWorkingDir() string {
+	return f.workingDir
+}
+
+func (f *fakeSessionManager) SetWorkingDir(_ context.Context, dir string) error {
+	if dir != "" {
+		info, err := os.Stat(dir)
+		if err != nil {
+			return fmt.Errorf("stat working dir %q: %w", dir, err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("working dir %q is not a directory", dir)
+		}
+	}
+	f.workingDir = dir
 	return nil
 }
 
