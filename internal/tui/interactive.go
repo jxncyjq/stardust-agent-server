@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync/atomic"
@@ -878,6 +879,8 @@ func (m InteractiveModel) renderFooter(width int) string {
 	if m.sessionID != "" {
 		left += m.styles.dim.Render(" · " + m.clean(m.sessionID))
 	}
+	left += m.styles.dim.Render(" · " + m.clean(m.footerMode()))
+	left += m.styles.dim.Render(" · " + m.clean(m.footerWorkingDir()))
 	if m.copyNotice != "" {
 		notice := m.styles.title.Render(" ✓ " + m.copyNotice)
 		gap := width - lipgloss.Width(left) - lipgloss.Width(notice)
@@ -901,6 +904,28 @@ func (m InteractiveModel) renderFooter(width int) string {
 		gap = 1
 	}
 	return left + strings.Repeat(" ", gap) + right
+}
+
+// footerMode returns the mode label for the status bar, defaulting to
+// domain.ModeAuto when the model has no mode bound yet (mirrors
+// currentMode's nil-manager default).
+func (m InteractiveModel) footerMode() string {
+	mode := strings.TrimSpace(m.mode)
+	if mode == "" {
+		return domain.ModeAuto
+	}
+	return mode
+}
+
+// footerWorkingDir returns a status-bar-safe label for the current working
+// directory: "(default)" when unset, otherwise the directory's basename so a
+// long path can't overflow the footer.
+func (m InteractiveModel) footerWorkingDir() string {
+	dir := strings.TrimSpace(m.workingDir)
+	if dir == "" {
+		return "(default)"
+	}
+	return filepath.Base(dir)
 }
 
 func (m InteractiveModel) handleSessionCommand(ctx context.Context, prompt string) (bool, InteractiveModel) {

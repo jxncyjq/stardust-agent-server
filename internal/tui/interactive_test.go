@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -371,6 +372,42 @@ func TestInteractiveModelFooterShowsWorkingProgressBar(t *testing.T) {
 	animated := model.renderFooter(100)
 	if footer == animated {
 		t.Fatalf("renderFooter(running animated) did not change across frames:\n%s", footer)
+	}
+}
+
+func TestInteractiveModelFooterShowsModeAndCwd(t *testing.T) {
+	t.Parallel()
+
+	model := NewInteractiveModel(InteractiveConfig{
+		AgentName: "agent",
+		ModelName: "deepseek-v4-pro",
+	})
+	model.mode = "manual"
+	model.workingDir = filepath.Join("proj", "app")
+	next, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 36})
+	model = next.(InteractiveModel)
+
+	view := model.View()
+	for _, want := range []string{"manual", "app"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("InteractiveModel.View() missing %q:\n%s", want, view)
+		}
+	}
+}
+
+func TestInteractiveModelFooterDefaultsModeAndCwd(t *testing.T) {
+	t.Parallel()
+
+	model := NewInteractiveModel(InteractiveConfig{
+		AgentName: "agent",
+		ModelName: "deepseek-v4-pro",
+	})
+
+	footer := model.renderFooter(100)
+	for _, want := range []string{"auto", "(default)"} {
+		if !strings.Contains(footer, want) {
+			t.Fatalf("renderFooter() missing default %q:\n%s", want, footer)
+		}
 	}
 }
 
