@@ -88,7 +88,14 @@ func NewGepFailureScanJob(events port.EventBus, runner GepRunner) BackgroundJob 
 			if !ok || !shouldRunGepForSignal(learning.Signal) {
 				continue
 			}
-			key := learningEventKey(event)
+			// Dedup on the GEP cycle's own identity, not on the event: one failed
+			// run emits several failure learning events (inference_error, then
+			// task_run_error) that share a Cycle, since Cycle is a
+			// second-resolution timestamp. Keying on the event let each of them
+			// start the same cycle, and the second run collided with the audit
+			// entry the first had already written under that cycle id.
+			input := extractionInputFromLearning(learning)
+			key := evolution.CycleID(input)
 			mu.Lock()
 			if processed[key] {
 				mu.Unlock()
@@ -96,7 +103,7 @@ func NewGepFailureScanJob(events port.EventBus, runner GepRunner) BackgroundJob 
 			}
 			processed[key] = true
 			mu.Unlock()
-			if _, err := runner.Run(ctx, extractionInputFromLearning(learning)); err != nil {
+			if _, err := runner.Run(ctx, input); err != nil {
 				return fmt.Errorf("run gep failure scan for %s: %w", learning.TaskID, err)
 			}
 		}
@@ -140,10 +147,6 @@ func extractionInputFromLearning(event evolution.LearningEvent) evolution.Extrac
 		Eval:  eval,
 		Cycle: int(event.PublishedAt.Unix()),
 	}
-}
-
-func learningEventKey(event domain.RuntimeEvent) string {
-	return event.TaskID + ":" + event.Message + ":" + event.CreatedAt.UTC().Format(time.RFC3339Nano)
 }
 
 func (s *BackgroundScheduler) RunOnce(ctx context.Context) error {
