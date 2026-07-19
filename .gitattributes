@@ -1,0 +1,5 @@
+# Golden fixtures are compared byte-for-byte against generated output, which
+# always uses LF. Without this, a Windows checkout with core.autocrlf=true
+# rewrites them to CRLF and the golden tests fail with a diff that renders
+# identically in the failure message.
+internal/compat/testdata/** text eol=lf
