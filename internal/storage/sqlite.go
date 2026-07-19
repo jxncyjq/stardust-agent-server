@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -44,11 +45,37 @@ type WorkflowState struct {
 	UpdatedAt  time.Time           `json:"updated_at"`
 }
 
+// sqliteBusyTimeout is how long a blocked SQLite operation waits for a competing
+// lock to clear before giving up. It is applied as a per-connection PRAGMA (see
+// sqliteDSN) so transient writer contention — e.g. an HTTP handler writing a
+// session while the coordinator's background scheduler writes a task — blocks and
+// retries instead of surfacing an immediate SQLITE_BUSY as a bare 500. This only
+// widens the retry window; a genuine, non-transient lock still fails loudly once
+// the timeout elapses, so no error is swallowed.
+const sqliteBusyTimeout = 5 * time.Second
+
+// sqliteDSN augments a filesystem path with the PRAGMAs every physical connection
+// must apply. busy_timeout is set through the DSN (rather than a one-off PRAGMA
+// after Open) so it takes effect on every connection the pool opens, not just the
+// first. Journal mode is deliberately left at the default rollback journal instead
+// of WAL: BackupSQLite copies the single database file, and WAL would move recent
+// commits into a separate -wal sidecar the copy would miss.
+func sqliteDSN(path string) string {
+	return path + "?_pragma=busy_timeout(" + strconv.Itoa(int(sqliteBusyTimeout.Milliseconds())) + ")"
+}
+
 func OpenSQLite(ctx context.Context, path string) (*SQLiteRepository, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", sqliteDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite: %w", err)
 	}
+	// Single-writer model: the repository is the sole writer of this embedded
+	// database, yet several goroutines (HTTP handlers, the coordinator scheduler,
+	// background sweeps) reach it at once. Capping the pool at one connection
+	// serializes every access so concurrent writers queue instead of colliding on
+	// the file lock and returning SQLITE_BUSY. Reads here are infrequent and cheap,
+	// so the lost read parallelism is an acceptable trade for contention-free writes.
+	db.SetMaxOpenConns(1)
 	repo := &SQLiteRepository{db: db}
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
