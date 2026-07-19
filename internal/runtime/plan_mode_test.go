@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -151,12 +152,7 @@ func TestAutoModeOffersAllTools(t *testing.T) {
 		t.Fatalf("RunTask: %v", err)
 	}
 	has := func(n string) bool {
-		for _, x := range maas.offeredTools {
-			if x == n {
-				return true
-			}
-		}
-		return false
+		return slices.Contains(maas.offeredTools, n)
 	}
 	if !has("write_x") || !has("read_x") {
 		t.Errorf("auto mode should offer all tools; offered=%v", maas.offeredTools)

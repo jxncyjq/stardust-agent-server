@@ -517,7 +517,7 @@ resource: %q
 // firstNonEmptyLine returns the first non-empty (trimmed) line of s, used as a
 // readable plan title.
 func firstNonEmptyLine(s string) string {
-	for _, line := range strings.Split(s, "\n") {
+	for line := range strings.SplitSeq(s, "\n") {
 		if t := strings.TrimSpace(line); t != "" {
 			return t
 		}
@@ -746,13 +746,6 @@ func boundPrompt(prompt string, maxChars int) string {
 	tail := string(runes[len(runes)-tailLen:])
 	dropped := len(runes) - headLen - tailLen
 	return head + fmt.Sprintf("\n\n…[older tool context trimmed: %d chars]…\n\n", dropped) + tail
-}
-
-func max(a int, b int) int {
-	if a > b {
-		return a
-	}
-	return b
 }
 
 type noopEventBus struct{}

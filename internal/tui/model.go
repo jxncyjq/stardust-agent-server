@@ -47,15 +47,15 @@ func (m Model) View() string {
 	var b strings.Builder
 	b.WriteString(title)
 	b.WriteString("\n\n")
-	b.WriteString(fmt.Sprintf("Task: %s\n", m.clean(m.result.TaskID)))
-	b.WriteString(fmt.Sprintf("Result: %s\n\n", m.clean(m.result.Result)))
+	fmt.Fprintf(&b, "Task: %s\n", m.clean(m.result.TaskID))
+	fmt.Fprintf(&b, "Result: %s\n\n", m.clean(m.result.Result))
 	b.WriteString("Event Stream:\n")
 	for _, event := range m.result.EventStream {
-		b.WriteString(fmt.Sprintf("- %s: %s\n", m.clean(event.Type), m.clean(event.Message)))
+		fmt.Fprintf(&b, "- %s: %s\n", m.clean(event.Type), m.clean(event.Message))
 	}
 	b.WriteString("\nAudit:\n")
 	for _, action := range m.result.AuditActions {
-		b.WriteString(fmt.Sprintf("- %s\n", m.clean(action)))
+		fmt.Fprintf(&b, "- %s\n", m.clean(action))
 	}
 	if m.done {
 		b.WriteString("\nPress any key to exit.\n")

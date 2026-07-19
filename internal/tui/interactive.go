@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -25,7 +26,7 @@ import (
 type Runner func(ctx context.Context, prompt string) (app.DemoResult, error)
 type StreamingRunner func(ctx context.Context, prompt string, emit func(domain.RuntimeEvent)) (app.DemoResult, error)
 
-var tuiAgentMessageIDCounter uint64
+var tuiAgentMessageIDCounter atomic.Uint64
 
 type InteractiveConfig struct {
 	Runner          Runner
@@ -569,10 +570,13 @@ func (m InteractiveModel) updateMouse(msg tea.MouseMsg) InteractiveModel {
 	if !m.mouseInMainArea(msg) {
 		return m
 	}
-	switch msg.Type {
-	case tea.MouseWheelUp:
+	if msg.Action != tea.MouseActionPress {
+		return m
+	}
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
 		m.mainScroll = m.clampMainScroll(m.mainScroll - 3)
-	case tea.MouseWheelDown:
+	case tea.MouseButtonWheelDown:
 		m.mainScroll = m.clampMainScroll(m.mainScroll + 3)
 	}
 	return m
@@ -758,17 +762,6 @@ func (m InteractiveModel) newStyle() lipgloss.Style {
 		return m.renderer.NewStyle()
 	}
 	return lipgloss.NewStyle()
-}
-
-func (m InteractiveModel) statusText() string {
-	status := "Ready"
-	if m.running {
-		status = "Running..."
-	}
-	if m.err != "" {
-		status = "Error"
-	}
-	return status
 }
 
 func (m InteractiveModel) renderHeader(width int) string {
@@ -1283,7 +1276,7 @@ func (m InteractiveModel) handleMessageCommand(ctx context.Context, prompt strin
 }
 
 func nextTUIAgentMessageID() string {
-	seq := atomic.AddUint64(&tuiAgentMessageIDCounter, 1)
+	seq := tuiAgentMessageIDCounter.Add(1)
 	return fmt.Sprintf("tui-msg-%s-%06d", time.Now().UTC().Format("20060102-150405"), seq)
 }
 
@@ -1295,12 +1288,7 @@ func (m InteractiveModel) isKnownAgent(agentID string) bool {
 	if len(m.agentNames) == 0 {
 		return true
 	}
-	for _, name := range m.agentNames {
-		if name == agentID {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(m.agentNames, agentID)
 }
 
 func renderInteractiveMessages(messages []domain.AgentMessage) string {
@@ -1309,19 +1297,21 @@ func renderInteractiveMessages(messages []domain.AgentMessage) string {
 	}
 	var b strings.Builder
 	for _, message := range messages {
-		b.WriteString(fmt.Sprintf("- `%s` `%s` `%s` %s -> %s: %s",
+		fmt.Fprintf(&b, "- `%s` `%s` `%s` %s -> %s: %s",
 			message.ID,
 			message.Type,
 			message.Status,
 			message.FromAgentID,
 			message.ToAgentID,
 			message.Summary,
-		))
+		)
 		if message.TaskID != "" {
-			b.WriteString(" task=" + message.TaskID)
+			b.WriteString(" task=")
+			b.WriteString(message.TaskID)
 		}
 		if message.Artifact != "" {
-			b.WriteString(" artifact=" + message.Artifact)
+			b.WriteString(" artifact=")
+			b.WriteString(message.Artifact)
 		}
 		b.WriteString("\n")
 	}
@@ -1345,14 +1335,6 @@ func (m InteractiveModel) renderWorkingProgressBar(width int, frame int) string 
 	rightWidth := width - markerWidth - leftWidth
 	bar := strings.Repeat("─", leftWidth) + marker + strings.Repeat("─", rightWidth)
 	return m.styles.title.Render(bar)
-}
-
-func (m InteractiveModel) renderPanel(label string, body string) string {
-	if strings.TrimSpace(body) == "" {
-		body = "No data yet."
-	}
-	content := m.styles.label.Render(label) + "\n" + body
-	return m.styles.panel.Render(content) + "\n"
 }
 
 func (m InteractiveModel) renderResult(width int) string {
@@ -1452,7 +1434,7 @@ func (m InteractiveModel) renderThinkingBlock(width int) string {
 	}
 	if strings.TrimSpace(m.result.ReasoningSummary) != "" {
 		reasoning := m.formatMarkdownBlock(m.result.ReasoningSummary, width-2)
-		for _, line := range strings.Split(reasoning, "\n") {
+		for line := range strings.SplitSeq(reasoning, "\n") {
 			if strings.TrimSpace(line) == "" {
 				lines = append(lines, m.styles.dim.Render("│"))
 				continue
@@ -1475,7 +1457,7 @@ func (m InteractiveModel) renderLiveEvent(event domain.RuntimeEvent, width int) 
 	}
 	if eventType == "tool_result" {
 		lines := []string{m.styles.dim.Italic(true).Render("│ tool_result")}
-		for _, line := range strings.Split(m.formatMarkdownBlock(message, width-2), "\n") {
+		for line := range strings.SplitSeq(m.formatMarkdownBlock(message, width-2), "\n") {
 			if strings.TrimSpace(line) == "" {
 				lines = append(lines, m.styles.dim.Render("│"))
 				continue
@@ -1504,7 +1486,7 @@ func (m InteractiveModel) renderLiveEvent(event domain.RuntimeEvent, width int) 
 
 // firstNonEmptyLine returns the first non-empty line of text.
 func firstNonEmptyLine(text string) string {
-	for _, line := range strings.Split(text, "\n") {
+	for line := range strings.SplitSeq(text, "\n") {
 		line = strings.TrimSpace(line)
 		if line != "" {
 			return line
@@ -1623,19 +1605,25 @@ func (m InteractiveModel) renderApprovalPrompt() string {
 	var b strings.Builder
 	b.WriteString(m.styles.label.Render("APPROVAL REQUIRED"))
 	b.WriteString("\n")
-	b.WriteString(m.styles.title.Render("工具: ") + m.clean(m.approvalTool))
+	b.WriteString(m.styles.title.Render("工具: "))
+	b.WriteString(m.clean(m.approvalTool))
 	if len(m.approvalArgs) > 0 {
-		b.WriteString("\n" + m.styles.dim.Render("参数:"))
+		b.WriteString("\n")
+		b.WriteString(m.styles.dim.Render("参数:"))
 		keys := make([]string, 0, len(m.approvalArgs))
 		for k := range m.approvalArgs {
 			keys = append(keys, k)
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			b.WriteString("\n  " + m.clean(k) + " = " + m.clean(m.approvalArgs[k]))
+			b.WriteString("\n  ")
+			b.WriteString(m.clean(k))
+			b.WriteString(" = ")
+			b.WriteString(m.clean(m.approvalArgs[k]))
 		}
 	}
-	b.WriteString("\n\n" + m.styles.err.Render("批准(y) / 拒绝(n)"))
+	b.WriteString("\n\n")
+	b.WriteString(m.styles.err.Render("批准(y) / 拒绝(n)"))
 	return b.String()
 }
 

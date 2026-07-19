@@ -128,7 +128,7 @@ func delegateResultsView(results []SubTaskResult) []map[string]any {
 // non-empty slice. Empty input yields nil (inherit the full parent tool set).
 func parseToolsetsCSV(value string) []string {
 	var names []string
-	for _, part := range strings.Split(value, ",") {
+	for part := range strings.SplitSeq(value, ",") {
 		if trimmed := strings.TrimSpace(part); trimmed != "" {
 			names = append(names, trimmed)
 		}

@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -1680,7 +1681,7 @@ func TestServeCommandEventsEndpointNotUnavailable(t *testing.T) {
 	defer streamCancel()
 	var status int
 	var contentType string
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		req, reqErr := http.NewRequestWithContext(streamCtx, http.MethodGet, "http://"+addr+"/v1/events", nil)
 		if reqErr != nil {
 			t.Fatalf("NewRequest(/v1/events) error = %v, want nil", reqErr)
@@ -2355,10 +2356,8 @@ func (f fakeSessionLister) ListAgentSessions(context.Context, string, string) ([
 
 func assertContains(t *testing.T, got []string, want string) {
 	t.Helper()
-	for _, g := range got {
-		if g == want {
-			return
-		}
+	if slices.Contains(got, want) {
+		return
 	}
 	t.Fatalf("bases = %v, want to contain %q", got, want)
 }
