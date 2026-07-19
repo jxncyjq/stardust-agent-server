@@ -2174,6 +2174,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		TrustGate:          trustManager,
 		MaxWorkers:         cfg.Runtime.MaxConcurrentTasks,
 		Checkpoints:        checkpointStore,
+		Logger:             defaultLogger(),
 	})
 	background := task.NewBackgroundScheduler()
 	background.AddJob("agent-coordinator-heartbeat", func(ctx context.Context) error {
