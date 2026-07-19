@@ -408,15 +408,23 @@ func TestInteractiveModelApprovalPromptLocksMouseScroll(t *testing.T) {
 		t.Fatalf("Update(pendingApproval) approvalActive = false, want true")
 	}
 
+	// The wheel event must be built the same way bubbletea delivers one —
+	// Action press + a wheel Button. Setting only the deprecated Type field
+	// leaves Button at MouseButtonNone, which updateMouse ignores outright, so
+	// the assertions below would hold even with the approvalActive guard gone.
 	before := model.mainScroll
-	for _, wheel := range []tea.MouseEventType{tea.MouseWheelDown, tea.MouseWheelUp} {
-		next, cmd := model.Update(tea.MouseMsg{Type: wheel, Y: 5})
+	for _, wheel := range []tea.MouseButton{tea.MouseButtonWheelDown, tea.MouseButtonWheelUp} {
+		msg := tea.MouseMsg{Action: tea.MouseActionPress, Button: wheel, Y: 5}
+		// MouseMsg is a defined type over MouseEvent and so does not inherit its
+		// String method; convert so failures name the button instead of its ordinal.
+		name := tea.MouseEvent(msg).String()
+		next, cmd := model.Update(msg)
 		model = next.(InteractiveModel)
 		if cmd != nil {
-			t.Fatalf("Update(%v while approval pending) cmd = non-nil, want nil", wheel)
+			t.Fatalf("Update(%s while approval pending) cmd = non-nil, want nil", name)
 		}
 		if model.mainScroll != before {
-			t.Fatalf("Update(%v while approval pending) mainScroll = %d, want %d (scroll locked)", wheel, model.mainScroll, before)
+			t.Fatalf("Update(%s while approval pending) mainScroll = %d, want %d (scroll locked)", name, model.mainScroll, before)
 		}
 		if !model.approvalActive {
 			t.Fatalf("approvalActive flipped false by a mouse event, want still true")
