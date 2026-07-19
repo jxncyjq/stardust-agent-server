@@ -55,10 +55,7 @@ func splitMessage(text string, max int) []string {
 	runes := []rune(text)
 	var chunks []string
 	for len(runes) > 0 {
-		end := max
-		if end > len(runes) {
-			end = len(runes)
-		}
+		end := min(max, len(runes))
 		if end < len(runes) {
 			// Prefer a newline break within [0, end).
 			for i := end - 1; i > 0; i-- {

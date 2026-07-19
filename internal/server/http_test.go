@@ -375,7 +375,7 @@ func TestHTTPServerCompletedTaskRecordsAssistantTurnOnce(t *testing.T) {
 
 	// Poll the result endpoint several times; the assistant turn must be written
 	// exactly once regardless of how many times it is queried.
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/v1/tasks/task-done-1/result", nil)
 		srv.ServeHTTP(rec, req)

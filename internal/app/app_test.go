@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 	"time"
 
@@ -558,12 +559,7 @@ func TestRunTaskStardustAgentsIsResident(t *testing.T) {
 }
 
 func hasDemoAuditAction(result DemoResult, action string) bool {
-	for _, got := range result.AuditActions {
-		if got == action {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(result.AuditActions, action)
 }
 
 type captureMaas struct {

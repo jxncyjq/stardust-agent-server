@@ -76,9 +76,7 @@ func NewDiagnostics(cfg DiagnosticsConfig) *Diagnostics {
 func (d *Diagnostics) Snapshot() DiagnosticsSnapshot {
 	now := d.now()
 	uptime := now.Sub(d.cfg.StartedAt)
-	if uptime < 0 {
-		uptime = 0
-	}
+	uptime = max(uptime, 0)
 	return DiagnosticsSnapshot{
 		Version:       defaultString(d.cfg.Version, "dev"),
 		Commit:        defaultString(d.cfg.Commit, "unknown"),

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"sort"
@@ -58,9 +59,7 @@ func LoadAgentFile(path string) (AgentConfig, error) {
 
 func New(agents map[string]AgentConfig) *Registry {
 	copied := make(map[string]AgentConfig, len(agents))
-	for name, agent := range agents {
-		copied[name] = agent
-	}
+	maps.Copy(copied, agents)
 	return &Registry{agents: copied}
 }
 

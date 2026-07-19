@@ -90,17 +90,14 @@ func TestTaskLedgerConcurrentCollaborationGolden(t *testing.T) {
 	var mu sync.Mutex
 	var errs []error
 	for _, event := range events {
-		event := event
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			_, err := ledger.Append(ctx, event)
 			if err != nil {
 				mu.Lock()
 				errs = append(errs, err)
 				mu.Unlock()
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	if len(errs) > 0 {

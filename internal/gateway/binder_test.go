@@ -60,11 +60,11 @@ func TestSQLiteBinderConcurrentBindsNoBusy(t *testing.T) {
 	const perWriter = 25
 	var wg sync.WaitGroup
 	errs := make(chan error, writers*perWriter)
-	for w := 0; w < writers; w++ {
+	for w := range writers {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
-			for i := 0; i < perWriter; i++ {
+			for i := range perWriter {
 				key := fmt.Sprintf("telegram:%d-%d", w, i)
 				if err := binder.Bind(ctx, key, fmt.Sprintf("session-%d-%d", w, i), fmt.Sprintf("%d", i)); err != nil {
 					errs <- fmt.Errorf("bind %q: %w", key, err)
@@ -83,8 +83,8 @@ func TestSQLiteBinderConcurrentBindsNoBusy(t *testing.T) {
 		t.Errorf("concurrent bind failed: %v", err)
 	}
 
-	for w := 0; w < writers; w++ {
-		for i := 0; i < perWriter; i++ {
+	for w := range writers {
+		for i := range perWriter {
 			key := fmt.Sprintf("telegram:%d-%d", w, i)
 			sid, _, ok, err := binder.Resolve(ctx, key)
 			if err != nil || !ok || sid != fmt.Sprintf("session-%d-%d", w, i) {

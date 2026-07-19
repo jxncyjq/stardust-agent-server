@@ -1,6 +1,10 @@
 package tool
 
-import "github.com/stardust/legion-agent/internal/domain"
+import (
+	"maps"
+
+	"github.com/stardust/legion-agent/internal/domain"
+)
 
 type PermissionEnforcerFunc func(domain.Agent, domain.ToolCall) error
 
@@ -21,9 +25,7 @@ type BatchRolePermissionEnforcer struct {
 
 func NewBatchRolePermissionEnforcer(allowed map[string]bool, overrides []RolePermissionOverride) BatchRolePermissionEnforcer {
 	copiedAllowed := make(map[string]bool, len(allowed))
-	for key, value := range allowed {
-		copiedAllowed[key] = value
-	}
+	maps.Copy(copiedAllowed, allowed)
 	copiedOverrides := make(map[string]bool, len(overrides))
 	for _, override := range overrides {
 		copiedOverrides[permissionKey(override.Role, override.ToolName)] = override.Allow

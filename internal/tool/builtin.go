@@ -448,7 +448,7 @@ func parseExtensions(raw string) map[string]bool {
 
 func firstMatchingLine(text string, pattern string) string {
 	lowerPattern := strings.ToLower(pattern)
-	for _, line := range strings.Split(text, "\n") {
+	for line := range strings.SplitSeq(text, "\n") {
 		if strings.Contains(strings.ToLower(line), lowerPattern) {
 			return strings.TrimSpace(line)
 		}

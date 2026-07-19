@@ -3,6 +3,7 @@ package compat
 import (
 	"encoding/json"
 	"os"
+	"slices"
 	"testing"
 )
 
@@ -37,10 +38,5 @@ func TestP21CollaborationSurfaceGolden(t *testing.T) {
 }
 
 func containsString(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(values, want)
 }

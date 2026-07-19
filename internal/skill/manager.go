@@ -111,8 +111,7 @@ func (m *DiskManager) Uninstall(_ context.Context, name string) error {
 //	"github:owner/repo"  →  https://raw.githubusercontent.com/owner/repo/main/SKILL.md
 //	"https://..."        →  as-is
 func resolveSourceURL(source string) string {
-	if strings.HasPrefix(source, "github:") {
-		repo := strings.TrimPrefix(source, "github:")
+	if repo, ok := strings.CutPrefix(source, "github:"); ok {
 		return "https://raw.githubusercontent.com/" + repo + "/main/SKILL.md"
 	}
 	return source

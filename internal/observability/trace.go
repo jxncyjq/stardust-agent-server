@@ -1,6 +1,7 @@
 package observability
 
 import (
+	"maps"
 	"strings"
 	"sync"
 	"time"
@@ -90,8 +91,6 @@ func isSensitiveTraceAttribute(key string) bool {
 
 func cloneStringMap(in map[string]string) map[string]string {
 	out := make(map[string]string, len(in))
-	for key, value := range in {
-		out[key] = value
-	}
+	maps.Copy(out, in)
 	return out
 }

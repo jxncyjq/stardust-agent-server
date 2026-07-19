@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"reflect"
 	"strings"
@@ -331,9 +332,7 @@ func normalizeFunctionParameters(schema map[string]any) map[string]any {
 		}
 	}
 	normalized := make(map[string]any, len(schema)+2)
-	for key, value := range schema {
-		normalized[key] = value
-	}
+	maps.Copy(normalized, schema)
 	if normalized["type"] == nil || normalized["type"] == "" {
 		normalized["type"] = "object"
 	}

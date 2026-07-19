@@ -53,7 +53,7 @@ func ParseLearningRuntimeEvent(event domain.RuntimeEvent) (LearningEvent, bool) 
 		return LearningEvent{}, false
 	}
 	fields := make(map[string]string)
-	for _, part := range strings.Fields(event.Message) {
+	for part := range strings.FieldsSeq(event.Message) {
 		key, value, ok := strings.Cut(part, "=")
 		if !ok {
 			continue

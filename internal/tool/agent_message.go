@@ -11,7 +11,7 @@ import (
 	"github.com/stardust/legion-agent/internal/domain"
 )
 
-var agentMessageToolIDCounter uint64
+var agentMessageToolIDCounter atomic.Uint64
 
 type AgentMessageStore interface {
 	SaveAgentMessage(context.Context, domain.AgentMessage) error
@@ -149,22 +149,25 @@ func renderAgentMessages(messages []domain.AgentMessage) string {
 	}
 	var b strings.Builder
 	for _, message := range messages {
-		b.WriteString(fmt.Sprintf("- `%s` `%s` `%s` %s -> %s: %s",
+		fmt.Fprintf(&b, "- `%s` `%s` `%s` %s -> %s: %s",
 			message.ID,
 			message.Type,
 			message.Status,
 			message.FromAgentID,
 			message.ToAgentID,
 			message.Summary,
-		))
+		)
 		if message.TaskID != "" {
-			b.WriteString(" task=" + message.TaskID)
+			b.WriteString(" task=")
+			b.WriteString(message.TaskID)
 		}
 		if message.Artifact != "" {
-			b.WriteString(" artifact=" + message.Artifact)
+			b.WriteString(" artifact=")
+			b.WriteString(message.Artifact)
 		}
 		if message.SourceEventID != "" {
-			b.WriteString(" source_event=" + message.SourceEventID)
+			b.WriteString(" source_event=")
+			b.WriteString(message.SourceEventID)
 		}
 		b.WriteString("\n")
 	}
@@ -202,6 +205,6 @@ func parseMessageBool(value string) bool {
 }
 
 func nextAgentMessageID() string {
-	seq := atomic.AddUint64(&agentMessageToolIDCounter, 1)
+	seq := agentMessageToolIDCounter.Add(1)
 	return fmt.Sprintf("msg-%s-%06d", time.Now().UTC().Format("20060102-150405"), seq)
 }

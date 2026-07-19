@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -20,7 +21,7 @@ var (
 	ErrProjectionTooLong = errors.New("task ledger projection exceeds configured line limit")
 )
 
-var eventIDCounter uint64
+var eventIDCounter atomic.Uint64
 
 type Config struct {
 	WorkspaceRoot    string
@@ -250,12 +251,7 @@ func (l *Ledger) agentAllowed(agentID string) bool {
 	if len(l.cfg.AllowedAgentIDs) == 0 {
 		return true
 	}
-	for _, allowed := range l.cfg.AllowedAgentIDs {
-		if agentID == allowed {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(l.cfg.AllowedAgentIDs, agentID)
 }
 
 func (l *Ledger) writeProjection(ctx context.Context, projection Projection) error {
@@ -393,6 +389,6 @@ func validEventType(eventType string) bool {
 }
 
 func defaultEventID(t time.Time) string {
-	seq := atomic.AddUint64(&eventIDCounter, 1)
+	seq := eventIDCounter.Add(1)
 	return fmt.Sprintf("evt-%s-%06d", t.UTC().Format("20060102-150405.000000000"), seq)
 }

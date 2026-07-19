@@ -74,17 +74,13 @@ func (g *GatewayRunner) Run(ctx context.Context) error {
 		}(adapter)
 	}
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		g.inboundWorker(ctx, inbound)
-	}()
+	})
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		g.pollLoop(ctx)
-	}()
+	})
 
 	<-ctx.Done()
 	wg.Wait()

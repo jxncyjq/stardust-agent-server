@@ -245,7 +245,7 @@ func scoreGene(queryText string, queryTags map[string]bool, gene Gene) float64 {
 	if queryText != "" && strings.Contains(text, queryText) {
 		score += 3
 	}
-	for _, word := range strings.Fields(queryText) {
+	for word := range strings.FieldsSeq(queryText) {
 		if strings.Contains(text, word) {
 			score++
 		}
@@ -260,7 +260,7 @@ func scoreCapsule(queryText string, queryTags map[string]bool, capsule Capsule) 
 	if queryText != "" && strings.Contains(text, queryText) {
 		score += 3
 	}
-	for _, word := range strings.Fields(queryText) {
+	for word := range strings.FieldsSeq(queryText) {
 		if strings.Contains(text, word) {
 			score++
 		}

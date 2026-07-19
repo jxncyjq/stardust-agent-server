@@ -1,6 +1,7 @@
 package observability
 
 import (
+	"maps"
 	"strconv"
 	"sync"
 	"time"
@@ -83,8 +84,6 @@ func (m *MetricsRecorder) inc(counters map[string]int64, key string) {
 
 func cloneCounterMap(in map[string]int64) map[string]int64 {
 	out := make(map[string]int64, len(in))
-	for key, value := range in {
-		out[key] = value
-	}
+	maps.Copy(out, in)
 	return out
 }

@@ -152,14 +152,11 @@ func (e *Engine) executeParallel(ctx context.Context, def Definition, node Node,
 	out := make(chan branchResult, len(node.Children))
 	var wg sync.WaitGroup
 	for _, child := range node.Children {
-		child := child
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			branch := Result{WorkflowID: def.ID}
 			status, err := e.executeNode(ctx, def, child, &branch)
 			out <- branchResult{status: status, err: err, nodes: branch.Nodes}
-		}()
+		})
 	}
 	wg.Wait()
 	close(out)
