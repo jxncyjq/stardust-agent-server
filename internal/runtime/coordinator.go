@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -15,6 +16,14 @@ import (
 	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/task"
 )
+
+// RuntimeEventTaskFailed carries the underlying cause of a failed task run.
+// It exists separately from the failure learning event because that event's
+// reason field is a fixed vocabulary (evolution.FailureReason*) parsed out of a
+// whitespace-separated key=value message: an error string, which always
+// contains spaces, would be truncated to its first word and would corrupt the
+// fields after it. The cause therefore travels here, unabridged.
+const RuntimeEventTaskFailed = "task_failed"
 
 type TaskRunner interface {
 	RunTask(context.Context, domain.Agent, domain.Task) (domain.TaskRun, error)
@@ -51,6 +60,12 @@ type CoordinatorConfig struct {
 	// decision) is re-dispatched from where it left off. Nil disables the scan
 	// (a valid "no manual-mode resume support configured" deployment).
 	Checkpoints *sessionstate.Store
+	// Logger records task-run failures structurally at the per-task goroutine
+	// boundary, where there is no caller left to return an error to. Nil is a
+	// valid "no logging configured" deployment (tests, embedded use): the
+	// failure is still published as a RuntimeEventTaskFailed event, so the
+	// cause is never lost outright.
+	Logger *slog.Logger
 }
 
 type Coordinator struct {
@@ -67,6 +82,7 @@ type Coordinator struct {
 	trustGate          TrustGate
 	lockTTL            time.Duration
 	checkpoints        *sessionstate.Store
+	logger             *slog.Logger
 	sem                chan struct{}
 	wg                 sync.WaitGroup
 
@@ -105,6 +121,7 @@ func NewCoordinator(cfg CoordinatorConfig) *Coordinator {
 		trustGate:          cfg.TrustGate,
 		lockTTL:            cfg.LockTTL,
 		checkpoints:        cfg.Checkpoints,
+		logger:             cfg.Logger,
 		sem:                make(chan struct{}, cfg.MaxWorkers),
 		resuming:           make(map[string]bool),
 	}
@@ -164,9 +181,9 @@ func (c *Coordinator) Heartbeat(ctx context.Context) (domain.Task, bool, error) 
 			defer func() { <-c.sem }()
 			if _, _, err := c.runAssigned(ctx, t); err != nil {
 				// Goroutine top-level: never swallow. runAssigned already
-				// transitioned the task to Failed on error; record the reason so
-				// a failed run is diagnosable rather than vanishing.
-				_ = c.publishLearning(ctx, c.agent.ID, t.ID, evolution.SignalFailure, "task_run_error", true)
+				// transitioned the task to Failed on error; record why, so a
+				// failed run is diagnosable rather than vanishing.
+				c.reportRunFailure(ctx, t.ID, err)
 			}
 		}(taskToRun)
 		dispatched = true
@@ -506,6 +523,52 @@ func (c *Coordinator) appendAudit(ctx context.Context, taskID string, action str
 		return fmt.Errorf("append %s audit event: %w", action, err)
 	}
 	return nil
+}
+
+// reportRunFailure records why a dispatched task run failed. It is called from
+// the per-task goroutine's top level, where there is no caller left to return
+// an error to, so it must not propagate — it reports on every channel it has
+// and never drops the cause silently.
+//
+// Three channels, deliberately:
+//   - the structured log, carrying the full wrapped error for operators;
+//   - a RuntimeEventTaskFailed event, so clients watching the event stream (the
+//     GUI's event panel) can show the cause instead of just "failed";
+//   - the failure learning event, whose reason stays the plain enum value the
+//     evolution pipeline expects.
+//
+// The event is published before the learning event so the cause is on the wire
+// even if the learning publish then fails.
+func (c *Coordinator) reportRunFailure(ctx context.Context, taskID string, cause error) {
+	if c.logger != nil {
+		c.logger.ErrorContext(ctx, "task run failed",
+			"component", "coordinator",
+			"task_id", taskID,
+			"agent_id", c.agent.ID,
+			"error", cause,
+		)
+	}
+	if c.events != nil {
+		if err := c.events.Publish(ctx, domain.RuntimeEvent{
+			Type:      RuntimeEventTaskFailed,
+			TaskID:    taskID,
+			Message:   cause.Error(),
+			CreatedAt: time.Now(),
+		}); err != nil && c.logger != nil {
+			c.logger.ErrorContext(ctx, "publish task failure event",
+				"component", "coordinator",
+				"task_id", taskID,
+				"error", err,
+			)
+		}
+	}
+	if err := c.publishLearning(ctx, c.agent.ID, taskID, evolution.SignalFailure, "task_run_error", true); err != nil && c.logger != nil {
+		c.logger.ErrorContext(ctx, "publish failure learning event",
+			"component", "coordinator",
+			"task_id", taskID,
+			"error", err,
+		)
+	}
 }
 
 func (c *Coordinator) publishLearning(ctx context.Context, agentID string, taskID string, signal evolution.SignalKind, reason string, lightweight bool) error {

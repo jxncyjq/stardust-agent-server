@@ -2,6 +2,8 @@ package runtime
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -517,6 +519,78 @@ func (r *recordingTaskRunner) RunTask(ctx context.Context, agent domain.Agent, t
 		Result:  r.result,
 	}
 	return r.lastRun, nil
+}
+
+// failingTaskRunner always fails RunTask with a fixed error, standing in for a
+// real runtime failure such as the MaaS call coming back 401.
+type failingTaskRunner struct{ err error }
+
+func (r *failingTaskRunner) RunTask(context.Context, domain.Agent, domain.Task) (domain.TaskRun, error) {
+	return domain.TaskRun{}, r.err
+}
+
+// Regression: a failed run must leave its cause somewhere a human can read.
+// Heartbeat published a fixed "task_run_error" string and dropped the wrapped
+// error runAssigned had built, so a failure was reported but never diagnosable
+// — the events feed, the task result and the GUI all showed only that something
+// had gone wrong, never what.
+func TestHeartbeatLearningEventCarriesRunFailureCause(t *testing.T) {
+	sched := task.NewScheduler()
+	events := adapter.NewMemoryEventBus()
+	c := NewCoordinator(CoordinatorConfig{
+		Agent:      domain.Agent{ID: "default-agent", CompanyID: "company-1", Role: "developer", Status: domain.AgentActive},
+		Scheduler:  sched,
+		Locks:      task.NewLockStore(),
+		Runtime:    &failingTaskRunner{err: errors.New("maas chat completion: status 401 unauthorized")},
+		Reviewer:   quality.NewAegisReviewer(),
+		Evaluator:  quality.NewEvalEngine(3),
+		Approvals:  approval.NewService(),
+		Audit:      adapter.NewMemoryAuditLog(),
+		Events:     events,
+		LockTTL:    time.Minute,
+		MaxWorkers: 1,
+	})
+
+	ctx := context.Background()
+	if err := sched.Add(ctx, domain.Task{ID: "t-fail", AgentID: "default-agent", Status: domain.TaskPending, Input: "x"}); err != nil {
+		t.Fatalf("Add(t-fail) error = %v, want nil", err)
+	}
+	if _, _, err := c.Heartbeat(ctx); err != nil {
+		t.Fatalf("Heartbeat() error = %v, want nil", err)
+	}
+	c.Wait()
+
+	got := events.Events()
+	if !hasLearningRuntimeEvent(got, evolution.SignalFailure) {
+		t.Fatalf("no failure learning event published: %#v", got)
+	}
+
+	// The cause travels in its own event, not in the learning event's reason:
+	// reason is a fixed vocabulary the evolution pipeline consumes, and
+	// ParseLearningRuntimeEvent splits the message on whitespace, so an error
+	// string would be truncated to its first word and corrupt later fields.
+	var failure domain.RuntimeEvent
+	for _, event := range got {
+		if event.Type == RuntimeEventTaskFailed {
+			failure = event
+			break
+		}
+	}
+	if failure.Type == "" {
+		t.Fatalf("no %s event published; the run failure cause is unreachable: %#v", RuntimeEventTaskFailed, got)
+	}
+	if !strings.Contains(failure.Message, "401 unauthorized") {
+		t.Fatalf("%s event = %q, want it to carry the underlying cause %q", RuntimeEventTaskFailed, failure.Message, "401 unauthorized")
+	}
+	if failure.TaskID != "t-fail" {
+		t.Errorf("%s event TaskID = %q, want %q", RuntimeEventTaskFailed, failure.TaskID, "t-fail")
+	}
+
+	// The learning event's reason must stay a clean enum value so the parser and
+	// the evolution pipeline keep working.
+	if !hasLearningMessagePart(got, "reason=task_run_error ") {
+		t.Errorf("learning event reason is no longer the plain enum value: %#v", got)
+	}
 }
 
 type staticTaskRunnerResolver struct {
