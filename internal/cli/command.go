@@ -878,6 +878,12 @@ type tuiSessionController struct {
 	restoreLatest bool
 	cache         sessionContextCache
 	currentID     string
+	// currentMode and currentWorkingDir mirror the AgentSession.Mode/WorkingDir
+	// of the session identified by currentID, kept in sync by NewSession,
+	// Initialize, SwitchSession, SetMode and SetWorkingDir so CurrentMode/
+	// CurrentWorkingDir can answer without a store round trip.
+	currentMode       string
+	currentWorkingDir string
 }
 
 type sessionContextCache interface {
@@ -918,6 +924,7 @@ func (c *tuiSessionController) Initialize(ctx context.Context) error {
 		}
 		if ok {
 			c.currentID = session.ID
+			c.applySessionState(session)
 			return nil
 		}
 	}
@@ -951,6 +958,7 @@ func (c *tuiSessionController) NewSession(ctx context.Context) (string, error) {
 	}
 	c.invalidateCurrentSessionCache()
 	c.currentID = id
+	c.applySessionState(session)
 	return id, nil
 }
 
@@ -989,6 +997,7 @@ func (c *tuiSessionController) SwitchSession(ctx context.Context, id string) err
 		if session.ID == id {
 			c.invalidateCurrentSessionCache()
 			c.currentID = id
+			c.applySessionState(session)
 			return nil
 		}
 	}
@@ -1085,6 +1094,131 @@ func (c *tuiSessionController) invalidateCurrentSessionCache() {
 		return
 	}
 	c.cache.InvalidateSession(c.currentID)
+}
+
+// applySessionState mirrors session's Mode/WorkingDir onto currentMode /
+// currentWorkingDir. It normalizes Mode via domain.NormalizeMode so an empty
+// persisted value reads back as domain.ModeAuto, matching NormalizeMode's own
+// "empty is a legitimate default" contract; a value NormalizeMode rejects (should
+// not occur for state this controller itself wrote) is kept as-is rather than
+// silently coerced, so a caller inspecting CurrentMode still sees the raw data.
+func (c *tuiSessionController) applySessionState(session domain.AgentSession) {
+	mode, ok := domain.NormalizeMode(session.Mode)
+	if !ok {
+		mode = session.Mode
+	}
+	c.currentMode = mode
+	c.currentWorkingDir = session.WorkingDir
+}
+
+// currentAgentSession loads the full AgentSession record for currentID from
+// the store. SaveAgentSession persists whole records (see
+// storage.SQLiteRepository.SaveAgentSession), so mutating a single field
+// requires reading the current record first or every other field would be
+// clobbered back to a stale/zero value.
+func (c *tuiSessionController) currentAgentSession(ctx context.Context) (domain.AgentSession, error) {
+	sessions, err := c.store.ListAgentSessions(ctx, c.companyID, c.agentID)
+	if err != nil {
+		return domain.AgentSession{}, err
+	}
+	for _, session := range sessions {
+		if session.ID == c.currentID {
+			return session, nil
+		}
+	}
+	return domain.AgentSession{}, fmt.Errorf("session %q not found", c.currentID)
+}
+
+// CurrentMode implements SessionManager. See SessionManager.CurrentMode.
+func (c *tuiSessionController) CurrentMode() string {
+	if c == nil {
+		return domain.ModeAuto
+	}
+	mode, ok := domain.NormalizeMode(c.currentMode)
+	if !ok {
+		return c.currentMode
+	}
+	return mode
+}
+
+// SetMode implements SessionManager. See SessionManager.SetMode.
+func (c *tuiSessionController) SetMode(ctx context.Context, mode string) error {
+	if c == nil || !c.enabled {
+		return nil
+	}
+	normalized, ok := domain.NormalizeMode(mode)
+	if !ok {
+		return fmt.Errorf("invalid mode %q (want manual|plan|auto)", mode)
+	}
+	if c.currentID == "" {
+		if err := c.Initialize(ctx); err != nil {
+			return err
+		}
+	}
+	session, err := c.currentAgentSession(ctx)
+	if err != nil {
+		return err
+	}
+	session.Mode = normalized
+	session.UpdatedAt = time.Now()
+	if err := c.store.SaveAgentSession(ctx, session); err != nil {
+		return err
+	}
+	c.invalidateCurrentSessionCache()
+	c.currentMode = normalized
+	return nil
+}
+
+// CurrentWorkingDir implements SessionManager. See SessionManager.CurrentWorkingDir.
+func (c *tuiSessionController) CurrentWorkingDir() string {
+	if c == nil {
+		return ""
+	}
+	return c.currentWorkingDir
+}
+
+// SetWorkingDir implements SessionManager. See SessionManager.SetWorkingDir.
+//
+// Unlike the HTTP server's PATCH /v1/sessions handler (server/http.go), this
+// does not enforce set-once-then-immutable semantics on WorkingDir: it always
+// persists whatever valid directory (or empty, to clear) is given. That
+// invariant exists server-side because session on-disk state
+// (sessionstate.SessionBase) is filed under whatever working_dir a session
+// carries at write time, and repointing it strands previously-filed state.
+// The same risk applies here since the TUI writes the same conversationStore
+// record; this is a deliberate scope limit for the initial TUI cwd binding
+// (tracked for follow-up), not a fallback for an error condition.
+func (c *tuiSessionController) SetWorkingDir(ctx context.Context, dir string) error {
+	if c == nil || !c.enabled {
+		return nil
+	}
+	dir = strings.TrimSpace(dir)
+	if dir != "" {
+		info, err := os.Stat(dir)
+		if err != nil {
+			return fmt.Errorf("stat working dir %q: %w", dir, err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("working dir %q is not a directory", dir)
+		}
+	}
+	if c.currentID == "" {
+		if err := c.Initialize(ctx); err != nil {
+			return err
+		}
+	}
+	session, err := c.currentAgentSession(ctx)
+	if err != nil {
+		return err
+	}
+	session.WorkingDir = dir
+	session.UpdatedAt = time.Now()
+	if err := c.store.SaveAgentSession(ctx, session); err != nil {
+		return err
+	}
+	c.invalidateCurrentSessionCache()
+	c.currentWorkingDir = dir
+	return nil
 }
 
 func normalizeRecentTurns(turns int) int {

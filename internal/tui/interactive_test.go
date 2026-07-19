@@ -1189,8 +1189,10 @@ func (f *fakeSkillManager) Uninstall(_ context.Context, name string) error {
 }
 
 type fakeSessionManager struct {
-	current  string
-	sessions []string
+	current    string
+	sessions   []string
+	mode       string
+	workingDir string
 }
 
 func (f *fakeSessionManager) CurrentSessionID() string {
@@ -1214,6 +1216,31 @@ func (f *fakeSessionManager) SwitchSession(_ context.Context, id string) error {
 
 func (f *fakeSessionManager) ClearSession(context.Context) error {
 	f.current = ""
+	return nil
+}
+
+func (f *fakeSessionManager) CurrentMode() string {
+	if f.mode == "" {
+		return domain.ModeAuto
+	}
+	return f.mode
+}
+
+func (f *fakeSessionManager) SetMode(_ context.Context, mode string) error {
+	normalized, ok := domain.NormalizeMode(mode)
+	if !ok {
+		return fmt.Errorf("invalid mode %q", mode)
+	}
+	f.mode = normalized
+	return nil
+}
+
+func (f *fakeSessionManager) CurrentWorkingDir() string {
+	return f.workingDir
+}
+
+func (f *fakeSessionManager) SetWorkingDir(_ context.Context, dir string) error {
+	f.workingDir = dir
 	return nil
 }
 

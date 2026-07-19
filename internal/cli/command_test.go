@@ -869,6 +869,114 @@ func TestTUISessionControllerCachesRecentTurnsAndInvalidatesAfterRecord(t *testi
 	}
 }
 
+func TestTUISessionControllerSetAndGetMode(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo := openCLITestSQLiteRepository(t)
+	session := newTUISessionController(tuiSessionControllerConfig{
+		Store:        repo,
+		Enabled:      true,
+		CompanyID:    "cli-company",
+		AgentID:      "cli-agent",
+		ModelProfile: "dev",
+	})
+	if _, err := session.NewSession(ctx); err != nil {
+		t.Fatalf("NewSession() error = %v, want nil", err)
+	}
+	if got := session.CurrentMode(); got != domain.ModeAuto {
+		t.Fatalf("CurrentMode() (fresh session) = %q, want %q", got, domain.ModeAuto)
+	}
+
+	if err := session.SetMode(ctx, "manual"); err != nil {
+		t.Fatalf("SetMode(manual) error = %v, want nil", err)
+	}
+	if got := session.CurrentMode(); got != "manual" {
+		t.Fatalf("CurrentMode() = %q, want %q", got, "manual")
+	}
+
+	// Persistence: re-fetch the session from the store directly.
+	sessions, err := repo.ListAgentSessions(ctx, "cli-company", "cli-agent")
+	if err != nil {
+		t.Fatalf("ListAgentSessions() error = %v, want nil", err)
+	}
+	var found bool
+	for _, s := range sessions {
+		if s.ID == session.CurrentSessionID() {
+			found = true
+			if s.Mode != "manual" {
+				t.Fatalf("persisted AgentSession.Mode = %q, want %q", s.Mode, "manual")
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("session %q not found in store", session.CurrentSessionID())
+	}
+
+	if err := session.SetMode(ctx, "bogus"); err == nil {
+		t.Fatalf("SetMode(bogus) error = nil, want error")
+	}
+	if got := session.CurrentMode(); got != "manual" {
+		t.Fatalf("CurrentMode() after rejected SetMode = %q, want unchanged %q", got, "manual")
+	}
+}
+
+func TestTUISessionControllerSetAndGetWorkingDir(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo := openCLITestSQLiteRepository(t)
+	session := newTUISessionController(tuiSessionControllerConfig{
+		Store:        repo,
+		Enabled:      true,
+		CompanyID:    "cli-company",
+		AgentID:      "cli-agent",
+		ModelProfile: "dev",
+	})
+	if _, err := session.NewSession(ctx); err != nil {
+		t.Fatalf("NewSession() error = %v, want nil", err)
+	}
+	if got := session.CurrentWorkingDir(); got != "" {
+		t.Fatalf("CurrentWorkingDir() (fresh session) = %q, want empty", got)
+	}
+
+	dir := t.TempDir()
+	if err := session.SetWorkingDir(ctx, dir); err != nil {
+		t.Fatalf("SetWorkingDir(%q) error = %v, want nil", dir, err)
+	}
+	if got := session.CurrentWorkingDir(); got != dir {
+		t.Fatalf("CurrentWorkingDir() = %q, want %q", got, dir)
+	}
+
+	sessions, err := repo.ListAgentSessions(ctx, "cli-company", "cli-agent")
+	if err != nil {
+		t.Fatalf("ListAgentSessions() error = %v, want nil", err)
+	}
+	var found bool
+	for _, s := range sessions {
+		if s.ID == session.CurrentSessionID() {
+			found = true
+			if s.WorkingDir != dir {
+				t.Fatalf("persisted AgentSession.WorkingDir = %q, want %q", s.WorkingDir, dir)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("session %q not found in store", session.CurrentSessionID())
+	}
+
+	notDir := filepath.Join(dir, "not-a-dir.txt")
+	if err := os.WriteFile(notDir, []byte("x"), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", notDir, err)
+	}
+	if err := session.SetWorkingDir(ctx, notDir); err == nil {
+		t.Fatalf("SetWorkingDir(%q) error = nil, want error (not a directory)", notDir)
+	}
+	if got := session.CurrentWorkingDir(); got != dir {
+		t.Fatalf("CurrentWorkingDir() after rejected SetWorkingDir = %q, want unchanged %q", got, dir)
+	}
+}
+
 func TestLoadServeAgentRegistryReturnsMissingChildError(t *testing.T) {
 	t.Parallel()
 

@@ -108,6 +108,20 @@ type SessionManager interface {
 	ListSessions(context.Context) ([]string, error)
 	SwitchSession(context.Context, string) error
 	ClearSession(context.Context) error
+	// CurrentMode returns the working mode bound to the current session
+	// ("manual"/"plan"/"auto"), normalized per domain.NormalizeMode (empty
+	// state reads back as "auto").
+	CurrentMode() string
+	// SetMode validates mode via domain.NormalizeMode (fail-loud on an
+	// unrecognized value) and persists it onto the current session.
+	SetMode(context.Context, string) error
+	// CurrentWorkingDir returns the host filesystem directory bound to the
+	// current session, or "" if the session is unbound.
+	CurrentWorkingDir() string
+	// SetWorkingDir validates dir exists and is a directory (fail-loud
+	// otherwise; an empty dir clears the binding) and persists it onto the
+	// current session.
+	SetWorkingDir(context.Context, string) error
 }
 
 type AgentMessageStore interface {
