@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"strconv"
+	"time"
 
 	_ "modernc.org/sqlite"
 )
@@ -23,12 +25,29 @@ type SQLiteBinder struct {
 	db *sql.DB
 }
 
+// binderBusyTimeout is how long a blocked SQLite operation waits for a competing
+// lock to clear before failing. Applied per-connection via the DSN so concurrent
+// binds/resolves from multiple platform goroutines block-and-retry instead of
+// surfacing an immediate SQLITE_BUSY. It only widens the retry window; a genuine
+// lock still fails loudly once the timeout elapses.
+const binderBusyTimeout = 5 * time.Second
+
+// binderDSN augments a filesystem path with the busy_timeout PRAGMA applied to
+// every physical connection the pool opens.
+func binderDSN(path string) string {
+	return path + "?_pragma=busy_timeout(" + strconv.Itoa(int(binderBusyTimeout.Milliseconds())) + ")"
+}
+
 // OpenSQLiteBinder opens (creating if needed) the binding database at path.
 func OpenSQLiteBinder(ctx context.Context, path string) (*SQLiteBinder, error) {
-	db, err := sql.Open("sqlite", path)
+	db, err := sql.Open("sqlite", binderDSN(path))
 	if err != nil {
 		return nil, fmt.Errorf("open gateway sqlite %q: %w", path, err)
 	}
+	// Single-writer model: cap the pool at one connection so concurrent gateway
+	// goroutines serialize instead of colliding on the file lock and returning
+	// SQLITE_BUSY.
+	db.SetMaxOpenConns(1)
 	if err := db.PingContext(ctx); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("ping gateway sqlite %q: %w", path, err)
