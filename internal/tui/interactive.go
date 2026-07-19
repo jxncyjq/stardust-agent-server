@@ -86,6 +86,8 @@ type InteractiveModel struct {
 	messageMsg     string
 	agentID        string
 	turns          []conversationTurn
+	mode           string
+	workingDir     string
 }
 
 type interactiveViewMode string
@@ -163,6 +165,8 @@ var interactiveCommands = []interactiveCommand{
 	{Name: "/skill install ", Description: "安装技能 <github:owner/repo | https://...>"},
 	{Name: "/skill update ", Description: "更新技能 <name>"},
 	{Name: "/skill uninstall ", Description: "卸载技能 <name>"},
+	{Name: "/mode ", Description: "设置工作模式 manual|plan|auto"},
+	{Name: "/cwd ", Description: "设置工作目录 <path>"},
 }
 
 // ThemeColors defines the color palette for the TUI.
@@ -260,6 +264,8 @@ func NewInteractiveModel(cfg InteractiveConfig) InteractiveModel {
 		agentID:        agentID,
 		showPrompt:     !cfg.HidePrompt,
 		showThinking:   !cfg.HideThinking,
+		mode:           currentMode(cfg.SessionManager),
+		workingDir:     currentWorkingDir(cfg.SessionManager),
 	}
 }
 
@@ -268,6 +274,24 @@ func currentSessionID(manager SessionManager) string {
 		return ""
 	}
 	return strings.TrimSpace(manager.CurrentSessionID())
+}
+
+// currentMode returns the session manager's current mode, or
+// domain.ModeAuto when manager is nil (no session binding available yet).
+func currentMode(manager SessionManager) string {
+	if manager == nil {
+		return domain.ModeAuto
+	}
+	return manager.CurrentMode()
+}
+
+// currentWorkingDir returns the session manager's current working
+// directory, or "" when manager is nil (no session binding available yet).
+func currentWorkingDir(manager SessionManager) string {
+	if manager == nil {
+		return ""
+	}
+	return manager.CurrentWorkingDir()
 }
 
 func normalizedAgentNames(names []string) []string {
@@ -380,6 +404,12 @@ func (m InteractiveModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if handled, next := m.handleSessionCommand(context.Background(), prompt); handled {
+				return next, nil
+			}
+			if handled, next := m.handleModeCommand(context.Background(), prompt); handled {
+				return next, nil
+			}
+			if handled, next := m.handleCwdCommand(context.Background(), prompt); handled {
 				return next, nil
 			}
 			if handled, next := m.handleTaskCommand(context.Background(), prompt); handled {
@@ -900,6 +930,8 @@ func (m InteractiveModel) handleSessionCommand(ctx context.Context, prompt strin
 		m.err = ""
 		m.sessionID = id
 		m.turns = nil
+		m.mode = currentMode(m.sessionManager)
+		m.workingDir = currentWorkingDir(m.sessionManager)
 		m.sessionMsg = "created " + id
 	case "/sessions":
 		ids, err := m.sessionManager.ListSessions(ctx)
@@ -925,6 +957,8 @@ func (m InteractiveModel) handleSessionCommand(ctx context.Context, prompt strin
 		m.err = ""
 		m.sessionID = fields[1]
 		m.turns = nil
+		m.mode = currentMode(m.sessionManager)
+		m.workingDir = currentWorkingDir(m.sessionManager)
 		m.sessionMsg = "switched to " + fields[1]
 	case "/clear-session":
 		if err := m.sessionManager.ClearSession(ctx); err != nil {
@@ -934,8 +968,65 @@ func (m InteractiveModel) handleSessionCommand(ctx context.Context, prompt strin
 		m.err = ""
 		m.sessionID = currentSessionID(m.sessionManager)
 		m.turns = nil
+		m.mode = currentMode(m.sessionManager)
+		m.workingDir = currentWorkingDir(m.sessionManager)
 		m.sessionMsg = "session cleared"
 	}
+	return true, m
+}
+
+// handleModeCommand handles the "/mode <manual|plan|auto>" command. It
+// delegates validation to SessionManager.SetMode (fail-loud on an
+// unrecognized mode via domain.NormalizeMode) and, on success, refreshes
+// model.mode from SessionManager.CurrentMode so the status bar reflects the
+// normalized, persisted value.
+func (m InteractiveModel) handleModeCommand(ctx context.Context, prompt string) (bool, InteractiveModel) {
+	fields := strings.Fields(prompt)
+	if len(fields) == 0 || !strings.EqualFold(fields[0], "/mode") {
+		return false, m
+	}
+	m.input = ""
+	if m.sessionManager == nil {
+		m.err = "session manager unavailable"
+		return true, m
+	}
+	if len(fields) < 2 {
+		m.err = "usage: /mode manual|plan|auto"
+		return true, m
+	}
+	if err := m.sessionManager.SetMode(ctx, fields[1]); err != nil {
+		m.err = err.Error()
+		return true, m
+	}
+	m.err = ""
+	m.mode = m.sessionManager.CurrentMode()
+	return true, m
+}
+
+// handleCwdCommand handles the "/cwd <path>" command. It delegates
+// validation to SessionManager.SetWorkingDir (fail-loud when path does not
+// resolve to an existing directory) and, on success, refreshes
+// model.workingDir from SessionManager.CurrentWorkingDir.
+func (m InteractiveModel) handleCwdCommand(ctx context.Context, prompt string) (bool, InteractiveModel) {
+	fields := strings.Fields(prompt)
+	if len(fields) == 0 || !strings.EqualFold(fields[0], "/cwd") {
+		return false, m
+	}
+	m.input = ""
+	if m.sessionManager == nil {
+		m.err = "session manager unavailable"
+		return true, m
+	}
+	if len(fields) < 2 {
+		m.err = "usage: /cwd <path>"
+		return true, m
+	}
+	if err := m.sessionManager.SetWorkingDir(ctx, fields[1]); err != nil {
+		m.err = err.Error()
+		return true, m
+	}
+	m.err = ""
+	m.workingDir = m.sessionManager.CurrentWorkingDir()
 	return true, m
 }
 

@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -549,6 +550,94 @@ func TestInteractiveModelSessionCommandsUseSessionManager(t *testing.T) {
 	model = next.(InteractiveModel)
 	if manager.current != "session-2" || model.sessionID != "session-2" {
 		t.Fatalf("/switch current = %q model.sessionID = %q, want session-2", manager.current, model.sessionID)
+	}
+}
+
+func TestInteractiveModelModeCommandSetsMode(t *testing.T) {
+	t.Parallel()
+
+	manager := &fakeSessionManager{current: "session-1"}
+	model := NewInteractiveModel(InteractiveConfig{SessionManager: manager})
+	next, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 36})
+	model = next.(InteractiveModel)
+
+	model = typeInteractiveText(t, model, "/mode manual")
+	next, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = next.(InteractiveModel)
+	if cmd != nil {
+		t.Fatalf("InteractiveModel.Update(/mode manual) cmd = non-nil, want local command")
+	}
+	if manager.mode != "manual" {
+		t.Fatalf("fakeSessionManager.mode = %q, want manual", manager.mode)
+	}
+	if model.mode != "manual" {
+		t.Fatalf("InteractiveModel.mode = %q, want manual", model.mode)
+	}
+	if model.err != "" {
+		t.Fatalf("InteractiveModel.err = %q, want empty after valid /mode", model.err)
+	}
+}
+
+func TestInteractiveModelModeCommandRejectsInvalid(t *testing.T) {
+	t.Parallel()
+
+	manager := &fakeSessionManager{current: "session-1"}
+	model := NewInteractiveModel(InteractiveConfig{SessionManager: manager})
+	next, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 36})
+	model = next.(InteractiveModel)
+
+	model = typeInteractiveText(t, model, "/mode bogus")
+	next, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = next.(InteractiveModel)
+	if model.err == "" {
+		t.Fatalf("InteractiveModel.err = empty, want non-empty for invalid /mode")
+	}
+	if manager.mode != "" {
+		t.Fatalf("fakeSessionManager.mode = %q, want unchanged empty after invalid /mode", manager.mode)
+	}
+	if model.mode != domain.ModeAuto {
+		t.Fatalf("InteractiveModel.mode = %q, want unchanged %q after invalid /mode", model.mode, domain.ModeAuto)
+	}
+}
+
+func TestInteractiveModelCwdCommandSetsWorkingDir(t *testing.T) {
+	t.Parallel()
+
+	manager := &fakeSessionManager{current: "session-1"}
+	model := NewInteractiveModel(InteractiveConfig{SessionManager: manager})
+	next, _ := model.Update(tea.WindowSizeMsg{Width: 120, Height: 36})
+	model = next.(InteractiveModel)
+
+	dir := t.TempDir()
+	model = typeInteractiveText(t, model, "/cwd "+dir)
+	next, cmd := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = next.(InteractiveModel)
+	if cmd != nil {
+		t.Fatalf("InteractiveModel.Update(/cwd) cmd = non-nil, want local command")
+	}
+	if manager.workingDir != dir {
+		t.Fatalf("fakeSessionManager.workingDir = %q, want %q", manager.workingDir, dir)
+	}
+	if model.workingDir != dir {
+		t.Fatalf("InteractiveModel.workingDir = %q, want %q", model.workingDir, dir)
+	}
+	if model.err != "" {
+		t.Fatalf("InteractiveModel.err = %q, want empty after valid /cwd", model.err)
+	}
+
+	model.input = ""
+	missing := dir + string(os.PathSeparator) + "does-not-exist"
+	model = typeInteractiveText(t, model, "/cwd "+missing)
+	next, _ = model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	model = next.(InteractiveModel)
+	if model.err == "" {
+		t.Fatalf("InteractiveModel.err = empty, want non-empty for nonexistent /cwd path")
+	}
+	if manager.workingDir != dir {
+		t.Fatalf("fakeSessionManager.workingDir = %q, want unchanged %q after invalid /cwd", manager.workingDir, dir)
+	}
+	if model.workingDir != dir {
+		t.Fatalf("InteractiveModel.workingDir = %q, want unchanged %q after invalid /cwd", model.workingDir, dir)
 	}
 }
 
@@ -1240,6 +1329,15 @@ func (f *fakeSessionManager) CurrentWorkingDir() string {
 }
 
 func (f *fakeSessionManager) SetWorkingDir(_ context.Context, dir string) error {
+	if dir != "" {
+		info, err := os.Stat(dir)
+		if err != nil {
+			return fmt.Errorf("stat working dir %q: %w", dir, err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("working dir %q is not a directory", dir)
+		}
+	}
 	f.workingDir = dir
 	return nil
 }
