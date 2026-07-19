@@ -276,6 +276,58 @@ Write concise cache documentation.
 	}
 }
 
+// Regression: a sub-agent whose skills install_root does not exist yet (nothing
+// has been installed) must still run. The default runtime guards the mount with
+// an existence check, but the resolver only tested the path for being a
+// non-empty string, so the skill walk hit a missing directory and EVERY task
+// routed to ANY configured sub-agent failed while building its context:
+//
+//	run task: build cognitive context: select task skills:
+//	scan skills in "skills/researcher": ... cannot find the path specified.
+//
+// An uninstalled skills directory is a valid empty state, not a failure.
+func TestAgentRuntimeResolverToleratesMissingSkillsRoot(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	// Deliberately never created — this is the "no skills installed yet" state.
+	missingSkills := filepath.Join(root, "skills", "researcher")
+
+	maas := &resolverCaptureMaas{response: "researched"}
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
+			"researcher": {
+				ID:           "researcher",
+				Role:         "researcher",
+				MaasProfile:  "deep",
+				ContextFiles: config.ContextFilesConfig{Root: root},
+				Skills:       config.SkillsConfig{InstallRoot: missingSkills},
+			},
+		}),
+		RootConfig: config.Config{
+			ContextFiles: config.ContextFilesConfig{Root: root},
+			Runtime:      config.RuntimeConfig{MaxToolRounds: 1},
+		},
+		Audit:  adapter.NewMemoryAuditLog(),
+		Events: adapter.NewMemoryEventBus(),
+		MaasFactory: func(profile string) (MaasRunnerFactoryResult, error) {
+			return MaasRunnerFactoryResult{Client: maas, ModelName: profile + "-model"}, nil
+		},
+	})
+
+	task := domain.Task{ID: "task-no-skills", AgentID: "researcher", Input: "research cache behavior"}
+	agent, runner, ok, err := resolver.ResolveTaskRunner(context.Background(), task)
+	if err != nil {
+		t.Fatalf("ResolveTaskRunner(missing skills root) error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatalf("ResolveTaskRunner(missing skills root) ok = false, want true")
+	}
+	if _, err := runner.RunTask(context.Background(), agent, task); err != nil {
+		t.Fatalf("RunTask(missing skills root) error = %v, want nil (an uninstalled skills dir is a valid empty state)", err)
+	}
+}
+
 func TestAgentRuntimeResolverRoleSkillsInheritRootWhenUnset(t *testing.T) {
 	t.Parallel()
 

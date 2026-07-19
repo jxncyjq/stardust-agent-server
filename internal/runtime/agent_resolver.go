@@ -88,7 +88,11 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		return domain.Agent{}, nil, false, fmt.Errorf("load agent context files for %q: %w", task.AgentID, err)
 	}
 	contextBuilder := cognitive.NewCore(cognitive.NoopCompressor{}).WithContextFiles(contextBlock)
-	if skillsRoot := agentSkillsRoot(r.rootConfig, agentCfg); skillsRoot != "" {
+	// skill.RootAvailable, not a bare non-empty check: an install_root that has
+	// not been created yet means "no skills installed", and mounting it would
+	// fail the skill walk and with it every task routed to this agent. The
+	// default runtime gates its own mount the same way.
+	if skillsRoot := agentSkillsRoot(r.rootConfig, agentCfg); skill.RootAvailable(skillsRoot) {
 		contextBuilder = contextBuilder.WithSkills(skill.NewSystem(skill.Config{
 			Roots:   []string{skillsRoot},
 			Scanner: skill.NewSecurityScanner(),

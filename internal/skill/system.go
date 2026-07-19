@@ -13,6 +13,33 @@ import (
 	"github.com/stardust/legion-agent/internal/domain"
 )
 
+// RootAvailable reports whether root is a directory that can be scanned for
+// skills. It is the single gate every caller must use before mounting a skills
+// root, so the default runtime and the per-agent runtimes cannot disagree about
+// what counts as usable.
+//
+// A missing directory is NOT an error: skills are an optional capability, and
+// "install_root configured but nothing installed yet" is the normal state of a
+// fresh deployment. Mounting it anyway makes the directory walk fail and takes
+// the whole task down with it.
+//
+// An unreadable-but-present root also reports false rather than an error,
+// matching the behaviour this replaces. That is a deliberate limitation, not an
+// endorsement: distinguishing it would change the signature and every call
+// site, and a skills root the process cannot stat is indistinguishable from an
+// absent one for the purpose of deciding whether to mount it.
+func RootAvailable(root string) bool {
+	root = strings.TrimSpace(root)
+	if root == "" {
+		return false
+	}
+	info, err := os.Stat(root)
+	if err != nil {
+		return false
+	}
+	return info.IsDir()
+}
+
 // UsageRecorder records that a skill was used (selected into a task's context),
 // feeding the Curator's idle-aging sweep. It is satisfied by *UsageStore.
 type UsageRecorder interface {
