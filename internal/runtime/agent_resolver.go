@@ -100,6 +100,26 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		Role:      agentCfg.Role,
 		Status:    domain.AgentActive,
 	}
+	// Per-agent (worker) toolset: read-only workspace + task ledger + agent
+	// messaging + web. This is deliberately a strict subset of the default
+	// runtime's toolset (cli.defaultTaskRunner.RunTask), which additionally
+	// carries session_search, moa_consult and delegate_task. Those three are
+	// orchestrator-tier capabilities and are intentionally NOT granted here:
+	//
+	//   - delegate_task: the default runtime is the root orchestrator; workers
+	//     spawning further workers would make the delegation tree unbounded.
+	//   - session_search: MessageSearcher.SearchMessages/BrowseSessions query
+	//     conversation history globally, with no company/agent filter. A worker
+	//     is confined to agentToolRoot's sandbox and to the brief its delegator
+	//     handed it; giving it unscoped cross-agent/cross-company history reads
+	//     would breach that boundary.
+	//   - moa_consult: high-risk and Sensitive, fanning out N+1 model calls to
+	//     arbitrary MaaS profiles. A worker runs under exactly the profile its
+	//     agent config assigns (agentCfg.MaasProfile); letting it consult other
+	//     profiles would bypass that assignment and amplify cost per delegation.
+	//
+	// The asymmetry is the design, not an oversight — see
+	// TestResolverOmitsOrchestratorOnlyTools, which locks it.
 	tools := tool.NewReadOnlyWorkspaceRegistry(agentToolRoot(r.rootConfig, agentCfg, task), r.audit)
 	tool.RegisterTaskLedgerTools(tools, r.taskLedger)
 	tool.RegisterAgentMessageTools(tools, r.messageStore)

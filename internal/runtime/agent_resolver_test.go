@@ -382,6 +382,65 @@ func TestAgentRuntimeResolverFactoryErrorReturnsError(t *testing.T) {
 	}
 }
 
+// TestResolverOmitsOrchestratorOnlyTools locks the intentional asymmetry
+// between the per-agent (worker) toolset built by ResolveTaskRunner and the
+// default runtime's toolset (cli.defaultTaskRunner.RunTask): workers get the
+// read-only workspace, task ledger, agent messaging and web tools, but never
+// the orchestrator-tier session_search / moa_consult / delegate_task. See the
+// rationale comment in ResolveTaskRunner — unbounded delegation, unscoped
+// cross-agent history reads, and MaaS-profile bypass respectively.
+func TestResolverOmitsOrchestratorOnlyTools(t *testing.T) {
+	t.Parallel()
+
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
+			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep"},
+		}),
+		RootConfig: config.Config{
+			ContextFiles: config.ContextFilesConfig{Root: t.TempDir()},
+			Runtime:      config.RuntimeConfig{MaxToolRounds: 1},
+			Web:          config.WebToolConfig{Enabled: true},
+		},
+		Audit:  adapter.NewMemoryAuditLog(),
+		Events: adapter.NewMemoryEventBus(),
+		MaasFactory: func(string) (MaasRunnerFactoryResult, error) {
+			return MaasRunnerFactoryResult{Client: &resolverCaptureMaas{response: "ok"}}, nil
+		},
+	})
+
+	_, runner, ok, err := resolver.ResolveTaskRunner(context.Background(), domain.Task{
+		ID:      "task-tools",
+		AgentID: "researcher",
+	})
+	if err != nil {
+		t.Fatalf("ResolveTaskRunner error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatalf("ResolveTaskRunner ok = false, want true")
+	}
+	rt, isRuntime := runner.(*Runtime)
+	if !isRuntime {
+		t.Fatalf("runner type = %T, want *Runtime", runner)
+	}
+	if rt.tools == nil {
+		t.Fatalf("resolver runtime tools = nil, want a registry")
+	}
+	names := make(map[string]bool)
+	for _, descriptor := range rt.tools.Descriptors() {
+		names[descriptor.Name] = true
+	}
+	for _, want := range []string{"read_file", "fetch_url"} {
+		if !names[want] {
+			t.Fatalf("per-agent registry missing worker tool %q, have %v", want, names)
+		}
+	}
+	for _, forbidden := range []string{"session_search", "moa_consult", "delegate_task"} {
+		if names[forbidden] {
+			t.Fatalf("per-agent registry registers orchestrator-only tool %q, want it omitted", forbidden)
+		}
+	}
+}
+
 type resolverCaptureMaas struct {
 	response string
 	prompt   string
