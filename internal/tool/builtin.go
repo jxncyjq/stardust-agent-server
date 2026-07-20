@@ -16,6 +16,19 @@ import (
 	"github.com/stardust/legion-agent/internal/quality"
 )
 
+const (
+	// searchContentMaxFileBytes caps how much of any single file search_content
+	// will read. It mirrors read_file's own limit: without it one large log in
+	// the workspace pulled the entire file into memory.
+	searchContentMaxFileBytes = 256 * 1024
+	// searchContentMaxMatches and listFilesMaxEntries cap how much these tools
+	// return. Their output goes straight into the model context, so an
+	// unbounded result is both a memory risk and an unusable answer. Truncation
+	// is always announced — a silently shortened list reads as a complete one.
+	searchContentMaxMatches = 200
+	listFilesMaxEntries     = 500
+)
+
 // WorkspaceRegistryOption configures optional behavior of a workspace registry
 // built by NewWorkspaceRegistry, such as the per-directory agents.md injection
 // that write_file performs after a successful write.
@@ -335,8 +348,14 @@ func searchContentTool(ctx context.Context, rootPath string, guard port.Workspac
 	}
 	extensions := parseExtensions(call.Arguments["file_types"])
 	var matches []string
+	var notices []string
+	truncated := false
 	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
+			// A directory that cannot be walked makes the result incomplete.
+			// Reporting it as a notice keeps the search usable while making the
+			// gap visible; returning nil would present a partial answer as whole.
+			notices = append(notices, fmt.Sprintf("skipped %s: %v", relativeToRootOrBase(root, path), walkErr))
 			return nil
 		}
 		if err := ctx.Err(); err != nil {
@@ -348,23 +367,36 @@ func searchContentTool(ctx context.Context, rootPath string, guard port.Workspac
 			}
 			return nil
 		}
+		if len(matches) >= searchContentMaxMatches {
+			truncated = true
+			return filepath.SkipAll
+		}
 		if len(extensions) > 0 && !extensions[strings.ToLower(filepath.Ext(path))] {
+			return nil
+		}
+		rel := relativeToRootOrBase(root, path)
+		info, err := entry.Info()
+		if err != nil {
+			notices = append(notices, fmt.Sprintf("skipped %s: %v", rel, err))
+			return nil
+		}
+		// Cap per file. Without it a single large log read the whole workspace
+		// into memory; read_file has enforced the same limit all along.
+		if info.Size() > searchContentMaxFileBytes {
+			notices = append(notices, fmt.Sprintf("skipped %s: file exceeds %d bytes", rel, searchContentMaxFileBytes))
 			return nil
 		}
 		data, err := os.ReadFile(path)
 		if err != nil {
+			// Unreadable files are reported, not silently treated as "no match".
+			notices = append(notices, fmt.Sprintf("skipped %s: %v", rel, err))
 			return nil
 		}
 		text := string(data)
 		if !strings.Contains(strings.ToLower(text), strings.ToLower(pattern)) {
 			return nil
 		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			rel = path
-		}
-		line := firstMatchingLine(text, pattern)
-		matches = append(matches, rel+": "+line)
+		matches = append(matches, rel+": "+firstMatchingLine(text, pattern))
 		return nil
 	})
 	if err != nil {
@@ -373,11 +405,27 @@ func searchContentTool(ctx context.Context, rootPath string, guard port.Workspac
 	if len(matches) == 0 {
 		matches = append(matches, "no matches")
 	}
+	if truncated {
+		matches = append(matches, fmt.Sprintf("…[truncated: more than %d matches; narrow the pattern, directory or file_types]", searchContentMaxMatches))
+	}
+	matches = append(matches, notices...)
 	return domain.ToolResult{
 		CallID:  call.ID,
 		Success: true,
 		Output:  strings.Join(matches, "\n"),
 	}, nil
+}
+
+// relativeToRootOrBase renders path relative to root, falling back to the base
+// name. The fallback deliberately avoids the absolute path: these strings go
+// into tool output, and an absolute path would disclose filesystem layout
+// outside the sandbox.
+func relativeToRootOrBase(root, path string) string {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return filepath.Base(path)
+	}
+	return rel
 }
 
 func listFilesTool(ctx context.Context, rootPath string, guard port.WorkspacePathGuard, call domain.ToolCall) (domain.ToolResult, error) {
@@ -393,8 +441,11 @@ func listFilesTool(ctx context.Context, rootPath string, guard port.WorkspacePat
 		return domain.ToolResult{}, err
 	}
 	var entries []string
+	var notices []string
+	truncated := false
 	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
+			notices = append(notices, fmt.Sprintf("skipped %s: %v", relativeToRootOrBase(root, path), walkErr))
 			return nil
 		}
 		if err := ctx.Err(); err != nil {
@@ -408,10 +459,11 @@ func listFilesTool(ctx context.Context, rootPath string, guard port.WorkspacePat
 				return nil
 			}
 		}
-		rel, err := filepath.Rel(root, path)
-		if err != nil {
-			rel = path
+		if len(entries) >= listFilesMaxEntries {
+			truncated = true
+			return filepath.SkipAll
 		}
+		rel := relativeToRootOrBase(root, path)
 		if entry.IsDir() {
 			rel += string(filepath.Separator)
 		}
@@ -424,6 +476,10 @@ func listFilesTool(ctx context.Context, rootPath string, guard port.WorkspacePat
 	if len(entries) == 0 {
 		entries = append(entries, "no files")
 	}
+	if truncated {
+		entries = append(entries, fmt.Sprintf("…[truncated: more than %d entries; narrow the directory]", listFilesMaxEntries))
+	}
+	entries = append(entries, notices...)
 	return domain.ToolResult{
 		CallID:  call.ID,
 		Success: true,
