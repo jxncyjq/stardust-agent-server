@@ -156,10 +156,13 @@ func (r *Registry) Execute(ctx context.Context, agent domain.Agent, call domain.
 			return domain.ToolResult{}, err
 		}
 	}
-	execCtx := ctx
+	// Hand the caller's identity down to the handler. Without it a tool cannot
+	// scope its result to the requester, and tools that must (agent messaging)
+	// would fall back to an unfiltered query.
+	execCtx := WithCaller(ctx, agent)
 	if descriptor.Timeout > 0 {
 		var cancel context.CancelFunc
-		execCtx, cancel = context.WithTimeout(ctx, descriptor.Timeout)
+		execCtx, cancel = context.WithTimeout(execCtx, descriptor.Timeout)
 		defer cancel()
 	}
 	result, err := handler.Execute(execCtx, call)

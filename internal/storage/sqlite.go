@@ -634,6 +634,16 @@ func (r *SQLiteRepository) SaveAgentMessage(ctx context.Context, message domain.
 }
 
 func (r *SQLiteRepository) ListAgentMessages(ctx context.Context, query domain.AgentMessageQuery) ([]domain.AgentMessage, error) {
+	// Defence in depth. Every filter below is "empty matches anything", so a
+	// fully unscoped query would return the first rows of the entire table
+	// across all agents and tenants. No legitimate caller needs that, and the
+	// tool layer already scopes to the caller — refusing here as well means a
+	// future caller that forgets cannot silently re-open the hole.
+	if strings.TrimSpace(query.CompanyID) == "" &&
+		strings.TrimSpace(query.ToAgentID) == "" &&
+		strings.TrimSpace(query.FromAgentID) == "" {
+		return nil, fmt.Errorf("list agent messages: refusing an unscoped query: company_id, to_agent_id or from_agent_id is required")
+	}
 	limit := query.Limit
 	if limit <= 0 {
 		limit = 100
