@@ -48,6 +48,8 @@
     "listen_addr": "127.0.0.1:8080",
     "admin_token": "change-me-admin-token",
     "public_health_enabled": true,
+    "_comment_require_identity": "true 时 X-Role / X-Company-ID 头缺失即 403（仅作用于按公司鉴权的单资源端点与治理端点，列表端点当前无租户过滤）。默认 false = 单机形态，无头请求视为全公司 admin。环境变量 LEGION_AGENT_REQUIRE_IDENTITY 只接受 true/false/1/0 等 ParseBool 取值，写错会让启动失败而不是静默关闭。",
+    "require_identity": false,
     "request_id_header": "X-Request-ID"
   },
   "service": {

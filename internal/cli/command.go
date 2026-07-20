@@ -2339,6 +2339,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		WorkspaceRoot:       workspaceRoot,
 		AdminToken:          cfg.Server.AdminToken,
 		PublicHealthEnabled: cfg.Server.PublicHealthEnabled,
+		RequireIdentity:     cfg.Server.RequireIdentity,
 		RequestIDHeader:     cfg.Server.RequestIDHeader,
 		Audit:               auditLog,
 		QualityEvals:        qualityEvals,

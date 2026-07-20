@@ -20,6 +20,7 @@ import (
 	"github.com/stardust/legion-agent/internal/observability"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/quality"
+	"github.com/stardust/legion-agent/internal/security"
 	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/skill"
 	"github.com/stardust/legion-agent/internal/storage"
@@ -101,7 +102,20 @@ type Config struct {
 	Readiness           ReadinessChecker
 	AdminToken          string
 	PublicHealthEnabled bool
-	RequestIDHeader     string
+	// RequireIdentity makes the X-Role and X-Company-ID request headers
+	// mandatory for RBAC and tenant checks. It defaults to false, which keeps
+	// the single-machine contract where a header-less request is treated as an
+	// admin of every company (see security.Policy.RequireIdentity).
+	//
+	// Scope, so it is not mistaken for a blanket authentication switch: it
+	// governs only the handlers that consult the policy — the single-resource
+	// endpoints guarded by requireCompanyAccess and the two RBAC-guarded
+	// governance endpoints. List endpoints (GET /v1/tasks, /v1/agents,
+	// /v1/sessions, ...) have no tenant filtering today and stay reachable.
+	// Both headers are caller-asserted, so they only form a boundary where a
+	// trusted gateway injects them and strips the client's own values.
+	RequireIdentity bool
+	RequestIDHeader string
 	// WorkspaceRoot is the base directory for a session's on-disk state when
 	// the session carries no working_dir (sessionstate.SessionBase's
 	// workspaceRoot argument). Session deletion joins it with the session key
@@ -131,6 +145,7 @@ type HTTPServer struct {
 	readiness           ReadinessChecker
 	adminToken          string
 	publicHealthEnabled bool
+	policy              security.Policy
 	requestIDHeader     string
 	workspaceRoot       string
 	logger              *slog.Logger
@@ -156,6 +171,15 @@ func NewHTTPServer(cfg Config) *HTTPServer {
 			workflowStates = states
 		}
 	}
+	if !cfg.RequireIdentity {
+		// The permissive mode is a declared optional contract, not a silent
+		// default: say so out loud at assembly time so an operator who exposes
+		// this listener beyond localhost cannot miss it.
+		observability.WithComponent(logger, "server").Info("identity verification disabled",
+			"detail", "requests without X-Role and X-Company-ID headers receive full access to every company",
+			"remedy", "set server.require_identity=true (LEGION_AGENT_REQUIRE_IDENTITY=true) to require caller identity",
+		)
+	}
 	return &HTTPServer{
 		tasks:               cfg.Tasks,
 		agents:              cfg.Agents,
@@ -174,6 +198,7 @@ func NewHTTPServer(cfg Config) *HTTPServer {
 		readiness:           cfg.Readiness,
 		adminToken:          cfg.AdminToken,
 		publicHealthEnabled: cfg.PublicHealthEnabled,
+		policy:              security.NewPolicy(cfg.RequireIdentity),
 		requestIDHeader:     requestIDHeader,
 		workspaceRoot:       cfg.WorkspaceRoot,
 		logger:              observability.WithComponent(logger, "server"),

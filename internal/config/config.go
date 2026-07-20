@@ -78,7 +78,16 @@ type ServerConfig struct {
 	ListenAddr          string `json:"listen_addr"`
 	AdminToken          string `json:"admin_token"`
 	PublicHealthEnabled bool   `json:"public_health_enabled"`
-	RequestIDHeader     string `json:"request_id_header"`
+	// RequireIdentity makes the X-Role and X-Company-ID headers mandatory for
+	// the HTTP server's RBAC and tenant checks. Defaults to false: the
+	// single-machine contract where a header-less request is treated as an
+	// admin of every company. Set it to true for multi-tenant or
+	// network-exposed deployments (env: LEGION_AGENT_REQUIRE_IDENTITY, which
+	// accepts only strconv.ParseBool values and fails Load otherwise).
+	// It covers the policy-guarded endpoints only, not the untenanted list
+	// endpoints; see server.Config.RequireIdentity for the exact scope.
+	RequireIdentity bool   `json:"require_identity"`
+	RequestIDHeader string `json:"request_id_header"`
 }
 
 type ServiceConfig struct {
@@ -193,7 +202,9 @@ func Load(ctx context.Context, opts Options) (Config, error) {
 			return Config{}, fmt.Errorf("decode config %q: %w", opts.Path, err)
 		}
 	}
-	applyEnv(&cfg)
+	if err := applyEnv(&cfg); err != nil {
+		return Config{}, err
+	}
 	cfg.Runtime.MaxToolRounds = normalizeMaxToolRounds(cfg.Runtime.MaxToolRounds)
 	return cfg, nil
 }
@@ -211,6 +222,7 @@ func defaultConfig() Config {
 		Server: ServerConfig{
 			ListenAddr:          ":8080",
 			PublicHealthEnabled: true,
+			RequireIdentity:     false,
 			RequestIDHeader:     "X-Request-ID",
 		},
 		Service: ServiceConfig{
@@ -288,7 +300,11 @@ func defaultConfig() Config {
 	}
 }
 
-func applyEnv(cfg *Config) {
+// applyEnv overlays environment variables onto cfg. It returns an error only
+// for security-relevant keys whose misspelling must not degrade silently into
+// the permissive default; the convenience toggles keep their historical
+// "true"/"1"-or-false parsing.
+func applyEnv(cfg *Config) error {
 	if value := os.Getenv("LEGION_AGENT_MAAS_URL"); value != "" {
 		cfg.Maas.BaseURL = value
 	}
@@ -309,6 +325,17 @@ func applyEnv(cfg *Config) {
 	}
 	if value := os.Getenv("LEGION_AGENT_PUBLIC_HEALTH"); value != "" {
 		cfg.Server.PublicHealthEnabled = value == "true" || value == "1"
+	}
+	if value := os.Getenv("LEGION_AGENT_REQUIRE_IDENTITY"); value != "" {
+		// Unlike the convenience toggles above, an unparseable value here must
+		// not fall back to false: an operator who writes REQUIRE_IDENTITY=yes
+		// intends to harden the server and would otherwise get zero hardening
+		// with zero warning.
+		required, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("parse LEGION_AGENT_REQUIRE_IDENTITY %q: %w", value, err)
+		}
+		cfg.Server.RequireIdentity = required
 	}
 	if value := os.Getenv("LEGION_AGENT_REQUEST_ID_HEADER"); value != "" {
 		cfg.Server.RequestIDHeader = value
@@ -419,6 +446,7 @@ func applyEnv(cfg *Config) {
 			cfg.Web.MaxResponseKB = kb
 		}
 	}
+	return nil
 }
 
 func normalizeMaxToolRounds(rounds int) int {
