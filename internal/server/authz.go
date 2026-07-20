@@ -25,15 +25,28 @@ func (s *HTTPServer) auditAccessDenied(ctx context.Context, principal security.P
 	if s.audit == nil {
 		return
 	}
-	_ = s.audit.Append(ctx, domain.AuditEvent{
+	const action = "access_denied.cross_company"
+	if err := s.audit.Append(ctx, domain.AuditEvent{
 		ID:          newRequestID(),
 		RequestID:   requestIDFromContext(ctx),
 		SubjectType: "company",
 		SubjectID:   principal.CompanyID,
-		Action:      "access_denied.cross_company",
+		Action:      action,
 		Hash:        hashResource(resourceType + ":" + resourceID),
 		CreatedAt:   time.Now(),
-	})
+	}); err != nil {
+		// The 403 itself already stands; what must not vanish is the fact that
+		// a denied cross-company attempt never reached the audit store. Losing
+		// it silently breaks the security forensics chain.
+		s.logger.Error("append access-denied audit",
+			"error", err,
+			"action", action,
+			"company_id", principal.CompanyID,
+			"resource_type", resourceType,
+			"resource_id", resourceID,
+			"request_id", requestIDFromContext(ctx),
+		)
+	}
 }
 
 func hashResource(value string) string {

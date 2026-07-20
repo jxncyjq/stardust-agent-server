@@ -126,6 +126,10 @@ func newRunCommand(application *app.App, out io.Writer) *cobra.Command {
 				if err != nil {
 					return err
 				}
+				logger, err := defaultLogger()
+				if err != nil {
+					return err
+				}
 				result, err = application.RunTask(cmd.Context(), app.RunTaskOptions{
 					TaskID:           newCommandTaskID("cli-task"),
 					Prompt:           prompt,
@@ -134,7 +138,7 @@ func newRunCommand(application *app.App, out io.Writer) *cobra.Command {
 					Audit:            persistent.audit,
 					TaskSink:         persistent.taskSink,
 					ContextPrefix:    contextPrefix,
-					Logger:           defaultLogger(),
+					Logger:           logger,
 					Metrics:          observability.NewMetricsRecorder(nil),
 					ToolRoot:         cfg.ContextFiles.Root,
 					ToolMaxFileChars: cfg.ContextFiles.MaxFileChars,
@@ -222,7 +226,11 @@ func newTUICommand(application *app.App, out io.Writer) *cobra.Command {
 			approvalGate := tui.NewApprovalGate(pendingApprovalCh, approvalDecisionCh)
 			workspaceRoot, workspaceRootWarning := sessionstate.ResolveWorkspaceRoot(cfg.Workspace.Root)
 			if workspaceRootWarning != "" {
-				defaultLogger().Warn("workspace root fallback", "detail", workspaceRootWarning)
+				logger, err := defaultLogger()
+				if err != nil {
+					return err
+				}
+				logger.Warn("workspace root fallback", "detail", workspaceRootWarning)
 			}
 			checkpointStore := sessionstate.NewStore(workspaceRoot)
 			session := newTUISessionController(tuiSessionControllerConfig{
@@ -517,6 +525,10 @@ func runTUITask(ctx context.Context, application *app.App, cfg tuiTaskRunConfig)
 		return result, nil
 	}
 	events := newStreamingEventBus(cfg.Events, cfg.Emit)
+	logger, err := defaultLogger()
+	if err != nil {
+		return app.DemoResult{}, err
+	}
 	result, err := application.RunTask(ctx, app.RunTaskOptions{
 		TaskID:            newCommandTaskID("tui-task"),
 		Prompt:            parsed.Prompt,
@@ -527,7 +539,7 @@ func runTUITask(ctx context.Context, application *app.App, cfg tuiTaskRunConfig)
 		ContextPrefix:     cfg.DefaultContextPrefix,
 		Mode:              cfg.Session.CurrentMode(),
 		WorkingDir:        cfg.Session.CurrentWorkingDir(),
-		Logger:            defaultLogger(),
+		Logger:            logger,
 		Metrics:           observability.NewMetricsRecorder(nil),
 		ToolRoot:          cfg.Config.ContextFiles.Root,
 		ToolMaxFileChars:  cfg.Config.ContextFiles.MaxFileChars,
@@ -600,6 +612,10 @@ func runMentionedTUIAgentTask(ctx context.Context, application *app.App, cfg tui
 		toolMaxFileChars = cfg.Config.ContextFiles.MaxFileChars
 	}
 	events := newStreamingEventBus(cfg.Events, cfg.Emit)
+	logger, err := defaultLogger()
+	if err != nil {
+		return app.DemoResult{}, err
+	}
 	result, err := application.RunTask(ctx, app.RunTaskOptions{
 		TaskID:            newCommandTaskID("tui-task"),
 		Prompt:            parsed.Prompt,
@@ -612,7 +628,7 @@ func runMentionedTUIAgentTask(ctx context.Context, application *app.App, cfg tui
 		Role:              firstNonEmpty(agentCfg.Role, "developer"),
 		Mode:              cfg.Session.CurrentMode(),
 		WorkingDir:        cfg.Session.CurrentWorkingDir(),
-		Logger:            defaultLogger(),
+		Logger:            logger,
 		Metrics:           observability.NewMetricsRecorder(nil),
 		ToolRoot:          toolRoot,
 		ToolMaxFileChars:  toolMaxFileChars,
@@ -1365,12 +1381,15 @@ func newServeCommand(out io.Writer) *cobra.Command {
 	return cmd
 }
 
-func defaultLogger() *slog.Logger {
+// defaultLogger opens the process-wide file logger. It never falls back to a
+// discarding logger: a silent downgrade to io.Discard mutes every later Warn and
+// Error in the whole binary, which is exactly the failure that must be visible.
+func defaultLogger() (*slog.Logger, error) {
 	logger, err := newFileLogger(defaultLogFilePath)
 	if err != nil {
-		logger, _ = observability.NewLogger(io.Discard, observability.LoggerConfig{})
+		return nil, fmt.Errorf("open default logger at %q: %w", defaultLogFilePath, err)
 	}
-	return logger
+	return logger, nil
 }
 
 func newFileLogger(path string) (*slog.Logger, error) {
@@ -2014,7 +2033,12 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 
 	logger := opts.Logger
 	if logger == nil {
-		logger = defaultLogger()
+		fileLogger, err := defaultLogger()
+		if err != nil {
+			closeStore()
+			return ServeResult{}, err
+		}
+		logger = fileLogger
 	}
 
 	// platformEvents backs the /v1/events SSE stream (push/subscribe). The
@@ -2076,7 +2100,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		MaasFactory:  maasFactoryFromConfig(cfg.Maas),
 		Checkpoints:  checkpointStore,
 		ToolGate:     manualGate,
-		Logger:       defaultLogger(),
+		Logger:       logger,
 	})
 	defaultMaas, err := adapter.NewMaasClientFromProfile(cfg.Maas, "")
 	if err != nil {
@@ -2171,7 +2195,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		TrustGate:          trustManager,
 		MaxWorkers:         cfg.Runtime.MaxConcurrentTasks,
 		Checkpoints:        checkpointStore,
-		Logger:             defaultLogger(),
+		Logger:             logger,
 	})
 	background := task.NewBackgroundScheduler()
 	background.AddJob("agent-coordinator-heartbeat", func(ctx context.Context) error {

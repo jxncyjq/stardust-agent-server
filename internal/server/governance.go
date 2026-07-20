@@ -51,13 +51,25 @@ func (s *HTTPServer) auditRBACDenied(r *http.Request, principal security.Princip
 	if s.audit == nil {
 		return
 	}
-	_ = s.audit.Append(r.Context(), domain.AuditEvent{
+	const action = "access_denied.rbac"
+	if err := s.audit.Append(r.Context(), domain.AuditEvent{
 		ID:          newRequestID(),
 		RequestID:   requestIDFromContext(r.Context()),
 		SubjectType: "company",
 		SubjectID:   principal.CompanyID,
-		Action:      "access_denied.rbac",
+		Action:      action,
 		Hash:        hashResource(string(resource)),
 		CreatedAt:   time.Now(),
-	})
+	}); err != nil {
+		// See auditAccessDenied: the 403 is correct either way, but an RBAC
+		// denial that never reached the audit store must still leave a trace.
+		s.logger.Error("append rbac-denied audit",
+			"error", err,
+			"action", action,
+			"company_id", principal.CompanyID,
+			"role", string(principal.Role),
+			"resource", string(resource),
+			"request_id", requestIDFromContext(r.Context()),
+		)
+	}
 }
