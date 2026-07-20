@@ -276,6 +276,27 @@ Write concise cache documentation.
 	}
 }
 
+// A whitespace-only install_root is a typo, not a choice. Treating it as
+// "configured" would hand RootAvailable a path it rejects, so the agent would
+// end up with no skills at all instead of inheriting the root config's.
+func TestAgentSkillsRootFallsBackOnBlankAgentConfig(t *testing.T) {
+	t.Parallel()
+
+	rootCfg := config.Config{Skills: config.SkillsConfig{InstallRoot: "root-skills"}}
+
+	for _, blank := range []string{"", "   ", "\t"} {
+		agentCfg := agentregistry.AgentConfig{Skills: config.SkillsConfig{InstallRoot: blank}}
+		if got := agentSkillsRoot(rootCfg, agentCfg); got != "root-skills" {
+			t.Errorf("agentSkillsRoot(install_root=%q) = %q, want the root config's %q", blank, got, "root-skills")
+		}
+	}
+
+	own := agentregistry.AgentConfig{Skills: config.SkillsConfig{InstallRoot: "  agent-skills  "}}
+	if got := agentSkillsRoot(rootCfg, own); got != "agent-skills" {
+		t.Errorf("agentSkillsRoot(padded own root) = %q, want %q", got, "agent-skills")
+	}
+}
+
 // Regression: a sub-agent whose skills install_root does not exist yet (nothing
 // has been installed) must still run. The default runtime guards the mount with
 // an existence check, but the resolver only tested the path for being a

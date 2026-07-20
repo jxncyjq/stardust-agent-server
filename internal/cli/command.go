@@ -2076,6 +2076,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		MaasFactory:  maasFactoryFromConfig(cfg.Maas),
 		Checkpoints:  checkpointStore,
 		ToolGate:     manualGate,
+		Logger:       defaultLogger(),
 	})
 	defaultMaas, err := adapter.NewMaasClientFromProfile(cfg.Maas, "")
 	if err != nil {
