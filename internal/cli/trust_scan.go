@@ -45,7 +45,11 @@ func newTrustScoreScanJob(events port.EventBus, manager *quality.TrustScoreManag
 		if events == nil || manager == nil {
 			return nil
 		}
-		for _, event := range events.Events() {
+		published, err := events.Events()
+		if err != nil {
+			return fmt.Errorf("read runtime events for trust score scan: %w", err)
+		}
+		for _, event := range published {
 			learning, ok := evolution.ParseLearningRuntimeEvent(event)
 			if !ok {
 				continue

@@ -75,7 +75,10 @@ func TestRegistrySyncWritesInstallAudit(t *testing.T) {
 	if report.Installed != 1 {
 		t.Fatalf("Sync().Installed = %d, want 1", report.Installed)
 	}
-	events := audit.Events()
+	events, err := audit.Events()
+	if err != nil {
+		t.Fatalf("Audit.Events() error = %v, want nil", err)
+	}
 	if len(events) != 1 {
 		t.Fatalf("Audit.Events() len = %d, want 1", len(events))
 	}

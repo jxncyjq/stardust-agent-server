@@ -71,8 +71,9 @@ func TestRegistryExecuteAuditsSuccessfulToolCall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Registry.Execute(%q) error = %v, want nil", "read_file", err)
 	}
-	if !hasAuditAction(audit.Events(), "tool_executed") {
-		t.Errorf("audit events missing %q: %#v", "tool_executed", audit.Events())
+	auditEvents := mustAuditEvents(t, audit)
+	if !hasAuditAction(auditEvents, "tool_executed") {
+		t.Errorf("audit events missing %q: %#v", "tool_executed", auditEvents)
 	}
 }
 
@@ -96,9 +97,22 @@ func TestRegistryExecuteAuditsFailedToolCall(t *testing.T) {
 	if err == nil {
 		t.Fatalf("Registry.Execute(%q) error = nil, want non-nil", "read_file")
 	}
-	if !hasAuditAction(audit.Events(), "tool_failed") {
-		t.Errorf("audit events missing %q: %#v", "tool_failed", audit.Events())
+	auditEvents := mustAuditEvents(t, audit)
+	if !hasAuditAction(auditEvents, "tool_failed") {
+		t.Errorf("audit events missing %q: %#v", "tool_failed", auditEvents)
 	}
+}
+
+// mustAuditEvents reads the audit log's events, failing the test immediately
+// if the read itself errors (fail-loud: never silently substitute an empty
+// slice for a read failure).
+func mustAuditEvents(t *testing.T, log port.AuditLog) []domain.AuditEvent {
+	t.Helper()
+	events, err := log.Events()
+	if err != nil {
+		t.Fatalf("AuditLog.Events() error = %v", err)
+	}
+	return events
 }
 
 func hasAuditAction(events []domain.AuditEvent, action string) bool {

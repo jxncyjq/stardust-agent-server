@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/stardust/legion-agent/internal/adapter"
-	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/evolution"
 	"github.com/stardust/legion-agent/internal/quality"
 )
@@ -23,7 +22,12 @@ func publishQualitySignal(t *testing.T, events *adapter.MemoryEventBus, agentID,
 	}
 }
 
-func countDegradationAlerts(events []domain.RuntimeEvent) int {
+func countDegradationAlerts(t *testing.T, bus *adapter.MemoryEventBus) int {
+	t.Helper()
+	events, err := bus.Events()
+	if err != nil {
+		t.Fatalf("Events() error = %v, want nil", err)
+	}
 	n := 0
 	for _, event := range events {
 		if event.Type == quality.RuntimeEventDegradationAlert {
@@ -63,7 +67,7 @@ func TestDegradationScanJobPublishesAlert(t *testing.T) {
 	if err := job(ctx); err != nil {
 		t.Fatalf("degradation scan job: %v", err)
 	}
-	if got := countDegradationAlerts(events.Events()); got != 1 {
+	if got := countDegradationAlerts(t, events); got != 1 {
 		t.Fatalf("degradation alerts = %d, want 1", got)
 	}
 }
@@ -92,7 +96,7 @@ func TestDegradationScanJobNoAlertWhenHealthy(t *testing.T) {
 	if err := job(ctx); err != nil {
 		t.Fatalf("degradation scan job: %v", err)
 	}
-	if got := countDegradationAlerts(events.Events()); got != 0 {
+	if got := countDegradationAlerts(t, events); got != 0 {
 		t.Fatalf("degradation alerts = %d, want 0 (healthy agent)", got)
 	}
 }
@@ -125,7 +129,7 @@ func TestDegradationScanJobTimeGated(t *testing.T) {
 		t.Fatalf("second scan: %v", err)
 	}
 	// Only the first run (within one scan period) should have evaluated.
-	if got := countDegradationAlerts(events.Events()); got != 1 {
+	if got := countDegradationAlerts(t, events); got != 1 {
 		t.Fatalf("degradation alerts = %d, want 1 (time-gated to one eval per period)", got)
 	}
 }

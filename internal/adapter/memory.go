@@ -26,10 +26,13 @@ func (l *MemoryAuditLog) Append(ctx context.Context, event domain.AuditEvent) er
 	return nil
 }
 
-func (l *MemoryAuditLog) Events() []domain.AuditEvent {
+// Events returns a copy of the recorded audit events. The in-memory store has
+// no failure mode, so the error is always nil; it exists to satisfy the
+// port.AuditLog contract that persistent implementations do need.
+func (l *MemoryAuditLog) Events() ([]domain.AuditEvent, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return append([]domain.AuditEvent(nil), l.events...)
+	return append([]domain.AuditEvent(nil), l.events...), nil
 }
 
 type MemoryEventBus struct {
@@ -51,8 +54,10 @@ func (b *MemoryEventBus) Publish(ctx context.Context, event domain.RuntimeEvent)
 	return nil
 }
 
-func (b *MemoryEventBus) Events() []domain.RuntimeEvent {
+// Events returns a copy of the published runtime events. The in-memory bus has
+// no failure mode, so the error is always nil.
+func (b *MemoryEventBus) Events() ([]domain.RuntimeEvent, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return append([]domain.RuntimeEvent(nil), b.events...)
+	return append([]domain.RuntimeEvent(nil), b.events...), nil
 }

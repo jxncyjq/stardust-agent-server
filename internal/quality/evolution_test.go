@@ -77,7 +77,10 @@ func TestEvolutionEvaluatorPublishesDegradationAlertForFourteenDayQualityDrop(t 
 	if report.Alert.QualityDrop < 0.2 {
 		t.Errorf("Evaluate().Alert.QualityDrop = %f, want >= 0.2", report.Alert.QualityDrop)
 	}
-	events := bus.Events()
+	events, err := bus.Events()
+	if err != nil {
+		t.Fatalf("EventBus.Events() error = %v, want nil", err)
+	}
 	if len(events) != 1 {
 		t.Fatalf("EventBus.Events() len = %d, want 1", len(events))
 	}
@@ -115,8 +118,12 @@ func TestEvolutionEvaluatorDoesNotAlertWhenEvalFindsExternalFault(t *testing.T) 
 	if report.Alert != nil {
 		t.Fatalf("Evaluate().Alert = %#v, want nil when external fault exists", report.Alert)
 	}
-	if len(bus.Events()) != 0 {
-		t.Fatalf("EventBus.Events() len = %d, want 0", len(bus.Events()))
+	events, err := bus.Events()
+	if err != nil {
+		t.Fatalf("EventBus.Events() error = %v, want nil", err)
+	}
+	if len(events) != 0 {
+		t.Fatalf("EventBus.Events() len = %d, want 0", len(events))
 	}
 }
 

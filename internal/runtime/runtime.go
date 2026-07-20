@@ -754,8 +754,8 @@ func (noopEventBus) Publish(ctx context.Context, _ domain.RuntimeEvent) error {
 	return ctx.Err()
 }
 
-func (noopEventBus) Events() []domain.RuntimeEvent {
-	return nil
+func (noopEventBus) Events() ([]domain.RuntimeEvent, error) {
+	return nil, nil
 }
 
 type noopAuditLog struct{}
@@ -764,8 +764,8 @@ func (noopAuditLog) Append(ctx context.Context, _ domain.AuditEvent) error {
 	return ctx.Err()
 }
 
-func (noopAuditLog) Events() []domain.AuditEvent {
-	return nil
+func (noopAuditLog) Events() ([]domain.AuditEvent, error) {
+	return nil, nil
 }
 
 func (r *Runtime) buildPrompt(ctx context.Context, agent domain.Agent, task domain.Task) (string, error) {

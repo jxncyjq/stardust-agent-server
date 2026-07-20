@@ -136,8 +136,12 @@ func TestGepFailureScanJobRunsCycleForFailureLearningEvents(t *testing.T) {
 	if len(hits) != 1 {
 		t.Fatalf("SearchGenes() len = %d, want 1", len(hits))
 	}
-	if len(audit.Events()) != 6 {
-		t.Fatalf("audit.Events() len = %d, want 6", len(audit.Events()))
+	auditEvents, err := audit.Events()
+	if err != nil {
+		t.Fatalf("audit.Events() error = %v, want nil", err)
+	}
+	if len(auditEvents) != 6 {
+		t.Fatalf("audit.Events() len = %d, want 6", len(auditEvents))
 	}
 	if err := audit.VerifyChain(ctx); err != nil {
 		t.Fatalf("VerifyChain() error = %v, want nil", err)

@@ -78,8 +78,9 @@ func TestCoordinatorSuspendsTrustBlockedTask(t *testing.T) {
 	if runner.calls != 0 {
 		t.Errorf("runner called %d times, want 0 (trust-blocked task must not run)", runner.calls)
 	}
-	if !hasAuditAction(audit.Events(), "trust_blocked") {
-		t.Errorf("audit actions missing %q: %#v", "trust_blocked", audit.Events())
+	auditEvents := mustAuditEvents(t, audit)
+	if !hasAuditAction(auditEvents, "trust_blocked") {
+		t.Errorf("audit actions missing %q: %#v", "trust_blocked", auditEvents)
 	}
 }
 

@@ -83,7 +83,11 @@ func NewGepFailureScanJob(events port.EventBus, runner GepRunner) BackgroundJob 
 		if events == nil || runner == nil {
 			return nil
 		}
-		for _, event := range events.Events() {
+		published, err := events.Events()
+		if err != nil {
+			return fmt.Errorf("read runtime events for gep failure scan: %w", err)
+		}
+		for _, event := range published {
 			learning, ok := evolution.ParseLearningRuntimeEvent(event)
 			if !ok || !shouldRunGepForSignal(learning.Signal) {
 				continue
