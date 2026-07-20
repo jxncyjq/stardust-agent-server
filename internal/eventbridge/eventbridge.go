@@ -67,11 +67,12 @@ func (b *Bridge) Publish(ctx context.Context, event domain.RuntimeEvent) error {
 }
 
 // Events returns a snapshot copy of every published RuntimeEvent, satisfying the
-// poll-only half of port.EventBus that existing background jobs consume.
-func (b *Bridge) Events() []domain.RuntimeEvent {
+// poll-only half of port.EventBus that existing background jobs consume. The
+// snapshot is in-memory, so the error is always nil.
+func (b *Bridge) Events() ([]domain.RuntimeEvent, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return append([]domain.RuntimeEvent(nil), b.events...)
+	return append([]domain.RuntimeEvent(nil), b.events...), nil
 }
 
 // translate maps a RuntimeEvent to a platform EventEnvelope. Type is preserved

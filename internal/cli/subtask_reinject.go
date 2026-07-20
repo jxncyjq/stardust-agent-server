@@ -27,7 +27,11 @@ func newSubtaskReinjectionJob(events port.EventBus, store tool.AgentMessageStore
 		if events == nil || store == nil {
 			return nil
 		}
-		for _, event := range events.Events() {
+		published, err := events.Events()
+		if err != nil {
+			return fmt.Errorf("read runtime events for subtask reinjection: %w", err)
+		}
+		for _, event := range published {
 			if event.Type != "subtask_completed" {
 				continue
 			}

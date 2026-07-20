@@ -171,10 +171,10 @@ func (b *collectingEventBus) Publish(ctx context.Context, event domain.RuntimeEv
 	return nil
 }
 
-func (b *collectingEventBus) Events() []domain.RuntimeEvent {
+func (b *collectingEventBus) Events() ([]domain.RuntimeEvent, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return append([]domain.RuntimeEvent(nil), b.events...)
+	return append([]domain.RuntimeEvent(nil), b.events...), nil
 }
 
 func (b *collectingEventBus) waitFor(t *testing.T, eventType string) domain.RuntimeEvent {

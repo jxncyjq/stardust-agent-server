@@ -146,9 +146,13 @@ func TestSkillInstallAudit(t *testing.T) {
 	if _, err := manager.Disable(ctx, "go-testing", "1.0.0"); err != nil {
 		t.Fatalf("Disable(go-testing) error = %v, want nil", err)
 	}
+	events, err := audit.Events()
+	if err != nil {
+		t.Fatalf("audit.Events() error = %v, want nil", err)
+	}
 	for _, action := range []string{"skill_installed", "skill_enabled", "skill_disabled"} {
-		if !hasSkillAuditAction(audit.Events(), action) {
-			t.Fatalf("audit events missing %s: %#v", action, audit.Events())
+		if !hasSkillAuditAction(events, action) {
+			t.Fatalf("audit events missing %s: %#v", action, events)
 		}
 	}
 }

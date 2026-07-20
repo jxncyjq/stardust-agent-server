@@ -12,8 +12,22 @@ import (
 
 	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/task"
 )
+
+// mustAuditEvents reads the audit trail, failing the test if the store cannot
+// serve it. Audit reads report their failures since this change, and a test
+// that ignored that error would assert against an empty slice it mistook for
+// "nothing was recorded" — the exact confusion the change removes.
+func mustAuditEvents(t *testing.T, log port.AuditLog) []domain.AuditEvent {
+	t.Helper()
+	events, err := log.Events()
+	if err != nil {
+		t.Fatalf("AuditLog.Events() error = %v, want nil", err)
+	}
+	return events
+}
 
 func requireIdentityScheduler(t *testing.T) *task.Scheduler {
 	t.Helper()
@@ -55,7 +69,7 @@ func TestHTTPRequireIdentityRejectsMissingCompanyHeader(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "company access denied") {
 		t.Fatalf("GET /v1/tasks/task-1 body = %s, want %q", rec.Body.String(), "company access denied")
 	}
-	events := audit.Events()
+	events := mustAuditEvents(t, audit)
 	if len(events) != 1 {
 		t.Fatalf("Audit.Events() len = %d, want 1", len(events))
 	}
@@ -150,7 +164,7 @@ func TestHTTPRequireIdentityRejectsMissingRoleHeader(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "audit access denied") {
 		t.Fatalf("GET /v1/audit-events body = %s, want %q", rec.Body.String(), "audit access denied")
 	}
-	events := audit.Events()
+	events := mustAuditEvents(t, audit)
 	if len(events) != 1 {
 		t.Fatalf("Audit.Events() len = %d, want 1", len(events))
 	}
@@ -181,7 +195,7 @@ func TestHTTPRequireIdentityRejectsMissingRoleOnQuality(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("GET /v1/quality/evals status = %d, want %d body=%s", rec.Code, http.StatusForbidden, rec.Body.String())
 	}
-	events := audit.Events()
+	events := mustAuditEvents(t, audit)
 	if len(events) != 1 {
 		t.Fatalf("Audit.Events() len = %d, want 1", len(events))
 	}

@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/observability"
 	"github.com/stardust/legion-agent/internal/quality"
 	"github.com/stardust/legion-agent/internal/security"
 )
@@ -21,7 +22,13 @@ func (s *HTTPServer) handleAuditEvents(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, []domain.AuditEvent{})
 		return
 	}
-	writeJSON(w, http.StatusOK, s.audit.Events())
+	events, err := s.audit.Events()
+	if err != nil {
+		observability.WithRequestID(s.logger, requestIDFromContext(r.Context())).Error("list audit events failed", "error", err)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("list audit events: %v", err))
+		return
+	}
+	writeJSON(w, http.StatusOK, events)
 }
 
 func (s *HTTPServer) handleQualityEvals(w http.ResponseWriter, r *http.Request) {

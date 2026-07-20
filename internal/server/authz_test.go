@@ -44,7 +44,10 @@ func TestHTTPRejectsCrossCompanyTaskAccess(t *testing.T) {
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("GET /v1/tasks/task-1 status = %d, want %d body=%s", rec.Code, http.StatusForbidden, rec.Body.String())
 	}
-	events := audit.Events()
+	events, err := audit.Events()
+	if err != nil {
+		t.Fatalf("Audit.Events() error = %v, want nil", err)
+	}
 	if len(events) != 1 {
 		t.Fatalf("Audit.Events() len = %d, want 1", len(events))
 	}

@@ -60,7 +60,11 @@ func newDegradationScanJob(events port.EventBus, evaluator quality.EvolutionEval
 		defer mu.Unlock()
 
 		// 1. Absorb any new quality samples from the learning event stream.
-		for _, event := range events.Events() {
+		published, err := events.Events()
+		if err != nil {
+			return fmt.Errorf("read runtime events for degradation scan: %w", err)
+		}
+		for _, event := range published {
 			learning, ok := evolution.ParseLearningRuntimeEvent(event)
 			if !ok {
 				continue

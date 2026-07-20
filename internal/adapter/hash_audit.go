@@ -43,10 +43,12 @@ func (l *HashChainAuditLog) Append(ctx context.Context, event domain.AuditEvent)
 	return nil
 }
 
-func (l *HashChainAuditLog) Events() []domain.AuditEvent {
+// Events returns a copy of the chained audit events. The in-memory chain has no
+// failure mode, so the error is always nil.
+func (l *HashChainAuditLog) Events() ([]domain.AuditEvent, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return append([]domain.AuditEvent(nil), l.events...)
+	return append([]domain.AuditEvent(nil), l.events...), nil
 }
 
 func (l *HashChainAuditLog) VerifyChain(ctx context.Context) error {

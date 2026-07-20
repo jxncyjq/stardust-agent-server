@@ -68,8 +68,12 @@ func TestGepCycleRunsSixStagesAndSolidifiesGeneAndCapsule(t *testing.T) {
 	if len(capsules) != 1 {
 		t.Fatalf("SearchCapsules() len = %d, want 1", len(capsules))
 	}
-	if len(audit.Events()) != 6 {
-		t.Fatalf("audit.Events() len = %d, want 6", len(audit.Events()))
+	auditEvents, err := audit.Events()
+	if err != nil {
+		t.Fatalf("audit.Events() error = %v, want nil", err)
+	}
+	if len(auditEvents) != 6 {
+		t.Fatalf("audit.Events() len = %d, want 6", len(auditEvents))
 	}
 	if err := audit.VerifyChain(ctx); err != nil {
 		t.Fatalf("VerifyChain() error = %v, want nil", err)
@@ -160,7 +164,11 @@ func TestGepCycleRecordsValidationFailure(t *testing.T) {
 	if result.Events[4].Decision != DecisionValidationFailed {
 		t.Fatalf("Run().Events[4].Decision = %s, want %s", result.Events[4].Decision, DecisionValidationFailed)
 	}
-	if len(audit.Events()) != 6 {
-		t.Fatalf("audit.Events() len = %d, want 6", len(audit.Events()))
+	auditEvents, err := audit.Events()
+	if err != nil {
+		t.Fatalf("audit.Events() error = %v, want nil", err)
+	}
+	if len(auditEvents) != 6 {
+		t.Fatalf("audit.Events() len = %d, want 6", len(auditEvents))
 	}
 }

@@ -65,7 +65,10 @@ func TestBridgePreservesEventsSnapshotForPollConsumers(t *testing.T) {
 	if err := b.Publish(context.Background(), second); err != nil {
 		t.Fatalf("Publish(second) error = %v, want nil", err)
 	}
-	got := b.Events()
+	got, err := b.Events()
+	if err != nil {
+		t.Fatalf("Events() error = %v, want nil", err)
+	}
 	if len(got) != 2 || got[0].Type != "task_started" || got[1].Type != "task_completed" {
 		t.Fatalf("Events() = %#v, want [task_started, task_completed] snapshot", got)
 	}
@@ -83,7 +86,11 @@ func TestBridgePublishSurvivesClosedPlatform(t *testing.T) {
 	if err := b.Publish(context.Background(), domain.RuntimeEvent{Type: "task_completed", TaskID: "t1"}); err != nil {
 		t.Fatalf("Publish() after platform close error = %v, want nil", err)
 	}
-	if got := b.Events(); len(got) != 1 {
+	got, err := b.Events()
+	if err != nil {
+		t.Fatalf("Events() error = %v, want nil", err)
+	}
+	if len(got) != 1 {
 		t.Fatalf("Events() len = %d, want 1 (append half unaffected by tee failure)", len(got))
 	}
 }
