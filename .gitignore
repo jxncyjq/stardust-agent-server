@@ -1,7 +1,20 @@
 /logs
 **/logs/
 /.omc
-docs/
+# OMC 运行时状态（含 agent 会话回放），出现在任何层级都不入库。
+# 必须写在 docs 放行规则之前，否则 docs/superpowers/**/.omc 会被放行带进来。
+**/.omc/
+
+# docs/ 同时是 agent 的产物输出目录（workspace.docs_root 默认为 "docs"），
+# 所以默认忽略整层，再按目录显式放行手写文档。
+# 用 docs/* 而非 docs/：Git 不会进入被忽略的目录，父目录整体被忽略时
+# 其下的 ! 规则不生效。
+docs/*
+!docs/README.md
+!docs/agents/
+!docs/architecture/
+!docs/superpowers/
+
 dist/
 *.exe
 
