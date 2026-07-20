@@ -28,7 +28,7 @@ func TestReadOnlyWorkspaceRegistryListFilesReturnsCompleteDirectoryListing(t *te
 		}
 	}
 
-	registry := NewReadOnlyWorkspaceRegistry(root, nil)
+	registry := NewFileReadOnlyWorkspaceRegistry(root, nil)
 	result, err := registry.Execute(context.Background(), domain.Agent{Role: "developer"}, domain.ToolCall{
 		ID:        "call-1",
 		Name:      "list_files",
@@ -58,7 +58,7 @@ func TestReadOnlyWorkspaceRegistryListFilesReturnsCompleteDirectoryListing(t *te
 func TestReadOnlyWorkspaceRegistryToolSchemasAreOpenAICompatibleObjects(t *testing.T) {
 	t.Parallel()
 
-	registry := NewReadOnlyWorkspaceRegistry(t.TempDir(), nil)
+	registry := NewFileReadOnlyWorkspaceRegistry(t.TempDir(), nil)
 	for _, descriptor := range registry.Descriptors() {
 		schemaType, _ := descriptor.InputSchema["type"].(string)
 		if schemaType != "object" {
