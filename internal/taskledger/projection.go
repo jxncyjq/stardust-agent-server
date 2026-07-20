@@ -21,6 +21,14 @@ func BuildProjection(events []Event, cfg Config) Projection {
 	tasks := make(map[string]Task)
 	var diagnostics []string
 	for _, event := range events {
+		// An event already on disk may carry an id that cannot be projected —
+		// written before ValidateTaskID gated the write path, or edited by hand.
+		// Skip it and say so: failing the whole rebuild would leave the ledger
+		// permanently unusable, since nothing can delete a persisted event.
+		if err := ValidateTaskID(event.TaskID); err != nil {
+			diagnostics = append(diagnostics, fmt.Sprintf("skipped event %s: %v", event.EventID, err))
+			continue
+		}
 		task := tasks[event.TaskID]
 		if task.ID == "" {
 			task = Task{
@@ -101,15 +109,27 @@ func BuildProjection(events []Event, cfg Config) Projection {
 	}
 	return Projection{
 		Tasks:         tasks,
-		IndexMarkdown: renderIndex(tasks, cfg),
+		IndexMarkdown: renderIndex(tasks, cfg, diagnostics),
 		TaskMarkdown:  renderTasks(tasks, cfg),
 		Diagnostics:   diagnostics,
 	}
 }
 
-func renderIndex(tasks map[string]Task, cfg Config) string {
+func renderIndex(tasks map[string]Task, cfg Config, diagnostics []string) string {
 	var b strings.Builder
 	b.WriteString("# tasks\n\n")
+	// Diagnostics are rendered into the index, not just returned on the
+	// Projection: skipped events and conflicts that only live in a struct field
+	// nobody reads are indistinguishable from no problem at all.
+	if len(diagnostics) > 0 {
+		b.WriteString("> 诊断（重建时发现的问题，需人工处理）：\n")
+		for _, diagnostic := range diagnostics {
+			b.WriteString(">\n> - ")
+			b.WriteString(diagnostic)
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
 	b.WriteString("本文件由 TaskLedger 根据 `tasks/events/*.jsonl` 生成，不手工并发改写。\n\n")
 	b.WriteString("| ID | Status | Owner | Participants | Summary | Link |\n")
 	b.WriteString("|----|--------|-------|--------------|---------|------|\n")

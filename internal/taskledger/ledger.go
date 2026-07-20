@@ -174,7 +174,10 @@ func (l *Ledger) ReadEvents(ctx context.Context) ([]Event, error) {
 	var events []Event
 	err := filepath.WalkDir(eventsRoot, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			return nil
+			// Never swallow: a partial event set would be handed to Rebuild,
+			// which atomically overwrites tasks.md and every tasks/*.md — so a
+			// single unreadable file would silently erase history.
+			return fmt.Errorf("walk events at %q: %w", path, walkErr)
 		}
 		if err := ctx.Err(); err != nil {
 			return err
@@ -221,8 +224,14 @@ func (l *Ledger) validateEvent(event Event) error {
 	if event.EventID == "" {
 		return fmt.Errorf("%w: event_id required", ErrInvalidEvent)
 	}
-	if event.TaskID == "" {
-		return fmt.Errorf("%w: task_id required", ErrInvalidEvent)
+	// Validate before the event becomes durable. Deferring this to the
+	// projection stage is what allowed an unsafe id to be written and then brick
+	// every subsequent Rebuild.
+	if err := ValidateTaskID(event.TaskID); err != nil {
+		return err
+	}
+	if err := l.validateStatus(event.Status); err != nil {
+		return err
 	}
 	if event.Type == "" {
 		return fmt.Errorf("%w: type required", ErrInvalidEvent)
@@ -245,6 +254,31 @@ func (l *Ledger) validateEvent(event Event) error {
 		}
 	}
 	return nil
+}
+
+// validateStatus rejects a status outside the configured vocabulary. status is
+// not cosmetic: isTerminal compares it against DoneStatuses to decide archival,
+// so a typo like "donee" produced a task that could never be archived and
+// stayed in the active index forever.
+//
+// An empty status is allowed — most event types (messages, handoffs) carry no
+// status, and create_task has its own default injected upstream. When neither
+// list is configured the ledger has no vocabulary to check against, so anything
+// is accepted; that is a configuration choice, not a silent fallback.
+func (l *Ledger) validateStatus(status string) error {
+	if status == "" {
+		return nil
+	}
+	allowed := make([]string, 0, len(l.cfg.ActiveStatuses)+len(l.cfg.DoneStatuses))
+	allowed = append(allowed, l.cfg.ActiveStatuses...)
+	allowed = append(allowed, l.cfg.DoneStatuses...)
+	if len(allowed) == 0 {
+		return nil
+	}
+	if slices.Contains(allowed, status) {
+		return nil
+	}
+	return fmt.Errorf("%w: unknown status %q (want one of %s)", ErrInvalidEvent, status, strings.Join(allowed, ", "))
 }
 
 func (l *Ledger) agentAllowed(agentID string) bool {
@@ -340,9 +374,44 @@ func (l *Ledger) indexPath() (string, error) {
 	return resolveWithin(l.cfg.WorkspaceRoot, l.cfg.IndexPath)
 }
 
+// ValidateTaskID is the single gate for task_id legality. Both the write path
+// (validateEvent, before the event is durable) and the projection path
+// (taskPath, when the id becomes a filename) go through it.
+//
+// They must never diverge: a rule that accepts on write but rejects on
+// projection produces an event that is written yet un-rebuildable, and since
+// nothing can delete a persisted event, every later Rebuild fails on it
+// forever.
+//
+// The id format itself is deliberately NOT constrained — ids like
+// "TASK-20260523-101" are generated and consumed internally. Only what makes an
+// id unsafe as a path component is rejected.
+func ValidateTaskID(taskID string) error {
+	if taskID == "" {
+		return fmt.Errorf("%w: task_id required", ErrInvalidEvent)
+	}
+	if strings.TrimSpace(taskID) != taskID || strings.TrimSpace(taskID) == "" {
+		return fmt.Errorf("%w: task_id %q has leading or trailing whitespace", ErrInvalidEvent, taskID)
+	}
+	if strings.ContainsAny(taskID, "/\\") || strings.Contains(taskID, string(filepath.Separator)) {
+		return fmt.Errorf("%w: unsafe task_id %q: path separators are not allowed", ErrInvalidEvent, taskID)
+	}
+	if strings.Contains(taskID, "..") {
+		return fmt.Errorf("%w: unsafe task_id %q: %q is not allowed", ErrInvalidEvent, taskID, "..")
+	}
+	for _, r := range taskID {
+		// Control characters would corrupt both the JSONL event log and the
+		// Markdown projection.
+		if r < 0x20 || r == 0x7f {
+			return fmt.Errorf("%w: task_id %q contains a control character", ErrInvalidEvent, taskID)
+		}
+	}
+	return nil
+}
+
 func (l *Ledger) taskPath(taskID string) (string, error) {
-	if strings.Contains(taskID, string(filepath.Separator)) || strings.Contains(taskID, "/") || strings.Contains(taskID, "\\") {
-		return "", fmt.Errorf("%w: unsafe task_id %q", ErrInvalidEvent, taskID)
+	if err := ValidateTaskID(taskID); err != nil {
+		return "", err
 	}
 	return resolveWithin(l.cfg.WorkspaceRoot, filepath.Join(l.cfg.Root, taskID+".md"))
 }
