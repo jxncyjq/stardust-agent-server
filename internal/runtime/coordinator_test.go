@@ -564,7 +564,7 @@ func TestHeartbeatLearningEventCarriesRunFailureCause(t *testing.T) {
 	}
 	c.Wait()
 
-	got := events.Events()
+	got := mustRuntimeEvents(t, events)
 	if !hasLearningRuntimeEvent(got, evolution.SignalFailure) {
 		t.Fatalf("no failure learning event published: %#v", got)
 	}

@@ -15,19 +15,23 @@ import (
 	"github.com/stardust/legion-agent/internal/task"
 )
 
-// failingAuditLog is an audit backend whose every write fails, standing in for a
-// broken SQLite audit store. The access-denied paths must still deny, and must
-// not let the write failure disappear.
-type failingAuditLog struct {
+// writeFailingAuditLog is an audit backend whose every write fails, standing in
+// for a broken SQLite audit store. The access-denied paths must still deny, and
+// must not let the write failure disappear.
+//
+// Named for the failing direction: readFailingAuditLog in
+// events_read_failure_test.go covers the other one, and the two are not
+// interchangeable — a store that rejects writes can still serve reads.
+type writeFailingAuditLog struct {
 	err error
 }
 
-func (f failingAuditLog) Append(context.Context, domain.AuditEvent) error {
+func (f writeFailingAuditLog) Append(context.Context, domain.AuditEvent) error {
 	return f.err
 }
 
-func (f failingAuditLog) Events() []domain.AuditEvent {
-	return nil
+func (writeFailingAuditLog) Events() ([]domain.AuditEvent, error) {
+	return nil, nil
 }
 
 func TestHTTPCrossCompanyDenialLogsAuditAppendFailure(t *testing.T) {
@@ -46,7 +50,7 @@ func TestHTTPCrossCompanyDenialLogsAuditAppendFailure(t *testing.T) {
 	var logs bytes.Buffer
 	srv := NewHTTPServer(Config{
 		Tasks:      scheduler,
-		Audit:      failingAuditLog{err: errors.New("audit backend down")},
+		Audit:      writeFailingAuditLog{err: errors.New("audit backend down")},
 		AdminToken: "token",
 		Logger:     slog.New(slog.NewTextHandler(&logs, nil)),
 	})
@@ -72,7 +76,7 @@ func TestHTTPRBACDenialLogsAuditAppendFailure(t *testing.T) {
 	var logs bytes.Buffer
 	srv := NewHTTPServer(Config{
 		AdminToken: "token",
-		Audit:      failingAuditLog{err: errors.New("audit backend down")},
+		Audit:      writeFailingAuditLog{err: errors.New("audit backend down")},
 		Logger:     slog.New(slog.NewTextHandler(&logs, nil)),
 	})
 	req := httptest.NewRequest(http.MethodGet, "/v1/audit-events", nil)
