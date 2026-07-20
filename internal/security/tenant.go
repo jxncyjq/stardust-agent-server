@@ -16,9 +16,13 @@ func PrincipalFromRequest(r *http.Request) Principal {
 	}
 }
 
-func CanAccessCompany(principal Principal, companyID string) bool {
+// CanAccessCompany reports whether principal may reach a resource owned by
+// companyID. An empty Principal.CompanyID matches every company only while
+// Policy.RequireIdentity is false; with the switch on it is rejected like a
+// mismatched tenant.
+func (p Policy) CanAccessCompany(principal Principal, companyID string) bool {
 	if principal.CompanyID == "" {
-		return true
+		return !p.RequireIdentity
 	}
 	return principal.CompanyID == companyID
 }

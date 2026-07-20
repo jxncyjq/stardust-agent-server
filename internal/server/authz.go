@@ -13,7 +13,7 @@ import (
 
 func (s *HTTPServer) requireCompanyAccess(w http.ResponseWriter, r *http.Request, companyID string, resourceType string, resourceID string) bool {
 	principal := security.PrincipalFromRequest(r)
-	if security.CanAccessCompany(principal, companyID) {
+	if s.policy.CanAccessCompany(principal, companyID) {
 		return true
 	}
 	s.auditAccessDenied(r.Context(), principal, resourceType, resourceID)

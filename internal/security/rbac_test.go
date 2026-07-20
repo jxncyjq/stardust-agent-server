@@ -4,7 +4,7 @@ import "testing"
 
 func TestRBACAllowsViewerReadQualityButRejectsAudit(t *testing.T) {
 	t.Parallel()
-	policy := NewRBACPolicy()
+	policy := NewPolicy(false)
 	viewer := Principal{CompanyID: "company-1", Role: "viewer"}
 	if !policy.Allows(viewer, ActionReadQuality, ResourceQuality) {
 		t.Fatalf("Allows(viewer, read_quality, quality) = false, want true")

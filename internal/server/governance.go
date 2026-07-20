@@ -12,7 +12,7 @@ import (
 
 func (s *HTTPServer) handleAuditEvents(w http.ResponseWriter, r *http.Request) {
 	principal := security.PrincipalFromRequest(r)
-	if !security.NewRBACPolicy().Allows(principal, security.ActionReadAudit, security.ResourceAudit) {
+	if !s.policy.Allows(principal, security.ActionReadAudit, security.ResourceAudit) {
 		s.auditRBACDenied(r, principal, security.ResourceAudit)
 		writeError(w, http.StatusForbidden, "audit access denied")
 		return
@@ -26,7 +26,7 @@ func (s *HTTPServer) handleAuditEvents(w http.ResponseWriter, r *http.Request) {
 
 func (s *HTTPServer) handleQualityEvals(w http.ResponseWriter, r *http.Request) {
 	principal := security.PrincipalFromRequest(r)
-	if !security.NewRBACPolicy().Allows(principal, security.ActionReadQuality, security.ResourceQuality) {
+	if !s.policy.Allows(principal, security.ActionReadQuality, security.ResourceQuality) {
 		s.auditRBACDenied(r, principal, security.ResourceQuality)
 		writeError(w, http.StatusForbidden, "quality access denied")
 		return
