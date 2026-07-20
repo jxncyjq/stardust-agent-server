@@ -118,13 +118,29 @@ func (s *memoryAgentMessageStore) SaveAgentMessage(_ context.Context, message do
 func (s *memoryAgentMessageStore) ListAgentMessages(_ context.Context, query domain.AgentMessageQuery) ([]domain.AgentMessage, error) {
 	var out []domain.AgentMessage
 	for _, message := range s.messages {
+		// Mirror SQLiteRepository.ListAgentMessages exactly: every filter is
+		// "empty means match anything". A fake that filters on fewer fields than
+		// the real store lets a test pass against behaviour production does not
+		// have — which is how an isolation gap would slip through unnoticed.
 		if query.CompanyID != "" && message.CompanyID != query.CompanyID {
+			continue
+		}
+		if query.TaskID != "" && message.TaskID != query.TaskID {
+			continue
+		}
+		if query.ThreadID != "" && message.ThreadID != query.ThreadID {
+			continue
+		}
+		if query.FromAgentID != "" && message.FromAgentID != query.FromAgentID {
 			continue
 		}
 		if query.ToAgentID != "" && message.ToAgentID != query.ToAgentID {
 			continue
 		}
 		if query.Status != "" && message.Status != query.Status {
+			continue
+		}
+		if query.SourceEventID != "" && message.SourceEventID != query.SourceEventID {
 			continue
 		}
 		out = append(out, message)

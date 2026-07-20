@@ -24,13 +24,24 @@ func RegisterAgentMessageTools(registry *Registry, store AgentMessageStore) {
 		return
 	}
 	registry.RegisterDescriptor(sendMessageDescriptor(), HandlerFunc(func(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
+		// The sender and the tenant are identity, not payload. Taking them from
+		// the caller rather than from model-supplied arguments is what stops an
+		// agent from forging a message "from" someone else — every downstream
+		// trust decision reads FromAgentID.
+		caller, err := RequireCaller(ctx)
+		if err != nil {
+			return domain.ToolResult{}, fmt.Errorf("send message: %w", err)
+		}
+		if claimed := firstMessageArgument(call.Arguments["from"], call.Arguments["from_agent_id"]); claimed != "" && claimed != caller.ID {
+			return domain.ToolResult{}, fmt.Errorf("send message: refusing to send as %q: the caller is %q", claimed, caller.ID)
+		}
 		message := domain.AgentMessage{
 			ID:            firstMessageArgument(call.Arguments["message_id"], nextAgentMessageID()),
-			CompanyID:     call.Arguments["company_id"],
+			CompanyID:     caller.CompanyID,
 			TaskID:        call.Arguments["task_id"],
 			SourceEventID: call.Arguments["source_event_id"],
 			ThreadID:      firstMessageArgument(call.Arguments["thread_id"], call.Arguments["task_id"]),
-			FromAgentID:   firstMessageArgument(call.Arguments["from"], call.Arguments["from_agent_id"]),
+			FromAgentID:   caller.ID,
 			ToAgentID:     firstMessageArgument(call.Arguments["to"], call.Arguments["to_agent_id"]),
 			Type:          agentMessageType(call.Arguments["type"]),
 			Status:        domain.AgentMessageUnread,
@@ -38,24 +49,43 @@ func RegisterAgentMessageTools(registry *Registry, store AgentMessageStore) {
 			Artifact:      call.Arguments["artifact"],
 			CreatedAt:     time.Now().UTC(),
 		}
-		if message.FromAgentID == "" {
-			message.FromAgentID = strings.TrimSpace(call.Arguments["actor_agent_id"])
-		}
-		if message.FromAgentID == "" {
-			message.FromAgentID = "agent"
-		}
 		if err := store.SaveAgentMessage(ctx, message); err != nil {
 			return domain.ToolResult{}, fmt.Errorf("send message: %w", err)
 		}
 		return messageToolResult(call.ID, fmt.Sprintf("sent message %s from %s to %s", message.ID, message.FromAgentID, message.ToAgentID)), nil
 	}))
 	registry.RegisterDescriptor(readMessagesDescriptor(), HandlerFunc(func(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
+		caller, err := RequireCaller(ctx)
+		if err != nil {
+			return domain.ToolResult{}, fmt.Errorf("read messages: %w", err)
+		}
+		// Every filter in the store means "empty matches anything", so an
+		// unconstrained query returns the whole table. The caller must therefore
+		// be a party to whatever it reads: either the recipient (inbox) or the
+		// sender (outbox).
+		to := firstMessageArgument(call.Arguments["to"], call.Arguments["to_agent_id"])
+		from := firstMessageArgument(call.Arguments["from"], call.Arguments["from_agent_id"])
+		switch {
+		case to == "" && from == "":
+			// No scope given: default to the caller's own inbox rather than to
+			// "everything".
+			to = caller.ID
+		case to != caller.ID && from != caller.ID:
+			// Neither end is the caller — this reads someone else's mail.
+			// Refuse loudly instead of quietly rewriting it to the caller's id,
+			// so the attempt is visible rather than masked.
+			return domain.ToolResult{}, fmt.Errorf(
+				"read messages: caller %q may only read messages it sent or received (got to=%q from=%q)",
+				caller.ID, to, from)
+		}
 		query := domain.AgentMessageQuery{
-			CompanyID:     call.Arguments["company_id"],
+			// The tenant comes from the caller, never from the arguments: a
+			// model-supplied company_id is not an authorisation.
+			CompanyID:     caller.CompanyID,
 			TaskID:        call.Arguments["task_id"],
 			ThreadID:      call.Arguments["thread_id"],
-			FromAgentID:   firstMessageArgument(call.Arguments["from"], call.Arguments["from_agent_id"]),
-			ToAgentID:     firstMessageArgument(call.Arguments["to"], call.Arguments["to_agent_id"]),
+			FromAgentID:   from,
+			ToAgentID:     to,
 			Status:        domain.AgentMessageStatus(strings.TrimSpace(call.Arguments["status"])),
 			SourceEventID: call.Arguments["source_event_id"],
 			Limit:         parseMessageLimit(call.Arguments["limit"]),
