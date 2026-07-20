@@ -71,12 +71,18 @@ AGENTS.md 的三个位置由代码推导，不可通过配置改变。
 
 ## 五、关于本手册所在目录
 
-仓库根 `.gitignore` 包含 `docs/`，因此 `docs/` 下的全部内容（含本手册与既有的 `docs/architecture/adr-*.md`）**都不会进入 git**。
-
-这意味着：手册只存在于本地工作树，克隆仓库的人拿不到。若需要随仓库分发，应移动到未被忽略的位置（例如 `configs/` 或仓库根的说明目录），或调整 `.gitignore` 为 `docs/` 下的特定子目录取消忽略：
+`docs/` **同时是 agent 的产物输出目录**（`workspace.docs_root` 默认值就是 `"docs"`），所以 `.gitignore` 默认忽略整层，再按目录显式放行手写文档：
 
 ```gitignore
-docs/
+docs/*
+!docs/README.md
 !docs/agents/
-!docs/agents/**
+!docs/architecture/
+!docs/superpowers/
 ```
+
+用 `docs/*` 而非 `docs/`：Git 不会进入被忽略的目录，父目录整体被忽略时其下的 `!` 规则不生效。写成 `docs/*` 则只忽略一级条目，未列入白名单的子目录（agent 将来写到 `docs/research/` 之类）仍然被挡住。
+
+**新增手写文档时**，若放在上述四个白名单之外的位置，需要同步添加放行规则，否则会被静默忽略 —— 用 `git check-ignore -v <路径>` 可确认。
+
+另有 `**/.omc/` 规则：OMC 运行时状态（含 agent 会话回放 `agent-replay-*.jsonl`）在任何层级都不入库。该规则必须位于 docs 白名单之前才生效。
