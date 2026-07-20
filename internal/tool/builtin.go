@@ -48,7 +48,12 @@ func WithAgentsInjection(maxFileChars int, homeDir string) WorkspaceRegistryOpti
 func NewWorkspaceRegistry(root string, audit port.AuditLog, opts ...WorkspaceRegistryOption) *Registry {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
-		absRoot = root
+		// filepath.Abs only fails when os.Getwd does — the process has no
+		// resolvable working directory, an unrecoverable environment fault.
+		// Falling back to the relative root would hand NewWorkspacePathGuard a
+		// path whose containment comparison is meaningless, silently disabling
+		// the sandbox. A security boundary must not degrade quietly.
+		panic(fmt.Sprintf("tool: cannot resolve workspace root %q: %v", root, err))
 	}
 	var options workspaceRegistryOptions
 	for _, opt := range opts {
@@ -104,10 +109,24 @@ func NewWorkspaceRegistry(root string, audit port.AuditLog, opts ...WorkspaceReg
 	return registry
 }
 
-func NewReadOnlyWorkspaceRegistry(root string, audit port.AuditLog) *Registry {
+// NewFileReadOnlyWorkspaceRegistry returns a registry whose *filesystem* access
+// is read-only: read_file, search_content and list_files, with no write_file.
+//
+// The name says "file read-only" rather than plain "read-only" on purpose. The
+// registry is not side-effect free: callers routinely add task-ledger, agent
+// messaging and web tools to it afterwards (see agent_resolver.ResolveTaskRunner
+// and cli.defaultTaskRunner.RunTask), and those do write — to the ledger, to
+// other agents' inboxes, and out to the network. Reading the old name as "this
+// agent cannot change anything" was the misconception worth removing.
+func NewFileReadOnlyWorkspaceRegistry(root string, audit port.AuditLog) *Registry {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
-		absRoot = root
+		// filepath.Abs only fails when os.Getwd does — the process has no
+		// resolvable working directory, an unrecoverable environment fault.
+		// Falling back to the relative root would hand NewWorkspacePathGuard a
+		// path whose containment comparison is meaningless, silently disabling
+		// the sandbox. A security boundary must not degrade quietly.
+		panic(fmt.Sprintf("tool: cannot resolve workspace root %q: %v", root, err))
 	}
 	guard := port.NewWorkspacePathGuard(absRoot)
 	registry := NewRegistry(

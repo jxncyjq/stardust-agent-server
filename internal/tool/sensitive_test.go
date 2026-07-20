@@ -27,10 +27,10 @@ func TestSafeToolNamesExcludesSensitive(t *testing.T) {
 }
 
 func TestBuiltinWorkspaceToolsClassification(t *testing.T) {
-	// NewReadOnlyWorkspaceRegistry does not register write_file (only
+	// NewFileReadOnlyWorkspaceRegistry does not register write_file (only
 	// registerReadOnlyDescriptors); NewWorkspaceRegistry is the constructor that
 	// actually registers all four tools below, so it is used here instead of the
-	// brief's suggested NewReadOnlyWorkspaceRegistry.
+	// brief's suggested NewFileReadOnlyWorkspaceRegistry.
 	reg := NewWorkspaceRegistry(t.TempDir(), nil)
 	want := map[string]bool{ // name -> sensitive
 		"read_file":      false,
@@ -45,7 +45,7 @@ func TestBuiltinWorkspaceToolsClassification(t *testing.T) {
 	for name, sensitive := range want {
 		g, ok := got[name]
 		if !ok {
-			t.Errorf("tool %q not registered by NewReadOnlyWorkspaceRegistry", name)
+			t.Errorf("tool %q not registered by NewFileReadOnlyWorkspaceRegistry", name)
 			continue
 		}
 		if g != sensitive {

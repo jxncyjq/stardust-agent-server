@@ -22,7 +22,7 @@ func TestReadFileTruncatesLargeFile(t *testing.T) {
 		t.Fatalf("write big file: %v", err)
 	}
 
-	registry := NewReadOnlyWorkspaceRegistry(root, nil)
+	registry := NewFileReadOnlyWorkspaceRegistry(root, nil)
 	result, err := registry.Execute(context.Background(), domain.Agent{Role: "developer"}, domain.ToolCall{
 		ID:        "read-1",
 		Name:      "read_file",

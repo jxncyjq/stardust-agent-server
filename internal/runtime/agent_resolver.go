@@ -99,10 +99,6 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 	// not been created yet means "no skills installed", and mounting it would
 	// fail the skill walk and with it every task routed to this agent. The
 	// default runtime gates its own mount the same way.
-	// skill.RootAvailable, not a bare non-empty check: an install_root that has
-	// not been created yet means "no skills installed", and mounting it would
-	// fail the skill walk and with it every task routed to this agent. The
-	// default runtime gates its own mount the same way.
 	if skillsRoot := agentSkillsRoot(r.rootConfig, agentCfg); skillsRoot != "" {
 		if skill.RootAvailable(skillsRoot) {
 			contextBuilder = contextBuilder.WithSkills(skill.NewSystem(skill.Config{
@@ -147,7 +143,7 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 	//
 	// The asymmetry is the design, not an oversight — see
 	// TestResolverOmitsOrchestratorOnlyTools, which locks it.
-	tools := tool.NewReadOnlyWorkspaceRegistry(agentToolRoot(r.rootConfig, agentCfg, task), r.audit)
+	tools := tool.NewFileReadOnlyWorkspaceRegistry(agentToolRoot(r.rootConfig, agentCfg, task), r.audit)
 	tool.RegisterTaskLedgerTools(tools, r.taskLedger)
 	tool.RegisterAgentMessageTools(tools, r.messageStore)
 	tool.RegisterWebTools(tools, webToolOptions(r.rootConfig.Web))

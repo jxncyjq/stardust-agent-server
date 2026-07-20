@@ -1881,7 +1881,7 @@ func (d *defaultTaskRunner) RunTask(ctx context.Context, agent domain.Agent, tas
 	if root == "" {
 		root = d.contextRoot
 	}
-	tools := tool.NewReadOnlyWorkspaceRegistry(root, d.audit)
+	tools := tool.NewFileReadOnlyWorkspaceRegistry(root, d.audit)
 	tool.RegisterTaskLedgerTools(tools, d.taskLedger)
 	tool.RegisterAgentMessageTools(tools, d.messageStore)
 	tool.RegisterWebTools(tools, d.webOptions)

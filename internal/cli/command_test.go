@@ -1836,7 +1836,7 @@ func TestServeCommandStreamsLifecycleEventsOverSSE(t *testing.T) {
 // It exercises read_file rather than write_file: both the HTTP/coordinator
 // task path (defaultTaskRunner.RunTask) and the per-agent path
 // (agent_resolver.go's ResolveTaskRunner) build
-// tool.NewReadOnlyWorkspaceRegistry — write_file is wired only into the CLI
+// tool.NewFileReadOnlyWorkspaceRegistry — write_file is wired only into the CLI
 // `run`/`tui` one-off path (internal/app.go's tool.NewWorkspaceRegistry), not
 // into serve. Adding write capability to the HTTP path would be a feature
 // change outside this task's scope (整合 + 门禁).
