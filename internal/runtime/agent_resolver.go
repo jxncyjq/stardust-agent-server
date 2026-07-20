@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -40,6 +41,10 @@ type AgentRuntimeResolverConfig struct {
 	// ToolGate gates each tool round for resolver-built runtimes, mirroring
 	// Config.ToolGate on the default runtime. Nil never suspends.
 	ToolGate ToolGate
+	// Logger reports conditions that are tolerated but worth surfacing, such as
+	// a configured skills root that does not exist. Nil disables that reporting
+	// (tests, embedded use); it never changes what the resolver builds.
+	Logger *slog.Logger
 }
 
 type AgentRuntimeResolver struct {
@@ -52,6 +57,7 @@ type AgentRuntimeResolver struct {
 	maasFactory  MaasRunnerFactory
 	checkpoints  *sessionstate.Store
 	toolGate     ToolGate
+	logger       *slog.Logger
 }
 
 func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolver {
@@ -65,6 +71,7 @@ func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolv
 		maasFactory:  cfg.MaasFactory,
 		checkpoints:  cfg.Checkpoints,
 		toolGate:     cfg.ToolGate,
+		logger:       cfg.Logger,
 	}
 }
 
@@ -88,11 +95,31 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		return domain.Agent{}, nil, false, fmt.Errorf("load agent context files for %q: %w", task.AgentID, err)
 	}
 	contextBuilder := cognitive.NewCore(cognitive.NoopCompressor{}).WithContextFiles(contextBlock)
+	// skill.RootAvailable, not a bare non-empty check: an install_root that has
+	// not been created yet means "no skills installed", and mounting it would
+	// fail the skill walk and with it every task routed to this agent. The
+	// default runtime gates its own mount the same way.
+	// skill.RootAvailable, not a bare non-empty check: an install_root that has
+	// not been created yet means "no skills installed", and mounting it would
+	// fail the skill walk and with it every task routed to this agent. The
+	// default runtime gates its own mount the same way.
 	if skillsRoot := agentSkillsRoot(r.rootConfig, agentCfg); skillsRoot != "" {
-		contextBuilder = contextBuilder.WithSkills(skill.NewSystem(skill.Config{
-			Roots:   []string{skillsRoot},
-			Scanner: skill.NewSecurityScanner(),
-		}))
+		if skill.RootAvailable(skillsRoot) {
+			contextBuilder = contextBuilder.WithSkills(skill.NewSystem(skill.Config{
+				Roots:   []string{skillsRoot},
+				Scanner: skill.NewSecurityScanner(),
+			}))
+		} else if r.logger != nil {
+			// Skipping is the right call, but not silently: a configured root
+			// that is unusable is far more often a typo or a missing setup step
+			// than a deliberate "no skills yet". Warn, not Error — the task
+			// runs fine without skills.
+			r.logger.WarnContext(ctx, "skills root unavailable, running without skills",
+				"component", "agent_resolver",
+				"agent_id", task.AgentID,
+				"skills_root", skillsRoot,
+			)
+		}
 	}
 	agent := domain.Agent{
 		ID:        firstNonEmptyAgentRuntimeResolver(agentCfg.ID, task.AgentID),
@@ -186,9 +213,14 @@ func agentToolRoot(rootCfg config.Config, agentCfg agentregistry.AgentConfig, ta
 	return rootCfg.ContextFiles.Root
 }
 
+// agentSkillsRoot picks the agent's own skills root, falling back to the root
+// config's. TrimSpace, not a bare != "": a whitespace-only install_root is a
+// typo, not a choice — treating it as "configured" would return a path that
+// RootAvailable then rejects, silently losing the root config's skills instead
+// of falling back to them.
 func agentSkillsRoot(rootCfg config.Config, agentCfg agentregistry.AgentConfig) string {
-	if agentCfg.Skills.InstallRoot != "" {
-		return agentCfg.Skills.InstallRoot
+	if root := strings.TrimSpace(agentCfg.Skills.InstallRoot); root != "" {
+		return root
 	}
 	return rootCfg.Skills.InstallRoot
 }

@@ -1911,16 +1911,12 @@ func webToolOptions(cfg config.WebToolConfig) tool.WebToolOptions {
 // (a valid optional deployment) and skips skill injection rather than failing
 // every task's context build. A path that exists but is not a directory is a
 // misconfiguration and is simply not treated as available here.
+// skillsRootAvailable delegates to skill.RootAvailable so the default runtime
+// and the per-agent runtimes gate their skills mount on the exact same rule.
+// They used to disagree — the resolver checked only for a non-empty path — and
+// every task routed to a sub-agent whose install_root did not exist yet failed.
 func skillsRootAvailable(root string) bool {
-	root = strings.TrimSpace(root)
-	if root == "" {
-		return false
-	}
-	info, err := os.Stat(root)
-	if err != nil {
-		return false
-	}
-	return info.IsDir()
+	return skill.RootAvailable(root)
 }
 
 // serveEventBusBuffer is the per-subscriber channel buffer for the platform
@@ -2080,6 +2076,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		MaasFactory:  maasFactoryFromConfig(cfg.Maas),
 		Checkpoints:  checkpointStore,
 		ToolGate:     manualGate,
+		Logger:       defaultLogger(),
 	})
 	defaultMaas, err := adapter.NewMaasClientFromProfile(cfg.Maas, "")
 	if err != nil {
