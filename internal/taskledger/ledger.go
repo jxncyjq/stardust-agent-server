@@ -125,7 +125,10 @@ func (l *Ledger) Append(ctx context.Context, event Event) (appended Event, err e
 			return Event{}, err
 		}
 	}
-	path := l.eventPath(event.CreatedAt)
+	path, err := l.eventPath(event.CreatedAt)
+	if err != nil {
+		return Event{}, err
+	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return Event{}, fmt.Errorf("create event directory: %w", err)
 	}
@@ -186,12 +189,15 @@ func (l *Ledger) ReadEvents(ctx context.Context) ([]Event, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	eventsRoot := l.eventsRoot()
-	if _, err := os.Stat(eventsRoot); errors.Is(err, os.ErrNotExist) {
+	root, err := l.eventsRoot()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := os.Stat(root); errors.Is(err, os.ErrNotExist) {
 		return nil, nil
 	}
 	var events []Event
-	err := filepath.WalkDir(eventsRoot, func(path string, entry os.DirEntry, walkErr error) error {
+	err = filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			// Never swallow: a partial event set would be handed to Rebuild,
 			// which atomically overwrites tasks.md and every tasks/*.md — so a
@@ -474,7 +480,11 @@ func (l *Ledger) acquireLock(ctx context.Context) (func() error, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	lockPath := filepath.Join(l.rootPath(), ".lock")
+	root, err := l.rootPath()
+	if err != nil {
+		return nil, err
+	}
+	lockPath := filepath.Join(root, ".lock")
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create lock directory: %w", err)
 	}
@@ -528,17 +538,32 @@ func (l *Ledger) acquireLock(ctx context.Context) (func() error, error) {
 	return nil, fmt.Errorf("acquire task ledger lock: still held after reclaiming a stale lock")
 }
 
-func (l *Ledger) eventsRoot() string {
-	return filepath.Join(l.rootPath(), "events")
+func (l *Ledger) eventsRoot() (string, error) {
+	root, err := l.rootPath()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, "events"), nil
 }
 
-func (l *Ledger) eventPath(t time.Time) string {
-	return filepath.Join(l.eventsRoot(), t.Format("2006-01-02")+".jsonl")
+func (l *Ledger) eventPath(t time.Time) (string, error) {
+	root, err := l.eventsRoot()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(root, t.Format("2006-01-02")+".jsonl"), nil
 }
 
-func (l *Ledger) rootPath() string {
-	path, _ := resolveWithin(l.cfg.WorkspaceRoot, l.cfg.Root)
-	return path
+// rootPath resolves the ledger root inside the workspace. It reports the sandbox
+// check's failure instead of returning "": a discarded error here degraded every
+// later filepath.Join into a process-cwd-relative path, writing events, .lock and
+// projections outside the ledger while the containment check appeared to pass.
+func (l *Ledger) rootPath() (string, error) {
+	path, err := resolveWithin(l.cfg.WorkspaceRoot, l.cfg.Root)
+	if err != nil {
+		return "", fmt.Errorf("resolve task ledger root: %w", err)
+	}
+	return path, nil
 }
 
 func (l *Ledger) indexPath() (string, error) {
