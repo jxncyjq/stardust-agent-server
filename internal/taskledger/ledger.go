@@ -95,7 +95,7 @@ func New(cfg Config) (*Ledger, error) {
 	return &Ledger{cfg: cfg}, nil
 }
 
-func (l *Ledger) Append(ctx context.Context, event Event) (Event, error) {
+func (l *Ledger) Append(ctx context.Context, event Event) (appended Event, err error) {
 	if err := ctx.Err(); err != nil {
 		return Event{}, err
 	}
@@ -105,10 +105,25 @@ func (l *Ledger) Append(ctx context.Context, event Event) (Event, error) {
 	if err != nil {
 		return Event{}, err
 	}
-	defer unlock()
+	// Surface a failed release when the write itself succeeded: a lock left
+	// behind blocks every later write, so reporting it is the difference
+	// between one failed call and a stuck ledger.
+	defer func() {
+		if unlockErr := unlock(); unlockErr != nil && err == nil {
+			appended, err = Event{}, unlockErr
+		}
+	}()
 	event = l.normalizeEvent(event)
 	if err := l.validateEvent(event); err != nil {
 		return Event{}, err
+	}
+	// Ownership is decided here, while the lock is held. Deciding it later (in
+	// the projection) meant every racing claimant got a success and the loser
+	// only found out by reading a Markdown conflict line it never sees.
+	if event.Type == EventTaskClaimed {
+		if err := l.checkClaim(event); err != nil {
+			return Event{}, err
+		}
 	}
 	path := l.eventPath(event.CreatedAt)
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
@@ -129,7 +144,7 @@ func (l *Ledger) Append(ctx context.Context, event Event) (Event, error) {
 	return event, nil
 }
 
-func (l *Ledger) Rebuild(ctx context.Context) (Projection, error) {
+func (l *Ledger) Rebuild(ctx context.Context) (projection Projection, rebuildErr error) {
 	if err := ctx.Err(); err != nil {
 		return Projection{}, err
 	}
@@ -139,12 +154,16 @@ func (l *Ledger) Rebuild(ctx context.Context) (Projection, error) {
 	if err != nil {
 		return Projection{}, err
 	}
-	defer unlock()
+	defer func() {
+		if unlockErr := unlock(); unlockErr != nil && rebuildErr == nil {
+			projection, rebuildErr = Projection{}, unlockErr
+		}
+	}()
 	events, err := l.ReadEvents(ctx)
 	if err != nil {
 		return Projection{}, err
 	}
-	projection := BuildProjection(events, l.cfg)
+	projection = BuildProjection(events, l.cfg)
 	if err := l.writeProjection(ctx, projection); err != nil {
 		return Projection{}, err
 	}
@@ -256,6 +275,110 @@ func (l *Ledger) validateEvent(event Event) error {
 	return nil
 }
 
+// ownersPath is the owner index: taskID -> current owner. It is a cache derived
+// entirely from the event log, kept next to it so a claim can be decided under
+// the lock without replaying every event on every call.
+func (l *Ledger) ownersPath() (string, error) {
+	return resolveWithin(l.cfg.WorkspaceRoot, filepath.Join(l.cfg.Root, ".owners.json"))
+}
+
+// readOwners loads the owner index, rebuilding it from the event log when it is
+// absent or unreadable.
+//
+// A missing index is normal (first run, or a ledger written before the index
+// existed). A corrupt one is not a reason to give up: the events remain the
+// source of truth, so it is rebuilt rather than treated as "no owners" — the
+// latter would silently let a claimed task be claimed again.
+func (l *Ledger) readOwners(ctx context.Context) (map[string]string, error) {
+	path, err := l.ownersPath()
+	if err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("read owner index %q: %w", path, err)
+		}
+		return l.ownersFromEvents(ctx)
+	}
+	owners := make(map[string]string)
+	if err := json.Unmarshal(data, &owners); err != nil {
+		return l.ownersFromEvents(ctx)
+	}
+	return owners, nil
+}
+
+// ownersFromEvents derives the index from the event log, which is authoritative.
+func (l *Ledger) ownersFromEvents(ctx context.Context) (map[string]string, error) {
+	events, err := l.ReadEvents(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("rebuild owner index: %w", err)
+	}
+	sortEvents(events)
+	owners := make(map[string]string)
+	for _, event := range events {
+		if event.Type != EventTaskClaimed {
+			continue
+		}
+		owner := firstNonEmptyLedgerValue(event.Owner, event.ActorAgentID)
+		if owner == "" {
+			continue
+		}
+		// First claim wins, matching how the projection resolves ownership.
+		if _, taken := owners[event.TaskID]; !taken {
+			owners[event.TaskID] = owner
+		}
+	}
+	return owners, nil
+}
+
+func (l *Ledger) writeOwners(owners map[string]string) error {
+	path, err := l.ownersPath()
+	if err != nil {
+		return err
+	}
+	data, err := json.Marshal(owners)
+	if err != nil {
+		return fmt.Errorf("encode owner index: %w", err)
+	}
+	if err := writeFileAtomic(path, string(data)); err != nil {
+		return fmt.Errorf("write owner index %q: %w", path, err)
+	}
+	return nil
+}
+
+// checkClaim enforces exclusive ownership. It runs inside Append while the
+// cross-process lock is held, so the read-decide-write sequence cannot
+// interleave with another claimant.
+//
+// Re-claiming a task one already owns succeeds: a caller that lost its response
+// must be able to retry without the retry looking like a conflict.
+func (l *Ledger) checkClaim(event Event) error {
+	ctx := context.Background()
+	owners, err := l.readOwners(ctx)
+	if err != nil {
+		return err
+	}
+	claimant := firstNonEmptyLedgerValue(event.Owner, event.ActorAgentID)
+	if claimant == "" {
+		return fmt.Errorf("%w: claim requires an owner", ErrInvalidEvent)
+	}
+	if current, taken := owners[event.TaskID]; taken && current != claimant {
+		return fmt.Errorf("%w: task %q is owned by %q", ErrDuplicateClaim, event.TaskID, current)
+	}
+	owners[event.TaskID] = claimant
+	return l.writeOwners(owners)
+}
+
+func firstNonEmptyLedgerValue(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
+		}
+	}
+	return ""
+}
+
 // validateStatus rejects a status outside the configured vocabulary. status is
 // not cosmetic: isTerminal compares it against DoneStatuses to decide archival,
 // so a typo like "donee" produced a task that could never be archived and
@@ -335,7 +458,19 @@ func (l *Ledger) writeProjection(ctx context.Context, projection Projection) err
 	return nil
 }
 
-func (l *Ledger) acquireLock(ctx context.Context) (func(), error) {
+// lockStaleAfter is how long a .lock may sit untouched before it is treated as
+// abandoned. It must exceed the longest legitimate Append/Rebuild, and the
+// projection rewrite is the slow part; a killed process should not block writes
+// for longer than this.
+const lockStaleAfter = 2 * time.Minute
+
+// acquireLock takes the cross-process ledger lock, reclaiming one left behind by
+// a process that died mid-write.
+//
+// The returned release function reports its own failure instead of discarding
+// it: a lock that cannot be removed blocks every later write, so it must not be
+// swallowed.
+func (l *Ledger) acquireLock(ctx context.Context) (func() error, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -343,18 +478,54 @@ func (l *Ledger) acquireLock(ctx context.Context) (func(), error) {
 	if err := os.MkdirAll(filepath.Dir(lockPath), 0o755); err != nil {
 		return nil, fmt.Errorf("create lock directory: %w", err)
 	}
-	file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
-	if err != nil {
-		if errors.Is(err, os.ErrExist) {
+
+	// Two attempts at most: acquire, and if an abandoned lock was cleared,
+	// acquire again. More would risk two writers ping-ponging over one lock.
+	for attempt := range 2 {
+		file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		if err == nil {
+			// The stamp is diagnostic only — staleness is judged by mtime, which
+			// cannot be corrupted by a partial write.
+			if _, writeErr := file.WriteString(time.Now().Format(time.RFC3339Nano)); writeErr != nil {
+				_ = file.Close()
+				_ = os.Remove(lockPath)
+				return nil, fmt.Errorf("stamp task ledger lock: %w", writeErr)
+			}
+			if closeErr := file.Close(); closeErr != nil {
+				_ = os.Remove(lockPath)
+				return nil, fmt.Errorf("close task ledger lock: %w", closeErr)
+			}
+			return func() error {
+				if err := os.Remove(lockPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+					return fmt.Errorf("release task ledger lock %q: %w", lockPath, err)
+				}
+				return nil
+			}, nil
+		}
+		if !errors.Is(err, os.ErrExist) {
 			return nil, fmt.Errorf("acquire task ledger lock: %w", err)
 		}
-		return nil, fmt.Errorf("acquire task ledger lock: %w", err)
+		if attempt > 0 {
+			break
+		}
+
+		info, statErr := os.Stat(lockPath)
+		if statErr != nil {
+			if errors.Is(statErr, os.ErrNotExist) {
+				// Released between our attempt and the stat; retry immediately.
+				continue
+			}
+			return nil, fmt.Errorf("inspect task ledger lock: %w", statErr)
+		}
+		if age := time.Since(info.ModTime()); age <= lockStaleAfter {
+			return nil, fmt.Errorf("acquire task ledger lock: held by another writer since %s (%s ago)",
+				info.ModTime().Format(time.RFC3339), age.Truncate(time.Second))
+		}
+		if removeErr := os.Remove(lockPath); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
+			return nil, fmt.Errorf("reclaim stale task ledger lock: %w", removeErr)
+		}
 	}
-	_, _ = file.WriteString(time.Now().Format(time.RFC3339Nano))
-	_ = file.Close()
-	return func() {
-		_ = os.Remove(lockPath)
-	}, nil
+	return nil, fmt.Errorf("acquire task ledger lock: still held after reclaiming a stale lock")
 }
 
 func (l *Ledger) eventsRoot() string {
