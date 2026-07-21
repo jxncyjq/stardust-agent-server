@@ -412,6 +412,11 @@ git commit -m "feat(capability): 能力目录的聚合、校验与确定序
 
 ### Task 2: `Descriptor.Group` 与 `ToolProvider`
 
+> **实施后修正（已合入，见提交 `422f968`）**：本任务 Step 3 给出的参考实现有两处被审查否掉，实际代码与下文不同，以代码为准 ——
+> (1) `registry == nil` 时不再返回 `nil, nil`，改为 fail-loud 报错并有测试覆盖（返回空目录会让「确实没工具」与「装配错了」不可区分）；
+> (2) `summarize()` 不再按 `.` / `。` / `
+` 切句 —— 工具描述里插了工作区根路径，而 per-agent 的会话根形如 `<working_dir>/.stardust` 含点，原写法会把摘要截在路径中间。
+
 **Files:**
 - Modify: `internal/tool/descriptor.go:9-18`（`Descriptor` 结构体）
 - Modify: `internal/tool/builtin.go`、`internal/tool/taskledger.go`、`internal/tool/agent_message.go`、`internal/tool/web.go`、`internal/tool/session_search.go`、`internal/runtime/delegation_tool.go`、`internal/runtime/moa_tool.go`（标注 `Group`）
