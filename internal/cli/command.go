@@ -2074,6 +2074,15 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// (Task 5) is the reconcile path for missed approval prompts.
 	platformEvents := observability.NewEventBus(serveEventBusBuffer)
 	workflowEvents := eventbridge.New(platformEvents, logger)
+	// Startup invariant: a durable driver whose store never became a sink would
+	// silently stop recording task state changes -- the exact defect this wiring
+	// exists to prevent, and one with no symptom until someone reads the
+	// database. Adding a persistent driver without teaching the branch above
+	// about it must fail here rather than at 3am.
+	if cfg.Storage.Driver != "memory" && taskSink == nil {
+		closeStore()
+		return ServeResult{}, fmt.Errorf("storage driver %q provides no task sink: task state changes would never be persisted", cfg.Storage.Driver)
+	}
 	liveTasks := task.NewSchedulerWithSink(taskSink)
 	httpTasks := server.TaskStore(liveTasks)
 	if taskStore != nil {

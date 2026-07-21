@@ -157,6 +157,11 @@ func (r *SQLiteRepository) ListTasks(ctx context.Context) ([]domain.Task, error)
 	return tasks, nil
 }
 
+// SaveTask writes a whole task row, overwriting every column. The row is a
+// partial projection of domain.Task: Mode, WorkingDir and Images have no
+// columns and do not survive the round trip, so a task read back from here is
+// not a full substitute for the live one. Callers holding only part of a task
+// want UpdateTaskStatus instead.
 func (r *SQLiteRepository) SaveTask(ctx context.Context, task domain.Task) error {
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO tasks (
@@ -173,6 +178,25 @@ func (r *SQLiteRepository) SaveTask(ctx context.Context, task domain.Task) error
 	`, task.ID, task.CompanyID, task.AgentID, task.SessionID, string(task.Status), task.Input, task.MaxIterations, formatTime(task.CreatedAt))
 	if err != nil {
 		return fmt.Errorf("save task %q: %w", task.ID, err)
+	}
+	return nil
+}
+
+// UpdateTaskStatus records a task state change, and nothing else: only the
+// status and agent_id columns move, so a caller holding a partially populated
+// domain.Task cannot blank out the rest of the row. Use SaveTask to write a
+// whole task.
+//
+// A task with no row is not an error. The tasks table records only tasks that
+// entered through a creation path; workflow-internal tasks live solely in the
+// scheduler and have nothing to update. That absence is contract, not a
+// swallowed failure.
+func (r *SQLiteRepository) UpdateTaskStatus(ctx context.Context, taskID string, status domain.TaskStatus, agentID string) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE tasks SET status = ?, agent_id = ? WHERE id = ?
+	`, string(status), agentID, taskID)
+	if err != nil {
+		return fmt.Errorf("update task %q status to %s: %w", taskID, status, err)
 	}
 	return nil
 }

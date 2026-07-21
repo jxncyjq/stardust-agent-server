@@ -1696,9 +1696,17 @@ func TestServeCommandPersistsTerminalTaskStatus(t *testing.T) {
 		cancel()
 		t.Fatalf("POST /v1/tasks error = %v, want nil", err)
 	}
+	status := resp.StatusCode
 	if err := resp.Body.Close(); err != nil {
 		cancel()
 		t.Fatalf("Body.Close() error = %v, want nil", err)
+	}
+	// waitForPostTask retries transport errors only, so a 5xx from SQLite under
+	// this package's parallel load would otherwise surface ten seconds later as
+	// "the task never ran" and read like a persistence failure.
+	if status != http.StatusCreated {
+		cancel()
+		t.Fatalf("POST /v1/tasks status = %d, want %d", status, http.StatusCreated)
 	}
 
 	// Wait for the live scheduler to report a terminal state before shutting
