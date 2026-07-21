@@ -15,14 +15,28 @@ var (
 	ErrTaskAlreadyPresent = errors.New("task already present")
 )
 
+// TaskSink is the durable store a Scheduler writes each task state change
+// through to. The storage repository satisfies it.
+type TaskSink interface {
+	SaveTask(ctx context.Context, task domain.Task) error
+}
+
 type Scheduler struct {
 	mu    sync.Mutex
 	order []string
 	tasks map[string]domain.Task
+	sink  TaskSink
 }
 
 func NewScheduler() *Scheduler {
 	return &Scheduler{tasks: make(map[string]domain.Task)}
+}
+
+// NewSchedulerWithSink returns a Scheduler that writes every task state change
+// through to sink before committing it in memory. A nil sink is the contract's
+// explicit opt-out: the scheduler stays purely in-memory, as NewScheduler.
+func NewSchedulerWithSink(sink TaskSink) *Scheduler {
+	return &Scheduler{tasks: make(map[string]domain.Task), sink: sink}
 }
 
 func (s *Scheduler) Add(ctx context.Context, task domain.Task) error {
@@ -34,8 +48,26 @@ func (s *Scheduler) Add(ctx context.Context, task domain.Task) error {
 	if _, ok := s.tasks[task.ID]; ok {
 		return fmt.Errorf("%w: %s", ErrTaskAlreadyPresent, task.ID)
 	}
+	if err := s.persist(ctx, task); err != nil {
+		return err
+	}
 	s.tasks[task.ID] = task
 	s.order = append(s.order, task.ID)
+	return nil
+}
+
+// persist writes task through to the durable sink, if one is configured. It is
+// always called before the in-memory map is updated: a durable write that fails
+// must leave the scheduler where it was rather than let memory and storage
+// disagree about a task's state. Callers hold s.mu, which also serializes the
+// sink writes.
+func (s *Scheduler) persist(ctx context.Context, task domain.Task) error {
+	if s.sink == nil {
+		return nil
+	}
+	if err := s.sink.SaveTask(ctx, task); err != nil {
+		return fmt.Errorf("persist task %q as %s: %w", task.ID, task.Status, err)
+	}
 	return nil
 }
 
@@ -54,6 +86,9 @@ func (s *Scheduler) Next(ctx context.Context, agentID string) (domain.Task, bool
 			task.AgentID = agentID
 		}
 		task.Status = domain.TaskAssigned
+		if err := s.persist(ctx, task); err != nil {
+			return domain.Task{}, false, err
+		}
 		s.tasks[id] = task
 		return task, true, nil
 	}
@@ -101,6 +136,9 @@ func (s *Scheduler) Transition(ctx context.Context, taskID string, next domain.T
 		return fmt.Errorf("%w: %s -> %s", ErrInvalidTransition, task.Status, next)
 	}
 	task.Status = next
+	if err := s.persist(ctx, task); err != nil {
+		return err
+	}
 	s.tasks[taskID] = task
 	return nil
 }

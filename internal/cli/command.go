@@ -1429,6 +1429,12 @@ type teeTaskStore struct {
 	persistent server.TaskStore
 }
 
+// Add persists the new task and registers it with the live scheduler. When the
+// scheduler carries a sink (the sqlite driver) this repeats that sink's own
+// create-time write; the write is an idempotent upsert, and keeping it here
+// means creation still reaches storage if a future store satisfies
+// server.TaskStore without satisfying task.TaskSink -- a silently unpersisted
+// task is the failure worth paying one redundant write to avoid.
 func (s teeTaskStore) Add(ctx context.Context, taskToAdd domain.Task) error {
 	if err := s.live.Add(ctx, taskToAdd); err != nil {
 		return err
@@ -2025,6 +2031,10 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	var messageStore tool.AgentMessageStore
 	var sessionSearcher tool.MessageSearcher
 	var skillCurator *skill.Curator
+	// taskSink is the durable store the live scheduler writes state changes
+	// through to. It stays nil for the non-sqlite drivers, whose "store" is the
+	// in-memory scheduler itself and has nothing to persist to.
+	var taskSink task.TaskSink
 	// skillUsage is the shared usage sidecar: the skill System records activity on
 	// it as skills are selected into task context, and the Curator sweep reads it
 	// to age idle skills. Sharing one instance connects the two.
@@ -2034,6 +2044,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		qualityEvals = repo
 		messageStore = repo
 		sessionSearcher = repo
+		taskSink = repo
 		curator, err := skill.NewCurator(skill.CuratorConfig{Repository: repo, Usage: skillUsage})
 		if err != nil {
 			closeStore()
@@ -2063,7 +2074,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// (Task 5) is the reconcile path for missed approval prompts.
 	platformEvents := observability.NewEventBus(serveEventBusBuffer)
 	workflowEvents := eventbridge.New(platformEvents, logger)
-	liveTasks := task.NewScheduler()
+	liveTasks := task.NewSchedulerWithSink(taskSink)
 	httpTasks := server.TaskStore(liveTasks)
 	if taskStore != nil {
 		httpTasks = teeTaskStore{live: liveTasks, persistent: taskStore}
