@@ -141,7 +141,10 @@ func (a *Adapter) getUpdates(ctx context.Context) ([]tgUpdate, error) {
 		return nil, fmt.Errorf("telegram getUpdates: %w", err)
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read telegram getUpdates response body: %w", err)
+	}
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("telegram getUpdates status %s: %s", resp.Status, string(data))
 	}
@@ -172,6 +175,9 @@ func (a *Adapter) Send(ctx context.Context, target gateway.DeliveryTarget, text 
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		// Only used to enrich an error that is already being returned, so a read
+		// failure here costs detail and nothing else — same reasoning as
+		// internal/adapter/http_maas.go.
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		return fmt.Errorf("telegram sendMessage status %s: %s", resp.Status, string(data))
 	}

@@ -88,9 +88,7 @@ func (s *Service) startHTTP(ctx context.Context) <-chan error {
 	}()
 	go func() {
 		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Second)
-		defer cancel()
-		_ = s.httpServer.Shutdown(shutdownCtx)
+		shutdownHTTPServer(context.Background(), s.logger, s.httpServer, time.Second)
 	}()
 	return done
 }

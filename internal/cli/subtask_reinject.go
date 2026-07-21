@@ -35,7 +35,17 @@ func newSubtaskReinjectionJob(events port.EventBus, store tool.AgentMessageStore
 			if event.Type != "subtask_completed" {
 				continue
 			}
-			parentTaskID, _ := agentruntime.ParentTaskIDForSubTask(event.TaskID)
+			// A subtask_completed event's TaskID is supposed to be a sub-task id.
+			// When it is not, ParentTaskIDForSubTask hands back the id unchanged,
+			// and carrying on with that value reinjects the result to the sub-task
+			// itself: the parent's read_messages never sees it and the delegation
+			// chain breaks silently, leaving the parent waiting for a reply that
+			// was already filed elsewhere. Return instead — the scheduler logs it,
+			// same as the save failure below.
+			parentTaskID, ok := agentruntime.ParentTaskIDForSubTask(event.TaskID)
+			if !ok {
+				return fmt.Errorf("reinject subtask result: %q is not a sub-task id", event.TaskID)
+			}
 			message := domain.AgentMessage{
 				ID:            event.TaskID + ":reinject",
 				TaskID:        parentTaskID,

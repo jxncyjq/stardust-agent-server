@@ -69,7 +69,13 @@ func (c *HTTPCoreClient) postJSON(ctx context.Context, path string, body any) ([
 		return nil, fmt.Errorf("call %s: %w", path, err)
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	// Read failures must not pass for content: a connection cut mid-body used
+	// to yield a truncated document that the caller then reported as malformed
+	// JSON, dressing a network failure up as a protocol one.
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return nil, fmt.Errorf("read %s response body: %w", path, err)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("%s returned %s: %s", path, resp.Status, strings.TrimSpace(string(data)))
 	}
@@ -127,7 +133,10 @@ func (c *HTTPCoreClient) TaskResult(ctx context.Context, taskID string) (string,
 		return "", false, fmt.Errorf("call task result %q: %w", taskID, err)
 	}
 	defer resp.Body.Close()
-	data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return "", false, fmt.Errorf("read task result %q response body: %w", taskID, err)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return "", false, fmt.Errorf("task result %q returned %s: %s", taskID, resp.Status, strings.TrimSpace(string(data)))
 	}
@@ -141,7 +150,18 @@ func (c *HTTPCoreClient) TaskResult(ctx context.Context, taskID string) (string,
 	switch out.Status {
 	case "done", "failed", "suspended":
 		return out.Result, true, nil
-	default:
+	case "pending", "running", "assigned":
+		// Not terminal yet: no error, poller retries. This is the contract the
+		// doc comment describes, and it is now stated as a case of its own rather
+		// than being whatever fell through.
 		return "", false, nil
+	default:
+		// A status this client has never heard of is not "not finished yet".
+		// Version skew or a renamed field used to land here and be answered like
+		// an in-flight task, so PollOnce retried forever: the user waiting in
+		// Telegram never got a reply, and nothing was logged, because runner.go
+		// only warns when err is non-nil. Returning an error routes it to that
+		// existing warning.
+		return "", false, fmt.Errorf("task result %q: unknown status %q", taskID, out.Status)
 	}
 }
