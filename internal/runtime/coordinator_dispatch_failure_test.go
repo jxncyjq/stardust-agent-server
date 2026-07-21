@@ -242,4 +242,20 @@ func TestCoordinatorCompletesTaskAfterTransientDispatchFailure(t *testing.T) {
 	if stored.Status != domain.TaskDone {
 		t.Errorf("task status = %q, want %q; the re-queued task never completed", stored.Status, domain.TaskDone)
 	}
+
+	// The retry must not have doubled the audit trail either: the second
+	// dispatch re-walks the same actions with the same deterministic ids.
+	auditEvents, err := repo.ListAuditEvents(ctx)
+	if err != nil {
+		t.Fatalf("ListAuditEvents() error = %v, want nil", err)
+	}
+	assigned := 0
+	for _, e := range auditEvents {
+		if e.SubjectID == "task-1" && e.Action == "task_assigned" {
+			assigned++
+		}
+	}
+	if assigned != 1 {
+		t.Errorf("task_assigned rows = %d, want 1", assigned)
+	}
 }

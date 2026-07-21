@@ -114,7 +114,9 @@ func TestAppendAuditEventIsIdempotent(t *testing.T) {
 		t.Fatalf("AppendAuditEvent() error = %v, want nil", err)
 	}
 
-	if err := repo.AppendAuditEvent(ctx, event); err != nil {
+	later := event
+	later.CreatedAt = event.CreatedAt.Add(time.Hour)
+	if err := repo.AppendAuditEvent(ctx, later); err != nil {
 		t.Fatalf("AppendAuditEvent() second call error = %v, want nil", err)
 	}
 
@@ -123,6 +125,11 @@ func TestAppendAuditEventIsIdempotent(t *testing.T) {
 		t.Fatalf("ListAuditEvents() error = %v, want nil", err)
 	}
 	if len(events) != 1 {
-		t.Errorf("audit events = %d, want 1: the same action must not be recorded twice", len(events))
+		t.Fatalf("audit events = %d, want 1: the same action must not be recorded twice", len(events))
+	}
+	// The doc promises the first occurrence is the one that survives; without
+	// this nobody holds it to that.
+	if !events[0].CreatedAt.Equal(event.CreatedAt) {
+		t.Errorf("created_at = %v, want %v (the first occurrence)", events[0].CreatedAt, event.CreatedAt)
 	}
 }

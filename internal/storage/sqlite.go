@@ -790,6 +790,15 @@ func (r *SQLiteRepository) ListTaskRuns(ctx context.Context, taskID string) ([]d
 // insert would fail it on the primary key forever, leaving a task that is
 // re-queued on every tick and never runs. The first occurrence's timestamp is
 // the one that survives.
+//
+// Two limits come with that. Action names must not contain a colon, or two
+// different (subject, action) pairs could spell the same id. And an action that
+// genuinely happens twice on one subject -- a task suspended, resumed and
+// suspended again; a skill enabled after being disabled -- is recorded once.
+// Those second occurrences were never stored before either (the bare insert
+// failed on the primary key), so nothing is lost here that was previously kept;
+// what changed is that the loss is now quiet. Recording them properly needs a
+// distinguishing part in the id, not a different conflict policy.
 func (r *SQLiteRepository) AppendAuditEvent(ctx context.Context, event domain.AuditEvent) error {
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO audit_events (
