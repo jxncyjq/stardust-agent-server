@@ -98,6 +98,11 @@ func (r *Runtime) newSubRuntime(role string, toolsets []string) (*Runtime, error
 		depth:              depth,
 		maxSpawnDepth:      r.maxSpawnDepth,
 		maxConcurrent:      r.maxConcurrent,
+		// The child is built as a struct literal, bypassing NewRuntime and its
+		// nil-logger fallback, so the parent's logger must be carried over
+		// explicitly: a child left with a nil logger would panic the first time
+		// one of its failure paths tried to record anything.
+		logger: r.logger,
 	}
 	return child, nil
 }
@@ -212,11 +217,16 @@ func (r *Runtime) RunSubTaskAsync(ctx context.Context, spec SubTaskSpec) (SubTas
 		} else {
 			event.Message = res.Summary
 		}
-		// Goroutine boundary: publish the outcome. If even the event sink fails
-		// there is nowhere left to report, so record it on the audit log as a last
-		// resort; a failure there ends the work unit rather than looping.
+		// Goroutine boundary: publish the outcome. If the event sink fails, fall
+		// back to the audit log.
 		if pubErr := r.events.Publish(bg, event); pubErr != nil {
-			_ = r.audit.Append(bg, domain.AuditEvent{
+			// That fallback is not independent, though: audit and event bus are
+			// both SQLite-backed, so whatever took out the publish routinely takes
+			// this out too — not a low-probability coincidence. When both go, the
+			// sub-task's outcome is gone and the parent waits forever, so the log,
+			// which depends on no database, is the actual last resort. It ends the
+			// work unit rather than looping.
+			if auditErr := r.audit.Append(bg, domain.AuditEvent{
 				ID:          subTaskID + ":subtask-publish-failed",
 				RequestID:   subTaskID,
 				SubjectType: "runtime",
@@ -224,7 +234,13 @@ func (r *Runtime) RunSubTaskAsync(ctx context.Context, spec SubTaskSpec) (SubTas
 				Action:      "subtask_event_publish_failed",
 				Hash:        pubErr.Error(),
 				CreatedAt:   time.Now(),
-			})
+			}); auditErr != nil {
+				r.logger.WarnContext(bg, "record sub-task event publish failure",
+					"component", "runtime",
+					"task_id", subTaskID,
+					"publish_error", pubErr,
+					"error", auditErr)
+			}
 		}
 	}()
 	return SubTaskHandle{TaskID: subTaskID}, nil

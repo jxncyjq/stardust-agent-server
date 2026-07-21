@@ -222,12 +222,12 @@ func (c *Coordinator) runAssigned(ctx context.Context, taskToRun domain.Task) (d
 	if c.taskRunnerResolver != nil {
 		resolvedAgent, resolvedRunner, resolved, err := c.taskRunnerResolver.ResolveTaskRunner(ctx, taskToRun)
 		if err != nil {
-			_ = c.scheduler.Transition(ctx, taskToRun.ID, domain.TaskFailed)
+			c.failTask(ctx, taskToRun.ID)
 			return domain.Task{}, false, fmt.Errorf("resolve task runner for task %s: %w", taskToRun.ID, err)
 		}
 		if resolved {
 			if resolvedRunner == nil {
-				_ = c.scheduler.Transition(ctx, taskToRun.ID, domain.TaskFailed)
+				c.failTask(ctx, taskToRun.ID)
 				return domain.Task{}, false, fmt.Errorf("resolve task runner for task %s: runner is nil", taskToRun.ID)
 			}
 			runnerAgent = resolvedAgent
@@ -235,13 +235,13 @@ func (c *Coordinator) runAssigned(ctx context.Context, taskToRun domain.Task) (d
 		}
 	}
 	if runner == nil {
-		_ = c.scheduler.Transition(ctx, taskToRun.ID, domain.TaskFailed)
+		c.failTask(ctx, taskToRun.ID)
 		return domain.Task{}, false, fmt.Errorf("run task %s: runtime is nil", taskToRun.ID)
 	}
 	if c.trustGate != nil {
 		decision, err := c.trustGate.CanExecute(ctx, runnerAgent.ID, quality.RiskLow, time.Now())
 		if err != nil {
-			_ = c.scheduler.Transition(ctx, taskToRun.ID, domain.TaskFailed)
+			c.failTask(ctx, taskToRun.ID)
 			return domain.Task{}, false, fmt.Errorf("evaluate trust gate for task %s: %w", taskToRun.ID, err)
 		}
 		if decision == quality.TrustDecisionBlocked {
@@ -277,7 +277,7 @@ func (c *Coordinator) runAssigned(ctx context.Context, taskToRun domain.Task) (d
 			}
 			return c.currentTask(ctx, taskToRun.ID)
 		}
-		_ = c.scheduler.Transition(ctx, taskToRun.ID, domain.TaskFailed)
+		c.failTask(ctx, taskToRun.ID)
 		return domain.Task{}, false, fmt.Errorf("run task: %w", err)
 	}
 	return c.afterRun(ctx, taskToRun, runnerAgent, run)
@@ -409,7 +409,26 @@ func (c *Coordinator) resumeScan(ctx context.Context) error {
 				// Goroutine top-level: never swallow. runResume already transitioned
 				// the task to Failed (or re-suspended it) on error; record the reason
 				// so a failed resume is diagnosable rather than vanishing.
-				_ = c.publishLearning(ctx, c.agent.ID, rt.ID, evolution.SignalFailure, "task_resume_error", true)
+				//
+				// The learning event carries only the fixed reason string — its
+				// message format cannot hold an error — so the actual cause has to be
+				// logged, and so does a failure of the learning publish itself. This
+				// is the sole outlet for a failed resume: with the event bus down and
+				// nothing logged, the task simply sits in Running and no one ever
+				// learns why.
+				if pubErr := c.publishLearning(ctx, c.agent.ID, rt.ID, evolution.SignalFailure, "task_resume_error", true); pubErr != nil && c.logger != nil {
+					c.logger.WarnContext(ctx, "publish resume failure learning event",
+						"component", "coordinator",
+						"task_id", rt.ID,
+						"error", pubErr)
+				}
+				if c.logger != nil {
+					c.logger.ErrorContext(ctx, "task resume failed",
+						"component", "coordinator",
+						"task_id", rt.ID,
+						"agent_id", c.agent.ID,
+						"error", err)
+				}
 			}
 		}(t)
 	}
@@ -428,19 +447,19 @@ func (c *Coordinator) runResume(ctx context.Context, t domain.Task) (domain.Task
 	if c.taskRunnerResolver != nil {
 		resolvedAgent, resolvedRunner, resolved, err := c.taskRunnerResolver.ResolveTaskRunner(ctx, t)
 		if err != nil {
-			_ = c.scheduler.Transition(ctx, t.ID, domain.TaskFailed)
+			c.failTask(ctx, t.ID)
 			return domain.Task{}, false, fmt.Errorf("resolve runner for resume of task %s: %w", t.ID, err)
 		}
 		if resolved {
 			if resolvedRunner == nil {
-				_ = c.scheduler.Transition(ctx, t.ID, domain.TaskFailed)
+				c.failTask(ctx, t.ID)
 				return domain.Task{}, false, fmt.Errorf("resolve runner for resume of task %s: runner is nil", t.ID)
 			}
 			runnerAgent, runner = resolvedAgent, resolvedRunner
 		}
 	}
 	if runner == nil {
-		_ = c.scheduler.Transition(ctx, t.ID, domain.TaskFailed)
+		c.failTask(ctx, t.ID)
 		return domain.Task{}, false, fmt.Errorf("resume task %s: runtime is nil", t.ID)
 	}
 	run, err := runner.RunTask(ctx, runnerAgent, t)
@@ -454,7 +473,7 @@ func (c *Coordinator) runResume(ctx context.Context, t domain.Task) (domain.Task
 			}
 			return c.currentTask(ctx, t.ID)
 		}
-		_ = c.scheduler.Transition(ctx, t.ID, domain.TaskFailed)
+		c.failTask(ctx, t.ID)
 		return domain.Task{}, false, fmt.Errorf("resume run task %s: %w", t.ID, err)
 	}
 	return c.afterRun(ctx, t, runnerAgent, run)
@@ -568,6 +587,27 @@ func (c *Coordinator) reportRunFailure(ctx context.Context, taskID string, cause
 			"task_id", taskID,
 			"error", err,
 		)
+	}
+}
+
+// failTask lands a task in TaskFailed, reporting a failure of that transition
+// instead of dropping it.
+//
+// Every caller is already returning a more important error — the reason the task
+// failed — so this cannot return one of its own. But the transition failing is
+// not a harmless second-order detail: the task then stays Running, and on the
+// runAssigned path it keeps its lock until the lease expires, so no worker can
+// claim it and resumeScan retries the same stuck task forever. The symptom is a
+// task frozen with nothing in the log, which is exactly what this prevents.
+//
+// The cause of the run failure is logged separately by the caller (Heartbeat's
+// "task run failed"), so only the transition's own error is recorded here.
+func (c *Coordinator) failTask(ctx context.Context, taskID string) {
+	if err := c.scheduler.Transition(ctx, taskID, domain.TaskFailed); err != nil && c.logger != nil {
+		c.logger.WarnContext(ctx, "mark task failed",
+			"component", "coordinator",
+			"task_id", taskID,
+			"error", err)
 	}
 }
 

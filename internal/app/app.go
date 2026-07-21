@@ -234,6 +234,7 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 		ConversationTurns: opts.ConversationTurns,
 		ToolGate:          opts.ToolGate,
 		Checkpoints:       opts.Checkpoints,
+		Logger:            taskLogger,
 	})
 	task := domain.Task{
 		ID:         opts.TaskID,

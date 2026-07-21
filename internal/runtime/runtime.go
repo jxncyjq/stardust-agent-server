@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -89,6 +90,15 @@ type Config struct {
 	Checkpoints *sessionstate.Store
 	// ToolGate gates each tool round for suspension. Nil never suspends.
 	ToolGate ToolGate
+	// Logger records failures at the boundaries where there is no caller left to
+	// return an error to: a failure-learning signal the event bus rejected, and
+	// the audit fallback a delegated sub-task falls back to when its own event
+	// publish already failed.
+	//
+	// Nil falls back to slog.Default() rather than to silence. A missing logger
+	// is a wiring oversight, not a request to discard diagnostics — the same
+	// mistake as the file logger that used to degrade to io.Discard.
+	Logger *slog.Logger
 }
 
 // Context-accumulation bounds for the tool-execution loop. Tool outputs are
@@ -120,6 +130,7 @@ type Runtime struct {
 	subTaskSeq         atomic.Uint64
 	checkpoints        *sessionstate.Store
 	toolGate           ToolGate
+	logger             *slog.Logger
 }
 
 // loopState is the mutable state threaded through the tool-execution loop.
@@ -173,6 +184,10 @@ func NewRuntime(cfg Config) *Runtime {
 	if events == nil {
 		events = noopEventBus{}
 	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 	role := cfg.Role
 	if role == "" {
 		if cfg.Depth == 0 {
@@ -199,6 +214,7 @@ func NewRuntime(cfg Config) *Runtime {
 		maxConcurrent:      normalizePositive(cfg.MaxConcurrent, defaultMaxConcurrent),
 		checkpoints:        cfg.Checkpoints,
 		toolGate:           cfg.ToolGate,
+		logger:             logger,
 	}
 }
 
@@ -232,11 +248,11 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		return domain.TaskRun{}, fmt.Errorf("publish task started event: %w", err)
 	}
 	if r.interrupted.Load() {
-		_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonInterrupted, true)
+		r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInterrupted)
 		return domain.TaskRun{}, ErrInterrupted
 	}
 	if r.maas == nil {
-		_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonInferenceError, true)
+		r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInferenceError)
 		return domain.TaskRun{}, ErrMaasUnavailable
 	}
 
@@ -294,7 +310,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	basePrompt := prompt
 	resp, err := r.generate(ctx, requestID, prompt, task.Images, len([]rune(basePrompt)), effTools)
 	if err != nil {
-		_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonInferenceError, true)
+		r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInferenceError)
 		return domain.TaskRun{}, fmt.Errorf("generate inference: %w", err)
 	}
 	st := loopState{
@@ -331,14 +347,14 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		}
 		results, err := r.executeToolCalls(ctx, agent, task, st.resp.ToolCalls, st.tools)
 		if err != nil {
-			_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonToolError, true)
+			r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonToolError)
 			return domain.TaskRun{}, fmt.Errorf("execute model tool calls: %w", err)
 		}
 		st.toolCtx = mergeToolResults(st.toolCtx, st.resp.ToolCalls, results, r.maxToolResultChars)
 		prompt := boundPrompt(st.basePrompt+renderToolEntries(st.toolCtx), r.maxPromptChars)
 		st.resp, err = r.generate(ctx, requestID, prompt, st.images, stablePrefixRunes(prompt, st.basePrompt), st.tools)
 		if err != nil {
-			_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonInferenceError, true)
+			r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInferenceError)
 			return domain.TaskRun{}, fmt.Errorf("generate inference after tools: %w", err)
 		}
 		st.promptTokens += st.resp.PromptTokens
@@ -359,7 +375,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		finalPrompt := prompt + "\n\n[系统] 工具调用已达上限。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。"
 		final, err := r.generateNoTools(ctx, requestID, finalPrompt, st.images, stablePrefixRunes(finalPrompt, st.basePrompt))
 		if err != nil {
-			_ = r.publishLearning(ctx, agent, task, evolution.SignalFailure, evolution.FailureReasonInferenceError, true)
+			r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInferenceError)
 			return domain.TaskRun{}, fmt.Errorf("generate final answer after tool budget exhausted: %w", err)
 		}
 		st.promptTokens += final.PromptTokens
@@ -823,6 +839,27 @@ func (r *Runtime) lazyToolHint(names []string) string {
 			"Never claim no tools are available — discover them with list_tools.\n",
 		strings.Join(names, ", "),
 	)
+}
+
+// recordLearningFailure publishes a failure learning signal and reports a
+// publish failure instead of dropping it.
+//
+// The callers are all on their way out with a more important error already in
+// hand, so this cannot return: the signal is a side record, not the result. But
+// losing it silently is not free either — these signals feed the evolution
+// pipeline and the trust score, so a bus that quietly rejects them leaves a
+// persistently failing agent's score intact and TrustGate still admitting it.
+// Warn is the level: the task's own failure is reported through its own channel;
+// what is degraded here is the learning record.
+func (r *Runtime) recordLearningFailure(ctx context.Context, agent domain.Agent, task domain.Task, reason string) {
+	if err := r.publishLearning(ctx, agent, task, evolution.SignalFailure, reason, true); err != nil {
+		r.logger.WarnContext(ctx, "publish failure learning event",
+			"component", "runtime",
+			"task_id", task.ID,
+			"agent_id", agent.ID,
+			"reason", reason,
+			"error", err)
+	}
 }
 
 func (r *Runtime) publishLearning(ctx context.Context, agent domain.Agent, task domain.Task, signal evolution.SignalKind, reason string, lightweight bool) error {
