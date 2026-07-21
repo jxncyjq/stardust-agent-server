@@ -276,7 +276,10 @@ func writeFileTool(_ context.Context, root string, guard port.WorkspacePathGuard
 	if err := os.WriteFile(resolved, []byte(content), 0o644); err != nil {
 		return domain.ToolResult{}, fmt.Errorf("write file: %w", err)
 	}
-	rel, _ := filepath.Rel(root, resolved)
+	rel, err := relativeToRoot(root, resolved)
+	if err != nil {
+		return domain.ToolResult{}, err
+	}
 	output := fmt.Sprintf("wrote %d bytes to %s", len(content), rel)
 	if note, err := nearestAgentsNote(root, filepath.Dir(resolved), options); err != nil {
 		return domain.ToolResult{}, err
@@ -472,6 +475,24 @@ func readFileContext(ctx context.Context, path string, limit int64) (data []byte
 		}
 	}
 	return buf.Bytes(), err
+}
+
+// relativeToRoot renders path relative to root, or fails.
+//
+// It is the fail-loud counterpart to relativeToRootOrBase below, and the two are
+// not interchangeable. That one produces a label for a notice, where degrading to
+// a base name costs nothing. This one produces the destination write_file reports
+// back, and its callers hand root a path the sandbox has already resolved and
+// approved — so Rel failing here means the sandbox's idea of the path and the
+// real one disagree. Papering over that with "" makes the tool answer
+// "wrote 1234 bytes to ", which the model reads as a successful write to an empty
+// path and then cannot find again.
+func relativeToRoot(root, path string) (string, error) {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return "", fmt.Errorf("resolve %q relative to workspace root: %w", filepath.Base(path), err)
+	}
+	return rel, nil
 }
 
 // relativeToRootOrBase renders path relative to root, falling back to the base
