@@ -26,6 +26,20 @@ type RegistrySyncReport struct {
 	Installed   int `json:"installed"`
 	Quarantined int `json:"quarantined"`
 	Failed      int `json:"failed"`
+	// Failures names every skill counted in Failed and why it failed.
+	//
+	// The count alone was not a record: an operator saw `failed=3` with no way to
+	// tell which manifest, or whether the cause was the network, malformed JSON,
+	// an unwritable install root, or a hostile package. Sync already returns a
+	// report, so the reason travels here rather than through a logger the syncer
+	// does not have. len(Failures) always equals Failed.
+	Failures []SyncFailure `json:"failures,omitempty"`
+}
+
+// SyncFailure records one skill the registry sync could not install.
+type SyncFailure struct {
+	ManifestURL string `json:"manifest_url"`
+	Reason      string `json:"reason"`
 }
 
 type RegistrySyncer struct {
@@ -49,6 +63,10 @@ func (s *RegistrySyncer) Sync(ctx context.Context) (RegistrySyncReport, error) {
 		manifestPath, cleanup, err := s.fetchManifest(ctx, item.ManifestURL)
 		if err != nil {
 			report.Failed++
+			report.Failures = append(report.Failures, SyncFailure{
+				ManifestURL: item.ManifestURL,
+				Reason:      fmt.Sprintf("fetch manifest: %v", err),
+			})
 			continue
 		}
 		installer := NewInstaller(InstallerConfig{
@@ -66,6 +84,10 @@ func (s *RegistrySyncer) Sync(ctx context.Context) (RegistrySyncReport, error) {
 			report.Quarantined++
 		default:
 			report.Failed++
+			report.Failures = append(report.Failures, SyncFailure{
+				ManifestURL: item.ManifestURL,
+				Reason:      fmt.Sprintf("install from manifest: %v", err),
+			})
 		}
 	}
 	return report, nil
