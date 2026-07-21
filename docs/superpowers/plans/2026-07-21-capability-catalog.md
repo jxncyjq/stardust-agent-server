@@ -1137,9 +1137,10 @@ Expected: `ok`
 
 - [ ] **Step 5: 变异测试**
 
-在 `Render` 的块头后面插一行 `b.WriteString(fmt.Sprintf("total: %d\n", len(entries)))`（需 import fmt）—— 这模拟「往目录里塞了个每轮会变的计数」。跑 `-run TestRenderIsByteStable`。
+把 `Render` 里写入 `entry.Summary` 的那一行删掉，跑 `go test ./internal/capability/ -run TestRenderGroupsEntriesUnderHeadings -count=1`。
+Expected: FAIL（条目缺少说明文本）。确认后改回。
 
-Expected: **仍然通过**（因为同一份输入计数相同）。这说明该测试**测不出**「随轮次变化」的不稳定。改为在 Task 8 用真实的两轮 `basePrompt` 比对来覆盖，此处保留 `TestRenderIsByteStable` 作为渲染纯函数性的下限保证。删掉刚插入的那行。
+**关于 `TestRenderIsByteStable` 的能力边界**：`Render` 是纯函数，同一输入必然产出同一输出，因此该测试只能保证渲染无随机性（如 map 迭代序泄漏），**测不出**「目录内容随轮次变化」这类问题。真正的稳定性由 Task 7 的 `TestBuildPromptIsIdenticalAcrossTasks`（两个不同任务的目录必须逐字节相同）覆盖。不要试图在这里加一个「变异后仍应通过」的步骤 —— 那不是变异测试。
 
 - [ ] **Step 6: 提交**
 
@@ -1714,7 +1715,9 @@ type SkillUsageRecorder interface {
 - [ ] **Step 4: 跑测试确认通过**
 
 Run: `go test ./internal/runtime/ -count=1`
-Expected: `ok`（若 `list_tools` 的既有测试因删除而失败，一并删除那些测试 —— 它们测的是已移除的行为）
+Expected: `ok`
+
+`list_tools` 的既有测试会因该工具被移除而失败。**一并删除它们**：它们断言的是已经不存在的行为，留着就是死代码。删除时在提交信息里**逐个点名删了哪些测试函数、以及它们原本测的行为现在由谁承担**（目录渲染由 `TestRenderGroupsEntriesUnderHeadings` 覆盖，明细获取由 `TestLoadCapabilitiesPutsDetailInLoadedBlock` 覆盖）—— 删测试必须留下可追溯的理由，否则与「悄悄降低覆盖」无法区分。
 
 - [ ] **Step 5: 变异测试**
 
