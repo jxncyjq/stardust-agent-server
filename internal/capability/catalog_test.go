@@ -103,9 +103,9 @@ func TestCatalogEntriesRejectsInvalidEntry(t *testing.T) {
 		long[i] = 'x'
 	}
 	cases := map[string]capability.Entry{
-		"missing summary": {Name: "a", Group: "files"},
-		"missing group":   {Name: "a", Summary: "有说明"},
-		"missing name":    {Group: "files", Summary: "有说明"},
+		"missing summary":  {Name: "a", Group: "files"},
+		"missing group":    {Name: "a", Summary: "有说明"},
+		"missing name":     {Group: "files", Summary: "有说明"},
 		"summary too long": {Name: "a", Group: "files", Summary: string(long)},
 	}
 	for name, entry := range cases {
