@@ -2,6 +2,7 @@ package quality
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -56,6 +57,12 @@ func (m *TrustScoreManager) LogSecurityEvent(ctx context.Context, event Security
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Validate at the door. An event whose type carries no defined weight cannot
+	// be scored later without either failing the read or silently counting zero,
+	// so it must not enter the store in the first place.
+	if _, err := trustDelta(event.Type); err != nil {
+		return fmt.Errorf("log security event for agent %q: %w", event.AgentID, err)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.events[event.AgentID] = append(m.events[event.AgentID], event)
@@ -73,7 +80,14 @@ func (m *TrustScoreManager) EffectiveScore(ctx context.Context, agentID string, 
 		if event.At.After(at) {
 			continue
 		}
-		score = clampTrustScore(score + trustDelta(event.Type))
+		// Not merely defensive duplication of LogSecurityEvent's gate: an event
+		// already in the store — recorded before a type was renamed, or written by
+		// some future path — must not be scored as a silent zero either.
+		delta, err := trustDelta(event.Type)
+		if err != nil {
+			return 0, fmt.Errorf("score agent %q: %w", agentID, err)
+		}
+		score = clampTrustScore(score + delta)
 	}
 	return score, nil
 }
@@ -135,22 +149,31 @@ func trustReason(score float64) string {
 	}
 }
 
-func trustDelta(eventType SecurityEventType) float64 {
+// trustDelta maps a security event to its contribution to an agent's trust
+// score. An unrecognised type is an error, not a zero.
+//
+// Returning 0 for the default branch looked harmless and was not: the trust
+// score is the coordinator's execution gate (CanExecute → TrustDecisionBlocked
+// suspends the task), so a type this switch has not been taught about — a new
+// one added without updating it, or a misspelled string from upstream —
+// contributed nothing to the score and an agent that should have been blocked
+// kept running, with nothing anywhere reporting it.
+func trustDelta(eventType SecurityEventType) (float64, error) {
 	switch eventType {
 	case SecurityEventPermissionDenied:
-		return -0.1
+		return -0.1, nil
 	case SecurityEventInjectionDetected:
-		return -0.25
+		return -0.25, nil
 	case SecurityEventSecretExposed:
-		return -0.4
+		return -0.4, nil
 	case SecurityEventHardLoop:
-		return -0.2
+		return -0.2, nil
 	case SecurityEventHumanRecoverySucceeded:
-		return 0.15
+		return 0.15, nil
 	case SecurityEventSafeCompletion:
-		return 0.05
+		return 0.05, nil
 	default:
-		return 0
+		return 0, fmt.Errorf("unknown security event type %q", eventType)
 	}
 }
 

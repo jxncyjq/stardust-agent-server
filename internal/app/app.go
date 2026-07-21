@@ -218,7 +218,7 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 	if toolRoot == "" {
 		toolRoot = "."
 	}
-	homeDir, _ := os.UserHomeDir()
+	homeDir := resolveHomeDir(taskLogger)
 	tools := tool.NewWorkspaceRegistry(toolRoot, audit, tool.WithAgentsInjection(opts.ToolMaxFileChars, homeDir))
 	tool.RegisterTaskLedgerTools(tools, opts.TaskLedger)
 	tool.RegisterAgentMessageTools(tools, opts.MessageStore)
@@ -319,4 +319,26 @@ func eventStream(taskID string, events []domain.RuntimeEvent, auditEvents []doma
 		})
 	}
 	return stream
+}
+
+// resolveHomeDir returns the user's home directory, or "" with a warning when it
+// cannot be determined.
+//
+// A missing home directory must not stop the agent from starting, so this does
+// not return an error — but it must not be invisible either. With
+// HOME/USERPROFILE unset (service accounts, containers, Windows services) the
+// global ~/.stardust/agents.md silently stops loading, and isResidentAgents
+// stops recognising it as already-in-context, so write_file may re-inject it.
+// The behaviour changes; without this line the user only sees "my global
+// conventions aren't taking effect" and has nothing to go on.
+func resolveHomeDir(logger *slog.Logger) string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		logger.Warn("resolve home directory",
+			"component", "app",
+			"consequence", "global agents.md will not be loaded",
+			"error", err)
+		return ""
+	}
+	return homeDir
 }
