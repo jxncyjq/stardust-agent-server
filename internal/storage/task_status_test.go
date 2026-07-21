@@ -90,3 +90,39 @@ func openTestRepo(t *testing.T) *storage.SQLiteRepository {
 	})
 	return repo
 }
+
+// TestAppendAuditEventIsIdempotent states what a repeated append means. Audit
+// event ids are deterministic -- "<taskID>:<action>" -- so re-appending one is
+// the same fact stated twice, not a second fact. A dispatch that is retried
+// after a transient failure re-walks the same actions, and a bare INSERT would
+// turn the retry into a permanent primary-key failure: the task would be
+// re-queued forever and never run.
+func TestAppendAuditEventIsIdempotent(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := openTestRepo(t)
+	event := domain.AuditEvent{
+		ID:          "task-1:task_assigned",
+		RequestID:   "task-1:coordinator",
+		SubjectType: "task",
+		SubjectID:   "task-1",
+		Action:      "task_assigned",
+		Hash:        "memory",
+		CreatedAt:   time.Date(2026, 7, 21, 8, 0, 0, 0, time.UTC),
+	}
+	if err := repo.AppendAuditEvent(ctx, event); err != nil {
+		t.Fatalf("AppendAuditEvent() error = %v, want nil", err)
+	}
+
+	if err := repo.AppendAuditEvent(ctx, event); err != nil {
+		t.Fatalf("AppendAuditEvent() second call error = %v, want nil", err)
+	}
+
+	events, err := repo.ListAuditEvents(ctx)
+	if err != nil {
+		t.Fatalf("ListAuditEvents() error = %v, want nil", err)
+	}
+	if len(events) != 1 {
+		t.Errorf("audit events = %d, want 1: the same action must not be recorded twice", len(events))
+	}
+}

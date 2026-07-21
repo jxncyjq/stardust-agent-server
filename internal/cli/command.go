@@ -1429,12 +1429,12 @@ type teeTaskStore struct {
 	persistent server.TaskStore
 }
 
-// Add persists the new task and registers it with the live scheduler. When the
-// scheduler carries a sink (the sqlite driver) this repeats that sink's own
-// create-time write; the write is an idempotent upsert, and keeping it here
-// means creation still reaches storage if a future store satisfies
-// server.TaskStore without satisfying task.TaskSink -- a silently unpersisted
-// task is the failure worth paying one redundant write to avoid.
+// Add persists the new task and registers it with the live scheduler.
+//
+// The write to s.persistent is the ONLY thing that creates a task's row. The
+// scheduler's own write-through moves an existing row's status and nothing
+// else, and never inserts -- so removing this write would leave the tasks table
+// permanently empty, and every later status update would find no row to change.
 func (s teeTaskStore) Add(ctx context.Context, taskToAdd domain.Task) error {
 	if err := s.live.Add(ctx, taskToAdd); err != nil {
 		return err
@@ -2079,7 +2079,15 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// exists to prevent, and one with no symptom until someone reads the
 	// database. Adding a persistent driver without teaching the branch above
 	// about it must fail here rather than at 3am.
-	if cfg.Storage.Driver != "memory" && taskSink == nil {
+	//
+	// It also catches a misspelled driver ("sqlite3", "sqllite"), which
+	// serviceStores would otherwise quietly serve from memory while the operator
+	// believes their data is being written to disk.
+	//
+	// "" is the unset driver and means the same as "memory" to serviceStores,
+	// which selects on the driver being "sqlite"; treating it as durable here
+	// would reject a configuration that runs fine.
+	if cfg.Storage.Driver != "" && cfg.Storage.Driver != "memory" && taskSink == nil {
 		closeStore()
 		return ServeResult{}, fmt.Errorf("storage driver %q provides no task sink: task state changes would never be persisted", cfg.Storage.Driver)
 	}

@@ -5,7 +5,9 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +15,7 @@ import (
 	"github.com/stardust/legion-agent/internal/approval"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/quality"
+	"github.com/stardust/legion-agent/internal/storage"
 	"github.com/stardust/legion-agent/internal/task"
 )
 
@@ -151,5 +154,92 @@ func TestCoordinatorLogsStuckRunningTaskAtErrorLevel(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Errorf("logger output = %q, want it to contain %q", got, want)
 		}
+	}
+}
+
+// onceFailingSink fails a status write the first time it sees it and lets every
+// later one through, which is the shape of a transient storage failure -- the
+// only shape where compensating is supposed to help.
+type onceFailingSink struct {
+	mu     sync.Mutex
+	failOn domain.TaskStatus
+	failed bool
+}
+
+func (s *onceFailingSink) UpdateTaskStatus(ctx context.Context, taskID string, status domain.TaskStatus, agentID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if status == s.failOn && !s.failed {
+		s.failed = true
+		return errors.New("storage briefly unavailable")
+	}
+	return nil
+}
+
+// TestCoordinatorCompletesTaskAfterTransientDispatchFailure is the test that
+// makes the compensation worth anything: putting a task back to Pending is only
+// a fix if the retry can then succeed.
+//
+// It needs the real SQLite audit log, not the memory one. Audit event ids are
+// deterministic ("<taskID>:<action>"), so a retried dispatch re-appends an id it
+// already wrote; the memory log happily appends duplicates and would hide the
+// problem, while the real table has id as its primary key.
+func TestCoordinatorCompletesTaskAfterTransientDispatchFailure(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo, err := storage.OpenSQLite(ctx, filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v, want nil", err)
+	}
+	t.Cleanup(func() {
+		if err := repo.Close(); err != nil {
+			t.Errorf("Close() error = %v, want nil", err)
+		}
+	})
+
+	scheduler := task.NewSchedulerWithSink(&onceFailingSink{failOn: domain.TaskRunning})
+	if err := scheduler.Add(ctx, domain.Task{
+		ID:        "task-1",
+		CompanyID: "company-1",
+		Status:    domain.TaskPending,
+		Input:     "ship it",
+	}); err != nil {
+		t.Fatalf("Add() error = %v, want nil", err)
+	}
+	audit := storage.NewSQLiteAuditLog(repo)
+	events := adapter.NewMemoryEventBus()
+	coordinator := NewCoordinator(CoordinatorConfig{
+		Agent:     domain.Agent{ID: "agent-1", CompanyID: "company-1", Role: "developer", Status: domain.AgentActive},
+		Scheduler: scheduler,
+		Locks:     task.NewLockStore(),
+		Runtime: NewRuntime(Config{
+			Maas:   adapter.NewRecordingMaas("safe result"),
+			Audit:  audit,
+			Events: events,
+		}),
+		Reviewer:  quality.NewAegisReviewer(),
+		Evaluator: quality.NewEvalEngine(3),
+		Approvals: approval.NewService(),
+		Audit:     audit,
+		Events:    events,
+		LockTTL:   time.Minute,
+	})
+
+	// First tick: the durable write of Running fails, so the claim is abandoned.
+	if _, _, err := coordinator.Heartbeat(ctx); err != nil {
+		t.Fatalf("Heartbeat() #1 error = %v, want nil", err)
+	}
+	coordinator.Wait()
+
+	// Second tick: storage is healthy again, so the re-queued task must run to
+	// completion rather than trip over the audit row the first attempt left.
+	if _, _, err := coordinator.Heartbeat(ctx); err != nil {
+		t.Fatalf("Heartbeat() #2 error = %v, want nil", err)
+	}
+	coordinator.Wait()
+
+	stored := awaitTerminal(t, scheduler, "task-1")
+	if stored.Status != domain.TaskDone {
+		t.Errorf("task status = %q, want %q; the re-queued task never completed", stored.Status, domain.TaskDone)
 	}
 }

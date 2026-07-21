@@ -163,6 +163,12 @@ func (s *Scheduler) Transition(ctx context.Context, taskID string, next domain.T
 // It refuses any other status. A task that reached Running has already had
 // whatever side effects its runner produced, and re-running it is not the
 // caller's to decide here.
+//
+// Known limitation: it does not undo the AgentID Next may have filled in, so a
+// released task keeps the agent whose dispatch failed and a later Next will not
+// re-route it. Harmless while serve runs a single coordinator agent; with
+// several, the scheduler would first have to remember whether the AgentID came
+// from Next or from the task's own routing.
 func (s *Scheduler) Release(ctx context.Context, taskID string) error {
 	if err := ctx.Err(); err != nil {
 		return err

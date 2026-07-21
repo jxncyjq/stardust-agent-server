@@ -780,11 +780,22 @@ func (r *SQLiteRepository) ListTaskRuns(ctx context.Context, taskID string) ([]d
 	return runs, nil
 }
 
+// AppendAuditEvent records an audit event, and does nothing if that exact event
+// id is already recorded.
+//
+// Event ids are deterministic -- the coordinator builds them as
+// "<taskID>:<action>" -- so an id that is already present means the same fact
+// stated twice, not a second fact worth keeping. Dropping the repeat is what
+// keeps a retried dispatch working: it re-walks the same actions, and a bare
+// insert would fail it on the primary key forever, leaving a task that is
+// re-queued on every tick and never runs. The first occurrence's timestamp is
+// the one that survives.
 func (r *SQLiteRepository) AppendAuditEvent(ctx context.Context, event domain.AuditEvent) error {
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO audit_events (
 			id, request_id, subject_type, subject_id, action, hash, created_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO NOTHING
 	`, event.ID, event.RequestID, event.SubjectType, event.SubjectID, event.Action, event.Hash, formatTime(event.CreatedAt))
 	if err != nil {
 		return fmt.Errorf("append audit event %q: %w", event.ID, err)
