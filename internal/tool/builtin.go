@@ -1,6 +1,7 @@
 package tool
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -27,6 +28,9 @@ const (
 	// is always announced — a silently shortened list reads as a complete one.
 	searchContentMaxMatches = 200
 	listFilesMaxEntries     = 500
+	// searchContentReadChunk bounds how many bytes readFileContext consumes
+	// between context checks.
+	searchContentReadChunk = 32 * 1024
 )
 
 // WorkspaceRegistryOption configures optional behavior of a workspace registry
@@ -386,8 +390,14 @@ func searchContentTool(ctx context.Context, rootPath string, guard port.Workspac
 			notices = append(notices, fmt.Sprintf("skipped %s: file exceeds %d bytes", rel, searchContentMaxFileBytes))
 			return nil
 		}
-		data, err := os.ReadFile(path)
+		data, err := readFileContext(ctx, path, searchContentMaxFileBytes)
 		if err != nil {
+			// A cancelled context is the walk being torn down, not a property of
+			// this file: abort the whole walk rather than filing it as a per-file
+			// skip notice, which would read as "this file is broken".
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return ctxErr
+			}
 			// Unreadable files are reported, not silently treated as "no match".
 			notices = append(notices, fmt.Sprintf("skipped %s: %v", rel, err))
 			return nil
@@ -414,6 +424,54 @@ func searchContentTool(ctx context.Context, rootPath string, guard port.Workspac
 		Success: true,
 		Output:  strings.Join(matches, "\n"),
 	}, nil
+}
+
+// readFileContext reads up to limit bytes of path, checking ctx between
+// chunks.
+//
+// os.ReadFile takes no context, so a cancelled or timed-out search still had to
+// wait out whatever file it was on. The per-file cap bounds that wait, but
+// bounded is not responsive: the walk checks ctx per directory entry and then
+// blocks inside a read it cannot interrupt. Reading in chunks puts the
+// cancellation check back on the inside of that read.
+//
+// A file longer than limit is truncated to limit rather than reported as an
+// error: callers apply their own size policy before getting here (search_content
+// skips oversized files loudly), and limit is the memory backstop.
+func readFileContext(ctx context.Context, path string, limit int64) (data []byte, err error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	// Named returns so a Close failure cannot be lost behind a successful read.
+	defer func() {
+		if closeErr := file.Close(); closeErr != nil && err == nil {
+			data, err = nil, closeErr
+		}
+	}()
+
+	var buf bytes.Buffer
+	chunk := make([]byte, searchContentReadChunk)
+	for int64(buf.Len()) < limit {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		remaining := limit - int64(buf.Len())
+		if remaining < int64(len(chunk)) {
+			chunk = chunk[:remaining]
+		}
+		n, readErr := file.Read(chunk)
+		if n > 0 {
+			buf.Write(chunk[:n])
+		}
+		if readErr == io.EOF {
+			break
+		}
+		if readErr != nil {
+			return nil, readErr
+		}
+	}
+	return buf.Bytes(), err
 }
 
 // relativeToRootOrBase renders path relative to root, falling back to the base
