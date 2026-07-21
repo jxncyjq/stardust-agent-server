@@ -1264,7 +1264,11 @@ func (s *HTTPServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 func writePrometheus(w http.ResponseWriter, snapshot observability.MetricsSnapshot) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(observability.PrometheusText(snapshot)))
+	// Same reasoning as writeJSON: unrepairable, but not to be silent. A scrape
+	// that quietly returns half a metrics page produces gaps no one can explain.
+	if _, err := w.Write([]byte(observability.PrometheusText(snapshot))); err != nil {
+		slog.Default().Warn("write prometheus response", "component", "server", "error", err)
+	}
 }
 
 type readinessResponse struct {
@@ -1462,10 +1466,33 @@ func (s *HTTPServer) handleDecideApproval(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, decided)
 }
 
+// writeJSON encodes value as the response body.
+//
+// It keeps its package-function signature — there are ~40 call sites, and
+// threading a logger through all of them would be a large change for a failure
+// that is diagnostic only — and falls back to the process logger. Silence was
+// the actual problem, not the missing plumbing.
 func writeJSON(w http.ResponseWriter, status int, value any) {
+	writeJSONLogging(slog.Default(), w, status, value)
+}
+
+// writeJSONLogging is writeJSON with the logger supplied, so the failure path is
+// testable.
+//
+// The write cannot be repaired: status and headers are already on the wire by
+// the time encoding fails, so the client gets 200 OK with an empty or truncated
+// body no matter what. Previously the server also recorded nothing, and in the
+// GUI that reads as "the call succeeded but the data is empty" — which sends the
+// reader looking at the wrong layer entirely.
+func writeJSONLogging(logger *slog.Logger, w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		logger.Warn("write json response",
+			"component", "server",
+			"status", status,
+			"error", err)
+	}
 }
 
 func writeError(w http.ResponseWriter, status int, message string) {

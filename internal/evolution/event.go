@@ -60,7 +60,17 @@ func ParseLearningRuntimeEvent(event domain.RuntimeEvent) (LearningEvent, bool) 
 		}
 		fields[key] = value
 	}
-	lightweight, _ := strconv.ParseBool(fields["lightweight"])
+	// lightweight is not optional: NewLearningRuntimeEvent above always writes it
+	// as `lightweight=%t`. Missing or unparseable therefore means the message was
+	// tampered with or the format drifted, and guessing false would process a
+	// heavyweight failure signal as a lightweight one — the evolution path
+	// branches on it, so an important failure would never trigger gene
+	// consolidation. It joins the same ok=false the caller already handles rather
+	// than needing a signature change.
+	lightweight, lightweightErr := strconv.ParseBool(fields["lightweight"])
+	if lightweightErr != nil {
+		return LearningEvent{}, false
+	}
 	return LearningEvent{
 		AgentID:       fields["agent_id"],
 		TaskID:        event.TaskID,
