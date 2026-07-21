@@ -157,6 +157,11 @@ func (r *SQLiteRepository) ListTasks(ctx context.Context) ([]domain.Task, error)
 	return tasks, nil
 }
 
+// SaveTask writes a whole task row, overwriting every column. The row is a
+// partial projection of domain.Task: Mode, WorkingDir and Images have no
+// columns and do not survive the round trip, so a task read back from here is
+// not a full substitute for the live one. Callers holding only part of a task
+// want UpdateTaskStatus instead.
 func (r *SQLiteRepository) SaveTask(ctx context.Context, task domain.Task) error {
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO tasks (
@@ -173,6 +178,25 @@ func (r *SQLiteRepository) SaveTask(ctx context.Context, task domain.Task) error
 	`, task.ID, task.CompanyID, task.AgentID, task.SessionID, string(task.Status), task.Input, task.MaxIterations, formatTime(task.CreatedAt))
 	if err != nil {
 		return fmt.Errorf("save task %q: %w", task.ID, err)
+	}
+	return nil
+}
+
+// UpdateTaskStatus records a task state change, and nothing else: only the
+// status and agent_id columns move, so a caller holding a partially populated
+// domain.Task cannot blank out the rest of the row. Use SaveTask to write a
+// whole task.
+//
+// A task with no row is not an error. The tasks table records only tasks that
+// entered through a creation path; workflow-internal tasks live solely in the
+// scheduler and have nothing to update. That absence is contract, not a
+// swallowed failure.
+func (r *SQLiteRepository) UpdateTaskStatus(ctx context.Context, taskID string, status domain.TaskStatus, agentID string) error {
+	_, err := r.db.ExecContext(ctx, `
+		UPDATE tasks SET status = ?, agent_id = ? WHERE id = ?
+	`, string(status), agentID, taskID)
+	if err != nil {
+		return fmt.Errorf("update task %q status to %s: %w", taskID, status, err)
 	}
 	return nil
 }
@@ -756,11 +780,31 @@ func (r *SQLiteRepository) ListTaskRuns(ctx context.Context, taskID string) ([]d
 	return runs, nil
 }
 
+// AppendAuditEvent records an audit event, and does nothing if that exact event
+// id is already recorded.
+//
+// Event ids are deterministic -- the coordinator builds them as
+// "<taskID>:<action>" -- so an id that is already present means the same fact
+// stated twice, not a second fact worth keeping. Dropping the repeat is what
+// keeps a retried dispatch working: it re-walks the same actions, and a bare
+// insert would fail it on the primary key forever, leaving a task that is
+// re-queued on every tick and never runs. The first occurrence's timestamp is
+// the one that survives.
+//
+// Two limits come with that. Action names must not contain a colon, or two
+// different (subject, action) pairs could spell the same id. And an action that
+// genuinely happens twice on one subject -- a task suspended, resumed and
+// suspended again; a skill enabled after being disabled -- is recorded once.
+// Those second occurrences were never stored before either (the bare insert
+// failed on the primary key), so nothing is lost here that was previously kept;
+// what changed is that the loss is now quiet. Recording them properly needs a
+// distinguishing part in the id, not a different conflict policy.
 func (r *SQLiteRepository) AppendAuditEvent(ctx context.Context, event domain.AuditEvent) error {
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO audit_events (
 			id, request_id, subject_type, subject_id, action, hash, created_at
 		) VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO NOTHING
 	`, event.ID, event.RequestID, event.SubjectType, event.SubjectID, event.Action, event.Hash, formatTime(event.CreatedAt))
 	if err != nil {
 		return fmt.Errorf("append audit event %q: %w", event.ID, err)

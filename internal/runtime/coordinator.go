@@ -209,10 +209,10 @@ func (c *Coordinator) runAssigned(ctx context.Context, taskToRun domain.Task) (d
 		return domain.Task{}, false, nil
 	}
 	if err := c.appendAudit(ctx, taskToRun.ID, "task_assigned"); err != nil {
-		return domain.Task{}, false, err
+		return domain.Task{}, false, c.abandonClaim(ctx, taskToRun.ID, err)
 	}
 	if err := c.scheduler.Transition(ctx, taskToRun.ID, domain.TaskRunning); err != nil {
-		return domain.Task{}, false, fmt.Errorf("mark task running: %w", err)
+		return domain.Task{}, false, c.abandonClaim(ctx, taskToRun.ID, fmt.Errorf("mark task running: %w", err))
 	}
 	if err := c.appendAudit(ctx, taskToRun.ID, "task_running"); err != nil {
 		return domain.Task{}, false, err
@@ -590,6 +590,27 @@ func (c *Coordinator) reportRunFailure(ctx context.Context, taskID string, cause
 	}
 }
 
+// abandonClaim undoes a claim that never turned into a run: it releases the
+// task's lock and puts the task back to Pending, then returns cause joined with
+// whatever the undo itself hit.
+//
+// It covers the window between Next handing a task out and the dispatcher
+// marking it Running. A task stranded in Assigned is reachable by nothing --
+// Next scans only Pending, resumeScan only Suspended tasks and Running ones
+// with a checkpoint -- so it would sit there until the process restarts while
+// clients poll it forever. Nothing has run at this point, so re-queueing costs
+// no repeated side effects.
+func (c *Coordinator) abandonClaim(ctx context.Context, taskID string, cause error) error {
+	errs := []error{cause}
+	if _, err := c.locks.Unlock(ctx, taskID, c.agent.ID); err != nil {
+		errs = append(errs, fmt.Errorf("release lock on abandoned claim for task %s: %w", taskID, err))
+	}
+	if err := c.scheduler.Release(ctx, taskID); err != nil {
+		errs = append(errs, fmt.Errorf("return abandoned task %s to pending: %w", taskID, err))
+	}
+	return errors.Join(errs...)
+}
+
 // failTask lands a task in TaskFailed, reporting a failure of that transition
 // instead of dropping it.
 //
@@ -604,9 +625,15 @@ func (c *Coordinator) reportRunFailure(ctx context.Context, taskID string, cause
 // "task run failed"), so only the transition's own error is recorded here.
 func (c *Coordinator) failTask(ctx context.Context, taskID string) {
 	if err := c.scheduler.Transition(ctx, taskID, domain.TaskFailed); err != nil && c.logger != nil {
-		c.logger.WarnContext(ctx, "mark task failed",
+		// Error, not Warn: the run's side effects already happened, so unlike an
+		// abandoned claim this task cannot be re-queued. It stays Running in
+		// memory and in storage while the truth is that it failed, and nothing
+		// will correct that on its own. left_status says what was stranded, so
+		// this reads as a divergence rather than a task that is merely slow.
+		c.logger.ErrorContext(ctx, "mark task failed",
 			"component", "coordinator",
 			"task_id", taskID,
+			"left_status", string(domain.TaskRunning),
 			"error", err)
 	}
 }

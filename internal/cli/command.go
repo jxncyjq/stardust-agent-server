@@ -1429,6 +1429,12 @@ type teeTaskStore struct {
 	persistent server.TaskStore
 }
 
+// Add persists the new task and registers it with the live scheduler.
+//
+// The write to s.persistent is the ONLY thing that creates a task's row. The
+// scheduler's own write-through moves an existing row's status and nothing
+// else, and never inserts -- so removing this write would leave the tasks table
+// permanently empty, and every later status update would find no row to change.
 func (s teeTaskStore) Add(ctx context.Context, taskToAdd domain.Task) error {
 	if err := s.live.Add(ctx, taskToAdd); err != nil {
 		return err
@@ -2025,6 +2031,10 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	var messageStore tool.AgentMessageStore
 	var sessionSearcher tool.MessageSearcher
 	var skillCurator *skill.Curator
+	// taskSink is the durable store the live scheduler writes state changes
+	// through to. It stays nil for the non-sqlite drivers, whose "store" is the
+	// in-memory scheduler itself and has nothing to persist to.
+	var taskSink task.TaskSink
 	// skillUsage is the shared usage sidecar: the skill System records activity on
 	// it as skills are selected into task context, and the Curator sweep reads it
 	// to age idle skills. Sharing one instance connects the two.
@@ -2034,6 +2044,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		qualityEvals = repo
 		messageStore = repo
 		sessionSearcher = repo
+		taskSink = repo
 		curator, err := skill.NewCurator(skill.CuratorConfig{Repository: repo, Usage: skillUsage})
 		if err != nil {
 			closeStore()
@@ -2063,7 +2074,24 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// (Task 5) is the reconcile path for missed approval prompts.
 	platformEvents := observability.NewEventBus(serveEventBusBuffer)
 	workflowEvents := eventbridge.New(platformEvents, logger)
-	liveTasks := task.NewScheduler()
+	// Startup invariant: a durable driver whose store never became a sink would
+	// silently stop recording task state changes -- the exact defect this wiring
+	// exists to prevent, and one with no symptom until someone reads the
+	// database. Adding a persistent driver without teaching the branch above
+	// about it must fail here rather than at 3am.
+	//
+	// It also catches a misspelled driver ("sqlite3", "sqllite"), which
+	// serviceStores would otherwise quietly serve from memory while the operator
+	// believes their data is being written to disk.
+	//
+	// "" is the unset driver and means the same as "memory" to serviceStores,
+	// which selects on the driver being "sqlite"; treating it as durable here
+	// would reject a configuration that runs fine.
+	if cfg.Storage.Driver != "" && cfg.Storage.Driver != "memory" && taskSink == nil {
+		closeStore()
+		return ServeResult{}, fmt.Errorf("storage driver %q provides no task sink: task state changes would never be persisted", cfg.Storage.Driver)
+	}
+	liveTasks := task.NewSchedulerWithSink(taskSink)
 	httpTasks := server.TaskStore(liveTasks)
 	if taskStore != nil {
 		httpTasks = teeTaskStore{live: liveTasks, persistent: taskStore}

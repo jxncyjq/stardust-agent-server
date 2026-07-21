@@ -1652,6 +1652,122 @@ func TestServeCommandUsesSQLiteForHTTPTaskState(t *testing.T) {
 	}
 }
 
+// TestServeCommandPersistsTerminalTaskStatus pins the durable half of task
+// state: a task that actually ran must not still read "pending" in SQLite once
+// serve is gone. Before the scheduler wrote transitions through, every row in
+// the tasks table kept the status it was created with forever, so a restarted
+// serve answered GET /v1/tasks/{id} with "pending" for a task that had long
+// since finished -- a stored value that looks healthy and is wrong.
+func TestServeCommandPersistsTerminalTaskStatus(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	dbPath := filepath.Join(t.TempDir(), "agent.db")
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	// background_interval must be short enough that the coordinator heartbeat
+	// dispatches the posted task inside the test window (see the comment in
+	// TestServeCommandStreamsLifecycleEventsOverSSE); no maas config means the
+	// demo recording client runs the task offline and deterministically.
+	if err := os.WriteFile(configPath, []byte(`{
+		"storage": {"driver": "sqlite", "path": "`+filepath.ToSlash(dbPath)+`"},
+		"service": {"background_interval": "20ms"}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", configPath, err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen() error = %v, want nil", err)
+	}
+	addr := listener.Addr().String()
+	if err := listener.Close(); err != nil {
+		t.Fatalf("listener.Close() error = %v, want nil", err)
+	}
+
+	var out bytes.Buffer
+	root := NewRoot(app.New(), &out)
+	root.SetContext(ctx)
+	root.SetArgs([]string{"serve", "--config", configPath, "--addr", addr})
+	done := make(chan error, 1)
+	go func() { done <- root.Execute() }()
+
+	resp, err := waitForPostTask(t, "http://"+addr+"/v1/tasks",
+		`{"id":"persist-status-1","company_id":"c1","input":"finish me"}`)
+	if err != nil {
+		cancel()
+		t.Fatalf("POST /v1/tasks error = %v, want nil", err)
+	}
+	status := resp.StatusCode
+	if err := resp.Body.Close(); err != nil {
+		cancel()
+		t.Fatalf("Body.Close() error = %v, want nil", err)
+	}
+	// waitForPostTask retries transport errors only, so a 5xx from SQLite under
+	// this package's parallel load would otherwise surface ten seconds later as
+	// "the task never ran" and read like a persistence failure.
+	if status != http.StatusCreated {
+		cancel()
+		t.Fatalf("POST /v1/tasks status = %d, want %d", status, http.StatusCreated)
+	}
+
+	// Wait for the live scheduler to report a terminal state before shutting
+	// serve down, so the assertion below is about persistence and not about
+	// the task never having run.
+	liveStatus := ""
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) && liveStatus != string(domain.TaskDone) && liveStatus != string(domain.TaskFailed) {
+		getResp, getErr := http.Get("http://" + addr + "/v1/tasks/persist-status-1")
+		if getErr != nil {
+			time.Sleep(20 * time.Millisecond)
+			continue
+		}
+		var payload struct {
+			Status string `json:"status"`
+		}
+		decErr := json.NewDecoder(getResp.Body).Decode(&payload)
+		if closeErr := getResp.Body.Close(); closeErr != nil {
+			t.Fatalf("Body.Close() error = %v, want nil", closeErr)
+		}
+		if decErr == nil {
+			liveStatus = payload.Status
+		}
+		if liveStatus == "" {
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	cancel()
+	select {
+	case execErr := <-done:
+		if execErr != nil {
+			t.Fatalf("Execute(serve) error = %v, want nil", execErr)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Execute(serve) did not stop")
+	}
+	if liveStatus != string(domain.TaskDone) && liveStatus != string(domain.TaskFailed) {
+		t.Fatalf("live task status = %q, want a terminal status; the task never ran so persistence cannot be judged", liveStatus)
+	}
+
+	repo, err := storage.OpenSQLite(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite(%q) error = %v, want nil", dbPath, err)
+	}
+	t.Cleanup(func() {
+		if err := repo.Close(); err != nil {
+			t.Errorf("Close() error = %v, want nil", err)
+		}
+	})
+	persisted, ok, err := repo.GetTask(context.Background(), "persist-status-1")
+	if err != nil {
+		t.Fatalf("GetTask(persist-status-1) error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatalf("GetTask(persist-status-1) ok = false, want true")
+	}
+	if string(persisted.Status) != liveStatus {
+		t.Errorf("persisted status = %q, want %q (the status the task actually reached)", persisted.Status, liveStatus)
+	}
+}
+
 func TestServeCommandEventsEndpointNotUnavailable(t *testing.T) {
 	t.Parallel()
 	ctx, cancel := context.WithCancel(context.Background())
