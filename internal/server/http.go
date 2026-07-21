@@ -324,8 +324,14 @@ func (s *HTTPServer) handleCreateSession(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	var req createSessionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid session request")
+	decoder := json.NewDecoder(r.Body)
+	// Same contract as handlePatchSession: a field this handler cannot apply is
+	// reported rather than dropped. id is the case that motivated it -- the
+	// server always generates the session id, so answering 201 carrying a
+	// different id than the caller sent hides the misunderstanding.
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid session request: %v", err))
 		return
 	}
 	companyID := strings.TrimSpace(req.CompanyID)
@@ -431,8 +437,14 @@ func (s *HTTPServer) handlePatchSession(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	var req patchSessionRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid session patch request")
+	decoder := json.NewDecoder(r.Body)
+	// A field this handler cannot apply must be reported, not dropped: silently
+	// accepting e.g. agent_id and answering 200 tells the caller a change landed
+	// when nothing did. The decoder's own message names the offending field, so
+	// it is passed through rather than replaced with a generic one.
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("invalid session patch request: %v", err))
 		return
 	}
 	session, ok, err := s.sessions.GetAgentSession(r.Context(), sessionID)
