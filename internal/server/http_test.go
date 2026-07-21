@@ -471,6 +471,96 @@ func TestHTTPServerPatchMissingSessionReturns404(t *testing.T) {
 	}
 }
 
+// TestHTTPServerCreateSessionRejectsUnknownField pins the same fail-loud contract
+// on create that TestHTTPServerPatchSessionRejectsUnknownField pins on patch. id
+// is the motivating case: the server always generates the session id, so a caller
+// supplying one is working from a wrong model of the API, and answering 201 with a
+// different id than the one sent hides that.
+func TestHTTPServerCreateSessionRejectsUnknownField(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := openServerTestRepo(t)
+	srv := NewHTTPServer(Config{Sessions: repo})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/sessions",
+		bytes.NewBufferString(`{"title":"新会话","company_id":"company-1","id":"session-caller-chosen"}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("POST unknown field status = %d, want %d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	var errBody struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&errBody); err != nil {
+		t.Fatalf("Decode(error body) error = %v, want nil", err)
+	}
+	if !strings.Contains(errBody.Error, `unknown field "id"`) {
+		t.Fatalf("POST unknown field error = %q, want the rejected field named", errBody.Error)
+	}
+
+	// A rejected create must leave no session behind.
+	sessions, err := repo.ListAgentSessions(ctx, "company-1", "")
+	if err != nil {
+		t.Fatalf("ListAgentSessions error = %v, want nil", err)
+	}
+	if len(sessions) != 0 {
+		t.Fatalf("sessions after rejected create = %d, want 0", len(sessions))
+	}
+}
+
+// TestHTTPServerPatchSessionRejectsUnknownField pins the fail-loud contract for
+// PATCH: a field the handler cannot apply must be reported, not dropped. agent_id
+// is the motivating case -- it looks patchable to a caller, patchSessionRequest
+// has no such field, and accepting it with 200 tells the caller a change landed
+// when nothing did.
+func TestHTTPServerPatchSessionRejectsUnknownField(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := openServerTestRepo(t)
+	createdAt := time.Date(2026, 7, 21, 9, 0, 0, 0, time.UTC)
+	session := domain.AgentSession{
+		ID:        "session-patch-unknown",
+		CompanyID: "company-1",
+		AgentID:   "agent-1",
+		Project:   "原项目",
+		Title:     "原标题",
+		CreatedAt: createdAt,
+		UpdatedAt: createdAt,
+	}
+	if err := repo.SaveAgentSession(ctx, session); err != nil {
+		t.Fatalf("SaveAgentSession error = %v, want nil", err)
+	}
+	srv := NewHTTPServer(Config{Sessions: repo})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPatch, "/v1/sessions/session-patch-unknown",
+		bytes.NewBufferString(`{"title":"改名后","agent_id":"agent-2"}`))
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("PATCH unknown field status = %d, want %d body=%s", rec.Code, http.StatusBadRequest, rec.Body.String())
+	}
+	var errBody struct {
+		Error string `json:"error"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&errBody); err != nil {
+		t.Fatalf("Decode(error body) error = %v, want nil", err)
+	}
+	if !strings.Contains(errBody.Error, `unknown field "agent_id"`) {
+		t.Fatalf("PATCH unknown field error = %q, want the rejected field named", errBody.Error)
+	}
+
+	// The whole request must be rejected, not partially applied: title travelled
+	// in the same body and must not have landed.
+	stored, ok, err := repo.GetAgentSession(ctx, "session-patch-unknown")
+	if err != nil || !ok {
+		t.Fatalf("GetAgentSession(after rejected patch) = _, %t, %v, want found", ok, err)
+	}
+	if stored.Title != "原标题" {
+		t.Fatalf("stored title = %q, want %q (rejected patch must not partially apply)", stored.Title, "原标题")
+	}
+}
+
 func TestHTTPServerDeleteSessionRemovesSessionAndTurns(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
