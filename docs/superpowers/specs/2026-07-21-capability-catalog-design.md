@@ -325,16 +325,19 @@ mcp:github:
 
 ## 13. 交付切分
 
-四个 PR，每个独立可合、可回滚：
+分两部分，各出一份实施计划。
 
-| PR | 内容 | 依赖 |
-|---|---|---|
-| 1 | `internal/capability` 包 + 两个 provider + `Descriptor.Group` + 技能上限与 `Summary` 契约 | 无 |
-| 2 | 目录进 `basePrompt`；`skillBlock` 切换；`usage.Touch` 迁移；进程内缓存 | PR 1 |
-| 3 | prompt 三段式 + 已加载区块 + checkpoint 迁移 + `load_capabilities` | PR 2 |
-| 4 | 阈值门控 + `search_capabilities`/`call_tool` 按条件注册 + 删除 `lazy_tools`（墓碑） | PR 3 |
+**第一部分：技能侧闭环**（计划：`docs/superpowers/plans/2026-07-21-capability-catalog.md`）
 
-**PR 2 完成后技能侧收益已全部到手**（目录 + 按需拉取 + 缓存），PR 3/4 为工具侧机制就位。若中途需要停止，PR 2 是一个完整的交付点。
+`capability` 包与两个 provider、`Descriptor.Group`、条目契约、目录渲染与进 `basePrompt`、prompt 三段式与已加载区块、`load_capabilities`、`usage.Touch` 迁移、checkpoint 迁移、作用域安全测试。
+
+**第二部分：工具侧门控**
+
+阈值门控、`search_capabilities`、`call_tool` 按条件注册、删除 `lazy_tools`（墓碑字段）。
+
+**切分依据**：必须以「能跑的闭环」为界，不能以「代码层次」为界。曾考虑把「目录进 prompt」与「`load_capabilities`」拆成两个 PR，那是错的 —— 中间态是模型看得见技能清单却没有任何办法拉取正文，比现状更糟。因此目录的接入与加载手段必须同一个 PR 落地。
+
+第一部分完成后技能侧即可工作；第二部分只影响工具侧，且现状规模下阈值不触发。
 
 ## 14. 前提与风险
 
