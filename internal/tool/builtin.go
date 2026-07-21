@@ -110,6 +110,7 @@ func NewWorkspaceRegistry(root string, audit port.AuditLog, opts ...WorkspaceReg
 		Description: fmt.Sprintf("Write content to a file inside the workspace root (%s). Arguments: path, content, optional overwrite (default false). Fails if the file exists and overwrite is not true.", absRoot),
 		RiskLevel:   "medium",
 		Timeout:     5 * time.Second,
+		Group:       "files",
 		Sensitive:   true, // writes to the filesystem
 		InputSchema: map[string]any{
 			"type":     "object",
@@ -184,6 +185,7 @@ func registerReadOnlyDescriptors(registry *Registry, absRoot string, guard port.
 		Description: fmt.Sprintf("Read a UTF-8 text file inside the workspace root (%s). The path argument can be relative (resolved against workspace root) or absolute (must be within workspace root).", absRoot),
 		RiskLevel:   "low",
 		Timeout:     2 * time.Second,
+		Group:       "files",
 		InputSchema: map[string]any{
 			"type":     "object",
 			"required": []string{"path"},
@@ -199,6 +201,7 @@ func registerReadOnlyDescriptors(registry *Registry, absRoot string, guard port.
 		Description: fmt.Sprintf("Search text files inside the workspace root (%s). Arguments: pattern, optional directory and file_types.", absRoot),
 		RiskLevel:   "low",
 		Timeout:     5 * time.Second,
+		Group:       "files",
 		InputSchema: map[string]any{
 			"type":     "object",
 			"required": []string{"pattern"},
@@ -216,6 +219,7 @@ func registerReadOnlyDescriptors(registry *Registry, absRoot string, guard port.
 		Description: fmt.Sprintf("List files and directories inside the workspace root (%s). Arguments: optional directory.", absRoot),
 		RiskLevel:   "low",
 		Timeout:     5 * time.Second,
+		Group:       "files",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

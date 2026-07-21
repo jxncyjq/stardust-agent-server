@@ -12,6 +12,11 @@ type Descriptor struct {
 	InputSchema map[string]any
 	RiskLevel   string
 	Timeout     time.Duration
+	// Group places this tool in the capability catalog, by what it is for
+	// ("files", "tasks", "messages"), not by where it came from. It is what a
+	// model scanning the catalog reads first, so it is required: an unplaced
+	// tool cannot be listed.
+	Group string
 	// Sensitive 标记一个工具为有副作用：Manual 模式下对它的调用被挡在人工审批后
 	// （M2b），Plan 模式把它排除出所提供的工具集。只读工具（read/search/list）非敏感。
 	Sensitive bool `json:"sensitive,omitempty"`
