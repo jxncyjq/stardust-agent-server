@@ -157,6 +157,7 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		LazyTools:      r.rootConfig.Runtime.LazyTools,
 		Checkpoints:    r.checkpoints,
 		ToolGate:       r.toolGate,
+		Logger:         r.logger,
 	})
 	return agent, runner, true, nil
 }

@@ -2171,6 +2171,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 			LazyTools:      cfg.Runtime.LazyTools,
 			Checkpoints:    checkpointStore,
 			ToolGate:       manualGate,
+			Logger:         logger,
 		},
 		contextRoot:     cfg.ContextFiles.Root,
 		audit:           auditLog,
