@@ -54,9 +54,19 @@ func (e *Engine) Execute(ctx context.Context, def Definition) (Result, error) {
 	result.Status = status
 	if err != nil {
 		result.Status = StatusFailed
-		_ = e.publish(ctx, def.ID, "workflow_failed", err.Error())
-		_ = e.appendAudit(ctx, def.ID, "workflow_failed")
-		return result, err
+		// Every other branch below returns its publish/audit error. This one used
+		// to drop both, which is the branch where it matters most: with the sink
+		// down, the last event an observer ever sees is workflow_started, so a
+		// failed workflow reads as still running — and both sinks are SQLite, so
+		// they fail together rather than independently.
+		//
+		// Joining rather than returning: err is the workflow's own failure, the
+		// more important one, and callers match on it (errors.Is traverses a join,
+		// so ErrInvalidNode and friends still match). Replacing it with a sink
+		// error would trade a real diagnosis for a secondary one.
+		return result, errors.Join(err,
+			e.publish(ctx, def.ID, "workflow_failed", err.Error()),
+			e.appendAudit(ctx, def.ID, "workflow_failed"))
 	}
 	switch status {
 	case StatusWaitingApproval:

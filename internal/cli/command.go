@@ -923,7 +923,7 @@ func persistentRunPorts(ctx context.Context, cfg config.Config) (runPorts, func(
 			sessionStore: repo,
 			messageStore: repo,
 		}, func() {
-			_ = repo.Close()
+			closeRepositoryLogging(slog.Default(), repo, "persistent-run")
 		}, nil
 }
 
@@ -1513,7 +1513,7 @@ func serviceStores(ctx context.Context, cfg config.Config) (server.TaskStore, se
 		return nil, nil, nil, nil, func() {}, err
 	}
 	return repo, repo, repo, repo, func() {
-		_ = repo.Close()
+		closeRepositoryLogging(slog.Default(), repo, "serve")
 	}, nil
 }
 
@@ -1609,7 +1609,7 @@ func newDataRetentionCommand(out io.Writer) *cobra.Command {
 				return err
 			}
 			defer func() {
-				_ = repo.Close()
+				closeRepositoryLogging(slog.Default(), repo, "retention")
 			}()
 			policy := storage.RetentionPolicy{
 				Now:                  time.Now(),
@@ -1680,7 +1680,7 @@ func newDataExportCommand(out io.Writer) *cobra.Command {
 				return err
 			}
 			defer func() {
-				_ = repo.Close()
+				closeRepositoryLogging(slog.Default(), repo, "export")
 			}()
 			audits, err := repo.ListAuditEvents(cmd.Context())
 			if err != nil {
@@ -1769,7 +1769,7 @@ func newSkillSyncCommand(out io.Writer) *cobra.Command {
 				repository = repo
 				audit = storage.NewSQLiteAuditLog(repo)
 				closeRepository = func() {
-					_ = repo.Close()
+					closeRepositoryLogging(slog.Default(), repo, "skill-sync")
 				}
 			} else {
 				closeRepository = func() {}
@@ -1786,8 +1786,18 @@ func newSkillSyncCommand(out io.Writer) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			_, err = fmt.Fprintf(out, "skill_sync installed=%d quarantined=%d failed=%d\n", report.Installed, report.Quarantined, report.Failed)
-			return err
+			if _, err := fmt.Fprintf(out, "skill_sync installed=%d quarantined=%d failed=%d\n", report.Installed, report.Quarantined, report.Failed); err != nil {
+				return err
+			}
+			// A bare failed=N tells the operator nothing actionable: not which
+			// skill, not whether it was the network, a malformed manifest or a
+			// hostile package. Print what the report now carries.
+			for _, failure := range report.Failures {
+				if _, err := fmt.Fprintf(out, "  failed %s: %s\n", failure.ManifestURL, failure.Reason); err != nil {
+					return err
+				}
+			}
+			return nil
 		},
 	}
 	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file")
