@@ -1949,13 +1949,11 @@ func TestServeCommandStreamsLifecycleEventsOverSSE(t *testing.T) {
 // that the two halves compose: the exact task object that flowed through the
 // real HTTP + storage layer is the one the sandbox enforces against.
 //
-// It exercises read_file rather than write_file: both the HTTP/coordinator
-// task path (defaultTaskRunner.RunTask) and the per-agent path
-// (agent_resolver.go's ResolveTaskRunner) build
-// tool.NewFileReadOnlyWorkspaceRegistry — write_file is wired only into the CLI
-// `run`/`tui` one-off path (internal/app.go's tool.NewWorkspaceRegistry), not
-// into serve. Adding write capability to the HTTP path would be a feature
-// change outside this task's scope (整合 + 门禁).
+// It exercises read_file to check the read-side sandbox boundary. The serve and
+// per-agent paths now build tool.NewFileReadWriteWorkspaceRegistry, so they also
+// carry write_file (sandboxed to the same root, still Sensitive); that write
+// capability is covered by TestDefaultTaskRunnerCanWriteFile here and by
+// TestResolverGivesWorkerWriteFile in package runtime.
 func TestServeCommandSandboxesTaskToolsToSessionWorkingDir(t *testing.T) {
 	t.Parallel()
 
@@ -2569,6 +2567,60 @@ func (m *toolProbingMaas) Generate(ctx context.Context, req port.InferenceReques
 		}}}, nil
 	}
 	return port.InferenceResponse{Text: "done"}, nil
+}
+
+// writeProbingMaas drives exactly one write_file tool call, then stops.
+type writeProbingMaas struct {
+	path       string
+	content    string
+	rounds     int
+	lastPrompt string
+}
+
+func (m *writeProbingMaas) Generate(ctx context.Context, req port.InferenceRequest) (port.InferenceResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return port.InferenceResponse{}, err
+	}
+	m.rounds++
+	m.lastPrompt = req.Prompt
+	if m.rounds == 1 {
+		return port.InferenceResponse{ToolCalls: []domain.ToolCall{{
+			ID:        "write-probe-1",
+			Name:      "write_file",
+			Arguments: map[string]string{"path": m.path, "content": m.content},
+		}}}, nil
+	}
+	return port.InferenceResponse{Text: "done"}, nil
+}
+
+// TestDefaultTaskRunnerCanWriteFile locks that the serve default task path can
+// create files: defaultTaskRunner builds NewFileReadWriteWorkspaceRegistry, so a
+// write_file tool call must actually land a file inside the sandbox root. This
+// is the serve half of the write capability; the per-agent half is
+// TestResolverGivesWorkerWriteFile in package runtime.
+func TestDefaultTaskRunnerCanWriteFile(t *testing.T) {
+	t.Parallel()
+
+	workingDir := t.TempDir()
+	maas := &writeProbingMaas{path: "created.txt", content: "hello serve"}
+	runner := &defaultTaskRunner{
+		runtimeCfg:  agentruntime.Config{Events: adapter.NewMemoryEventBus(), Maas: maas},
+		contextRoot: workingDir,
+		audit:       adapter.NewMemoryAuditLog(),
+		webOptions:  tool.WebToolOptions{},
+	}
+
+	if _, err := runner.RunTask(context.Background(), domain.Agent{}, domain.Task{ID: "serve-write", WorkingDir: workingDir}); err != nil {
+		t.Fatalf("RunTask(write) error = %v, want nil", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(workingDir, "created.txt"))
+	if err != nil {
+		t.Fatalf("ReadFile(created.txt) error = %v, want the serve task to have written it", err)
+	}
+	if string(got) != "hello serve" {
+		t.Errorf("written content = %q, want %q", got, "hello serve")
+	}
 }
 
 // TestDefaultTaskRunnerSandboxesToolsToTaskWorkingDir guards Task 7's other

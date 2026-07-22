@@ -1943,9 +1943,10 @@ type defaultTaskRunner struct {
 	maasResolver    agentruntime.ModelResolver
 }
 
-// RunTask builds a fresh read-only workspace tool registry rooted at
-// task.WorkingDir (or contextRoot, when the task has none), registers on it
-// every tool the pre-M3a fixed default registry carried — task ledger, agent
+// RunTask builds a fresh workspace tool registry rooted at task.WorkingDir (or
+// contextRoot, when the task has none) via NewFileReadWriteWorkspaceRegistry, so
+// the default task can read and write files inside its sandbox. It registers on
+// it every tool the pre-M3a fixed default registry carried — task ledger, agent
 // messaging, web, session search, MoA consult — plus delegate_task (the
 // default runtime is always a root orchestrator), then runs the task on a
 // freshly constructed *agentruntime.Runtime built from runtimeCfg with that
@@ -1958,7 +1959,7 @@ func (d *defaultTaskRunner) RunTask(ctx context.Context, agent domain.Agent, tas
 	if root == "" {
 		root = d.contextRoot
 	}
-	tools := tool.NewFileReadOnlyWorkspaceRegistry(root, d.audit)
+	tools := tool.NewFileReadWriteWorkspaceRegistry(root, d.audit)
 	tool.RegisterTaskLedgerTools(tools, d.taskLedger)
 	tool.RegisterAgentMessageTools(tools, d.messageStore)
 	tool.RegisterWebTools(tools, d.webOptions)

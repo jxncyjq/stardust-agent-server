@@ -162,7 +162,7 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 	//
 	// The asymmetry is the design, not an oversight — see
 	// TestResolverOmitsOrchestratorOnlyTools, which locks it.
-	tools := tool.NewFileReadOnlyWorkspaceRegistry(agentToolRoot(r.rootConfig, agentCfg, task), r.audit)
+	tools := tool.NewFileReadWriteWorkspaceRegistry(agentToolRoot(r.rootConfig, agentCfg, task), r.audit)
 	tool.RegisterTaskLedgerTools(tools, r.taskLedger)
 	tool.RegisterAgentMessageTools(tools, r.messageStore)
 	tool.RegisterWebTools(tools, webToolOptions(r.rootConfig.Web))
