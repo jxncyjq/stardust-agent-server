@@ -99,6 +99,15 @@ type Config struct {
 	// is a wiring oversight, not a request to discard diagnostics — the same
 	// mistake as the file logger that used to degrade to io.Discard.
 	Logger *slog.Logger
+	// SkillUsage records that a skill was actually loaded. The Curator ages
+	// idle skills off this record, and leaves skills with no usage history
+	// alone -- so a runtime that never touches it silently disables the sweep.
+	SkillUsage SkillUsageRecorder
+}
+
+// SkillUsageRecorder is the usage sidecar skill.UsageStore satisfies.
+type SkillUsageRecorder interface {
+	Touch(id string, at time.Time)
 }
 
 // Context-accumulation bounds for the tool-execution loop. Tool outputs are
@@ -131,6 +140,7 @@ type Runtime struct {
 	checkpoints        *sessionstate.Store
 	toolGate           ToolGate
 	logger             *slog.Logger
+	skillUsage         SkillUsageRecorder
 }
 
 // loopState is the mutable state threaded through the tool-execution loop.
@@ -216,6 +226,7 @@ func NewRuntime(cfg Config) *Runtime {
 		checkpoints:        cfg.Checkpoints,
 		toolGate:           cfg.ToolGate,
 		logger:             logger,
+		skillUsage:         cfg.SkillUsage,
 	}
 }
 

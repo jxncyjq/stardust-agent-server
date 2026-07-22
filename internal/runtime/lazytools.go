@@ -3,57 +3,65 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/stardust/legion-agent/internal/capability"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
 // Meta-tool names for the lazy (on-demand) tool protocol. The model sees only
-// these two tools and discovers/invokes the real registered tools through them,
-// instead of receiving the full native tool schema on every inference.
+// these meta tools and discovers/invokes the real registered tools and skills
+// through them, instead of receiving the full native tool schema on every
+// inference.
 const (
-	metaToolListTools = "list_tools"
-	metaToolCallTool  = "call_tool"
+	metaToolCallTool         = "call_tool"
+	metaToolLoadCapabilities = "load_capabilities"
 )
 
-// metaInferenceTools returns the two meta tools offered under the lazy protocol.
+// maxLoadBatch bounds one load_capabilities call. A single skill body runs to
+// kilobytes; five at once is already a large slice of the loaded block, and
+// the model can simply call again.
+const maxLoadBatch = 5
+
+// metaInferenceTools returns the meta tools offered under the lazy protocol.
 // Their schemas are intentionally tiny so a simple no-tool chat pays only this
 // fixed overhead instead of the full native tool schema (~1800 tokens).
 func metaInferenceTools() []port.InferenceTool {
 	return []port.InferenceTool{
 		{
-			Name:        metaToolListTools,
-			Description: "List the available tools and their parameters. Call this first whenever you need a tool: it returns each tool's name, description and input schema so you can then invoke one via call_tool.",
-			InputSchema: map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"query": map[string]any{
-						"type":        "string",
-						"description": "Optional case-insensitive filter; only tools whose name or description contains it are returned.",
-					},
-				},
-			},
-		},
-		{
 			Name:        metaToolCallTool,
-			Description: "Invoke one real tool by name. Discover tool names and parameters first with list_tools.",
+			Description: "Invoke one real tool by name. Discover tool names and parameters via load_capabilities and <available_capabilities>.",
 			InputSchema: map[string]any{
 				"type":     "object",
 				"required": []string{"tool_name", "arguments_json"},
 				"properties": map[string]any{
 					"tool_name": map[string]any{
 						"type":        "string",
-						"description": "The exact name of the tool to invoke (from list_tools).",
+						"description": "The exact name of the tool to invoke.",
 					},
 					"arguments_json": map[string]any{
 						"type":        "string",
 						"description": `A JSON object string holding the target tool's arguments, e.g. {"path":"README.md"}. Use {} when the tool takes no arguments.`,
+					},
+				},
+			},
+		},
+		{
+			Name:        metaToolLoadCapabilities,
+			Description: "Load the full definition of one or more capabilities listed in <available_capabilities>: a tool's parameter schema, or a skill's full instructions. Load before using. Pass a comma-separated list of names.",
+			InputSchema: map[string]any{
+				"type":     "object",
+				"required": []string{"names"},
+				"properties": map[string]any{
+					"names": map[string]any{
+						"type":        "string",
+						"description": "Comma-separated capability names, at most 5 per call.",
 					},
 				},
 			},
@@ -63,46 +71,7 @@ func metaInferenceTools() []port.InferenceTool {
 
 // isMetaTool reports whether name is one of the lazy-protocol meta tools.
 func isMetaTool(name string) bool {
-	return name == metaToolListTools || name == metaToolCallTool
-}
-
-// toolCatalogEntry is one real tool exposed by list_tools, mirroring the native
-// InferenceTool shape so the model gets the same name/description/schema it would
-// have seen up-front under the eager protocol.
-type toolCatalogEntry struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description,omitempty"`
-	InputSchema map[string]any `json:"input_schema,omitempty"`
-}
-
-// listToolsCatalog renders the real-tool directory (excluding the meta tools
-// themselves) as JSON, optionally filtered by a case-insensitive query that
-// matches tool name or description.
-func (r *Runtime) listToolsCatalog(query string, tools *tool.Registry) (string, error) {
-	descriptors := tools.Descriptors()
-	query = strings.ToLower(strings.TrimSpace(query))
-	entries := make([]toolCatalogEntry, 0, len(descriptors))
-	for _, descriptor := range descriptors {
-		if isMetaTool(descriptor.Name) {
-			continue
-		}
-		if query != "" &&
-			!strings.Contains(strings.ToLower(descriptor.Name), query) &&
-			!strings.Contains(strings.ToLower(descriptor.Description), query) {
-			continue
-		}
-		entries = append(entries, toolCatalogEntry{
-			Name:        descriptor.Name,
-			Description: descriptor.Description,
-			InputSchema: descriptor.InputSchema,
-		})
-	}
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name < entries[j].Name })
-	encoded, err := json.Marshal(map[string]any{"tools": entries})
-	if err != nil {
-		return "", fmt.Errorf("marshal tool catalog: %w", err)
-	}
-	return string(encoded), nil
+	return name == metaToolCallTool || name == metaToolLoadCapabilities
 }
 
 // parseCallToolArguments decodes the arguments_json string of a call_tool meta
@@ -150,13 +119,21 @@ func stringifyArgument(value any) string {
 
 // dispatchToolCall routes one model tool call. Under the lazy protocol the meta
 // tools are handled in-runtime (they are not registered in the tool registry):
-// list_tools returns the real-tool catalog and call_tool unpacks and forwards to
-// the named real tool through the registry (preserving permission/audit/timeout/
-// sanitizer). Every other call — and all calls under the eager protocol — goes
-// straight to the registry. Meta-tool fail-loud conditions (empty tool_name,
-// malformed arguments_json, unknown target tool) return an unsuccessful
-// ToolResult so the model can see and correct them, rather than a Go error that
-// would abort the task.
+// call_tool unpacks and forwards to the named real tool through the registry
+// (preserving permission/audit/timeout/sanitizer). Every other call — and all
+// calls under the eager protocol — goes straight to the registry. Meta-tool
+// fail-loud conditions (empty tool_name, malformed arguments_json, unknown
+// target tool) return an unsuccessful ToolResult so the model can see and
+// correct them, rather than a Go error that would abort the task.
+//
+// load_capabilities is offered (metaInferenceTools) and recognised by
+// isMetaTool, but is not yet routed here: dispatchLoadCapabilities needs both
+// the run's mutable loopState and a *capability.Catalog, neither of which
+// reaches this call today (the catalog is only wired into prompt building, not
+// into dispatch). A model that calls it here hits the default case below and
+// fails the task loudly rather than silently no-opping -- routing it requires
+// threading loopState/catalog down from runToolLoop, left to the task that
+// wires the catalog into RunTask.
 func (r *Runtime) dispatchToolCall(ctx context.Context, agent domain.Agent, task domain.Task, call domain.ToolCall, tools *tool.Registry) (domain.ToolResult, error) {
 	if r.toolGate != nil {
 		allow, err := r.toolGate.Resolve(ctx, task, call, tools)
@@ -171,17 +148,74 @@ func (r *Runtime) dispatchToolCall(ctx context.Context, agent domain.Agent, task
 		return tools.Execute(ctx, agent, call)
 	}
 	switch call.Name {
-	case metaToolListTools:
-		catalog, err := r.listToolsCatalog(call.Arguments["query"], tools)
-		if err != nil {
-			return domain.ToolResult{}, err
-		}
-		return domain.ToolResult{CallID: call.ID, Success: true, Output: catalog}, nil
 	case metaToolCallTool:
 		return r.dispatchCallTool(ctx, agent, task, call, tools)
 	default:
 		return domain.ToolResult{}, fmt.Errorf("unhandled meta tool %q", call.Name)
 	}
+}
+
+// dispatchLoadCapabilities pins the requested capabilities' full definitions
+// into the run's loaded block.
+//
+// The tool result itself is only an acknowledgement. Putting the definitions
+// in the result instead would subject them to the 4000-char per-result
+// truncation and to the mid-prompt dropping that boundPrompt does -- a schema
+// cut in half is invalid JSON, and one silently dropped leaves the model
+// calling from memory.
+//
+// Every failure comes back as an unsuccessful ToolResult rather than a Go
+// error: the model can read it and correct itself, whereas an error aborts the
+// task.
+func (r *Runtime) dispatchLoadCapabilities(ctx context.Context, st *loopState, call domain.ToolCall, catalog *capability.Catalog) (domain.ToolResult, error) {
+	names := splitNames(call.Arguments["names"])
+	if len(names) == 0 {
+		return domain.ToolResult{CallID: call.ID, Success: false, Error: "load_capabilities requires at least one name"}, nil
+	}
+	if len(names) > maxLoadBatch {
+		return domain.ToolResult{CallID: call.ID, Success: false,
+			Error: fmt.Sprintf("load at most %d capabilities per call, got %d", maxLoadBatch, len(names))}, nil
+	}
+	maxLoadedChars := r.maxPromptChars / 3
+	loadedNames := make([]string, 0, len(names))
+	evictedAll := make([]string, 0)
+	for _, name := range names {
+		detail, err := catalog.Detail(ctx, name)
+		if errors.Is(err, capability.ErrUnknownCapability) {
+			return domain.ToolResult{CallID: call.ID, Success: false,
+				Error: fmt.Sprintf("unknown capability %q: it is not in <available_capabilities> for this task", name)}, nil
+		}
+		if err != nil {
+			return domain.ToolResult{}, err
+		}
+		next, evicted, err := appendLoaded(st.loaded, name, detail, maxLoadedChars)
+		if err != nil {
+			return domain.ToolResult{CallID: call.ID, Success: false, Error: err.Error()}, nil
+		}
+		st.loaded = next
+		evictedAll = append(evictedAll, evicted...)
+		loadedNames = append(loadedNames, name)
+		if r.skillUsage != nil {
+			r.skillUsage.Touch(name, time.Now())
+		}
+	}
+	output := "loaded: " + strings.Join(loadedNames, ", ")
+	if notice := renderEvictionNotice(evictedAll); notice != "" {
+		output += "\n" + notice
+	}
+	return domain.ToolResult{CallID: call.ID, Success: true, Output: output}, nil
+}
+
+// splitNames parses the comma-separated names argument, dropping empties.
+func splitNames(raw string) []string {
+	parts := strings.Split(raw, ",")
+	names := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			names = append(names, trimmed)
+		}
+	}
+	return names
 }
 
 // dispatchCallTool unpacks a call_tool meta call and forwards it to the named
