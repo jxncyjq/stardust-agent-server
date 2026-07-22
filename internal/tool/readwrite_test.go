@@ -88,3 +88,40 @@ func TestReadWriteRegistryDoesNotInjectAgentsNote(t *testing.T) {
 		t.Errorf("write_file result leaked an agents.md injection: %q", result.Output)
 	}
 }
+
+// TestReadWriteRegistryIsReadOnlyPlusWriteFile pins the intended relationship
+// between the two file registries: they differ by exactly write_file. The two
+// constructors maintain their tool policy/permission separately, so without
+// this an added file tool could land in one and not the other and neither the
+// compiler nor any other test would notice.
+func TestReadWriteRegistryIsReadOnlyPlusWriteFile(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	names := func(r *Registry) map[string]bool {
+		m := make(map[string]bool)
+		for _, d := range r.Descriptors() {
+			m[d.Name] = true
+		}
+		return m
+	}
+	readOnly := names(NewFileReadOnlyWorkspaceRegistry(root, nil))
+	readWrite := names(NewFileReadWriteWorkspaceRegistry(root, nil))
+
+	if readOnly["write_file"] {
+		t.Error("read-only registry unexpectedly registers write_file")
+	}
+	if !readWrite["write_file"] {
+		t.Fatal("read-write registry missing write_file")
+	}
+	// Remove the one intended difference; what remains must match exactly.
+	delete(readWrite, "write_file")
+	if len(readWrite) != len(readOnly) {
+		t.Errorf("read-write minus write_file = %v, want it equal to read-only %v (the two constructors drifted)", readWrite, readOnly)
+	}
+	for name := range readOnly {
+		if !readWrite[name] {
+			t.Errorf("read-write registry missing read-only tool %q", name)
+		}
+	}
+}
