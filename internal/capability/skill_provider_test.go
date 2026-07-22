@@ -14,32 +14,26 @@ import (
 )
 
 // writeSkill lays down a minimal SKILL.md that internal/skill's readSkill can
-// parse. Verified against internal/skill/system.go: readSkill only ever
-// consumes the front-matter keys id/name/source/version/risk_level/status/tags
-// into Skill fields -- a "summary:" front-matter line is scanned into the
-// metadata map but never read back out. Skill.Summary and Skill.Content are
-// both set to the exact same trimmed body text (everything after the closing
-// "---"). So there is no independent front-matter summary to recover; the
-// catalog's one-line summary has to be derived from the body itself (first
-// line, same as ToolProvider's summarize()).
+// parse. Skill.Summary comes from the front matter's "summary" key,
+// independent of Skill.Content (the body after the closing "---") -- see
+// internal/skill/system.go's readSkill.
 //
-// When summaryLine is non-empty, the body's first line is the summary
-// candidate and a later line carries the "正文内容 <id>" marker used to prove
-// Detail() returns the full body. When summaryLine is empty, the body after
-// the front matter is left completely empty, so both Skill.Summary and
-// Skill.Content come back "" -- the only way, given the real Skill struct, to
-// produce a skill with no derivable summary.
-func writeSkill(t *testing.T, root, id, summaryLine string) {
+// When summary is non-empty, the front matter carries a "summary:" line and
+// the body carries a "正文内容 <id>" marker used to prove Detail() returns the
+// full body, distinct from the catalog summary. When summary is empty, the
+// front matter omits the "summary" key entirely -- the legal way, per
+// readSkill's contract, to produce a skill with no summary.
+func writeSkill(t *testing.T, root, id, summary string) {
 	t.Helper()
 	dir := filepath.Join(root, id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatalf("MkdirAll(%q) error = %v", dir, err)
 	}
 	var body string
-	if summaryLine == "" {
-		body = fmt.Sprintf("---\nid: %s\nname: %s\nstatus: active\n---\n", id, id)
+	if summary == "" {
+		body = fmt.Sprintf("---\nid: %s\nname: %s\nstatus: active\n---\n\n正文内容 %s\n", id, id, id)
 	} else {
-		body = fmt.Sprintf("---\nid: %s\nname: %s\nstatus: active\n---\n\n%s\n\n正文内容 %s\n", id, id, summaryLine, id)
+		body = fmt.Sprintf("---\nid: %s\nname: %s\nsummary: %s\nstatus: active\n---\n\n正文内容 %s\n", id, id, summary, id)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "SKILL.md"), []byte(body), 0o600); err != nil {
 		t.Fatalf("WriteFile error = %v", err)

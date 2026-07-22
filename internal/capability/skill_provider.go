@@ -18,12 +18,12 @@ const MaxSkillsPerAgent = 64
 
 // SkillProvider exposes an agent's skills as catalog entries.
 //
-// skill.Skill has no field of its own for a short, catalog-sized summary:
-// Skill.Summary and Skill.Content are both populated from the exact same
-// trimmed SKILL.md body (see internal/skill/system.go's readSkill). So the
-// one-line entry offered here is derived from the body via summarize(), the
-// same first-line-and-truncate rule ToolProvider applies to tool
-// descriptions, rather than read off a distinct field.
+// skill.Skill.Summary holds the SKILL.md front matter's "summary" key --
+// independent of Skill.Content, which is the full body (see
+// internal/skill/system.go's readSkill). Entries reads that field directly:
+// a skill without a front-matter summary cannot be catalogued, since there
+// is no independent line to show, and refresh fails loud on that skill
+// rather than deriving a substitute from the body.
 type SkillProvider struct {
 	system *skill.System
 
@@ -81,14 +81,13 @@ func (p *SkillProvider) refresh(ctx context.Context) error {
 		if !skill.IsInjectable(s) {
 			continue
 		}
-		summary := summarize(s.Content)
-		if summary == "" {
-			return fmt.Errorf("skill %q at %q declares no summary: a catalog line cannot be derived from an empty body", s.ID, s.Path)
+		if s.Summary == "" {
+			return fmt.Errorf("skill %q at %q declares no summary: add a \"summary\" front-matter line", s.ID, s.Path)
 		}
 		entries = append(entries, Entry{
 			Name:    s.ID,
 			Group:   "skills",
-			Summary: summary,
+			Summary: s.Summary,
 			Kind:    KindSkill,
 		})
 		bodies[s.ID] = s.Content

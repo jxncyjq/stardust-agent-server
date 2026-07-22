@@ -84,6 +84,15 @@ type Config struct {
 	Scanner SkillSecurityScanner
 }
 
+// Skill is a loaded SKILL.md: its front-matter metadata plus its body.
+//
+// Summary and Content are independent: Summary is the front matter's
+// "summary" key, a short one-line description meant for a catalog entry;
+// Content is the full body text after the closing "---". A skill file that
+// omits the "summary" key yields an empty Summary -- that is a legal state
+// at this layer (front-matter fields are optional here), not an error.
+// Callers that require every skill to carry a summary (e.g.
+// capability.SkillProvider) enforce that contract themselves.
 type Skill struct {
 	ID        string
 	Name      string
@@ -285,7 +294,7 @@ func readSkill(path string) (Skill, error) {
 		RiskLevel: RiskLevel(metadata["risk_level"]),
 		Status:    normalizeStatus(Status(metadata["status"])),
 		Tags:      parseTags(metadata["tags"]),
-		Summary:   strings.TrimSpace(strings.Join(body, "\n")),
+		Summary:   strings.TrimSpace(metadata["summary"]),
 		Content:   strings.TrimSpace(strings.Join(body, "\n")),
 	}
 	if skill.ID == "" {
