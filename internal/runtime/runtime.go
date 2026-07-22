@@ -593,8 +593,8 @@ func (r *Runtime) inferenceTools(tools *tool.Registry) []port.InferenceTool {
 		return nil
 	}
 	// Lazy (on-demand) protocol: offer only the two meta tools so the model pays
-	// a tiny fixed schema cost per inference. It discovers real tools via
-	// list_tools and invokes them via call_tool, both handled in-runtime.
+	// a tiny fixed schema cost per inference. It loads a real tool's schema via
+	// load_capabilities and invokes it via call_tool, both handled in-runtime.
 	if r.lazyTools {
 		return metaInferenceTools()
 	}
@@ -847,8 +847,8 @@ func (r *Runtime) lazyToolHint(names []string) string {
 	return fmt.Sprintf(
 		"\n\nAvailable tools (provided on demand, NOT empty): %s.\n"+
 			"To use any tool, call call_tool with its tool_name and an arguments_json string; "+
-			"call list_tools first if you need a tool's exact parameters. "+
-			"Never claim no tools are available — discover them with list_tools.\n",
+			"call load_capabilities first if you need a tool's exact parameters. "+
+			"Never claim no tools are available — they are listed above and loaded on demand via load_capabilities.\n",
 		strings.Join(names, ", "),
 	)
 }
