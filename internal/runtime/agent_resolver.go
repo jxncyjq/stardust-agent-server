@@ -46,6 +46,13 @@ type AgentRuntimeResolverConfig struct {
 	// a configured skills root that does not exist. Nil disables that reporting
 	// (tests, embedded use); it never changes what the resolver builds.
 	Logger *slog.Logger
+	// SkillUsage records that a skill was actually loaded, mirroring
+	// Config.SkillUsage on the default runtime. It is the same shared
+	// *skill.UsageStore instance the Curator sweep reads (see command.go), so a
+	// skill loaded by any per-agent runtime ages the same as one loaded by the
+	// default runtime. Nil disables aging for every resolver-built runtime
+	// (skill.Curator "no usage history" — never touched, never swept).
+	SkillUsage SkillUsageRecorder
 }
 
 type AgentRuntimeResolver struct {
@@ -59,6 +66,7 @@ type AgentRuntimeResolver struct {
 	checkpoints  *sessionstate.Store
 	toolGate     ToolGate
 	logger       *slog.Logger
+	skillUsage   SkillUsageRecorder
 }
 
 func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolver {
@@ -73,6 +81,7 @@ func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolv
 		checkpoints:  cfg.Checkpoints,
 		toolGate:     cfg.ToolGate,
 		logger:       cfg.Logger,
+		skillUsage:   cfg.SkillUsage,
 	}
 }
 
@@ -169,6 +178,7 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		ToolGate:         r.toolGate,
 		Logger:           r.logger,
 		CapabilitySkills: capabilitySkills,
+		SkillUsage:       r.skillUsage,
 	})
 	return agent, runner, true, nil
 }
