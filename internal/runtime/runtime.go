@@ -141,6 +141,7 @@ type loopState struct {
 	basePrompt       string
 	round            int
 	toolCtx          []toolEntry
+	loaded           []loadedEntry
 	resp             port.InferenceResponse
 	promptTokens     int
 	completionTokens int
@@ -351,7 +352,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 			return domain.TaskRun{}, fmt.Errorf("execute model tool calls: %w", err)
 		}
 		st.toolCtx = mergeToolResults(st.toolCtx, st.resp.ToolCalls, results, r.maxToolResultChars)
-		prompt := boundPrompt(st.basePrompt+renderToolEntries(st.toolCtx), r.maxPromptChars)
+		prompt := composePrompt(st.basePrompt, st.loaded, st.toolCtx, r.maxPromptChars)
 		st.resp, err = r.generate(ctx, requestID, prompt, st.images, stablePrefixRunes(prompt, st.basePrompt), st.tools)
 		if err != nil {
 			r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInferenceError)
@@ -371,7 +372,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// model to answer rather than narrate another tool call — otherwise it
 		// tends to emit text like "list_files 参数: {...}" instead of a real
 		// answer when it is cut off mid-exploration.
-		prompt := boundPrompt(st.basePrompt+renderToolEntries(st.toolCtx), r.maxPromptChars)
+		prompt := composePrompt(st.basePrompt, st.loaded, st.toolCtx, r.maxPromptChars)
 		finalPrompt := prompt + "\n\n[系统] 工具调用已达上限。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。"
 		final, err := r.generateNoTools(ctx, requestID, finalPrompt, st.images, stablePrefixRunes(finalPrompt, st.basePrompt))
 		if err != nil {
