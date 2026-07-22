@@ -120,21 +120,20 @@ func stringifyArgument(value any) string {
 // dispatchToolCall routes one model tool call. Under the lazy protocol the meta
 // tools are handled in-runtime (they are not registered in the tool registry):
 // call_tool unpacks and forwards to the named real tool through the registry
-// (preserving permission/audit/timeout/sanitizer). Every other call — and all
-// calls under the eager protocol — goes straight to the registry. Meta-tool
-// fail-loud conditions (empty tool_name, malformed arguments_json, unknown
-// target tool) return an unsuccessful ToolResult so the model can see and
-// correct them, rather than a Go error that would abort the task.
+// (preserving permission/audit/timeout/sanitizer), and load_capabilities pins
+// the requested capabilities' definitions into the run's loaded block. Every
+// other call — and all calls under the eager protocol — goes straight to the
+// registry. Meta-tool fail-loud conditions (empty tool_name, malformed
+// arguments_json, unknown target tool/capability) return an unsuccessful
+// ToolResult so the model can see and correct them, rather than a Go error that
+// would abort the task.
 //
-// load_capabilities is offered (metaInferenceTools) and recognised by
-// isMetaTool, but is not yet routed here: dispatchLoadCapabilities needs both
-// the run's mutable loopState and a *capability.Catalog, neither of which
-// reaches this call today (the catalog is only wired into prompt building, not
-// into dispatch). A model that calls it here hits the default case below and
-// fails the task loudly rather than silently no-opping -- routing it requires
-// threading loopState/catalog down from runToolLoop, left to the task that
-// wires the catalog into RunTask.
-func (r *Runtime) dispatchToolCall(ctx context.Context, agent domain.Agent, task domain.Task, call domain.ToolCall, tools *tool.Registry) (domain.ToolResult, error) {
+// It takes the run's mutable *loopState so load_capabilities can write st.loaded
+// and so both the effective registry (st.tools) and the catalog (st.catalog) are
+// drawn from one scoped source: a Plan-mode run dispatches and loads against its
+// read-only subset, never a broader set than it offered.
+func (r *Runtime) dispatchToolCall(ctx context.Context, agent domain.Agent, task domain.Task, call domain.ToolCall, st *loopState) (domain.ToolResult, error) {
+	tools := st.tools
 	if r.toolGate != nil {
 		allow, err := r.toolGate.Resolve(ctx, task, call, tools)
 		if err != nil {
@@ -150,6 +149,8 @@ func (r *Runtime) dispatchToolCall(ctx context.Context, agent domain.Agent, task
 	switch call.Name {
 	case metaToolCallTool:
 		return r.dispatchCallTool(ctx, agent, task, call, tools)
+	case metaToolLoadCapabilities:
+		return r.dispatchLoadCapabilities(ctx, st, call, st.catalog)
 	default:
 		return domain.ToolResult{}, fmt.Errorf("unhandled meta tool %q", call.Name)
 	}
@@ -168,6 +169,12 @@ func (r *Runtime) dispatchToolCall(ctx context.Context, agent domain.Agent, task
 // error: the model can read it and correct itself, whereas an error aborts the
 // task.
 func (r *Runtime) dispatchLoadCapabilities(ctx context.Context, st *loopState, call domain.ToolCall, catalog *capability.Catalog) (domain.ToolResult, error) {
+	// A nil catalog here is not "no capabilities": it is a wiring invariant
+	// violation -- load_capabilities was offered and dispatched but the run built
+	// no catalog to load from. Fail loud rather than nil-deref or pretend success.
+	if catalog == nil {
+		return domain.ToolResult{}, fmt.Errorf("load_capabilities for call %s dispatched without a catalog", call.ID)
+	}
 	names := splitNames(call.Arguments["names"])
 	if len(names) == 0 {
 		return domain.ToolResult{CallID: call.ID, Success: false, Error: "load_capabilities requires at least one name"}, nil

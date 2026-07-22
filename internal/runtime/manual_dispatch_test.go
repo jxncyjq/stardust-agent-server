@@ -33,7 +33,7 @@ func TestDispatchDeniedSensitiveReturnsRejectResult(t *testing.T) {
 	if _, err := store.Decide("s1", approval.TicketID("t1", "c1"), approval.ApprovalDenied, ""); err != nil {
 		t.Fatal(err)
 	}
-	res, err := r.dispatchToolCall(context.Background(), domain.Agent{ID: "a1"}, task, call, reg)
+	res, err := r.dispatchToolCall(context.Background(), domain.Agent{ID: "a1"}, task, call, &loopState{tools: reg})
 	if err != nil {
 		t.Fatalf("dispatchToolCall err = %v, want nil (reject is a result, not a Go error)", err)
 	}
@@ -73,7 +73,7 @@ func TestDispatchDeniedLazyCallToolReturnsRejectResult(t *testing.T) {
 	if _, err := store.Decide("s1", approval.TicketID("t1", "c1"), approval.ApprovalDenied, ""); err != nil {
 		t.Fatal(err)
 	}
-	res, err := r.dispatchToolCall(context.Background(), domain.Agent{ID: "a1"}, task, call, reg)
+	res, err := r.dispatchToolCall(context.Background(), domain.Agent{ID: "a1"}, task, call, &loopState{tools: reg})
 	if err != nil {
 		t.Fatalf("dispatchToolCall err = %v, want nil (reject is a result, not a Go error)", err)
 	}

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/stardust/legion-agent/internal/agentregistry"
+	"github.com/stardust/legion-agent/internal/capability"
 	"github.com/stardust/legion-agent/internal/cognitive"
 	"github.com/stardust/legion-agent/internal/config"
 	"github.com/stardust/legion-agent/internal/contextfiles"
@@ -95,16 +96,25 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		return domain.Agent{}, nil, false, fmt.Errorf("load agent context files for %q: %w", task.AgentID, err)
 	}
 	contextBuilder := cognitive.NewCore(cognitive.NoopCompressor{}).WithContextFiles(contextBlock)
+	// capabilitySkills is the skill half of the capability catalog for this
+	// agent. It is set only when a skills root is actually available; the tool
+	// half is built per task by the runtime from the effective registry.
+	var capabilitySkills capability.Provider
 	// skill.RootAvailable, not a bare non-empty check: an install_root that has
 	// not been created yet means "no skills installed", and mounting it would
 	// fail the skill walk and with it every task routed to this agent. The
 	// default runtime gates its own mount the same way.
 	if skillsRoot := agentSkillsRoot(r.rootConfig, agentCfg); skillsRoot != "" {
 		if skill.RootAvailable(skillsRoot) {
-			contextBuilder = contextBuilder.WithSkills(skill.NewSystem(skill.Config{
+			skillSystem := skill.NewSystem(skill.Config{
 				Roots:   []string{skillsRoot},
 				Scanner: skill.NewSecurityScanner(),
-			}))
+			})
+			// WithSkills is retained for the /skills query paths; it no longer
+			// injects into the prompt. Skills reach the model through the capability
+			// catalog, whose skill half is this same skill system.
+			contextBuilder = contextBuilder.WithSkills(skillSystem)
+			capabilitySkills = capability.NewSkillProvider(skillSystem)
 		} else if r.logger != nil {
 			// Skipping is the right call, but not silently: a configured root
 			// that is unusable is far more often a typo or a missing setup step
@@ -148,16 +158,17 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 	tool.RegisterAgentMessageTools(tools, r.messageStore)
 	tool.RegisterWebTools(tools, webToolOptions(r.rootConfig.Web))
 	runner := NewRuntime(Config{
-		Maas:           maas.Client,
-		Audit:          r.audit,
-		Events:         r.events,
-		ContextBuilder: contextBuilder,
-		Tools:          tools,
-		MaxToolRounds:  r.rootConfig.Runtime.MaxToolRounds,
-		LazyTools:      r.rootConfig.Runtime.LazyTools,
-		Checkpoints:    r.checkpoints,
-		ToolGate:       r.toolGate,
-		Logger:         r.logger,
+		Maas:             maas.Client,
+		Audit:            r.audit,
+		Events:           r.events,
+		ContextBuilder:   contextBuilder,
+		Tools:            tools,
+		MaxToolRounds:    r.rootConfig.Runtime.MaxToolRounds,
+		LazyTools:        r.rootConfig.Runtime.LazyTools,
+		Checkpoints:      r.checkpoints,
+		ToolGate:         r.toolGate,
+		Logger:           r.logger,
+		CapabilitySkills: capabilitySkills,
 	})
 	return agent, runner, true, nil
 }

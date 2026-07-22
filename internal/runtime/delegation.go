@@ -103,6 +103,11 @@ func (r *Runtime) newSubRuntime(role string, toolsets []string) (*Runtime, error
 		// explicitly: a child left with a nil logger would panic the first time
 		// one of its failure paths tried to record anything.
 		logger: r.logger,
+		// The child builds its own per-task catalog in RunTask (from its own
+		// effective registry, which may be a narrowed subset); it only needs the
+		// skill provider carried over so its catalog can list skills too. Its
+		// loaded block still starts empty -- the child gets an independent context.
+		capabilitySkills: r.capabilitySkills,
 	}
 	return child, nil
 }

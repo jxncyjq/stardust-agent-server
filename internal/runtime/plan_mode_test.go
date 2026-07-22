@@ -112,10 +112,10 @@ func TestPlanModeLazyCallToolCannotReachSensitiveTool(t *testing.T) {
 		tool.PermissionEnforcerFunc(func(domain.Agent, domain.ToolCall) error { return nil }),
 		tool.NoopGuardrails{},
 	)
-	reg.RegisterDescriptor(tool.Descriptor{Name: "read_x", Sensitive: false}, tool.HandlerFunc(func(context.Context, domain.ToolCall) (domain.ToolResult, error) {
+	reg.RegisterDescriptor(tool.Descriptor{Name: "read_x", Group: "files", Sensitive: false}, tool.HandlerFunc(func(context.Context, domain.ToolCall) (domain.ToolResult, error) {
 		return domain.ToolResult{Success: true}, nil
 	}))
-	reg.RegisterDescriptor(tool.Descriptor{Name: "write_x", Sensitive: true}, tool.HandlerFunc(func(context.Context, domain.ToolCall) (domain.ToolResult, error) {
+	reg.RegisterDescriptor(tool.Descriptor{Name: "write_x", Group: "files", Sensitive: true}, tool.HandlerFunc(func(context.Context, domain.ToolCall) (domain.ToolResult, error) {
 		writeXCalled = true
 		return domain.ToolResult{Success: true}, nil
 	}))

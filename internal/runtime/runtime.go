@@ -10,6 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/stardust/legion-agent/internal/capability"
 	"github.com/stardust/legion-agent/internal/cognitive"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/evolution"
@@ -103,6 +104,13 @@ type Config struct {
 	// idle skills off this record, and leaves skills with no usage history
 	// alone -- so a runtime that never touches it silently disables the sweep.
 	SkillUsage SkillUsageRecorder
+	// CapabilitySkills is the skill half of the capability catalog: the provider
+	// that lists an agent's loadable skills and returns their bodies. The tool
+	// half is built per task from the run's effective registry, so the catalog is
+	// scoped to exactly what that task may load and dispatch. Nil means no skills
+	// are catalogued (the catalog then lists only tools). It is consulted only
+	// under the lazy protocol, the only protocol that offers load_capabilities.
+	CapabilitySkills capability.Provider
 }
 
 // SkillUsageRecorder is the usage sidecar skill.UsageStore satisfies.
@@ -141,6 +149,7 @@ type Runtime struct {
 	toolGate           ToolGate
 	logger             *slog.Logger
 	skillUsage         SkillUsageRecorder
+	capabilitySkills   capability.Provider
 }
 
 // loopState is the mutable state threaded through the tool-execution loop.
@@ -166,6 +175,12 @@ type loopState struct {
 	// model (inferenceTools) and dispatching them (dispatchToolCall), so a run
 	// never dispatches against a broader set than it offered.
 	tools *tool.Registry
+	// catalog is the per-call capability catalog, built from the same effective
+	// registry as tools (buildCatalog). It is what the prompt advertises and what
+	// load_capabilities loads from, so both are scoped identically -- a Plan-mode
+	// run cannot load a sensitive tool that was filtered out of tools. Nil under
+	// the eager protocol, which offers native schemas and never load_capabilities.
+	catalog *capability.Catalog
 }
 
 // effectiveTools returns the tool registry a run should use: in Plan mode only
@@ -178,6 +193,32 @@ func (r *Runtime) effectiveTools(task domain.Task) *tool.Registry {
 		return r.tools.Subset(r.tools.SafeToolNames()...)
 	}
 	return r.tools
+}
+
+// buildCatalog assembles the per-task capability catalog from the run's
+// effective tool registry plus the assembly-provided skill provider. It is the
+// single source both the prompt (what to advertise) and dispatch
+// (load_capabilities) draw from, so they are always scoped to the same set: a
+// Plan-mode run passes its read-only subset here, and so cannot advertise or
+// load a sensitive tool it may not run.
+//
+// It returns nil under the eager protocol: eager offers full native schemas and
+// never load_capabilities, so a catalog would be dead weight in the prompt. That
+// is why a group-less registry only matters under the lazy protocol -- a tool
+// with no catalog group fails loud in ToolProvider.Entries, but only a lazy run
+// builds a catalog to hit it.
+func (r *Runtime) buildCatalog(tools *tool.Registry) *capability.Catalog {
+	if !r.lazyTools {
+		return nil
+	}
+	providers := make([]capability.Provider, 0, 2)
+	if tools != nil {
+		providers = append(providers, capability.NewToolProvider(tools))
+	}
+	if r.capabilitySkills != nil {
+		providers = append(providers, r.capabilitySkills)
+	}
+	return capability.NewCatalog(providers...)
 }
 
 // planInstruction is appended to the base prompt in Plan mode, directing the
@@ -227,6 +268,7 @@ func NewRuntime(cfg Config) *Runtime {
 		toolGate:           cfg.ToolGate,
 		logger:             logger,
 		skillUsage:         cfg.SkillUsage,
+		capabilitySkills:   cfg.CapabilitySkills,
 	}
 }
 
@@ -291,6 +333,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 			// (coordinator resume) may hand us a task rebuilt from the scheduler; the
 			// mode captured at suspend time must win so gating stays consistent.
 			task.Mode = cp.Mode
+			effTools := r.effectiveTools(task)
 			st := loopState{
 				started:          started,
 				basePrompt:       cp.BasePrompt,
@@ -302,14 +345,20 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 				cachedTokens:     cp.CachedTokens,
 				totalTokens:      cp.TotalTokens,
 				images:           cp.Images,
-				tools:            r.effectiveTools(task),
+				tools:            effTools,
+				// The resumed prompt's catalog is already baked into cp.BasePrompt
+				// from the first run; this rebuilds the dispatch-side catalog so a
+				// load_capabilities issued in a resumed round still resolves, scoped
+				// to the same effective registry.
+				catalog: r.buildCatalog(effTools),
 			}
 			return r.runToolLoop(ctx, requestID, agent, task, st)
 		}
 	}
 
 	effTools := r.effectiveTools(task)
-	prompt, err := r.buildPrompt(ctx, agent, task)
+	catalog := r.buildCatalog(effTools)
+	prompt, err := r.buildPrompt(ctx, agent, task, catalog)
 	if err != nil {
 		return domain.TaskRun{}, err
 	}
@@ -336,6 +385,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		totalTokens:      resp.TotalTokens,
 		images:           task.Images,
 		tools:            effTools,
+		catalog:          catalog,
 	}
 	return r.runToolLoop(ctx, requestID, agent, task, st)
 }
@@ -357,7 +407,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		if suspend {
 			return domain.TaskRun{}, ErrSuspended
 		}
-		results, err := r.executeToolCalls(ctx, agent, task, st.resp.ToolCalls, st.tools)
+		results, err := r.executeToolCalls(ctx, agent, task, &st)
 		if err != nil {
 			r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonToolError)
 			return domain.TaskRun{}, fmt.Errorf("execute model tool calls: %w", err)
@@ -610,10 +660,16 @@ func (r *Runtime) inferenceTools(tools *tool.Registry) []port.InferenceTool {
 	return out
 }
 
-func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task domain.Task, calls []domain.ToolCall, tools *tool.Registry) ([]domain.ToolResult, error) {
-	if tools == nil {
+// executeToolCalls runs the current round's tool calls and returns their
+// results. It takes the mutable *loopState so a dispatched load_capabilities can
+// pin definitions into st.loaded and the caller sees the write when it composes
+// the next round's prompt; it reads the pending calls, effective registry and
+// catalog off st for the same reason.
+func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task domain.Task, st *loopState) ([]domain.ToolResult, error) {
+	if st.tools == nil {
 		return nil, fmt.Errorf("tool registry unavailable")
 	}
+	calls := st.resp.ToolCalls
 	results := make([]domain.ToolResult, 0, len(calls))
 	for _, call := range calls {
 		if call.ID == "" {
@@ -627,7 +683,7 @@ func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task
 		}); err != nil {
 			return nil, fmt.Errorf("publish tool request event: %w", err)
 		}
-		result, err := r.dispatchToolCall(ctx, agent, task, call, tools)
+		result, err := r.dispatchToolCall(ctx, agent, task, call, st)
 		if err != nil {
 			if pubErr := r.events.Publish(ctx, domain.RuntimeEvent{
 				Type:      "tool_failed",
@@ -796,7 +852,7 @@ func (noopAuditLog) Events() ([]domain.AuditEvent, error) {
 	return nil, nil
 }
 
-func (r *Runtime) buildPrompt(ctx context.Context, agent domain.Agent, task domain.Task) (string, error) {
+func (r *Runtime) buildPrompt(ctx context.Context, agent domain.Agent, task domain.Task, catalog *capability.Catalog) (string, error) {
 	toolNames := r.toolNames()
 	if r.contextBuilder != nil {
 		built, err := r.contextBuilder.BuildContext(ctx, cognitive.Request{
@@ -804,6 +860,9 @@ func (r *Runtime) buildPrompt(ctx context.Context, agent domain.Agent, task doma
 			Task:              task,
 			ConversationTurns: append([]domain.ConversationTurn(nil), r.conversationTurns...),
 			Tools:             toolNames,
+			// Per-task, effective-registry-scoped catalog; nil under the eager
+			// protocol so the Core renders no <available_capabilities> block.
+			Catalog: catalog,
 		})
 		if err != nil {
 			return "", fmt.Errorf("build cognitive context: %w", err)

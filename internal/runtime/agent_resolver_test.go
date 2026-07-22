@@ -207,6 +207,7 @@ name: Go Research
 version: 1.0.0
 status: enabled
 tags: research,cache
+summary: Use evidence-first cache research.
 ---
 Use evidence-first cache research.
 `)
@@ -216,6 +217,7 @@ name: Go Writing
 version: 1.0.0
 status: enabled
 tags: write,cache
+summary: Write concise cache documentation.
 ---
 Write concise cache documentation.
 `)
@@ -240,7 +242,7 @@ Write concise cache documentation.
 		}),
 		RootConfig: config.Config{
 			ContextFiles: config.ContextFilesConfig{Root: root},
-			Runtime:      config.RuntimeConfig{MaxToolRounds: 1},
+			Runtime:      config.RuntimeConfig{MaxToolRounds: 1, LazyTools: true},
 			Skills:       config.SkillsConfig{InstallRoot: filepath.Join(root, "skills", "global")},
 		},
 		Audit:  adapter.NewMemoryAuditLog(),
@@ -359,6 +361,7 @@ name: Go Shared
 version: 1.0.0
 status: enabled
 tags: cache
+summary: Shared cache skill.
 ---
 Shared cache skill.
 `)
@@ -374,7 +377,7 @@ Shared cache skill.
 		}),
 		RootConfig: config.Config{
 			ContextFiles: config.ContextFilesConfig{Root: root},
-			Runtime:      config.RuntimeConfig{MaxToolRounds: 1},
+			Runtime:      config.RuntimeConfig{MaxToolRounds: 1, LazyTools: true},
 			Skills:       config.SkillsConfig{InstallRoot: filepath.Join(root, "skills", "global")},
 		},
 		Audit:  adapter.NewMemoryAuditLog(),

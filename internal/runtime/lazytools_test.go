@@ -21,6 +21,7 @@ func newLazyTestRegistry(audit port.AuditLog) *tool.Registry {
 	).WithAuditLog(audit)
 	registry.RegisterDescriptor(tool.Descriptor{
 		Name:        "lookup",
+		Group:       "files",
 		Description: "lookup test data",
 		InputSchema: map[string]any{
 			"required":   []string{"query"},
@@ -175,7 +176,8 @@ func TestRuntimeCallToolFailLoudOnBadInput(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			call := domain.ToolCall{ID: "meta-call", Name: metaToolCallTool, Arguments: tc.args}
-			result, err := runner.dispatchToolCall(context.Background(), agent, task, call, runner.tools)
+			st := &loopState{tools: runner.tools}
+			result, err := runner.dispatchToolCall(context.Background(), agent, task, call, st)
 			if err != nil {
 				t.Fatalf("dispatchToolCall(%s) returned Go error = %v, want fail-loud ToolResult", tc.name, err)
 			}

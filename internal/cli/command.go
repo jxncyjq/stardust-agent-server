@@ -24,6 +24,7 @@ import (
 	"github.com/stardust/legion-agent/internal/agentregistry"
 	"github.com/stardust/legion-agent/internal/app"
 	"github.com/stardust/legion-agent/internal/approval"
+	"github.com/stardust/legion-agent/internal/capability"
 	"github.com/stardust/legion-agent/internal/cognitive"
 	"github.com/stardust/legion-agent/internal/config"
 	"github.com/stardust/legion-agent/internal/contextfiles"
@@ -2185,11 +2186,18 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		WithContextFiles(defaultContext).
 		WithMemory(episodicMemory).
 		WithCapabilityMemory(capabilityStore)
+	// capabilitySkills is the skill half of the default runtime's capability
+	// catalog. It is set only when a skills root is present; the runtime builds
+	// the tool half per task from the per-task registry. WithSkills is retained
+	// for the /skills query paths but no longer injects into the prompt.
+	var capabilitySkills capability.Provider
 	if skillsRootAvailable(cfg.Skills.InstallRoot) {
-		defaultCore = defaultCore.WithSkills(skill.NewSystem(skill.Config{
+		defaultSkillSystem := skill.NewSystem(skill.Config{
 			Roots:   []string{cfg.Skills.InstallRoot},
 			Scanner: skill.NewSecurityScanner(),
-		}).WithUsage(skillUsage, time.Now))
+		}).WithUsage(skillUsage, time.Now)
+		defaultCore = defaultCore.WithSkills(defaultSkillSystem)
+		capabilitySkills = capability.NewSkillProvider(defaultSkillSystem)
 	}
 
 	// The default task runner rebuilds its tool registry (and thus the
@@ -2201,15 +2209,16 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// shared across every call, same as before.
 	defaultRunner := &defaultTaskRunner{
 		runtimeCfg: agentruntime.Config{
-			Maas:           defaultMaas,
-			Audit:          auditLog,
-			Events:         workflowEvents,
-			ContextBuilder: defaultCore,
-			MaxToolRounds:  cfg.Runtime.MaxToolRounds,
-			LazyTools:      cfg.Runtime.LazyTools,
-			Checkpoints:    checkpointStore,
-			ToolGate:       manualGate,
-			Logger:         logger,
+			Maas:             defaultMaas,
+			Audit:            auditLog,
+			Events:           workflowEvents,
+			ContextBuilder:   defaultCore,
+			MaxToolRounds:    cfg.Runtime.MaxToolRounds,
+			LazyTools:        cfg.Runtime.LazyTools,
+			Checkpoints:      checkpointStore,
+			ToolGate:         manualGate,
+			Logger:           logger,
+			CapabilitySkills: capabilitySkills,
 		},
 		contextRoot:     cfg.ContextFiles.Root,
 		audit:           auditLog,
