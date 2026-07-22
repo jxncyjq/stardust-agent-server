@@ -1753,16 +1753,29 @@ usage.Touch 从 SelectForTask 迁到这里。Curator 靠使用记录做老化清
 
 ---
 
-### Task 7: 目录接进 `basePrompt` 并撤掉旧的技能注入
+### Task 7: 目录接进 `basePrompt`、撤旧技能注入、并把 `load_capabilities` 接进 dispatch 路由
+
+> **本任务额外认领 Task 6 遗留的缺口（Task 6 review 的 Important B 发现）**：`load_capabilities` 已被 offered 给模型（在 `metaInferenceTools` 里），但 `dispatchToolCall`（`internal/runtime/lazytools.go`）的 switch 尚未路由它 —— 目前只有 `case metaToolCallTool`，`load_capabilities` 会走 `default` 分支 `unhandled meta tool` 而中止任务。原因是 `dispatchToolCall` 当前签名 `(ctx, agent, task, call, tools)` 拿不到两样东西：可变的 `*loopState`（`dispatchLoadCapabilities` 要写 `st.loaded`）和 `*capability.Catalog`（明细来源）。本任务把 catalog 接进 runtime 的同时，必须把这两样穿到 dispatch 层并补上路由，否则该功能对用户永久不可用。
+>
+> 具体接线（在本任务的 core/prompt 改动之外增加）：
+> - `Runtime` 需要能拿到 per-run 的 `*capability.Catalog`。它与 prompt 构建用的是同一个 catalog —— 在 `runToolLoop` / `executeToolCalls` / `dispatchToolCall` 的调用链上把 catalog 与 `st` 的可变引用穿下去（当前 `runToolLoop` 收的是 `st loopState` 值，`executeToolCalls`(`runtime.go:613`)、`dispatchToolCall`(`lazytools.go:137`) 都要相应改签名以携带 `*loopState` 和 `*capability.Catalog`）。
+> - `dispatchToolCall` 的 switch 增加 `case metaToolLoadCapabilities: return r.dispatchLoadCapabilities(ctx, st, call, catalog)`。
+> - **作用域安全**：路由用的 catalog 必须与该任务 effective registry 同源（Plan 模式下 catalog 由 effective registry 构建，见 Task 8 的作用域测试）—— 不能用一个更宽的全局 catalog，否则 `load_capabilities` 会成为绕过 Plan 只读限制的通道。
+> - Task 6 已把 `lazyToolHint` 改为引导 `load_capabilities`；本任务路由接好后，该引导才真正可用。补一个端到端测试：让模型（用桩 MaaS）发一个 `load_capabilities` 调用，断言它**不**走 `unhandled meta tool`、而是真的把明细钉进 `st.loaded`。
+>
+> `dispatchToolCall` 现有注释（`lazytools.go:129-136`）说明了「load_capabilities 未路由、留给接入 catalog 到 RunTask 的那个任务」——本任务就是那个任务，接好后更新/删除该注释。
 
 **Files:**
 - Modify: `internal/cognitive/core.go:234-259`（`skillBlock`）
-- Modify: `internal/runtime/agent_resolver.go:104` 与 `internal/cli/command.go:2189`（装配 `SkillProvider`）
-- Test: `internal/cognitive/core_catalog_test.go`
+- Modify: `internal/runtime/agent_resolver.go:104` 与 `internal/cli/command.go:2189`（装配 `SkillProvider` + `NewToolProvider` 组成 catalog）
+- Modify: `internal/runtime/runtime.go`（`runToolLoop` / `executeToolCalls` 携带 catalog 与 `*loopState`）、`internal/runtime/lazytools.go`（`dispatchToolCall` 路由 `load_capabilities`）
+- Test: `internal/cognitive/core_catalog_test.go`、`internal/runtime`（load_capabilities 端到端路由测试）
 
 **Interfaces:**
-- Consumes: Task 1-4 的 `Catalog` / `Render` / `NewSkillProvider` / `NewToolProvider`
-- Produces: `Core` 的 `WithSkills` 改为接受 `*capability.Catalog`（或新增 `WithCatalog`），`skillBlock` 输出 `capability.Render` 的结果
+- Consumes: Task 1-6 的 `Catalog` / `Render` / `NewSkillProvider` / `NewToolProvider` / `dispatchLoadCapabilities` / `metaToolLoadCapabilities`
+- Produces: `Core` 的 `WithSkills` 改为接受 `*capability.Catalog`（或新增 `WithCatalog`），`skillBlock` 输出 `capability.Render` 的结果；`dispatchToolCall` 路由 `load_capabilities`
+
+**注意**：本任务比计划原文范围更大（含 dispatch 路由接线），拆分实施时可分成「7a 目录进 prompt + 撤旧注入」与「7b catalog/loopState 穿进 dispatch + 路由 load_capabilities」两步各自 TDD，但两步都属本任务、一起 review。
 
 - [ ] **Step 1: 写失败测试**
 
