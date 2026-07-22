@@ -64,6 +64,20 @@ func TestAppendLoadedRejectsOversizedDetail(t *testing.T) {
 	}
 }
 
+func TestAppendLoadedRejectsWhenSoleSurvivorStillExceedsBudget(t *testing.T) {
+	t.Parallel()
+	// detail(990) 单独 <= maxChars(1000),入口校验放行;但 name(30)+detail(990)=1020
+	// 才是驱逐循环真正比较的 loadedSize 口径。驱逐到只剩这一条时循环因
+	// len(kept)>1 为假而停止,若函数此时返回 nil error,就是把一个明知超预算
+	// 的区块当作正常结果静默交还给调用方 —— 违反 fail-loud。
+	name := "a-fairly-long-capability-name"
+	detail := strings.Repeat("x", 990)
+	_, _, err := appendLoaded(nil, name, detail, 1000)
+	if err == nil {
+		t.Fatal("appendLoaded() error = nil, want an error: name+detail exceeds maxChars even though detail alone does not")
+	}
+}
+
 func TestRenderLoadedStatesEvictions(t *testing.T) {
 	t.Parallel()
 	got := renderLoaded([]loadedEntry{{name: "read_file", detail: "SCHEMA"}})
@@ -74,19 +88,38 @@ func TestRenderLoadedStatesEvictions(t *testing.T) {
 
 func TestComposePromptTrimsToolOutputNotLoadedBlock(t *testing.T) {
 	t.Parallel()
-	base := "BASE-PROMPT"
+	const maxPromptChars = 300 // headLen = maxPromptChars/3 = 100 inside boundPrompt
+
+	// base must be long enough on its own to run past boundPrompt's headLen
+	// (100 runes), so that under a merged single-budget boundPrompt(base+
+	// loadedBlock+toolCtx, maxPromptChars) call, the loaded block that follows
+	// it starts *after* the kept head window. The marker text itself sits at
+	// the very front of base (within the head window), so it always survives
+	// regardless of implementation -- it is the loaded block's marker below
+	// that has to discriminate the two implementations.
+	base := "BASE-PROMPT" + strings.Repeat("z", 200) // 211 runes > headLen(100)
 	loaded := []loadedEntry{{name: "read_file", detail: "LOADED-SCHEMA-MARKER"}}
+	// toolCtx must be large enough that it alone spans the merged boundPrompt's
+	// tail window (tailLen = maxPromptChars-headLen = 200 runes), so the tail
+	// kept by a merged boundPrompt call is carved entirely out of toolCtx and
+	// never reaches back into the loaded block that precedes it.
 	toolCtx := []toolEntry{{key: "k", text: strings.Repeat("t", 5000)}}
 
-	got := composePrompt(base, loaded, toolCtx, 1000)
+	got := composePrompt(base, loaded, toolCtx, maxPromptChars)
 
 	if !strings.Contains(got, "BASE-PROMPT") {
 		t.Error("base prompt was trimmed: the task framing must survive")
 	}
+	// This is the assertion with discriminating power: under a merged single-
+	// budget boundPrompt(base+loadedBlock+toolCtx, maxPromptChars) call, the
+	// loaded block falls in the dropped middle (base alone already exceeds
+	// headLen, and toolCtx alone already exceeds tailLen), so the marker is
+	// lost. Only a true three-part composePrompt -- which never trims base or
+	// the loaded block -- keeps it.
 	if !strings.Contains(got, "LOADED-SCHEMA-MARKER") {
 		t.Error("loaded block was trimmed: a schema that silently vanishes leaves the model calling from memory")
 	}
-	if len([]rune(got)) > 1000+len([]rune(base))+len([]rune(renderLoaded(loaded))) {
+	if len([]rune(got)) > maxPromptChars+len([]rune(base))+len([]rune(renderLoaded(loaded))) {
 		t.Errorf("composed prompt is %d runes, larger than the budget allows", len([]rune(got)))
 	}
 }

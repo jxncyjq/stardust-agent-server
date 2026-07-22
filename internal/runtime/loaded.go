@@ -19,7 +19,14 @@ type loadedEntry struct {
 // invalid JSON schema or a half a skill -- both worse than a refusal it can
 // see and react to.
 func appendLoaded(entries []loadedEntry, name, detail string, maxChars int) ([]loadedEntry, []string, error) {
-	if size := len([]rune(detail)); maxChars > 0 && size > maxChars {
+	// Same size accounting as the eviction loop below (loadedSize: name+detail).
+	// A weaker check here (e.g. detail alone) can pass while name+detail still
+	// exceeds maxChars; once eviction reduces kept to this sole entry, the loop
+	// stops on len(kept)>1 without ever re-checking the budget, so a mismatched
+	// check here would let a block that is known to exceed maxChars come back
+	// with a nil error -- fail-loud forbids returning a look-normal value like
+	// that to mask the invariant violation.
+	if size := len([]rune(name)) + len([]rune(detail)); maxChars > 0 && size > maxChars {
 		return entries, nil, fmt.Errorf("capability %q is too large to load: %d chars, limit %d", name, size, maxChars)
 	}
 	kept := make([]loadedEntry, 0, len(entries)+1)
