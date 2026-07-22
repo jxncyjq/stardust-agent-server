@@ -107,6 +107,13 @@ func (r *Runtime) newSubRuntime(role string, toolsets []string) (*Runtime, error
 		// effective registry, which may be a narrowed subset); it only needs the
 		// skill provider carried over so its catalog can list skills too. Its
 		// loaded block still starts empty -- the child gets an independent context.
+		//
+		// This is structural, not incidental: "loaded" lives on loopState, which
+		// RunTask constructs fresh for every run (including a child's own
+		// RunTask call below), not on Runtime. Runtime carries no loaded-capability
+		// field at all, so there is nothing here for newSubRuntime to copy from
+		// the parent even if it wanted to -- a parent's in-flight loaded block
+		// simply has no path into a spawned child's loopState.
 		capabilitySkills: r.capabilitySkills,
 	}
 	return child, nil

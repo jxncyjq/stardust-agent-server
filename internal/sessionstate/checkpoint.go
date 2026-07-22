@@ -14,7 +14,14 @@ import (
 // CheckpointSchemaVersion versions the on-disk checkpoint format. Load rejects a
 // checkpoint whose version it does not recognise (fail-loud) rather than
 // half-decoding a future/older layout and resuming a task from wrong state.
-const CheckpointSchemaVersion = 2
+//
+// v3 adds the Loaded field (capability catalog entries pinned into the run's
+// loaded block). A v3 checkpoint that happens to carry no "loaded" key still
+// decodes fine — Loaded simply comes back nil, which is the legitimate state
+// for a run that never called load_capabilities. That is a JSON-decoding
+// nicety, not a schema-version concession: a checkpoint tagged with an older
+// SchemaVersion is still rejected outright by the check below, same as before.
+const CheckpointSchemaVersion = 3
 
 // checkpointFileName is the single per-session checkpoint file, per design §4.0.
 const checkpointFileName = "task-state.json"
@@ -55,6 +62,21 @@ type Checkpoint struct {
 	// to locate this checkpoint's session directory rather than defaulting back
 	// to the workspace root.
 	WorkingDir string `json:"working_dir,omitempty"`
+	// Loaded carries the capabilities whose full definitions the model pulled
+	// during this run (via load_capabilities), so a resumed task does not have
+	// to rediscover and reload them. An empty/absent Loaded is legitimate: a
+	// fresh task, one that never called load_capabilities, or a checkpoint
+	// written before this field existed all restore to no loaded capabilities,
+	// and the model can simply load them again if it needs to.
+	Loaded []LoadedCapability `json:"loaded,omitempty"`
+}
+
+// LoadedCapability is one entry of the loaded block, persisted verbatim so a
+// resumed run's prompt can re-render the exact same "Loaded capabilities:"
+// section the suspended run had, without re-querying the capability catalog.
+type LoadedCapability struct {
+	Name   string `json:"name"`
+	Detail string `json:"detail"`
 }
 
 // Store persists task checkpoints under a base directory, one file per session

@@ -34,3 +34,26 @@ func restoreToolEntries(snaps []sessionstate.ToolEntrySnapshot) []toolEntry {
 	}
 	return out
 }
+
+// snapshotLoaded converts the runtime's internal (unexported-field) loaded
+// block into the serialisable checkpoint form, so a suspended run's pinned
+// capability definitions survive a resume without having to be reloaded.
+func snapshotLoaded(entries []loadedEntry) []sessionstate.LoadedCapability {
+	out := make([]sessionstate.LoadedCapability, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, sessionstate.LoadedCapability{Name: e.name, Detail: e.detail})
+	}
+	return out
+}
+
+// restoreLoaded rebuilds the internal loaded block from a checkpoint's Loaded
+// snapshot. An empty/nil snaps is legitimate (fresh task, a run that never
+// called load_capabilities, or a checkpoint written before this field
+// existed) and restores to an empty loaded block, not an error.
+func restoreLoaded(snaps []sessionstate.LoadedCapability) []loadedEntry {
+	out := make([]loadedEntry, 0, len(snaps))
+	for _, s := range snaps {
+		out = append(out, loadedEntry{name: s.Name, detail: s.Detail})
+	}
+	return out
+}
