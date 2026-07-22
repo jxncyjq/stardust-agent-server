@@ -127,7 +127,7 @@ func RegisterTaskLedgerTools(registry *Registry, ledger *taskledger.Ledger) {
 }
 
 func createTaskDescriptor() Descriptor {
-	return taskDescriptor("create_task", "Create a task ledger task and rebuild task projections.", "medium", true, // writes task ledger events
+	return taskDescriptor("create_task", "tasks", "Create a task ledger task and rebuild task projections.", "medium", true, // writes task ledger events
 		[]string{"title"}, map[string]any{
 			"task_id":         taskString("Optional stable task id; generated when omitted."),
 			"title":           taskString("Human-readable task title."),
@@ -140,7 +140,7 @@ func createTaskDescriptor() Descriptor {
 }
 
 func claimTaskDescriptor() Descriptor {
-	return taskDescriptor("claim_task", "Claim a task for a registered agent and rebuild task projections.", "medium", true, // writes task ledger events
+	return taskDescriptor("claim_task", "tasks", "Claim a task for a registered agent and rebuild task projections.", "medium", true, // writes task ledger events
 		[]string{"task_id", "owner"}, map[string]any{
 			"task_id":         taskString("Task id to claim."),
 			"owner":           taskString("Registered agent id claiming the task."),
@@ -150,7 +150,7 @@ func claimTaskDescriptor() Descriptor {
 }
 
 func updateTaskDescriptor() Descriptor {
-	return taskDescriptor("update_task", "Update task ledger status and summary.", "medium", true, // writes task ledger events
+	return taskDescriptor("update_task", "tasks", "Update task ledger status and summary.", "medium", true, // writes task ledger events
 		[]string{"task_id", "status"}, map[string]any{
 			"task_id":         taskString("Task id to update."),
 			"status":          taskString("New status."),
@@ -161,7 +161,7 @@ func updateTaskDescriptor() Descriptor {
 }
 
 func appendTaskMessageDescriptor() Descriptor {
-	return taskDescriptor("append_task_message", "Append a task message, handoff, result, or review event.", "medium", true, // writes task ledger events
+	return taskDescriptor("append_task_message", "tasks", "Append a task message, handoff, result, or review event.", "medium", true, // writes task ledger events
 		[]string{"task_id", "summary"}, map[string]any{
 			"task_id":         taskString("Task id to append to."),
 			"type":            taskString("message, handoff, result, or review. Defaults to message."),
@@ -175,16 +175,16 @@ func appendTaskMessageDescriptor() Descriptor {
 }
 
 func readTaskDescriptor() Descriptor {
-	return taskDescriptor("read_task", "Read a generated task detail projection from TaskLedger.", "low", false,
+	return taskDescriptor("read_task", "tasks", "Read a generated task detail projection from TaskLedger.", "low", false,
 		[]string{"task_id"}, map[string]any{"task_id": taskString("Task id to read.")})
 }
 
 func rebuildTasksDescriptor() Descriptor {
-	return taskDescriptor("rebuild_tasks", "Replay task ledger events and rebuild tasks.md projections.", "medium", true, // rewrites tasks.md index projections
+	return taskDescriptor("rebuild_tasks", "tasks", "Replay task ledger events and rebuild tasks.md projections.", "medium", true, // rewrites tasks.md index projections
 		nil, map[string]any{})
 }
 
-func taskDescriptor(name, description, risk string, sensitive bool, required []string, properties map[string]any) Descriptor {
+func taskDescriptor(name, group, description, risk string, sensitive bool, required []string, properties map[string]any) Descriptor {
 	schema := map[string]any{
 		"type":       "object",
 		"properties": properties,
@@ -197,6 +197,7 @@ func taskDescriptor(name, description, risk string, sensitive bool, required []s
 		Description: description,
 		RiskLevel:   risk,
 		Timeout:     5 * time.Second,
+		Group:       group,
 		InputSchema: schema,
 		Sensitive:   sensitive,
 	}

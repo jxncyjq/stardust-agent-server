@@ -44,6 +44,7 @@ func sessionSearchDescriptor() Descriptor {
 			"(3) browse — pass no query to list the most recent sessions. Optional limit/window bound the result size.",
 		RiskLevel: "low",
 		Timeout:   5 * time.Second,
+		Group:     "history",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{

@@ -584,6 +584,30 @@ func TestRuntimeGracefullyAnswersWhenToolBudgetExhausted(t *testing.T) {
 	}
 }
 
+// TestLazyToolHintPointsToLoadCapabilitiesNotListTools guards against
+// regressing to the deleted list_tools meta tool. The hint text is spliced
+// directly into the prompt sent to the model (buildPrompt), so if it ever
+// tells the model to call list_tools again the model will call a tool that
+// dispatchToolCall does not recognize, aborting the task with "unhandled
+// meta tool" (see internal/runtime/lazytools.go dispatchToolCall).
+func TestLazyToolHintPointsToLoadCapabilitiesNotListTools(t *testing.T) {
+	t.Parallel()
+
+	runner := NewRuntime(Config{
+		Maas:      adapter.NewRecordingMaas("done"),
+		LazyTools: true,
+	})
+
+	hint := runner.lazyToolHint([]string{"lookup"})
+
+	if strings.Contains(hint, "list_tools") {
+		t.Fatalf("lazyToolHint() = %q, must not reference the deleted list_tools meta tool", hint)
+	}
+	if !strings.Contains(hint, "load_capabilities") {
+		t.Fatalf("lazyToolHint() = %q, want it to guide the model to load_capabilities", hint)
+	}
+}
+
 func hasRuntimeEvent(events []domain.RuntimeEvent, eventType string) bool {
 	for _, event := range events {
 		if event.Type == eventType {

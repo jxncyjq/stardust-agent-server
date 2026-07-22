@@ -27,3 +27,25 @@ func TestToolEntrySnapshotRoundTrip(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadedSnapshotRoundTrip(t *testing.T) {
+	entries := []loadedEntry{
+		{name: "read_file", detail: `{"name":"read_file"}`},
+		{name: "curator", detail: "skill body text"},
+	}
+	restored := restoreLoaded(snapshotLoaded(entries))
+	if len(restored) != len(entries) {
+		t.Fatalf("restored len = %d, want %d", len(restored), len(entries))
+	}
+	for i := range entries {
+		if restored[i].name != entries[i].name || restored[i].detail != entries[i].detail {
+			t.Errorf("restored[%d] = %+v, want %+v", i, restored[i], entries[i])
+		}
+	}
+}
+
+func TestLoadedSnapshotRoundTripEmptyIsEmpty(t *testing.T) {
+	if got := restoreLoaded(snapshotLoaded(nil)); len(got) != 0 {
+		t.Fatalf("restoreLoaded(snapshotLoaded(nil)) = %#v, want empty", got)
+	}
+}

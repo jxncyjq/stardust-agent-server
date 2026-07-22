@@ -46,6 +46,7 @@ func delegateTaskDescriptor() tool.Descriptor {
 			"role is \"leaf\" (default, cannot re-delegate) or \"orchestrator\" (may nest until the depth limit).",
 		RiskLevel: "high",
 		Timeout:   5 * time.Minute,
+		Group:     "agents",
 		Sensitive: true, // spawns sub-agents with side effects of their own
 		InputSchema: map[string]any{
 			"type": "object",

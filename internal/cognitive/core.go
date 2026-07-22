@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/stardust/legion-agent/internal/capability"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/memory"
 	"github.com/stardust/legion-agent/internal/skill"
@@ -15,6 +16,12 @@ type Request struct {
 	Task              domain.Task
 	Tools             []string
 	ConversationTurns []domain.ConversationTurn
+	// Catalog, when non-nil, is the per-task capability catalog rendered into the
+	// prompt. The runtime supplies one built from the run's effective (per-task,
+	// Plan-scoped) tool registry so the prompt advertises exactly what that task
+	// may load and dispatch. It takes precedence over the Core-level catalog set
+	// by WithCatalog; when nil the Core-level catalog is used (standalone/tests).
+	Catalog *capability.Catalog
 }
 
 type BuiltContext struct {
@@ -49,6 +56,7 @@ type Core struct {
 	compressor       Compressor
 	memory           MemoryProvider
 	skills           SkillProvider
+	catalog          *capability.Catalog
 	capabilityMemory CapabilityMemoryProvider
 	contextFiles     string
 }
@@ -62,8 +70,31 @@ func (c *Core) WithMemory(memory MemoryProvider) *Core {
 	return c
 }
 
+// WithSkills attaches the skill selector.
+//
+// Deprecated for prompt building: skills now reach the model through the
+// capability catalog (WithCatalog), which lists every skill rather than a
+// keyword-matched top-N. SelectForTask is kept for the /skills query paths and
+// for future catalog search scoring; it no longer injects anything into a
+// prompt.
 func (c *Core) WithSkills(skills SkillProvider) *Core {
 	c.skills = skills
+	return c
+}
+
+// WithCatalog attaches the capability catalog rendered into the prompt.
+//
+// The catalog lists every callable tool and loadable skill, one line each, so
+// its rendering is the same for every task of the same agent -- unlike the
+// previous keyword-matched skill selection, which changed the task framing per
+// task and so missed the provider prompt cache on every task. The model pulls
+// the full definition of whatever it needs with load_capabilities.
+//
+// Request.Catalog, when set, overrides this per task: the runtime passes a
+// catalog scoped to the run's effective tool registry so the prompt matches
+// exactly what that task may load and dispatch.
+func (c *Core) WithCatalog(catalog *capability.Catalog) *Core {
+	c.catalog = catalog
 	return c
 }
 
@@ -89,7 +120,7 @@ func (c *Core) BuildContext(ctx context.Context, req Request) (BuiltContext, err
 	if err != nil {
 		return BuiltContext{}, err
 	}
-	skillBlock, err := c.skillBlock(ctx, req)
+	catalogBlock, err := c.catalogBlock(ctx, req)
 	if err != nil {
 		return BuiltContext{}, err
 	}
@@ -115,8 +146,8 @@ func (c *Core) BuildContext(ctx context.Context, req Request) (BuiltContext, err
 	if capabilityBlock != "" {
 		prompt += capabilityBlock
 	}
-	if skillBlock != "" {
-		prompt += skillBlock
+	if catalogBlock != "" {
+		prompt += catalogBlock
 	}
 	result, err := c.compressor.Compress(ctx, prompt)
 	if err != nil {
@@ -231,32 +262,30 @@ func (c *Core) capabilityBlock(ctx context.Context, req Request) (string, error)
 	return b.String(), nil
 }
 
-func (c *Core) skillBlock(ctx context.Context, req Request) (string, error) {
-	if c.skills == nil {
+// catalogBlock renders the capability catalog into the prompt.
+//
+// It replaces the previous keyword-matched skill injection, which scored skills
+// against task.Input, took the top three, and fell back to injecting a skill's
+// entire body when it declared no summary. That made the task framing different
+// for every task -- so the provider prompt cache missed on every task -- and let
+// the system guess on the model's behalf. The catalog lists everything in one
+// line each; the model pulls what it wants with load_capabilities.
+//
+// Request.Catalog (the per-task, effective-registry-scoped catalog the runtime
+// supplies) takes precedence over the Core-level catalog set by WithCatalog.
+func (c *Core) catalogBlock(ctx context.Context, req Request) (string, error) {
+	catalog := req.Catalog
+	if catalog == nil {
+		catalog = c.catalog
+	}
+	if catalog == nil {
 		return "", nil
 	}
-	injections, err := c.skills.SelectForTask(ctx, req.Task, 3)
+	entries, err := catalog.Entries(ctx)
 	if err != nil {
-		return "", fmt.Errorf("select task skills: %w", err)
+		return "", fmt.Errorf("build capability catalog: %w", err)
 	}
-	if len(injections) == 0 {
-		return "", nil
-	}
-	var b strings.Builder
-	b.WriteString("Mounted skills:\n")
-	for _, injection := range injections {
-		if !skill.IsInjectable(injection.Skill) {
-			continue
-		}
-		b.WriteString("- ")
-		b.WriteString(injection.Skill.ID)
-		b.WriteString(" (")
-		b.WriteString(injection.Skill.Name)
-		b.WriteString("): ")
-		b.WriteString(firstNonEmpty(injection.Skill.Summary, injection.Skill.Content))
-		b.WriteString("\n")
-	}
-	return b.String(), nil
+	return capability.Render(entries), nil
 }
 
 func queryTags(input string) []string {
@@ -272,15 +301,6 @@ func queryTags(input string) []string {
 		tags = append(tags, field)
 	}
 	return tags
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		if strings.TrimSpace(value) != "" {
-			return value
-		}
-	}
-	return ""
 }
 
 type NoopCompressor struct{}

@@ -1,6 +1,7 @@
 package sessionstate
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -224,6 +225,57 @@ func TestListSuspendedInScansGivenBase(t *testing.T) {
 	}
 	if len(got) != 1 || got[0].TaskID != "t1" {
 		t.Fatalf("ListSuspendedIn = %#v, want 1 checkpoint t1", got)
+	}
+}
+
+func TestCheckpointRoundTripPreservesLoaded(t *testing.T) {
+	store := NewStore(t.TempDir())
+	cp := sampleCheckpoint("sess-loaded")
+	cp.Loaded = []LoadedCapability{
+		{Name: "read_file", Detail: `{"name":"read_file"}`},
+		{Name: "curator", Detail: "skill body text"},
+	}
+	if err := store.Save(cp); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	got, ok, err := store.Load("sess-loaded", "")
+	if err != nil || !ok {
+		t.Fatalf("Load: ok=%v err=%v", ok, err)
+	}
+	if len(got.Loaded) != 2 {
+		t.Fatalf("Load Loaded = %#v, want 2 entries", got.Loaded)
+	}
+	if got.Loaded[0].Name != "read_file" || got.Loaded[0].Detail != `{"name":"read_file"}` {
+		t.Errorf("Load Loaded[0] = %#v, want the read_file entry preserved verbatim", got.Loaded[0])
+	}
+	if got.Loaded[1].Name != "curator" || got.Loaded[1].Detail != "skill body text" {
+		t.Errorf("Load Loaded[1] = %#v, want the curator entry preserved verbatim", got.Loaded[1])
+	}
+}
+
+// TestLoadCheckpointWithoutLoadedFieldIsEmptyNotError pins that a checkpoint
+// JSON payload with no "loaded" key at all (the shape a v3 checkpoint has
+// whenever the run never called load_capabilities) decodes to an empty Loaded
+// with no error -- absence here is a legitimate optional state, not a fault.
+func TestLoadCheckpointWithoutLoadedFieldIsEmptyNotError(t *testing.T) {
+	dir := t.TempDir()
+	sessDir := SessionDir(dir, "sess-noloaded")
+	if err := os.MkdirAll(sessDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	payload := fmt.Sprintf(`{"schema_version":%d,"task_id":"t1","session_key":"sess-noloaded"}`, CheckpointSchemaVersion)
+	if err := os.WriteFile(filepath.Join(sessDir, checkpointFileName), []byte(payload), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, ok, err := NewStore(dir).Load("sess-noloaded", "")
+	if err != nil {
+		t.Fatalf("Load error = %v, want nil (missing loaded key is legal)", err)
+	}
+	if !ok {
+		t.Fatal("Load ok = false, want true")
+	}
+	if len(got.Loaded) != 0 {
+		t.Fatalf("Loaded = %#v, want empty", got.Loaded)
 	}
 }
 

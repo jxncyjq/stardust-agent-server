@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 	"testing"
 
@@ -22,6 +21,7 @@ func newLazyTestRegistry(audit port.AuditLog) *tool.Registry {
 	).WithAuditLog(audit)
 	registry.RegisterDescriptor(tool.Descriptor{
 		Name:        "lookup",
+		Group:       "files",
 		Description: "lookup test data",
 		InputSchema: map[string]any{
 			"required":   []string{"query"},
@@ -46,10 +46,10 @@ func TestInferenceToolsLazyOffersOnlyMetaTools(t *testing.T) {
 		t.Fatalf("lazy inferenceTools() = %d tools, want 2 meta tools: %#v", len(tools), tools)
 	}
 	names := map[string]bool{tools[0].Name: true, tools[1].Name: true}
-	if !names[metaToolListTools] || !names[metaToolCallTool] {
-		t.Fatalf("lazy inferenceTools() names = %v, want list_tools and call_tool", names)
+	if !names[metaToolLoadCapabilities] || !names[metaToolCallTool] {
+		t.Fatalf("lazy inferenceTools() names = %v, want load_capabilities and call_tool", names)
 	}
-	for _, want := range []string{metaToolListTools, metaToolCallTool} {
+	for _, want := range []string{metaToolLoadCapabilities, metaToolCallTool} {
 		if names[want] && strings.Contains(strings.ToLower(want), "lookup") {
 			t.Fatalf("lazy inferenceTools() leaked real tool name %q", want)
 		}
@@ -70,9 +70,9 @@ func TestInferenceToolsEagerOffersFullSchema(t *testing.T) {
 	}
 }
 
-// lazyToolCallingMaas drives the lazy protocol: round 1 lists tools, round 2
-// calls the real lookup tool via call_tool, round 3 answers in text. It records
-// the offered tools per round so tests can assert only meta tools were exposed.
+// lazyToolCallingMaas drives the lazy protocol: round 1 calls the real lookup
+// tool via call_tool, round 2 answers in text. It records the offered tools
+// per round so tests can assert only meta tools were exposed.
 type lazyToolCallingMaas struct {
 	prompts []string
 	tools   [][]port.InferenceTool
@@ -87,12 +87,6 @@ func (m *lazyToolCallingMaas) Generate(ctx context.Context, req port.InferenceRe
 	switch len(m.prompts) {
 	case 1:
 		return port.InferenceResponse{ToolCalls: []domain.ToolCall{{
-			ID:        "meta-list",
-			Name:      metaToolListTools,
-			Arguments: map[string]string{},
-		}}}, nil
-	case 2:
-		return port.InferenceResponse{ToolCalls: []domain.ToolCall{{
 			ID:        "meta-call",
 			Name:      metaToolCallTool,
 			Arguments: map[string]string{"tool_name": "lookup", "arguments_json": `{"query":"cache"}`},
@@ -102,7 +96,7 @@ func (m *lazyToolCallingMaas) Generate(ctx context.Context, req port.InferenceRe
 	}
 }
 
-func TestRuntimeLazyListToolsAndCallToolDispatch(t *testing.T) {
+func TestRuntimeLazyCallToolDispatch(t *testing.T) {
 	t.Parallel()
 
 	maas := &lazyToolCallingMaas{}
@@ -126,8 +120,8 @@ func TestRuntimeLazyListToolsAndCallToolDispatch(t *testing.T) {
 	if run.Result != "cache uses map" {
 		t.Fatalf("RunTask(lazy).Result = %q, want final answer", run.Result)
 	}
-	if len(maas.prompts) != 3 {
-		t.Fatalf("lazy maas prompts = %d, want 3 (list, call, answer)", len(maas.prompts))
+	if len(maas.prompts) != 2 {
+		t.Fatalf("lazy maas prompts = %d, want 2 (call, answer)", len(maas.prompts))
 	}
 	// Every inference must have offered only the two meta tools.
 	for round, tools := range maas.tools {
@@ -135,56 +129,13 @@ func TestRuntimeLazyListToolsAndCallToolDispatch(t *testing.T) {
 			t.Fatalf("round %d offered %d tools, want 2 meta tools: %#v", round, len(tools), tools)
 		}
 	}
-	// The list_tools result fed into round 2 must contain the real tool catalog.
-	if !strings.Contains(maas.prompts[1], "lookup") {
-		t.Fatalf("round 2 prompt missing list_tools catalog with real tool name:\n%s", maas.prompts[1])
-	}
-	// The call_tool result fed into round 3 must contain the real tool output.
-	if !strings.Contains(maas.prompts[2], "cache is implemented by map") {
-		t.Fatalf("round 3 prompt missing real tool output:\n%s", maas.prompts[2])
+	// The call_tool result fed into round 2 must contain the real tool output.
+	if !strings.Contains(maas.prompts[1], "cache is implemented by map") {
+		t.Fatalf("round 2 prompt missing real tool output:\n%s", maas.prompts[1])
 	}
 	runtimeEvents := mustRuntimeEvents(t, events)
 	if !hasRuntimeEvent(runtimeEvents, "tool_executed") {
 		t.Fatalf("runtime events missing tool_executed for real tool: %#v", runtimeEvents)
-	}
-}
-
-func TestRuntimeListToolsCatalogExcludesMetaToolsAndFilters(t *testing.T) {
-	t.Parallel()
-
-	runner := NewRuntime(Config{
-		Maas:      &captureMaas{response: "done"},
-		Tools:     newLazyTestRegistry(adapter.NewMemoryAuditLog()),
-		LazyTools: true,
-	})
-	catalog, err := runner.listToolsCatalog("", runner.tools)
-	if err != nil {
-		t.Fatalf("listToolsCatalog() error = %v, want nil", err)
-	}
-	var decoded struct {
-		Tools []toolCatalogEntry `json:"tools"`
-	}
-	if err := json.Unmarshal([]byte(catalog), &decoded); err != nil {
-		t.Fatalf("listToolsCatalog() returned invalid JSON: %v\n%s", err, catalog)
-	}
-	if len(decoded.Tools) != 1 || decoded.Tools[0].Name != "lookup" {
-		t.Fatalf("listToolsCatalog() = %#v, want only the real lookup tool", decoded.Tools)
-	}
-	for _, entry := range decoded.Tools {
-		if isMetaTool(entry.Name) {
-			t.Fatalf("listToolsCatalog() leaked meta tool %q", entry.Name)
-		}
-	}
-	// A non-matching query filters everything out.
-	filtered, err := runner.listToolsCatalog("nonexistent", runner.tools)
-	if err != nil {
-		t.Fatalf("listToolsCatalog(query) error = %v, want nil", err)
-	}
-	if err := json.Unmarshal([]byte(filtered), &decoded); err != nil {
-		t.Fatalf("filtered catalog invalid JSON: %v", err)
-	}
-	if len(decoded.Tools) != 0 {
-		t.Fatalf("listToolsCatalog(\"nonexistent\") = %#v, want empty", decoded.Tools)
 	}
 }
 
@@ -225,7 +176,8 @@ func TestRuntimeCallToolFailLoudOnBadInput(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			call := domain.ToolCall{ID: "meta-call", Name: metaToolCallTool, Arguments: tc.args}
-			result, err := runner.dispatchToolCall(context.Background(), agent, task, call, runner.tools)
+			st := &loopState{tools: runner.tools}
+			result, err := runner.dispatchToolCall(context.Background(), agent, task, call, st)
 			if err != nil {
 				t.Fatalf("dispatchToolCall(%s) returned Go error = %v, want fail-loud ToolResult", tc.name, err)
 			}

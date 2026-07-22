@@ -113,7 +113,11 @@ func TestCoreBuildContextIncludesRecentConversationTurns(t *testing.T) {
 	}
 }
 
-func TestCoreBuildContextMountsTaskSkills(t *testing.T) {
+// TestCoreBuildContextDoesNotInjectSelectedSkills pins the behaviour change:
+// WithSkills is retained for the /skills query paths, but SelectForTask no
+// longer injects a keyword-matched top-N into the prompt. Skills reach the
+// model only through the capability catalog (WithCatalog) now.
+func TestCoreBuildContextDoesNotInjectSelectedSkills(t *testing.T) {
 	t.Parallel()
 
 	core := NewCore(NoopCompressor{}).WithSkills(fakeSkillProvider{
@@ -139,55 +143,11 @@ func TestCoreBuildContextMountsTaskSkills(t *testing.T) {
 	if err != nil {
 		t.Fatalf("BuildContext() error = %v, want nil", err)
 	}
-	for _, want := range []string{"Mounted skills:", "go-testing", "Go Testing", "table-driven tests"} {
-		if !strings.Contains(built.Prompt, want) {
-			t.Errorf("BuildContext() prompt missing %q:\n%s", want, built.Prompt)
-		}
+	if strings.Contains(built.Prompt, "Mounted skills:") {
+		t.Errorf("BuildContext() still injects the removed skill block:\n%s", built.Prompt)
 	}
-}
-
-func TestCoreBuildContextSkipsDisabledTaskSkills(t *testing.T) {
-	t.Parallel()
-
-	core := NewCore(NoopCompressor{}).WithSkills(fakeSkillProvider{
-		injections: []skill.Injection{
-			{
-				TaskID: "task-1",
-				Rank:   1,
-				Skill: skill.Skill{
-					ID:      "enabled-skill",
-					Name:    "Enabled",
-					Version: "1.0.0",
-					Status:  skill.StatusEnabled,
-					Summary: "use this enabled skill",
-				},
-			},
-			{
-				TaskID: "task-1",
-				Rank:   2,
-				Skill: skill.Skill{
-					ID:      "disabled-skill",
-					Name:    "Disabled",
-					Version: "1.0.0",
-					Status:  skill.StatusDisabled,
-					Summary: "do not inject this disabled skill",
-				},
-			},
-		},
-	})
-
-	built, err := core.BuildContext(context.Background(), Request{
-		Agent: domain.Agent{ID: "agent-1"},
-		Task:  domain.Task{ID: "task-1", Input: "write go tests"},
-	})
-	if err != nil {
-		t.Fatalf("BuildContext() error = %v, want nil", err)
-	}
-	if !strings.Contains(built.Prompt, "enabled-skill") {
-		t.Fatalf("BuildContext() prompt missing enabled skill:\n%s", built.Prompt)
-	}
-	if strings.Contains(built.Prompt, "disabled-skill") {
-		t.Fatalf("BuildContext() prompt includes disabled skill:\n%s", built.Prompt)
+	if strings.Contains(built.Prompt, "go-testing") {
+		t.Errorf("BuildContext() injected a selected skill; skills must reach the model via the catalog now:\n%s", built.Prompt)
 	}
 }
 

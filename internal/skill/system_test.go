@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -148,6 +149,69 @@ func TestSystemReturnsCopyOfLoadedSkills(t *testing.T) {
 	}
 	if reloaded[0].Name != "Go Testing" {
 		t.Fatalf("Load() after caller mutation name = %q, want %q", reloaded[0].Name, "Go Testing")
+	}
+}
+
+func TestReadSkillSummaryComesFromFrontMatterNotBody(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	writeSkill(t, root, "go-testing", `---
+id: go-testing
+name: Go Testing
+version: 1.0.0
+source: workspace
+risk_level: safe
+status: active
+tags: go,test
+summary: 写 Go 表驱动测试
+---
+# Go Testing
+
+Use this when writing Go tests.
+`)
+
+	system := NewSystem(Config{Roots: []string{root}})
+	skills, err := system.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+	if len(skills) != 1 {
+		t.Fatalf("Load() len = %d, want 1", len(skills))
+	}
+	if skills[0].Summary != "写 Go 表驱动测试" {
+		t.Fatalf("Summary = %q, want the front-matter summary line", skills[0].Summary)
+	}
+	if !strings.Contains(skills[0].Content, "Use this when writing Go tests.") {
+		t.Fatalf("Content = %q, want it to carry the full body", skills[0].Content)
+	}
+	if skills[0].Summary == skills[0].Content {
+		t.Fatalf("Summary must not equal Content: front-matter summary and body are independent data")
+	}
+}
+
+// TestReadSkillSummaryEmptyWhenFrontMatterOmitsIt documents that a missing
+// "summary" front-matter key is a legal optional state at the readSkill
+// layer -- older skills that predate this field simply have no summary.
+// readSkill must not fail loud here; the "a skill must carry a summary"
+// contract belongs to capability.SkillProvider, which fails loud when it
+// tries to catalog a skill with an empty Summary.
+func TestReadSkillSummaryEmptyWhenFrontMatterOmitsIt(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	root := t.TempDir()
+	writeSkill(t, root, "legacy", skillDoc("legacy", "Legacy", "1.0.0", "safe", "active", "legacy"))
+
+	system := NewSystem(Config{Roots: []string{root}})
+	skills, err := system.Load(ctx)
+	if err != nil {
+		t.Fatalf("Load() error = %v, want nil", err)
+	}
+	if len(skills) != 1 {
+		t.Fatalf("Load() len = %d, want 1", len(skills))
+	}
+	if skills[0].Summary != "" {
+		t.Fatalf("Summary = %q, want empty when front matter has no summary key", skills[0].Summary)
 	}
 }
 

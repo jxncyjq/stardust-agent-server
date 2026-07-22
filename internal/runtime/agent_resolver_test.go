@@ -69,6 +69,52 @@ func TestResolverInjectsCheckpointsAndGate(t *testing.T) {
 	}
 }
 
+// TestResolverInjectsSkillUsage guards the per-agent half of the I-1 fix: a
+// resolver constructed with SkillUsage must pass it through to every per-agent
+// *Runtime it builds, mirroring TestResolverInjectsCheckpointsAndGate. Without
+// this wiring, dispatchLoadCapabilities's `if r.skillUsage != nil { Touch }`
+// (internal/runtime/lazytools.go) silently no-ops for every per-agent task, and
+// the Curator (internal/skill/curator.go:153) never ages skills those agents
+// load because they carry no usage history.
+func TestResolverInjectsSkillUsage(t *testing.T) {
+	t.Parallel()
+
+	usage := &recordingUsage{}
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
+			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep"},
+		}),
+		RootConfig: config.Config{Runtime: config.RuntimeConfig{MaxToolRounds: 1}},
+		Audit:      adapter.NewMemoryAuditLog(),
+		Events:     adapter.NewMemoryEventBus(),
+		MaasFactory: func(string) (MaasRunnerFactoryResult, error) {
+			return MaasRunnerFactoryResult{Client: &resolverCaptureMaas{response: "ok"}}, nil
+		},
+		SkillUsage: usage,
+	})
+
+	_, runner, ok, err := resolver.ResolveTaskRunner(context.Background(), domain.Task{
+		ID:      "task-skill-usage",
+		AgentID: "researcher",
+	})
+	if err != nil {
+		t.Fatalf("ResolveTaskRunner error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatalf("ResolveTaskRunner ok = false, want true")
+	}
+	rt, isRuntime := runner.(*Runtime)
+	if !isRuntime {
+		t.Fatalf("runner type = %T, want *Runtime", runner)
+	}
+	if rt.skillUsage == nil {
+		t.Fatalf("resolver runtime missing skillUsage, want non-nil (usage)")
+	}
+	if rt.skillUsage != SkillUsageRecorder(usage) {
+		t.Fatalf("resolver runtime skillUsage = %v, want the same recorder %v", rt.skillUsage, usage)
+	}
+}
+
 // TestAgentToolRootPrefersTaskWorkingDir guards Task 7's sandbox-root
 // priority: a task carrying a non-empty WorkingDir always wins over both the
 // agent's and the root config's configured ContextFiles.Root, since the
@@ -207,6 +253,7 @@ name: Go Research
 version: 1.0.0
 status: enabled
 tags: research,cache
+summary: Use evidence-first cache research.
 ---
 Use evidence-first cache research.
 `)
@@ -216,6 +263,7 @@ name: Go Writing
 version: 1.0.0
 status: enabled
 tags: write,cache
+summary: Write concise cache documentation.
 ---
 Write concise cache documentation.
 `)
@@ -240,7 +288,7 @@ Write concise cache documentation.
 		}),
 		RootConfig: config.Config{
 			ContextFiles: config.ContextFilesConfig{Root: root},
-			Runtime:      config.RuntimeConfig{MaxToolRounds: 1},
+			Runtime:      config.RuntimeConfig{MaxToolRounds: 1, LazyTools: true},
 			Skills:       config.SkillsConfig{InstallRoot: filepath.Join(root, "skills", "global")},
 		},
 		Audit:  adapter.NewMemoryAuditLog(),
@@ -359,6 +407,7 @@ name: Go Shared
 version: 1.0.0
 status: enabled
 tags: cache
+summary: Shared cache skill.
 ---
 Shared cache skill.
 `)
@@ -374,7 +423,7 @@ Shared cache skill.
 		}),
 		RootConfig: config.Config{
 			ContextFiles: config.ContextFilesConfig{Root: root},
-			Runtime:      config.RuntimeConfig{MaxToolRounds: 1},
+			Runtime:      config.RuntimeConfig{MaxToolRounds: 1, LazyTools: true},
 			Skills:       config.SkillsConfig{InstallRoot: filepath.Join(root, "skills", "global")},
 		},
 		Audit:  adapter.NewMemoryAuditLog(),

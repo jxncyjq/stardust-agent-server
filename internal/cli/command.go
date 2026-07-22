@@ -24,6 +24,7 @@ import (
 	"github.com/stardust/legion-agent/internal/agentregistry"
 	"github.com/stardust/legion-agent/internal/app"
 	"github.com/stardust/legion-agent/internal/approval"
+	"github.com/stardust/legion-agent/internal/capability"
 	"github.com/stardust/legion-agent/internal/cognitive"
 	"github.com/stardust/legion-agent/internal/config"
 	"github.com/stardust/legion-agent/internal/contextfiles"
@@ -1871,6 +1872,43 @@ type ServeResult struct {
 	Close    func()
 }
 
+// buildDefaultRunnerConfig assembles the agentruntime.Config template for the
+// default task runner (defaultTaskRunner.runtimeCfg). It is extracted out of
+// BuildServeService so this wiring is directly unit-testable without the full
+// serve assembly (storage, HTTP listener, MaaS client, etc.) — see
+// TestBuildDefaultRunnerConfigWiresSkillUsage in default_runner_config_test.go,
+// which pins skillUsage flowing into Config.SkillUsage. Dropping the
+// SkillUsage field here reproduces I-1 (final-review.md): the Curator
+// (internal/skill/curator.go:153) ages skills only through usage history
+// recorded via that field, and dispatchLoadCapabilities silently no-ops the
+// Touch when it is nil.
+func buildDefaultRunnerConfig(
+	maas port.MaasInferenceClient,
+	auditLog port.AuditLog,
+	events port.EventBus,
+	contextBuilder agentruntime.ContextBuilder,
+	runtimeSettings config.RuntimeConfig,
+	checkpoints *sessionstate.Store,
+	toolGate agentruntime.ToolGate,
+	logger *slog.Logger,
+	capabilitySkills capability.Provider,
+	skillUsage agentruntime.SkillUsageRecorder,
+) agentruntime.Config {
+	return agentruntime.Config{
+		Maas:             maas,
+		Audit:            auditLog,
+		Events:           events,
+		ContextBuilder:   contextBuilder,
+		MaxToolRounds:    runtimeSettings.MaxToolRounds,
+		LazyTools:        runtimeSettings.LazyTools,
+		Checkpoints:      checkpoints,
+		ToolGate:         toolGate,
+		Logger:           logger,
+		CapabilitySkills: capabilitySkills,
+		SkillUsage:       skillUsage,
+	}
+}
+
 // defaultTaskRunner is the agentruntime.TaskRunner the coordinator dispatches
 // a task to when no per-agent resolver runner is resolved for it (an empty
 // task.AgentID, or an AgentID missing from the registry — see
@@ -2143,6 +2181,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		Checkpoints:  checkpointStore,
 		ToolGate:     manualGate,
 		Logger:       logger,
+		SkillUsage:   skillUsage,
 	})
 	defaultMaas, err := adapter.NewMaasClientFromProfile(cfg.Maas, "")
 	if err != nil {
@@ -2185,11 +2224,18 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		WithContextFiles(defaultContext).
 		WithMemory(episodicMemory).
 		WithCapabilityMemory(capabilityStore)
+	// capabilitySkills is the skill half of the default runtime's capability
+	// catalog. It is set only when a skills root is present; the runtime builds
+	// the tool half per task from the per-task registry. WithSkills is retained
+	// for the /skills query paths but no longer injects into the prompt.
+	var capabilitySkills capability.Provider
 	if skillsRootAvailable(cfg.Skills.InstallRoot) {
-		defaultCore = defaultCore.WithSkills(skill.NewSystem(skill.Config{
+		defaultSkillSystem := skill.NewSystem(skill.Config{
 			Roots:   []string{cfg.Skills.InstallRoot},
 			Scanner: skill.NewSecurityScanner(),
-		}).WithUsage(skillUsage, time.Now))
+		}).WithUsage(skillUsage, time.Now)
+		defaultCore = defaultCore.WithSkills(defaultSkillSystem)
+		capabilitySkills = capability.NewSkillProvider(defaultSkillSystem)
 	}
 
 	// The default task runner rebuilds its tool registry (and thus the
@@ -2200,17 +2246,11 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// context builder, checkpoints, tool gate) is fixed at serve assembly and
 	// shared across every call, same as before.
 	defaultRunner := &defaultTaskRunner{
-		runtimeCfg: agentruntime.Config{
-			Maas:           defaultMaas,
-			Audit:          auditLog,
-			Events:         workflowEvents,
-			ContextBuilder: defaultCore,
-			MaxToolRounds:  cfg.Runtime.MaxToolRounds,
-			LazyTools:      cfg.Runtime.LazyTools,
-			Checkpoints:    checkpointStore,
-			ToolGate:       manualGate,
-			Logger:         logger,
-		},
+		runtimeCfg: buildDefaultRunnerConfig(
+			defaultMaas, auditLog, workflowEvents, defaultCore,
+			cfg.Runtime, checkpointStore, manualGate, logger, capabilitySkills,
+			skillUsage,
+		),
 		contextRoot:     cfg.ContextFiles.Root,
 		audit:           auditLog,
 		taskLedger:      taskLedger,
