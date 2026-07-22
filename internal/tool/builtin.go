@@ -105,6 +105,18 @@ func NewWorkspaceRegistry(root string, audit port.AuditLog, opts ...WorkspaceReg
 		NoopGuardrails{},
 	).WithAuditLog(audit).WithOutputSanitizer(quality.NewOutputSanitizer())
 	registerReadOnlyDescriptors(registry, absRoot, guard)
+	registerWriteFileDescriptor(registry, absRoot, guard, true, options)
+	return registry
+}
+
+// registerWriteFileDescriptor adds the write_file tool to an already-constructed
+// registry. write_file requires overwrite=true when the target already exists,
+// and its filesystem access is bounded by guard. injectAgentsNote controls
+// whether a successful write appends the nearest directory's agents.md
+// conventions to the result — an interactive-CLI UX feature that serve and
+// per-agent tasks turn off. The registry's execution policy and permission
+// enforcer must already allow write_file; this only registers the descriptor.
+func registerWriteFileDescriptor(registry *Registry, absRoot string, guard port.WorkspacePathGuard, injectAgentsNote bool, options workspaceRegistryOptions) {
 	registry.RegisterDescriptor(Descriptor{
 		Name:        "write_file",
 		Description: fmt.Sprintf("Write content to a file inside the workspace root (%s). Arguments: path, content, optional overwrite (default false). Fails if the file exists and overwrite is not true.", absRoot),
@@ -122,9 +134,8 @@ func NewWorkspaceRegistry(root string, audit port.AuditLog, opts ...WorkspaceReg
 			},
 		},
 	}, HandlerFunc(func(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
-		return writeFileTool(ctx, absRoot, guard, call, options)
+		return writeFileTool(ctx, absRoot, guard, call, injectAgentsNote, options)
 	}))
-	return registry
 }
 
 // NewFileReadOnlyWorkspaceRegistry returns a registry whose *filesystem* access
@@ -174,6 +185,56 @@ func NewFileReadOnlyWorkspaceRegistry(root string, audit port.AuditLog) *Registr
 		NoopGuardrails{},
 	).WithAuditLog(audit).WithOutputSanitizer(quality.NewOutputSanitizer())
 	registerReadOnlyDescriptors(registry, absRoot, guard)
+	return registry
+}
+
+// NewFileReadWriteWorkspaceRegistry returns a registry with the read-only file
+// tools plus write_file, all sandboxed to root. It is the serve / per-agent
+// counterpart to NewWorkspaceRegistry: same write capability, but without the
+// interactive-CLI agents.md injection on write (a directory's agents.md must not
+// leak into a server task's tool results). write_file stays Sensitive, so Manual
+// mode still gates it and Plan mode still excludes it. Callers add task-ledger,
+// messaging and web tools afterwards, exactly as with the read-only constructor.
+func NewFileReadWriteWorkspaceRegistry(root string, audit port.AuditLog) *Registry {
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		// filepath.Abs only fails when os.Getwd does — the process has no
+		// resolvable working directory, an unrecoverable environment fault.
+		// Falling back to the relative root would hand NewWorkspacePathGuard a
+		// path whose containment comparison is meaningless, silently disabling
+		// the sandbox. A security boundary must not degrade quietly.
+		panic(fmt.Sprintf("tool: cannot resolve workspace root %q: %v", root, err))
+	}
+	guard := port.NewWorkspacePathGuard(absRoot)
+	registry := NewRegistry(
+		NewExecutionPolicy(ExecutionPolicyConfig{AutoAllowTools: []string{
+			"read_file", "search_content", "list_files", "write_file",
+			"create_task", "claim_task", "update_task", "append_task_message", "read_task", "rebuild_tasks",
+			"send_message", "read_messages",
+			"fetch_url", "session_search", "delegate_task", "moa_consult",
+		}}),
+		NewBatchRolePermissionEnforcer(map[string]bool{
+			"developer:read_file":           true,
+			"developer:search_content":      true,
+			"developer:list_files":          true,
+			"developer:write_file":          true,
+			"developer:delegate_task":       true,
+			"developer:moa_consult":         true,
+			"developer:create_task":         true,
+			"developer:claim_task":          true,
+			"developer:update_task":         true,
+			"developer:append_task_message": true,
+			"developer:read_task":           true,
+			"developer:rebuild_tasks":       true,
+			"developer:send_message":        true,
+			"developer:read_messages":       true,
+			"developer:fetch_url":           true,
+			"developer:session_search":      true,
+		}, nil),
+		NoopGuardrails{},
+	).WithAuditLog(audit).WithOutputSanitizer(quality.NewOutputSanitizer())
+	registerReadOnlyDescriptors(registry, absRoot, guard)
+	registerWriteFileDescriptor(registry, absRoot, guard, false, workspaceRegistryOptions{})
 	return registry
 }
 
@@ -263,7 +324,7 @@ func readFileTool(ctx context.Context, root string, guard port.WorkspacePathGuar
 	}, nil
 }
 
-func writeFileTool(_ context.Context, root string, guard port.WorkspacePathGuard, call domain.ToolCall, options workspaceRegistryOptions) (domain.ToolResult, error) {
+func writeFileTool(_ context.Context, root string, guard port.WorkspacePathGuard, call domain.ToolCall, injectAgentsNote bool, options workspaceRegistryOptions) (domain.ToolResult, error) {
 	resolved, err := guard.Check(context.Background(), resolveToolPath(root, call.Arguments["path"]))
 	if err != nil {
 		return domain.ToolResult{}, err
@@ -285,10 +346,15 @@ func writeFileTool(_ context.Context, root string, guard port.WorkspacePathGuard
 		return domain.ToolResult{}, err
 	}
 	output := fmt.Sprintf("wrote %d bytes to %s", len(content), rel)
-	if note, err := nearestAgentsNote(root, filepath.Dir(resolved), options); err != nil {
-		return domain.ToolResult{}, err
-	} else if note != "" {
-		output += note
+	// The agents.md note is an interactive-CLI convenience. serve / per-agent
+	// tasks disable it (injectAgentsNote=false) so a directory's agents.md does
+	// not leak into their tool results.
+	if injectAgentsNote {
+		if note, err := nearestAgentsNote(root, filepath.Dir(resolved), options); err != nil {
+			return domain.ToolResult{}, err
+		} else if note != "" {
+			output += note
+		}
 	}
 	return domain.ToolResult{
 		CallID:  call.ID,

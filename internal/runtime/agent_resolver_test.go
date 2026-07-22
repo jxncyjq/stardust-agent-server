@@ -563,6 +563,49 @@ func TestResolverOmitsOrchestratorOnlyTools(t *testing.T) {
 	}
 }
 
+// TestResolverGivesWorkerWriteFile locks that per-agent (worker) tasks can
+// write files: workers build NewFileReadWriteWorkspaceRegistry, so write_file
+// must be present (sandboxed to the agent's working dir, still Sensitive). This
+// is the per-agent half of giving serve tasks write capability; the CLI default
+// runner is covered in package cli.
+func TestResolverGivesWorkerWriteFile(t *testing.T) {
+	t.Parallel()
+
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
+			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep"},
+		}),
+		RootConfig: config.Config{
+			ContextFiles: config.ContextFilesConfig{Root: t.TempDir()},
+			Runtime:      config.RuntimeConfig{MaxToolRounds: 1},
+		},
+		Audit:  adapter.NewMemoryAuditLog(),
+		Events: adapter.NewMemoryEventBus(),
+		MaasFactory: func(string) (MaasRunnerFactoryResult, error) {
+			return MaasRunnerFactoryResult{Client: &resolverCaptureMaas{response: "ok"}}, nil
+		},
+	})
+
+	_, runner, ok, err := resolver.ResolveTaskRunner(context.Background(), domain.Task{
+		ID:      "task-write",
+		AgentID: "researcher",
+	})
+	if err != nil || !ok {
+		t.Fatalf("ResolveTaskRunner = (_, %v, %v), want (_, true, nil)", ok, err)
+	}
+	rt, isRuntime := runner.(*Runtime)
+	if !isRuntime {
+		t.Fatalf("runner type = %T, want *Runtime", runner)
+	}
+	names := make(map[string]bool)
+	for _, descriptor := range rt.tools.Descriptors() {
+		names[descriptor.Name] = true
+	}
+	if !names["write_file"] {
+		t.Fatalf("per-agent registry missing write_file, have %v", names)
+	}
+}
+
 type resolverCaptureMaas struct {
 	response string
 	prompt   string
