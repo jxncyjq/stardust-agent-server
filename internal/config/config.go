@@ -449,9 +449,22 @@ func applyEnv(cfg *Config) error {
 	return nil
 }
 
+// UnlimitedToolRoundsCap is the value max_tool_rounds normalizes to when a
+// config explicitly requests no limit (0 or negative). It is not truly infinite:
+// the tool loop still stops here so a model that loops forever cannot burn tokens
+// without bound — the runtime's hard-loop detection only evaluates after a task's
+// runner returns, so it cannot break an unbounded in-flight tool loop. A normal
+// task finishes in a handful of rounds and never approaches this.
+const UnlimitedToolRoundsCap = 1000
+
+// normalizeMaxToolRounds maps a configured max_tool_rounds to its effective
+// value. A positive value is used as-is. Zero or negative means "no limit" and
+// maps to UnlimitedToolRoundsCap — an explicit opt-in, since Load starts from
+// defaultConfig (4) and only an explicit 0 in the JSON reaches here as 0; an
+// absent field keeps the default 4.
 func normalizeMaxToolRounds(rounds int) int {
 	if rounds <= 0 {
-		return 4
+		return UnlimitedToolRoundsCap
 	}
 	return rounds
 }

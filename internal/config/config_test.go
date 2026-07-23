@@ -239,7 +239,13 @@ func TestDefaultSessionCacheConfig(t *testing.T) {
 	}
 }
 
-func TestLoadRuntimeMaxToolRoundsInvalidFallsBackToDefault(t *testing.T) {
+// TestLoadRuntimeMaxToolRoundsZeroMeansUnlimited pins the contract that an
+// explicit max_tool_rounds of 0 (or negative) removes the per-task tool-round
+// cap: the model may keep calling tools until it finishes the task. The value is
+// normalized to UnlimitedToolRoundsCap, a large runaway hard cap that still stops
+// a truly looping model. An ABSENT field keeps the safe default 4 (see
+// TestLoadRuntimeMaxToolRoundsAbsentKeepsDefault).
+func TestLoadRuntimeMaxToolRoundsZeroMeansUnlimited(t *testing.T) {
 	t.Parallel()
 
 	path := filepath.Join(t.TempDir(), "agent.json")
@@ -256,8 +262,33 @@ func TestLoadRuntimeMaxToolRoundsInvalidFallsBackToDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(%q) error = %v, want nil", path, err)
 	}
+	if cfg.Runtime.MaxToolRounds != UnlimitedToolRoundsCap {
+		t.Fatalf("Load(%q).Runtime.MaxToolRounds = %d, want unlimited cap %d", path, cfg.Runtime.MaxToolRounds, UnlimitedToolRoundsCap)
+	}
+}
+
+// TestLoadRuntimeMaxToolRoundsAbsentKeepsDefault guards that omitting the field
+// entirely still yields the safe default 4 — only an explicit 0 opts into
+// unlimited, so existing deployments that never set it are unaffected.
+func TestLoadRuntimeMaxToolRoundsAbsentKeepsDefault(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "agent.json")
+	body := `{
+		"runtime": {
+			"demo_response": "no rounds field here"
+		}
+	}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", path, err)
+	}
+
+	cfg, err := Load(context.Background(), Options{Path: path})
+	if err != nil {
+		t.Fatalf("Load(%q) error = %v, want nil", path, err)
+	}
 	if cfg.Runtime.MaxToolRounds != 4 {
-		t.Fatalf("Load(%q).Runtime.MaxToolRounds = %d, want fallback 4", path, cfg.Runtime.MaxToolRounds)
+		t.Fatalf("Load(%q).Runtime.MaxToolRounds = %d, want default 4 when field absent", path, cfg.Runtime.MaxToolRounds)
 	}
 }
 
