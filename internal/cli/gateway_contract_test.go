@@ -63,7 +63,7 @@ func TestTaskSubmitEmitsCompletedEvent(t *testing.T) {
 
 	const taskID = "task-contract-1"
 	postURL := "http://" + addr + "/v1/tasks"
-	resp, err := waitForPostTask(t, postURL, `{"id":"`+taskID+`","company_id":"company-1","input":"say hi"}`)
+	resp, err := waitForPostTask(t, postURL, `{"id":"`+taskID+`","company_id":"company-1","input":"say hi"}`, done)
 	if err != nil {
 		cancel()
 		t.Fatalf("POST /v1/tasks error = %v, want nil", err)
