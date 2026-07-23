@@ -448,3 +448,31 @@ func TestLoadApprovalTimeoutSecondsDefault(t *testing.T) {
 		t.Fatalf("default ApprovalTimeoutSeconds = %d, want 300", cfg.Runtime.ApprovalTimeoutSeconds)
 	}
 }
+
+// TestNormalizeMaxToolRounds pins the config-layer normalization invariant
+// directly, so the "0/negative = unlimited cap" contract is a locked regression
+// line rather than only inferred through Load. This function carries a safety
+// role — the cap is the only thing stopping a runaway in-flight tool loop, since
+// hard-loop detection cannot break one — so changing it must break a test.
+func TestNormalizeMaxToolRounds(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		in   int
+		want int
+	}{
+		{"explicit zero maps to the unlimited cap", 0, UnlimitedToolRoundsCap},
+		{"negative maps to the unlimited cap", -1, UnlimitedToolRoundsCap},
+		{"positive is used as-is", 5, 5},
+		{"one is used as-is", 1, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := normalizeMaxToolRounds(tc.in); got != tc.want {
+				t.Errorf("normalizeMaxToolRounds(%d) = %d, want %d", tc.in, got, tc.want)
+			}
+		})
+	}
+}

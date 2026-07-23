@@ -272,6 +272,15 @@ func NewRuntime(cfg Config) *Runtime {
 	}
 }
 
+// normalizeMaxToolRounds is the runtime-layer fallback for a directly
+// constructed Runtime: an unset (<=0) MaxToolRounds falls back to
+// defaultMaxToolRounds.
+//
+// This intentionally differs from config.normalizeMaxToolRounds, which maps
+// <=0 to config.UnlimitedToolRoundsCap as the user-facing "0 = no limit"
+// opt-in. Production always runs config.Load first, so the value reaching
+// NewRuntime is already positive and never takes this <=0 branch; this fallback
+// only covers direct construction (tests, and app.RunDemo's bare Config).
 func normalizeMaxToolRounds(rounds int) int {
 	if rounds <= 0 {
 		return defaultMaxToolRounds

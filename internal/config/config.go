@@ -462,6 +462,12 @@ const UnlimitedToolRoundsCap = 1000
 // maps to UnlimitedToolRoundsCap — an explicit opt-in, since Load starts from
 // defaultConfig (4) and only an explicit 0 in the JSON reaches here as 0; an
 // absent field keeps the default 4.
+//
+// Note: runtime has its own same-named normalizeMaxToolRounds that maps <=0 to
+// its own default (4) for directly constructed Runtimes. Production always
+// normalizes here first, so the value the runtime sees is already positive and
+// never hits that branch. The two differ on purpose: this is the user-facing
+// "0 = unlimited" contract; the runtime one is a construction-time fallback.
 func normalizeMaxToolRounds(rounds int) int {
 	if rounds <= 0 {
 		return UnlimitedToolRoundsCap
