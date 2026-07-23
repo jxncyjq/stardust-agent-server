@@ -7,9 +7,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	neturl "net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -169,18 +171,26 @@ func TestBuildRunContextPrefixLoadsAllConfiguredContextFiles(t *testing.T) {
 	}
 }
 
-func waitForPostTask(t *testing.T, url string, body string) (*http.Response, error) {
+// waitForPostTask waits for the in-process serve to start listening, then posts
+// the task once.
+//
+// It used to retry the POST 100 times at 10ms — a 1s ceiling that a slow CI
+// startup crossed, surfacing as "connection refused" from the request itself
+// (runs 29938476692, 29986168680). Readiness is now a dial probe with a real
+// budget, and serveDone (the channel `go root.Execute()` reports on; nil is
+// allowed) turns a serve that died during startup into that error rather than a
+// timeout. Waiting on the port instead of retrying the POST also means the task
+// is submitted exactly once, so a retry can never create a second task.
+func waitForPostTask(t *testing.T, url string, body string, serveDone <-chan error) (*http.Response, error) {
 	t.Helper()
-	var lastErr error
-	for range 100 {
-		resp, err := http.Post(url, "application/json", strings.NewReader(body))
-		if err == nil {
-			return resp, nil
-		}
-		lastErr = err
-		time.Sleep(10 * time.Millisecond)
+	parsed, err := neturl.Parse(url)
+	if err != nil {
+		return nil, fmt.Errorf("parse task URL %q: %w", url, err)
 	}
-	return nil, lastErr
+	if err := waitForServeListening(parsed.Host, serveDone, serveReadyTimeout); err != nil {
+		return nil, err
+	}
+	return http.Post(url, "application/json", strings.NewReader(body))
 }
 
 func TestRunCommandUsesHTTPMaasForPrompt(t *testing.T) {
@@ -1612,7 +1622,7 @@ func TestServeCommandUsesSQLiteForHTTPTaskState(t *testing.T) {
 		done <- root.Execute()
 	}()
 	postURL := "http://" + addr + "/v1/tasks"
-	resp, err := waitForPostTask(t, postURL, `{"id":"task-api-1","company_id":"company-1","input":"persist api"}`)
+	resp, err := waitForPostTask(t, postURL, `{"id":"task-api-1","company_id":"company-1","input":"persist api"}`, done)
 	if err != nil {
 		cancel()
 		t.Fatalf("POST /v1/tasks error = %v, want nil", err)
@@ -1691,7 +1701,7 @@ func TestServeCommandPersistsTerminalTaskStatus(t *testing.T) {
 	go func() { done <- root.Execute() }()
 
 	resp, err := waitForPostTask(t, "http://"+addr+"/v1/tasks",
-		`{"id":"persist-status-1","company_id":"c1","input":"finish me"}`)
+		`{"id":"persist-status-1","company_id":"c1","input":"finish me"}`, done)
 	if err != nil {
 		cancel()
 		t.Fatalf("POST /v1/tasks error = %v, want nil", err)
@@ -1865,7 +1875,7 @@ func TestServeCommandStreamsLifecycleEventsOverSSE(t *testing.T) {
 	// Drive one task to completion (demo maas), so task_started/task_completed
 	// are buffered on the platform bus.
 	resp, err := waitForPostTask(t, "http://"+addr+"/v1/tasks",
-		`{"id":"sse-task-1","company_id":"c1","input":"hello sse"}`)
+		`{"id":"sse-task-1","company_id":"c1","input":"hello sse"}`, done)
 	if err != nil {
 		cancel()
 		t.Fatalf("POST /v1/tasks error = %v, want nil", err)
