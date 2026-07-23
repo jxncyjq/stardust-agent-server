@@ -8,6 +8,7 @@ import (
 
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/testsupport"
 )
 
 // recordingSubMaas returns a fixed summary and records every prompt it sees, so
@@ -24,7 +25,7 @@ func (m *recordingSubMaas) Generate(ctx context.Context, req port.InferenceReque
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.prompts = append(m.prompts, req.Prompt)
+	m.prompts = append(m.prompts, testsupport.RequestText(req))
 	return port.InferenceResponse{Text: m.summary}, nil
 }
 

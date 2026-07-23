@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/testsupport"
 )
 
 // concurrencyMaas records the peak number of overlapping Generate calls, so a
@@ -49,7 +50,7 @@ func (m *capturingMaas) Generate(ctx context.Context, req port.InferenceRequest)
 		return port.InferenceResponse{}, err
 	}
 	m.mu.Lock()
-	m.prompt = req.Prompt
+	m.prompt = testsupport.RequestText(req)
 	m.mu.Unlock()
 	return port.InferenceResponse{Text: m.reply}, nil
 }

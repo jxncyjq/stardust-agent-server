@@ -16,6 +16,7 @@ import (
 	"github.com/stardust/legion-agent/internal/manualgate"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/sessionstate"
+	"github.com/stardust/legion-agent/internal/testsupport"
 )
 
 // TestResolverInjectsCheckpointsAndGate guards Task 7's resolver wiring: a
@@ -615,7 +616,7 @@ func (m *resolverCaptureMaas) Generate(ctx context.Context, req port.InferenceRe
 	if err := ctx.Err(); err != nil {
 		return port.InferenceResponse{}, err
 	}
-	m.prompt = req.Prompt
+	m.prompt = testsupport.RequestText(req)
 	return port.InferenceResponse{Text: m.response}, nil
 }
 

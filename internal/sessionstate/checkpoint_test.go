@@ -18,12 +18,16 @@ func sampleCheckpoint(key string) Checkpoint {
 		SessionKey:    key,
 		BasePrompt:    "system + task framing",
 		Round:         2,
-		ToolEntries:   []ToolEntrySnapshot{{Key: "read|path=a", Text: "- a success: hi"}},
-		PendingCalls:  []domain.ToolCall{{ID: "c1", Name: "read", Arguments: map[string]string{"path": "b"}}},
-		PromptTokens:  10,
-		TotalTokens:   12,
-		Images:        []string{"data:image/png;base64,xxx"},
-		CreatedAt:     time.Unix(1_700_000_000, 0).UTC(),
+		Messages: []MessageSnapshot{
+			{Role: "user", Content: "system + task framing"},
+			{Role: "assistant", ToolCalls: []domain.ToolCall{{ID: "c1", Name: "read"}}},
+			{Role: "tool", ToolCallID: "c1", Content: "hi"},
+		},
+		PendingCalls: []domain.ToolCall{{ID: "c1", Name: "read", Arguments: map[string]string{"path": "b"}}},
+		PromptTokens: 10,
+		TotalTokens:  12,
+		Images:       []string{"data:image/png;base64,xxx"},
+		CreatedAt:    time.Unix(1_700_000_000, 0).UTC(),
 	}
 }
 
@@ -46,8 +50,11 @@ func TestStoreSaveLoadRoundTrip(t *testing.T) {
 	if len(got.PendingCalls) != 1 || got.PendingCalls[0].Name != "read" {
 		t.Errorf("Load PendingCalls = %#v, want one read call", got.PendingCalls)
 	}
-	if len(got.ToolEntries) != 1 || got.ToolEntries[0].Key != "read|path=a" {
-		t.Errorf("Load ToolEntries = %#v, want one entry", got.ToolEntries)
+	if len(got.Messages) != 3 || got.Messages[2].ToolCallID != "c1" {
+		t.Errorf("Load Messages = %#v, want the three-turn exchange with its tool pairing", got.Messages)
+	}
+	if len(got.Messages[1].ToolCalls) != 1 || got.Messages[1].ToolCalls[0].Name != "read" {
+		t.Errorf("Load Messages[1] = %#v, want the assistant turn carrying its call", got.Messages[1])
 	}
 }
 

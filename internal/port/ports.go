@@ -2,6 +2,8 @@ package port
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	"github.com/stardust/legion-agent/internal/domain"
 )
@@ -21,6 +23,62 @@ type InferenceRequest struct {
 	// breakpoint at this boundary. Zero means "no known stable prefix" and is
 	// fully backward compatible — adapters treat the whole prompt as volatile.
 	StablePrefixLen int
+	// Messages carries a multi-turn exchange (user / assistant-with-tool_calls /
+	// tool-result). When non-empty it is authoritative and Prompt must be empty.
+	// The tool loop uses it so the model can see the calls it already made —
+	// something a re-sent single user message cannot express, and whose absence
+	// let a model re-issue the same call indefinitely.
+	//
+	// Multi-turn requests set no cache breakpoint: the exchange is append-only,
+	// so its leading messages are already a stable prefix for providers that do
+	// automatic prefix caching.
+	Messages []InferenceMessage
+}
+
+// Roles accepted in InferenceRequest.Messages. There is deliberately no system
+// role: task framing lives in the first user message, exactly as it does in the
+// single-turn Prompt contract this extends.
+const (
+	RoleUser      = "user"
+	RoleAssistant = "assistant"
+	RoleTool      = "tool"
+)
+
+// InferenceMessage is one turn of a multi-turn exchange. Role decides which
+// fields carry meaning: Images only on user, ToolCalls only on assistant,
+// ToolCallID only on tool — and required there, since an OpenAI-compatible
+// provider rejects a tool message it cannot pair with a preceding tool call.
+type InferenceMessage struct {
+	Role       string            `json:"role"`
+	Content    string            `json:"content"`
+	Images     []string          `json:"images,omitempty"`
+	ToolCalls  []domain.ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string            `json:"tool_call_id,omitempty"`
+}
+
+// Validate enforces the request's shape before it reaches an adapter. Prompt and
+// Messages are mutually exclusive: accepting both would leave which one the
+// model actually sees up to each adapter, so a caller that filled the wrong
+// field would silently receive an answer to a different question.
+func (r InferenceRequest) Validate() error {
+	if len(r.Messages) == 0 {
+		return nil
+	}
+	if strings.TrimSpace(r.Prompt) != "" {
+		return fmt.Errorf("inference request %s: Prompt and Messages are mutually exclusive", r.RequestID)
+	}
+	for i, msg := range r.Messages {
+		switch msg.Role {
+		case RoleUser, RoleAssistant:
+		case RoleTool:
+			if strings.TrimSpace(msg.ToolCallID) == "" {
+				return fmt.Errorf("inference request %s: message %d has role tool without ToolCallID", r.RequestID, i)
+			}
+		default:
+			return fmt.Errorf("inference request %s: message %d has unknown role %q", r.RequestID, i, msg.Role)
+		}
+	}
+	return nil
 }
 
 type InferenceResponse struct {

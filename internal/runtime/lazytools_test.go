@@ -8,6 +8,7 @@ import (
 	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/testsupport"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
@@ -82,7 +83,7 @@ func (m *lazyToolCallingMaas) Generate(ctx context.Context, req port.InferenceRe
 	if err := ctx.Err(); err != nil {
 		return port.InferenceResponse{}, err
 	}
-	m.prompts = append(m.prompts, req.Prompt)
+	m.prompts = append(m.prompts, testsupport.RequestText(req))
 	m.tools = append(m.tools, append([]port.InferenceTool(nil), req.Tools...))
 	switch len(m.prompts) {
 	case 1:

@@ -11,6 +11,7 @@ import (
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/evolution"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/testsupport"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
@@ -422,7 +423,7 @@ func (m *toolCallingMaas) Generate(ctx context.Context, req port.InferenceReques
 	if err := ctx.Err(); err != nil {
 		return port.InferenceResponse{}, err
 	}
-	m.prompts = append(m.prompts, req.Prompt)
+	m.prompts = append(m.prompts, testsupport.RequestText(req))
 	if len(m.prompts) == 1 {
 		m.tools = append([]port.InferenceTool(nil), req.Tools...)
 		return port.InferenceResponse{
@@ -440,7 +441,7 @@ func (m *multiRoundToolCallingMaas) Generate(ctx context.Context, req port.Infer
 	if err := ctx.Err(); err != nil {
 		return port.InferenceResponse{}, err
 	}
-	m.prompts = append(m.prompts, req.Prompt)
+	m.prompts = append(m.prompts, testsupport.RequestText(req))
 	switch len(m.prompts) {
 	case 1:
 		return port.InferenceResponse{
@@ -467,7 +468,7 @@ func (m *captureMaas) Generate(ctx context.Context, req port.InferenceRequest) (
 	if err := ctx.Err(); err != nil {
 		return port.InferenceResponse{}, err
 	}
-	m.prompt = req.Prompt
+	m.prompt = testsupport.RequestText(req)
 	return port.InferenceResponse{Text: m.response, ReasoningSummary: m.reasoning}, nil
 }
 

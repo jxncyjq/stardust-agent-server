@@ -8,6 +8,7 @@ import (
 	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/testsupport"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
@@ -45,7 +46,7 @@ func (m *loadCapabilitiesMaas) Generate(ctx context.Context, req port.InferenceR
 	if err := ctx.Err(); err != nil {
 		return port.InferenceResponse{}, err
 	}
-	m.prompts = append(m.prompts, req.Prompt)
+	m.prompts = append(m.prompts, testsupport.RequestText(req))
 	if len(m.prompts) == 1 {
 		return port.InferenceResponse{ToolCalls: []domain.ToolCall{{
 			ID:        "meta-load",
