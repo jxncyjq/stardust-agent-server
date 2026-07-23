@@ -102,20 +102,17 @@ func (c *HTTPMaasClient) Generate(ctx context.Context, req port.InferenceRequest
 }
 
 func (c *HTTPMaasClient) generateOpenAIChat(ctx context.Context, req port.InferenceRequest) (port.InferenceResponse, error) {
-	stablePrefixLen := 0
-	if c.enablePromptCache {
-		stablePrefixLen = req.StablePrefixLen
+	if err := req.Validate(); err != nil {
+		return port.InferenceResponse{}, fmt.Errorf("validate inference request: %w", err)
 	}
-	content, err := openAIChatUserContent(req.Prompt, req.Images, stablePrefixLen)
+	messages, err := c.openAIChatMessages(req)
 	if err != nil {
-		return port.InferenceResponse{}, fmt.Errorf("build openai chat user content: %w", err)
+		return port.InferenceResponse{}, fmt.Errorf("build openai chat messages: %w", err)
 	}
 	body, err := json.Marshal(openAIChatCompletionRequest{
-		Model: c.model,
-		Messages: []openAIChatRequestMessage{
-			{Role: "user", Content: content},
-		},
-		Tools: openAIChatTools(req.Tools),
+		Model:    c.model,
+		Messages: messages,
+		Tools:    openAIChatTools(req.Tools),
 	})
 	if err != nil {
 		return port.InferenceResponse{}, fmt.Errorf("encode openai chat request: %w", err)
@@ -156,6 +153,74 @@ func (c *HTTPMaasClient) generateOpenAIChat(ctx context.Context, req port.Infere
 	}, nil
 }
 
+// openAIChatMessages renders the request as OpenAI chat messages. With
+// req.Messages empty it produces the historical single user message —
+// byte-for-byte the previous body, prompt-cache breakpoint included. With
+// req.Messages set it renders the multi-turn exchange, pairing each tool result
+// with the assistant tool call that produced it, so the model can see the calls
+// it already made.
+func (c *HTTPMaasClient) openAIChatMessages(req port.InferenceRequest) ([]openAIChatRequestMessage, error) {
+	if len(req.Messages) == 0 {
+		stablePrefixLen := 0
+		if c.enablePromptCache {
+			stablePrefixLen = req.StablePrefixLen
+		}
+		content, err := openAIChatUserContent(req.Prompt, req.Images, stablePrefixLen)
+		if err != nil {
+			return nil, fmt.Errorf("build openai chat user content: %w", err)
+		}
+		return []openAIChatRequestMessage{{Role: "user", Content: content}}, nil
+	}
+	// A multi-turn exchange is append-only, so its leading messages are already
+	// a stable prefix for providers that cache automatically; no explicit cache
+	// breakpoint is emitted here.
+	out := make([]openAIChatRequestMessage, 0, len(req.Messages))
+	for i, msg := range req.Messages {
+		switch msg.Role {
+		case port.RoleUser:
+			content, err := openAIChatUserContent(msg.Content, msg.Images, 0)
+			if err != nil {
+				return nil, fmt.Errorf("build user content for message %d: %w", i, err)
+			}
+			out = append(out, openAIChatRequestMessage{Role: "user", Content: content})
+		case port.RoleAssistant:
+			calls, err := openAIChatRequestToolCalls(msg.ToolCalls)
+			if err != nil {
+				return nil, fmt.Errorf("encode tool calls for message %d: %w", i, err)
+			}
+			out = append(out, openAIChatRequestMessage{Role: "assistant", Content: msg.Content, ToolCalls: calls})
+		case port.RoleTool:
+			out = append(out, openAIChatRequestMessage{Role: "tool", Content: msg.Content, ToolCallID: msg.ToolCallID})
+		default:
+			return nil, fmt.Errorf("message %d has unknown role %q", i, msg.Role)
+		}
+	}
+	return out, nil
+}
+
+// openAIChatRequestToolCalls re-encodes tool calls the model previously emitted.
+// Their arguments were decoded into a string map on the way in; marshalling that
+// map back is lossless for the model's purposes — it sees the same keys and
+// values — and is the shape the provider requires on the way out.
+func openAIChatRequestToolCalls(calls []domain.ToolCall) ([]openAIChatToolCall, error) {
+	if len(calls) == 0 {
+		return nil, nil
+	}
+	out := make([]openAIChatToolCall, 0, len(calls))
+	for _, call := range calls {
+		args, err := json.Marshal(call.Arguments)
+		if err != nil {
+			return nil, fmt.Errorf("marshal arguments of tool call %s: %w", call.ID, err)
+		}
+		out = append(out, openAIChatToolCall{
+			ID:       call.ID,
+			Type:     "function",
+			Function: openAIChatCallFunction{Name: call.Name, Arguments: string(args)},
+		})
+	}
+	return out, nil
+}
+
 type openAIChatCompletionRequest struct {
 	Model    string                     `json:"model"`
 	Messages []openAIChatRequestMessage `json:"messages"`
@@ -168,9 +233,14 @@ type openAIChatCompletionRequest struct {
 // multimodal/vision form). Responses are decoded into openAIChatMessage, whose
 // Content stays a string, so this request/response split keeps response parsing
 // unchanged.
+// ToolCalls carries an assistant turn's tool calls; ToolCallID pairs a tool
+// turn back to the call it answers. Both are omitted on plain user turns, so a
+// single-turn request body stays exactly as it was.
 type openAIChatRequestMessage struct {
-	Role    string `json:"role"`
-	Content any    `json:"content"`
+	Role       string               `json:"role"`
+	Content    any                  `json:"content"`
+	ToolCalls  []openAIChatToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string               `json:"tool_call_id,omitempty"`
 }
 
 // contentPart is one element of a multimodal content array. Text is set for a

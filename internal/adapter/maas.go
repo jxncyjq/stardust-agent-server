@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/stardust/legion-agent/internal/port"
@@ -20,6 +21,12 @@ func NewRecordingMaas(response string) *RecordingMaas {
 func (m *RecordingMaas) Generate(ctx context.Context, req port.InferenceRequest) (port.InferenceResponse, error) {
 	if err := ctx.Err(); err != nil {
 		return port.InferenceResponse{}, err
+	}
+	// The stand-in client validates too: a caller that builds an ambiguous
+	// request must fail the same way here as against a real provider, instead of
+	// passing in tests and breaking in production.
+	if err := req.Validate(); err != nil {
+		return port.InferenceResponse{}, fmt.Errorf("validate inference request: %w", err)
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
