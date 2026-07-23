@@ -137,6 +137,46 @@ func TestRenderLeavesExchangeAloneWithinBudget(t *testing.T) {
 	}
 }
 
+func TestRepeatedCallStreakCountsIdenticalConsecutiveRounds(t *testing.T) {
+	t.Parallel()
+	convo := newConversation("base", nil)
+	for i := range 3 {
+		calls := []domain.ToolCall{{ID: fmt.Sprintf("c%d", i), Name: "read_file", Arguments: map[string]string{"path": "a.txt"}}}
+		convo.appendAssistant("", calls)
+		convo.appendToolResults(calls, []domain.ToolResult{{CallID: calls[0].ID, Success: true, Output: "same"}}, 0)
+	}
+
+	pending := []domain.ToolCall{{ID: "c3", Name: "read_file", Arguments: map[string]string{"path": "a.txt"}}}
+	if got := repeatedCallStreak(convo.messages, pending); got != 4 {
+		t.Fatalf("repeatedCallStreak = %d, want 4 (3 recorded rounds + the pending one)", got)
+	}
+}
+
+// Call IDs are fresh every round, so the streak must compare name+arguments.
+func TestRepeatedCallStreakResetsOnDifferentArguments(t *testing.T) {
+	t.Parallel()
+	convo := newConversation("base", nil)
+	for _, path := range []string{"a.txt", "a.txt", "b.txt"} {
+		calls := []domain.ToolCall{{ID: "c-" + path, Name: "read_file", Arguments: map[string]string{"path": path}}}
+		convo.appendAssistant("", calls)
+		convo.appendToolResults(calls, []domain.ToolResult{{CallID: calls[0].ID, Success: true, Output: "x"}}, 0)
+	}
+
+	pending := []domain.ToolCall{{ID: "c-next", Name: "read_file", Arguments: map[string]string{"path": "c.txt"}}}
+	if got := repeatedCallStreak(convo.messages, pending); got != 1 {
+		t.Fatalf("repeatedCallStreak = %d, want 1 for a call the model has not just made", got)
+	}
+}
+
+func TestRepeatedCallStreakIsZeroWithoutPendingCalls(t *testing.T) {
+	t.Parallel()
+	convo := newConversation("base", nil)
+
+	if got := repeatedCallStreak(convo.messages, nil); got != 0 {
+		t.Fatalf("repeatedCallStreak(no pending calls) = %d, want 0", got)
+	}
+}
+
 func TestConversationCarriesImagesOnTheFirstUserTurn(t *testing.T) {
 	t.Parallel()
 	convo := newConversation("look", []string{"data:image/png;base64,AAAA"})

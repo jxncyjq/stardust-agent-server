@@ -415,6 +415,11 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 	// Each round appends the model's own turn and one tool turn per executed
 	// call, so the exchange the model sees grows monotonically and its repeated
 	// calls stay visible to it.
+	//
+	// loopCut records that the loop ended because the model kept repeating one
+	// call rather than because it ran out of rounds; the two need different
+	// closing instructions.
+	loopCut := false
 	for st.round < r.maxToolRounds && len(st.resp.ToolCalls) > 0 {
 		suspend, err := r.checkSuspend(ctx, task, st)
 		if err != nil {
@@ -424,6 +429,9 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 			return domain.TaskRun{}, ErrSuspended
 		}
 		calls := st.resp.ToolCalls
+		// Counted before this round is recorded, so the streak is "how many
+		// consecutive rounds have asked for exactly this, including now".
+		streak := repeatedCallStreak(st.convo.messages, calls)
 		st.convo.appendAssistant(st.resp.Text, calls)
 		results, err := r.executeToolCalls(ctx, agent, task, &st)
 		if err != nil {
@@ -435,6 +443,30 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// new definitions as their own turn rather than re-sending the whole
 		// block every round.
 		st.convo.syncLoaded(renderLoaded(st.loaded))
+		if streak >= repeatAbortStreak {
+			// The model is not making progress: it has asked for exactly the same
+			// calls this many rounds running and the results are already in its
+			// context. Cutting the loop here is the difference between a finished
+			// task and the 152-round, 554s run of 2026-07-23. Say so loudly —
+			// silently stopping would look to the user like the model simply chose
+			// to answer.
+			if err := r.events.Publish(ctx, domain.RuntimeEvent{
+				Type:      "tool_loop_broken",
+				TaskID:    task.ID,
+				Message:   fmt.Sprintf("同一工具调用连续重复 %d 次，已停止工具循环", streak),
+				CreatedAt: time.Now(),
+			}); err != nil {
+				return domain.TaskRun{}, fmt.Errorf("publish tool loop broken event: %w", err)
+			}
+			r.logger.Warn("tool loop broken: identical call repeated",
+				"task_id", task.ID, "streak", streak, "calls", callsKey(calls))
+			loopCut = true
+			break
+		}
+		if streak >= repeatWarnStreak {
+			st.convo.appendUser(fmt.Sprintf(
+				"[系统] 你已连续 %d 次以完全相同的参数调用同一工具，结果没有变化。不要再重复该调用：改用其他工具，或基于已获取的信息直接给出最终回答。", streak))
+		}
 		st.resp, err = r.generate(ctx, requestID, st.convo, st.tools)
 		if err != nil {
 			r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInferenceError)
@@ -454,7 +486,11 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// model to answer rather than narrate another tool call — otherwise it
 		// tends to emit text like "list_files 参数: {...}" instead of a real
 		// answer when it is cut off mid-exploration.
-		st.convo.appendUser("[系统] 工具调用已达上限。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。")
+		closing := "[系统] 工具调用已达上限。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。"
+		if loopCut {
+			closing = "[系统] 检测到你在重复同一个工具调用，已停止工具循环。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。"
+		}
+		st.convo.appendUser(closing)
 		final, err := r.generateNoTools(ctx, requestID, st.convo)
 		if err != nil {
 			r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInferenceError)

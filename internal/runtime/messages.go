@@ -3,6 +3,8 @@ package runtime
 import (
 	"fmt"
 	"slices"
+	"sort"
+	"strings"
 
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
@@ -114,6 +116,53 @@ func (c *conversation) render(maxChars int) []port.InferenceMessage {
 		}
 	}
 	return out
+}
+
+const (
+	// repeatWarnStreak is how many consecutive identical tool-call rounds (same
+	// names and arguments) earn an explicit warning turn, and repeatAbortStreak
+	// how many end the tool loop.
+	//
+	// Multi-turn context makes repetition visible to the model, but visible is
+	// not the same as stopped: with max_tool_rounds unlimited, a model that keeps
+	// re-reading the same file has nothing else to stop it. Warning first keeps a
+	// legitimately repeated call — polling a file expected to change — workable.
+	repeatWarnStreak  = 3
+	repeatAbortStreak = 8
+)
+
+// repeatedCallStreak reports how many consecutive rounds requested exactly the
+// same tool calls, counting the pending calls as the newest round. It returns 1
+// when the pending calls differ from the previous round, and 0 when there are
+// no pending calls.
+func repeatedCallStreak(msgs []port.InferenceMessage, calls []domain.ToolCall) int {
+	if len(calls) == 0 {
+		return 0
+	}
+	want := callsKey(calls)
+	streak := 1
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if msgs[i].Role != port.RoleAssistant || len(msgs[i].ToolCalls) == 0 {
+			continue
+		}
+		if callsKey(msgs[i].ToolCalls) != want {
+			break
+		}
+		streak++
+	}
+	return streak
+}
+
+// callsKey identifies a whole round's tool calls by name and arguments. Call
+// IDs are excluded on purpose: they are fresh every round and would make every
+// comparison unequal.
+func callsKey(calls []domain.ToolCall) string {
+	parts := make([]string, 0, len(calls))
+	for _, call := range calls {
+		parts = append(parts, dedupKey(call))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "\n")
 }
 
 // totalChars is the rune length of every message's content: the unit render
