@@ -17,6 +17,7 @@ import (
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/storage"
 	"github.com/stardust/legion-agent/internal/taskledger"
+	"github.com/stardust/legion-agent/internal/testsupport"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
@@ -113,7 +114,7 @@ func TestRunTaskExecutesBuiltInReadOnlyToolCalls(t *testing.T) {
 // toolRootProbingMaas issues a single read_file tool call for path on its
 // first Generate call, then returns a final text answer, capturing every
 // prompt the runtime built. Round 2's prompt renders the tool result
-// ("- <call> success: <content>" or "- <call> failed: <error>", see
+// (a tool turn carries the output verbatim, or "failed: <error>", see
 // runtime.renderToolResult), so a test can observe whether the call actually
 // reached the file (sandbox allowed it) or was rejected by
 // WorkspacePathGuard, without a real inference backend. Mirrors
@@ -127,7 +128,7 @@ func (m *toolRootProbingMaas) Generate(ctx context.Context, req port.InferenceRe
 	if err := ctx.Err(); err != nil {
 		return port.InferenceResponse{}, err
 	}
-	m.prompts = append(m.prompts, req.Prompt)
+	m.prompts = append(m.prompts, testsupport.RequestText(req))
 	if len(m.prompts) == 1 {
 		return port.InferenceResponse{ToolCalls: []domain.ToolCall{{
 			ID:        "probe-1",
@@ -168,7 +169,7 @@ func TestRunTaskSandboxesToolsToWorkingDir(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("RunTask(inside) error = %v, want nil", err)
 		}
-		if len(maas.prompts) != 2 || !bytes.Contains([]byte(maas.prompts[1]), []byte("success: inside-content")) {
+		if len(maas.prompts) != 2 || !bytes.Contains([]byte(maas.prompts[1]), []byte("inside-content")) {
 			t.Fatalf("RunTask(inside) prompts = %#v, want tool success reading inside.txt", maas.prompts)
 		}
 	})
@@ -588,7 +589,7 @@ func (m *appWriteFileMaas) Generate(ctx context.Context, req port.InferenceReque
 	if err := ctx.Err(); err != nil {
 		return port.InferenceResponse{}, err
 	}
-	m.prompts = append(m.prompts, req.Prompt)
+	m.prompts = append(m.prompts, testsupport.RequestText(req))
 	if len(m.prompts) == 1 {
 		return port.InferenceResponse{
 			ToolCalls: []domain.ToolCall{{
@@ -609,7 +610,7 @@ func (m *appToolCallingMaas) Generate(ctx context.Context, req port.InferenceReq
 	if err := ctx.Err(); err != nil {
 		return port.InferenceResponse{}, err
 	}
-	m.prompts = append(m.prompts, req.Prompt)
+	m.prompts = append(m.prompts, testsupport.RequestText(req))
 	if len(m.prompts) == 1 {
 		return port.InferenceResponse{
 			ToolCalls: []domain.ToolCall{{
@@ -626,7 +627,7 @@ func (m *appMultiRoundToolCallingMaas) Generate(ctx context.Context, req port.In
 	if err := ctx.Err(); err != nil {
 		return port.InferenceResponse{}, err
 	}
-	m.prompts = append(m.prompts, req.Prompt)
+	m.prompts = append(m.prompts, testsupport.RequestText(req))
 	switch len(m.prompts) {
 	case 1:
 		return port.InferenceResponse{
@@ -653,7 +654,7 @@ func (m *captureMaas) Generate(ctx context.Context, req port.InferenceRequest) (
 	if err := ctx.Err(); err != nil {
 		return port.InferenceResponse{}, err
 	}
-	m.prompt = req.Prompt
+	m.prompt = testsupport.RequestText(req)
 	return port.InferenceResponse{Text: m.response}, nil
 }
 

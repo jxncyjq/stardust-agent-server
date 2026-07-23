@@ -80,22 +80,3 @@ func renderEvictionNotice(evicted []string) string {
 	}
 	return fmt.Sprintf("[unloaded to free space: %s — call load_capabilities again if you still need them]\n", strings.Join(evicted, ", "))
 }
-
-// composePrompt assembles the round's prompt in three parts with separate
-// budgets: the task framing and the loaded block are never trimmed, only the
-// accumulated tool output is.
-//
-// The previous single-budget version handed base+tools to boundPrompt, which
-// drops the middle -- so the task framing's tail and every early tool result
-// were the first things to go.
-func composePrompt(basePrompt string, loaded []loadedEntry, toolCtx []toolEntry, maxPromptChars int) string {
-	loadedBlock := renderLoaded(loaded)
-	if maxPromptChars <= 0 {
-		return basePrompt + loadedBlock + renderToolEntries(toolCtx)
-	}
-	budget := maxPromptChars - len([]rune(basePrompt)) - len([]rune(loadedBlock))
-	if floor := maxPromptChars / 4; budget < floor {
-		budget = floor
-	}
-	return basePrompt + loadedBlock + boundPrompt(renderToolEntries(toolCtx), budget)
-}

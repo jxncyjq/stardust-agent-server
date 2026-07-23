@@ -8,6 +8,7 @@ import (
 	"github.com/stardust/legion-agent/internal/capability"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/testsupport"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
@@ -67,7 +68,7 @@ type childCapturingMaas struct {
 }
 
 func (m *childCapturingMaas) Generate(_ context.Context, req port.InferenceRequest) (port.InferenceResponse, error) {
-	m.prompts = append(m.prompts, req.Prompt)
+	m.prompts = append(m.prompts, testsupport.RequestText(req))
 	if len(m.prompts) == 1 {
 		return port.InferenceResponse{ToolCalls: []domain.ToolCall{{
 			ID: "c1", Name: "lookup", Arguments: map[string]string{"query": "x"},

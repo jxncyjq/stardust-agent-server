@@ -156,10 +156,14 @@ type Runtime struct {
 // runToolLoop advances it; a suspend serialises the relevant fields to a
 // checkpoint and a resume rebuilds it from one.
 type loopState struct {
-	started          time.Time
-	basePrompt       string
-	round            int
-	toolCtx          []toolEntry
+	started    time.Time
+	basePrompt string
+	round      int
+	// convo is the append-only multi-turn exchange sent to the model each round
+	// (see messages.go). It replaced a single re-sent prompt string whose tool
+	// results were deduplicated by (name, arguments), which hid the model's own
+	// repeated calls from it.
+	convo            *conversation
 	loaded           []loadedEntry
 	resp             port.InferenceResponse
 	promptTokens     int
@@ -347,7 +351,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 				started:          started,
 				basePrompt:       cp.BasePrompt,
 				round:            cp.Round,
-				toolCtx:          restoreToolEntries(cp.ToolEntries),
+				convo:            restoreConversation(cp.Messages),
 				loaded:           restoreLoaded(cp.Loaded),
 				resp:             port.InferenceResponse{ToolCalls: cp.PendingCalls},
 				promptTokens:     cp.PromptTokens,
@@ -379,7 +383,8 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	// as the head of every tool-round prompt, so it is the stable prefix that
 	// drives the provider prompt-cache breakpoint (InferenceRequest.StablePrefixLen).
 	basePrompt := prompt
-	resp, err := r.generate(ctx, requestID, prompt, task.Images, len([]rune(basePrompt)), effTools)
+	convo := newConversation(basePrompt, task.Images)
+	resp, err := r.generate(ctx, requestID, convo, effTools)
 	if err != nil {
 		r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInferenceError)
 		return domain.TaskRun{}, fmt.Errorf("generate inference: %w", err)
@@ -387,6 +392,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	st := loopState{
 		started:          started,
 		basePrompt:       basePrompt,
+		convo:            convo,
 		round:            0,
 		resp:             resp,
 		promptTokens:     resp.PromptTokens,
@@ -406,9 +412,9 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 // says suspend, it writes a checkpoint and returns ErrSuspended, releasing the
 // goroutine. A successfully completed run deletes any checkpoint.
 func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domain.Agent, task domain.Task, st loopState) (domain.TaskRun, error) {
-	// toolCtx accumulates tool results deduplicated by (tool, arguments), so
-	// re-reading the same file/URL keeps only the latest copy in context instead
-	// of stacking duplicates each round.
+	// Each round appends the model's own turn and one tool turn per executed
+	// call, so the exchange the model sees grows monotonically and its repeated
+	// calls stay visible to it.
 	for st.round < r.maxToolRounds && len(st.resp.ToolCalls) > 0 {
 		suspend, err := r.checkSuspend(ctx, task, st)
 		if err != nil {
@@ -417,14 +423,19 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		if suspend {
 			return domain.TaskRun{}, ErrSuspended
 		}
+		calls := st.resp.ToolCalls
+		st.convo.appendAssistant(st.resp.Text, calls)
 		results, err := r.executeToolCalls(ctx, agent, task, &st)
 		if err != nil {
 			r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonToolError)
 			return domain.TaskRun{}, fmt.Errorf("execute model tool calls: %w", err)
 		}
-		st.toolCtx = mergeToolResults(st.toolCtx, st.resp.ToolCalls, results, r.maxToolResultChars)
-		prompt := composePrompt(st.basePrompt, st.loaded, st.toolCtx, r.maxPromptChars)
-		st.resp, err = r.generate(ctx, requestID, prompt, st.images, stablePrefixRunes(prompt, st.basePrompt), st.tools)
+		st.convo.appendToolResults(calls, results, r.maxToolResultChars)
+		// A load_capabilities in this round changed the pinned block; surface the
+		// new definitions as their own turn rather than re-sending the whole
+		// block every round.
+		st.convo.syncLoaded(renderLoaded(st.loaded))
+		st.resp, err = r.generate(ctx, requestID, st.convo, st.tools)
 		if err != nil {
 			r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInferenceError)
 			return domain.TaskRun{}, fmt.Errorf("generate inference after tools: %w", err)
@@ -443,9 +454,8 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// model to answer rather than narrate another tool call — otherwise it
 		// tends to emit text like "list_files 参数: {...}" instead of a real
 		// answer when it is cut off mid-exploration.
-		prompt := composePrompt(st.basePrompt, st.loaded, st.toolCtx, r.maxPromptChars)
-		finalPrompt := prompt + "\n\n[系统] 工具调用已达上限。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。"
-		final, err := r.generateNoTools(ctx, requestID, finalPrompt, st.images, stablePrefixRunes(finalPrompt, st.basePrompt))
+		st.convo.appendUser("[系统] 工具调用已达上限。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。")
+		final, err := r.generateNoTools(ctx, requestID, st.convo)
 		if err != nil {
 			r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInferenceError)
 			return domain.TaskRun{}, fmt.Errorf("generate final answer after tool budget exhausted: %w", err)
@@ -482,7 +492,7 @@ func (r *Runtime) checkSuspend(ctx context.Context, task domain.Task, st loopSta
 		Mode:             task.Mode,
 		BasePrompt:       st.basePrompt,
 		Round:            st.round,
-		ToolEntries:      snapshotToolEntries(st.toolCtx),
+		Messages:         snapshotMessages(st.convo),
 		Loaded:           snapshotLoaded(st.loaded),
 		PendingCalls:     st.resp.ToolCalls,
 		PromptTokens:     st.promptTokens,
@@ -614,39 +624,28 @@ func firstNonEmptyLine(s string) string {
 	return ""
 }
 
-func (r *Runtime) generate(ctx context.Context, requestID string, prompt string, images []string, stablePrefixLen int, tools *tool.Registry) (port.InferenceResponse, error) {
+// generate sends the accumulated exchange and offers the run's effective tools.
+// The request carries Messages (never Prompt): the model has to see the calls it
+// already made, and no cache breakpoint is set because an append-only exchange
+// is already a stable prefix for providers that cache automatically.
+func (r *Runtime) generate(ctx context.Context, requestID string, convo *conversation, tools *tool.Registry) (port.InferenceResponse, error) {
 	return r.maas.Generate(ctx, port.InferenceRequest{
-		RequestID:       requestID,
-		Prompt:          prompt,
-		Tools:           r.inferenceTools(tools),
-		Images:          images,
-		StablePrefixLen: stablePrefixLen,
+		RequestID: requestID,
+		Messages:  convo.render(r.maxPromptChars),
+		Tools:     r.inferenceTools(tools),
 	})
 }
 
 // generateNoTools runs a final inference with no tools offered, so the model is
 // forced to produce a textual answer instead of requesting more tool calls. It
-// is used to gracefully finish a task that has exhausted its tool-round budget.
-func (r *Runtime) generateNoTools(ctx context.Context, requestID string, prompt string, images []string, stablePrefixLen int) (port.InferenceResponse, error) {
+// finishes a task that exhausted its tool-round budget or whose loop was cut
+// for repeating itself.
+func (r *Runtime) generateNoTools(ctx context.Context, requestID string, convo *conversation) (port.InferenceResponse, error) {
 	return r.maas.Generate(ctx, port.InferenceRequest{
-		RequestID:       requestID,
-		Prompt:          prompt,
-		Tools:           nil,
-		Images:          images,
-		StablePrefixLen: stablePrefixLen,
+		RequestID: requestID,
+		Messages:  convo.render(r.maxPromptChars),
+		Tools:     nil,
 	})
-}
-
-// stablePrefixRunes reports the rune length of base when base is a verbatim
-// prefix of sent, and 0 otherwise. Tool-round bounding (boundPrompt) can trim
-// the head once the accumulated prompt exceeds the char budget; when that
-// happens base is no longer a stable prefix and callers must not claim a cache
-// breakpoint (contract: 0 means "no known stable prefix").
-func stablePrefixRunes(sent, base string) int {
-	if strings.HasPrefix(sent, base) {
-		return len([]rune(base))
-	}
-	return 0
 }
 
 func (r *Runtime) inferenceTools(tools *tool.Registry) []port.InferenceTool {
@@ -732,13 +731,6 @@ func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task
 	return results, nil
 }
 
-// toolEntry is one tool result kept in the accumulated tool context, tagged with
-// a dedup key so repeated calls collapse to a single most-recent copy.
-type toolEntry struct {
-	key  string
-	text string
-}
-
 // dedupKey identifies a tool call by its name and arguments, so two reads of the
 // same file (or two fetches of the same URL) share a key and deduplicate.
 func dedupKey(call domain.ToolCall) string {
@@ -758,57 +750,6 @@ func dedupKey(call domain.ToolCall) string {
 	return b.String()
 }
 
-func renderToolResult(result domain.ToolResult, maxResultChars int) string {
-	var b strings.Builder
-	b.WriteString("- ")
-	b.WriteString(result.CallID)
-	if result.Success {
-		b.WriteString(" success: ")
-		b.WriteString(truncateText(result.Output, maxResultChars))
-	} else {
-		b.WriteString(" failed: ")
-		b.WriteString(truncateText(result.Error, maxResultChars))
-	}
-	return b.String()
-}
-
-// mergeToolResults folds this round's results into the accumulated tool context,
-// deduplicated by (tool, arguments): a repeated call replaces its earlier entry
-// and moves it to the end (most-recent-wins), so duplicate large outputs do not
-// pile up across rounds.
-func mergeToolResults(entries []toolEntry, calls []domain.ToolCall, results []domain.ToolResult, maxResultChars int) []toolEntry {
-	byID := make(map[string]domain.ToolResult, len(results))
-	for _, res := range results {
-		byID[res.CallID] = res
-	}
-	for _, call := range calls {
-		res, ok := byID[call.ID]
-		if !ok {
-			continue
-		}
-		key := dedupKey(call)
-		kept := make([]toolEntry, 0, len(entries)+1)
-		for _, e := range entries {
-			if e.key != key {
-				kept = append(kept, e)
-			}
-		}
-		entries = append(kept, toolEntry{key: key, text: renderToolResult(res, maxResultChars)})
-	}
-	return entries
-}
-
-func renderToolEntries(entries []toolEntry) string {
-	var b strings.Builder
-	b.WriteString("\n\nTool results:\n")
-	for _, e := range entries {
-		b.WriteString(e.text)
-		b.WriteString("\n")
-	}
-	b.WriteString("\nUse the tool results above to answer the original user request directly.")
-	return b.String()
-}
-
 // truncateText caps a single piece of text to maxChars runes, appending a marker
 // noting how much was dropped. maxChars <= 0 disables truncation.
 func truncateText(text string, maxChars int) string {
@@ -820,27 +761,6 @@ func truncateText(text string, maxChars int) string {
 		return text
 	}
 	return string(runes[:maxChars]) + fmt.Sprintf("\n…[truncated %d chars]", len(runes)-maxChars)
-}
-
-// boundPrompt caps the whole accumulated tool-loop prompt to maxChars by keeping
-// the head (original task framing) and the most recent tail (latest tool
-// results), collapsing the older middle. This prevents the prompt from growing
-// unbounded across tool rounds without an extra LLM summarization call in the
-// hot loop. maxChars <= 0 disables bounding.
-func boundPrompt(prompt string, maxChars int) string {
-	if maxChars <= 0 {
-		return prompt
-	}
-	runes := []rune(prompt)
-	if len(runes) <= maxChars {
-		return prompt
-	}
-	headLen := maxChars / 3
-	tailLen := maxChars - headLen
-	head := string(runes[:headLen])
-	tail := string(runes[len(runes)-tailLen:])
-	dropped := len(runes) - headLen - tailLen
-	return head + fmt.Sprintf("\n\n…[older tool context trimmed: %d chars]…\n\n", dropped) + tail
 }
 
 type noopEventBus struct{}

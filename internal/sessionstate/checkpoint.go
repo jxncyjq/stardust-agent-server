@@ -21,17 +21,27 @@ import (
 // for a run that never called load_capabilities. That is a JSON-decoding
 // nicety, not a schema-version concession: a checkpoint tagged with an older
 // SchemaVersion is still rejected outright by the check below, same as before.
-const CheckpointSchemaVersion = 3
+// v4 replaces ToolEntries with Messages, the append-only multi-turn exchange
+// (user / assistant-with-tool_calls / tool-result) the runtime now sends. A v3
+// checkpoint cannot be upgraded: its tool context was collapsed by
+// (name, arguments) and the assistant turns were never recorded at all, so the
+// conversation it describes cannot be reconstructed. Load rejects it outright
+// rather than resuming a run from a history that never existed.
+const CheckpointSchemaVersion = 4
 
 // checkpointFileName is the single per-session checkpoint file, per design §4.0.
 const checkpointFileName = "task-state.json"
 
-// ToolEntrySnapshot is the serialisable form of the runtime's internal toolEntry
-// (whose fields are unexported). It preserves the dedup key and rendered text so
-// a resumed loop rebuilds identical accumulated tool context.
-type ToolEntrySnapshot struct {
-	Key  string `json:"key"`
-	Text string `json:"text"`
+// MessageSnapshot is the serialisable form of one conversation turn (the
+// runtime's internal conversation has unexported fields). Role decides which
+// fields carry meaning, matching port.InferenceMessage: Images on user,
+// ToolCalls on assistant, ToolCallID on tool.
+type MessageSnapshot struct {
+	Role       string            `json:"role"`
+	Content    string            `json:"content"`
+	Images     []string          `json:"images,omitempty"`
+	ToolCalls  []domain.ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID string            `json:"tool_call_id,omitempty"`
 }
 
 // Checkpoint is the serialised mid-flight state of a suspended tool loop: enough
@@ -46,17 +56,19 @@ type Checkpoint struct {
 	// Mode is the task's working mode (manual|plan|auto) captured at suspend time,
 	// so a resumed run re-applies the same gating (e.g. Manual still gates sensitive
 	// tools) instead of losing it and executing side effects unguarded.
-	Mode             string              `json:"mode,omitempty"`
-	BasePrompt       string              `json:"base_prompt"`
-	Round            int                 `json:"round"`
-	ToolEntries      []ToolEntrySnapshot `json:"tool_entries"`
-	PendingCalls     []domain.ToolCall   `json:"pending_calls"`
-	PromptTokens     int                 `json:"prompt_tokens"`
-	CompletionTokens int                 `json:"completion_tokens"`
-	CachedTokens     int                 `json:"cached_tokens"`
-	TotalTokens      int                 `json:"total_tokens"`
-	Images           []string            `json:"images,omitempty"`
-	CreatedAt        time.Time           `json:"created_at"`
+	Mode       string `json:"mode,omitempty"`
+	BasePrompt string `json:"base_prompt"`
+	Round      int    `json:"round"`
+	// Messages is the exchange as it stood when the run suspended. Restoring it
+	// verbatim is what lets a resumed run keep seeing the calls it already made.
+	Messages         []MessageSnapshot `json:"messages"`
+	PendingCalls     []domain.ToolCall `json:"pending_calls"`
+	PromptTokens     int               `json:"prompt_tokens"`
+	CompletionTokens int               `json:"completion_tokens"`
+	CachedTokens     int               `json:"cached_tokens"`
+	TotalTokens      int               `json:"total_tokens"`
+	Images           []string          `json:"images,omitempty"`
+	CreatedAt        time.Time         `json:"created_at"`
 	// WorkingDir captures the task's working_dir at suspend time, so a resumed
 	// run resolves the same session base (SessionBase(workspaceRoot, WorkingDir))
 	// to locate this checkpoint's session directory rather than defaulting back

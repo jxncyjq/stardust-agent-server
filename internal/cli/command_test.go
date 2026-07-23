@@ -30,6 +30,7 @@ import (
 	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/storage"
 	"github.com/stardust/legion-agent/internal/taskledger"
+	"github.com/stardust/legion-agent/internal/testsupport"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
@@ -193,7 +194,7 @@ func TestRunCommandUsesHTTPMaasForPrompt(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("Decode(request body) error = %v, want nil", err)
 		}
-		gotPrompt = req.Prompt
+		gotPrompt = testsupport.RequestText(req)
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(port.InferenceResponse{Text: "real result"}); err != nil {
 			t.Fatalf("Encode(response body) error = %v, want nil", err)
@@ -232,7 +233,7 @@ func TestRunCommandLoadsHTTPMaasFromConfigFile(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("Decode(request body) error = %v, want nil", err)
 		}
-		gotPrompt = req.Prompt
+		gotPrompt = testsupport.RequestText(req)
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(port.InferenceResponse{Text: "configured result"}); err != nil {
 			t.Fatalf("Encode(response body) error = %v, want nil", err)
@@ -279,7 +280,7 @@ func TestRunCommandLoadsContextFilesFromConfig(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("Decode(request body) error = %v, want nil", err)
 		}
-		gotPrompt = req.Prompt
+		gotPrompt = testsupport.RequestText(req)
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(port.InferenceResponse{Text: "context ok"}); err != nil {
 			t.Fatalf("Encode(response body) error = %v, want nil", err)
@@ -337,7 +338,7 @@ func TestRunCommandUsesMaasProfile(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("Decode(request body) error = %v, want nil", err)
 		}
-		gotPrompt = req.Prompt
+		gotPrompt = testsupport.RequestText(req)
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(port.InferenceResponse{Text: "profile result"}); err != nil {
 			t.Fatalf("Encode(response body) error = %v, want nil", err)
@@ -388,7 +389,7 @@ func TestRunCommandUsesDefaultMaasProfileBeforeTopLevelBaseURL(t *testing.T) {
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Fatalf("Decode(request body) error = %v, want nil", err)
 		}
-		gotPrompt = req.Prompt
+		gotPrompt = testsupport.RequestText(req)
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(port.InferenceResponse{Text: "profile default result"}); err != nil {
 			t.Fatalf("Encode(response body) error = %v, want nil", err)
@@ -839,9 +840,14 @@ func TestRunMentionedTUIAgentTaskAppliesSessionModeAndWorkingDir(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				t.Fatalf("Decode(request body) error = %v, want nil", err)
 			}
-			if len(req.Messages) > 0 {
-				lastPrompt = req.Messages[0].Content
+			// Flatten every turn: with multi-turn requests the tool output arrives
+			// as its own tool message instead of being appended to the first one.
+			var flattened strings.Builder
+			for _, msg := range req.Messages {
+				flattened.WriteString(msg.Content)
+				flattened.WriteString("\n")
 			}
+			lastPrompt = flattened.String()
 			w.Header().Set("Content-Type", "application/json")
 			if requestCount == 1 {
 				argsJSON, err := json.Marshal(map[string]string{"path": filepath.Join(workingDir, "inside.txt")})
@@ -892,7 +898,7 @@ func TestRunMentionedTUIAgentTaskAppliesSessionModeAndWorkingDir(t *testing.T) {
 		if result.Result != "mention-done" {
 			t.Fatalf("runTUITask(@researcher, session working_dir).Result = %q, want %q", result.Result, "mention-done")
 		}
-		if !strings.Contains(lastPrompt, "success: inside-content") {
+		if !strings.Contains(lastPrompt, "inside-content") {
 			t.Fatalf("runTUITask(@researcher, session working_dir) prompt = %q, want tool success reading inside.txt", lastPrompt)
 		}
 	})
@@ -915,9 +921,14 @@ func TestRunMentionedTUIAgentTaskAppliesSessionModeAndWorkingDir(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 				t.Fatalf("Decode(request body) error = %v, want nil", err)
 			}
-			if len(req.Messages) > 0 {
-				lastPrompt = req.Messages[0].Content
+			// Flatten every turn: with multi-turn requests the tool output arrives
+			// as its own tool message instead of being appended to the first one.
+			var flattened strings.Builder
+			for _, msg := range req.Messages {
+				flattened.WriteString(msg.Content)
+				flattened.WriteString("\n")
 			}
+			lastPrompt = flattened.String()
 			w.Header().Set("Content-Type", "application/json")
 			if requestCount == 1 {
 				argsJSON, err := json.Marshal(map[string]string{"path": target, "content": "package foo\n"})
@@ -1082,7 +1093,7 @@ func TestRunTUITaskAppliesSessionModeAndWorkingDir(t *testing.T) {
 		if result.Result != "done" {
 			t.Fatalf("runTUITask(session working_dir).Result = %q, want %q", result.Result, "done")
 		}
-		if !strings.Contains(maas.lastPrompt, "success: inside-content") {
+		if !strings.Contains(maas.lastPrompt, "inside-content") {
 			t.Fatalf("runTUITask(session working_dir) prompt = %q, want tool success reading inside.txt", maas.lastPrompt)
 		}
 	})
@@ -1129,7 +1140,7 @@ func (m *appPlanWriteFileMaas) Generate(ctx context.Context, req port.InferenceR
 		return port.InferenceResponse{}, err
 	}
 	m.rounds++
-	m.lastPrompt = req.Prompt
+	m.lastPrompt = testsupport.RequestText(req)
 	if m.rounds == 1 {
 		return port.InferenceResponse{ToolCalls: []domain.ToolCall{{
 			ID:        "plan-write-1",
@@ -2030,7 +2041,7 @@ func TestServeCommandSandboxesTaskToolsToSessionWorkingDir(t *testing.T) {
 		if _, err := runner.RunTask(context.Background(), domain.Agent{}, insideTask); err != nil {
 			t.Fatalf("RunTask(inside) error = %v, want nil", err)
 		}
-		if !strings.Contains(maas.lastPrompt, "success: inside-content") {
+		if !strings.Contains(maas.lastPrompt, "inside-content") {
 			t.Fatalf("RunTask(inside) prompt = %q, want tool success reading inside.txt", maas.lastPrompt)
 		}
 	})
@@ -2536,14 +2547,14 @@ func (m *cliCaptureMaas) Generate(ctx context.Context, req port.InferenceRequest
 	if err := ctx.Err(); err != nil {
 		return port.InferenceResponse{}, err
 	}
-	m.prompt = req.Prompt
+	m.prompt = testsupport.RequestText(req)
 	return port.InferenceResponse{Text: m.response}, nil
 }
 
 // toolProbingMaas issues a single read_file tool call for path on its first
 // Generate call, then stops (no further tool calls), capturing the prompt the
 // runtime built for the following round — which renders the tool result
-// ("- <call> success: <content>" or "- <call> failed: <error>", see
+// (a tool turn carries the output verbatim, or "failed: <error>", see
 // runtime.renderToolResult) — so a test can observe whether the call actually
 // reached the file (sandbox allowed it) or was rejected by
 // WorkspacePathGuard, without a real inference backend.
@@ -2558,7 +2569,7 @@ func (m *toolProbingMaas) Generate(ctx context.Context, req port.InferenceReques
 		return port.InferenceResponse{}, err
 	}
 	m.rounds++
-	m.lastPrompt = req.Prompt
+	m.lastPrompt = testsupport.RequestText(req)
 	if m.rounds == 1 {
 		return port.InferenceResponse{ToolCalls: []domain.ToolCall{{
 			ID:        "probe-1",
@@ -2582,7 +2593,7 @@ func (m *writeProbingMaas) Generate(ctx context.Context, req port.InferenceReque
 		return port.InferenceResponse{}, err
 	}
 	m.rounds++
-	m.lastPrompt = req.Prompt
+	m.lastPrompt = testsupport.RequestText(req)
 	if m.rounds == 1 {
 		return port.InferenceResponse{ToolCalls: []domain.ToolCall{{
 			ID:        "write-probe-1",
@@ -2664,7 +2675,7 @@ func TestDefaultTaskRunnerSandboxesToolsToTaskWorkingDir(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("RunTask(task.WorkingDir set) error = %v, want nil", err)
 		}
-		if !strings.Contains(maas.lastPrompt, "success: task-content") {
+		if !strings.Contains(maas.lastPrompt, "task-content") {
 			t.Fatalf("RunTask(task.WorkingDir set) prompt = %q, want tool success reading task-only.txt", maas.lastPrompt)
 		}
 	})
@@ -2697,7 +2708,7 @@ func TestDefaultTaskRunnerSandboxesToolsToTaskWorkingDir(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("RunTask(no working dir) error = %v, want nil", err)
 		}
-		if !strings.Contains(maas.lastPrompt, "success: root-content") {
+		if !strings.Contains(maas.lastPrompt, "root-content") {
 			t.Fatalf("RunTask(no working dir) prompt = %q, want tool success reading root-only.txt", maas.lastPrompt)
 		}
 	})

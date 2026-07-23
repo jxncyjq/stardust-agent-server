@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/sessionstate"
 )
 
@@ -15,24 +16,39 @@ func sessionKeyForTask(task domain.Task) string {
 	return task.ID
 }
 
-// snapshotToolEntries converts the runtime's internal (unexported-field) tool
-// context into the serialisable snapshot form for a checkpoint.
-func snapshotToolEntries(entries []toolEntry) []sessionstate.ToolEntrySnapshot {
-	out := make([]sessionstate.ToolEntrySnapshot, 0, len(entries))
-	for _, e := range entries {
-		out = append(out, sessionstate.ToolEntrySnapshot{Key: e.key, Text: e.text})
+// snapshotMessages converts the runtime's internal (unexported-field)
+// conversation into the serialisable snapshot form for a checkpoint.
+func snapshotMessages(convo *conversation) []sessionstate.MessageSnapshot {
+	if convo == nil {
+		return nil
+	}
+	out := make([]sessionstate.MessageSnapshot, 0, len(convo.messages))
+	for _, msg := range convo.messages {
+		out = append(out, sessionstate.MessageSnapshot{
+			Role:       msg.Role,
+			Content:    msg.Content,
+			Images:     msg.Images,
+			ToolCalls:  msg.ToolCalls,
+			ToolCallID: msg.ToolCallID,
+		})
 	}
 	return out
 }
 
-// restoreToolEntries rebuilds internal tool context from a checkpoint snapshot,
-// so a resumed loop re-accumulates identical deduplicated context.
-func restoreToolEntries(snaps []sessionstate.ToolEntrySnapshot) []toolEntry {
-	out := make([]toolEntry, 0, len(snaps))
+// restoreConversation rebuilds the exchange from a checkpoint snapshot, so a
+// resumed loop continues from the same history the model was last shown.
+func restoreConversation(snaps []sessionstate.MessageSnapshot) *conversation {
+	convo := &conversation{messages: make([]port.InferenceMessage, 0, len(snaps))}
 	for _, s := range snaps {
-		out = append(out, toolEntry{key: s.Key, text: s.Text})
+		convo.messages = append(convo.messages, port.InferenceMessage{
+			Role:       s.Role,
+			Content:    s.Content,
+			Images:     s.Images,
+			ToolCalls:  s.ToolCalls,
+			ToolCallID: s.ToolCallID,
+		})
 	}
-	return out
+	return convo
 }
 
 // snapshotLoaded converts the runtime's internal (unexported-field) loaded
