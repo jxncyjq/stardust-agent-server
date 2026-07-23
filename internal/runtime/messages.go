@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"fmt"
 	"slices"
 
 	"github.com/stardust/legion-agent/internal/domain"
@@ -87,7 +88,40 @@ func (c *conversation) syncLoaded(rendered string) {
 	c.appendUser(rendered)
 }
 
-// render returns the messages to send.
+// render returns the messages to send, folding the oldest tool outputs first
+// once the exchange exceeds maxChars.
+//
+// It never drops a message: a provider rejects a tool message whose assistant
+// tool_call is absent, so the turn structure is load-bearing. The first user
+// turn (task framing) is pinned as well — trimming it would silently delete the
+// instructions the run is judged against. maxChars <= 0 disables folding.
 func (c *conversation) render(maxChars int) []port.InferenceMessage {
-	return slices.Clone(c.messages)
+	out := slices.Clone(c.messages)
+	if maxChars <= 0 || totalChars(out) <= maxChars {
+		return out
+	}
+	for i := range out {
+		if out[i].Role != port.RoleTool {
+			continue
+		}
+		dropped := len([]rune(out[i].Content))
+		if dropped == 0 {
+			continue
+		}
+		out[i].Content = fmt.Sprintf("[older tool output trimmed: %d chars]", dropped)
+		if totalChars(out) <= maxChars {
+			break
+		}
+	}
+	return out
+}
+
+// totalChars is the rune length of every message's content: the unit render
+// budgets in.
+func totalChars(msgs []port.InferenceMessage) int {
+	total := 0
+	for _, msg := range msgs {
+		total += len([]rune(msg.Content))
+	}
+	return total
 }

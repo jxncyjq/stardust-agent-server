@@ -82,6 +82,61 @@ func TestConversationRecordsFailedToolAsToolMessage(t *testing.T) {
 	}
 }
 
+// An OpenAI-compatible provider rejects a tool message whose assistant
+// tool_call is missing, so the budget may rewrite content but never drop turns.
+func TestRenderFoldsOldestToolOutputWhenOverBudget(t *testing.T) {
+	t.Parallel()
+	convo := newConversation("base", nil)
+	for i := range 5 {
+		calls := []domain.ToolCall{{ID: fmt.Sprintf("c%d", i), Name: "read_file"}}
+		convo.appendAssistant("", calls)
+		convo.appendToolResults(calls, []domain.ToolResult{{CallID: calls[0].ID, Success: true, Output: strings.Repeat("x", 1000)}}, 0)
+	}
+
+	msgs := convo.render(2000)
+
+	if len(msgs) != 11 {
+		t.Fatalf("render() = %d messages, want the turn structure preserved (11)", len(msgs))
+	}
+	if !strings.Contains(msgs[2].Content, "trimmed") {
+		t.Fatalf("oldest tool turn = %q, want it folded first", msgs[2].Content)
+	}
+	if last := msgs[len(msgs)-1].Content; last != strings.Repeat("x", 1000) {
+		t.Fatalf("newest tool turn was folded (%d chars), want it intact", len([]rune(last)))
+	}
+	if total := totalChars(msgs); total > 2000 {
+		t.Fatalf("render() total = %d chars, want <= 2000", total)
+	}
+}
+
+// The task framing is pinned: trimming it would delete the instructions the run
+// is judged against, which is exactly how the previous single-budget bounding
+// used to lose the head of the prompt.
+func TestRenderNeverFoldsTheFirstUserTurn(t *testing.T) {
+	t.Parallel()
+	convo := newConversation(strings.Repeat("b", 3000), nil)
+
+	msgs := convo.render(1000)
+
+	if msgs[0].Content != strings.Repeat("b", 3000) {
+		t.Fatalf("first turn was folded (%d chars), want the task framing intact", len([]rune(msgs[0].Content)))
+	}
+}
+
+func TestRenderLeavesExchangeAloneWithinBudget(t *testing.T) {
+	t.Parallel()
+	convo := newConversation("base", nil)
+	calls := []domain.ToolCall{{ID: "c1", Name: "read_file"}}
+	convo.appendAssistant("", calls)
+	convo.appendToolResults(calls, []domain.ToolResult{{CallID: "c1", Success: true, Output: "small"}}, 0)
+
+	msgs := convo.render(10000)
+
+	if msgs[2].Content != "small" {
+		t.Fatalf("tool turn = %q, want it untouched within budget", msgs[2].Content)
+	}
+}
+
 func TestConversationCarriesImagesOnTheFirstUserTurn(t *testing.T) {
 	t.Parallel()
 	convo := newConversation("look", []string{"data:image/png;base64,AAAA"})
