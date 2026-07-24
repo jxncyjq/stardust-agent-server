@@ -96,6 +96,25 @@ func (r *Registry) Subset(names ...string) *Registry {
 	return sub
 }
 
+// Without returns a new registry exposing every registered tool except the
+// named ones. It shares this registry's policy, enforcer, guardrails, audit log
+// and sanitizer (like Subset). Names with no matching tool are ignored:
+// disabling a tool an agent never had is a legitimate no-op, not an error. It
+// never mutates the receiver.
+func (r *Registry) Without(names ...string) *Registry {
+	remove := make(map[string]bool, len(names))
+	for _, name := range names {
+		remove[name] = true
+	}
+	keep := make([]string, 0, len(r.describes))
+	for name := range r.describes {
+		if !remove[name] {
+			keep = append(keep, name)
+		}
+	}
+	return r.Subset(keep...)
+}
+
 func (r *Registry) Descriptors() []Descriptor {
 	descriptors := make([]Descriptor, 0, len(r.describes))
 	for _, descriptor := range r.describes {

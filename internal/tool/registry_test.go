@@ -123,3 +123,41 @@ func hasAuditAction(events []domain.AuditEvent, action string) bool {
 	}
 	return false
 }
+
+func TestRegistryWithoutRemovesNamedTools(t *testing.T) {
+	base := NewFileReadWriteWorkspaceRegistry(t.TempDir(), nil)
+	got := base.Without("write_file")
+
+	names := map[string]bool{}
+	for _, d := range got.Descriptors() {
+		names[d.Name] = true
+	}
+	if names["write_file"] {
+		t.Fatal("Without(write_file) still exposes write_file")
+	}
+	if !names["read_file"] {
+		t.Fatal("Without(write_file) dropped an unrelated tool")
+	}
+}
+
+func TestRegistryWithoutIgnoresUnknownNames(t *testing.T) {
+	base := NewFileReadWriteWorkspaceRegistry(t.TempDir(), nil)
+	before := len(base.Descriptors())
+
+	got := base.Without("no_such_tool")
+
+	if len(got.Descriptors()) != before {
+		t.Fatalf("Without(unknown) changed the tool set: %d -> %d", before, len(got.Descriptors()))
+	}
+}
+
+func TestRegistryWithoutDoesNotMutateReceiver(t *testing.T) {
+	base := NewFileReadWriteWorkspaceRegistry(t.TempDir(), nil)
+	before := len(base.Descriptors())
+
+	base.Without("write_file")
+
+	if len(base.Descriptors()) != before {
+		t.Fatal("Without mutated the receiver registry")
+	}
+}
