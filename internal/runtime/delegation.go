@@ -84,12 +84,16 @@ func (r *Runtime) newSubRuntime(role string, toolsets []string) (*Runtime, error
 		tools = tools.Subset(toolsets...)
 	}
 	child := &Runtime{
-		maas:               r.maas,
-		audit:              r.audit,
-		events:             r.events,
-		contextBuilder:     r.contextBuilder,
-		contextPrefix:      r.contextPrefix,
-		tools:              tools,
+		maas:           r.maas,
+		audit:          r.audit,
+		events:         r.events,
+		contextBuilder: r.contextBuilder,
+		contextPrefix:  r.contextPrefix,
+		tools:          tools,
+		// The deny-list must survive delegation: a child built by hand here
+		// would otherwise regain a tool its parent was denied. Carry it over
+		// explicitly, like tools/logger above.
+		disabledTools:      r.disabledTools,
 		maxToolRounds:      r.maxToolRounds,
 		maxToolResultChars: r.maxToolResultChars,
 		maxPromptChars:     r.maxPromptChars,

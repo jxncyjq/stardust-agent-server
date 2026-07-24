@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+
+	"github.com/stardust/legion-agent/internal/toolauth"
 )
 
 var ErrConfigNotFound = errors.New("config file not found")
@@ -111,6 +113,11 @@ type RuntimeConfig struct {
 	// (a contract outcome — a reject result to the model — not a silent drop).
 	// Defaults to 300 (5 minutes) when 0 or negative.
 	ApprovalTimeoutSeconds int `json:"approval_timeout_seconds"`
+	// DisabledTools names the tools this agent may not use (deny-list). Absent /
+	// null / empty means no tool is disabled — every tool is available. Each name
+	// must be a known gateable tool (validated at agent assembly); meta-tools are
+	// never listed here and cannot be disabled.
+	DisabledTools []string `json:"disabled_tools,omitempty"`
 }
 
 type SessionConfig struct {
@@ -206,6 +213,16 @@ func Load(ctx context.Context, opts Options) (Config, error) {
 		return Config{}, err
 	}
 	cfg.Runtime.MaxToolRounds = normalizeMaxToolRounds(cfg.Runtime.MaxToolRounds)
+
+	// Validate DisabledTools: each name must be a known gateable tool (fail-loud).
+	// Build the set once, outside the loop, for efficiency.
+	gateableNames := toolauth.GateableToolNames()
+	for _, name := range cfg.Runtime.DisabledTools {
+		if !gateableNames[name] {
+			return Config{}, fmt.Errorf("unknown disabled tool %q", name)
+		}
+	}
+
 	return cfg, nil
 }
 

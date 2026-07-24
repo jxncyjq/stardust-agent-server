@@ -607,6 +607,85 @@ func TestResolverGivesWorkerWriteFile(t *testing.T) {
 	}
 }
 
+// TestResolverRejectsUnknownDisabledTool guards fail-loud assembly-time
+// validation: a disabled_tools entry that does not name a known gateable tool
+// is a config error (a typo silently disabling nothing is exactly what
+// fail-loud forbids — CLAUDE.md §0), so ResolveTaskRunner must return an error
+// naming the offending tool rather than building a runtime with a dead-letter
+// deny-list entry.
+func TestResolverRejectsUnknownDisabledTool(t *testing.T) {
+	t.Parallel()
+
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
+			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep", DisabledTools: []string{"writ_file"}},
+		}),
+		RootConfig: config.Config{
+			ContextFiles: config.ContextFilesConfig{Root: t.TempDir()},
+			Runtime:      config.RuntimeConfig{MaxToolRounds: 1},
+		},
+		Audit:  adapter.NewMemoryAuditLog(),
+		Events: adapter.NewMemoryEventBus(),
+		MaasFactory: func(string) (MaasRunnerFactoryResult, error) {
+			return MaasRunnerFactoryResult{Client: &resolverCaptureMaas{response: "ok"}}, nil
+		},
+	})
+
+	_, _, _, err := resolver.ResolveTaskRunner(context.Background(), domain.Task{
+		ID:      "task-unknown-disabled",
+		AgentID: "researcher",
+	})
+	if err == nil {
+		t.Fatal("resolver accepted an unknown disabled tool name")
+	}
+	if !strings.Contains(err.Error(), "writ_file") {
+		t.Fatalf("error = %v, want it to name the unknown tool", err)
+	}
+}
+
+// TestResolverAppliesDisabledTools guards that a valid disabled_tools entry
+// actually reaches the built runtime and takes effect: the offered tool
+// schema must omit it.
+func TestResolverAppliesDisabledTools(t *testing.T) {
+	t.Parallel()
+
+	maas := &recordingRoundsMaas{responses: []port.InferenceResponse{{Text: "done"}}}
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
+			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep", DisabledTools: []string{"write_file"}},
+		}),
+		RootConfig: config.Config{
+			ContextFiles: config.ContextFilesConfig{Root: t.TempDir()},
+			Runtime:      config.RuntimeConfig{MaxToolRounds: 1},
+		},
+		Audit:  adapter.NewMemoryAuditLog(),
+		Events: adapter.NewMemoryEventBus(),
+		MaasFactory: func(string) (MaasRunnerFactoryResult, error) {
+			return MaasRunnerFactoryResult{Client: maas}, nil
+		},
+	})
+
+	task := domain.Task{ID: "task-disabled-tools", AgentID: "researcher", Input: "go"}
+	agent, runner, ok, err := resolver.ResolveTaskRunner(context.Background(), task)
+	if err != nil {
+		t.Fatalf("ResolveTaskRunner error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatalf("ResolveTaskRunner ok = false, want true")
+	}
+	if _, err := runner.RunTask(context.Background(), agent, task); err != nil {
+		t.Fatalf("RunTask error = %v, want nil", err)
+	}
+	if len(maas.requests) == 0 {
+		t.Fatalf("no requests captured by maas")
+	}
+	for _, tl := range maas.requests[0].Tools {
+		if tl.Name == "write_file" {
+			t.Fatal("disabled write_file was still offered to the model")
+		}
+	}
+}
+
 type resolverCaptureMaas struct {
 	response string
 	prompt   string
