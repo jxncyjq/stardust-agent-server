@@ -20,6 +20,7 @@ import (
 	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/taskledger"
 	"github.com/stardust/legion-agent/internal/tool"
+	"github.com/stardust/legion-agent/internal/toolauth"
 )
 
 type DemoResult struct {
@@ -81,6 +82,12 @@ type RunTaskOptions struct {
 	// unwired gate regardless of whether that particular gate would ever use
 	// it, because it cannot tell the two cases apart from the Config alone.
 	Checkpoints *sessionstate.Store
+	// DisabledTools names tools the default runtime's agent may not use
+	// (deny-list), mirroring runtime.Config.DisabledTools. Each name must be a
+	// known gateable tool (validated in RunTask; an unknown name is a config
+	// error — CLAUDE.md §0 fail-loud — not a silent no-op). Empty disables
+	// nothing.
+	DisabledTools []string
 }
 
 type TaskSink interface {
@@ -189,6 +196,14 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 	if opts.Prompt == "" {
 		return DemoResult{}, fmt.Errorf("prompt is required")
 	}
+	// Fail-loud assembly-time validation (CLAUDE.md §0): a disabled_tools entry
+	// that does not name a known gateable tool is a config error, not an inert
+	// no-op — a typo would otherwise silently disable nothing.
+	for _, name := range opts.DisabledTools {
+		if !toolauth.IsGateable(name) {
+			return DemoResult{}, fmt.Errorf("disabled_tools names unknown tool %q", name)
+		}
+	}
 	logger := opts.Logger
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -235,6 +250,7 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 		ToolGate:          opts.ToolGate,
 		Checkpoints:       opts.Checkpoints,
 		Logger:            taskLogger,
+		DisabledTools:     opts.DisabledTools,
 	})
 	task := domain.Task{
 		ID:         opts.TaskID,

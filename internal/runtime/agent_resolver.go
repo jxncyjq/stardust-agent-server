@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sort"
 	"strings"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/stardust/legion-agent/internal/skill"
 	"github.com/stardust/legion-agent/internal/taskledger"
 	"github.com/stardust/legion-agent/internal/tool"
+	"github.com/stardust/legion-agent/internal/toolauth"
 )
 
 type MaasRunnerFactoryResult struct {
@@ -92,6 +94,19 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 	agentCfg, ok := r.registry.Get(task.AgentID)
 	if !ok {
 		return domain.Agent{}, nil, false, nil
+	}
+	// Fail-loud assembly-time validation (CLAUDE.md §0): a disabled_tools entry
+	// that does not name a known gateable tool is a config error, not an inert
+	// no-op — a typo would otherwise silently disable nothing. gateableNames is
+	// fetched once, outside the loop, so validating N entries costs one map
+	// build rather than N.
+	gateableNames := toolauth.GateableToolNames()
+	for _, name := range agentCfg.DisabledTools {
+		if !gateableNames[name] {
+			return domain.Agent{}, nil, false, fmt.Errorf(
+				"agent %q disabled_tools names unknown tool %q (gateable: %v)",
+				agentCfg.ID, name, sortedKeys(gateableNames))
+		}
 	}
 	if r.maasFactory == nil {
 		return domain.Agent{}, nil, false, fmt.Errorf("maas runner factory is nil")
@@ -179,6 +194,7 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		Logger:           r.logger,
 		CapabilitySkills: capabilitySkills,
 		SkillUsage:       r.skillUsage,
+		DisabledTools:    agentCfg.DisabledTools,
 	})
 	return agent, runner, true, nil
 }
@@ -241,6 +257,18 @@ func agentSkillsRoot(rootCfg config.Config, agentCfg agentregistry.AgentConfig) 
 		return root
 	}
 	return rootCfg.Skills.InstallRoot
+}
+
+// sortedKeys returns the keys of a gateable-tool-name set sorted ascending, so
+// a fail-loud "unknown disabled tool" error message lists the valid set in a
+// stable, readable order rather than Go's randomized map iteration order.
+func sortedKeys(names map[string]bool) []string {
+	keys := make([]string, 0, len(names))
+	for k := range names {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func firstNonEmptyAgentRuntimeResolver(values ...string) string {

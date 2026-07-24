@@ -147,6 +147,32 @@ func TestParentTaskIDForSubTask(t *testing.T) {
 	}
 }
 
+// TestSubRuntimeInheritsDisabledTools guards a Task 4 review gap: a disabled
+// tool must stay disabled after delegation. The child runtime is built by hand
+// in newSubRuntime (not via NewRuntime), so it must carry the parent's
+// deny-list or a delegating agent silently regains the tool it was denied.
+func TestSubRuntimeInheritsDisabledTools(t *testing.T) {
+	parent := NewRuntime(Config{
+		Maas:          &recordingRoundsMaas{responses: []port.InferenceResponse{{Text: "done"}}},
+		Tools:         unchangingReadRegistry(t), // has read_file
+		MaxSpawnDepth: 2,
+		DisabledTools: []string{"read_file"},
+	})
+	child, err := parent.newSubRuntime("leaf", nil) // no toolsets → inherits parent's full registry
+	if err != nil {
+		t.Fatalf("newSubRuntime error = %v, want nil", err)
+	}
+	if _, err := child.RunTask(context.Background(), domain.Agent{ID: "c"}, domain.Task{ID: "t1", Input: "go"}); err != nil {
+		t.Fatalf("child RunTask error = %v, want nil", err)
+	}
+	req := child.maas.(*recordingRoundsMaas).requests[0]
+	for _, tl := range req.Tools {
+		if tl.Name == "read_file" {
+			t.Fatal("delegated child still offers the parent's disabled read_file")
+		}
+	}
+}
+
 // collectingEventBus is a thread-safe event sink that lets a test block until an
 // event of a given type is published (for the background delegation path).
 type collectingEventBus struct {

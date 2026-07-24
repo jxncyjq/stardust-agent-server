@@ -148,6 +148,7 @@ func newRunCommand(application *app.App, out io.Writer) *cobra.Command {
 					MaxToolRounds:    cfg.Runtime.MaxToolRounds,
 					LazyTools:        cfg.Runtime.LazyTools,
 					WebTools:         webToolOptions(cfg.Web),
+					DisabledTools:    cfg.Runtime.DisabledTools,
 				})
 			default:
 				err = fmt.Errorf("run requires --demo or --prompt")
@@ -552,6 +553,7 @@ func runTUITask(ctx context.Context, application *app.App, cfg tuiTaskRunConfig)
 		WebTools:          webToolOptions(cfg.Config.Web),
 		ToolGate:          cfg.ToolGate,
 		Checkpoints:       cfg.Checkpoints,
+		DisabledTools:     cfg.Config.Runtime.DisabledTools,
 	})
 	if err != nil {
 		return app.DemoResult{}, err
@@ -641,6 +643,7 @@ func runMentionedTUIAgentTask(ctx context.Context, application *app.App, cfg tui
 		WebTools:          webToolOptions(cfg.Config.Web),
 		ToolGate:          cfg.ToolGate,
 		Checkpoints:       cfg.Checkpoints,
+		DisabledTools:     cfg.Config.Runtime.DisabledTools,
 	})
 	if err != nil {
 		return app.DemoResult{}, err
@@ -1906,6 +1909,7 @@ func buildDefaultRunnerConfig(
 		Logger:           logger,
 		CapabilitySkills: capabilitySkills,
 		SkillUsage:       skillUsage,
+		DisabledTools:    runtimeSettings.DisabledTools,
 	}
 }
 
