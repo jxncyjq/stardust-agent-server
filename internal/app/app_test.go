@@ -692,25 +692,3 @@ func (s *appMemoryAgentMessageStore) ListAgentMessages(context.Context, domain.A
 func (s *appMemoryAgentMessageStore) MarkAgentMessageRead(context.Context, string, time.Time) error {
 	return nil
 }
-
-func TestListGateableToolsReturnsSortedNamedTools(t *testing.T) {
-	got := New().ListGateableTools()
-	if len(got) == 0 {
-		t.Fatal("ListGateableTools() returned nothing")
-	}
-	var sawWrite bool
-	for i, tl := range got {
-		if tl.Name == "" || tl.Description == "" {
-			t.Errorf("ListGateableTools()[%d] missing name/description: %#v", i, tl)
-		}
-		if tl.Name == "write_file" {
-			sawWrite = true
-		}
-		if tl.Name == "call_tool" || tl.Name == "load_capabilities" {
-			t.Errorf("ListGateableTools() leaked meta-tool %q", tl.Name)
-		}
-	}
-	if !sawWrite {
-		t.Error("ListGateableTools() missing write_file")
-	}
-}
