@@ -111,6 +111,11 @@ type Config struct {
 	// are catalogued (the catalog then lists only tools). It is consulted only
 	// under the lazy protocol, the only protocol that offers load_capabilities.
 	CapabilitySkills capability.Provider
+	// DisabledTools names tools this runtime's agent may not use (deny-list).
+	// effectiveTools removes them from the registry that drives the offered
+	// schema, the lazy capability catalog and dispatch at once. Meta-tools are
+	// never in the registry, so they are unaffected. Empty disables nothing.
+	DisabledTools []string
 }
 
 // SkillUsageRecorder is the usage sidecar skill.UsageStore satisfies.
@@ -150,6 +155,7 @@ type Runtime struct {
 	logger             *slog.Logger
 	skillUsage         SkillUsageRecorder
 	capabilitySkills   capability.Provider
+	disabledTools      []string
 }
 
 // loopState is the mutable state threaded through the tool-execution loop.
@@ -193,10 +199,14 @@ type loopState struct {
 // mutates r.tools and returns a fresh per-call Registry, safe under concurrent
 // tasks sharing this Runtime.
 func (r *Runtime) effectiveTools(task domain.Task) *tool.Registry {
-	if r.tools != nil && task.Mode == domain.ModePlan {
-		return r.tools.Subset(r.tools.SafeToolNames()...)
+	tools := r.tools
+	if tools != nil && task.Mode == domain.ModePlan {
+		tools = tools.Subset(tools.SafeToolNames()...)
 	}
-	return r.tools
+	if tools != nil && len(r.disabledTools) > 0 {
+		tools = tools.Without(r.disabledTools...)
+	}
+	return tools
 }
 
 // buildCatalog assembles the per-task capability catalog from the run's
@@ -273,6 +283,7 @@ func NewRuntime(cfg Config) *Runtime {
 		logger:             logger,
 		skillUsage:         cfg.SkillUsage,
 		capabilitySkills:   cfg.CapabilitySkills,
+		disabledTools:      cfg.DisabledTools,
 	}
 }
 
