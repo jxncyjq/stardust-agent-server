@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+
+	"github.com/stardust/legion-agent/internal/toolauth"
 )
 
 var ErrConfigNotFound = errors.New("config file not found")
@@ -211,6 +213,16 @@ func Load(ctx context.Context, opts Options) (Config, error) {
 		return Config{}, err
 	}
 	cfg.Runtime.MaxToolRounds = normalizeMaxToolRounds(cfg.Runtime.MaxToolRounds)
+
+	// Validate DisabledTools: each name must be a known gateable tool (fail-loud).
+	// Build the set once, outside the loop, for efficiency.
+	gateableNames := toolauth.GateableToolNames()
+	for _, name := range cfg.Runtime.DisabledTools {
+		if !gateableNames[name] {
+			return Config{}, fmt.Errorf("unknown disabled tool %q", name)
+		}
+	}
+
 	return cfg, nil
 }
 

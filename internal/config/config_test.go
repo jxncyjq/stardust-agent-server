@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -474,5 +475,54 @@ func TestNormalizeMaxToolRounds(t *testing.T) {
 				t.Errorf("normalizeMaxToolRounds(%d) = %d, want %d", tc.in, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestLoadDisabledToolsUnknownNameFailsLoud validates that an unknown tool name
+// in disabled_tools causes Load to return an error with the bad name included.
+// This is a fail-loud invariant: typos in the config must be caught eagerly.
+func TestLoadDisabledToolsUnknownNameFailsLoud(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "agent.json")
+	body := `{
+		"runtime": {
+			"disabled_tools": ["writ_file"]
+		}
+	}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", path, err)
+	}
+
+	_, err := Load(context.Background(), Options{Path: path})
+	if err == nil {
+		t.Fatal("Load with unknown disabled_tools name should return error, got nil")
+	}
+	if !strings.Contains(err.Error(), "writ_file") {
+		t.Fatalf("Load error %q should mention unknown tool name 'writ_file'", err.Error())
+	}
+}
+
+// TestLoadDisabledToolsValidNameSucceeds validates that a valid tool name in
+// disabled_tools is accepted and the config loads successfully.
+func TestLoadDisabledToolsValidNameSucceeds(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "agent.json")
+	body := `{
+		"runtime": {
+			"disabled_tools": ["write_file"]
+		}
+	}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", path, err)
+	}
+
+	cfg, err := Load(context.Background(), Options{Path: path})
+	if err != nil {
+		t.Fatalf("Load with valid disabled_tools name should succeed, got error: %v", err)
+	}
+	if len(cfg.Runtime.DisabledTools) != 1 || cfg.Runtime.DisabledTools[0] != "write_file" {
+		t.Fatalf("Load().Runtime.DisabledTools = %v, want [write_file]", cfg.Runtime.DisabledTools)
 	}
 }
