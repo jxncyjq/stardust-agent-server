@@ -2,6 +2,7 @@ package agentregistry
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -120,5 +121,26 @@ func TestRegistryNewCopiesInputsAndNamesReturnsSortedCopy(t *testing.T) {
 	}
 	if agent.ID != "writer" {
 		t.Fatalf("New(agents).Get(writer).ID = %q, want writer", agent.ID)
+	}
+}
+
+func TestAgentConfigCarriesDisabledTools(t *testing.T) {
+	raw := []byte(`{"id":"a1","role":"researcher","disabled_tools":["write_file"]}`)
+	var cfg AgentConfig
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("Unmarshal error = %v, want nil", err)
+	}
+	if len(cfg.DisabledTools) != 1 || cfg.DisabledTools[0] != "write_file" {
+		t.Fatalf("DisabledTools = %#v, want [write_file]", cfg.DisabledTools)
+	}
+}
+
+func TestAgentConfigOmitsDisabledToolsWhenAbsent(t *testing.T) {
+	var cfg AgentConfig
+	if err := json.Unmarshal([]byte(`{"id":"a1","role":"r"}`), &cfg); err != nil {
+		t.Fatalf("Unmarshal error = %v, want nil", err)
+	}
+	if cfg.DisabledTools != nil {
+		t.Fatalf("DisabledTools = %#v, want nil when absent", cfg.DisabledTools)
 	}
 }

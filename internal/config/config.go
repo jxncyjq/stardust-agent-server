@@ -111,6 +111,11 @@ type RuntimeConfig struct {
 	// (a contract outcome — a reject result to the model — not a silent drop).
 	// Defaults to 300 (5 minutes) when 0 or negative.
 	ApprovalTimeoutSeconds int `json:"approval_timeout_seconds"`
+	// DisabledTools names the tools this agent may not use (deny-list). Absent /
+	// null / empty means no tool is disabled — every tool is available. Each name
+	// must be a known gateable tool (validated at agent assembly); meta-tools are
+	// never listed here and cannot be disabled.
+	DisabledTools []string `json:"disabled_tools,omitempty"`
 }
 
 type SessionConfig struct {
