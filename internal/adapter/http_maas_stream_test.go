@@ -169,3 +169,33 @@ func TestGenerateStreamFallsBackToSyncWithoutModel(t *testing.T) {
 		t.Fatalf("deltaCount = %d, want 0 (no streaming without a model)", deltaCount)
 	}
 }
+
+// TestGenerateOpenAIChatStreamAccumulatesReasoningContent verifies that
+// delta.reasoning_content fragments from the stream are accumulated and
+// returned in the final InferenceResponse.ReasoningSummary, matching the
+// contract that streaming produces the same complete InferenceResponse that
+// Generate returns (for reasoning-capable models like deepseek-reasoner).
+func TestGenerateOpenAIChatStreamAccumulatesReasoningContent(t *testing.T) {
+	srv := streamServer(t, []string{
+		`{"choices":[{"delta":{"reasoning_content":"Let me think"}}]}`,
+		`{"choices":[{"delta":{"reasoning_content":" about this"}}]}`,
+		`{"choices":[{"delta":{"content":"The answer is 42"}}]}`,
+		`{"choices":[{"delta":{"reasoning_content":" step by step"}}]}`,
+		`{"choices":[{"delta":{}}],"usage":{"prompt_tokens":20,"completion_tokens":5,"total_tokens":25}}`,
+	})
+	t.Cleanup(srv.Close)
+	client := NewHTTPMaasClient(HTTPMaasConfig{BaseURL: srv.URL, Model: "deepseek-reasoner", Client: srv.Client()})
+
+	resp, err := client.generateOpenAIChatStream(context.Background(),
+		port.InferenceRequest{Messages: []port.InferenceMessage{{Role: port.RoleUser, Content: "think"}}}, nil)
+	if err != nil {
+		t.Fatalf("generateOpenAIChatStream error = %v, want nil", err)
+	}
+	if resp.Text != "The answer is 42" {
+		t.Fatalf("resp.Text = %q, want 'The answer is 42'", resp.Text)
+	}
+	expectedReasoning := "Let me think about this step by step"
+	if resp.ReasoningSummary != expectedReasoning {
+		t.Fatalf("resp.ReasoningSummary = %q, want %q", resp.ReasoningSummary, expectedReasoning)
+	}
+}

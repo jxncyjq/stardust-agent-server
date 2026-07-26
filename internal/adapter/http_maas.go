@@ -175,13 +175,15 @@ func (c *HTTPMaasClient) generateOpenAIChat(ctx context.Context, req port.Infere
 
 // openAIChatStreamChunk is one SSE "data:" payload of a streaming chat
 // completion. Delta.Content carries a text increment; Delta.ToolCalls carries
-// tool-call fragments keyed by index. Usage is non-nil only on the chunk(s)
-// requested via stream_options.include_usage.
+// tool-call fragments keyed by index; Delta.ReasoningContent carries reasoning
+// fragments for reasoning models (e.g. deepseek-reasoner). Usage is non-nil
+// only on the chunk(s) requested via stream_options.include_usage.
 type openAIChatStreamChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content   string                     `json:"content"`
-			ToolCalls []openAIChatStreamToolCall `json:"tool_calls"`
+			Content          string                     `json:"content"`
+			ToolCalls        []openAIChatStreamToolCall `json:"tool_calls"`
+			ReasoningContent string                     `json:"reasoning_content"`
 		} `json:"delta"`
 	} `json:"choices"`
 	Usage *openAIChatUsage `json:"usage"`
@@ -244,6 +246,7 @@ func (c *HTTPMaasClient) generateOpenAIChatStream(ctx context.Context, req port.
 	}
 
 	var textB strings.Builder
+	var reasoningB strings.Builder
 	// toolAcc accumulates tool-call fragments by index: id/name arrive first,
 	// arguments stream as substrings that must be concatenated in order.
 	type toolAccum struct {
@@ -281,6 +284,9 @@ func (c *HTTPMaasClient) generateOpenAIChatStream(ctx context.Context, req port.
 				if onDelta != nil {
 					onDelta(ch.Delta.Content)
 				}
+			}
+			if ch.Delta.ReasoningContent != "" {
+				reasoningB.WriteString(ch.Delta.ReasoningContent)
 			}
 			for _, tc := range ch.Delta.ToolCalls {
 				acc, ok := toolByIndex[tc.Index]
@@ -321,8 +327,9 @@ func (c *HTTPMaasClient) generateOpenAIChatStream(ctx context.Context, req port.
 		return port.InferenceResponse{}, fmt.Errorf("parse openai chat stream tool calls: %w", err)
 	}
 	out := port.InferenceResponse{
-		Text:      textB.String(),
-		ToolCalls: assembledToolCalls,
+		Text:             textB.String(),
+		ReasoningSummary: reasoningB.String(),
+		ToolCalls:        assembledToolCalls,
 	}
 	if usage != nil {
 		out.PromptTokens = usage.PromptTokens
