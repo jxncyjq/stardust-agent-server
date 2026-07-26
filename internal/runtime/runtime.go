@@ -395,7 +395,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	// drives the provider prompt-cache breakpoint (InferenceRequest.StablePrefixLen).
 	basePrompt := prompt
 	convo := newConversation(basePrompt, task.Images)
-	resp, err := r.generate(ctx, requestID, convo, effTools)
+	resp, err := r.generate(ctx, requestID, task.ID, convo, effTools)
 	if err != nil {
 		r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInferenceError)
 		return domain.TaskRun{}, fmt.Errorf("generate inference: %w", err)
@@ -478,7 +478,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 			st.convo.appendUser(fmt.Sprintf(
 				"[系统] 你已连续 %d 次以完全相同的参数调用同一工具，结果没有变化。不要再重复该调用：改用其他工具，或基于已获取的信息直接给出最终回答。", streak))
 		}
-		st.resp, err = r.generate(ctx, requestID, st.convo, st.tools)
+		st.resp, err = r.generate(ctx, requestID, task.ID, st.convo, st.tools)
 		if err != nil {
 			r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInferenceError)
 			return domain.TaskRun{}, fmt.Errorf("generate inference after tools: %w", err)
@@ -502,7 +502,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 			closing = "[系统] 检测到你在重复同一个工具调用，已停止工具循环。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。"
 		}
 		st.convo.appendUser(closing)
-		final, err := r.generateNoTools(ctx, requestID, st.convo)
+		final, err := r.generateNoTools(ctx, requestID, task.ID, st.convo)
 		if err != nil {
 			r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInferenceError)
 			return domain.TaskRun{}, fmt.Errorf("generate final answer after tool budget exhausted: %w", err)
@@ -675,24 +675,44 @@ func firstNonEmptyLine(s string) string {
 // The request carries Messages (never Prompt): the model has to see the calls it
 // already made, and no cache breakpoint is set because an append-only exchange
 // is already a stable prefix for providers that cache automatically.
-func (r *Runtime) generate(ctx context.Context, requestID string, convo *conversation, tools *tool.Registry) (port.InferenceResponse, error) {
-	return r.maas.Generate(ctx, port.InferenceRequest{
+func (r *Runtime) generate(ctx context.Context, requestID string, taskID string, convo *conversation, tools *tool.Registry) (port.InferenceResponse, error) {
+	req := port.InferenceRequest{
 		RequestID: requestID,
 		Messages:  convo.render(r.maxPromptChars),
 		Tools:     r.inferenceTools(tools),
-	})
+	}
+	return r.runInference(ctx, taskID, req)
 }
 
 // generateNoTools runs a final inference with no tools offered, so the model is
 // forced to produce a textual answer instead of requesting more tool calls. It
 // finishes a task that exhausted its tool-round budget or whose loop was cut
 // for repeating itself.
-func (r *Runtime) generateNoTools(ctx context.Context, requestID string, convo *conversation) (port.InferenceResponse, error) {
-	return r.maas.Generate(ctx, port.InferenceRequest{
+func (r *Runtime) generateNoTools(ctx context.Context, requestID string, taskID string, convo *conversation) (port.InferenceResponse, error) {
+	req := port.InferenceRequest{
 		RequestID: requestID,
 		Messages:  convo.render(r.maxPromptChars),
 		Tools:     nil,
-	})
+	}
+	return r.runInference(ctx, taskID, req)
+}
+
+// runInference sends req, streaming token deltas as RuntimeEvent{Type:"token"}
+// when the maas client supports streaming, otherwise going through the
+// synchronous path. A token publish failure is logged (Warn) but never aborts
+// inference: token events are a best-effort display channel, the authoritative
+// result is the returned InferenceResponse (and GetTaskResult on the GUI side).
+func (r *Runtime) runInference(ctx context.Context, taskID string, req port.InferenceRequest) (port.InferenceResponse, error) {
+	if s, ok := r.maas.(port.MaasStreamingClient); ok {
+		return s.GenerateStream(ctx, req, func(delta string) {
+			if err := r.events.Publish(ctx, domain.RuntimeEvent{
+				Type: "token", TaskID: taskID, Message: delta, CreatedAt: time.Now(),
+			}); err != nil {
+				r.logger.Warn("publish token delta failed", "task_id", taskID, "err", err)
+			}
+		})
+	}
+	return r.maas.Generate(ctx, req)
 }
 
 func (r *Runtime) inferenceTools(tools *tool.Registry) []port.InferenceTool {

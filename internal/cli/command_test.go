@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -475,14 +476,7 @@ func TestRunTUITaskRoutesMentionToConfiguredAgent(t *testing.T) {
 		if len(req.Messages) > 0 {
 			gotPrompt = req.Messages[0].Content
 		}
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(map[string]any{
-			"choices": []map[string]any{
-				{"message": map[string]any{"content": "research result"}},
-			},
-		}); err != nil {
-			t.Fatalf("Encode(response body) error = %v, want nil", err)
-		}
+		writeSSEChoice(t, w, map[string]any{"content": "research result"})
 	}))
 	t.Cleanup(server.Close)
 	root := t.TempDir()
@@ -545,14 +539,7 @@ func TestRunTUITaskBindsMentionedAgentToTaskLedgerTask(t *testing.T) {
 		if len(req.Messages) > 0 {
 			gotPrompt = req.Messages[0].Content
 		}
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(map[string]any{
-			"choices": []map[string]any{
-				{"message": map[string]any{"content": "整理后的任务说明"}},
-			},
-		}); err != nil {
-			t.Fatalf("Encode(response body) error = %v, want nil", err)
-		}
+		writeSSEChoice(t, w, map[string]any{"content": "整理后的任务说明"})
 	}))
 	t.Cleanup(server.Close)
 
@@ -640,14 +627,7 @@ func TestRunTUITaskInjectsMentionedAgentInboxAndMarksRead(t *testing.T) {
 		if len(req.Messages) > 0 {
 			gotPrompt = req.Messages[0].Content
 		}
-		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(map[string]any{
-			"choices": []map[string]any{
-				{"message": map[string]any{"content": "writer summary"}},
-			},
-		}); err != nil {
-			t.Fatalf("Encode(response body) error = %v, want nil", err)
-		}
+		writeSSEChoice(t, w, map[string]any{"content": "writer summary"})
 	}))
 	t.Cleanup(server.Close)
 
@@ -858,33 +838,20 @@ func TestRunMentionedTUIAgentTaskAppliesSessionModeAndWorkingDir(t *testing.T) {
 				flattened.WriteString("\n")
 			}
 			lastPrompt = flattened.String()
-			w.Header().Set("Content-Type", "application/json")
 			if requestCount == 1 {
 				argsJSON, err := json.Marshal(map[string]string{"path": filepath.Join(workingDir, "inside.txt")})
 				if err != nil {
 					t.Fatalf("Marshal(read_file args) error = %v, want nil", err)
 				}
-				if err := json.NewEncoder(w).Encode(map[string]any{
-					"choices": []map[string]any{
-						{"message": map[string]any{"tool_calls": []map[string]any{
-							{"id": "call-1", "type": "function", "function": map[string]any{
-								"name":      "read_file",
-								"arguments": string(argsJSON),
-							}},
-						}}},
-					},
-				}); err != nil {
-					t.Fatalf("Encode(tool_calls response) error = %v, want nil", err)
-				}
+				writeSSEChoice(t, w, map[string]any{"tool_calls": []map[string]any{
+					{"index": 0, "id": "call-1", "type": "function", "function": map[string]any{
+						"name":      "read_file",
+						"arguments": string(argsJSON),
+					}},
+				}})
 				return
 			}
-			if err := json.NewEncoder(w).Encode(map[string]any{
-				"choices": []map[string]any{
-					{"message": map[string]any{"content": "mention-done"}},
-				},
-			}); err != nil {
-				t.Fatalf("Encode(final response) error = %v, want nil", err)
-			}
+			writeSSEChoice(t, w, map[string]any{"content": "mention-done"})
 		}))
 		t.Cleanup(server.Close)
 
@@ -939,33 +906,20 @@ func TestRunMentionedTUIAgentTaskAppliesSessionModeAndWorkingDir(t *testing.T) {
 				flattened.WriteString("\n")
 			}
 			lastPrompt = flattened.String()
-			w.Header().Set("Content-Type", "application/json")
 			if requestCount == 1 {
 				argsJSON, err := json.Marshal(map[string]string{"path": target, "content": "package foo\n"})
 				if err != nil {
 					t.Fatalf("Marshal(write_file args) error = %v, want nil", err)
 				}
-				if err := json.NewEncoder(w).Encode(map[string]any{
-					"choices": []map[string]any{
-						{"message": map[string]any{"tool_calls": []map[string]any{
-							{"id": "call-1", "type": "function", "function": map[string]any{
-								"name":      "write_file",
-								"arguments": string(argsJSON),
-							}},
-						}}},
-					},
-				}); err != nil {
-					t.Fatalf("Encode(tool_calls response) error = %v, want nil", err)
-				}
+				writeSSEChoice(t, w, map[string]any{"tool_calls": []map[string]any{
+					{"index": 0, "id": "call-1", "type": "function", "function": map[string]any{
+						"name":      "write_file",
+						"arguments": string(argsJSON),
+					}},
+				}})
 				return
 			}
-			if err := json.NewEncoder(w).Encode(map[string]any{
-				"choices": []map[string]any{
-					{"message": map[string]any{"content": "写不了"}},
-				},
-			}); err != nil {
-				t.Fatalf("Encode(final response) error = %v, want nil", err)
-			}
+			writeSSEChoice(t, w, map[string]any{"content": "写不了"})
 		}))
 		t.Cleanup(server.Close)
 
@@ -2419,6 +2373,29 @@ func storageTestTask(id string, input string) domain.Task {
 func sha256String(content string) string {
 	sum := sha256.Sum256([]byte(content))
 	return hex.EncodeToString(sum[:])
+}
+
+// writeSSEChoice serves delta as a single-chunk text/event-stream response in
+// the OpenAI-chat streaming shape (choices[].delta + a trailing [DONE]).
+//
+// Task 4 made the runtime always prefer GenerateStream when the maas client
+// implements port.MaasStreamingClient (HTTPMaasClient does whenever a Model is
+// configured), so these test doubles must speak the streaming wire format —
+// serving a plain non-streaming JSON body here would leave the client's SSE
+// scanner with no "data:" lines and silently produce an empty result.
+func writeSSEChoice(t *testing.T, w http.ResponseWriter, delta map[string]any) {
+	t.Helper()
+	w.Header().Set("Content-Type", "text/event-stream")
+	data, err := json.Marshal(map[string]any{"choices": []map[string]any{{"delta": delta}}})
+	if err != nil {
+		t.Fatalf("Marshal(sse chunk) error = %v, want nil", err)
+	}
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+		t.Fatalf("Write(sse chunk) error = %v, want nil", err)
+	}
+	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+		t.Fatalf("Write(sse done) error = %v, want nil", err)
+	}
 }
 
 func writeCLIFile(t *testing.T, root string, rel string, content string) {
