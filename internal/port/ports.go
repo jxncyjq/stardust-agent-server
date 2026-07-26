@@ -104,6 +104,19 @@ type MaasInferenceClient interface {
 	Generate(ctx context.Context, req InferenceRequest) (InferenceResponse, error)
 }
 
+// MaasStreamingClient is optionally implemented by inference clients that can
+// stream token deltas. Callers opt in per call site via a type assertion, so the
+// synchronous MaasInferenceClient contract is unchanged — summary/MOA paths and
+// non-streaming providers keep working untouched.
+type MaasStreamingClient interface {
+	// GenerateStream streams token deltas through onDelta while producing the
+	// same complete InferenceResponse (assembled tool calls + usage) that
+	// Generate returns, so the tool loop consumes the finished response exactly
+	// as in the non-streaming path. onDelta is called zero or more times before
+	// the response is returned; a nil onDelta is treated as no callback.
+	GenerateStream(ctx context.Context, req InferenceRequest, onDelta func(delta string)) (InferenceResponse, error)
+}
+
 type EmbeddingProvider interface {
 	Embed(ctx context.Context, text string) ([]float64, error)
 }

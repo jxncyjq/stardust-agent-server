@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -19,6 +20,7 @@ const defaultMaasInferencePath = "/v1/inference/generate"
 const defaultOpenAIChatCompletionsPath = "/chat/completions"
 
 var _ port.MaasInferenceClient = (*HTTPMaasClient)(nil)
+var _ port.MaasStreamingClient = (*HTTPMaasClient)(nil)
 
 type HTTPMaasConfig struct {
 	BaseURL      string
@@ -64,6 +66,20 @@ func NewHTTPMaasClient(cfg HTTPMaasConfig) *HTTPMaasClient {
 		client:            client,
 		enablePromptCache: cfg.EnablePromptCache,
 	}
+}
+
+// GenerateStream streams a chat completion when this client targets an
+// OpenAI-compatible chat model; without a model (the plain maas inference path)
+// there is no streaming protocol, so it degrades to the synchronous Generate and
+// makes no onDelta calls. Either way it returns a complete InferenceResponse.
+func (c *HTTPMaasClient) GenerateStream(ctx context.Context, req port.InferenceRequest, onDelta func(delta string)) (port.InferenceResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return port.InferenceResponse{}, err
+	}
+	if c.model == "" {
+		return c.Generate(ctx, req)
+	}
+	return c.generateOpenAIChatStream(ctx, req, onDelta)
 }
 
 func (c *HTTPMaasClient) Generate(ctx context.Context, req port.InferenceRequest) (port.InferenceResponse, error) {
@@ -142,15 +158,186 @@ func (c *HTTPMaasClient) generateOpenAIChat(ctx context.Context, req port.Infere
 		return port.InferenceResponse{}, fmt.Errorf("openai chat response contained no choices")
 	}
 	message := resp.Choices[0].Message
+	toolCalls, err := openAIToolCalls(message.ToolCalls)
+	if err != nil {
+		return port.InferenceResponse{}, fmt.Errorf("parse openai chat tool calls: %w", err)
+	}
 	return port.InferenceResponse{
 		Text:             message.Content,
 		ReasoningSummary: firstNonEmpty(message.ReasoningSummary, message.ReasoningContent, message.Reasoning),
-		ToolCalls:        openAIToolCalls(message.ToolCalls),
+		ToolCalls:        toolCalls,
 		PromptTokens:     resp.Usage.PromptTokens,
 		CompletionTokens: resp.Usage.CompletionTokens,
 		CachedTokens:     cachedTokens(resp.Usage),
 		TotalTokens:      resp.Usage.TotalTokens,
 	}, nil
+}
+
+// openAIChatStreamChunk is one SSE "data:" payload of a streaming chat
+// completion. Delta.Content carries a text increment; Delta.ToolCalls carries
+// tool-call fragments keyed by index; Delta.ReasoningContent carries reasoning
+// fragments for reasoning models (e.g. deepseek-reasoner). Usage is non-nil
+// only on the chunk(s) requested via stream_options.include_usage.
+type openAIChatStreamChunk struct {
+	Choices []struct {
+		Delta struct {
+			Content          string                     `json:"content"`
+			ToolCalls        []openAIChatStreamToolCall `json:"tool_calls"`
+			ReasoningContent string                     `json:"reasoning_content"`
+		} `json:"delta"`
+	} `json:"choices"`
+	Usage *openAIChatUsage `json:"usage"`
+}
+
+// openAIChatStreamToolCall is one fragment of a streamed tool call. The first
+// fragment for a given Index carries ID and Function.Name; every fragment
+// (including the first) carries a substring of Function.Arguments that must be
+// concatenated in arrival order to recover the complete JSON arguments.
+type openAIChatStreamToolCall struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+// generateOpenAIChatStream runs an OpenAI/DeepSeek chat completion in streaming
+// mode. It calls onDelta with each text delta while accumulating the full text,
+// reassembles fragmented tool_calls by their index, and reads the trailing usage
+// chunk — returning the same complete InferenceResponse the non-streaming path
+// produces. onDelta may be nil.
+func (c *HTTPMaasClient) generateOpenAIChatStream(ctx context.Context, req port.InferenceRequest, onDelta func(delta string)) (port.InferenceResponse, error) {
+	if err := req.Validate(); err != nil {
+		return port.InferenceResponse{}, fmt.Errorf("validate inference request: %w", err)
+	}
+	messages, err := c.openAIChatMessages(req)
+	if err != nil {
+		return port.InferenceResponse{}, fmt.Errorf("build openai chat messages: %w", err)
+	}
+	body, err := json.Marshal(openAIChatCompletionRequest{
+		Model:         c.model,
+		Messages:      messages,
+		Tools:         openAIChatTools(req.Tools),
+		Stream:        true,
+		StreamOptions: &openAIStreamOptions{IncludeUsage: true},
+	})
+	if err != nil {
+		return port.InferenceResponse{}, fmt.Errorf("encode openai chat stream request: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+c.endpointPath, bytes.NewReader(body))
+	if err != nil {
+		return port.InferenceResponse{}, fmt.Errorf("create openai chat stream request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Accept", "text/event-stream")
+	if c.apiKey != "" {
+		httpReq.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	resp, err := c.client.Do(httpReq)
+	if err != nil {
+		return port.InferenceResponse{}, fmt.Errorf("call openai chat stream endpoint: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
+		msg, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
+		return port.InferenceResponse{}, fmt.Errorf("openai chat stream endpoint returned %s: %s", resp.Status, strings.TrimSpace(string(msg)))
+	}
+
+	var textB strings.Builder
+	var reasoningB strings.Builder
+	// toolAcc accumulates tool-call fragments by index: id/name arrive first,
+	// arguments stream as substrings that must be concatenated in order.
+	type toolAccum struct {
+		id, name string
+		args     strings.Builder
+	}
+	toolByIndex := map[int]*toolAccum{}
+	var order []int
+	var usage *openAIChatUsage
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" {
+			continue
+		}
+		if data == "[DONE]" {
+			break
+		}
+		var chunk openAIChatStreamChunk
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			return port.InferenceResponse{}, fmt.Errorf("decode stream chunk %q: %w", data, err)
+		}
+		if chunk.Usage != nil {
+			usage = chunk.Usage
+		}
+		for _, ch := range chunk.Choices {
+			if ch.Delta.Content != "" {
+				textB.WriteString(ch.Delta.Content)
+				if onDelta != nil {
+					onDelta(ch.Delta.Content)
+				}
+			}
+			if ch.Delta.ReasoningContent != "" {
+				reasoningB.WriteString(ch.Delta.ReasoningContent)
+			}
+			for _, tc := range ch.Delta.ToolCalls {
+				acc, ok := toolByIndex[tc.Index]
+				if !ok {
+					acc = &toolAccum{}
+					toolByIndex[tc.Index] = acc
+					order = append(order, tc.Index)
+				}
+				if tc.ID != "" {
+					acc.id = tc.ID
+				}
+				if tc.Function.Name != "" {
+					acc.name = tc.Function.Name
+				}
+				acc.args.WriteString(tc.Function.Arguments)
+			}
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return port.InferenceResponse{}, fmt.Errorf("read openai chat stream: %w", err)
+	}
+
+	// Assemble accumulated fragments into the same []openAIChatToolCall the
+	// non-streaming decoder yields, then reuse openAIToolCalls for identical
+	// arguments parsing.
+	assembled := make([]openAIChatToolCall, 0, len(order))
+	for _, idx := range order {
+		acc := toolByIndex[idx]
+		assembled = append(assembled, openAIChatToolCall{
+			ID:       acc.id,
+			Type:     "function",
+			Function: openAIChatCallFunction{Name: acc.name, Arguments: acc.args.String()},
+		})
+	}
+
+	assembledToolCalls, err := openAIToolCalls(assembled)
+	if err != nil {
+		return port.InferenceResponse{}, fmt.Errorf("parse openai chat stream tool calls: %w", err)
+	}
+	out := port.InferenceResponse{
+		Text:             textB.String(),
+		ReasoningSummary: reasoningB.String(),
+		ToolCalls:        assembledToolCalls,
+	}
+	if usage != nil {
+		out.PromptTokens = usage.PromptTokens
+		out.CompletionTokens = usage.CompletionTokens
+		out.CachedTokens = cachedTokens(*usage)
+		out.TotalTokens = usage.TotalTokens
+	}
+	return out, nil
 }
 
 // openAIChatMessages renders the request as OpenAI chat messages. With
@@ -222,9 +409,18 @@ func openAIChatRequestToolCalls(calls []domain.ToolCall) ([]openAIChatToolCall, 
 }
 
 type openAIChatCompletionRequest struct {
-	Model    string                     `json:"model"`
-	Messages []openAIChatRequestMessage `json:"messages"`
-	Tools    []openAIChatTool           `json:"tools,omitempty"`
+	Model         string                     `json:"model"`
+	Messages      []openAIChatRequestMessage `json:"messages"`
+	Tools         []openAIChatTool           `json:"tools,omitempty"`
+	Stream        bool                       `json:"stream,omitempty"`
+	StreamOptions *openAIStreamOptions       `json:"stream_options,omitempty"`
+}
+
+// openAIStreamOptions requests a final usage chunk in the stream. Without it a
+// streamed response carries no usage, silently dropping the token accounting a
+// non-streamed response returns by default.
+type openAIStreamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
 }
 
 // openAIChatRequestMessage is the message shape sent in a chat-completion
@@ -428,23 +624,24 @@ func isNilRequired(value any) bool {
 	}
 }
 
-func openAIToolCalls(calls []openAIChatToolCall) []domain.ToolCall {
+func openAIToolCalls(calls []openAIChatToolCall) ([]domain.ToolCall, error) {
 	if len(calls) == 0 {
-		return nil
+		return nil, nil
 	}
 	out := make([]domain.ToolCall, 0, len(calls))
 	for _, call := range calls {
 		args := map[string]string{}
 		if strings.TrimSpace(call.Function.Arguments) != "" {
 			var raw map[string]any
-			if err := json.Unmarshal([]byte(call.Function.Arguments), &raw); err == nil {
-				for key, value := range raw {
-					switch typed := value.(type) {
-					case string:
-						args[key] = typed
-					default:
-						args[key] = fmt.Sprint(typed)
-					}
+			if err := json.Unmarshal([]byte(call.Function.Arguments), &raw); err != nil {
+				return nil, fmt.Errorf("decode tool call arguments %q: %w", call.Function.Arguments, err)
+			}
+			for key, value := range raw {
+				switch typed := value.(type) {
+				case string:
+					args[key] = typed
+				default:
+					args[key] = fmt.Sprint(typed)
 				}
 			}
 		}
@@ -454,7 +651,7 @@ func openAIToolCalls(calls []openAIChatToolCall) []domain.ToolCall {
 			Arguments: args,
 		})
 	}
-	return out
+	return out, nil
 }
 
 func firstNonEmpty(values ...string) string {
