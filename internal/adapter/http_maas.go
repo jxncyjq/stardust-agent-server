@@ -20,6 +20,7 @@ const defaultMaasInferencePath = "/v1/inference/generate"
 const defaultOpenAIChatCompletionsPath = "/chat/completions"
 
 var _ port.MaasInferenceClient = (*HTTPMaasClient)(nil)
+var _ port.MaasStreamingClient = (*HTTPMaasClient)(nil)
 
 type HTTPMaasConfig struct {
 	BaseURL      string
@@ -65,6 +66,20 @@ func NewHTTPMaasClient(cfg HTTPMaasConfig) *HTTPMaasClient {
 		client:            client,
 		enablePromptCache: cfg.EnablePromptCache,
 	}
+}
+
+// GenerateStream streams a chat completion when this client targets an
+// OpenAI-compatible chat model; without a model (the plain maas inference path)
+// there is no streaming protocol, so it degrades to the synchronous Generate and
+// makes no onDelta calls. Either way it returns a complete InferenceResponse.
+func (c *HTTPMaasClient) GenerateStream(ctx context.Context, req port.InferenceRequest, onDelta func(delta string)) (port.InferenceResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return port.InferenceResponse{}, err
+	}
+	if c.model == "" {
+		return c.Generate(ctx, req)
+	}
+	return c.generateOpenAIChatStream(ctx, req, onDelta)
 }
 
 func (c *HTTPMaasClient) Generate(ctx context.Context, req port.InferenceRequest) (port.InferenceResponse, error) {

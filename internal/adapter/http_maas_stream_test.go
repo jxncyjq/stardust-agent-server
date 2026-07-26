@@ -129,3 +129,43 @@ func TestGenerateOpenAIChatStreamFailsLoudOnInvalidToolCallArguments(t *testing.
 		t.Fatal("generateOpenAIChatStream error = nil, want error for invalid tool call arguments JSON (fail-loud)")
 	}
 }
+
+func TestGenerateStreamUsesStreamingForOpenAIChat(t *testing.T) {
+	srv := streamServer(t, []string{`{"choices":[{"delta":{"content":"hi"}}]}`})
+	t.Cleanup(srv.Close)
+	var client port.MaasStreamingClient = NewHTTPMaasClient(HTTPMaasConfig{BaseURL: srv.URL, Model: "deepseek-chat", Client: srv.Client()})
+	var got string
+	resp, err := client.GenerateStream(context.Background(),
+		port.InferenceRequest{Messages: []port.InferenceMessage{{Role: port.RoleUser, Content: "x"}}},
+		func(d string) { got += d })
+	if err != nil {
+		t.Fatalf("GenerateStream error = %v, want nil", err)
+	}
+	if got != "hi" || resp.Text != "hi" {
+		t.Fatalf("got=%q resp.Text=%q, want hi", got, resp.Text)
+	}
+}
+
+// A client with no model (the non-OpenAI maas path) has no streaming protocol;
+// GenerateStream must degrade to the synchronous Generate rather than fail, so
+// the runtime's single streaming code path stays valid for every provider.
+func TestGenerateStreamFallsBackToSyncWithoutModel(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(port.InferenceResponse{Text: "sync result"})
+	}))
+	t.Cleanup(srv.Close)
+	var client port.MaasStreamingClient = NewHTTPMaasClient(HTTPMaasConfig{BaseURL: srv.URL, Client: srv.Client()}) // no Model
+	var deltaCount int
+	resp, err := client.GenerateStream(context.Background(),
+		port.InferenceRequest{Prompt: "x"}, func(string) { deltaCount++ })
+	if err != nil {
+		t.Fatalf("GenerateStream error = %v, want nil", err)
+	}
+	if resp.Text != "sync result" {
+		t.Fatalf("resp.Text = %q, want sync result", resp.Text)
+	}
+	if deltaCount != 0 {
+		t.Fatalf("deltaCount = %d, want 0 (no streaming without a model)", deltaCount)
+	}
+}
