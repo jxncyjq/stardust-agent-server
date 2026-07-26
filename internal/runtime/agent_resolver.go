@@ -189,6 +189,7 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		Tools:            tools,
 		MaxToolRounds:    r.rootConfig.Runtime.MaxToolRounds,
 		LazyTools:        r.rootConfig.Runtime.LazyTools,
+		Debug:            r.rootConfig.Runtime.Debug,
 		Checkpoints:      r.checkpoints,
 		ToolGate:         r.toolGate,
 		Logger:           r.logger,

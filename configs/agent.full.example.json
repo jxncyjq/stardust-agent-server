@@ -63,7 +63,9 @@
     "_comment_demo_response": "未配置真实 MaaS 或显式使用 demo 路径时返回的演示响应。",
     "demo_response": "task completed",
     "_comment_max_tool_rounds": "模型真实工具调用的最大闭环轮数。默认 4；超过后 Runtime 会报错，防止无限工具循环。",
-    "max_tool_rounds": 4
+    "max_tool_rounds": 4,
+    "_comment_debug": "调试探针开关。开启后每次模型调用前，Runtime 会在日志里打出该次请求的逐条消息拆解（role、字符数、工具/图片数、内容预览）和总字符数，用于定位 prompt 体量在哪条消息膨胀。默认 false（关闭，无额外日志）。",
+    "debug": false
   },
   "session": {
     "_comment": "会话上下文连续性配置。仅在 sqlite 存储下可跨进程恢复；memory 存储下只适合临时演示。",

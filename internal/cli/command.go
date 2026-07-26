@@ -1910,6 +1910,7 @@ func buildDefaultRunnerConfig(
 		CapabilitySkills: capabilitySkills,
 		SkillUsage:       skillUsage,
 		DisabledTools:    runtimeSettings.DisabledTools,
+		Debug:            runtimeSettings.Debug,
 	}
 }
 
