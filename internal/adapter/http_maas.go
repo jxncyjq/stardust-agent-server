@@ -143,10 +143,14 @@ func (c *HTTPMaasClient) generateOpenAIChat(ctx context.Context, req port.Infere
 		return port.InferenceResponse{}, fmt.Errorf("openai chat response contained no choices")
 	}
 	message := resp.Choices[0].Message
+	toolCalls, err := openAIToolCalls(message.ToolCalls)
+	if err != nil {
+		return port.InferenceResponse{}, fmt.Errorf("parse openai chat tool calls: %w", err)
+	}
 	return port.InferenceResponse{
 		Text:             message.Content,
 		ReasoningSummary: firstNonEmpty(message.ReasoningSummary, message.ReasoningContent, message.Reasoning),
-		ToolCalls:        openAIToolCalls(message.ToolCalls),
+		ToolCalls:        toolCalls,
 		PromptTokens:     resp.Usage.PromptTokens,
 		CompletionTokens: resp.Usage.CompletionTokens,
 		CachedTokens:     cachedTokens(resp.Usage),
@@ -297,9 +301,13 @@ func (c *HTTPMaasClient) generateOpenAIChatStream(ctx context.Context, req port.
 		})
 	}
 
+	assembledToolCalls, err := openAIToolCalls(assembled)
+	if err != nil {
+		return port.InferenceResponse{}, fmt.Errorf("parse openai chat stream tool calls: %w", err)
+	}
 	out := port.InferenceResponse{
 		Text:      textB.String(),
-		ToolCalls: openAIToolCalls(assembled),
+		ToolCalls: assembledToolCalls,
 	}
 	if usage != nil {
 		out.PromptTokens = usage.PromptTokens
@@ -594,23 +602,24 @@ func isNilRequired(value any) bool {
 	}
 }
 
-func openAIToolCalls(calls []openAIChatToolCall) []domain.ToolCall {
+func openAIToolCalls(calls []openAIChatToolCall) ([]domain.ToolCall, error) {
 	if len(calls) == 0 {
-		return nil
+		return nil, nil
 	}
 	out := make([]domain.ToolCall, 0, len(calls))
 	for _, call := range calls {
 		args := map[string]string{}
 		if strings.TrimSpace(call.Function.Arguments) != "" {
 			var raw map[string]any
-			if err := json.Unmarshal([]byte(call.Function.Arguments), &raw); err == nil {
-				for key, value := range raw {
-					switch typed := value.(type) {
-					case string:
-						args[key] = typed
-					default:
-						args[key] = fmt.Sprint(typed)
-					}
+			if err := json.Unmarshal([]byte(call.Function.Arguments), &raw); err != nil {
+				return nil, fmt.Errorf("decode tool call arguments %q: %w", call.Function.Arguments, err)
+			}
+			for key, value := range raw {
+				switch typed := value.(type) {
+				case string:
+					args[key] = typed
+				default:
+					args[key] = fmt.Sprint(typed)
 				}
 			}
 		}
@@ -620,7 +629,7 @@ func openAIToolCalls(calls []openAIChatToolCall) []domain.ToolCall {
 			Arguments: args,
 		})
 	}
-	return out
+	return out, nil
 }
 
 func firstNonEmpty(values ...string) string {

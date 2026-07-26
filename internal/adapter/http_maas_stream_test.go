@@ -77,3 +77,55 @@ func TestGenerateOpenAIChatStreamAssemblesToolCallsFromDeltas(t *testing.T) {
 		t.Fatalf("assembled tool call = %#v, want read_file path=a.txt id=call_1", c)
 	}
 }
+
+// TestGenerateOpenAIChatStreamAssemblesInterleavedToolCallsByIndex verifies
+// that fragments for two different tool_call indexes arriving interleaved
+// (index0 first-chunk, index1 first-chunk, index0 arg-chunk, index1
+// arg-chunk) are accumulated independently per index and assembled into two
+// distinct, correctly-reconstructed tool calls, ordered by first appearance.
+func TestGenerateOpenAIChatStreamAssemblesInterleavedToolCallsByIndex(t *testing.T) {
+	srv := streamServer(t, []string{
+		`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_0","type":"function","function":{"name":"read_file","arguments":""}}]}}]}`,
+		`{"choices":[{"delta":{"tool_calls":[{"index":1,"id":"call_1","type":"function","function":{"name":"list_files","arguments":""}}]}}]}`,
+		`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":\"a.txt\"}"}}]}}]}`,
+		`{"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"{\"dir\":\"/tmp\"}"}}]}}]}`,
+	})
+	t.Cleanup(srv.Close)
+	client := NewHTTPMaasClient(HTTPMaasConfig{BaseURL: srv.URL, Model: "deepseek-chat", Client: srv.Client()})
+
+	resp, err := client.generateOpenAIChatStream(context.Background(),
+		port.InferenceRequest{Messages: []port.InferenceMessage{{Role: port.RoleUser, Content: "list then read"}}}, nil)
+	if err != nil {
+		t.Fatalf("generateOpenAIChatStream error = %v, want nil", err)
+	}
+	if len(resp.ToolCalls) != 2 {
+		t.Fatalf("resp.ToolCalls = %#v, want two assembled calls", resp.ToolCalls)
+	}
+	first, second := resp.ToolCalls[0], resp.ToolCalls[1]
+	if first.ID != "call_0" || first.Name != "read_file" || first.Arguments["path"] != "a.txt" {
+		t.Fatalf("first tool call = %#v, want read_file path=a.txt id=call_0", first)
+	}
+	if second.ID != "call_1" || second.Name != "list_files" || second.Arguments["dir"] != "/tmp" {
+		t.Fatalf("second tool call = %#v, want list_files dir=/tmp id=call_1", second)
+	}
+}
+
+// TestGenerateOpenAIChatStreamFailsLoudOnInvalidToolCallArguments verifies
+// that when the concatenated tool_call arguments fragments do not form valid
+// JSON (here only "{\"path\":" is ever sent, so the object is never closed),
+// generateOpenAIChatStream returns an error instead of silently degrading to
+// an empty arguments map.
+func TestGenerateOpenAIChatStreamFailsLoudOnInvalidToolCallArguments(t *testing.T) {
+	srv := streamServer(t, []string{
+		`{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":""}}]}}]}`,
+		`{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"path\":"}}]}}]}`,
+	})
+	t.Cleanup(srv.Close)
+	client := NewHTTPMaasClient(HTTPMaasConfig{BaseURL: srv.URL, Model: "deepseek-chat", Client: srv.Client()})
+
+	_, err := client.generateOpenAIChatStream(context.Background(),
+		port.InferenceRequest{Messages: []port.InferenceMessage{{Role: port.RoleUser, Content: "read it"}}}, nil)
+	if err == nil {
+		t.Fatal("generateOpenAIChatStream error = nil, want error for invalid tool call arguments JSON (fail-loud)")
+	}
+}
