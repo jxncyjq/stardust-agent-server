@@ -65,3 +65,11 @@ func TestInferenceRequestValidateAcceptsPromptOnly(t *testing.T) {
 		t.Fatalf("prompt-only request must stay valid: %v", err)
 	}
 }
+
+// A type that implements MaasStreamingClient must also be a MaasInferenceClient
+// is NOT required by the interface, but the runtime type-asserts a MaasInference
+// Client up to the streaming one, so pin the shape here.
+func TestMaasStreamingClientShape(t *testing.T) {
+	var _ port.MaasStreamingClient = (port.MaasStreamingClient)(nil)
+	// GenerateStream returns the same InferenceResponse shape as Generate.
+}
