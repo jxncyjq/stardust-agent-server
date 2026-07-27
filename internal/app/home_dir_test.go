@@ -11,8 +11,8 @@ import (
 //
 // With HOME/USERPROFILE unset — service accounts, containers, Windows services —
 // homeDir became "" and the global ~/.stardust/agents.md silently stopped
-// loading, while isResidentAgents(root, absPath, "") also stopped recognising it
-// as already-in-context and could re-inject it. The behaviour changes and the
+// loading, while the resident-path dedup seed (ResidentAgentsPaths(root, "")) also
+// stopped recognising it as already-in-context and could re-inject it. The behaviour changes and the
 // user just sees "my global conventions aren't taking effect".
 //
 // A missing home directory must not stop the agent from starting, so this is a

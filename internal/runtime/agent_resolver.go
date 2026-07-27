@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -87,6 +88,27 @@ func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolv
 	}
 }
 
+// resolveHomeDir returns the user's home directory, used to exclude the
+// resident ~/.stardust/agents.md from on-demand subtree injection
+// (tool.WithAgentsInjection's homeDir). Injection is a context-quality
+// nicety, not something a per-agent task should fail over for, so a
+// resolution failure degrades to "" (only the two workspace-local resident
+// paths are excluded) rather than failing ResolveTaskRunner — but the miss is
+// logged (Warn), not silently dropped, per CLAUDE.md fail-loud.
+func (r *AgentRuntimeResolver) resolveHomeDir(ctx context.Context) string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		if r.logger != nil {
+			r.logger.WarnContext(ctx, "resolve home directory",
+				"component", "agent_resolver",
+				"consequence", "resident global agents.md will not be excluded from subtree injection",
+				"error", err)
+		}
+		return ""
+	}
+	return homeDir
+}
+
 func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domain.Task) (domain.Agent, TaskRunner, bool, error) {
 	if r == nil || r.registry == nil || task.AgentID == "" {
 		return domain.Agent{}, nil, false, nil
@@ -115,7 +137,7 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 	if err != nil {
 		return domain.Agent{}, nil, false, fmt.Errorf("create maas runner for profile %q: %w", agentCfg.MaasProfile, err)
 	}
-	contextBlock, err := loadAgentContextFiles(ctx, r.rootConfig, agentCfg.ContextFiles)
+	contextBlock, err := loadAgentContextFiles(ctx, r.rootConfig, agentCfg.ContextFiles, agentToolRoot(r.rootConfig, agentCfg, task))
 	if err != nil {
 		return domain.Agent{}, nil, false, fmt.Errorf("load agent context files for %q: %w", task.AgentID, err)
 	}
@@ -177,7 +199,10 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 	//
 	// The asymmetry is the design, not an oversight — see
 	// TestResolverOmitsOrchestratorOnlyTools, which locks it.
-	tools := tool.NewFileReadWriteWorkspaceRegistry(agentToolRoot(r.rootConfig, agentCfg, task), r.audit)
+	toolRoot := agentToolRoot(r.rootConfig, agentCfg, task)
+	tools := tool.NewFileReadWriteWorkspaceRegistry(toolRoot, r.audit,
+		tool.WithAgentsInjection(r.rootConfig.ContextFiles.MaxFileChars, r.resolveHomeDir(ctx)),
+		tool.WithProjectRoot(toolRoot))
 	tool.RegisterTaskLedgerTools(tools, r.taskLedger)
 	tool.RegisterAgentMessageTools(tools, r.messageStore)
 	tool.RegisterWebTools(tools, webToolOptions(r.rootConfig.Web))
@@ -211,13 +236,20 @@ func webToolOptions(cfg config.WebToolConfig) tool.WebToolOptions {
 	}
 }
 
-func loadAgentContextFiles(ctx context.Context, rootCfg config.Config, childCfg config.ContextFilesConfig) (string, error) {
+// loadAgentContextFiles loads the resident context block for an agent.
+// projectRoot is the agents.md project root (and upward ancestor chain
+// anchor) — the caller passes agentToolRoot's result so agents.md tracks the
+// same task.WorkingDir-first sandbox boundary as the tool registry. Root
+// (childCfg.Root, falling back to rootCfg.ContextFiles.Root) stays the
+// persona root for Soul/Tools/User/Memory, unaffected by projectRoot.
+func loadAgentContextFiles(ctx context.Context, rootCfg config.Config, childCfg config.ContextFilesConfig, projectRoot string) (string, error) {
 	if childCfg.Root == "" {
 		childCfg.Root = rootCfg.ContextFiles.Root
 	}
 	block, err := contextfiles.Load(ctx, contextfiles.Config{
 		Enabled:      childCfg.Enabled,
 		Root:         childCfg.Root,
+		ProjectRoot:  projectRoot,
 		SoulPath:     childCfg.SoulPath,
 		ToolsPath:    childCfg.ToolsPath,
 		UserPath:     childCfg.UserPath,
