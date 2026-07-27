@@ -1946,6 +1946,11 @@ type defaultTaskRunner struct {
 	sessionSearcher tool.MessageSearcher
 	webOptions      tool.WebToolOptions
 	maasResolver    agentruntime.ModelResolver
+	// toolMaxFileChars and homeDir configure on-demand subtree agents.md
+	// injection (tool.WithAgentsInjection) on the tool registry RunTask builds
+	// per call. Both are resolved once at serve assembly (see resolveHomeDir).
+	toolMaxFileChars int
+	homeDir          string
 }
 
 // RunTask builds a fresh workspace tool registry rooted at task.WorkingDir (or
@@ -1964,7 +1969,9 @@ func (d *defaultTaskRunner) RunTask(ctx context.Context, agent domain.Agent, tas
 	if root == "" {
 		root = d.contextRoot
 	}
-	tools := tool.NewFileReadWriteWorkspaceRegistry(root, d.audit)
+	tools := tool.NewFileReadWriteWorkspaceRegistry(root, d.audit,
+		tool.WithAgentsInjection(d.toolMaxFileChars, d.homeDir),
+		tool.WithProjectRoot(root))
 	tool.RegisterTaskLedgerTools(tools, d.taskLedger)
 	tool.RegisterAgentMessageTools(tools, d.messageStore)
 	tool.RegisterWebTools(tools, d.webOptions)
@@ -1975,6 +1982,27 @@ func (d *defaultTaskRunner) RunTask(ctx context.Context, agent domain.Agent, tas
 	rt := agentruntime.NewRuntime(runtimeCfg)
 	rt.RegisterDelegateTaskTool(tools)
 	return rt.RunTask(ctx, agent, task)
+}
+
+// resolveHomeDir returns the user's home directory, used to exclude the
+// resident ~/.stardust/agents.md from the default runtime's on-demand subtree
+// agents.md injection (tool.WithAgentsInjection's homeDir). Injection is a
+// context-quality nicety, not something serve assembly should fail over for,
+// so a resolution failure degrades to "" (only the two workspace-local
+// resident paths are excluded) — but the miss is logged (Warn), not silently
+// dropped, per CLAUDE.md fail-loud.
+func resolveHomeDir(logger *slog.Logger) string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		if logger != nil {
+			logger.Warn("resolve home directory",
+				"component", "cli",
+				"consequence", "resident global agents.md will not be excluded from subtree injection",
+				"error", err)
+		}
+		return ""
+	}
+	return homeDir
 }
 
 // webToolOptions maps the web config block onto the tool package options.
@@ -2257,13 +2285,15 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 			cfg.Runtime, checkpointStore, manualGate, logger, capabilitySkills,
 			skillUsage,
 		),
-		contextRoot:     cfg.ContextFiles.Root,
-		audit:           auditLog,
-		taskLedger:      taskLedger,
-		messageStore:    messageStore,
-		sessionSearcher: sessionSearcher,
-		webOptions:      webToolOptions(cfg.Web),
-		maasResolver:    maasProfileResolver{cfg: cfg.Maas},
+		contextRoot:      cfg.ContextFiles.Root,
+		audit:            auditLog,
+		taskLedger:       taskLedger,
+		messageStore:     messageStore,
+		sessionSearcher:  sessionSearcher,
+		webOptions:       webToolOptions(cfg.Web),
+		maasResolver:     maasProfileResolver{cfg: cfg.Maas},
+		toolMaxFileChars: cfg.ContextFiles.MaxFileChars,
+		homeDir:          resolveHomeDir(logger),
 	}
 	coordinator := agentruntime.NewCoordinator(agentruntime.CoordinatorConfig{
 		Agent: domain.Agent{

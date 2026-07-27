@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
 	"strings"
 	"time"
@@ -85,6 +86,27 @@ func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolv
 		logger:       cfg.Logger,
 		skillUsage:   cfg.SkillUsage,
 	}
+}
+
+// resolveHomeDir returns the user's home directory, used to exclude the
+// resident ~/.stardust/agents.md from on-demand subtree injection
+// (tool.WithAgentsInjection's homeDir). Injection is a context-quality
+// nicety, not something a per-agent task should fail over for, so a
+// resolution failure degrades to "" (only the two workspace-local resident
+// paths are excluded) rather than failing ResolveTaskRunner — but the miss is
+// logged (Warn), not silently dropped, per CLAUDE.md fail-loud.
+func (r *AgentRuntimeResolver) resolveHomeDir(ctx context.Context) string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		if r.logger != nil {
+			r.logger.WarnContext(ctx, "resolve home directory",
+				"component", "agent_resolver",
+				"consequence", "resident global agents.md will not be excluded from subtree injection",
+				"error", err)
+		}
+		return ""
+	}
+	return homeDir
 }
 
 func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domain.Task) (domain.Agent, TaskRunner, bool, error) {
@@ -177,7 +199,10 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 	//
 	// The asymmetry is the design, not an oversight — see
 	// TestResolverOmitsOrchestratorOnlyTools, which locks it.
-	tools := tool.NewFileReadWriteWorkspaceRegistry(agentToolRoot(r.rootConfig, agentCfg, task), r.audit)
+	toolRoot := agentToolRoot(r.rootConfig, agentCfg, task)
+	tools := tool.NewFileReadWriteWorkspaceRegistry(toolRoot, r.audit,
+		tool.WithAgentsInjection(r.rootConfig.ContextFiles.MaxFileChars, r.resolveHomeDir(ctx)),
+		tool.WithProjectRoot(toolRoot))
 	tool.RegisterTaskLedgerTools(tools, r.taskLedger)
 	tool.RegisterAgentMessageTools(tools, r.messageStore)
 	tool.RegisterWebTools(tools, webToolOptions(r.rootConfig.Web))

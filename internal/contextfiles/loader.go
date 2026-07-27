@@ -461,6 +461,53 @@ func readTrusted(absPath string, label string, maxChars int) (content string, bl
 	return truncate(trimmed, label, maxChars), false, nil
 }
 
+// SubtreeAgentsChain collects agents.md files in the directories from
+// projectRoot (exclusive — it is already loaded as the resident project slot)
+// down to fileDir (inclusive), ordered weakest→strongest (projectRoot side
+// first, fileDir side last). fileDir must be within projectRoot; a fileDir
+// outside projectRoot is a sandbox violation and returns an error. A directory
+// with no agents.md is skipped. Reads go through readOne, so they are
+// sandboxed to projectRoot, injection-scanned, and size-truncated; a real read
+// failure (not a missing file) is returned as an error, and unsafe content
+// yields a Blocked entry rather than being silently dropped.
+func SubtreeAgentsChain(projectRoot string, fileDir string, maxChars int) ([]AgentsEntry, error) {
+	absRoot, err := filepath.Abs(projectRoot)
+	if err != nil {
+		return nil, fmt.Errorf("resolve project root: %w", err)
+	}
+	absRoot = filepath.Clean(absRoot)
+	dir, err := filepath.Abs(fileDir)
+	if err != nil {
+		return nil, fmt.Errorf("resolve file dir: %w", err)
+	}
+	dir = filepath.Clean(dir)
+	if !isWithinRoot(absRoot, dir) {
+		return nil, fmt.Errorf("subtree file dir outside project root: %s", dir)
+	}
+	var rev []AgentsEntry // collected deep->shallow, reversed before return
+	for dir != absRoot {
+		if p := findAgentsFile(dir); p != "" {
+			content, blocked, rErr := readOne(absRoot, p, "agents.md", maxChars)
+			if rErr != nil {
+				return nil, rErr
+			}
+			if blocked || content != "" {
+				rev = append(rev, AgentsEntry{Label: p, Content: content, Blocked: blocked})
+			}
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	// reverse to shallow(projectRoot side)->deep(fileDir side)
+	for i, j := 0, len(rev)-1; i < j; i, j = i+1, j-1 {
+		rev[i], rev[j] = rev[j], rev[i]
+	}
+	return rev, nil
+}
+
 func isWithinRoot(root string, path string) bool {
 	rel, err := filepath.Rel(root, path)
 	if err != nil {
