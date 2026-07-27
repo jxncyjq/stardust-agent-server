@@ -343,8 +343,9 @@ func eventStream(taskID string, events []domain.RuntimeEvent, auditEvents []doma
 // A missing home directory must not stop the agent from starting, so this does
 // not return an error — but it must not be invisible either. With
 // HOME/USERPROFILE unset (service accounts, containers, Windows services) the
-// global ~/.stardust/agents.md silently stops loading, and isResidentAgents
-// stops recognising it as already-in-context, so write_file may re-inject it.
+// global ~/.stardust/agents.md silently stops loading, and the resident-path
+// dedup seed (ResidentAgentsPaths) stops recognising it as already-in-context,
+// so the tools may re-inject it.
 // The behaviour changes; without this line the user only sees "my global
 // conventions aren't taking effect" and has nothing to go on.
 func resolveHomeDir(logger *slog.Logger) string {
