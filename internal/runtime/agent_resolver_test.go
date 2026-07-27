@@ -244,6 +244,69 @@ func TestAgentRuntimeResolverUsesRegisteredAgentMaasProfileAndContextFiles(t *te
 	}
 }
 
+// TestResolveTaskRunnerLoadsProjectRootAgents guards Task A4's wiring: the
+// resolver must load agents.md from the task's working directory (via
+// agentToolRoot), not from the agent's persona ContextFiles.Root. Before this
+// wiring, loadAgentContextFiles never passed ProjectRoot, so
+// contextfiles.Load fell back to Root (the persona dir) and a project-level
+// agents.md placed at task.WorkingDir was silently never loaded.
+func TestResolveTaskRunnerLoadsProjectRootAgents(t *testing.T) {
+	t.Parallel()
+
+	personaDir := t.TempDir()
+	writeResolverContextFile(t, personaDir, "SOUL.md", "researcher SOUL context")
+
+	projectDir := t.TempDir()
+	writeResolverContextFile(t, projectDir, "agents.md", "PROJECT-RULE-XYZ")
+
+	maas := &resolverCaptureMaas{response: "ok"}
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
+			"researcher": {
+				ID:          "agent-researcher",
+				Role:        "researcher",
+				MaasProfile: "deep",
+				ContextFiles: config.ContextFilesConfig{
+					Enabled:  true,
+					SoulPath: "SOUL.md",
+				},
+			},
+		}),
+		RootConfig: config.Config{
+			ContextFiles: config.ContextFilesConfig{Root: personaDir},
+			Runtime:      config.RuntimeConfig{MaxToolRounds: 1},
+		},
+		Audit:  adapter.NewMemoryAuditLog(),
+		Events: adapter.NewMemoryEventBus(),
+		MaasFactory: func(string) (MaasRunnerFactoryResult, error) {
+			return MaasRunnerFactoryResult{Client: maas}, nil
+		},
+	})
+
+	task := domain.Task{
+		ID:         "task-project-root",
+		AgentID:    "researcher",
+		Input:      "review project rules",
+		WorkingDir: projectDir,
+	}
+	agent, runner, ok, err := resolver.ResolveTaskRunner(context.Background(), task)
+	if err != nil {
+		t.Fatalf("ResolveTaskRunner(project root) error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatalf("ResolveTaskRunner(project root) ok = false, want true")
+	}
+	if _, err := runner.RunTask(context.Background(), agent, task); err != nil {
+		t.Fatalf("RunTask(project root) error = %v, want nil", err)
+	}
+	if !strings.Contains(maas.prompt, "PROJECT-RULE-XYZ") {
+		t.Fatalf("RunTask(project root) prompt missing projectDir agents.md content:\n%s", maas.prompt)
+	}
+	if !strings.Contains(maas.prompt, "researcher SOUL context") {
+		t.Fatalf("RunTask(project root) prompt missing persona SOUL context (Root must stay the persona root):\n%s", maas.prompt)
+	}
+}
+
 func TestAgentRuntimeResolverMountsRoleScopedSkills(t *testing.T) {
 	t.Parallel()
 

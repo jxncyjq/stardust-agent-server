@@ -115,7 +115,7 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 	if err != nil {
 		return domain.Agent{}, nil, false, fmt.Errorf("create maas runner for profile %q: %w", agentCfg.MaasProfile, err)
 	}
-	contextBlock, err := loadAgentContextFiles(ctx, r.rootConfig, agentCfg.ContextFiles)
+	contextBlock, err := loadAgentContextFiles(ctx, r.rootConfig, agentCfg.ContextFiles, agentToolRoot(r.rootConfig, agentCfg, task))
 	if err != nil {
 		return domain.Agent{}, nil, false, fmt.Errorf("load agent context files for %q: %w", task.AgentID, err)
 	}
@@ -211,13 +211,20 @@ func webToolOptions(cfg config.WebToolConfig) tool.WebToolOptions {
 	}
 }
 
-func loadAgentContextFiles(ctx context.Context, rootCfg config.Config, childCfg config.ContextFilesConfig) (string, error) {
+// loadAgentContextFiles loads the resident context block for an agent.
+// projectRoot is the agents.md project root (and upward ancestor chain
+// anchor) — the caller passes agentToolRoot's result so agents.md tracks the
+// same task.WorkingDir-first sandbox boundary as the tool registry. Root
+// (childCfg.Root, falling back to rootCfg.ContextFiles.Root) stays the
+// persona root for Soul/Tools/User/Memory, unaffected by projectRoot.
+func loadAgentContextFiles(ctx context.Context, rootCfg config.Config, childCfg config.ContextFilesConfig, projectRoot string) (string, error) {
 	if childCfg.Root == "" {
 		childCfg.Root = rootCfg.ContextFiles.Root
 	}
 	block, err := contextfiles.Load(ctx, contextfiles.Config{
 		Enabled:      childCfg.Enabled,
 		Root:         childCfg.Root,
+		ProjectRoot:  projectRoot,
 		SoulPath:     childCfg.SoulPath,
 		ToolsPath:    childCfg.ToolsPath,
 		UserPath:     childCfg.UserPath,
