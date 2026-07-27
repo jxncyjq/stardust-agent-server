@@ -632,6 +632,38 @@ func TestLoadUsesProjectRootForAgentsNotPersonaRoot(t *testing.T) {
 	}
 }
 
+// ── SubtreeAgentsChain (downward walk from projectRoot to fileDir) ──────────
+
+func TestSubtreeAgentsChainShallowToDeep(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	fileDir := filepath.Join(root, "a", "b")
+	if err := os.MkdirAll(fileDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, root, "agents.md", "ROOT (should be excluded)")
+	writeFile(t, filepath.Join(root, "a"), "agents.md", "a-rule")
+	writeFile(t, fileDir, "agents.md", "b-rule")
+
+	entries, err := SubtreeAgentsChain(root, fileDir, 20000)
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if len(entries) != 2 || entries[0].Content != "a-rule" || entries[1].Content != "b-rule" {
+		t.Fatalf("want [a-rule,b-rule], got %+v", entries)
+	}
+}
+
+func TestSubtreeAgentsChainRejectsOutsideRoot(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	if _, err := SubtreeAgentsChain(root, filepath.Dir(root), 20000); err == nil {
+		t.Fatal("expected sandbox error for fileDir outside root")
+	}
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 func writeFile(t *testing.T, root string, rel string, content string) {
