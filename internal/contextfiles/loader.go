@@ -334,6 +334,89 @@ func NearestAgentsFile(root string, startDir string, maxChars int) (content stri
 	}
 }
 
+// AgentsEntry is one resolved agents.md in a layered chain: its absolute path
+// (Label), loaded Content, and whether it was Blocked as unsafe (Content empty
+// when Blocked).
+type AgentsEntry struct {
+	Label   string
+	Content string
+	Blocked bool
+}
+
+// AncestorAgentsChain collects agents.md files in the directories strictly
+// above projectRoot up to and including homeDir, ordered weakest→strongest
+// (homeDir side first, projectRoot side last). These directories live above the
+// project sandbox — they are the user's own filesystem — so reads are
+// sandbox-exempt but still injection-scanned and size-truncated. A directory
+// with no agents.md is skipped. Returns error only on a real read failure.
+func AncestorAgentsChain(projectRoot string, homeDir string, maxChars int) ([]AgentsEntry, error) {
+	if maxChars <= 0 {
+		maxChars = 20000
+	}
+	absRoot, err := filepath.Abs(projectRoot)
+	if err != nil {
+		return nil, fmt.Errorf("resolve project root for ancestor chain: %w", err)
+	}
+	absRoot = filepath.Clean(absRoot)
+	absHome := ""
+	if homeDir != "" {
+		if absHome, err = filepath.Abs(homeDir); err != nil {
+			return nil, fmt.Errorf("resolve home dir for ancestor chain: %w", err)
+		}
+		absHome = filepath.Clean(absHome)
+	}
+	var rev []AgentsEntry // collected strong→weak, reversed before return
+	dir := filepath.Dir(absRoot)
+	for {
+		if p := findAgentsFile(dir); p != "" {
+			content, blocked, rErr := readTrusted(p, p, maxChars)
+			if rErr != nil {
+				return nil, rErr
+			}
+			if blocked || content != "" {
+				rev = append(rev, AgentsEntry{Label: p, Content: content, Blocked: blocked})
+			}
+		}
+		if absHome != "" && dir == absHome {
+			break
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir { // filesystem root
+			break
+		}
+		dir = parent
+	}
+	// reverse to weak(home)→strong(projectRoot side)
+	for i, j := 0, len(rev)-1; i < j; i, j = i+1, j-1 {
+		rev[i], rev[j] = rev[j], rev[i]
+	}
+	return rev, nil
+}
+
+// readTrusted reads a sandbox-exempt agents.md (used for locations above the
+// project root and the global slot): trims, injection-scans, truncates. A
+// missing file yields ("", false, nil); unsafe yields ("", true, nil).
+func readTrusted(absPath string, label string, maxChars int) (content string, blocked bool, err error) {
+	data, err := os.ReadFile(absPath)
+	if os.IsNotExist(err) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf("read %s: %w", label, err)
+	}
+	trimmed := strings.TrimSpace(string(data))
+	if trimmed == "" {
+		return "", false, nil
+	}
+	if isUnsafeContext(trimmed) {
+		return "", true, nil
+	}
+	if maxChars <= 0 {
+		maxChars = 20000
+	}
+	return truncate(trimmed, label, maxChars), false, nil
+}
+
 func isWithinRoot(root string, path string) bool {
 	rel, err := filepath.Rel(root, path)
 	if err != nil {
