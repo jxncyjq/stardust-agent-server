@@ -384,7 +384,7 @@ func writeFileTool(_ context.Context, root string, guard port.WorkspacePathGuard
 	// tasks disable it (injectAgentsNote=false) so a directory's agents.md does
 	// not leak into their tool results.
 	if injectAgentsNote {
-		if note, err := nearestAgentsNote(root, filepath.Dir(resolved), options); err != nil {
+		if note, err := subtreeAgentsNote(filepath.Dir(resolved), options); err != nil {
 			return domain.ToolResult{}, err
 		} else if note != "" {
 			output += note
@@ -397,56 +397,43 @@ func writeFileTool(_ context.Context, root string, guard port.WorkspacePathGuard
 	}, nil
 }
 
-// nearestAgentsNote returns the on-demand agents.md injection appended to a
-// write_file result. It locates the nearest agents.md / AGENTS.md walking up
-// from startDir to root, skipping the three resident locations (global
-// ~/.stardust/agents.md, workspace agents.md, workspace .stardust/agents.md —
-// those are always in context), and renders the file's local-directory
-// conventions. An empty string means there is nothing to inject (no nearby file,
-// or the only match is a resident file). A file flagged as unsafe yields a note
-// saying it was ignored rather than its content.
-func nearestAgentsNote(root string, startDir string, options workspaceRegistryOptions) (string, error) {
-	content, absPath, found, blocked, err := contextfiles.NearestAgentsFile(root, startDir, options.maxFileChars)
-	if err != nil {
-		return "", fmt.Errorf("locate nearest agents.md for write_file injection: %w", err)
-	}
-	if !found {
+// subtreeAgentsNote returns the on-demand agents.md injection appended to a
+// write_file result. It walks the directory chain from options.projectRoot
+// (exclusive — already resident) down to startDir (inclusive) via
+// contextfiles.SubtreeAgentsChain, and renders every entry not yet seen by
+// options.injected for this task, marking it seen as it goes so the same
+// directory's conventions are not repeated on later write_file calls within
+// the task. An entry already seen (resident or previously injected) is
+// skipped. Injection is disabled — returning ("", nil) — when options.injected
+// is nil or options.projectRoot is empty, which is the state before the
+// registry's agents.md assembly wires them up; this also guards against
+// calling markIfNew on a nil *injectedAgentsSet. A file flagged as unsafe
+// yields a note saying it was ignored rather than its content.
+func subtreeAgentsNote(startDir string, options workspaceRegistryOptions) (string, error) {
+	if options.injected == nil || strings.TrimSpace(options.projectRoot) == "" {
 		return "", nil
 	}
-	resident, err := isResidentAgents(root, absPath, options.homeDir)
+	entries, err := contextfiles.SubtreeAgentsChain(options.projectRoot, startDir, options.maxFileChars)
 	if err != nil {
-		return "", fmt.Errorf("check resident agents for injection: %w", err)
+		return "", fmt.Errorf("locate subtree agents.md for injection: %w", err)
 	}
-	if resident {
-		return "", nil
+	var out strings.Builder
+	for _, e := range entries {
+		if !options.injected.markIfNew(e.Label) {
+			continue
+		}
+		rel, relErr := filepath.Rel(options.projectRoot, e.Label)
+		if relErr != nil {
+			rel = e.Label
+		}
+		rel = filepath.ToSlash(rel)
+		if e.Blocked {
+			fmt.Fprintf(&out, "\n\n[本目录 agents.md 含不安全内容，已忽略: %s]", rel)
+			continue
+		}
+		fmt.Fprintf(&out, "\n\n📁 本目录约定 (%s)：\n%s", rel, e.Content)
 	}
-	rel, relErr := filepath.Rel(root, absPath)
-	if relErr != nil {
-		rel = absPath
-	}
-	rel = filepath.ToSlash(rel)
-	if blocked {
-		return fmt.Sprintf("\n\n[本目录 agents.md 含不安全内容，已忽略: %s]", rel), nil
-	}
-	return fmt.Sprintf("\n\n📁 本目录约定 (%s)：\n%s", rel, content), nil
-}
-
-// isResidentAgents reports whether absPath is one of the three agents.md files
-// that are loaded permanently into context, which must not be re-injected by
-// write_file. The three resident paths are:
-//  1. <homeDir>/.stardust/agents.md  (or AGENTS.md)
-//  2. <root>/agents.md               (or AGENTS.md)
-//  3. <root>/.stardust/agents.md     (or AGENTS.md)
-//
-// homeDir may be empty, in which case only the two workspace-local paths are
-// excluded (graceful degradation). Returns an error when computing the
-// resident set fails (e.g. an ancestor agents.md could not be read).
-func isResidentAgents(root string, absPath string, homeDir string) (bool, error) {
-	residents, err := contextfiles.ResidentAgentsPaths(root, homeDir)
-	if err != nil {
-		return false, err
-	}
-	return residents[filepath.Clean(absPath)], nil
+	return out.String(), nil
 }
 
 func searchContentTool(ctx context.Context, rootPath string, guard port.WorkspacePathGuard, call domain.ToolCall) (domain.ToolResult, error) {
