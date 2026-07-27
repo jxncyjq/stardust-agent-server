@@ -2,7 +2,9 @@ package contextfiles
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -448,7 +450,10 @@ func TestResidentAgentsPathsCoversThreeLocations(t *testing.T) {
 		t.Fatalf("WriteFile(global) error = %v", err)
 	}
 
-	residents := ResidentAgentsPaths(root, fakeHome)
+	residents, err := ResidentAgentsPaths(root, fakeHome)
+	if err != nil {
+		t.Fatalf("ResidentAgentsPaths error = %v, want nil", err)
+	}
 	wantPaths := []string{
 		filepath.Join(fakeHome, ".stardust", "agents.md"),
 		filepath.Join(root, "agents.md"),
@@ -466,7 +471,10 @@ func TestResidentAgentsPathsEmptyWhenNoFilesExist(t *testing.T) {
 
 	root := t.TempDir()
 	fakeHome := t.TempDir()
-	residents := ResidentAgentsPaths(root, fakeHome)
+	residents, err := ResidentAgentsPaths(root, fakeHome)
+	if err != nil {
+		t.Fatalf("ResidentAgentsPaths error = %v, want nil", err)
+	}
 	if len(residents) != 0 {
 		t.Fatalf("ResidentAgentsPaths(no files) = %v, want empty map", residents)
 	}
@@ -486,7 +494,10 @@ func TestResidentAgentsPathsCoversAncestorsAndProject(t *testing.T) {
 	writeFile(t, projectRoot, "agents.md", "proj")
 	writeFile(t, projectRoot, filepath.Join(".stardust", "agents.md"), "projstar")
 
-	res := ResidentAgentsPaths(projectRoot, home)
+	res, err := ResidentAgentsPaths(projectRoot, home)
+	if err != nil {
+		t.Fatalf("ResidentAgentsPaths error = %v, want nil", err)
+	}
 	for _, want := range []string{
 		filepath.Clean(filepath.Join(home, ".stardust", "agents.md")),
 		filepath.Clean(filepath.Join(proj, "agents.md")),
@@ -496,6 +507,29 @@ func TestResidentAgentsPathsCoversAncestorsAndProject(t *testing.T) {
 		if !res[want] {
 			t.Errorf("missing resident %q in %v", want, res)
 		}
+	}
+}
+
+// Regression: ResidentAgentsPaths silently swallowed a real read error from
+// AncestorAgentsChain (err == nil check) and returned a partial/empty set as
+// if nothing were wrong. Fail-loud requires the error to propagate instead.
+func TestResidentAgentsPathsPropagatesAncestorReadError(t *testing.T) {
+	home := t.TempDir()
+	proj := filepath.Join(home, "proj")
+	projectRoot := filepath.Join(proj, "root")
+	if err := os.MkdirAll(projectRoot, 0o755); err != nil {
+		t.Fatalf("MkdirAll error = %v, want nil", err)
+	}
+	writeFile(t, proj, "agents.md", "ancestor rule")
+	agentsPath := filepath.Join(proj, "agents.md")
+	denyReadAccess(t, agentsPath)
+
+	residents, err := ResidentAgentsPaths(projectRoot, home)
+	if err == nil {
+		t.Fatalf("ResidentAgentsPaths error = nil, want non-nil when ancestor agents.md is unreadable; residents=%v", residents)
+	}
+	if residents != nil {
+		t.Fatalf("ResidentAgentsPaths residents = %v, want nil on error (fail-loud, not a silent partial set)", residents)
 	}
 }
 
@@ -609,5 +643,41 @@ func writeFile(t *testing.T, root string, rel string, content string) {
 	}
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("WriteFile(%q) error = %v, want nil", path, err)
+	}
+}
+
+// denyReadAccess makes the file at path unreadable so os.ReadFile returns a
+// genuine (non-NotExist) error, and restores access on test cleanup so
+// t.TempDir() can remove it. Unix chmod(0o000) does not restrict access for a
+// privileged/owning process on Windows (see
+// TestReadEventsFailsLoudOnUnreadableDirectory in internal/taskledger), so
+// Windows uses an explicit icacls deny ACE instead, which Windows honours
+// ahead of the inherited Allow ACE an Administrator account normally has.
+//
+// Some sandboxed/elevated processes hold a privileged token that bypasses
+// filesystem ACLs and permission bits entirely, so the restriction is
+// verified to actually take effect before the caller relies on it; if not,
+// the test skips (environment limitation) instead of failing for an
+// unrelated reason.
+func denyReadAccess(t *testing.T, path string) {
+	t.Helper()
+
+	if runtime.GOOS == "windows" {
+		out, err := exec.Command("icacls", path, "/deny", "*S-1-1-0:(R)").CombinedOutput()
+		if err != nil {
+			t.Skipf("icacls deny unavailable, skipping unreadable-file test: %v: %s", err, out)
+		}
+		t.Cleanup(func() {
+			_, _ = exec.Command("icacls", path, "/remove:d", "*S-1-1-0").CombinedOutput()
+		})
+	} else {
+		if err := os.Chmod(path, 0o000); err != nil {
+			t.Fatalf("Chmod(%q) error = %v, want nil", path, err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(path, 0o600) })
+	}
+
+	if _, err := os.ReadFile(path); err == nil {
+		t.Skip("this environment does not enforce the read restriction (privileged process bypasses ACLs/permission bits); skipping unreadable-file test")
 	}
 }

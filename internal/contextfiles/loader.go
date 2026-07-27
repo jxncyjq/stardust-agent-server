@@ -175,7 +175,9 @@ func (b Block) Render() string {
 // re-injecting a file that the model already sees in every prompt. projectRoot
 // must be the absolute, cleaned project root; homeDir is the user home
 // directory (passed in so callers don't need to call os.UserHomeDir twice).
-func ResidentAgentsPaths(projectRoot string, homeDir string) map[string]bool {
+// Returns an error (nil set) if the ancestor chain walk hits a real read
+// failure — it never silently returns a partial/empty set on error.
+func ResidentAgentsPaths(projectRoot string, homeDir string) (map[string]bool, error) {
 	set := make(map[string]bool, 8)
 	add := func(p string) {
 		if p != "" {
@@ -186,14 +188,16 @@ func ResidentAgentsPaths(projectRoot string, homeDir string) map[string]bool {
 	// Ancestor chain above projectRoot up to homeDir; maxChars=1 only to fetch
 	// paths cheaply — even if content is truncated/blocked, Label is still the
 	// real path, and dedup only looks at the path.
-	if entries, err := AncestorAgentsChain(projectRoot, homeDir, 1); err == nil {
-		for _, e := range entries {
-			add(e.Label)
-		}
+	entries, err := AncestorAgentsChain(projectRoot, homeDir, 1)
+	if err != nil {
+		return nil, fmt.Errorf("resident agents ancestor chain: %w", err)
+	}
+	for _, e := range entries {
+		add(e.Label)
 	}
 	add(findAgentsFile(projectRoot))
 	add(findAgentsFile(filepath.Join(projectRoot, ".stardust")))
-	return set
+	return set, nil
 }
 
 // findAgentsFile returns the absolute path of the first agents file found in

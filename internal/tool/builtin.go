@@ -379,7 +379,11 @@ func nearestAgentsNote(root string, startDir string, options workspaceRegistryOp
 	if !found {
 		return "", nil
 	}
-	if isResidentAgents(root, absPath, options.homeDir) {
+	resident, err := isResidentAgents(root, absPath, options.homeDir)
+	if err != nil {
+		return "", fmt.Errorf("check resident agents for injection: %w", err)
+	}
+	if resident {
 		return "", nil
 	}
 	rel, relErr := filepath.Rel(root, absPath)
@@ -401,10 +405,14 @@ func nearestAgentsNote(root string, startDir string, options workspaceRegistryOp
 //  3. <root>/.stardust/agents.md     (or AGENTS.md)
 //
 // homeDir may be empty, in which case only the two workspace-local paths are
-// excluded (graceful degradation).
-func isResidentAgents(root string, absPath string, homeDir string) bool {
-	residents := contextfiles.ResidentAgentsPaths(root, homeDir)
-	return residents[filepath.Clean(absPath)]
+// excluded (graceful degradation). Returns an error when computing the
+// resident set fails (e.g. an ancestor agents.md could not be read).
+func isResidentAgents(root string, absPath string, homeDir string) (bool, error) {
+	residents, err := contextfiles.ResidentAgentsPaths(root, homeDir)
+	if err != nil {
+		return false, err
+	}
+	return residents[filepath.Clean(absPath)], nil
 }
 
 func searchContentTool(ctx context.Context, rootPath string, guard port.WorkspacePathGuard, call domain.ToolCall) (domain.ToolResult, error) {
