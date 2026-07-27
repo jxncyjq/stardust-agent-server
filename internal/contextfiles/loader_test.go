@@ -472,6 +472,33 @@ func TestResidentAgentsPathsEmptyWhenNoFilesExist(t *testing.T) {
 	}
 }
 
+func TestResidentAgentsPathsCoversAncestorsAndProject(t *testing.T) {
+	t.Parallel()
+
+	home := t.TempDir()
+	proj := filepath.Join(home, "p")
+	projectRoot := filepath.Join(proj, "root")
+	if err := os.MkdirAll(filepath.Join(projectRoot, ".stardust"), 0o755); err != nil {
+		t.Fatalf("MkdirAll error = %v, want nil", err)
+	}
+	writeFile(t, home, filepath.Join(".stardust", "agents.md"), "g")
+	writeFile(t, proj, "agents.md", "ancestor")
+	writeFile(t, projectRoot, "agents.md", "proj")
+	writeFile(t, projectRoot, filepath.Join(".stardust", "agents.md"), "projstar")
+
+	res := ResidentAgentsPaths(projectRoot, home)
+	for _, want := range []string{
+		filepath.Clean(filepath.Join(home, ".stardust", "agents.md")),
+		filepath.Clean(filepath.Join(proj, "agents.md")),
+		filepath.Clean(filepath.Join(projectRoot, "agents.md")),
+		filepath.Clean(filepath.Join(projectRoot, ".stardust", "agents.md")),
+	} {
+		if !res[want] {
+			t.Errorf("missing resident %q in %v", want, res)
+		}
+	}
+}
+
 // ── AncestorAgentsChain (upward walk to home, sandbox-exempt trusted reads) ──
 
 func TestAncestorAgentsChainWalksUpToHome(t *testing.T) {

@@ -168,22 +168,31 @@ func (b Block) Render() string {
 }
 
 // ResidentAgentsPaths returns the set of absolute paths that are permanently
-// loaded into context (the three fixed AGENTS.md locations). write_file uses
-// this to avoid re-injecting a file that the model already sees in every prompt.
-// root must be the absolute, cleaned workspace root; homeDir is the user home
+// loaded into context: the global agents.md (<homeDir>/.stardust/agents.md),
+// every agents.md in the ancestor chain strictly above projectRoot up to
+// homeDir, and the two fixed projectRoot locations (<projectRoot>/agents.md
+// and <projectRoot>/.stardust/agents.md). write_file uses this to avoid
+// re-injecting a file that the model already sees in every prompt. projectRoot
+// must be the absolute, cleaned project root; homeDir is the user home
 // directory (passed in so callers don't need to call os.UserHomeDir twice).
-func ResidentAgentsPaths(root string, homeDir string) map[string]bool {
-	set := make(map[string]bool, 3)
-	for _, dir := range []string{
-		filepath.Join(homeDir, ".stardust"),
-		root,
-		filepath.Join(root, ".stardust"),
-	} {
-		p := findAgentsFile(dir)
+func ResidentAgentsPaths(projectRoot string, homeDir string) map[string]bool {
+	set := make(map[string]bool, 8)
+	add := func(p string) {
 		if p != "" {
 			set[filepath.Clean(p)] = true
 		}
 	}
+	add(findAgentsFile(filepath.Join(homeDir, ".stardust")))
+	// Ancestor chain above projectRoot up to homeDir; maxChars=1 only to fetch
+	// paths cheaply — even if content is truncated/blocked, Label is still the
+	// real path, and dedup only looks at the path.
+	if entries, err := AncestorAgentsChain(projectRoot, homeDir, 1); err == nil {
+		for _, e := range entries {
+			add(e.Label)
+		}
+	}
+	add(findAgentsFile(projectRoot))
+	add(findAgentsFile(filepath.Join(projectRoot, ".stardust")))
 	return set
 }
 
