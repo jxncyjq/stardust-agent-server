@@ -532,6 +532,45 @@ func TestAncestorAgentsChainProjectRootEqualsHome(t *testing.T) {
 	}
 }
 
+// ── Config.ProjectRoot separates persona root from agents.md project root ────
+
+func TestLoadUsesProjectRootForAgentsNotPersonaRoot(t *testing.T) {
+	home := t.TempDir()
+	personaRoot := filepath.Join(home, "serveCwd") // persona lives here
+	projectRoot := filepath.Join(home, "myproj")   // agents.md project root
+	if err := os.MkdirAll(personaRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(projectRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, personaRoot, "SOUL.md", "i am soul")
+	writeFile(t, projectRoot, "agents.md", "project rule")
+	// an agents.md in personaRoot must NOT be loaded as project rule:
+	writeFile(t, personaRoot, "agents.md", "serve-cwd rule SHOULD NOT LOAD")
+
+	block, err := Load(t.Context(), Config{
+		Enabled:      true,
+		Root:         personaRoot,
+		ProjectRoot:  projectRoot,
+		SoulPath:     "SOUL.md",
+		MaxFileChars: 20000,
+	})
+	if err != nil {
+		t.Fatalf("Load err=%v", err)
+	}
+	if block.Soul != "i am soul" {
+		t.Fatalf("Soul from personaRoot expected, got %q", block.Soul)
+	}
+	if block.WorkspaceAgents != "project rule" {
+		t.Fatalf("WorkspaceAgents should come from projectRoot, got %q", block.WorkspaceAgents)
+	}
+	rendered := block.Render()
+	if strings.Contains(rendered, "SHOULD NOT LOAD") {
+		t.Fatalf("serve-cwd agents.md must not be loaded as project rule:\n%s", rendered)
+	}
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 func writeFile(t *testing.T, root string, rel string, content string) {

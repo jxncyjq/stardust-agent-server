@@ -15,8 +15,12 @@ import (
 // are not configurable per-path — any present file at those fixed locations is
 // loaded automatically.
 type Config struct {
-	Enabled      bool
-	Root         string
+	Enabled bool
+	Root    string
+	// ProjectRoot is the root for agents.md project rules and the upward ancestor
+	// chain (typically the session working_dir). Empty falls back to Root. Persona
+	// files (Soul/Tools/User/Memory) always resolve against Root, never ProjectRoot.
+	ProjectRoot  string
 	SoulPath     string
 	ToolsPath    string
 	UserPath     string
@@ -29,9 +33,10 @@ type Config struct {
 // loaded from the three fixed locations described in Load.
 type Block struct {
 	Soul            string
-	GlobalAgents    string // ~/.stardust/agents.md (or AGENTS.md)
-	WorkspaceAgents string // <root>/agents.md (or AGENTS.md)
-	StardustAgents  string // <root>/.stardust/agents.md (or AGENTS.md)
+	GlobalAgents    string        // ~/.stardust/agents.md (or AGENTS.md)
+	AncestorAgents  []AgentsEntry // agents.md in directories strictly above ProjectRoot, up to home; weak->strong
+	WorkspaceAgents string        // <projectRoot>/agents.md (or AGENTS.md)
+	StardustAgents  string        // <projectRoot>/.stardust/agents.md (or AGENTS.md)
 	Tools           string
 	User            string
 	Memory          string
@@ -41,15 +46,21 @@ type Block struct {
 // Load reads the resident context files from cfg and returns a populated Block.
 // Three AGENTS.md locations are always checked (each may be absent without
 // error):
-//  1. Global:             <homeDir>/.stardust/agents.md  (or AGENTS.md)
-//  2. Workspace:          <root>/agents.md               (or AGENTS.md)
-//  3. Workspace .stardust: <root>/.stardust/agents.md    (or AGENTS.md)
+//  1. Global:              <homeDir>/.stardust/agents.md      (or AGENTS.md)
+//  2. Project:              <projectRoot>/agents.md            (or AGENTS.md)
+//  3. Project .stardust:    <projectRoot>/.stardust/agents.md  (or AGENTS.md)
+//
+// plus the upward ancestor chain of agents.md files strictly above projectRoot
+// up to homeDir (see AncestorAgentsChain). projectRoot is cfg.ProjectRoot when
+// set, otherwise cfg.Root. Persona files (Soul/Tools/User/Memory) always resolve
+// against cfg.Root, never cfg.ProjectRoot.
 //
 // At every location the filename is resolved by trying "agents.md" first, then
 // "AGENTS.md" as a fallback, so both casings are accepted. The global location
-// is outside the workspace sandbox and is explicitly trusted (it is the user's
-// own configuration); it therefore skips the workspace-root boundary check but
-// still passes through the prompt-injection scan and size truncation.
+// and the ancestor chain are outside the workspace sandbox and are explicitly
+// trusted (they are the user's own configuration); they therefore skip the
+// workspace-root boundary check but still pass through the prompt-injection
+// scan and size truncation.
 func Load(ctx context.Context, cfg Config) (Block, error) {
 	if err := ctx.Err(); err != nil {
 		return Block{}, err
@@ -68,6 +79,14 @@ func Load(ctx context.Context, cfg Config) (Block, error) {
 		return Block{}, fmt.Errorf("resolve context root: %w", err)
 	}
 	root = filepath.Clean(root)
+
+	projectRoot := root
+	if strings.TrimSpace(cfg.ProjectRoot) != "" {
+		if projectRoot, err = filepath.Abs(cfg.ProjectRoot); err != nil {
+			return Block{}, fmt.Errorf("resolve project root: %w", err)
+		}
+		projectRoot = filepath.Clean(projectRoot)
+	}
 
 	var block Block
 
@@ -90,18 +109,23 @@ func Load(ctx context.Context, cfg Config) (Block, error) {
 		}
 	}
 
-	// 2b. Workspace: <root>/agents.md
-	wsAgentsPath := findAgentsFile(root)
-	if wsAgentsPath != "" {
-		if block.WorkspaceAgents, err = loadOneFull(root, wsAgentsPath, "agents.md", cfg.MaxFileChars, &block); err != nil {
+	// 2a'. Ancestor chain: agents.md in directories strictly above projectRoot,
+	// up to and including homeDir. Sandbox-exempt (above the project sandbox by
+	// design), still injection-scanned and truncated.
+	if block.AncestorAgents, err = AncestorAgentsChain(projectRoot, homeDir, cfg.MaxFileChars); err != nil {
+		return Block{}, err
+	}
+
+	// 2b. Project: <projectRoot>/agents.md
+	if wsAgentsPath := findAgentsFile(projectRoot); wsAgentsPath != "" {
+		if block.WorkspaceAgents, err = loadOneFull(projectRoot, wsAgentsPath, "agents.md", cfg.MaxFileChars, &block); err != nil {
 			return Block{}, err
 		}
 	}
 
-	// 2c. Workspace .stardust: <root>/.stardust/agents.md
-	wsStardustAgentsPath := findAgentsFile(filepath.Join(root, ".stardust"))
-	if wsStardustAgentsPath != "" {
-		if block.StardustAgents, err = loadOneFull(root, wsStardustAgentsPath, ".stardust/agents.md", cfg.MaxFileChars, &block); err != nil {
+	// 2c. Project .stardust: <projectRoot>/.stardust/agents.md
+	if p := findAgentsFile(filepath.Join(projectRoot, ".stardust")); p != "" {
+		if block.StardustAgents, err = loadOneFull(projectRoot, p, ".stardust/agents.md", cfg.MaxFileChars, &block); err != nil {
 			return Block{}, err
 		}
 	}
@@ -125,6 +149,13 @@ func (b Block) Render() string {
 	var out strings.Builder
 	writeSection(&out, "Agent identity (SOUL.md)", b.Soul)
 	writeSection(&out, "Global instructions (~/.stardust/agents.md)", b.GlobalAgents)
+	for _, e := range b.AncestorAgents {
+		if e.Blocked {
+			writeSection(&out, "Blocked ancestor agents.md", "["+e.Label+"]")
+			continue
+		}
+		writeSection(&out, "Ancestor instructions ("+e.Label+")", e.Content)
+	}
 	writeSection(&out, "Workspace instructions (agents.md)", b.WorkspaceAgents)
 	writeSection(&out, "Workspace instructions (.stardust/agents.md)", b.StardustAgents)
 	writeSection(&out, "Tool policy (TOOLS.md)", b.Tools)
