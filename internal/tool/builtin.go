@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/stardust/legion-agent/internal/contextfiles"
@@ -41,6 +42,39 @@ type WorkspaceRegistryOption func(*workspaceRegistryOptions)
 type workspaceRegistryOptions struct {
 	maxFileChars int
 	homeDir      string // user home directory for resident-path exclusion
+	projectRoot  string
+	injected     *injectedAgentsSet
+}
+
+// injectedAgentsSet tracks which non-resident agents.md files have already
+// been injected into a task's tool results, so the same directory's
+// conventions are not repeated on every write_file call within that task.
+type injectedAgentsSet struct {
+	mu   sync.Mutex
+	seen map[string]bool
+}
+
+// newInjectedAgentsSet returns a set seeded with resident (always-in-context)
+// agents.md paths, so markIfNew reports them as already seen from the start.
+func newInjectedAgentsSet(resident map[string]bool) *injectedAgentsSet {
+	seen := make(map[string]bool, len(resident)+8)
+	for p := range resident {
+		seen[filepath.Clean(p)] = true
+	}
+	return &injectedAgentsSet{seen: seen}
+}
+
+// markIfNew returns true the first time absPath is seen, false afterwards (and
+// for paths seeded as resident). Concurrency-safe for parallel tool calls.
+func (s *injectedAgentsSet) markIfNew(absPath string) bool {
+	p := filepath.Clean(absPath)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.seen[p] {
+		return false
+	}
+	s.seen[p] = true
+	return true
 }
 
 // WithAgentsInjection enables write_file to append the nearest subdirectory

@@ -330,6 +330,19 @@ func TestWorkspaceRegistryWriteFileInjectsUpperCaseAgentsFallback(t *testing.T) 
 	}
 }
 
+func TestInjectedAgentsSetMarksOnce(t *testing.T) {
+	s := newInjectedAgentsSet(map[string]bool{"/x/agents.md": true})
+	if s.markIfNew("/x/agents.md") {
+		t.Fatal("resident path should be seen (not new)")
+	}
+	if !s.markIfNew("/y/agents.md") {
+		t.Fatal("first sight should be new")
+	}
+	if s.markIfNew("/y/agents.md") {
+		t.Fatal("second sight should not be new")
+	}
+}
+
 func TestWorkspaceRegistryAllToolSchemasAreOpenAICompatibleObjects(t *testing.T) {
 	t.Parallel()
 
