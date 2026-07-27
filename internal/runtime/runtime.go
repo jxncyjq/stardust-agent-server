@@ -116,6 +116,10 @@ type Config struct {
 	// schema, the lazy capability catalog and dispatch at once. Meta-tools are
 	// never in the registry, so they are unaffected. Empty disables nothing.
 	DisabledTools []string
+	// Debug enables the inference debug probe: runInference logs a per-message
+	// breakdown of every outgoing prompt (see inferenceRequestDebug). Off by
+	// default; intended to be driven by the config file's runtime.debug toggle.
+	Debug bool
 }
 
 // SkillUsageRecorder is the usage sidecar skill.UsageStore satisfies.
@@ -156,6 +160,7 @@ type Runtime struct {
 	skillUsage         SkillUsageRecorder
 	capabilitySkills   capability.Provider
 	disabledTools      []string
+	debug              bool
 }
 
 // loopState is the mutable state threaded through the tool-execution loop.
@@ -281,6 +286,7 @@ func NewRuntime(cfg Config) *Runtime {
 		checkpoints:        cfg.Checkpoints,
 		toolGate:           cfg.ToolGate,
 		logger:             logger,
+		debug:              cfg.Debug,
 		skillUsage:         cfg.SkillUsage,
 		capabilitySkills:   cfg.CapabilitySkills,
 		disabledTools:      cfg.DisabledTools,
@@ -703,6 +709,9 @@ func (r *Runtime) generateNoTools(ctx context.Context, requestID string, taskID 
 // inference: token events are a best-effort display channel, the authoritative
 // result is the returned InferenceResponse (and GetTaskResult on the GUI side).
 func (r *Runtime) runInference(ctx context.Context, taskID string, req port.InferenceRequest) (port.InferenceResponse, error) {
+	if r.debug {
+		r.logInferenceRequest(taskID, req)
+	}
 	if s, ok := r.maas.(port.MaasStreamingClient); ok {
 		return s.GenerateStream(ctx, req, func(delta string) {
 			if err := r.events.Publish(ctx, domain.RuntimeEvent{

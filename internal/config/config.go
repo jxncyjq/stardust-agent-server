@@ -118,6 +118,12 @@ type RuntimeConfig struct {
 	// must be a known gateable tool (validated at agent assembly); meta-tools are
 	// never listed here and cannot be disabled.
 	DisabledTools []string `json:"disabled_tools,omitempty"`
+	// Debug turns on the inference debug probe: before each model call the
+	// runtime logs a per-message breakdown of the outgoing prompt (role, rune
+	// count, tool-call/image counts and a short preview) plus the total size, so
+	// a bloated prompt can be traced to the exact message carrying it. Optional
+	// diagnostic switch; absent / false means off (no probe output).
+	Debug bool `json:"debug,omitempty"`
 }
 
 type SessionConfig struct {
