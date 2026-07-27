@@ -336,14 +336,167 @@ func TestSubtreeAgentsNoteFlagsUnsafeSubtreeEntry(t *testing.T) {
 
 func TestInjectedAgentsSetMarksOnce(t *testing.T) {
 	s := newInjectedAgentsSet(map[string]bool{"/x/agents.md": true})
-	if s.markIfNew("/x/agents.md") {
+	if isNew, err := s.markIfNew("/x/agents.md"); err != nil {
+		t.Fatalf("err=%v, want nil", err)
+	} else if isNew {
 		t.Fatal("resident path should be seen (not new)")
 	}
-	if !s.markIfNew("/y/agents.md") {
+	if isNew, err := s.markIfNew("/y/agents.md"); err != nil {
+		t.Fatalf("err=%v, want nil", err)
+	} else if !isNew {
 		t.Fatal("first sight should be new")
 	}
-	if s.markIfNew("/y/agents.md") {
+	if isNew, err := s.markIfNew("/y/agents.md"); err != nil {
+		t.Fatalf("err=%v, want nil", err)
+	} else if isNew {
 		t.Fatal("second sight should not be new")
+	}
+}
+
+// TestSubtreeAgentsNoteReturnsErrorOnSandboxViolation pins the fail-loud
+// contract subtreeAgentsNote's callers (read_file/search_content/write_file)
+// depend on: a contextfiles.SubtreeAgentsChain failure (startDir outside
+// projectRoot, a sandbox violation) must come back as an error, not be
+// swallowed into an empty ("no injection") note.
+func TestSubtreeAgentsNoteReturnsErrorOnSandboxViolation(t *testing.T) {
+	root := t.TempDir()
+	outside := t.TempDir()
+	opts := workspaceRegistryOptions{
+		maxFileChars: 20000,
+		projectRoot:  root,
+		injected:     newInjectedAgentsSet(map[string]bool{}),
+	}
+	if _, err := subtreeAgentsNote(outside, opts); err == nil {
+		t.Fatal("subtreeAgentsNote error = nil, want sandbox-violation error propagated from SubtreeAgentsChain")
+	}
+}
+
+// TestWriteFileToolPropagatesSubtreeAgentsNoteError pins that a
+// subtreeAgentsNote failure surfaces as write_file's own error rather than
+// being dropped. WithProjectRoot is set narrower than the registry's sandbox
+// root, so a write that lands outside projectRoot (but still inside the
+// sandbox root, so guard.Check itself allows it) makes SubtreeAgentsChain fail
+// with a sandbox-violation error that write_file must not swallow.
+func TestWriteFileToolPropagatesSubtreeAgentsNoteError(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	narrowProjectRoot := filepath.Join(root, "sub")
+	if err := os.MkdirAll(narrowProjectRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	registry := NewWorkspaceRegistry(root, nil,
+		WithAgentsInjection(20000, t.TempDir()),
+		WithProjectRoot(narrowProjectRoot))
+	_, err := registry.Execute(context.Background(), domain.Agent{Role: "developer"}, domain.ToolCall{
+		ID:        "call-err1",
+		Name:      "write_file",
+		Arguments: map[string]string{"path": "outside.txt", "content": "hi"},
+	})
+	if err == nil {
+		t.Fatal("Execute(write_file outside projectRoot) error = nil, want subtreeAgentsNote sandbox-violation error propagated")
+	}
+}
+
+// TestReadFileInjectsSubtreeAgents pins that read_file, not just write_file,
+// appends not-yet-seen subdirectory agents.md conventions to its result when
+// agents.md injection is enabled — the file it reads determines the
+// directory the injection walk targets (filepath.Dir of the resolved path).
+func TestReadFileInjectsSubtreeAgents(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(sub, "agents.md"), "SUB-RULE-Z")
+	writeFile(t, filepath.Join(sub, "x.txt"), "hello")
+
+	reg := NewFileReadWriteWorkspaceRegistry(root, nil,
+		WithAgentsInjection(20000, t.TempDir()),
+		WithProjectRoot(root))
+	res, err := reg.Execute(context.Background(), domain.Agent{Role: "developer"}, domain.ToolCall{
+		Name: "read_file", ID: "1",
+		Arguments: map[string]string{"path": "sub/x.txt"},
+	})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if !strings.Contains(res.Output, "SUB-RULE-Z") {
+		t.Fatalf("read_file must append subtree agents.md, got %q", res.Output)
+	}
+}
+
+// TestSearchContentInjectsSubtreeAgents mirrors TestReadFileInjectsSubtreeAgents
+// for search_content: the injection walk targets the resolved search
+// directory itself (not a file inside it — search_content's "startDir" is
+// the directory argument).
+func TestSearchContentInjectsSubtreeAgents(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(sub, "agents.md"), "SUB-RULE-SEARCH")
+	writeFile(t, filepath.Join(sub, "x.txt"), "needle here")
+
+	reg := NewFileReadWriteWorkspaceRegistry(root, nil,
+		WithAgentsInjection(20000, t.TempDir()),
+		WithProjectRoot(root))
+	res, err := reg.Execute(context.Background(), domain.Agent{Role: "developer"}, domain.ToolCall{
+		Name: "search_content", ID: "1",
+		Arguments: map[string]string{"pattern": "needle", "directory": "sub"},
+	})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if !strings.Contains(res.Output, "SUB-RULE-SEARCH") {
+		t.Fatalf("search_content must append subtree agents.md, got %q", res.Output)
+	}
+}
+
+// TestWriteFileInjectsSubtreeAgentsOncePerTask pins the dedup contract across
+// calls sharing one registry (one task): the first write into a directory
+// with its own agents.md injects it, a later write into a sibling directory
+// under the same not-yet-seen agents.md does not repeat it.
+func TestWriteFileInjectsSubtreeAgentsOncePerTask(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(sub, "agents.md"), "SUB-RULE-WRITE")
+
+	reg := NewFileReadWriteWorkspaceRegistry(root, nil,
+		WithAgentsInjection(20000, t.TempDir()),
+		WithProjectRoot(root))
+
+	first, err := reg.Execute(context.Background(), domain.Agent{Role: "developer"}, domain.ToolCall{
+		Name: "write_file", ID: "1",
+		Arguments: map[string]string{"path": "sub/y.txt", "content": "y"},
+	})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if !strings.Contains(first.Output, "SUB-RULE-WRITE") {
+		t.Fatalf("first write_file must inject sub/agents.md, got %q", first.Output)
+	}
+
+	second, err := reg.Execute(context.Background(), domain.Agent{Role: "developer"}, domain.ToolCall{
+		Name: "write_file", ID: "2",
+		Arguments: map[string]string{"path": "sub/z.txt", "content": "z"},
+	})
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if strings.Contains(second.Output, "SUB-RULE-WRITE") {
+		t.Fatalf("second write_file must not repeat sub/agents.md (dedup), got %q", second.Output)
 	}
 }
 

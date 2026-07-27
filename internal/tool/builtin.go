@@ -44,50 +44,125 @@ type workspaceRegistryOptions struct {
 	homeDir      string // user home directory for resident-path exclusion
 	projectRoot  string
 	injected     *injectedAgentsSet
+	// injectionEnabled records that WithAgentsInjection was supplied,
+	// distinguishing "injection off" from "maxFileChars/homeDir happen to be
+	// zero value" so finalizeWorkspaceRegistryOptions knows whether to seed
+	// projectRoot/injected at all.
+	injectionEnabled bool
 }
 
 // injectedAgentsSet tracks which non-resident agents.md files have already
 // been injected into a task's tool results, so the same directory's
 // conventions are not repeated on every write_file call within that task.
+//
+// It supports two seeding modes. newInjectedAgentsSet takes an
+// already-computed resident set and seeds immediately — used directly by
+// tests and anywhere the resident set is already in hand. newLazyInjectedAgentsSet
+// instead stores root/homeDir and defers the contextfiles.ResidentAgentsPaths
+// call to the first markIfNew, because the registry constructors that own
+// this set (NewWorkspaceRegistry, NewFileReadWriteWorkspaceRegistry) have no
+// error return through which a ResidentAgentsPaths failure could be reported
+// at construction time; deferring lets that error surface as the tool call's
+// own error instead of being silently dropped (CLAUDE.md fail-loud).
 type injectedAgentsSet struct {
-	mu   sync.Mutex
-	seen map[string]bool
+	mu      sync.Mutex
+	seen    map[string]bool
+	seeded  bool
+	root    string
+	homeDir string
 }
 
-// newInjectedAgentsSet returns a set seeded with resident (always-in-context)
-// agents.md paths, so markIfNew reports them as already seen from the start.
+// newInjectedAgentsSet returns a set seeded immediately with resident
+// (always-in-context) agents.md paths, so markIfNew reports them as already
+// seen from the start.
 func newInjectedAgentsSet(resident map[string]bool) *injectedAgentsSet {
 	seen := make(map[string]bool, len(resident)+8)
 	for p := range resident {
 		seen[filepath.Clean(p)] = true
 	}
-	return &injectedAgentsSet{seen: seen}
+	return &injectedAgentsSet{seen: seen, seeded: true}
+}
+
+// newLazyInjectedAgentsSet returns a set that seeds itself with resident
+// agents.md paths for root/homeDir (via contextfiles.ResidentAgentsPaths) on
+// the first markIfNew call rather than at construction. See injectedAgentsSet
+// for why.
+func newLazyInjectedAgentsSet(root, homeDir string) *injectedAgentsSet {
+	return &injectedAgentsSet{root: root, homeDir: homeDir}
 }
 
 // markIfNew returns true the first time absPath is seen, false afterwards (and
-// for paths seeded as resident). Concurrency-safe for parallel tool calls.
-func (s *injectedAgentsSet) markIfNew(absPath string) bool {
-	p := filepath.Clean(absPath)
+// for paths seeded as resident). Concurrency-safe for parallel tool calls. For
+// a lazily-constructed set, the first call resolves the resident set via
+// contextfiles.ResidentAgentsPaths; a failure there is returned rather than
+// swallowed, per CLAUDE.md fail-loud.
+func (s *injectedAgentsSet) markIfNew(absPath string) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if !s.seeded {
+		resident, err := contextfiles.ResidentAgentsPaths(s.root, s.homeDir)
+		if err != nil {
+			return false, fmt.Errorf("resolve resident agents.md paths: %w", err)
+		}
+		seen := make(map[string]bool, len(resident)+8)
+		for p := range resident {
+			seen[filepath.Clean(p)] = true
+		}
+		s.seen = seen
+		s.seeded = true
+	}
+	p := filepath.Clean(absPath)
 	if s.seen[p] {
-		return false
+		return false, nil
 	}
 	s.seen[p] = true
-	return true
+	return true, nil
 }
 
-// WithAgentsInjection enables write_file to append the nearest subdirectory
-// agents.md / AGENTS.md (the local directory conventions) to its result after
-// writing a file. maxFileChars caps the injected content. homeDir is the user
-// home directory (used to compute the resident ~/.stardust/agents.md path so it
-// is never re-injected). An empty homeDir degrades gracefully: only the two
-// workspace-local resident paths are excluded.
+// WithAgentsInjection enables the read_file/search_content/write_file tools to
+// append any not-yet-seen subdirectory agents.md / AGENTS.md (local directory
+// conventions) encountered on the path to the file they just touched. maxFileChars
+// caps the injected content. homeDir is the user home directory (used to compute
+// the resident ~/.stardust/agents.md path so it is never re-injected). An empty
+// homeDir degrades gracefully: only the two workspace-local resident paths are
+// excluded.
 func WithAgentsInjection(maxFileChars int, homeDir string) WorkspaceRegistryOption {
 	return func(o *workspaceRegistryOptions) {
 		o.maxFileChars = maxFileChars
 		o.homeDir = homeDir
+		o.injectionEnabled = true
 	}
+}
+
+// WithProjectRoot sets the root from which subtree agents.md injection walks
+// down to a touched file's directory (contextfiles.SubtreeAgentsChain's
+// projectRoot). It only matters together with WithAgentsInjection; when
+// injection is enabled but WithProjectRoot is not supplied,
+// finalizeWorkspaceRegistryOptions defaults it to the registry's own sandbox
+// root, since the project root and the file-tool root are always the same
+// directory for these workspace registries.
+func WithProjectRoot(projectRoot string) WorkspaceRegistryOption {
+	return func(o *workspaceRegistryOptions) { o.projectRoot = projectRoot }
+}
+
+// finalizeWorkspaceRegistryOptions completes options after opts have been
+// applied. When agents.md injection was not requested (WithAgentsInjection
+// never called), it is a no-op — the zero-value options already make
+// subtreeAgentsNote a no-op via its own nil/empty guards. When injection was
+// requested, it defaults projectRoot to absRoot (unless WithProjectRoot
+// overrode it) and lazily seeds injected, so callers of NewWorkspaceRegistry /
+// NewFileReadWriteWorkspaceRegistry never have to seed either by hand.
+func finalizeWorkspaceRegistryOptions(absRoot string, options workspaceRegistryOptions) workspaceRegistryOptions {
+	if !options.injectionEnabled {
+		return options
+	}
+	if strings.TrimSpace(options.projectRoot) == "" {
+		options.projectRoot = absRoot
+	}
+	if options.injected == nil {
+		options.injected = newLazyInjectedAgentsSet(options.projectRoot, options.homeDir)
+	}
+	return options
 }
 
 // NewWorkspaceRegistry returns a registry with read-only tools (read_file,
@@ -138,19 +213,21 @@ func NewWorkspaceRegistry(root string, audit port.AuditLog, opts ...WorkspaceReg
 		}, nil),
 		NoopGuardrails{},
 	).WithAuditLog(audit).WithOutputSanitizer(quality.NewOutputSanitizer())
-	registerReadOnlyDescriptors(registry, absRoot, guard)
-	registerWriteFileDescriptor(registry, absRoot, guard, true, options)
+	options = finalizeWorkspaceRegistryOptions(absRoot, options)
+	registerReadOnlyDescriptors(registry, absRoot, guard, options)
+	registerWriteFileDescriptor(registry, absRoot, guard, options)
 	return registry
 }
 
 // registerWriteFileDescriptor adds the write_file tool to an already-constructed
 // registry. write_file requires overwrite=true when the target already exists,
-// and its filesystem access is bounded by guard. injectAgentsNote controls
-// whether a successful write appends the nearest directory's agents.md
-// conventions to the result — an interactive-CLI UX feature that serve and
-// per-agent tasks turn off. The registry's execution policy and permission
-// enforcer must already allow write_file; this only registers the descriptor.
-func registerWriteFileDescriptor(registry *Registry, absRoot string, guard port.WorkspacePathGuard, injectAgentsNote bool, options workspaceRegistryOptions) {
+// and its filesystem access is bounded by guard. Whether a successful write
+// appends not-yet-seen directory agents.md conventions to the result is
+// decided entirely by options (specifically options.injected != nil, set up by
+// finalizeWorkspaceRegistryOptions when WithAgentsInjection was supplied) — see
+// subtreeAgentsNote. The registry's execution policy and permission enforcer
+// must already allow write_file; this only registers the descriptor.
+func registerWriteFileDescriptor(registry *Registry, absRoot string, guard port.WorkspacePathGuard, options workspaceRegistryOptions) {
 	registry.RegisterDescriptor(Descriptor{
 		Name:        "write_file",
 		Description: fmt.Sprintf("Write content to a file inside the workspace root (%s). Arguments: path, content, optional overwrite (default false). Fails if the file exists and overwrite is not true.", absRoot),
@@ -168,7 +245,7 @@ func registerWriteFileDescriptor(registry *Registry, absRoot string, guard port.
 			},
 		},
 	}, HandlerFunc(func(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
-		return writeFileTool(ctx, absRoot, guard, call, injectAgentsNote, options)
+		return writeFileTool(ctx, absRoot, guard, call, options)
 	}))
 }
 
@@ -218,18 +295,20 @@ func NewFileReadOnlyWorkspaceRegistry(root string, audit port.AuditLog) *Registr
 		}, nil),
 		NoopGuardrails{},
 	).WithAuditLog(audit).WithOutputSanitizer(quality.NewOutputSanitizer())
-	registerReadOnlyDescriptors(registry, absRoot, guard)
+	registerReadOnlyDescriptors(registry, absRoot, guard, workspaceRegistryOptions{})
 	return registry
 }
 
 // NewFileReadWriteWorkspaceRegistry returns a registry with the read-only file
 // tools plus write_file, all sandboxed to root. It is the serve / per-agent
-// counterpart to NewWorkspaceRegistry: same write capability, but without the
-// interactive-CLI agents.md injection on write (a directory's agents.md must not
-// leak into a server task's tool results). write_file stays Sensitive, so Manual
-// mode still gates it and Plan mode still excludes it. Callers add task-ledger,
-// messaging and web tools afterwards, exactly as with the read-only constructor.
-func NewFileReadWriteWorkspaceRegistry(root string, audit port.AuditLog) *Registry {
+// counterpart to NewWorkspaceRegistry: same write capability, and — like
+// NewWorkspaceRegistry — agents.md injection across read_file/search_content/
+// write_file only happens when a caller opts in via WithAgentsInjection; by
+// default (no opts) a directory's agents.md does not leak into a server task's
+// tool results. write_file stays Sensitive, so Manual mode still gates it and
+// Plan mode still excludes it. Callers add task-ledger, messaging and web
+// tools afterwards, exactly as with the read-only constructor.
+func NewFileReadWriteWorkspaceRegistry(root string, audit port.AuditLog, opts ...WorkspaceRegistryOption) *Registry {
 	absRoot, err := filepath.Abs(root)
 	if err != nil {
 		// filepath.Abs only fails when os.Getwd does — the process has no
@@ -238,6 +317,10 @@ func NewFileReadWriteWorkspaceRegistry(root string, audit port.AuditLog) *Regist
 		// path whose containment comparison is meaningless, silently disabling
 		// the sandbox. A security boundary must not degrade quietly.
 		panic(fmt.Sprintf("tool: cannot resolve workspace root %q: %v", root, err))
+	}
+	var options workspaceRegistryOptions
+	for _, opt := range opts {
+		opt(&options)
 	}
 	guard := port.NewWorkspacePathGuard(absRoot)
 	registry := NewRegistry(
@@ -267,14 +350,18 @@ func NewFileReadWriteWorkspaceRegistry(root string, audit port.AuditLog) *Regist
 		}, nil),
 		NoopGuardrails{},
 	).WithAuditLog(audit).WithOutputSanitizer(quality.NewOutputSanitizer())
-	registerReadOnlyDescriptors(registry, absRoot, guard)
-	registerWriteFileDescriptor(registry, absRoot, guard, false, workspaceRegistryOptions{})
+	options = finalizeWorkspaceRegistryOptions(absRoot, options)
+	registerReadOnlyDescriptors(registry, absRoot, guard, options)
+	registerWriteFileDescriptor(registry, absRoot, guard, options)
 	return registry
 }
 
 // registerReadOnlyDescriptors adds read_file, search_content, and list_files
-// to an already-constructed registry. Shared by both workspace registry constructors.
-func registerReadOnlyDescriptors(registry *Registry, absRoot string, guard port.WorkspacePathGuard) {
+// to an already-constructed registry. Shared by all three workspace registry
+// constructors; options carries the (possibly disabled) agents.md injection
+// settings that read_file and search_content pass through to
+// subtreeAgentsNote after resolving their target directory.
+func registerReadOnlyDescriptors(registry *Registry, absRoot string, guard port.WorkspacePathGuard, options workspaceRegistryOptions) {
 	registry.RegisterDescriptor(Descriptor{
 		Name:        "read_file",
 		Description: fmt.Sprintf("Read a UTF-8 text file inside the workspace root (%s). The path argument can be relative (resolved against workspace root) or absolute (must be within workspace root).", absRoot),
@@ -289,7 +376,7 @@ func registerReadOnlyDescriptors(registry *Registry, absRoot string, guard port.
 			},
 		},
 	}, HandlerFunc(func(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
-		return readFileTool(ctx, absRoot, guard, call)
+		return readFileTool(ctx, absRoot, guard, call, options)
 	}))
 	registry.RegisterDescriptor(Descriptor{
 		Name:        "search_content",
@@ -307,7 +394,7 @@ func registerReadOnlyDescriptors(registry *Registry, absRoot string, guard port.
 			},
 		},
 	}, HandlerFunc(func(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
-		return searchContentTool(ctx, absRoot, guard, call)
+		return searchContentTool(ctx, absRoot, guard, call, options)
 	}))
 	registry.RegisterDescriptor(Descriptor{
 		Name:        "list_files",
@@ -326,7 +413,7 @@ func registerReadOnlyDescriptors(registry *Registry, absRoot string, guard port.
 	}))
 }
 
-func readFileTool(ctx context.Context, root string, guard port.WorkspacePathGuard, call domain.ToolCall) (domain.ToolResult, error) {
+func readFileTool(ctx context.Context, root string, guard port.WorkspacePathGuard, call domain.ToolCall, options workspaceRegistryOptions) (domain.ToolResult, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.ToolResult{}, err
 	}
@@ -351,6 +438,11 @@ func readFileTool(ctx context.Context, root string, guard port.WorkspacePathGuar
 	if len(data) > maxReadFileBytes {
 		output = string(data[:maxReadFileBytes]) + fmt.Sprintf("\n…[truncated: file exceeds %d bytes]", maxReadFileBytes)
 	}
+	if note, err := subtreeAgentsNote(filepath.Dir(resolved), options); err != nil {
+		return domain.ToolResult{}, err
+	} else if note != "" {
+		output += note
+	}
 	return domain.ToolResult{
 		CallID:  call.ID,
 		Success: true,
@@ -358,7 +450,7 @@ func readFileTool(ctx context.Context, root string, guard port.WorkspacePathGuar
 	}, nil
 }
 
-func writeFileTool(_ context.Context, root string, guard port.WorkspacePathGuard, call domain.ToolCall, injectAgentsNote bool, options workspaceRegistryOptions) (domain.ToolResult, error) {
+func writeFileTool(_ context.Context, root string, guard port.WorkspacePathGuard, call domain.ToolCall, options workspaceRegistryOptions) (domain.ToolResult, error) {
 	resolved, err := guard.Check(context.Background(), resolveToolPath(root, call.Arguments["path"]))
 	if err != nil {
 		return domain.ToolResult{}, err
@@ -380,15 +472,10 @@ func writeFileTool(_ context.Context, root string, guard port.WorkspacePathGuard
 		return domain.ToolResult{}, err
 	}
 	output := fmt.Sprintf("wrote %d bytes to %s", len(content), rel)
-	// The agents.md note is an interactive-CLI convenience. serve / per-agent
-	// tasks disable it (injectAgentsNote=false) so a directory's agents.md does
-	// not leak into their tool results.
-	if injectAgentsNote {
-		if note, err := subtreeAgentsNote(filepath.Dir(resolved), options); err != nil {
-			return domain.ToolResult{}, err
-		} else if note != "" {
-			output += note
-		}
+	if note, err := subtreeAgentsNote(filepath.Dir(resolved), options); err != nil {
+		return domain.ToolResult{}, err
+	} else if note != "" {
+		output += note
 	}
 	return domain.ToolResult{
 		CallID:  call.ID,
@@ -419,7 +506,11 @@ func subtreeAgentsNote(startDir string, options workspaceRegistryOptions) (strin
 	}
 	var out strings.Builder
 	for _, e := range entries {
-		if !options.injected.markIfNew(e.Label) {
+		isNew, err := options.injected.markIfNew(e.Label)
+		if err != nil {
+			return "", err
+		}
+		if !isNew {
 			continue
 		}
 		rel, relErr := filepath.Rel(options.projectRoot, e.Label)
@@ -436,7 +527,7 @@ func subtreeAgentsNote(startDir string, options workspaceRegistryOptions) (strin
 	return out.String(), nil
 }
 
-func searchContentTool(ctx context.Context, rootPath string, guard port.WorkspacePathGuard, call domain.ToolCall) (domain.ToolResult, error) {
+func searchContentTool(ctx context.Context, rootPath string, guard port.WorkspacePathGuard, call domain.ToolCall, options workspaceRegistryOptions) (domain.ToolResult, error) {
 	if err := ctx.Err(); err != nil {
 		return domain.ToolResult{}, err
 	}
@@ -521,10 +612,16 @@ func searchContentTool(ctx context.Context, rootPath string, guard port.Workspac
 		matches = append(matches, fmt.Sprintf("…[truncated: more than %d matches; narrow the pattern, directory or file_types]", searchContentMaxMatches))
 	}
 	matches = append(matches, notices...)
+	output := strings.Join(matches, "\n")
+	if note, err := subtreeAgentsNote(root, options); err != nil {
+		return domain.ToolResult{}, err
+	} else if note != "" {
+		output += note
+	}
 	return domain.ToolResult{
 		CallID:  call.ID,
 		Success: true,
-		Output:  strings.Join(matches, "\n"),
+		Output:  output,
 	}, nil
 }
 
