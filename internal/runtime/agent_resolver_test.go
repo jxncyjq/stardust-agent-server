@@ -750,6 +750,55 @@ func TestResolverAppliesDisabledTools(t *testing.T) {
 	}
 }
 
+// TestResolveTaskRunnerInjectsSessionHistory guards Task 2's serve wiring: a
+// resolver constructed with ConversationTurns must inject the loaded session
+// history into the prompt of every per-agent *Runtime it builds, so a GUI
+// task started with task.SessionID set actually sees prior turns rather than
+// starting from a blank slate. This is the end-to-end complement of
+// TestRecentTurnsForTaskExcludesCurrentTurn, which only exercises the loader
+// in isolation.
+func TestResolveTaskRunnerInjectsSessionHistory(t *testing.T) {
+	t.Parallel()
+
+	maas := &resolverCaptureMaas{response: "ok"}
+	lister := &fakeTurnLister{turns: []domain.ConversationTurn{
+		{ID: "t1:user", TaskID: "task-1", Role: domain.ConversationRoleUser, Content: "HISTORY-MARKER"},
+	}}
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
+			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep"},
+		}),
+		RootConfig: config.Config{
+			Runtime: config.RuntimeConfig{MaxToolRounds: 1},
+			Session: config.SessionConfig{DefaultRecentTurns: 6, MaxTurnChars: 6000},
+		},
+		Audit:  adapter.NewMemoryAuditLog(),
+		Events: adapter.NewMemoryEventBus(),
+		MaasFactory: func(string) (MaasRunnerFactoryResult, error) {
+			return MaasRunnerFactoryResult{Client: maas}, nil
+		},
+		ConversationTurns: lister,
+	})
+
+	task := domain.Task{ID: "task-9", SessionID: "s1", AgentID: "researcher", Input: "continue the plan"}
+	agent, runner, ok, err := resolver.ResolveTaskRunner(context.Background(), task)
+	if err != nil {
+		t.Fatalf("ResolveTaskRunner error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatalf("ResolveTaskRunner ok = false, want true")
+	}
+	if _, err := runner.RunTask(context.Background(), agent, task); err != nil {
+		t.Fatalf("RunTask error = %v, want nil", err)
+	}
+	if !strings.Contains(maas.prompt, "Recent conversation") {
+		t.Fatalf("RunTask prompt missing %q:\n%s", "Recent conversation", maas.prompt)
+	}
+	if !strings.Contains(maas.prompt, "HISTORY-MARKER") {
+		t.Fatalf("RunTask prompt missing %q:\n%s", "HISTORY-MARKER", maas.prompt)
+	}
+}
+
 type fakeTurnLister struct {
 	turns    []domain.ConversationTurn
 	err      error
