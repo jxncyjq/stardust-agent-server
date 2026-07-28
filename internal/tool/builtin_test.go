@@ -511,3 +511,29 @@ func TestWorkspaceRegistryAllToolSchemasAreOpenAICompatibleObjects(t *testing.T)
 		}
 	}
 }
+
+func TestReadHistoryRecord(t *testing.T) {
+	h := newReadHistory()
+	if c, u := h.record("/x", "A"); c != 1 || u {
+		t.Fatalf("first read = (%d,%v), want (1,false)", c, u)
+	}
+	if c, u := h.record("/x", "A"); c != 2 || !u {
+		t.Fatalf("second identical read = (%d,%v), want (2,true)", c, u)
+	}
+	if c, u := h.record("/x", "B"); c != 3 || u {
+		t.Fatalf("third changed read = (%d,%v), want (3,false)", c, u)
+	}
+	if c, u := h.record("/y", "A"); c != 1 || u {
+		t.Fatalf("other path = (%d,%v), want (1,false)", c, u)
+	}
+}
+
+func TestRepeatNoticeCarriesCount(t *testing.T) {
+	n := repeatNotice(2)
+	if !strings.Contains(n, "第 2 次") {
+		t.Fatalf("notice missing count: %q", n)
+	}
+	if !strings.Contains(n, "search_content") {
+		t.Fatalf("notice should guide to search_content: %q", n)
+	}
+}

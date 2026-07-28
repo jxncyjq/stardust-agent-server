@@ -3,6 +3,8 @@ package tool
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"io/fs"
@@ -117,6 +119,52 @@ func (s *injectedAgentsSet) markIfNew(absPath string) (bool, error) {
 	}
 	s.seen[p] = true
 	return true, nil
+}
+
+type readEntry struct {
+	hash  string
+	count int
+}
+
+// readHistory tracks, per task (one per workspace registry), how many times each
+// file path has been read and the hash of the last content returned, so a repeat
+// read of unchanged content can be flagged to the model instead of silently
+// re-sending an identical full copy every round.
+type readHistory struct {
+	mu   sync.Mutex
+	seen map[string]readEntry
+}
+
+func newReadHistory() *readHistory {
+	return &readHistory{seen: make(map[string]readEntry)}
+}
+
+// record notes a read of path with the given content. It returns the running
+// read count for that path (including this read) and whether this read returned
+// the same content as the previous read of the same path (unchanged is always
+// false on the first read). Thread-safe for concurrent tool calls.
+func (h *readHistory) record(path string, content string) (count int, unchanged bool) {
+	sum := sha256.Sum256([]byte(content))
+	hash := hex.EncodeToString(sum[:])
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	prev := h.seen[path]
+	count = prev.count + 1
+	unchanged = count > 1 && prev.hash == hash
+	h.seen[path] = readEntry{hash: hash, count: count}
+	return count, unchanged
+}
+
+// repeatNotice is the visible banner prepended to a read_file result when the
+// model re-reads a file whose content has not changed within the task. It names
+// the repeat count and steers the model toward search_content so it stops
+// re-reading whole files (the tool-loop token blow-up this addresses).
+func repeatNotice(count int) string {
+	return fmt.Sprintf(
+		"⚠️ 本任务已第 %d 次读取此文件，内容与前次相同、未变化。该内容此前已在上文出现；"+
+			"若只需其中某段，请改用 search_content 精确检索，避免重复整篇读取消耗上下文。\n\n",
+		count,
+	)
 }
 
 // WithAgentsInjection enables the read_file/search_content/write_file tools to
