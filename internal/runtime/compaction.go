@@ -13,6 +13,13 @@ import (
 // back off any orphan RoleTool it lands on.
 const compactPreserveTail = 8
 
+// maxCompactionsPerTask caps how many times runToolLoop will compact a single
+// task's conversation. st.promptTokens only grows, so without a cap a task
+// that stays over compactTokenThreshold would re-summarise every round; the
+// cap bounds that spend while still letting the first several compactions
+// keep the exchange's token growth in check.
+const maxCompactionsPerTask = 3
+
 // compactionSplit computes the range of messages that may be summarised away.
 // msgs[0] (the base prompt / stable cache prefix) is always pinned, so
 // compactStart is always 1. preserveStart is the index at which the preserved

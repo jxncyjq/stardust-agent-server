@@ -186,6 +186,10 @@ type loopState struct {
 	completionTokens int
 	cachedTokens     int
 	totalTokens      int
+	// compactions counts how many times this task's conversation has been
+	// summarised by compactConversation, capped at maxCompactionsPerTask so a
+	// pathological run cannot spend its whole budget re-summarising every round.
+	compactions int
 	// images is checkpoint-consistent: on resume it comes from the loaded
 	// checkpoint (not the live task), so a resumed run keeps the images it
 	// was suspended with even if the reconstructed task no longer carries them.
@@ -500,6 +504,17 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		st.cachedTokens += st.resp.CachedTokens
 		st.totalTokens += st.resp.TotalTokens
 		st.round++
+		if r.compactTokenThreshold > 0 && st.promptTokens > r.compactTokenThreshold && st.compactions < maxCompactionsPerTask {
+			compacted, err := r.compactConversation(ctx, st.convo)
+			if err != nil {
+				// Fail-loud but non-fatal: keep the un-compacted history and press on;
+				// a failed summary must never abort a task or drop context.
+				r.logger.Warn("conversation compaction failed",
+					"task_id", task.ID, "err", err)
+			} else if compacted {
+				st.compactions++
+			}
+		}
 	}
 	if len(st.resp.ToolCalls) > 0 {
 		// Tool-round budget exhausted but the model still wants tools. Rather
