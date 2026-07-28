@@ -910,3 +910,57 @@ func writeResolverSkill(t *testing.T, root string, rel string, content string) {
 	t.Helper()
 	writeResolverContextFile(t, root, rel, content)
 }
+
+// TestRecentTurnsForTaskTrimsToLimit covers the tail-slice branch: when the
+// store returns more turns than the limit (none of them the task's own), only
+// the most recent `limit` survive — the newest ones, not the oldest.
+func TestRecentTurnsForTaskTrimsToLimit(t *testing.T) {
+	task := domain.Task{ID: "task-9", SessionID: "s1", AgentID: "a"}
+	limit := 3
+	turns := []domain.ConversationTurn{
+		{ID: "t1", TaskID: "task-1", Role: domain.ConversationRoleUser, Content: "OLDEST"},
+		{ID: "t2", TaskID: "task-2", Role: domain.ConversationRoleUser, Content: "MID-1"},
+		{ID: "t3", TaskID: "task-3", Role: domain.ConversationRoleUser, Content: "MID-2"},
+		{ID: "t4", TaskID: "task-4", Role: domain.ConversationRoleUser, Content: "NEWEST"},
+	}
+	r := &AgentRuntimeResolver{
+		conversationTurns: &fakeTurnLister{turns: turns},
+		rootConfig: config.Config{Session: config.SessionConfig{
+			DefaultRecentTurns: limit, MaxTurnChars: 6000,
+		}},
+	}
+	got, err := r.recentTurnsForTask(t.Context(), task)
+	if err != nil {
+		t.Fatalf("recentTurnsForTask err = %v, want nil", err)
+	}
+	if len(got) != limit {
+		t.Fatalf("len(got) = %d, want %d", len(got), limit)
+	}
+	if got[0].Content != "MID-1" || got[limit-1].Content != "NEWEST" {
+		t.Fatalf("want the newest %d turns [MID-1,MID-2,NEWEST], got %+v", limit, got)
+	}
+}
+
+// TestRecentTurnsForTaskNormalisesZeroMaxTurnChars pins the CLI-matching
+// behaviour for an explicitly-zero MaxTurnChars: truncateText treats <= 0 as
+// "no truncation", so without normalisation a zero would inject unbounded turn
+// bodies on the serve path while the CLI path capped them.
+func TestRecentTurnsForTaskNormalisesZeroMaxTurnChars(t *testing.T) {
+	task := domain.Task{ID: "task-9", SessionID: "s1", AgentID: "a"}
+	huge := strings.Repeat("x", 20000)
+	r := &AgentRuntimeResolver{
+		conversationTurns: &fakeTurnLister{turns: []domain.ConversationTurn{
+			{ID: "t1", TaskID: "task-1", Role: domain.ConversationRoleUser, Content: huge},
+		}},
+		rootConfig: config.Config{Session: config.SessionConfig{
+			DefaultRecentTurns: 6, MaxTurnChars: 0,
+		}},
+	}
+	got, err := r.recentTurnsForTask(t.Context(), task)
+	if err != nil {
+		t.Fatalf("recentTurnsForTask err = %v, want nil", err)
+	}
+	if len([]rune(got[0].Content)) >= len([]rune(huge)) {
+		t.Fatalf("MaxTurnChars=0 must fall back to the default cap, got %d runes", len([]rune(got[0].Content)))
+	}
+}

@@ -140,6 +140,14 @@ func (r *AgentRuntimeResolver) recentTurnsForTask(ctx context.Context, task doma
 	if limit <= 0 {
 		limit = 6
 	}
+	// Normalised like limit above, and for the same reason the CLI path does it
+	// (normalizeMaxTurnCharsForSession): truncateText treats maxChars <= 0 as
+	// "no truncation", so an explicitly-zero MaxTurnChars would inject unbounded
+	// turn bodies here while the CLI capped them at the default.
+	maxTurnChars := r.rootConfig.Session.MaxTurnChars
+	if maxTurnChars <= 0 {
+		maxTurnChars = 6000
+	}
 	// +1: the task's own user turn is already persisted and will be filtered out.
 	turns, err := r.conversationTurns.ListConversationTurns(ctx, task.SessionID, limit+1)
 	if err != nil {
@@ -150,7 +158,7 @@ func (r *AgentRuntimeResolver) recentTurnsForTask(ctx context.Context, task doma
 		if turn.TaskID == task.ID {
 			continue
 		}
-		turn.Content = truncateText(turn.Content, r.rootConfig.Session.MaxTurnChars)
+		turn.Content = truncateText(turn.Content, maxTurnChars)
 		out = append(out, turn)
 	}
 	if len(out) > limit {
