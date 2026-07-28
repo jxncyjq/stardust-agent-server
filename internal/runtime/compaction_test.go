@@ -136,3 +136,33 @@ func TestCompactConversationFailLoudKeepsHistory(t *testing.T) {
 		t.Fatalf("失败后历史被改动: %d != %d", len(convo.messages), len(orig))
 	}
 }
+
+// TestCompactConversationEmptySummaryFailLoud covers I-1: a successful Generate
+// that returns an empty summary must be treated as a failure (not applied), or
+// real history would be replaced by an empty "[对话摘要]" — a cleared-history
+// fallback smuggled in via a zero value.
+func TestCompactConversationEmptySummaryFailLoud(t *testing.T) {
+	orig := []port.InferenceMessage{
+		msg(port.RoleUser, "BASE", nil, ""),
+		msg(port.RoleAssistant, "a", nil, ""),
+		msg(port.RoleUser, "b", nil, ""),
+		msg(port.RoleAssistant, "c", nil, ""),
+		msg(port.RoleUser, "d", nil, ""),
+		msg(port.RoleAssistant, "e", nil, ""),
+		msg(port.RoleUser, "f", nil, ""),
+		msg(port.RoleAssistant, "g", nil, ""),
+		msg(port.RoleUser, "h", nil, ""),
+		msg(port.RoleAssistant, "i", nil, ""),
+		msg(port.RoleUser, "j", nil, ""),
+		msg(port.RoleAssistant, "k", nil, ""),
+	}
+	convo := &conversation{messages: append([]port.InferenceMessage(nil), orig...)}
+	r := &Runtime{maas: &fakeSummaryMaas{out: "   "}} // whitespace-only = empty
+	ok, err := r.compactConversation(t.Context(), convo)
+	if ok || err == nil {
+		t.Fatalf("空摘要应 (false,err), got (%v,%v)", ok, err)
+	}
+	if len(convo.messages) != len(orig) {
+		t.Fatalf("空摘要后历史被改动: %d != %d", len(convo.messages), len(orig))
+	}
+}

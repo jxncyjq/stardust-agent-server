@@ -86,6 +86,13 @@ func (r *Runtime) compactConversation(ctx context.Context, convo *conversation) 
 	if err != nil {
 		return false, fmt.Errorf("compact summarize: %w", err)
 	}
+	// An empty-but-successful summary (safety filter, truncation, a demo/degraded
+	// path returning "") must be treated as a failure, not applied: replacing real
+	// history with an empty "[对话摘要]" would lose context exactly like a cleared
+	// history — the fail-loud rule forbids passing a zero value off as valid.
+	if strings.TrimSpace(resp.Text) == "" {
+		return false, fmt.Errorf("compact summarize: empty summary")
+	}
 	convo.applyCompaction(ps, resp.Text)
 	return true, nil
 }
