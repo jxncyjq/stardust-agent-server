@@ -120,6 +120,10 @@ type Config struct {
 	// breakdown of every outgoing prompt (see inferenceRequestDebug). Off by
 	// default; intended to be driven by the config file's runtime.debug toggle.
 	Debug bool
+	// CompactTokenThreshold triggers conversation compaction when the tool
+	// loop's accumulated prompt tokens exceed it. 0 disables compaction
+	// (default), matching config.RuntimeConfig.CompactTokenThreshold.
+	CompactTokenThreshold int
 }
 
 // SkillUsageRecorder is the usage sidecar skill.UsageStore satisfies.
@@ -137,30 +141,31 @@ const (
 )
 
 type Runtime struct {
-	maas               port.MaasInferenceClient
-	audit              port.AuditLog
-	events             port.EventBus
-	contextBuilder     ContextBuilder
-	contextPrefix      string
-	tools              *tool.Registry
-	maxToolRounds      int
-	maxToolResultChars int
-	maxPromptChars     int
-	lazyTools          bool
-	conversationTurns  []domain.ConversationTurn
-	interrupted        atomic.Bool
-	role               string
-	depth              int
-	maxSpawnDepth      int
-	maxConcurrent      int
-	subTaskSeq         atomic.Uint64
-	checkpoints        *sessionstate.Store
-	toolGate           ToolGate
-	logger             *slog.Logger
-	skillUsage         SkillUsageRecorder
-	capabilitySkills   capability.Provider
-	disabledTools      []string
-	debug              bool
+	maas                  port.MaasInferenceClient
+	audit                 port.AuditLog
+	events                port.EventBus
+	contextBuilder        ContextBuilder
+	contextPrefix         string
+	tools                 *tool.Registry
+	maxToolRounds         int
+	maxToolResultChars    int
+	maxPromptChars        int
+	lazyTools             bool
+	conversationTurns     []domain.ConversationTurn
+	interrupted           atomic.Bool
+	role                  string
+	depth                 int
+	maxSpawnDepth         int
+	maxConcurrent         int
+	subTaskSeq            atomic.Uint64
+	checkpoints           *sessionstate.Store
+	toolGate              ToolGate
+	logger                *slog.Logger
+	skillUsage            SkillUsageRecorder
+	capabilitySkills      capability.Provider
+	disabledTools         []string
+	debug                 bool
+	compactTokenThreshold int
 }
 
 // loopState is the mutable state threaded through the tool-execution loop.
@@ -184,6 +189,10 @@ type loopState struct {
 	completionTokens int
 	cachedTokens     int
 	totalTokens      int
+	// compactions counts how many times this task's conversation has been
+	// summarised by compactConversation, capped at maxCompactionsPerTask so a
+	// pathological run cannot spend its whole budget re-summarising every round.
+	compactions int
 	// images is checkpoint-consistent: on resume it comes from the loaded
 	// checkpoint (not the live task), so a resumed run keeps the images it
 	// was suspended with even if the reconstructed task no longer carries them.
@@ -271,28 +280,29 @@ func NewRuntime(cfg Config) *Runtime {
 		}
 	}
 	return &Runtime{
-		maas:               cfg.Maas,
-		audit:              audit,
-		events:             events,
-		contextBuilder:     cfg.ContextBuilder,
-		contextPrefix:      strings.TrimSpace(cfg.ContextPrefix),
-		tools:              cfg.Tools,
-		maxToolRounds:      normalizeMaxToolRounds(cfg.MaxToolRounds),
-		maxToolResultChars: normalizePositive(cfg.MaxToolResultChars, defaultMaxToolResultChars),
-		maxPromptChars:     normalizePositive(cfg.MaxPromptChars, defaultMaxPromptChars),
-		lazyTools:          cfg.LazyTools,
-		conversationTurns:  append([]domain.ConversationTurn(nil), cfg.ConversationTurns...),
-		role:               role,
-		depth:              cfg.Depth,
-		maxSpawnDepth:      normalizePositive(cfg.MaxSpawnDepth, defaultMaxSpawnDepth),
-		maxConcurrent:      normalizePositive(cfg.MaxConcurrent, defaultMaxConcurrent),
-		checkpoints:        cfg.Checkpoints,
-		toolGate:           cfg.ToolGate,
-		logger:             logger,
-		debug:              cfg.Debug,
-		skillUsage:         cfg.SkillUsage,
-		capabilitySkills:   cfg.CapabilitySkills,
-		disabledTools:      cfg.DisabledTools,
+		maas:                  cfg.Maas,
+		audit:                 audit,
+		events:                events,
+		contextBuilder:        cfg.ContextBuilder,
+		contextPrefix:         strings.TrimSpace(cfg.ContextPrefix),
+		tools:                 cfg.Tools,
+		maxToolRounds:         normalizeMaxToolRounds(cfg.MaxToolRounds),
+		maxToolResultChars:    normalizePositive(cfg.MaxToolResultChars, defaultMaxToolResultChars),
+		maxPromptChars:        normalizePositive(cfg.MaxPromptChars, defaultMaxPromptChars),
+		lazyTools:             cfg.LazyTools,
+		conversationTurns:     append([]domain.ConversationTurn(nil), cfg.ConversationTurns...),
+		role:                  role,
+		depth:                 cfg.Depth,
+		maxSpawnDepth:         normalizePositive(cfg.MaxSpawnDepth, defaultMaxSpawnDepth),
+		maxConcurrent:         normalizePositive(cfg.MaxConcurrent, defaultMaxConcurrent),
+		checkpoints:           cfg.Checkpoints,
+		toolGate:              cfg.ToolGate,
+		logger:                logger,
+		debug:                 cfg.Debug,
+		skillUsage:            cfg.SkillUsage,
+		capabilitySkills:      cfg.CapabilitySkills,
+		disabledTools:         cfg.DisabledTools,
+		compactTokenThreshold: cfg.CompactTokenThreshold,
 	}
 }
 
@@ -506,6 +516,17 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		st.cachedTokens += st.resp.CachedTokens
 		st.totalTokens += st.resp.TotalTokens
 		st.round++
+		if r.compactTokenThreshold > 0 && st.promptTokens > r.compactTokenThreshold && st.compactions < maxCompactionsPerTask {
+			compacted, err := r.compactConversation(ctx, st.convo)
+			if err != nil {
+				// Fail-loud but non-fatal: keep the un-compacted history and press on;
+				// a failed summary must never abort a task or drop context.
+				r.logger.Warn("conversation compaction failed",
+					"task_id", task.ID, "err", err)
+			} else if compacted {
+				st.compactions++
+			}
+		}
 	}
 	if len(st.resp.ToolCalls) > 0 {
 		// Tool-round budget exhausted but the model still wants tools. Rather

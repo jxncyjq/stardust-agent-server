@@ -99,6 +99,9 @@ type ServiceConfig struct {
 type RuntimeConfig struct {
 	DemoResponse  string `json:"demo_response"`
 	MaxToolRounds int    `json:"max_tool_rounds"`
+	// CompactTokenThreshold triggers conversation compaction when the tool loop's
+	// accumulated prompt tokens exceed it. 0 disables compaction (default).
+	CompactTokenThreshold int `json:"compact_token_threshold,omitempty"`
 	// LazyTools enables the on-demand (lazy) tool protocol: the model is offered
 	// two small meta tools (list_tools/call_tool) instead of the full native tool
 	// schema on every inference, so simple chats that need no tools avoid paying

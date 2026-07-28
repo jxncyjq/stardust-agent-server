@@ -207,20 +207,21 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 	tool.RegisterAgentMessageTools(tools, r.messageStore)
 	tool.RegisterWebTools(tools, webToolOptions(r.rootConfig.Web))
 	runner := NewRuntime(Config{
-		Maas:             maas.Client,
-		Audit:            r.audit,
-		Events:           r.events,
-		ContextBuilder:   contextBuilder,
-		Tools:            tools,
-		MaxToolRounds:    r.rootConfig.Runtime.MaxToolRounds,
-		LazyTools:        r.rootConfig.Runtime.LazyTools,
-		Debug:            r.rootConfig.Runtime.Debug,
-		Checkpoints:      r.checkpoints,
-		ToolGate:         r.toolGate,
-		Logger:           r.logger,
-		CapabilitySkills: capabilitySkills,
-		SkillUsage:       r.skillUsage,
-		DisabledTools:    agentCfg.DisabledTools,
+		Maas:                  maas.Client,
+		Audit:                 r.audit,
+		Events:                r.events,
+		ContextBuilder:        contextBuilder,
+		Tools:                 tools,
+		MaxToolRounds:         r.rootConfig.Runtime.MaxToolRounds,
+		LazyTools:             r.rootConfig.Runtime.LazyTools,
+		Debug:                 r.rootConfig.Runtime.Debug,
+		CompactTokenThreshold: r.rootConfig.Runtime.CompactTokenThreshold,
+		Checkpoints:           r.checkpoints,
+		ToolGate:              r.toolGate,
+		Logger:                r.logger,
+		CapabilitySkills:      capabilitySkills,
+		SkillUsage:            r.skillUsage,
+		DisabledTools:         agentCfg.DisabledTools,
 	})
 	return agent, runner, true, nil
 }

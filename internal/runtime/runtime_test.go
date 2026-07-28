@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -461,6 +462,122 @@ func (m *multiRoundToolCallingMaas) Generate(ctx context.Context, req port.Infer
 		}, nil
 	default:
 		return port.InferenceResponse{Text: "cache uses map with LRU eviction"}, nil
+	}
+}
+
+// compactingToolMaas is a port.MaasInferenceClient test double that serves two
+// distinct request shapes from a single fake: the tool-loop's own generate
+// calls (returning a tool call for the first maxToolRounds calls, then a
+// final text answer), and compactConversation's summarization calls, which it
+// recognises by shape (a single RoleUser message built by summarizePrompt) and
+// counts separately in summarizeCalls so tests can assert the compaction
+// trigger fired without exceeding maxCompactionsPerTask.
+type compactingToolMaas struct {
+	maxToolRounds  int
+	promptTokens   int
+	toolCalls      int
+	summarizeCalls int
+}
+
+func (m *compactingToolMaas) Generate(ctx context.Context, req port.InferenceRequest) (port.InferenceResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return port.InferenceResponse{}, err
+	}
+	if len(req.Messages) == 1 && strings.Contains(req.Messages[0].Content, "压缩") {
+		m.summarizeCalls++
+		return port.InferenceResponse{Text: "SUMMARY-TEXT"}, nil
+	}
+	m.toolCalls++
+	if m.toolCalls <= m.maxToolRounds {
+		return port.InferenceResponse{
+			PromptTokens: m.promptTokens,
+			ToolCalls: []domain.ToolCall{{
+				ID:        fmt.Sprintf("call-%d", m.toolCalls),
+				Name:      "lookup",
+				Arguments: map[string]string{"query": fmt.Sprintf("q%d", m.toolCalls)},
+			}},
+		}, nil
+	}
+	return port.InferenceResponse{PromptTokens: m.promptTokens, Text: "final answer"}, nil
+}
+
+func newCompactionTestRuntime(t *testing.T, maas *compactingToolMaas, compactTokenThreshold int) *Runtime {
+	t.Helper()
+	audit := adapter.NewMemoryAuditLog()
+	registry := tool.NewRegistry(
+		tool.NewExecutionPolicy(tool.ExecutionPolicyConfig{AutoAllowTools: []string{"lookup"}}),
+		tool.PermissionEnforcerFunc(func(domain.Agent, domain.ToolCall) error { return nil }),
+		tool.NoopGuardrails{},
+	).WithAuditLog(audit)
+	registry.RegisterDescriptor(tool.Descriptor{
+		Name:        "lookup",
+		Description: "lookup test data",
+		InputSchema: map[string]any{
+			"required": []string{"query"},
+			"properties": map[string]any{
+				"query": map[string]any{"type": "string"},
+			},
+		},
+	}, tool.HandlerFunc(func(_ context.Context, call domain.ToolCall) (domain.ToolResult, error) {
+		return domain.ToolResult{CallID: call.ID, Success: true, Output: "ok " + call.Arguments["query"]}, nil
+	}))
+	return NewRuntime(Config{
+		Maas:                  maas,
+		Audit:                 audit,
+		Tools:                 registry,
+		MaxToolRounds:         15,
+		CompactTokenThreshold: compactTokenThreshold,
+	})
+}
+
+// TestRunToolLoopCompactsOverThreshold drives enough tool-calling rounds (each
+// contributing promptTokens well over the small threshold) that runToolLoop's
+// compaction trigger fires. It asserts compaction happened (a summarization
+// call was made, distinguishable by request shape) and that it never ran more
+// than maxCompactionsPerTask times, even though promptTokens stays over
+// threshold for every remaining round.
+func TestRunToolLoopCompactsOverThreshold(t *testing.T) {
+	t.Parallel()
+
+	maas := &compactingToolMaas{maxToolRounds: 10, promptTokens: 20}
+	runner := newCompactionTestRuntime(t, maas, 5)
+
+	run, err := runner.RunTask(context.Background(), domain.Agent{ID: "agent-1", Role: "developer"}, domain.Task{
+		ID:    "task-compaction",
+		Input: "keep looking things up",
+	})
+	if err != nil {
+		t.Fatalf("RunTask error = %v, want nil", err)
+	}
+	if run.Result != "final answer" {
+		t.Fatalf("RunTask.Result = %q, want final answer", run.Result)
+	}
+	if maas.summarizeCalls == 0 {
+		t.Fatalf("expected conversation compaction to trigger at least once, summarizeCalls=0")
+	}
+	if maas.summarizeCalls > maxCompactionsPerTask {
+		t.Fatalf("compaction ran %d times, want <= maxCompactionsPerTask(%d)", maas.summarizeCalls, maxCompactionsPerTask)
+	}
+}
+
+// TestRunToolLoopCompactionDisabledAtZeroThreshold uses the same tool-round
+// workload as TestRunToolLoopCompactsOverThreshold but leaves
+// CompactTokenThreshold at its zero value, which must disable compaction
+// entirely (0 = off, not a fallback threshold).
+func TestRunToolLoopCompactionDisabledAtZeroThreshold(t *testing.T) {
+	t.Parallel()
+
+	maas := &compactingToolMaas{maxToolRounds: 10, promptTokens: 20}
+	runner := newCompactionTestRuntime(t, maas, 0)
+
+	if _, err := runner.RunTask(context.Background(), domain.Agent{ID: "agent-1", Role: "developer"}, domain.Task{
+		ID:    "task-no-compaction",
+		Input: "keep looking things up",
+	}); err != nil {
+		t.Fatalf("RunTask error = %v, want nil", err)
+	}
+	if maas.summarizeCalls != 0 {
+		t.Fatalf("compact_token_threshold=0 must disable compaction, got summarizeCalls=%d", maas.summarizeCalls)
 	}
 }
 

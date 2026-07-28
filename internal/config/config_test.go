@@ -2,6 +2,7 @@ package config
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -524,5 +525,17 @@ func TestLoadDisabledToolsValidNameSucceeds(t *testing.T) {
 	}
 	if len(cfg.Runtime.DisabledTools) != 1 || cfg.Runtime.DisabledTools[0] != "write_file" {
 		t.Fatalf("Load().Runtime.DisabledTools = %v, want [write_file]", cfg.Runtime.DisabledTools)
+	}
+}
+
+// TestRuntimeConfigCompactThresholdParses validates that
+// runtime.compact_token_threshold decodes into RuntimeConfig.CompactTokenThreshold.
+func TestRuntimeConfigCompactThresholdParses(t *testing.T) {
+	var rc RuntimeConfig
+	if err := json.Unmarshal([]byte(`{"compact_token_threshold":60000}`), &rc); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if rc.CompactTokenThreshold != 60000 {
+		t.Fatalf("CompactTokenThreshold=%d want 60000", rc.CompactTokenThreshold)
 	}
 }
