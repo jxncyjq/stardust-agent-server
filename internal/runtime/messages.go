@@ -90,6 +90,17 @@ func (c *conversation) syncLoaded(rendered string) {
 	c.appendUser(rendered)
 }
 
+// applyCompaction replaces messages[1:preserveStart] with a single summary
+// user message, pinning messages[0] (the stable cache prefix / base prompt)
+// and keeping the recent tail from preserveStart onward verbatim.
+func (c *conversation) applyCompaction(preserveStart int, summary string) {
+	tail := append([]port.InferenceMessage(nil), c.messages[preserveStart:]...)
+	c.messages = append([]port.InferenceMessage{
+		c.messages[0],
+		{Role: port.RoleUser, Content: "[对话摘要]\n" + summary},
+	}, tail...)
+}
+
 // render returns the messages to send, folding the oldest tool outputs first
 // once the exchange exceeds maxChars.
 //
