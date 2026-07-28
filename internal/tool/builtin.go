@@ -500,16 +500,21 @@ func readFileTool(ctx context.Context, root string, guard port.WorkspacePathGuar
 	if len(data) > maxReadFileBytes {
 		output = string(data[:maxReadFileBytes]) + fmt.Sprintf("\n…[truncated: file exceeds %d bytes]", maxReadFileBytes)
 	}
+	// Resolve the subtree agents.md note first: it is the only step left that can
+	// fail, and readHistory.record must run only on the success path so a repeat
+	// count is never advanced for a read the model never received. record keys on
+	// the file content (before the note is appended) so the note's own
+	// once-per-task dedup does not perturb the unchanged-content comparison.
+	note, err := subtreeAgentsNote(filepath.Dir(resolved), options)
+	if err != nil {
+		return domain.ToolResult{}, err
+	}
 	if options.readHistory != nil {
 		if count, unchanged := options.readHistory.record(resolved, output); unchanged {
 			output = repeatNotice(count) + output
 		}
 	}
-	if note, err := subtreeAgentsNote(filepath.Dir(resolved), options); err != nil {
-		return domain.ToolResult{}, err
-	} else if note != "" {
-		output += note
-	}
+	output += note
 	return domain.ToolResult{
 		CallID:  call.ID,
 		Success: true,
