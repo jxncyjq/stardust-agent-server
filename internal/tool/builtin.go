@@ -121,6 +121,8 @@ func (s *injectedAgentsSet) markIfNew(absPath string) (bool, error) {
 	return true, nil
 }
 
+// readEntry holds the last-seen content hash and cumulative read count for one
+// file path within a task.
 type readEntry struct {
 	hash  string
 	count int
@@ -135,6 +137,7 @@ type readHistory struct {
 	seen map[string]readEntry
 }
 
+// newReadHistory returns an empty readHistory ready for concurrent use.
 func newReadHistory() *readHistory {
 	return &readHistory{seen: make(map[string]readEntry)}
 }
