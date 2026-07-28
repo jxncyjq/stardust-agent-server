@@ -609,6 +609,95 @@ func TestLazyToolHintPointsToLoadCapabilitiesNotListTools(t *testing.T) {
 	}
 }
 
+// alternatingRepeatMaas requests two distinct tool calls (A, B) in strict
+// alternation — A,B,A,B,... — so no two consecutive rounds ever repeat the
+// same call (repeatedCallStreak stays at 1), while each of A and B
+// individually recurs across the whole task. It models the 152-incident's
+// non-consecutive counterpart: a model that oscillates between two calls
+// instead of hammering one. Once no tools are offered (the forced final
+// pass) it returns a plain textual answer.
+type alternatingRepeatMaas struct {
+	rounds int
+}
+
+func (m *alternatingRepeatMaas) Generate(ctx context.Context, req port.InferenceRequest) (port.InferenceResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return port.InferenceResponse{}, err
+	}
+	if len(req.Tools) == 0 {
+		return port.InferenceResponse{Text: "final answer after alternating repeats"}, nil
+	}
+	call := domain.ToolCall{ID: "call-a", Name: "lookup", Arguments: map[string]string{"query": "cache"}}
+	if m.rounds%2 == 1 {
+		call = domain.ToolCall{ID: "call-b", Name: "other", Arguments: map[string]string{"query": "eviction"}}
+	}
+	m.rounds++
+	return port.InferenceResponse{ToolCalls: []domain.ToolCall{call}}, nil
+}
+
+// TestRunToolLoopAbortsOnNonConsecutiveRepeat guards the non-consecutive
+// repeat guard (repeatGuard, messages.go): a model that alternates between two
+// distinct tool calls (A,B,A,B,...) never trips the consecutive-streak guard
+// (repeatedCallStreak never reaches repeatAbortStreak), but each call
+// individually accumulates across the task and must still trip the abort path
+// once one of them recurs repeatAbortCount times.
+func TestRunToolLoopAbortsOnNonConsecutiveRepeat(t *testing.T) {
+	t.Parallel()
+
+	maas := &alternatingRepeatMaas{}
+	audit := adapter.NewMemoryAuditLog()
+	events := adapter.NewMemoryEventBus()
+	registry := tool.NewRegistry(
+		tool.NewExecutionPolicy(tool.ExecutionPolicyConfig{AutoAllowTools: []string{"lookup", "other"}}),
+		tool.PermissionEnforcerFunc(func(domain.Agent, domain.ToolCall) error { return nil }),
+		tool.NoopGuardrails{},
+	).WithAuditLog(audit)
+	registerLookupLikeTool := func(name string) {
+		registry.RegisterDescriptor(tool.Descriptor{
+			Name:        name,
+			Description: name + " test data",
+			InputSchema: map[string]any{
+				"required":   []string{"query"},
+				"properties": map[string]any{"query": map[string]any{"type": "string"}},
+			},
+		}, tool.HandlerFunc(func(_ context.Context, call domain.ToolCall) (domain.ToolResult, error) {
+			return domain.ToolResult{CallID: call.ID, Success: true, Output: "data for " + name}, nil
+		}))
+	}
+	registerLookupLikeTool("lookup")
+	registerLookupLikeTool("other")
+
+	runner := NewRuntime(Config{
+		Maas:          maas,
+		Audit:         audit,
+		Events:        events,
+		Tools:         registry,
+		MaxToolRounds: 20,
+	})
+
+	run, err := runner.RunTask(context.Background(), domain.Agent{ID: "agent-1", Role: "developer"}, domain.Task{
+		ID:    "task-alt-repeat",
+		Input: "alternate between lookup and other",
+	})
+	if err != nil {
+		t.Fatalf("RunTask() error = %v, want graceful completion after the abort cuts the loop", err)
+	}
+	if run.Result != "final answer after alternating repeats" {
+		t.Fatalf("RunTask().Result = %q, want the forced final answer after the loop was cut", run.Result)
+	}
+	runtimeEvents := mustRuntimeEvents(t, events)
+	if !hasRuntimeEvent(runtimeEvents, "tool_loop_broken") {
+		t.Fatalf("runtime events missing tool_loop_broken for a non-consecutive repeat: %#v", runtimeEvents)
+	}
+	// The loop must have stopped well before the consecutive-streak threshold:
+	// alternating calls never run more than 1 round deep, so if it took
+	// anywhere near repeatAbortStreak (8) rounds per call to trip, the
+	// consecutive guard — not the non-consecutive one — would be responsible.
+	if maas.rounds > repeatAbortCount*2+1 {
+		t.Fatalf("alternatingRepeatMaas made %d tool-offering rounds before the loop was cut, want it to stop shortly after repeatAbortCount (%d) non-consecutive repeats of one call", maas.rounds, repeatAbortCount)
+	}
+}
+
 func hasRuntimeEvent(events []domain.RuntimeEvent, eventType string) bool {
 	for _, event := range events {
 		if event.Type == eventType {

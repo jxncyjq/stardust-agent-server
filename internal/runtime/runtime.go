@@ -174,7 +174,10 @@ type loopState struct {
 	// (see messages.go). It replaced a single re-sent prompt string whose tool
 	// results were deduplicated by (name, arguments), which hid the model's own
 	// repeated calls from it.
-	convo            *conversation
+	convo *conversation
+	// repeatGuard counts non-consecutive repeats of each tool-call signature
+	// across the whole task (see messages.go). One per RunTask.
+	repeatGuard      *repeatGuard
 	loaded           []loadedEntry
 	resp             port.InferenceResponse
 	promptTokens     int
@@ -377,6 +380,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 				totalTokens:      cp.TotalTokens,
 				images:           cp.Images,
 				tools:            effTools,
+				repeatGuard:      newRepeatGuard(),
 				// The resumed prompt's catalog is already baked into cp.BasePrompt
 				// from the first run; this rebuilds the dispatch-side catalog so a
 				// load_capabilities issued in a resumed round still resolves, scoped
@@ -418,6 +422,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		totalTokens:      resp.TotalTokens,
 		images:           task.Images,
 		tools:            effTools,
+		repeatGuard:      newRepeatGuard(),
 		catalog:          catalog,
 	}
 	return r.runToolLoop(ctx, requestID, agent, task, st)
@@ -449,6 +454,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// Counted before this round is recorded, so the streak is "how many
 		// consecutive rounds have asked for exactly this, including now".
 		streak := repeatedCallStreak(st.convo.messages, calls)
+		repeatCount := st.repeatGuard.record(callsKey(calls))
 		st.convo.appendAssistant(st.resp.Text, calls)
 		results, err := r.executeToolCalls(ctx, agent, task, &st)
 		if err != nil {
@@ -460,7 +466,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// new definitions as their own turn rather than re-sending the whole
 		// block every round.
 		st.convo.syncLoaded(renderLoaded(st.loaded))
-		if streak >= repeatAbortStreak {
+		if streak >= repeatAbortStreak || repeatCount >= repeatAbortCount {
 			// The model is not making progress: it has asked for exactly the same
 			// calls this many rounds running and the results are already in its
 			// context. Cutting the loop here is the difference between a finished
@@ -470,19 +476,19 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 			if err := r.events.Publish(ctx, domain.RuntimeEvent{
 				Type:      "tool_loop_broken",
 				TaskID:    task.ID,
-				Message:   fmt.Sprintf("同一工具调用连续重复 %d 次，已停止工具循环", streak),
+				Message:   "同一工具调用重复过多，已停止工具循环",
 				CreatedAt: time.Now(),
 			}); err != nil {
 				return domain.TaskRun{}, fmt.Errorf("publish tool loop broken event: %w", err)
 			}
 			r.logger.Warn("tool loop broken: identical call repeated",
-				"task_id", task.ID, "streak", streak, "calls", callsKey(calls))
+				"task_id", task.ID, "streak", streak, "repeat_count", repeatCount, "calls", callsKey(calls))
 			loopCut = true
 			break
 		}
-		if streak >= repeatWarnStreak {
+		if streak >= repeatWarnStreak || repeatCount >= repeatWarnCount {
 			st.convo.appendUser(fmt.Sprintf(
-				"[系统] 你已连续 %d 次以完全相同的参数调用同一工具，结果没有变化。不要再重复该调用：改用其他工具，或基于已获取的信息直接给出最终回答。", streak))
+				"[系统] 你已多次以完全相同的参数调用同一工具，结果没有变化。不要再重复该调用：改用其他工具，或基于已获取的信息直接给出最终回答。（连续%d次/累计%d次）", streak, repeatCount))
 		}
 		st.resp, err = r.generate(ctx, requestID, task.ID, st.convo, st.tools)
 		if err != nil {
