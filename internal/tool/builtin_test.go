@@ -248,6 +248,74 @@ func writeFile(t *testing.T, path string, body string) {
 	}
 }
 
+func TestReadFileFlagsUnchangedRepeat(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "a.txt"), "hello world")
+	registry := NewFileReadWriteWorkspaceRegistry(root, nil)
+
+	r1, err := registry.Execute(context.Background(), domain.Agent{Role: "developer"}, domain.ToolCall{
+		ID:        "1",
+		Name:      "read_file",
+		Arguments: map[string]string{"path": "a.txt"},
+	})
+	if err != nil {
+		t.Fatalf("Execute(read_file) first read error = %v, want nil", err)
+	}
+	if strings.Contains(r1.Output, "第") || !strings.Contains(r1.Output, "hello world") {
+		t.Fatalf("first read must be plain content, got %q", r1.Output)
+	}
+
+	r2, err := registry.Execute(context.Background(), domain.Agent{Role: "developer"}, domain.ToolCall{
+		ID:        "2",
+		Name:      "read_file",
+		Arguments: map[string]string{"path": "a.txt"},
+	})
+	if err != nil {
+		t.Fatalf("Execute(read_file) second read error = %v, want nil", err)
+	}
+	if !strings.Contains(r2.Output, "第 2 次") {
+		t.Fatalf("repeat read must carry notice, got %q", r2.Output)
+	}
+	if !strings.Contains(r2.Output, "hello world") {
+		t.Fatalf("repeat read must STILL contain full content (fail-loud), got %q", r2.Output)
+	}
+}
+
+func TestReadFileNoNoticeWhenContentChanged(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	p := filepath.Join(root, "a.txt")
+	writeFile(t, p, "v1")
+	registry := NewFileReadWriteWorkspaceRegistry(root, nil)
+
+	if _, err := registry.Execute(context.Background(), domain.Agent{Role: "developer"}, domain.ToolCall{
+		ID:        "1",
+		Name:      "read_file",
+		Arguments: map[string]string{"path": "a.txt"},
+	}); err != nil {
+		t.Fatalf("Execute(read_file) first read error = %v, want nil", err)
+	}
+
+	writeFile(t, p, "v2-changed")
+	r2, err := registry.Execute(context.Background(), domain.Agent{Role: "developer"}, domain.ToolCall{
+		ID:        "2",
+		Name:      "read_file",
+		Arguments: map[string]string{"path": "a.txt"},
+	})
+	if err != nil {
+		t.Fatalf("Execute(read_file) second read error = %v, want nil", err)
+	}
+	if strings.Contains(r2.Output, "第") {
+		t.Fatalf("changed content must NOT carry repeat notice, got %q", r2.Output)
+	}
+	if !strings.Contains(r2.Output, "v2-changed") {
+		t.Fatalf("must return new content, got %q", r2.Output)
+	}
+}
+
 func TestSubtreeAgentsNoteInjectsChainOnce(t *testing.T) {
 	root := t.TempDir()
 	fileDir := filepath.Join(root, "a", "b")

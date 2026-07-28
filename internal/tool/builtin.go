@@ -51,6 +51,11 @@ type workspaceRegistryOptions struct {
 	// zero value" so finalizeWorkspaceRegistryOptions knows whether to seed
 	// projectRoot/injected at all.
 	injectionEnabled bool
+	// readHistory tracks read_file repeats within this registry's task, so an
+	// unchanged repeat read can be flagged via repeatNotice. Always non-nil by
+	// the time a registry is returned from NewWorkspaceRegistry /
+	// NewFileReadWriteWorkspaceRegistry — see those constructors.
+	readHistory *readHistory
 }
 
 // injectedAgentsSet tracks which non-resident agents.md files have already
@@ -265,6 +270,9 @@ func NewWorkspaceRegistry(root string, audit port.AuditLog, opts ...WorkspaceReg
 		NoopGuardrails{},
 	).WithAuditLog(audit).WithOutputSanitizer(quality.NewOutputSanitizer())
 	options = finalizeWorkspaceRegistryOptions(absRoot, options)
+	if options.readHistory == nil {
+		options.readHistory = newReadHistory()
+	}
 	registerReadOnlyDescriptors(registry, absRoot, guard, options)
 	registerWriteFileDescriptor(registry, absRoot, guard, options)
 	return registry
@@ -402,6 +410,9 @@ func NewFileReadWriteWorkspaceRegistry(root string, audit port.AuditLog, opts ..
 		NoopGuardrails{},
 	).WithAuditLog(audit).WithOutputSanitizer(quality.NewOutputSanitizer())
 	options = finalizeWorkspaceRegistryOptions(absRoot, options)
+	if options.readHistory == nil {
+		options.readHistory = newReadHistory()
+	}
 	registerReadOnlyDescriptors(registry, absRoot, guard, options)
 	registerWriteFileDescriptor(registry, absRoot, guard, options)
 	return registry
@@ -488,6 +499,11 @@ func readFileTool(ctx context.Context, root string, guard port.WorkspacePathGuar
 	output := string(data)
 	if len(data) > maxReadFileBytes {
 		output = string(data[:maxReadFileBytes]) + fmt.Sprintf("\n…[truncated: file exceeds %d bytes]", maxReadFileBytes)
+	}
+	if options.readHistory != nil {
+		if count, unchanged := options.readHistory.record(resolved, output); unchanged {
+			output = repeatNotice(count) + output
+		}
 	}
 	if note, err := subtreeAgentsNote(filepath.Dir(resolved), options); err != nil {
 		return domain.ToolResult{}, err
