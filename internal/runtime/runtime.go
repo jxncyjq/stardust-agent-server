@@ -454,6 +454,12 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// Counted before this round is recorded, so the streak is "how many
 		// consecutive rounds have asked for exactly this, including now".
 		streak := repeatedCallStreak(st.convo.messages, calls)
+		// repeatCount counts every occurrence of this call signature in the task,
+		// consecutive or not. Because repeatAbortCount (6) < repeatAbortStreak (8),
+		// a purely consecutive repeat now trips this guard at 6 rather than the
+		// streak guard at 8 — intended: six identical calls is enough to stop,
+		// whether or not they were interleaved. The streak guard still owns the
+		// earlier consecutive *warning* (repeatWarnStreak=3 < repeatWarnCount=4).
 		repeatCount := st.repeatGuard.record(callsKey(calls))
 		st.convo.appendAssistant(st.resp.Text, calls)
 		results, err := r.executeToolCalls(ctx, agent, task, &st)
