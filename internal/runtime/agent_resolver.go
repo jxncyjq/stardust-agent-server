@@ -30,6 +30,13 @@ type MaasRunnerFactoryResult struct {
 
 type MaasRunnerFactory func(profile string) (MaasRunnerFactoryResult, error)
 
+// ConversationTurnLister loads a session's recent conversation turns. It is the
+// one method the resolver needs from the session store, kept as its own
+// interface so the runtime package does not depend on the whole store.
+type ConversationTurnLister interface {
+	ListConversationTurns(ctx context.Context, sessionID string, limit int) ([]domain.ConversationTurn, error)
+}
+
 type AgentRuntimeResolverConfig struct {
 	Registry     *agentregistry.Registry
 	RootConfig   config.Config
@@ -56,35 +63,42 @@ type AgentRuntimeResolverConfig struct {
 	// default runtime. Nil disables aging for every resolver-built runtime
 	// (skill.Curator "no usage history" — never touched, never swept).
 	SkillUsage SkillUsageRecorder
+	// ConversationTurns loads the session history injected into each task's
+	// prompt (the "Recent conversation" block). Nil disables injection — the
+	// serve path without a session store, and tests. Without it a GUI task runs
+	// with no cross-turn memory at all.
+	ConversationTurns ConversationTurnLister
 }
 
 type AgentRuntimeResolver struct {
-	registry     *agentregistry.Registry
-	rootConfig   config.Config
-	audit        port.AuditLog
-	events       port.EventBus
-	taskLedger   *taskledger.Ledger
-	messageStore tool.AgentMessageStore
-	maasFactory  MaasRunnerFactory
-	checkpoints  *sessionstate.Store
-	toolGate     ToolGate
-	logger       *slog.Logger
-	skillUsage   SkillUsageRecorder
+	registry          *agentregistry.Registry
+	rootConfig        config.Config
+	audit             port.AuditLog
+	events            port.EventBus
+	taskLedger        *taskledger.Ledger
+	messageStore      tool.AgentMessageStore
+	maasFactory       MaasRunnerFactory
+	checkpoints       *sessionstate.Store
+	toolGate          ToolGate
+	logger            *slog.Logger
+	skillUsage        SkillUsageRecorder
+	conversationTurns ConversationTurnLister
 }
 
 func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolver {
 	return &AgentRuntimeResolver{
-		registry:     cfg.Registry,
-		rootConfig:   cfg.RootConfig,
-		audit:        cfg.Audit,
-		events:       cfg.Events,
-		taskLedger:   cfg.TaskLedger,
-		messageStore: cfg.MessageStore,
-		maasFactory:  cfg.MaasFactory,
-		checkpoints:  cfg.Checkpoints,
-		toolGate:     cfg.ToolGate,
-		logger:       cfg.Logger,
-		skillUsage:   cfg.SkillUsage,
+		registry:          cfg.Registry,
+		rootConfig:        cfg.RootConfig,
+		audit:             cfg.Audit,
+		events:            cfg.Events,
+		taskLedger:        cfg.TaskLedger,
+		messageStore:      cfg.MessageStore,
+		maasFactory:       cfg.MaasFactory,
+		checkpoints:       cfg.Checkpoints,
+		toolGate:          cfg.ToolGate,
+		logger:            cfg.Logger,
+		skillUsage:        cfg.SkillUsage,
+		conversationTurns: cfg.ConversationTurns,
 	}
 }
 
@@ -107,6 +121,42 @@ func (r *AgentRuntimeResolver) resolveHomeDir(ctx context.Context) string {
 		return ""
 	}
 	return homeDir
+}
+
+// recentTurnsForTask loads the session turns to inject into this task's prompt:
+// the most recent DefaultRecentTurns turns of task.SessionID, excluding the
+// task's own user turn (the HTTP layer records it before enqueuing, so it would
+// otherwise be duplicated alongside task.Input), each truncated to
+// Session.MaxTurnChars.
+//
+// A nil lister or an empty task.SessionID is a legitimate "no session history"
+// state and yields (nil, nil). A store failure is NOT: it returns an error, so
+// a lost history is never mistaken for an empty one (CLAUDE.md fail-loud).
+func (r *AgentRuntimeResolver) recentTurnsForTask(ctx context.Context, task domain.Task) ([]domain.ConversationTurn, error) {
+	if r.conversationTurns == nil || strings.TrimSpace(task.SessionID) == "" {
+		return nil, nil
+	}
+	limit := r.rootConfig.Session.DefaultRecentTurns
+	if limit <= 0 {
+		limit = 6
+	}
+	// +1: the task's own user turn is already persisted and will be filtered out.
+	turns, err := r.conversationTurns.ListConversationTurns(ctx, task.SessionID, limit+1)
+	if err != nil {
+		return nil, fmt.Errorf("list conversation turns for session %q: %w", task.SessionID, err)
+	}
+	out := make([]domain.ConversationTurn, 0, len(turns))
+	for _, turn := range turns {
+		if turn.TaskID == task.ID {
+			continue
+		}
+		turn.Content = truncateText(turn.Content, r.rootConfig.Session.MaxTurnChars)
+		out = append(out, turn)
+	}
+	if len(out) > limit {
+		out = out[len(out)-limit:]
+	}
+	return out, nil
 }
 
 func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domain.Task) (domain.Agent, TaskRunner, bool, error) {
@@ -206,6 +256,10 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 	tool.RegisterTaskLedgerTools(tools, r.taskLedger)
 	tool.RegisterAgentMessageTools(tools, r.messageStore)
 	tool.RegisterWebTools(tools, webToolOptions(r.rootConfig.Web))
+	recentTurns, err := r.recentTurnsForTask(ctx, task)
+	if err != nil {
+		return domain.Agent{}, nil, false, err
+	}
 	runner := NewRuntime(Config{
 		Maas:                  maas.Client,
 		Audit:                 r.audit,
@@ -222,6 +276,7 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		CapabilitySkills:      capabilitySkills,
 		SkillUsage:            r.skillUsage,
 		DisabledTools:         agentCfg.DisabledTools,
+		ConversationTurns:     recentTurns,
 	})
 	return agent, runner, true, nil
 }

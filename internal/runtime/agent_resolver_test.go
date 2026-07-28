@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -746,6 +747,89 @@ func TestResolverAppliesDisabledTools(t *testing.T) {
 		if tl.Name == "write_file" {
 			t.Fatal("disabled write_file was still offered to the model")
 		}
+	}
+}
+
+type fakeTurnLister struct {
+	turns    []domain.ConversationTurn
+	err      error
+	gotLimit int
+}
+
+func (f *fakeTurnLister) ListConversationTurns(ctx context.Context, sessionID string, limit int) ([]domain.ConversationTurn, error) {
+	f.gotLimit = limit
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.turns, nil
+}
+
+func TestRecentTurnsForTaskExcludesCurrentTurn(t *testing.T) {
+	task := domain.Task{ID: "task-9", SessionID: "s1", AgentID: "a"}
+	lister := &fakeTurnLister{turns: []domain.ConversationTurn{
+		{ID: "t1:user", TaskID: "task-1", Role: domain.ConversationRoleUser, Content: "OLD-1"},
+		{ID: "t1:assistant", TaskID: "task-1", Role: domain.ConversationRoleAssistant, Content: "OLD-2"},
+		{ID: "task-9:user", TaskID: "task-9", Role: domain.ConversationRoleUser, Content: "CURRENT-TURN"},
+	}}
+	r := &AgentRuntimeResolver{conversationTurns: lister, rootConfig: config.Config{
+		Session: config.SessionConfig{DefaultRecentTurns: 6, MaxTurnChars: 6000},
+	}}
+	got, err := r.recentTurnsForTask(t.Context(), task)
+	if err != nil {
+		t.Fatalf("recentTurnsForTask err = %v, want nil", err)
+	}
+	for _, turn := range got {
+		if turn.TaskID == task.ID {
+			t.Fatalf("current turn must be excluded, got %+v", got)
+		}
+	}
+	if len(got) != 2 || got[0].Content != "OLD-1" {
+		t.Fatalf("got %+v, want the 2 older turns", got)
+	}
+}
+
+func TestRecentTurnsForTaskTruncatesAndFailsLoud(t *testing.T) {
+	task := domain.Task{ID: "task-9", SessionID: "s1", AgentID: "a"}
+	long := strings.Repeat("x", 100)
+	r := &AgentRuntimeResolver{
+		conversationTurns: &fakeTurnLister{turns: []domain.ConversationTurn{
+			{ID: "t1:user", TaskID: "task-1", Role: domain.ConversationRoleUser, Content: long},
+		}},
+		rootConfig: config.Config{Session: config.SessionConfig{DefaultRecentTurns: 6, MaxTurnChars: 10}},
+	}
+	got, err := r.recentTurnsForTask(t.Context(), task)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if len([]rune(got[0].Content)) > 60 { // 10 + 截断标记裕量
+		t.Fatalf("content not truncated: %d runes", len([]rune(got[0].Content)))
+	}
+
+	// fail-loud：lister 出错必须返回 error，不得静默空注入
+	rErr := &AgentRuntimeResolver{
+		conversationTurns: &fakeTurnLister{err: fmt.Errorf("db down")},
+		rootConfig:        config.Config{Session: config.SessionConfig{DefaultRecentTurns: 6}},
+	}
+	if _, err := rErr.recentTurnsForTask(t.Context(), task); err == nil {
+		t.Fatalf("lister error must propagate (fail-loud), got nil")
+	}
+}
+
+func TestRecentTurnsForTaskSkipsWhenNoSessionOrLister(t *testing.T) {
+	task := domain.Task{ID: "task-9", AgentID: "a"} // SessionID 空
+	r := &AgentRuntimeResolver{
+		conversationTurns: &fakeTurnLister{turns: []domain.ConversationTurn{{ID: "x", TaskID: "t"}}},
+		rootConfig:        config.Config{Session: config.SessionConfig{DefaultRecentTurns: 6}},
+	}
+	got, err := r.recentTurnsForTask(t.Context(), task)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("no SessionID → (nil,nil), got (%v,%v)", got, err)
+	}
+	// lister == nil 同样不注入、不 panic
+	rNil := &AgentRuntimeResolver{rootConfig: config.Config{Session: config.SessionConfig{DefaultRecentTurns: 6}}}
+	got, err = rNil.recentTurnsForTask(t.Context(), domain.Task{ID: "t", SessionID: "s1"})
+	if err != nil || len(got) != 0 {
+		t.Fatalf("nil lister → (nil,nil), got (%v,%v)", got, err)
 	}
 }
 
