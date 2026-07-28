@@ -120,6 +120,10 @@ type Config struct {
 	// breakdown of every outgoing prompt (see inferenceRequestDebug). Off by
 	// default; intended to be driven by the config file's runtime.debug toggle.
 	Debug bool
+	// CompactTokenThreshold triggers conversation compaction when the tool
+	// loop's accumulated prompt tokens exceed it. 0 disables compaction
+	// (default), matching config.RuntimeConfig.CompactTokenThreshold.
+	CompactTokenThreshold int
 }
 
 // SkillUsageRecorder is the usage sidecar skill.UsageStore satisfies.
@@ -137,30 +141,31 @@ const (
 )
 
 type Runtime struct {
-	maas               port.MaasInferenceClient
-	audit              port.AuditLog
-	events             port.EventBus
-	contextBuilder     ContextBuilder
-	contextPrefix      string
-	tools              *tool.Registry
-	maxToolRounds      int
-	maxToolResultChars int
-	maxPromptChars     int
-	lazyTools          bool
-	conversationTurns  []domain.ConversationTurn
-	interrupted        atomic.Bool
-	role               string
-	depth              int
-	maxSpawnDepth      int
-	maxConcurrent      int
-	subTaskSeq         atomic.Uint64
-	checkpoints        *sessionstate.Store
-	toolGate           ToolGate
-	logger             *slog.Logger
-	skillUsage         SkillUsageRecorder
-	capabilitySkills   capability.Provider
-	disabledTools      []string
-	debug              bool
+	maas                  port.MaasInferenceClient
+	audit                 port.AuditLog
+	events                port.EventBus
+	contextBuilder        ContextBuilder
+	contextPrefix         string
+	tools                 *tool.Registry
+	maxToolRounds         int
+	maxToolResultChars    int
+	maxPromptChars        int
+	lazyTools             bool
+	conversationTurns     []domain.ConversationTurn
+	interrupted           atomic.Bool
+	role                  string
+	depth                 int
+	maxSpawnDepth         int
+	maxConcurrent         int
+	subTaskSeq            atomic.Uint64
+	checkpoints           *sessionstate.Store
+	toolGate              ToolGate
+	logger                *slog.Logger
+	skillUsage            SkillUsageRecorder
+	capabilitySkills      capability.Provider
+	disabledTools         []string
+	debug                 bool
+	compactTokenThreshold int
 }
 
 // loopState is the mutable state threaded through the tool-execution loop.
@@ -268,28 +273,29 @@ func NewRuntime(cfg Config) *Runtime {
 		}
 	}
 	return &Runtime{
-		maas:               cfg.Maas,
-		audit:              audit,
-		events:             events,
-		contextBuilder:     cfg.ContextBuilder,
-		contextPrefix:      strings.TrimSpace(cfg.ContextPrefix),
-		tools:              cfg.Tools,
-		maxToolRounds:      normalizeMaxToolRounds(cfg.MaxToolRounds),
-		maxToolResultChars: normalizePositive(cfg.MaxToolResultChars, defaultMaxToolResultChars),
-		maxPromptChars:     normalizePositive(cfg.MaxPromptChars, defaultMaxPromptChars),
-		lazyTools:          cfg.LazyTools,
-		conversationTurns:  append([]domain.ConversationTurn(nil), cfg.ConversationTurns...),
-		role:               role,
-		depth:              cfg.Depth,
-		maxSpawnDepth:      normalizePositive(cfg.MaxSpawnDepth, defaultMaxSpawnDepth),
-		maxConcurrent:      normalizePositive(cfg.MaxConcurrent, defaultMaxConcurrent),
-		checkpoints:        cfg.Checkpoints,
-		toolGate:           cfg.ToolGate,
-		logger:             logger,
-		debug:              cfg.Debug,
-		skillUsage:         cfg.SkillUsage,
-		capabilitySkills:   cfg.CapabilitySkills,
-		disabledTools:      cfg.DisabledTools,
+		maas:                  cfg.Maas,
+		audit:                 audit,
+		events:                events,
+		contextBuilder:        cfg.ContextBuilder,
+		contextPrefix:         strings.TrimSpace(cfg.ContextPrefix),
+		tools:                 cfg.Tools,
+		maxToolRounds:         normalizeMaxToolRounds(cfg.MaxToolRounds),
+		maxToolResultChars:    normalizePositive(cfg.MaxToolResultChars, defaultMaxToolResultChars),
+		maxPromptChars:        normalizePositive(cfg.MaxPromptChars, defaultMaxPromptChars),
+		lazyTools:             cfg.LazyTools,
+		conversationTurns:     append([]domain.ConversationTurn(nil), cfg.ConversationTurns...),
+		role:                  role,
+		depth:                 cfg.Depth,
+		maxSpawnDepth:         normalizePositive(cfg.MaxSpawnDepth, defaultMaxSpawnDepth),
+		maxConcurrent:         normalizePositive(cfg.MaxConcurrent, defaultMaxConcurrent),
+		checkpoints:           cfg.Checkpoints,
+		toolGate:              cfg.ToolGate,
+		logger:                logger,
+		debug:                 cfg.Debug,
+		skillUsage:            cfg.SkillUsage,
+		capabilitySkills:      cfg.CapabilitySkills,
+		disabledTools:         cfg.DisabledTools,
+		compactTokenThreshold: cfg.CompactTokenThreshold,
 	}
 }
 
