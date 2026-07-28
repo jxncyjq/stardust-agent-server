@@ -186,3 +186,23 @@ func TestConversationCarriesImagesOnTheFirstUserTurn(t *testing.T) {
 		t.Fatalf("first turn images = %v, want the task's images", msgs[0].Images)
 	}
 }
+
+func TestRepeatGuardCountsNonConsecutive(t *testing.T) {
+	g := newRepeatGuard()
+	// A, B, A, B alternating: A 的累计次数应递增，不受 B 打断
+	if n := g.record("A"); n != 1 {
+		t.Fatalf("A#1=%d want 1", n)
+	}
+	if n := g.record("B"); n != 1 {
+		t.Fatalf("B#1=%d want 1", n)
+	}
+	if n := g.record("A"); n != 2 {
+		t.Fatalf("A#2=%d want 2", n)
+	}
+	if n := g.record("B"); n != 2 {
+		t.Fatalf("B#2=%d want 2", n)
+	}
+	if n := g.record("A"); n != 3 {
+		t.Fatalf("A#3=%d want 3", n)
+	}
+}

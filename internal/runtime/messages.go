@@ -129,7 +129,37 @@ const (
 	// legitimately repeated call — polling a file expected to change — workable.
 	repeatWarnStreak  = 3
 	repeatAbortStreak = 8
+
+	// repeatWarnCount and repeatAbortCount bound how many times ONE tool-call
+	// signature (callsKey: names+arguments) may recur across a whole task,
+	// regardless of whether the recurrences are consecutive. They complement
+	// repeatWarnStreak/repeatAbortStreak (which only see consecutive repeats):
+	// an A→B→A→B loop never trips the streak guard but does accumulate here.
+	// At the warn count the loop injects a steering turn; at the abort count it
+	// stops the tool loop (the non-consecutive analogue of the 152-round abort).
+	repeatWarnCount  = 4
+	repeatAbortCount = 6
 )
+
+// repeatGuard counts, per task, how many times each tool-call signature
+// (callsKey) has been requested — including non-consecutive recurrences. One
+// guard lives for the whole tool loop (loopState.repeatGuard); it is the
+// non-consecutive counterpart to repeatedCallStreak.
+type repeatGuard struct {
+	seen map[string]int
+}
+
+// newRepeatGuard returns an empty guard.
+func newRepeatGuard() *repeatGuard {
+	return &repeatGuard{seen: make(map[string]int)}
+}
+
+// record increments the running count for signature and returns the new count
+// (1 on first sighting).
+func (g *repeatGuard) record(signature string) int {
+	g.seen[signature]++
+	return g.seen[signature]
+}
 
 // repeatedCallStreak reports how many consecutive rounds requested exactly the
 // same tool calls, counting the pending calls as the newest round. It returns 1
