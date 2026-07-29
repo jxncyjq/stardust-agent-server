@@ -711,3 +711,80 @@ func tailRunes(s string) string {
 	}
 	return string(r[len(r)-200:])
 }
+
+// TestReadFileFitsBudgetWithAgentsNote is the regression the first cut of
+// pagination missed: the page budget only accounted for the page itself, so a
+// subtree agents.md note (bounded by MaxFileChars, far larger than the tool
+// result budget) pushed the whole result past runtime's maxToolResultChars.
+// Truncation there cuts from the front, taking the continuation hint with it —
+// leaving the model unable to page and back to re-reading the file whole.
+func TestReadFileFitsBudgetWithAgentsNote(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// A big local-conventions file: this is what blew the budget.
+	writeFile(t, filepath.Join(sub, "agents.md"), strings.Repeat("约", 3000))
+	writeFile(t, filepath.Join(sub, "big.md"), strings.Repeat("汉", 5000))
+
+	reg := NewFileReadWriteWorkspaceRegistry(root, nil,
+		WithAgentsInjection(20000, ""), WithProjectRoot(root))
+	res, err := reg.Execute(t.Context(), domain.Agent{}, domain.ToolCall{
+		Name: "read_file", ID: "1", Arguments: map[string]string{"path": "sub/big.md"},
+	})
+	if err != nil {
+		t.Fatalf("read_file err = %v, want nil", err)
+	}
+	if got := len([]rune(res.Output)); got > toolResultBudgetRunes {
+		t.Fatalf("result = %d runes, must fit the %d-rune tool result budget", got, toolResultBudgetRunes)
+	}
+	// Without this the test would pass vacuously on a build where the note was
+	// never injected — and it is the note's size that the budget must absorb.
+	if !strings.Contains(res.Output, "本目录约定") {
+		t.Fatalf("agents.md note was not injected; the budget interaction is untested")
+	}
+	if !strings.Contains(res.Output, "继续读用") {
+		t.Fatalf("continuation hint must survive alongside the note, got: %q", res.Output[:200])
+	}
+}
+
+// TestReadFilePageBudgetShrinksForNote pins the arithmetic directly: a note
+// large enough to consume the budget must shrink the page, never below the
+// floor that keeps some file content in the result.
+func TestReadFilePageBudgetShrinksForNote(t *testing.T) {
+	content := strings.Repeat("汉", 10000)
+	if got := readFilePageBudget(readFilePageRunes, content, "a.md", 0); got != readFilePageRunes {
+		t.Fatalf("no note: budget = %d, want the full %d", got, readFilePageRunes)
+	}
+	shrunk := readFilePageBudget(readFilePageRunes, content, "a.md", 2000)
+	if shrunk >= readFilePageRunes || shrunk < minReadFilePageRunes {
+		t.Fatalf("2000-rune note: budget = %d, want shrunk but >= %d", shrunk, minReadFilePageRunes)
+	}
+	if got := readFilePageBudget(readFilePageRunes, content, "a.md", 99999); got != minReadFilePageRunes {
+		t.Fatalf("oversized note: budget = %d, want the floor %d", got, minReadFilePageRunes)
+	}
+}
+
+// TestReadFileClampsOversizedLimit pins the cap the spec requires: a model may
+// ask for more than one page, but the result must still fit the tool result
+// budget, so the request is clamped rather than honoured.
+func TestReadFileClampsOversizedLimit(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "big.md"), strings.Repeat("汉", 20000))
+	reg := NewFileReadWriteWorkspaceRegistry(root, nil)
+
+	res, err := reg.Execute(t.Context(), domain.Agent{}, domain.ToolCall{
+		Name: "read_file", ID: "1",
+		Arguments: map[string]string{"path": "big.md", "limit": "99999"},
+	})
+	if err != nil {
+		t.Fatalf("read_file err = %v, want nil", err)
+	}
+	if got := len([]rune(res.Output)); got > toolResultBudgetRunes {
+		t.Fatalf("limit=99999 returned %d runes, must be clamped within %d", got, toolResultBudgetRunes)
+	}
+	if !strings.Contains(res.Output, "继续读用") {
+		t.Fatal("a clamped page still has more to read, so it must carry the hint")
+	}
+}

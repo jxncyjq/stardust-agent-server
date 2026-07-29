@@ -41,6 +41,22 @@ const (
 	// result to that cap, which would silently cut the page short and defeat
 	// pagination.
 	readFilePageRunes = 3500
+	// toolResultBudgetRunes mirrors runtime's maxToolResultChars (4000):
+	// appendToolResults hard-truncates any longer tool result from the front, so
+	// a read_file page plus everything appended to it (the subtree agents.md
+	// note, the repeat-read notice, the continuation hint) must fit inside this
+	// budget. Without that accounting the continuation hint — the one thing that
+	// tells the model how to read the rest — is what gets cut, which is exactly
+	// the failure pagination exists to prevent. Keep in sync with
+	// runtime.defaultMaxToolResultChars.
+	toolResultBudgetRunes = 4000
+	// minReadFilePageRunes floors the page so a large agents.md note can never
+	// squeeze the actual file content down to nothing.
+	minReadFilePageRunes = 500
+	// repeatNoticeMaxRunes bounds repeatNotice's rendered length (a fixed
+	// sentence plus a small count), reserved up front because whether the notice
+	// applies is only known after the page has been sliced.
+	repeatNoticeMaxRunes = 120
 )
 
 // paginateRunes returns the [offset, offset+limit) rune window of content, the
@@ -68,6 +84,35 @@ func paginateRunes(content string, offset, limit int) (string, int, int, error) 
 		return string(runes[offset:]), -1, total, nil
 	}
 	return string(runes[offset:end]), end, total, nil
+}
+
+// readFilePageBudget shrinks a requested page size so the whole read_file
+// result — page plus continuation hint, repeat-read notice and subtree
+// agents.md note — fits inside toolResultBudgetRunes. Without it a large
+// agents.md note pushes the result past runtime's maxToolResultChars, which
+// truncates from the front and takes the continuation hint with it, leaving the
+// model unable to page through the file: the very loop this feature removes.
+//
+// The hint's own length is measured exactly by formatting it with the largest
+// numbers it could carry (the file's total rune count in every slot) and the
+// real path, so a long path is charged for rather than assumed small. The page
+// never drops below minReadFilePageRunes, so an oversized note degrades the
+// page instead of erasing it.
+func readFilePageBudget(limit int, content, path string, noteRunes int) int {
+	if limit <= 0 || limit > readFilePageRunes {
+		limit = readFilePageRunes
+	}
+	total := len([]rune(content))
+	hint := fmt.Sprintf("…[已返回第 %d-%d 字，共 %d 字；继续读用 read_file(path=%q, offset=%d)]\n",
+		total, total, total, path, total)
+	budget := toolResultBudgetRunes - noteRunes - repeatNoticeMaxRunes - len([]rune(hint))
+	if budget < minReadFilePageRunes {
+		budget = minReadFilePageRunes
+	}
+	if limit > budget {
+		return budget
+	}
+	return limit
 }
 
 // intArg parses an optional integer tool argument. An absent or empty value
@@ -561,24 +606,29 @@ func readFileTool(ctx context.Context, root string, guard port.WorkspacePathGuar
 	if err != nil {
 		return domain.ToolResult{}, err
 	}
+	// Resolve the subtree agents.md note before slicing the page: it is the only
+	// step left that can fail, and its length has to be charged against the same
+	// budget as the page (see toolResultBudgetRunes) — an agents.md note can run
+	// to MaxFileChars, which alone dwarfs the budget.
+	note, err := subtreeAgentsNote(filepath.Dir(resolved), options)
+	if err != nil {
+		return domain.ToolResult{}, err
+	}
+	limit = readFilePageBudget(limit, output, call.Arguments["path"], len([]rune(note)))
 	page, next, total, err := paginateRunes(output, offset, limit)
 	if err != nil {
 		return domain.ToolResult{}, err
 	}
 	output = page
 	if next >= 0 {
-		output += fmt.Sprintf("\n…[已返回第 %d-%d 字，共 %d 字；继续读用 read_file(path=%q, offset=%d)]",
-			offset+1, next, total, call.Arguments["path"], next)
+		// Prepended, not appended: if anything downstream still overruns the
+		// budget, truncation cuts the tail, so a leading hint survives and the
+		// model can always see how to read the rest.
+		output = fmt.Sprintf("…[已返回第 %d-%d 字，共 %d 字；继续读用 read_file(path=%q, offset=%d)]\n",
+			offset+1, next, total, call.Arguments["path"], next) + output
 	}
-	// Resolve the subtree agents.md note first: it is the only step left that can
-	// fail, and readHistory.record must run only on the success path so a repeat
-	// count is never advanced for a read the model never received. record keys on
-	// the file content (before the note is appended) so the note's own
-	// once-per-task dedup does not perturb the unchanged-content comparison.
-	note, err := subtreeAgentsNote(filepath.Dir(resolved), options)
-	if err != nil {
-		return domain.ToolResult{}, err
-	}
+	// record keys on the page (before the notice and note are attached) so the
+	// note's own once-per-task dedup does not perturb the unchanged comparison.
 	if options.readHistory != nil {
 		if count, unchanged := options.readHistory.record(resolved, output); unchanged {
 			output = repeatNotice(count) + output
