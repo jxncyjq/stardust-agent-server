@@ -605,3 +605,109 @@ func TestRepeatNoticeCarriesCount(t *testing.T) {
 		t.Fatalf("notice should guide to search_content: %q", n)
 	}
 }
+
+func TestPaginateRunes(t *testing.T) {
+	content := strings.Repeat("汉", 1000) // 1000 runes, multibyte
+
+	page, next, total, err := paginateRunes(content, 0, 400)
+	if err != nil {
+		t.Fatalf("paginateRunes(0,400) err = %v, want nil", err)
+	}
+	if len([]rune(page)) != 400 || next != 400 || total != 1000 {
+		t.Fatalf("got page=%d next=%d total=%d, want 400/400/1000", len([]rune(page)), next, total)
+	}
+	// 末页：next 必须是 -1（读完），页长为剩余
+	page, next, _, err = paginateRunes(content, 800, 400)
+	if err != nil {
+		t.Fatalf("paginateRunes(800,400) err = %v, want nil", err)
+	}
+	if len([]rune(page)) != 200 || next != -1 {
+		t.Fatalf("last page: len=%d next=%d, want 200/-1", len([]rune(page)), next)
+	}
+	// 越界与负数：fail-loud
+	if _, _, _, err := paginateRunes(content, 1000, 400); err == nil {
+		t.Fatal("offset==total should error, not return empty content")
+	}
+	if _, _, _, err := paginateRunes(content, -1, 400); err == nil {
+		t.Fatal("negative offset should error")
+	}
+	// 不切半个汉字
+	page, _, _, _ = paginateRunes(content, 0, 1)
+	if page != "汉" {
+		t.Fatalf("page = %q, want a whole rune", page)
+	}
+}
+
+func TestReadFilePaginatesLongFile(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	body := strings.Repeat("汉", 5000) // > one page
+	writeFile(t, filepath.Join(root, "big.md"), body)
+	registry := NewFileReadWriteWorkspaceRegistry(root, nil)
+
+	first, err := registry.Execute(context.Background(), domain.Agent{Role: "developer"}, domain.ToolCall{
+		Name: "read_file", ID: "1", Arguments: map[string]string{"path": "big.md"},
+	})
+	if err != nil {
+		t.Fatalf("read_file(page1) err = %v", err)
+	}
+	if !strings.Contains(first.Output, "offset=3500") {
+		t.Fatalf("page1 must tell the model how to continue, got tail: %q", tailRunes(first.Output))
+	}
+	// 第二页：从提示给出的 offset 续读，且不应再要求 offset=3500
+	second, err := registry.Execute(context.Background(), domain.Agent{Role: "developer"}, domain.ToolCall{
+		Name: "read_file", ID: "2", Arguments: map[string]string{"path": "big.md", "offset": "3500"},
+	})
+	if err != nil {
+		t.Fatalf("read_file(page2) err = %v", err)
+	}
+	if strings.Contains(second.Output, "继续读用") {
+		t.Fatalf("last page must not advertise a next page, got tail: %q", tailRunes(second.Output))
+	}
+	// 越界 fail-loud
+	if _, err := registry.Execute(context.Background(), domain.Agent{Role: "developer"}, domain.ToolCall{
+		Name: "read_file", ID: "3", Arguments: map[string]string{"path": "big.md", "offset": "999999"},
+	}); err == nil {
+		t.Fatal("offset past end should error")
+	}
+}
+
+func TestReadFileShortFileHasNoContinuationHint(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "small.md"), "短文件")
+	registry := NewFileReadWriteWorkspaceRegistry(root, nil)
+	res, err := registry.Execute(context.Background(), domain.Agent{Role: "developer"}, domain.ToolCall{
+		Name: "read_file", ID: "1", Arguments: map[string]string{"path": "small.md"},
+	})
+	if err != nil {
+		t.Fatalf("read_file err = %v", err)
+	}
+	if !strings.Contains(res.Output, "短文件") || strings.Contains(res.Output, "继续读用") {
+		t.Fatalf("short file must return whole content with no hint, got %q", res.Output)
+	}
+}
+
+func TestReadFileBadOffsetArgumentIsRejected(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeFile(t, filepath.Join(root, "small.md"), "短文件")
+	registry := NewFileReadWriteWorkspaceRegistry(root, nil)
+	if _, err := registry.Execute(context.Background(), domain.Agent{Role: "developer"}, domain.ToolCall{
+		Name: "read_file", ID: "1", Arguments: map[string]string{"path": "small.md", "offset": "not-a-number"},
+	}); err == nil {
+		t.Fatal("non-numeric offset should error, not silently fall back to default")
+	}
+}
+
+// tailRunes returns the last 200 runes of s for readable failure messages.
+func tailRunes(s string) string {
+	r := []rune(s)
+	if len(r) <= 200 {
+		return s
+	}
+	return string(r[len(r)-200:])
+}

@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,7 +35,55 @@ const (
 	// searchContentReadChunk bounds how many bytes readFileContext consumes
 	// between context checks.
 	searchContentReadChunk = 32 * 1024
+	// readFilePageRunes is both the default and the maximum number of runes one
+	// read_file call returns. It is deliberately below runtime's
+	// maxToolResultChars (4000): appendToolResults truncates any longer tool
+	// result to that cap, which would silently cut the page short and defeat
+	// pagination.
+	readFilePageRunes = 3500
 )
+
+// paginateRunes returns the [offset, offset+limit) rune window of content, the
+// offset the caller should pass next (-1 when the window reached the end) and
+// the content's total rune count. Slicing by rune (not byte) keeps multibyte
+// text intact.
+//
+// An offset at or past the end is an error rather than an empty page: an empty
+// result reads to the model as "the file ends here", which is exactly the
+// misunderstanding this pagination exists to prevent.
+func paginateRunes(content string, offset, limit int) (string, int, int, error) {
+	runes := []rune(content)
+	total := len(runes)
+	if offset < 0 {
+		return "", 0, total, fmt.Errorf("read_file offset must not be negative, got %d", offset)
+	}
+	if offset >= total && total > 0 {
+		return "", 0, total, fmt.Errorf("read_file offset %d is past the end of the file (%d chars)", offset, total)
+	}
+	if limit <= 0 || limit > readFilePageRunes {
+		limit = readFilePageRunes
+	}
+	end := offset + limit
+	if end >= total {
+		return string(runes[offset:]), -1, total, nil
+	}
+	return string(runes[offset:end]), end, total, nil
+}
+
+// intArg parses an optional integer tool argument. An absent or empty value
+// yields def; a present but unparseable value is an error rather than a silent
+// fallback to the default, which would hide a malformed call from the model.
+func intArg(args map[string]string, name string, def int) (int, error) {
+	raw := strings.TrimSpace(args[name])
+	if raw == "" {
+		return def, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("read_file %s must be an integer, got %q: %w", name, raw, err)
+	}
+	return v, nil
+}
 
 // WorkspaceRegistryOption configures optional behavior of a workspace registry
 // built by NewWorkspaceRegistry, such as the per-directory agents.md injection
