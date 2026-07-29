@@ -2107,6 +2107,11 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// through to. It stays nil for the non-sqlite drivers, whose "store" is the
 	// in-memory scheduler itself and has nothing to persist to.
 	var taskSink task.TaskSink
+	// conversationTurns loads the session history injected into each per-agent
+	// task's prompt (agentruntime.AgentRuntimeResolverConfig.ConversationTurns).
+	// It stays nil for the non-sqlite drivers, mirroring messageStore/taskSink
+	// below — there is no durable session history to read back for those.
+	var conversationTurns agentruntime.ConversationTurnLister
 	// skillUsage is the shared usage sidecar: the skill System records activity on
 	// it as skills are selected into task context, and the Curator sweep reads it
 	// to age idle skills. Sharing one instance connects the two.
@@ -2117,6 +2122,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		messageStore = repo
 		sessionSearcher = repo
 		taskSink = repo
+		conversationTurns = repo
 		curator, err := skill.NewCurator(skill.CuratorConfig{Repository: repo, Usage: skillUsage})
 		if err != nil {
 			closeStore()
@@ -2205,17 +2211,18 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// also drives the background timeout sweep and the restart reconcile below.
 	approvalCoordinator := manualgate.NewApprovalCoordinator(toolGateStore, liveTasks, manualgate.WithCoordinatorSink(approvalSink))
 	resolver := agentruntime.NewAgentRuntimeResolver(agentruntime.AgentRuntimeResolverConfig{
-		Registry:     registry,
-		RootConfig:   cfg,
-		Audit:        auditLog,
-		Events:       workflowEvents,
-		TaskLedger:   taskLedger,
-		MessageStore: messageStore,
-		MaasFactory:  maasFactoryFromConfig(cfg.Maas),
-		Checkpoints:  checkpointStore,
-		ToolGate:     manualGate,
-		Logger:       logger,
-		SkillUsage:   skillUsage,
+		Registry:          registry,
+		RootConfig:        cfg,
+		Audit:             auditLog,
+		Events:            workflowEvents,
+		TaskLedger:        taskLedger,
+		MessageStore:      messageStore,
+		MaasFactory:       maasFactoryFromConfig(cfg.Maas),
+		Checkpoints:       checkpointStore,
+		ToolGate:          manualGate,
+		Logger:            logger,
+		SkillUsage:        skillUsage,
+		ConversationTurns: conversationTurns,
 	})
 	defaultMaas, err := adapter.NewMaasClientFromProfile(cfg.Maas, "")
 	if err != nil {

@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -749,6 +750,138 @@ func TestResolverAppliesDisabledTools(t *testing.T) {
 	}
 }
 
+// TestResolveTaskRunnerInjectsSessionHistory guards Task 2's serve wiring: a
+// resolver constructed with ConversationTurns must inject the loaded session
+// history into the prompt of every per-agent *Runtime it builds, so a GUI
+// task started with task.SessionID set actually sees prior turns rather than
+// starting from a blank slate. This is the end-to-end complement of
+// TestRecentTurnsForTaskExcludesCurrentTurn, which only exercises the loader
+// in isolation.
+func TestResolveTaskRunnerInjectsSessionHistory(t *testing.T) {
+	t.Parallel()
+
+	maas := &resolverCaptureMaas{response: "ok"}
+	lister := &fakeTurnLister{turns: []domain.ConversationTurn{
+		{ID: "t1:user", TaskID: "task-1", Role: domain.ConversationRoleUser, Content: "HISTORY-MARKER"},
+	}}
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
+			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep"},
+		}),
+		RootConfig: config.Config{
+			Runtime: config.RuntimeConfig{MaxToolRounds: 1},
+			Session: config.SessionConfig{DefaultRecentTurns: 6, MaxTurnChars: 6000},
+		},
+		Audit:  adapter.NewMemoryAuditLog(),
+		Events: adapter.NewMemoryEventBus(),
+		MaasFactory: func(string) (MaasRunnerFactoryResult, error) {
+			return MaasRunnerFactoryResult{Client: maas}, nil
+		},
+		ConversationTurns: lister,
+	})
+
+	task := domain.Task{ID: "task-9", SessionID: "s1", AgentID: "researcher", Input: "continue the plan"}
+	agent, runner, ok, err := resolver.ResolveTaskRunner(context.Background(), task)
+	if err != nil {
+		t.Fatalf("ResolveTaskRunner error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatalf("ResolveTaskRunner ok = false, want true")
+	}
+	if _, err := runner.RunTask(context.Background(), agent, task); err != nil {
+		t.Fatalf("RunTask error = %v, want nil", err)
+	}
+	if !strings.Contains(maas.prompt, "Recent conversation") {
+		t.Fatalf("RunTask prompt missing %q:\n%s", "Recent conversation", maas.prompt)
+	}
+	if !strings.Contains(maas.prompt, "HISTORY-MARKER") {
+		t.Fatalf("RunTask prompt missing %q:\n%s", "HISTORY-MARKER", maas.prompt)
+	}
+}
+
+type fakeTurnLister struct {
+	turns    []domain.ConversationTurn
+	err      error
+	gotLimit int
+}
+
+func (f *fakeTurnLister) ListConversationTurns(ctx context.Context, sessionID string, limit int) ([]domain.ConversationTurn, error) {
+	f.gotLimit = limit
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.turns, nil
+}
+
+func TestRecentTurnsForTaskExcludesCurrentTurn(t *testing.T) {
+	task := domain.Task{ID: "task-9", SessionID: "s1", AgentID: "a"}
+	lister := &fakeTurnLister{turns: []domain.ConversationTurn{
+		{ID: "t1:user", TaskID: "task-1", Role: domain.ConversationRoleUser, Content: "OLD-1"},
+		{ID: "t1:assistant", TaskID: "task-1", Role: domain.ConversationRoleAssistant, Content: "OLD-2"},
+		{ID: "task-9:user", TaskID: "task-9", Role: domain.ConversationRoleUser, Content: "CURRENT-TURN"},
+	}}
+	r := &AgentRuntimeResolver{conversationTurns: lister, rootConfig: config.Config{
+		Session: config.SessionConfig{DefaultRecentTurns: 6, MaxTurnChars: 6000},
+	}}
+	got, err := r.recentTurnsForTask(t.Context(), task)
+	if err != nil {
+		t.Fatalf("recentTurnsForTask err = %v, want nil", err)
+	}
+	for _, turn := range got {
+		if turn.TaskID == task.ID {
+			t.Fatalf("current turn must be excluded, got %+v", got)
+		}
+	}
+	if len(got) != 2 || got[0].Content != "OLD-1" {
+		t.Fatalf("got %+v, want the 2 older turns", got)
+	}
+}
+
+func TestRecentTurnsForTaskTruncatesAndFailsLoud(t *testing.T) {
+	task := domain.Task{ID: "task-9", SessionID: "s1", AgentID: "a"}
+	long := strings.Repeat("x", 100)
+	r := &AgentRuntimeResolver{
+		conversationTurns: &fakeTurnLister{turns: []domain.ConversationTurn{
+			{ID: "t1:user", TaskID: "task-1", Role: domain.ConversationRoleUser, Content: long},
+		}},
+		rootConfig: config.Config{Session: config.SessionConfig{DefaultRecentTurns: 6, MaxTurnChars: 10}},
+	}
+	got, err := r.recentTurnsForTask(t.Context(), task)
+	if err != nil {
+		t.Fatalf("err = %v", err)
+	}
+	if len([]rune(got[0].Content)) > 60 { // 10 + 截断标记裕量
+		t.Fatalf("content not truncated: %d runes", len([]rune(got[0].Content)))
+	}
+
+	// fail-loud：lister 出错必须返回 error，不得静默空注入
+	rErr := &AgentRuntimeResolver{
+		conversationTurns: &fakeTurnLister{err: fmt.Errorf("db down")},
+		rootConfig:        config.Config{Session: config.SessionConfig{DefaultRecentTurns: 6}},
+	}
+	if _, err := rErr.recentTurnsForTask(t.Context(), task); err == nil {
+		t.Fatalf("lister error must propagate (fail-loud), got nil")
+	}
+}
+
+func TestRecentTurnsForTaskSkipsWhenNoSessionOrLister(t *testing.T) {
+	task := domain.Task{ID: "task-9", AgentID: "a"} // SessionID 空
+	r := &AgentRuntimeResolver{
+		conversationTurns: &fakeTurnLister{turns: []domain.ConversationTurn{{ID: "x", TaskID: "t"}}},
+		rootConfig:        config.Config{Session: config.SessionConfig{DefaultRecentTurns: 6}},
+	}
+	got, err := r.recentTurnsForTask(t.Context(), task)
+	if err != nil || len(got) != 0 {
+		t.Fatalf("no SessionID → (nil,nil), got (%v,%v)", got, err)
+	}
+	// lister == nil 同样不注入、不 panic
+	rNil := &AgentRuntimeResolver{rootConfig: config.Config{Session: config.SessionConfig{DefaultRecentTurns: 6}}}
+	got, err = rNil.recentTurnsForTask(t.Context(), domain.Task{ID: "t", SessionID: "s1"})
+	if err != nil || len(got) != 0 {
+		t.Fatalf("nil lister → (nil,nil), got (%v,%v)", got, err)
+	}
+}
+
 type resolverCaptureMaas struct {
 	response string
 	prompt   string
@@ -776,4 +909,58 @@ func writeResolverContextFile(t *testing.T, root string, rel string, content str
 func writeResolverSkill(t *testing.T, root string, rel string, content string) {
 	t.Helper()
 	writeResolverContextFile(t, root, rel, content)
+}
+
+// TestRecentTurnsForTaskTrimsToLimit covers the tail-slice branch: when the
+// store returns more turns than the limit (none of them the task's own), only
+// the most recent `limit` survive — the newest ones, not the oldest.
+func TestRecentTurnsForTaskTrimsToLimit(t *testing.T) {
+	task := domain.Task{ID: "task-9", SessionID: "s1", AgentID: "a"}
+	limit := 3
+	turns := []domain.ConversationTurn{
+		{ID: "t1", TaskID: "task-1", Role: domain.ConversationRoleUser, Content: "OLDEST"},
+		{ID: "t2", TaskID: "task-2", Role: domain.ConversationRoleUser, Content: "MID-1"},
+		{ID: "t3", TaskID: "task-3", Role: domain.ConversationRoleUser, Content: "MID-2"},
+		{ID: "t4", TaskID: "task-4", Role: domain.ConversationRoleUser, Content: "NEWEST"},
+	}
+	r := &AgentRuntimeResolver{
+		conversationTurns: &fakeTurnLister{turns: turns},
+		rootConfig: config.Config{Session: config.SessionConfig{
+			DefaultRecentTurns: limit, MaxTurnChars: 6000,
+		}},
+	}
+	got, err := r.recentTurnsForTask(t.Context(), task)
+	if err != nil {
+		t.Fatalf("recentTurnsForTask err = %v, want nil", err)
+	}
+	if len(got) != limit {
+		t.Fatalf("len(got) = %d, want %d", len(got), limit)
+	}
+	if got[0].Content != "MID-1" || got[limit-1].Content != "NEWEST" {
+		t.Fatalf("want the newest %d turns [MID-1,MID-2,NEWEST], got %+v", limit, got)
+	}
+}
+
+// TestRecentTurnsForTaskNormalisesZeroMaxTurnChars pins the CLI-matching
+// behaviour for an explicitly-zero MaxTurnChars: truncateText treats <= 0 as
+// "no truncation", so without normalisation a zero would inject unbounded turn
+// bodies on the serve path while the CLI path capped them.
+func TestRecentTurnsForTaskNormalisesZeroMaxTurnChars(t *testing.T) {
+	task := domain.Task{ID: "task-9", SessionID: "s1", AgentID: "a"}
+	huge := strings.Repeat("x", 20000)
+	r := &AgentRuntimeResolver{
+		conversationTurns: &fakeTurnLister{turns: []domain.ConversationTurn{
+			{ID: "t1", TaskID: "task-1", Role: domain.ConversationRoleUser, Content: huge},
+		}},
+		rootConfig: config.Config{Session: config.SessionConfig{
+			DefaultRecentTurns: 6, MaxTurnChars: 0,
+		}},
+	}
+	got, err := r.recentTurnsForTask(t.Context(), task)
+	if err != nil {
+		t.Fatalf("recentTurnsForTask err = %v, want nil", err)
+	}
+	if len([]rune(got[0].Content)) >= len([]rune(huge)) {
+		t.Fatalf("MaxTurnChars=0 must fall back to the default cap, got %d runes", len([]rune(got[0].Content)))
+	}
 }
