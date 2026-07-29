@@ -53,6 +53,14 @@ const (
 	// minReadFilePageRunes floors the page so a large agents.md note can never
 	// squeeze the actual file content down to nothing.
 	minReadFilePageRunes = 500
+	// maxNoteRunesInResult caps how much of the subtree agents.md note may ride
+	// along with a page. The note is bounded only by ContextFiles.MaxFileChars
+	// (20000 by default) — five times the whole tool result budget — so capping
+	// the page alone cannot keep the result within budget: the note is appended
+	// after it. Truncating the note here is what makes the budget real, and it
+	// is announced in the output rather than left to runtime's silent front
+	// truncation, which would eat the page instead.
+	maxNoteRunesInResult = 800
 	// repeatNoticeMaxRunes bounds repeatNotice's rendered length (a fixed
 	// sentence plus a small count), reserved up front because whether the notice
 	// applies is only known after the page has been sliced.
@@ -105,6 +113,12 @@ func readFilePageBudget(limit int, content, path string, noteRunes int) int {
 	total := len([]rune(content))
 	hint := fmt.Sprintf("…[已返回第 %d-%d 字，共 %d 字；继续读用 read_file(path=%q, offset=%d)]\n",
 		total, total, total, path, total)
+	// noteRunes is charged at its capped size: capReadFileNote trims the note to
+	// maxNoteRunesInResult before it is appended, so charging the raw length here
+	// would shrink the page for space the note will not use.
+	if noteRunes > maxNoteRunesInResult {
+		noteRunes = maxNoteRunesInResult
+	}
 	budget := toolResultBudgetRunes - noteRunes - repeatNoticeMaxRunes - len([]rune(hint))
 	if budget < minReadFilePageRunes {
 		budget = minReadFilePageRunes
@@ -113,6 +127,21 @@ func readFilePageBudget(limit int, content, path string, noteRunes int) int {
 		return budget
 	}
 	return limit
+}
+
+// capReadFileNote trims a subtree agents.md note to maxNoteRunesInResult and
+// says so in the text it returns. The note is otherwise bounded only by
+// ContextFiles.MaxFileChars, which is far larger than the whole tool result
+// budget; leaving it uncapped would push the result past
+// maxToolResultChars and hand it to runtime's front truncation, which cuts the
+// file content and the continuation hint rather than the note.
+func capReadFileNote(note string) string {
+	runes := []rune(note)
+	if len(runes) <= maxNoteRunesInResult {
+		return note
+	}
+	return string(runes[:maxNoteRunesInResult]) +
+		fmt.Sprintf("\n…[本目录约定已截断，省略 %d 字；完整内容见该目录的 agents.md]", len(runes)-maxNoteRunesInResult)
 }
 
 // intArg parses an optional integer tool argument. An absent or empty value
@@ -614,6 +643,7 @@ func readFileTool(ctx context.Context, root string, guard port.WorkspacePathGuar
 	if err != nil {
 		return domain.ToolResult{}, err
 	}
+	note = capReadFileNote(note)
 	limit = readFilePageBudget(limit, output, call.Arguments["path"], len([]rune(note)))
 	page, next, total, err := paginateRunes(output, offset, limit)
 	if err != nil {

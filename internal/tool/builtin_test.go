@@ -725,7 +725,7 @@ func TestReadFileFitsBudgetWithAgentsNote(t *testing.T) {
 		t.Fatal(err)
 	}
 	// A big local-conventions file: this is what blew the budget.
-	writeFile(t, filepath.Join(sub, "agents.md"), strings.Repeat("约", 3000))
+	writeFile(t, filepath.Join(sub, "agents.md"), strings.Repeat("约", 19000))
 	writeFile(t, filepath.Join(sub, "big.md"), strings.Repeat("汉", 5000))
 
 	reg := NewFileReadWriteWorkspaceRegistry(root, nil,
@@ -747,6 +747,11 @@ func TestReadFileFitsBudgetWithAgentsNote(t *testing.T) {
 	if !strings.Contains(res.Output, "继续读用") {
 		t.Fatalf("continuation hint must survive alongside the note, got: %q", res.Output[:200])
 	}
+	// Trimming the note must be announced, not silent: the model should know the
+	// local conventions it is reading are partial.
+	if !strings.Contains(res.Output, "本目录约定已截断") {
+		t.Fatal("an oversized note must be trimmed visibly, not silently")
+	}
 }
 
 // TestReadFilePageBudgetShrinksForNote pins the arithmetic directly: a note
@@ -761,8 +766,17 @@ func TestReadFilePageBudgetShrinksForNote(t *testing.T) {
 	if shrunk >= readFilePageRunes || shrunk < minReadFilePageRunes {
 		t.Fatalf("2000-rune note: budget = %d, want shrunk but >= %d", shrunk, minReadFilePageRunes)
 	}
-	if got := readFilePageBudget(readFilePageRunes, content, "a.md", 99999); got != minReadFilePageRunes {
-		t.Fatalf("oversized note: budget = %d, want the floor %d", got, minReadFilePageRunes)
+	// An oversized note is capped at maxNoteRunesInResult before it is appended,
+	// so it is charged at that cap rather than its raw length: the page keeps a
+	// real budget instead of collapsing to the floor for space the note will
+	// never occupy.
+	capped := readFilePageBudget(readFilePageRunes, content, "a.md", 99999)
+	atCap := readFilePageBudget(readFilePageRunes, content, "a.md", maxNoteRunesInResult)
+	if capped != atCap {
+		t.Fatalf("oversized note: budget = %d, want it charged at the cap (%d)", capped, atCap)
+	}
+	if capped <= minReadFilePageRunes {
+		t.Fatalf("oversized note: budget = %d, want well above the floor %d", capped, minReadFilePageRunes)
 	}
 }
 
