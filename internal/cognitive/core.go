@@ -27,6 +27,21 @@ type Request struct {
 type BuiltContext struct {
 	Prompt     string
 	Compressed bool
+	// Blocks is the per-section size accounting of Prompt, in assembly order.
+	// Without it a prompt that grew (say from 3.4k to 11.6k chars) can only be
+	// observed as a total, leaving no way to attribute the growth to persona
+	// files, the capability catalog, conversation history or anything else.
+	// The sizes sum to the assembled prompt's rune count when no compressor
+	// rewrote it.
+	Blocks []BlockSize
+}
+
+// BlockSize is one named section of an assembled context prompt and its size in
+// runes (not bytes: the prompt is largely CJK, where a byte count would read as
+// roughly triple the real length).
+type BlockSize struct {
+	Name  string
+	Chars int
 }
 
 type MemoryProvider interface {
@@ -124,36 +139,37 @@ func (c *Core) BuildContext(ctx context.Context, req Request) (BuiltContext, err
 	if err != nil {
 		return BuiltContext{}, err
 	}
-	prompt := fmt.Sprintf(
+	var prompt string
+	var blocks []BlockSize
+	// add appends one named section and records its size, so the caller can
+	// attribute prompt growth to a specific block instead of only seeing a total.
+	add := func(name, body string) {
+		if body == "" {
+			return
+		}
+		prompt += body
+		blocks = append(blocks, BlockSize{Name: name, Chars: len([]rune(body))})
+	}
+	add("header", fmt.Sprintf(
 		"Agent: %s\nRole: %s\nTask: %s\nInput: %s\nTools: %s\n",
 		req.Agent.ID,
 		req.Agent.Role,
 		req.Task.ID,
 		req.Task.Input,
 		strings.Join(req.Tools, ", "),
-	)
-	if memoryBlock != "" {
-		prompt += memoryBlock
-	}
-	if conversationBlock := conversationBlock(req.ConversationTurns); conversationBlock != "" {
-		prompt += conversationBlock
-	}
+	))
+	add("memory", memoryBlock)
+	add("conversation", conversationBlock(req.ConversationTurns))
 	if c.contextFiles != "" {
-		prompt += "Runtime context files:\n"
-		prompt += c.contextFiles
-		prompt += "\n"
+		add("context_files", "Runtime context files:\n"+c.contextFiles+"\n")
 	}
-	if capabilityBlock != "" {
-		prompt += capabilityBlock
-	}
-	if catalogBlock != "" {
-		prompt += catalogBlock
-	}
+	add("capability", capabilityBlock)
+	add("catalog", catalogBlock)
 	result, err := c.compressor.Compress(ctx, prompt)
 	if err != nil {
 		return BuiltContext{}, fmt.Errorf("compress context: %w", err)
 	}
-	return BuiltContext{Prompt: result.Text, Compressed: result.Compressed}, nil
+	return BuiltContext{Prompt: result.Text, Compressed: result.Compressed, Blocks: blocks}, nil
 }
 
 func (c *Core) memoryBlock(ctx context.Context, req Request) (string, error) {
