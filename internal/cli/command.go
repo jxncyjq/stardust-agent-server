@@ -1911,6 +1911,10 @@ func buildDefaultRunnerConfig(
 		SkillUsage:       skillUsage,
 		DisabledTools:    runtimeSettings.DisabledTools,
 		Debug:            runtimeSettings.Debug,
+		// Compaction must be enabled here as well as on the resolver path: this
+		// config serves default-agent tasks, so wiring it only on the resolver
+		// left a configured threshold doing nothing for the GUI.
+		CompactTokenThreshold: runtimeSettings.CompactTokenThreshold,
 	}
 }
 
@@ -1951,6 +1955,13 @@ type defaultTaskRunner struct {
 	// per call. Both are resolved once at serve assembly (see resolveHomeDir).
 	toolMaxFileChars int
 	homeDir          string
+	// conversationTurns and sessionCfg drive cross-turn memory on this path.
+	// They must be wired here as well as on AgentRuntimeResolver: this runner
+	// serves every task whose AgentID is absent from the agent registry, which
+	// is every default-agent task (the GUI's own path). A nil lister is the
+	// legitimate "no session history configured" state.
+	conversationTurns agentruntime.ConversationTurnLister
+	sessionCfg        config.SessionConfig
 }
 
 // RunTask builds a fresh workspace tool registry rooted at task.WorkingDir (or
@@ -1979,6 +1990,11 @@ func (d *defaultTaskRunner) RunTask(ctx context.Context, agent domain.Agent, tas
 	agentruntime.RegisterMoAConsultTool(tools, d.maasResolver)
 	runtimeCfg := d.runtimeCfg
 	runtimeCfg.Tools = tools
+	turns, err := agentruntime.RecentTurnsForTask(ctx, d.conversationTurns, d.sessionCfg, task)
+	if err != nil {
+		return domain.TaskRun{}, err
+	}
+	runtimeCfg.ConversationTurns = turns
 	rt := agentruntime.NewRuntime(runtimeCfg)
 	rt.RegisterDelegateTaskTool(tools)
 	return rt.RunTask(ctx, agent, task)
@@ -2301,6 +2317,9 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		maasResolver:     maasProfileResolver{cfg: cfg.Maas},
 		toolMaxFileChars: cfg.ContextFiles.MaxFileChars,
 		homeDir:          resolveHomeDir(logger),
+		// Same store the resolver path uses, so both runners read one history.
+		conversationTurns: conversationTurns,
+		sessionCfg:        cfg.Session,
 	}
 	coordinator := agentruntime.NewCoordinator(agentruntime.CoordinatorConfig{
 		Agent: domain.Agent{
