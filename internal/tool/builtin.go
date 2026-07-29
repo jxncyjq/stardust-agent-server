@@ -475,7 +475,7 @@ func NewFileReadWriteWorkspaceRegistry(root string, audit port.AuditLog, opts ..
 func registerReadOnlyDescriptors(registry *Registry, absRoot string, guard port.WorkspacePathGuard, options workspaceRegistryOptions) {
 	registry.RegisterDescriptor(Descriptor{
 		Name:        "read_file",
-		Description: fmt.Sprintf("Read a UTF-8 text file inside the workspace root (%s). The path argument can be relative (resolved against workspace root) or absolute (must be within workspace root).", absRoot),
+		Description: fmt.Sprintf("Read a UTF-8 text file inside the workspace root (%s). The path argument can be relative (resolved against workspace root) or absolute (must be within workspace root). Long files are returned one page at a time: pass offset to continue reading where the previous page ended.", absRoot),
 		RiskLevel:   "low",
 		Timeout:     2 * time.Second,
 		Group:       "files",
@@ -483,7 +483,9 @@ func registerReadOnlyDescriptors(registry *Registry, absRoot string, guard port.
 			"type":     "object",
 			"required": []string{"path"},
 			"properties": map[string]any{
-				"path": map[string]any{"type": "string", "description": fmt.Sprintf("File path relative to workspace root (%s) or absolute path within workspace root.", absRoot)},
+				"path":   map[string]any{"type": "string", "description": fmt.Sprintf("File path relative to workspace root (%s) or absolute path within workspace root.", absRoot)},
+				"offset": map[string]any{"type": "number", "description": "Start reading at this character (rune) offset. Defaults to 0. Use the offset printed at the end of a truncated page to read the rest."},
+				"limit":  map[string]any{"type": "number", "description": fmt.Sprintf("Maximum characters to return, capped at %d (the default).", readFilePageRunes)},
 			},
 		},
 	}, HandlerFunc(func(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
@@ -539,8 +541,10 @@ func readFileTool(ctx context.Context, root string, guard port.WorkspacePathGuar
 	defer file.Close()
 	// Cap how much of a file enters context. A read_file with no limit lets a
 	// single huge file blow up the prompt; read one byte past the cap to detect
-	// (and flag) truncation.
-	const maxReadFileBytes = 256 * 1024
+	// (and flag) truncation. Raised from 256KB to 512KB now that pagination
+	// lets the model reach any part of that range via offset instead of only
+	// ever seeing the front of the file.
+	const maxReadFileBytes = 512 * 1024
 	data, err := io.ReadAll(io.LimitReader(file, maxReadFileBytes+1))
 	if err != nil {
 		return domain.ToolResult{}, fmt.Errorf("read file: %w", err)
@@ -548,6 +552,23 @@ func readFileTool(ctx context.Context, root string, guard port.WorkspacePathGuar
 	output := string(data)
 	if len(data) > maxReadFileBytes {
 		output = string(data[:maxReadFileBytes]) + fmt.Sprintf("\n…[truncated: file exceeds %d bytes]", maxReadFileBytes)
+	}
+	offset, err := intArg(call.Arguments, "offset", 0)
+	if err != nil {
+		return domain.ToolResult{}, err
+	}
+	limit, err := intArg(call.Arguments, "limit", readFilePageRunes)
+	if err != nil {
+		return domain.ToolResult{}, err
+	}
+	page, next, total, err := paginateRunes(output, offset, limit)
+	if err != nil {
+		return domain.ToolResult{}, err
+	}
+	output = page
+	if next >= 0 {
+		output += fmt.Sprintf("\n…[已返回第 %d-%d 字，共 %d 字；继续读用 read_file(path=%q, offset=%d)]",
+			offset+1, next, total, call.Arguments["path"], next)
 	}
 	// Resolve the subtree agents.md note first: it is the only step left that can
 	// fail, and readHistory.record must run only on the success path so a repeat
