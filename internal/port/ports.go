@@ -49,11 +49,16 @@ const (
 // ToolCallID only on tool — and required there, since an OpenAI-compatible
 // provider rejects a tool message it cannot pair with a preceding tool call.
 type InferenceMessage struct {
-	Role       string            `json:"role"`
-	Content    string            `json:"content"`
-	Images     []string          `json:"images,omitempty"`
-	ToolCalls  []domain.ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string            `json:"tool_call_id,omitempty"`
+	Role    string `json:"role"`
+	Content string `json:"content"`
+	// StablePrefixLen marks how many leading runes of Content form a stable cache
+	// prefix. Only meaningful on the first user message (the task framing); an
+	// adapter that supports prompt caching places a cache_control breakpoint at
+	// that boundary. Zero disables it, keeping the message byte-identical.
+	StablePrefixLen int
+	Images          []string          `json:"images,omitempty"`
+	ToolCalls       []domain.ToolCall `json:"tool_calls,omitempty"`
+	ToolCallID      string            `json:"tool_call_id,omitempty"`
 }
 
 // Validate enforces the request's shape before it reaches an adapter. Prompt and

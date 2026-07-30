@@ -358,14 +358,19 @@ func (c *HTTPMaasClient) openAIChatMessages(req port.InferenceRequest) ([]openAI
 		}
 		return []openAIChatRequestMessage{{Role: "user", Content: content}}, nil
 	}
-	// A multi-turn exchange is append-only, so its leading messages are already
-	// a stable prefix for providers that cache automatically; no explicit cache
-	// breakpoint is emitted here.
+	// A multi-turn exchange is append-only, so message[0]'s stable task framing
+	// carries its own StablePrefixLen and gets an explicit cache breakpoint here;
+	// every later user turn has StablePrefixLen 0 and is unaffected, staying
+	// append-only for providers that cache automatically.
 	out := make([]openAIChatRequestMessage, 0, len(req.Messages))
 	for i, msg := range req.Messages {
 		switch msg.Role {
 		case port.RoleUser:
-			content, err := openAIChatUserContent(msg.Content, msg.Images, 0)
+			stablePrefixLen := 0
+			if c.enablePromptCache {
+				stablePrefixLen = msg.StablePrefixLen
+			}
+			content, err := openAIChatUserContent(msg.Content, msg.Images, stablePrefixLen)
 			if err != nil {
 				return nil, fmt.Errorf("build user content for message %d: %w", i, err)
 			}

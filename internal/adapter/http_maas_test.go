@@ -311,3 +311,43 @@ func TestCachedTokensIsProviderNeutral(t *testing.T) {
 		})
 	}
 }
+
+func TestOpenAIChatMessagesCacheBreakpoint(t *testing.T) {
+	c := &HTTPMaasClient{enablePromptCache: true}
+	msgs, err := c.openAIChatMessages(port.InferenceRequest{
+		Messages: []port.InferenceMessage{{
+			Role: port.RoleUser, Content: "STABLEvolatile", StablePrefixLen: 6,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("openAIChatMessages: %v", err)
+	}
+	parts, ok := msgs[0].Content.([]contentPart)
+	if !ok {
+		t.Fatalf("content not []contentPart: %T", msgs[0].Content)
+	}
+	if len(parts) != 2 {
+		t.Fatalf("parts = %d, want 2", len(parts))
+	}
+	if parts[0].Text != "STABLE" || parts[0].CacheControl == nil || parts[0].CacheControl.Type != "ephemeral" {
+		t.Fatalf("first part not a cached stable prefix: %+v", parts[0])
+	}
+	if parts[1].Text != "volatile" || parts[1].CacheControl != nil {
+		t.Fatalf("tail wrong: %+v", parts[1])
+	}
+}
+
+func TestOpenAIChatMessagesCacheDisabled(t *testing.T) {
+	c := &HTTPMaasClient{enablePromptCache: false}
+	msgs, err := c.openAIChatMessages(port.InferenceRequest{
+		Messages: []port.InferenceMessage{{
+			Role: port.RoleUser, Content: "STABLEvolatile", StablePrefixLen: 6,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("openAIChatMessages: %v", err)
+	}
+	if s, ok := msgs[0].Content.(string); !ok || s != "STABLEvolatile" {
+		t.Fatalf("cache disabled must keep plain string, got %T %v", msgs[0].Content, msgs[0].Content)
+	}
+}
