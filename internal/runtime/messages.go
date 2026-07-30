@@ -36,6 +36,16 @@ func newConversation(basePrompt string, images []string) *conversation {
 	}}}
 }
 
+// pinCachePrefix marks the first message's stable cache-prefix rune length, the
+// boundary the adapter turns into a prompt-cache breakpoint. No-op on an empty
+// exchange or a non-positive length. Kept separate from newConversation so its
+// many callers stay unchanged.
+func (c *conversation) pinCachePrefix(n int) {
+	if n > 0 && len(c.messages) > 0 {
+		c.messages[0].StablePrefixLen = n
+	}
+}
+
 // appendAssistant records the model's turn. calls may be empty (a plain textual
 // answer) and text may be empty (a pure tool-call turn).
 func (c *conversation) appendAssistant(text string, calls []domain.ToolCall) {

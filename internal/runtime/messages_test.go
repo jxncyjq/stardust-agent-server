@@ -32,6 +32,14 @@ func TestConversationRecordsAssistantToolCallsThenResults(t *testing.T) {
 	}
 }
 
+func TestPinCachePrefix(t *testing.T) {
+	convo := newConversation("framing", nil)
+	convo.pinCachePrefix(4)
+	if convo.messages[0].StablePrefixLen != 4 {
+		t.Fatalf("StablePrefixLen = %d, want 4", convo.messages[0].StablePrefixLen)
+	}
+}
+
 // The 152-read incident in one assertion: repeated identical calls must stay
 // visible as separate turns. Collapsing them by (name, arguments) — the old
 // behaviour — is what made every round look identical to the model.

@@ -403,7 +403,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 
 	effTools := r.effectiveTools(task)
 	catalog := r.buildCatalog(effTools)
-	prompt, err := r.buildPrompt(ctx, agent, task, catalog)
+	prompt, stablePrefixLen, err := r.buildPrompt(ctx, agent, task, catalog)
 	if err != nil {
 		return domain.TaskRun{}, err
 	}
@@ -415,6 +415,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	// drives the provider prompt-cache breakpoint (InferenceRequest.StablePrefixLen).
 	basePrompt := prompt
 	convo := newConversation(basePrompt, task.Images)
+	convo.pinCachePrefix(stablePrefixLen)
 	resp, err := r.generate(ctx, requestID, task.ID, convo, effTools)
 	if err != nil {
 		r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInferenceError)
@@ -892,7 +893,7 @@ func (noopAuditLog) Events() ([]domain.AuditEvent, error) {
 	return nil, nil
 }
 
-func (r *Runtime) buildPrompt(ctx context.Context, agent domain.Agent, task domain.Task, catalog *capability.Catalog) (string, error) {
+func (r *Runtime) buildPrompt(ctx context.Context, agent domain.Agent, task domain.Task, catalog *capability.Catalog) (string, int, error) {
 	toolNames := r.toolNames()
 	if r.contextBuilder != nil {
 		built, err := r.contextBuilder.BuildContext(ctx, cognitive.Request{
@@ -905,7 +906,7 @@ func (r *Runtime) buildPrompt(ctx context.Context, agent domain.Agent, task doma
 			Catalog: catalog,
 		})
 		if err != nil {
-			return "", fmt.Errorf("build cognitive context: %w", err)
+			return "", 0, fmt.Errorf("build cognitive context: %w", err)
 		}
 		if r.debug {
 			r.logContextBlocks(task.ID, built.Blocks)
@@ -913,12 +914,12 @@ func (r *Runtime) buildPrompt(ctx context.Context, agent domain.Agent, task doma
 		// The hint is only needed on the Core path: Core renders a "Tools:" line
 		// that, when empty under the lazy protocol, can mislead the model into
 		// believing no tools exist. The plain paths below carry no such line.
-		return built.Prompt + r.lazyToolHint(toolNames), nil
+		return built.Prompt + r.lazyToolHint(toolNames), built.StablePrefixLen, nil
 	}
 	if r.contextPrefix != "" {
-		return r.contextPrefix + "\n\nTask input:\n" + task.Input, nil
+		return r.contextPrefix + "\n\nTask input:\n" + task.Input, 0, nil
 	}
-	return task.Input, nil
+	return task.Input, 0, nil
 }
 
 // toolNames lists the registered real tool names (excluding the lazy-protocol
