@@ -254,6 +254,33 @@ func TestBuildContextStablePrefixAcrossTasks(t *testing.T) {
 	}
 }
 
+// TestPrefetchBlockFencesRetrievedMemory pins the quarantine contract for
+// retrieved episodic memory: it must be wrapped in a <memory-context> fence
+// with an explicit "NOT new user input" system note and a per-entry
+// source:<id> tag, so the model cannot confuse retrieved memory with real
+// user input and each entry stays traceable to its origin.
+func TestPrefetchBlockFencesRetrievedMemory(t *testing.T) {
+	t.Parallel()
+
+	fake := fakeMemoryProvider{prefetched: []domain.MemoryEntry{
+		{ID: "episodic-abc", Content: "团体保险保全服务办理成功"},
+	}}
+	core := NewCore(NoopCompressor{}).WithMemory(fake)
+	built, err := core.BuildContext(context.Background(), Request{
+		Agent: domain.Agent{ID: "a1"},
+		Task:  domain.Task{ID: "t1", Input: "保全"},
+	})
+	if err != nil {
+		t.Fatalf("BuildContext() error = %v, want nil", err)
+	}
+	p := built.Prompt
+	for _, want := range []string{"<memory-context>", "</memory-context>", "NOT", "source:episodic-abc", "团体保险保全服务办理成功"} {
+		if !strings.Contains(p, want) {
+			t.Fatalf("BuildContext() prompt missing %q:\n%s", want, p)
+		}
+	}
+}
+
 type fakeMemoryProvider struct {
 	systemBlock string
 	prefetched  []domain.MemoryEntry
