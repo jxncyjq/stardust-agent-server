@@ -2236,6 +2236,25 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// Suspended->Running so the coordinator's resume scan re-dispatches it. It
 	// also drives the background timeout sweep and the restart reconcile below.
 	approvalCoordinator := manualgate.NewApprovalCoordinator(toolGateStore, liveTasks, manualgate.WithCoordinatorSink(approvalSink))
+	// defaultMaas is built here (moved ahead of its previous position below the
+	// resolver) so episodeRecorder can use it as the distillation client — the
+	// resolver needs episodeRecorder already constructed to wire it into
+	// AgentRuntimeResolverConfig.EpisodeRecorder.
+	defaultMaas, err := adapter.NewMaasClientFromProfile(cfg.Maas, "")
+	if err != nil {
+		closeStore()
+		return ServeResult{}, err
+	}
+	if defaultMaas == nil {
+		defaultMaas = adapter.NewRecordingMaas(cfg.Runtime.DemoResponse)
+	}
+	// episodeRecorder distills each resolver-built per-agent runtime's finished
+	// tasks (success/failure, via runtime.Config.EpisodeRecorder's hooks) into
+	// the episodic store, off the task's critical path. It writes into the SAME
+	// episodicStore instance the cognitive memory provider (episodicMemory,
+	// below) reads from, so a recorded episode is retrievable by later tasks'
+	// Prefetch.
+	episodeRecorder := newEpisodeRecorder(defaultMaas, episodicStore, logger)
 	resolver := agentruntime.NewAgentRuntimeResolver(agentruntime.AgentRuntimeResolverConfig{
 		Registry:          registry,
 		RootConfig:        cfg,
@@ -2249,15 +2268,8 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		Logger:            logger,
 		SkillUsage:        skillUsage,
 		ConversationTurns: conversationTurns,
+		EpisodeRecorder:   episodeRecorder,
 	})
-	defaultMaas, err := adapter.NewMaasClientFromProfile(cfg.Maas, "")
-	if err != nil {
-		closeStore()
-		return ServeResult{}, err
-	}
-	if defaultMaas == nil {
-		defaultMaas = adapter.NewRecordingMaas(cfg.Runtime.DemoResponse)
-	}
 	defaultDisplay := tuiDisplayConfig(cfg.Maas, "", "")
 	defaultContext, err := buildRunContextPrefix(ctx, cfg, false, defaultDisplay.ModelName)
 	if err != nil {

@@ -68,6 +68,10 @@ type AgentRuntimeResolverConfig struct {
 	// serve path without a session store, and tests. Without it a GUI task runs
 	// with no cross-turn memory at all.
 	ConversationTurns ConversationTurnLister
+	// EpisodeRecorder distills each resolver-built runtime's finished tasks
+	// into the episodic store, mirroring Config.EpisodeRecorder on the default
+	// runtime. Nil disables episodic recording for those runtimes.
+	EpisodeRecorder EpisodeRecorder
 }
 
 type AgentRuntimeResolver struct {
@@ -83,6 +87,7 @@ type AgentRuntimeResolver struct {
 	logger            *slog.Logger
 	skillUsage        SkillUsageRecorder
 	conversationTurns ConversationTurnLister
+	episodeRecorder   EpisodeRecorder
 }
 
 func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolver {
@@ -99,6 +104,7 @@ func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolv
 		logger:            cfg.Logger,
 		skillUsage:        cfg.SkillUsage,
 		conversationTurns: cfg.ConversationTurns,
+		episodeRecorder:   cfg.EpisodeRecorder,
 	}
 }
 
@@ -257,6 +263,7 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		SkillUsage:            r.skillUsage,
 		DisabledTools:         agentCfg.DisabledTools,
 		ConversationTurns:     recentTurns,
+		EpisodeRecorder:       r.episodeRecorder,
 	})
 	return agent, runner, true, nil
 }
