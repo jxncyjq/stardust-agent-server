@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/evolution"
@@ -491,6 +492,135 @@ func (r *SQLiteRepository) ListConversationTurns(ctx context.Context, sessionID 
 		reversed[i], reversed[j] = reversed[j], reversed[i]
 	}
 	return reversed, nil
+}
+
+// AddEpisodicMemory persists one episodic memory entry and its full-text index
+// row in a single transaction, so episodic_memory_fts never drifts from the
+// source table.
+func (r *SQLiteRepository) AddEpisodicMemory(ctx context.Context, entry domain.MemoryEntry) error {
+	tx, err := r.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin add episodic memory %q: %w", entry.ID, err)
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO episodic_memory (id, agent_id, task_id, content, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, entry.ID, entry.AgentID, entry.TaskID, entry.Content, formatTime(entry.CreatedAt)); err != nil {
+		return fmt.Errorf("insert episodic memory %q: %w", entry.ID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		INSERT INTO episodic_memory_fts (content, entry_id, agent_id, task_id, created_at)
+		VALUES (?, ?, ?, ?, ?)
+	`, entry.Content, entry.ID, entry.AgentID, entry.TaskID, formatTime(entry.CreatedAt)); err != nil {
+		return fmt.Errorf("index episodic memory %q: %w", entry.ID, err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit add episodic memory %q: %w", entry.ID, err)
+	}
+	return nil
+}
+
+// SearchEpisodicMemory returns up to topK episodic entries. A blank query
+// returns the most recent entries; a non-blank query runs an FTS5 MATCH built
+// from its tokens (see episodicFTSQuery) so arbitrary task input never produces
+// an FTS5 syntax error. topK <= 0 returns nil.
+func (r *SQLiteRepository) SearchEpisodicMemory(ctx context.Context, query string, topK int) ([]domain.MemoryEntry, error) {
+	if topK <= 0 {
+		return nil, nil
+	}
+	match := episodicFTSQuery(query)
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if match == "" {
+		rows, err = r.db.QueryContext(ctx, `
+			SELECT id, agent_id, task_id, content, created_at
+			FROM episodic_memory
+			ORDER BY created_at DESC, id DESC
+			LIMIT ?
+		`, topK)
+	} else {
+		rows, err = r.db.QueryContext(ctx, `
+			SELECT e.id, e.agent_id, e.task_id, e.content, e.created_at
+			FROM episodic_memory_fts f
+			JOIN episodic_memory e ON e.id = f.entry_id
+			WHERE episodic_memory_fts MATCH ?
+			ORDER BY rank
+			LIMIT ?
+		`, match, topK)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("search episodic memory: %w", err)
+	}
+	defer rows.Close()
+	var out []domain.MemoryEntry
+	for rows.Next() {
+		var (
+			e         domain.MemoryEntry
+			createdAt string
+		)
+		if err := rows.Scan(&e.ID, &e.AgentID, &e.TaskID, &e.Content, &createdAt); err != nil {
+			return nil, fmt.Errorf("scan episodic memory: %w", err)
+		}
+		parsedCreatedAt, err := parseTime(createdAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse episodic memory %q created_at: %w", e.ID, err)
+		}
+		e.CreatedAt = parsedCreatedAt
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate episodic memory: %w", err)
+	}
+	return out, nil
+}
+
+// episodicFTSQuery builds a safe FTS5 MATCH expression from arbitrary text.
+// It extracts alphanumeric / CJK runs (discarding everything else, so
+// punctuation and FTS5 operators like " ; * - in the raw input can never form
+// a bad query), then breaks each run into its overlapping 3-character windows
+// and ORs every window together as a quoted term. Returns "" when the input
+// has no usable window, so the caller falls back to a recent-first scan
+// instead of matching everything.
+//
+// The 3-character window mirrors episodic_memory_fts's own tokenize='trigram'
+// index (see schemaStatements): FTS5 MATCH is token equality, not substring,
+// so a query would otherwise need to land on an exact trigram to match. A run
+// shorter than 3 characters (e.g. a lone CJK word or a short acronym) has no
+// full window, so it is kept as a single quoted term instead — it may not hit
+// under the trigram index, but it still cannot produce a syntax error.
+func episodicFTSQuery(raw string) string {
+	var runs []string
+	var b strings.Builder
+	flush := func() {
+		if b.Len() > 0 {
+			runs = append(runs, b.String())
+			b.Reset()
+		}
+	}
+	for _, r := range raw {
+		if unicode.IsLetter(r) || unicode.IsNumber(r) {
+			b.WriteRune(r)
+		} else {
+			flush()
+		}
+	}
+	flush()
+
+	var terms []string
+	for _, run := range runs {
+		chars := []rune(run)
+		if len(chars) < 3 {
+			terms = append(terms, `"`+run+`"`)
+			continue
+		}
+		for i := 0; i+3 <= len(chars); i++ {
+			terms = append(terms, `"`+string(chars[i:i+3])+`"`)
+		}
+	}
+	return strings.Join(terms, " OR ")
 }
 
 // execer is the ExecContext subset shared by *sql.DB and *sql.Tx, so the FTS
@@ -1904,11 +2034,21 @@ var schemaStatements = []string{
 	// backing Lane B similarity retrieval. Non-content columns are UNINDEXED
 	// (stored for retrieval, not tokenized). Rows are written alongside
 	// episodic_memory in the same transaction so the index never drifts.
+	//
+	// tokenize='trigram' instead of the FTS5 default (unicode61): unicode61
+	// groups an unbroken run of CJK ideographs into a single opaque token (a
+	// whole Chinese sentence with no ASCII/space boundaries becomes ONE token),
+	// so MATCH — which is token-equality, not substring — could never find a
+	// query for part of that sentence. The trigram tokenizer indexes every
+	// overlapping 3-character window instead, which works uniformly for CJK and
+	// Latin text and lets episodicFTSQuery (below) do substring-style recall by
+	// OR-ing the query's own trigrams.
 	`CREATE VIRTUAL TABLE IF NOT EXISTS episodic_memory_fts USING fts5(
 		content,
 		entry_id UNINDEXED,
 		agent_id UNINDEXED,
 		task_id UNINDEXED,
-		created_at UNINDEXED
+		created_at UNINDEXED,
+		tokenize = 'trigram'
 	)`,
 }
