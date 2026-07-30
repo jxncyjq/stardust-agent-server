@@ -37,7 +37,9 @@ var ErrAgentSessionNotFound = errors.New("agent session not found")
 // Version 5 added the agent_sessions.mode column for persisting manual/auto mode.
 // Version 6 added the agent_sessions.working_dir column for persisting the host
 // filesystem directory a session is bound to.
-const CurrentSchemaVersion = 6
+// Version 7 added the episodic_memory table and episodic_memory_fts FTS5 index
+// backing Lane B episodic memory.
+const CurrentSchemaVersion = 7
 
 type WorkflowState struct {
 	Definition workflow.Definition `json:"definition"`
@@ -1890,5 +1892,23 @@ var schemaStatements = []string{
 		score REAL NOT NULL DEFAULT 0,
 		quality_drop REAL NOT NULL DEFAULT 0,
 		created_at TEXT NOT NULL
+	)`,
+	`CREATE TABLE IF NOT EXISTS episodic_memory (
+		id TEXT PRIMARY KEY,
+		agent_id TEXT NOT NULL,
+		task_id TEXT NOT NULL,
+		content TEXT NOT NULL,
+		created_at TEXT NOT NULL
+	)`,
+	// episodic_memory_fts is a full-text index over episodic memory content,
+	// backing Lane B similarity retrieval. Non-content columns are UNINDEXED
+	// (stored for retrieval, not tokenized). Rows are written alongside
+	// episodic_memory in the same transaction so the index never drifts.
+	`CREATE VIRTUAL TABLE IF NOT EXISTS episodic_memory_fts USING fts5(
+		content,
+		entry_id UNINDEXED,
+		agent_id UNINDEXED,
+		task_id UNINDEXED,
+		created_at UNINDEXED
 	)`,
 }

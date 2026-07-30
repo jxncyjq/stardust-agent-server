@@ -1007,6 +1007,29 @@ func TestSQLiteListSkillsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSchemaHasEpisodicMemoryTables(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := openTestSQLiteRepository(t)
+
+	for _, name := range []string{"episodic_memory", "episodic_memory_fts"} {
+		var got string
+		if err := repo.db.QueryRowContext(ctx,
+			`SELECT name FROM sqlite_master WHERE name = ?`, name).Scan(&got); err != nil {
+			t.Fatalf("table %q not found: %v", name, err)
+		}
+	}
+
+	var version int
+	if err := repo.db.QueryRowContext(ctx,
+		`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
+		t.Fatalf("read schema version: %v", err)
+	}
+	if version < 7 {
+		t.Fatalf("schema version = %d, want >= 7", version)
+	}
+}
+
 func openTestSQLiteRepository(t *testing.T) *SQLiteRepository {
 	t.Helper()
 	repo, err := OpenSQLite(context.Background(), filepath.Join(t.TempDir(), "agent.db"))
