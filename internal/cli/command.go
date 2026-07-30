@@ -2128,6 +2128,10 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// It stays nil for the non-sqlite drivers, mirroring messageStore/taskSink
 	// below — there is no durable session history to read back for those.
 	var conversationTurns agentruntime.ConversationTurnLister
+	// episodicStore backs the cognitive memory provider's Add/Search calls. It
+	// stays nil here for the non-sqlite drivers and is given an in-memory
+	// fallback below, mirroring taskSink/conversationTurns/messageStore above.
+	var episodicStore memory.EpisodicStore
 	// skillUsage is the shared usage sidecar: the skill System records activity on
 	// it as skills are selected into task context, and the Curator sweep reads it
 	// to age idle skills. Sharing one instance connects the two.
@@ -2139,6 +2143,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		sessionSearcher = repo
 		taskSink = repo
 		conversationTurns = repo
+		episodicStore = memory.NewPersistentEpisodicStore(repo)
 		curator, err := skill.NewCurator(skill.CuratorConfig{Repository: repo, Usage: skillUsage})
 		if err != nil {
 			closeStore()
@@ -2148,6 +2153,11 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	}
 	if auditLog == nil {
 		auditLog = adapter.NewMemoryAuditLog()
+	}
+	if episodicStore == nil {
+		// 非 sqlite 部署：无持久后端，退回进程内存 episodic 存储（重启即失，
+		// 与 taskSink/conversationTurns 对非 sqlite 驱动留空的语义一致）。
+		episodicStore = memory.NewEpisodicMemoryStore(adapter.KeywordEmbeddingProvider{})
 	}
 
 	logger := opts.Logger
@@ -2259,7 +2269,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// it, and the cognitive Core (L4) reads them back when building context, so
 	// failures distilled by the background scan resurface as capability hints.
 	capabilityStore := memory.NewCapabilityMemoryStore()
-	episodicMemory := newEpisodicMemoryProvider(memory.NewEpisodicMemoryStore(adapter.KeywordEmbeddingProvider{}), 3)
+	episodicMemory := newEpisodicMemoryProvider(episodicStore, 3)
 	gepCycle := evolution.NewGepCycle(evolution.GepCycleConfig{
 		Extractor:       evolution.NewSignalExtractor(),
 		Distiller:       evolution.DefaultDistillationOperator{},
