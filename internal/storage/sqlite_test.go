@@ -1080,6 +1080,22 @@ func TestEpisodicMemoryAddAndSearch(t *testing.T) {
 		t.Fatalf("topK=0 → want (nil,nil), got (%v,%v)", none, err)
 	}
 
+	// 2 字 CJK 查询命中更长内容子串（trigram 单独做不到，靠 LIKE 补）
+	add("e3", "保全服务办理流程说明")
+	short, err := repo.SearchEpisodicMemory(ctx, "保全", 5)
+	if err != nil {
+		t.Fatalf("SearchEpisodicMemory short CJK: %v", err)
+	}
+	foundE3 := false
+	for _, h := range short {
+		if h.ID == "e3" {
+			foundE3 = true
+		}
+	}
+	if !foundE3 {
+		t.Fatalf(`2-char CJK query "保全" must hit content substring, got %+v`, short)
+	}
+
 	// 含 FTS5 特殊字符的查询不得报错（稳健性）
 	if _, err := repo.SearchEpisodicMemory(ctx, `"; DROP -- (保全)*`, 5); err != nil {
 		t.Fatalf("special-char query must not error: %v", err)

@@ -522,19 +522,20 @@ func (r *SQLiteRepository) AddEpisodicMemory(ctx context.Context, entry domain.M
 }
 
 // SearchEpisodicMemory returns up to topK episodic entries. A blank query
-// returns the most recent entries; a non-blank query runs an FTS5 MATCH built
-// from its tokens (see episodicFTSQuery) so arbitrary task input never produces
-// an FTS5 syntax error. topK <= 0 returns nil.
+// returns the most recent entries; a non-blank query matches via a hybrid of
+// an FTS5 trigram MATCH and LIKE substring clauses built from its tokens (see
+// episodicSearchTerms) so arbitrary task input never produces an FTS5 syntax
+// error. topK <= 0 returns nil.
 func (r *SQLiteRepository) SearchEpisodicMemory(ctx context.Context, query string, topK int) ([]domain.MemoryEntry, error) {
 	if topK <= 0 {
 		return nil, nil
 	}
-	match := episodicFTSQuery(query)
+	ftsExpr, likeTerms := episodicSearchTerms(query)
 	var (
 		rows *sql.Rows
 		err  error
 	)
-	if match == "" {
+	if ftsExpr == "" && len(likeTerms) == 0 {
 		rows, err = r.db.QueryContext(ctx, `
 			SELECT id, agent_id, task_id, content, created_at
 			FROM episodic_memory
@@ -542,14 +543,24 @@ func (r *SQLiteRepository) SearchEpisodicMemory(ctx context.Context, query strin
 			LIMIT ?
 		`, topK)
 	} else {
+		var clauses []string
+		var args []any
+		if ftsExpr != "" {
+			clauses = append(clauses, `id IN (SELECT entry_id FROM episodic_memory_fts WHERE episodic_memory_fts MATCH ?)`)
+			args = append(args, ftsExpr)
+		}
+		for _, term := range likeTerms {
+			clauses = append(clauses, `content LIKE ?`)
+			args = append(args, "%"+term+"%")
+		}
+		args = append(args, topK)
 		rows, err = r.db.QueryContext(ctx, `
-			SELECT e.id, e.agent_id, e.task_id, e.content, e.created_at
-			FROM episodic_memory_fts f
-			JOIN episodic_memory e ON e.id = f.entry_id
-			WHERE episodic_memory_fts MATCH ?
-			ORDER BY rank
+			SELECT id, agent_id, task_id, content, created_at
+			FROM episodic_memory
+			WHERE `+strings.Join(clauses, " OR ")+`
+			ORDER BY created_at DESC, id DESC
 			LIMIT ?
-		`, match, topK)
+		`, args...)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("search episodic memory: %w", err)
@@ -577,21 +588,20 @@ func (r *SQLiteRepository) SearchEpisodicMemory(ctx context.Context, query strin
 	return out, nil
 }
 
-// episodicFTSQuery builds a safe FTS5 MATCH expression from arbitrary text.
-// It extracts alphanumeric / CJK runs (discarding everything else, so
-// punctuation and FTS5 operators like " ; * - in the raw input can never form
-// a bad query), then breaks each run into its overlapping 3-character windows
-// and ORs every window together as a quoted term. Returns "" when the input
-// has no usable window, so the caller falls back to a recent-first scan
-// instead of matching everything.
+// episodicSearchTerms turns arbitrary text into an FTS5 trigram MATCH expression
+// (for token runs of 3+ chars) plus a list of short (<3-char) runs that trigram
+// cannot index and must be matched by substring instead. Extracting only
+// letter/number runs means no run can contain an FTS operator or a LIKE
+// wildcard, so both outputs are safe to use as bound parameters. Empty raw or
+// all-separator input yields ("", nil) so the caller falls back to recent-first.
 //
 // The 3-character window mirrors episodic_memory_fts's own tokenize='trigram'
 // index (see schemaStatements): FTS5 MATCH is token equality, not substring,
 // so a query would otherwise need to land on an exact trigram to match. A run
 // shorter than 3 characters (e.g. a lone CJK word or a short acronym) has no
-// full window, so it is kept as a single quoted term instead — it may not hit
-// under the trigram index, but it still cannot produce a syntax error.
-func episodicFTSQuery(raw string) string {
+// full window, so trigram can never recall it — those runs are instead
+// returned as LIKE terms so the caller can OR in a substring match.
+func episodicSearchTerms(raw string) (ftsExpr string, likeTerms []string) {
 	var runs []string
 	var b strings.Builder
 	flush := func() {
@@ -609,18 +619,18 @@ func episodicFTSQuery(raw string) string {
 	}
 	flush()
 
-	var terms []string
+	var grams []string
 	for _, run := range runs {
 		chars := []rune(run)
 		if len(chars) < 3 {
-			terms = append(terms, `"`+run+`"`)
+			likeTerms = append(likeTerms, run)
 			continue
 		}
 		for i := 0; i+3 <= len(chars); i++ {
-			terms = append(terms, `"`+string(chars[i:i+3])+`"`)
+			grams = append(grams, `"`+string(chars[i:i+3])+`"`)
 		}
 	}
-	return strings.Join(terms, " OR ")
+	return strings.Join(grams, " OR "), likeTerms
 }
 
 // execer is the ExecContext subset shared by *sql.DB and *sql.Tx, so the FTS
@@ -2041,8 +2051,8 @@ var schemaStatements = []string{
 	// so MATCH — which is token-equality, not substring — could never find a
 	// query for part of that sentence. The trigram tokenizer indexes every
 	// overlapping 3-character window instead, which works uniformly for CJK and
-	// Latin text and lets episodicFTSQuery (below) do substring-style recall by
-	// OR-ing the query's own trigrams.
+	// Latin text and lets episodicSearchTerms (below) do substring-style recall
+	// by OR-ing the query's own trigrams.
 	`CREATE VIRTUAL TABLE IF NOT EXISTS episodic_memory_fts USING fts5(
 		content,
 		entry_id UNINDEXED,
