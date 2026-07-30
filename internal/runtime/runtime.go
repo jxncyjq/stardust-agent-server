@@ -907,6 +907,9 @@ func (r *Runtime) buildPrompt(ctx context.Context, agent domain.Agent, task doma
 		if err != nil {
 			return "", fmt.Errorf("build cognitive context: %w", err)
 		}
+		if r.debug {
+			r.logContextBlocks(task.ID, built.Blocks)
+		}
 		// The hint is only needed on the Core path: Core renders a "Tools:" line
 		// that, when empty under the lazy protocol, can mislead the model into
 		// believing no tools exist. The plain paths below carry no such line.

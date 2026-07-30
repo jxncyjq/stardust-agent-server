@@ -133,38 +133,10 @@ func (r *AgentRuntimeResolver) resolveHomeDir(ctx context.Context) string {
 // state and yields (nil, nil). A store failure is NOT: it returns an error, so
 // a lost history is never mistaken for an empty one (CLAUDE.md fail-loud).
 func (r *AgentRuntimeResolver) recentTurnsForTask(ctx context.Context, task domain.Task) ([]domain.ConversationTurn, error) {
-	if r.conversationTurns == nil || strings.TrimSpace(task.SessionID) == "" {
-		return nil, nil
-	}
-	limit := r.rootConfig.Session.DefaultRecentTurns
-	if limit <= 0 {
-		limit = 6
-	}
-	// Normalised like limit above, and for the same reason the CLI path does it
-	// (normalizeMaxTurnCharsForSession): truncateText treats maxChars <= 0 as
-	// "no truncation", so an explicitly-zero MaxTurnChars would inject unbounded
-	// turn bodies here while the CLI capped them at the default.
-	maxTurnChars := r.rootConfig.Session.MaxTurnChars
-	if maxTurnChars <= 0 {
-		maxTurnChars = 6000
-	}
-	// +1: the task's own user turn is already persisted and will be filtered out.
-	turns, err := r.conversationTurns.ListConversationTurns(ctx, task.SessionID, limit+1)
-	if err != nil {
-		return nil, fmt.Errorf("list conversation turns for session %q: %w", task.SessionID, err)
-	}
-	out := make([]domain.ConversationTurn, 0, len(turns))
-	for _, turn := range turns {
-		if turn.TaskID == task.ID {
-			continue
-		}
-		turn.Content = truncateText(turn.Content, maxTurnChars)
-		out = append(out, turn)
-	}
-	if len(out) > limit {
-		out = out[len(out)-limit:]
-	}
-	return out, nil
+	// Delegated to the shared helper so this path and the CLI's
+	// defaultTaskRunner cannot drift apart — wiring history into only one of
+	// them is exactly how the GUI ended up with no cross-turn memory.
+	return RecentTurnsForTask(ctx, r.conversationTurns, r.rootConfig.Session, task)
 }
 
 func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domain.Task) (domain.Agent, TaskRunner, bool, error) {

@@ -23,6 +23,7 @@ import (
 	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/agentregistry"
 	"github.com/stardust/legion-agent/internal/app"
+	"github.com/stardust/legion-agent/internal/cognitive"
 	"github.com/stardust/legion-agent/internal/config"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
@@ -2699,4 +2700,90 @@ func TestDefaultTaskRunnerSandboxesToolsToTaskWorkingDir(t *testing.T) {
 			t.Fatalf("RunTask(no working dir) prompt = %q, want tool success reading root-only.txt", maas.lastPrompt)
 		}
 	})
+}
+
+// fakeCLITurnLister is a ConversationTurnLister double for the default-runner
+// path: it returns a fixed history and records the limit it was asked for.
+type fakeCLITurnLister struct {
+	turns     []domain.ConversationTurn
+	gotLimit  int
+	gotSessID string
+}
+
+func (f *fakeCLITurnLister) ListConversationTurns(_ context.Context, sessionID string, limit int) ([]domain.ConversationTurn, error) {
+	f.gotSessID = sessionID
+	f.gotLimit = limit
+	return f.turns, nil
+}
+
+// promptRecordingMaas records the flattened prompt of the first inference and
+// answers with plain text (no tool calls), ending the loop immediately.
+type promptRecordingMaas struct{ lastPrompt string }
+
+func (m *promptRecordingMaas) Generate(_ context.Context, req port.InferenceRequest) (port.InferenceResponse, error) {
+	var b strings.Builder
+	for _, msg := range req.Messages {
+		b.WriteString(msg.Content)
+		b.WriteString("\n")
+	}
+	m.lastPrompt = b.String()
+	return port.InferenceResponse{Text: "done"}, nil
+}
+
+// TestDefaultTaskRunnerInjectsSessionHistory pins cross-turn memory on the path
+// the GUI actually takes. defaultTaskRunner serves every task whose AgentID is
+// absent from the agent registry — which is every default-agent task — so
+// wiring session history only on AgentRuntimeResolver left the GUI with no
+// cross-turn memory at all.
+func TestDefaultTaskRunnerInjectsSessionHistory(t *testing.T) {
+	t.Parallel()
+	maas := &promptRecordingMaas{}
+	lister := &fakeCLITurnLister{turns: []domain.ConversationTurn{
+		{ID: "t1", TaskID: "task-earlier", Role: domain.ConversationRoleUser, Content: "EARLIER-USER-TURN"},
+		{ID: "t2", TaskID: "task-earlier", Role: domain.ConversationRoleAssistant, Content: "EARLIER-ASSISTANT-TURN"},
+		{ID: "t3", TaskID: "task-now", Role: domain.ConversationRoleUser, Content: "CURRENT-TURN-MUST-NOT-REPEAT"},
+	}}
+	runner := &defaultTaskRunner{
+		// A real Core is what renders the "Recent conversation" block, so this
+		// asserts the whole turns -> context -> prompt path, not just field
+		// assignment.
+		runtimeCfg: agentruntime.Config{
+			Maas:           maas,
+			Events:         adapter.NewMemoryEventBus(),
+			ContextBuilder: cognitive.NewCore(cognitive.NoopCompressor{}),
+		},
+		contextRoot:       t.TempDir(),
+		audit:             adapter.NewMemoryAuditLog(),
+		webOptions:        tool.WebToolOptions{},
+		conversationTurns: lister,
+		sessionCfg:        config.SessionConfig{DefaultRecentTurns: 6, MaxTurnChars: 6000},
+	}
+	task := domain.Task{ID: "task-now", SessionID: "sess-1", Input: "hello"}
+	if _, err := runner.RunTask(context.Background(), domain.Agent{}, task); err != nil {
+		t.Fatalf("RunTask error = %v, want nil", err)
+	}
+	if lister.gotSessID != "sess-1" {
+		t.Fatalf("lister got sessionID %q, want sess-1", lister.gotSessID)
+	}
+	if !strings.Contains(maas.lastPrompt, "EARLIER-USER-TURN") {
+		t.Fatalf("prompt missing session history:\n%s", maas.lastPrompt)
+	}
+	if strings.Contains(maas.lastPrompt, "CURRENT-TURN-MUST-NOT-REPEAT") {
+		t.Fatalf("prompt must exclude the task's own turn:\n%s", maas.lastPrompt)
+	}
+}
+
+// TestBuildDefaultRunnerConfigCarriesCompactThreshold pins that conversation
+// compaction is enabled on the default-runner path too: it was wired only on
+// the resolver path, so a configured threshold silently did nothing for the
+// GUI's default-agent tasks.
+func TestBuildDefaultRunnerConfigCarriesCompactThreshold(t *testing.T) {
+	t.Parallel()
+	cfg := buildDefaultRunnerConfig(
+		nil, adapter.NewMemoryAuditLog(), adapter.NewMemoryEventBus(), nil,
+		config.RuntimeConfig{CompactTokenThreshold: 4321}, nil, nil, nil, nil, nil,
+	)
+	if cfg.CompactTokenThreshold != 4321 {
+		t.Fatalf("CompactTokenThreshold = %d, want 4321", cfg.CompactTokenThreshold)
+	}
 }

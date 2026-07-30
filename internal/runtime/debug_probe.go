@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/stardust/legion-agent/internal/cognitive"
 	"github.com/stardust/legion-agent/internal/port"
 )
 
@@ -67,6 +68,26 @@ func (r *Runtime) logInferenceRequest(taskID string, req port.InferenceRequest) 
 			"tool_calls", m.ToolCalls,
 			"images", m.Images,
 			"preview", m.Preview,
+		)
+	}
+}
+
+// logContextBlocks emits the per-section size accounting of the base prompt
+// (persona/context files, capability catalog, conversation history, ...). The
+// per-message probe only reports each message's total, which is enough to see
+// that the base prompt grew but not what grew it — this closes that gap.
+// Gated by the caller on r.debug.
+func (r *Runtime) logContextBlocks(taskID string, blocks []cognitive.BlockSize) {
+	total := 0
+	for _, b := range blocks {
+		total += b.Chars
+	}
+	for _, b := range blocks {
+		r.logger.Info("debug context block",
+			"task_id", taskID,
+			"block", b.Name,
+			"chars", b.Chars,
+			"total_chars", total,
 		)
 	}
 }

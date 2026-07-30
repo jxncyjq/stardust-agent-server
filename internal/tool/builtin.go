@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -34,7 +35,129 @@ const (
 	// searchContentReadChunk bounds how many bytes readFileContext consumes
 	// between context checks.
 	searchContentReadChunk = 32 * 1024
+	// readFilePageRunes is both the default and the maximum number of runes one
+	// read_file call returns. It is deliberately below runtime's
+	// maxToolResultChars (4000): appendToolResults truncates any longer tool
+	// result to that cap, which would silently cut the page short and defeat
+	// pagination.
+	readFilePageRunes = 3500
+	// toolResultBudgetRunes mirrors runtime's maxToolResultChars (4000):
+	// appendToolResults hard-truncates any longer tool result from the front, so
+	// a read_file page plus everything appended to it (the subtree agents.md
+	// note, the repeat-read notice, the continuation hint) must fit inside this
+	// budget. Without that accounting the continuation hint — the one thing that
+	// tells the model how to read the rest — is what gets cut, which is exactly
+	// the failure pagination exists to prevent. Keep in sync with
+	// runtime.defaultMaxToolResultChars.
+	toolResultBudgetRunes = 4000
+	// minReadFilePageRunes floors the page so a large agents.md note can never
+	// squeeze the actual file content down to nothing.
+	minReadFilePageRunes = 500
+	// maxNoteRunesInResult caps how much of the subtree agents.md note may ride
+	// along with a page. The note is bounded only by ContextFiles.MaxFileChars
+	// (20000 by default) — five times the whole tool result budget — so capping
+	// the page alone cannot keep the result within budget: the note is appended
+	// after it. Truncating the note here is what makes the budget real, and it
+	// is announced in the output rather than left to runtime's silent front
+	// truncation, which would eat the page instead.
+	maxNoteRunesInResult = 800
+	// repeatNoticeMaxRunes bounds repeatNotice's rendered length (a fixed
+	// sentence plus a small count), reserved up front because whether the notice
+	// applies is only known after the page has been sliced.
+	repeatNoticeMaxRunes = 120
 )
+
+// paginateRunes returns the [offset, offset+limit) rune window of content, the
+// offset the caller should pass next (-1 when the window reached the end) and
+// the content's total rune count. Slicing by rune (not byte) keeps multibyte
+// text intact.
+//
+// An offset at or past the end is an error rather than an empty page: an empty
+// result reads to the model as "the file ends here", which is exactly the
+// misunderstanding this pagination exists to prevent.
+func paginateRunes(content string, offset, limit int) (string, int, int, error) {
+	runes := []rune(content)
+	total := len(runes)
+	if offset < 0 {
+		return "", 0, total, fmt.Errorf("read_file offset must not be negative, got %d", offset)
+	}
+	if offset >= total && total > 0 {
+		return "", 0, total, fmt.Errorf("read_file offset %d is past the end of the file (%d chars)", offset, total)
+	}
+	if limit <= 0 || limit > readFilePageRunes {
+		limit = readFilePageRunes
+	}
+	end := offset + limit
+	if end >= total {
+		return string(runes[offset:]), -1, total, nil
+	}
+	return string(runes[offset:end]), end, total, nil
+}
+
+// readFilePageBudget shrinks a requested page size so the whole read_file
+// result — page plus continuation hint, repeat-read notice and subtree
+// agents.md note — fits inside toolResultBudgetRunes. Without it a large
+// agents.md note pushes the result past runtime's maxToolResultChars, which
+// truncates from the front and takes the continuation hint with it, leaving the
+// model unable to page through the file: the very loop this feature removes.
+//
+// The hint's own length is measured exactly by formatting it with the largest
+// numbers it could carry (the file's total rune count in every slot) and the
+// real path, so a long path is charged for rather than assumed small. The page
+// never drops below minReadFilePageRunes, so an oversized note degrades the
+// page instead of erasing it.
+func readFilePageBudget(limit int, content, path string, noteRunes int) int {
+	if limit <= 0 || limit > readFilePageRunes {
+		limit = readFilePageRunes
+	}
+	total := len([]rune(content))
+	hint := fmt.Sprintf("…[已返回第 %d-%d 字，共 %d 字；继续读用 read_file(path=%q, offset=%d)]\n",
+		total, total, total, path, total)
+	// noteRunes is charged at its capped size: capReadFileNote trims the note to
+	// maxNoteRunesInResult before it is appended, so charging the raw length here
+	// would shrink the page for space the note will not use.
+	if noteRunes > maxNoteRunesInResult {
+		noteRunes = maxNoteRunesInResult
+	}
+	budget := toolResultBudgetRunes - noteRunes - repeatNoticeMaxRunes - len([]rune(hint))
+	if budget < minReadFilePageRunes {
+		budget = minReadFilePageRunes
+	}
+	if limit > budget {
+		return budget
+	}
+	return limit
+}
+
+// capReadFileNote trims a subtree agents.md note to maxNoteRunesInResult and
+// says so in the text it returns. The note is otherwise bounded only by
+// ContextFiles.MaxFileChars, which is far larger than the whole tool result
+// budget; leaving it uncapped would push the result past
+// maxToolResultChars and hand it to runtime's front truncation, which cuts the
+// file content and the continuation hint rather than the note.
+func capReadFileNote(note string) string {
+	runes := []rune(note)
+	if len(runes) <= maxNoteRunesInResult {
+		return note
+	}
+	return string(runes[:maxNoteRunesInResult]) +
+		fmt.Sprintf("\n…[本目录约定已截断，省略 %d 字；完整内容见该目录的 agents.md]", len(runes)-maxNoteRunesInResult)
+}
+
+// intArg parses an optional integer tool argument. An absent or empty value
+// yields def; a present but unparseable value is an error rather than a silent
+// fallback to the default, which would hide a malformed call from the model.
+func intArg(args map[string]string, name string, def int) (int, error) {
+	raw := strings.TrimSpace(args[name])
+	if raw == "" {
+		return def, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("read_file %s must be an integer, got %q: %w", name, raw, err)
+	}
+	return v, nil
+}
 
 // WorkspaceRegistryOption configures optional behavior of a workspace registry
 // built by NewWorkspaceRegistry, such as the per-directory agents.md injection
@@ -426,7 +549,7 @@ func NewFileReadWriteWorkspaceRegistry(root string, audit port.AuditLog, opts ..
 func registerReadOnlyDescriptors(registry *Registry, absRoot string, guard port.WorkspacePathGuard, options workspaceRegistryOptions) {
 	registry.RegisterDescriptor(Descriptor{
 		Name:        "read_file",
-		Description: fmt.Sprintf("Read a UTF-8 text file inside the workspace root (%s). The path argument can be relative (resolved against workspace root) or absolute (must be within workspace root).", absRoot),
+		Description: fmt.Sprintf("Read a UTF-8 text file inside the workspace root (%s). The path argument can be relative (resolved against workspace root) or absolute (must be within workspace root). Long files are returned one page at a time: pass offset to continue reading where the previous page ended.", absRoot),
 		RiskLevel:   "low",
 		Timeout:     2 * time.Second,
 		Group:       "files",
@@ -434,7 +557,9 @@ func registerReadOnlyDescriptors(registry *Registry, absRoot string, guard port.
 			"type":     "object",
 			"required": []string{"path"},
 			"properties": map[string]any{
-				"path": map[string]any{"type": "string", "description": fmt.Sprintf("File path relative to workspace root (%s) or absolute path within workspace root.", absRoot)},
+				"path":   map[string]any{"type": "string", "description": fmt.Sprintf("File path relative to workspace root (%s) or absolute path within workspace root.", absRoot)},
+				"offset": map[string]any{"type": "number", "description": "Start reading at this character (rune) offset. Defaults to 0. Use the offset printed at the end of a truncated page to read the rest."},
+				"limit":  map[string]any{"type": "number", "description": fmt.Sprintf("Maximum characters to return, capped at %d (the default).", readFilePageRunes)},
 			},
 		},
 	}, HandlerFunc(func(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
@@ -490,8 +615,10 @@ func readFileTool(ctx context.Context, root string, guard port.WorkspacePathGuar
 	defer file.Close()
 	// Cap how much of a file enters context. A read_file with no limit lets a
 	// single huge file blow up the prompt; read one byte past the cap to detect
-	// (and flag) truncation.
-	const maxReadFileBytes = 256 * 1024
+	// (and flag) truncation. Raised from 256KB to 512KB now that pagination
+	// lets the model reach any part of that range via offset instead of only
+	// ever seeing the front of the file.
+	const maxReadFileBytes = 512 * 1024
 	data, err := io.ReadAll(io.LimitReader(file, maxReadFileBytes+1))
 	if err != nil {
 		return domain.ToolResult{}, fmt.Errorf("read file: %w", err)
@@ -500,17 +627,49 @@ func readFileTool(ctx context.Context, root string, guard port.WorkspacePathGuar
 	if len(data) > maxReadFileBytes {
 		output = string(data[:maxReadFileBytes]) + fmt.Sprintf("\n…[truncated: file exceeds %d bytes]", maxReadFileBytes)
 	}
-	// Resolve the subtree agents.md note first: it is the only step left that can
-	// fail, and readHistory.record must run only on the success path so a repeat
-	// count is never advanced for a read the model never received. record keys on
-	// the file content (before the note is appended) so the note's own
-	// once-per-task dedup does not perturb the unchanged-content comparison.
+	offset, err := intArg(call.Arguments, "offset", 0)
+	if err != nil {
+		return domain.ToolResult{}, err
+	}
+	limit, err := intArg(call.Arguments, "limit", readFilePageRunes)
+	if err != nil {
+		return domain.ToolResult{}, err
+	}
+	// Resolve the subtree agents.md note before slicing the page: it is the only
+	// step left that can fail, and its length has to be charged against the same
+	// budget as the page (see toolResultBudgetRunes) — an agents.md note can run
+	// to MaxFileChars, which alone dwarfs the budget.
 	note, err := subtreeAgentsNote(filepath.Dir(resolved), options)
 	if err != nil {
 		return domain.ToolResult{}, err
 	}
+	note = capReadFileNote(note)
+	// fileContent is the pre-pagination text: the stable identity used for repeat
+	// detection below, unaffected by page size or note presence.
+	fileContent := output
+	limit = readFilePageBudget(limit, output, call.Arguments["path"], len([]rune(note)))
+	page, next, total, err := paginateRunes(output, offset, limit)
+	if err != nil {
+		return domain.ToolResult{}, err
+	}
+	output = page
+	if next >= 0 {
+		// Prepended, not appended: if anything downstream still overruns the
+		// budget, truncation cuts the tail, so a leading hint survives and the
+		// model can always see how to read the rest.
+		output = fmt.Sprintf("…[已返回第 %d-%d 字，共 %d 字；继续读用 read_file(path=%q, offset=%d)]\n",
+			offset+1, next, total, call.Arguments["path"], next) + output
+	}
+	// Repeat detection keys on (path, offset) and hashes the whole file, never the
+	// rendered page. The page is not a stable identity: its size depends on the
+	// agents.md note, which subtreeAgentsNote emits only the first time a
+	// directory is seen in a task — so the same file at the same offset came back
+	// as a bigger page on the second read and the repeat went undetected. Hashing
+	// the file keeps re-reads detectable, while including offset in the key keeps
+	// legitimate paging (same file, next offset) from being flagged as a repeat.
 	if options.readHistory != nil {
-		if count, unchanged := options.readHistory.record(resolved, output); unchanged {
+		key := fmt.Sprintf("%s#%d", resolved, offset)
+		if count, unchanged := options.readHistory.record(key, fileContent); unchanged {
 			output = repeatNotice(count) + output
 		}
 	}

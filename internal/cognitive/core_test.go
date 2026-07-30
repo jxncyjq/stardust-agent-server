@@ -236,3 +236,37 @@ type fakeSkillProvider struct {
 func (p fakeSkillProvider) SelectForTask(context.Context, domain.Task, int) ([]skill.Injection, error) {
 	return p.injections, nil
 }
+
+// TestBuildContextReportsBlockSizes pins the per-block accounting the debug
+// probe needs: a prompt that ballooned to 11.6k chars could not be attributed
+// to a block from the logs, because the probe only saw the assembled total.
+func TestBuildContextReportsBlockSizes(t *testing.T) {
+	core := NewCore(NoopCompressor{}).WithContextFiles("CONTEXT-FILES-BODY")
+	built, err := core.BuildContext(t.Context(), Request{
+		Agent: domain.Agent{ID: "a", Role: "developer"},
+		Task:  domain.Task{ID: "t1", Input: "hi"},
+		Tools: []string{"read_file"},
+		ConversationTurns: []domain.ConversationTurn{
+			{Role: domain.ConversationRoleUser, Content: "EARLIER"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("BuildContext error = %v, want nil", err)
+	}
+	sizes := map[string]int{}
+	total := 0
+	for _, b := range built.Blocks {
+		sizes[b.Name] = b.Chars
+		total += b.Chars
+	}
+	for _, name := range []string{"header", "conversation", "context_files"} {
+		if sizes[name] <= 0 {
+			t.Errorf("block %q = %d chars, want > 0 (blocks: %+v)", name, sizes[name], built.Blocks)
+		}
+	}
+	// The accounting must add up to the assembled prompt, or it cannot be used
+	// to attribute growth.
+	if total != len([]rune(built.Prompt)) {
+		t.Fatalf("block chars sum = %d, want prompt length %d", total, len([]rune(built.Prompt)))
+	}
+}
