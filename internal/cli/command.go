@@ -1896,6 +1896,7 @@ func buildDefaultRunnerConfig(
 	logger *slog.Logger,
 	capabilitySkills capability.Provider,
 	skillUsage agentruntime.SkillUsageRecorder,
+	episodeRecorder agentruntime.EpisodeRecorder,
 ) agentruntime.Config {
 	return agentruntime.Config{
 		Maas:             maas,
@@ -1909,6 +1910,7 @@ func buildDefaultRunnerConfig(
 		Logger:           logger,
 		CapabilitySkills: capabilitySkills,
 		SkillUsage:       skillUsage,
+		EpisodeRecorder:  episodeRecorder,
 		DisabledTools:    runtimeSettings.DisabledTools,
 		Debug:            runtimeSettings.Debug,
 		// Compaction must be enabled here as well as on the resolver path: this
@@ -2329,6 +2331,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 			defaultMaas, auditLog, workflowEvents, defaultCore,
 			cfg.Runtime, checkpointStore, manualGate, logger, capabilitySkills,
 			skillUsage,
+			episodeRecorder,
 		),
 		contextRoot:      cfg.ContextFiles.Root,
 		audit:            auditLog,

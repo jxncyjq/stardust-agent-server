@@ -2782,6 +2782,7 @@ func TestBuildDefaultRunnerConfigCarriesCompactThreshold(t *testing.T) {
 	cfg := buildDefaultRunnerConfig(
 		nil, adapter.NewMemoryAuditLog(), adapter.NewMemoryEventBus(), nil,
 		config.RuntimeConfig{CompactTokenThreshold: 4321}, nil, nil, nil, nil, nil,
+		nil,
 	)
 	if cfg.CompactTokenThreshold != 4321 {
 		t.Fatalf("CompactTokenThreshold = %d, want 4321", cfg.CompactTokenThreshold)

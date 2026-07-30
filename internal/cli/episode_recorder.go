@@ -17,6 +17,12 @@ import (
 // blows up the episodic store.
 const maxDistilledEpisodeChars = 2000
 
+// maxDistillInputChars caps the content fed into the distillation LLM prompt,
+// separately from maxDistilledEpisodeChars (the output/fallback cap). It
+// bounds the cost/latency of the distill call itself against an oversized raw
+// task result, independent of how the output is later truncated.
+const maxDistillInputChars = 4000
+
 // defaultEpisodeRecordTimeout bounds how long the background distill+store
 // work is allowed to run before it's abandoned. It must never block the task
 // it is recording, so this is generous but finite.
@@ -91,9 +97,14 @@ func (r *episodeRecorder) record(ctx context.Context, agent domain.Agent, task d
 	distilled := content
 
 	if r.summarizer != nil {
+		// Pre-truncate the input independently of the maxDistilledEpisodeChars
+		// output cap below: content is often st.resp.Text from a large task
+		// result, and sending it unbounded into the distill prompt inflates this
+		// call's own cost/latency before the output-side truncation ever runs.
+		promptContent := truncateEpisodeContent(content, maxDistillInputChars)
 		resp, err := r.summarizer.Generate(ctx, port.InferenceRequest{
-			RequestID: "episode-distill",
-			Prompt:    distillInstruction(outcome) + "\n\n" + content,
+			RequestID: "episode-distill:" + task.ID,
+			Prompt:    distillInstruction(outcome) + "\n\n" + promptContent,
 		})
 		if err != nil {
 			r.logger.Warn("episode distillation failed, falling back to raw content",
