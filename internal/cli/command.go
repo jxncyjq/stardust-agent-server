@@ -1602,6 +1602,7 @@ func newDataRetentionCommand(out io.Writer) *cobra.Command {
 	var auditDays int
 	var runtimeDays int
 	var qualityDays int
+	var episodicDays int
 	var apply bool
 	cmd := &cobra.Command{
 		Use:   "retention",
@@ -1626,6 +1627,7 @@ func newDataRetentionCommand(out io.Writer) *cobra.Command {
 				AuditMaxAge:          daysDuration(auditDays),
 				RuntimeEventMaxAge:   daysDuration(runtimeDays),
 				QualityHistoryMaxAge: daysDuration(qualityDays),
+				EpisodicMaxAge:       daysDuration(episodicDays),
 				DryRun:               !apply,
 			}
 			var plan storage.RetentionPlan
@@ -1639,11 +1641,12 @@ func newDataRetentionCommand(out io.Writer) *cobra.Command {
 			}
 			_, err = fmt.Fprintf(
 				out,
-				"retention dry_run=%t audit_events_deleted=%d runtime_events_deleted=%d quality_history_deleted=%d\n",
+				"retention dry_run=%t audit_events_deleted=%d runtime_events_deleted=%d quality_history_deleted=%d episodic_memory_deleted=%d\n",
 				plan.DryRun,
 				plan.AuditEventsDeleted,
 				plan.RuntimeEventsDeleted,
 				plan.QualityHistoryDeleted,
+				plan.EpisodicDeleted,
 			)
 			return err
 		},
@@ -1652,6 +1655,7 @@ func newDataRetentionCommand(out io.Writer) *cobra.Command {
 	cmd.Flags().IntVar(&auditDays, "audit-days", 0, "delete audit events older than this many days")
 	cmd.Flags().IntVar(&runtimeDays, "runtime-days", 0, "delete runtime events older than this many days")
 	cmd.Flags().IntVar(&qualityDays, "quality-days", 0, "delete quality history older than this many days")
+	cmd.Flags().IntVar(&episodicDays, "episodic-days", 0, "delete episodic memory older than this many days")
 	cmd.Flags().BoolVar(&apply, "apply", false, "apply the retention plan instead of dry-running it")
 	return cmd
 }

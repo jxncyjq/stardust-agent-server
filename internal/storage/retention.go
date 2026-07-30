@@ -13,6 +13,7 @@ type RetentionPolicy struct {
 	AuditMaxAge          time.Duration
 	RuntimeEventMaxAge   time.Duration
 	QualityHistoryMaxAge time.Duration
+	EpisodicMaxAge       time.Duration
 	DryRun               bool
 }
 
@@ -20,6 +21,7 @@ type RetentionPlan struct {
 	AuditEventsDeleted    int
 	RuntimeEventsDeleted  int
 	QualityHistoryDeleted int
+	EpisodicDeleted       int
 	DryRun                bool
 }
 
@@ -61,6 +63,13 @@ func (r *SQLiteRepository) retention(ctx context.Context, policy RetentionPolicy
 			return RetentionPlan{}, fmt.Errorf("plan quality history retention: %w", err)
 		}
 	}
+	if policy.EpisodicMaxAge > 0 {
+		cutoff := policy.Now.Add(-policy.EpisodicMaxAge)
+		plan.EpisodicDeleted, err = r.countOlderThan(ctx, "episodic_memory", cutoff)
+		if err != nil {
+			return RetentionPlan{}, fmt.Errorf("plan episodic retention: %w", err)
+		}
+	}
 	if plan.DryRun {
 		return plan, nil
 	}
@@ -80,6 +89,15 @@ func (r *SQLiteRepository) retention(ctx context.Context, policy RetentionPolicy
 		cutoff := policy.Now.Add(-policy.QualityHistoryMaxAge)
 		if err := r.deleteOlderThan(ctx, "quality_history", cutoff); err != nil {
 			return RetentionPlan{}, fmt.Errorf("apply quality history retention: %w", err)
+		}
+	}
+	if policy.EpisodicMaxAge > 0 {
+		cutoff := policy.Now.Add(-policy.EpisodicMaxAge)
+		if err := r.deleteOlderThan(ctx, "episodic_memory", cutoff); err != nil {
+			return RetentionPlan{}, fmt.Errorf("apply episodic retention: %w", err)
+		}
+		if err := r.deleteOlderThan(ctx, "episodic_memory_fts", cutoff); err != nil {
+			return RetentionPlan{}, fmt.Errorf("apply episodic fts retention: %w", err)
 		}
 	}
 	if err := r.AppendAuditEvent(ctx, domain.AuditEvent{
@@ -111,5 +129,5 @@ func (r *SQLiteRepository) deleteOlderThan(ctx context.Context, table string, cu
 }
 
 func retentionPlanHash(plan RetentionPlan) string {
-	return fmt.Sprintf("audit=%d runtime=%d quality=%d", plan.AuditEventsDeleted, plan.RuntimeEventsDeleted, plan.QualityHistoryDeleted)
+	return fmt.Sprintf("audit=%d runtime=%d quality=%d episodic=%d", plan.AuditEventsDeleted, plan.RuntimeEventsDeleted, plan.QualityHistoryDeleted, plan.EpisodicDeleted)
 }
