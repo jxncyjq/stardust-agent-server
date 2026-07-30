@@ -802,3 +802,46 @@ func TestReadFileClampsOversizedLimit(t *testing.T) {
 		t.Fatal("a clamped page still has more to read, so it must carry the hint")
 	}
 }
+
+// TestReadFileRepeatNoticeSurvivesAgentsNote is the regression the page-budget
+// fix introduced: the budget subtracts the agents.md note's size, but
+// subtreeAgentsNote emits a note only the first time a directory is seen in a
+// task. The second read of the same file therefore got a *larger* page, so
+// hashing the rendered page made the repeat undetectable — defeating PR #58 in
+// exactly the directories that have local conventions.
+func TestReadFileRepeatNoticeSurvivesAgentsNote(t *testing.T) {
+	root := t.TempDir()
+	sub := filepath.Join(root, "sub")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	writeFile(t, filepath.Join(sub, "agents.md"), strings.Repeat("约", 2000))
+	writeFile(t, filepath.Join(sub, "big.md"), strings.Repeat("汉", 6000))
+
+	reg := NewFileReadWriteWorkspaceRegistry(root, nil,
+		WithAgentsInjection(20000, ""), WithProjectRoot(root))
+	read := func(id string, args map[string]string) string {
+		res, err := reg.Execute(t.Context(), domain.Agent{}, domain.ToolCall{
+			Name: "read_file", ID: id, Arguments: args,
+		})
+		if err != nil {
+			t.Fatalf("read_file(%v) err = %v, want nil", args, err)
+		}
+		return res.Output
+	}
+
+	first := read("1", map[string]string{"path": "sub/big.md"})
+	if strings.Contains(first, "第 2 次读取") {
+		t.Fatal("first read must not be flagged as a repeat")
+	}
+	// Same file, same offset: a genuine repeat, and the note is now deduped away.
+	second := read("2", map[string]string{"path": "sub/big.md"})
+	if !strings.Contains(second, "第 2 次读取") {
+		t.Fatalf("repeat read must be flagged even though the note was deduped, got: %q", second[:200])
+	}
+	// Paging forward is progress, not a repeat.
+	next := read("3", map[string]string{"path": "sub/big.md", "offset": "3000"})
+	if strings.Contains(next, "次读取此文件") {
+		t.Fatalf("reading a different offset must not be flagged as a repeat, got: %q", next[:200])
+	}
+}

@@ -644,6 +644,9 @@ func readFileTool(ctx context.Context, root string, guard port.WorkspacePathGuar
 		return domain.ToolResult{}, err
 	}
 	note = capReadFileNote(note)
+	// fileContent is the pre-pagination text: the stable identity used for repeat
+	// detection below, unaffected by page size or note presence.
+	fileContent := output
 	limit = readFilePageBudget(limit, output, call.Arguments["path"], len([]rune(note)))
 	page, next, total, err := paginateRunes(output, offset, limit)
 	if err != nil {
@@ -657,10 +660,16 @@ func readFileTool(ctx context.Context, root string, guard port.WorkspacePathGuar
 		output = fmt.Sprintf("…[已返回第 %d-%d 字，共 %d 字；继续读用 read_file(path=%q, offset=%d)]\n",
 			offset+1, next, total, call.Arguments["path"], next) + output
 	}
-	// record keys on the page (before the notice and note are attached) so the
-	// note's own once-per-task dedup does not perturb the unchanged comparison.
+	// Repeat detection keys on (path, offset) and hashes the whole file, never the
+	// rendered page. The page is not a stable identity: its size depends on the
+	// agents.md note, which subtreeAgentsNote emits only the first time a
+	// directory is seen in a task — so the same file at the same offset came back
+	// as a bigger page on the second read and the repeat went undetected. Hashing
+	// the file keeps re-reads detectable, while including offset in the key keeps
+	// legitimate paging (same file, next offset) from being flagged as a repeat.
 	if options.readHistory != nil {
-		if count, unchanged := options.readHistory.record(resolved, output); unchanged {
+		key := fmt.Sprintf("%s#%d", resolved, offset)
+		if count, unchanged := options.readHistory.record(key, fileContent); unchanged {
 			output = repeatNotice(count) + output
 		}
 	}
