@@ -216,6 +216,44 @@ func TestCoreBuildContextIncludesCapabilityMemory(t *testing.T) {
 	}
 }
 
+// TestBuildContextStablePrefixAcrossTasks pins the cache-stability contract:
+// the leading StablePrefixLen runes of Prompt must be byte-identical across
+// tasks of the same agent+session (catalog + durable memory + context files),
+// and per-task input must land only past that boundary.
+func TestBuildContextStablePrefixAcrossTasks(t *testing.T) {
+	core := NewCore(NoopCompressor{}).WithContextFiles("STABLE-FILES")
+	agent := domain.Agent{ID: "a1", Role: "developer"}
+	build := func(input string) BuiltContext {
+		t.Helper()
+		bc, err := core.BuildContext(context.Background(), Request{
+			Agent: agent,
+			Task:  domain.Task{ID: "t-" + input, Input: input},
+		})
+		if err != nil {
+			t.Fatalf("BuildContext(%q): %v", input, err)
+		}
+		return bc
+	}
+	a := build("alpha")
+	b := build("beta")
+	if a.StablePrefixLen <= 0 {
+		t.Fatalf("StablePrefixLen = %d, want > 0", a.StablePrefixLen)
+	}
+	if a.StablePrefixLen != b.StablePrefixLen {
+		t.Fatalf("prefix len differs across tasks: %d vs %d", a.StablePrefixLen, b.StablePrefixLen)
+	}
+	ra, rb := []rune(a.Prompt), []rune(b.Prompt)
+	if string(ra[:a.StablePrefixLen]) != string(rb[:b.StablePrefixLen]) {
+		t.Fatal("stable prefixes differ across tasks")
+	}
+	if string(ra[a.StablePrefixLen:]) == string(rb[b.StablePrefixLen:]) {
+		t.Fatal("volatile suffixes identical; per-task input did not land past the boundary")
+	}
+	if strings.Contains(string(ra[:a.StablePrefixLen]), "alpha") {
+		t.Fatal("per-task input leaked into stable prefix")
+	}
+}
+
 type fakeMemoryProvider struct {
 	systemBlock string
 	prefetched  []domain.MemoryEntry

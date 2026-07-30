@@ -27,6 +27,11 @@ type Request struct {
 type BuiltContext struct {
 	Prompt     string
 	Compressed bool
+	// StablePrefixLen is the rune count of Prompt's leading section that stays
+	// byte-identical across tasks of the same agent+session (catalog + durable
+	// memory + context files). The runtime passes it as the message[0] prompt-
+	// cache breakpoint. Zero means no stable prefix is known (backward compatible).
+	StablePrefixLen int
 	// Blocks is the per-section size accounting of Prompt, in assembly order.
 	// Without it a prompt that grew (say from 3.4k to 11.6k chars) can only be
 	// observed as a total, leaving no way to attribute the growth to persona
@@ -127,7 +132,11 @@ func (c *Core) BuildContext(ctx context.Context, req Request) (BuiltContext, err
 	if err := ctx.Err(); err != nil {
 		return BuiltContext{}, err
 	}
-	memoryBlock, err := c.memoryBlock(ctx, req)
+	durableBlock, err := c.durableMemoryBlock(ctx, req)
+	if err != nil {
+		return BuiltContext{}, err
+	}
+	prefetched, err := c.prefetchBlock(ctx, req)
 	if err != nil {
 		return BuiltContext{}, err
 	}
@@ -150,6 +159,15 @@ func (c *Core) BuildContext(ctx context.Context, req Request) (BuiltContext, err
 		prompt += body
 		blocks = append(blocks, BlockSize{Name: name, Chars: len([]rune(body))})
 	}
+	// --- Stable prefix: byte-identical across a session's tasks. Order matters:
+	// nothing task-specific may appear before the boundary or the cache misses. ---
+	add("catalog", catalogBlock)
+	add("durable_memory", durableBlock)
+	if c.contextFiles != "" {
+		add("context_files", "Runtime context files:\n"+c.contextFiles+"\n")
+	}
+	stablePrefixLen := len([]rune(prompt))
+	// --- Volatile suffix: task framing + per-task retrieval + recent turns. ---
 	add("header", fmt.Sprintf(
 		"Agent: %s\nRole: %s\nTask: %s\nInput: %s\nTools: %s\n",
 		req.Agent.ID,
@@ -158,21 +176,29 @@ func (c *Core) BuildContext(ctx context.Context, req Request) (BuiltContext, err
 		req.Task.Input,
 		strings.Join(req.Tools, ", "),
 	))
-	add("memory", memoryBlock)
-	add("conversation", conversationBlock(req.ConversationTurns))
-	if c.contextFiles != "" {
-		add("context_files", "Runtime context files:\n"+c.contextFiles+"\n")
-	}
 	add("capability", capabilityBlock)
-	add("catalog", catalogBlock)
+	add("prefetch", prefetched)
+	add("conversation", conversationBlock(req.ConversationTurns))
 	result, err := c.compressor.Compress(ctx, prompt)
 	if err != nil {
 		return BuiltContext{}, fmt.Errorf("compress context: %w", err)
 	}
-	return BuiltContext{Prompt: result.Text, Compressed: result.Compressed, Blocks: blocks}, nil
+	// A compressor that rewrote the prompt invalidates the byte offset; drop it
+	// rather than point the cache breakpoint at shifted content.
+	if result.Compressed {
+		stablePrefixLen = 0
+	}
+	return BuiltContext{
+		Prompt:          result.Text,
+		Compressed:      result.Compressed,
+		StablePrefixLen: stablePrefixLen,
+		Blocks:          blocks,
+	}, nil
 }
 
-func (c *Core) memoryBlock(ctx context.Context, req Request) (string, error) {
+// durableMemoryBlock renders the agent-scoped system memory that is stable
+// across a session's tasks -- it belongs in the cache-stable prefix.
+func (c *Core) durableMemoryBlock(ctx context.Context, req Request) (string, error) {
 	if c.memory == nil {
 		return "", nil
 	}
@@ -180,23 +206,31 @@ func (c *Core) memoryBlock(ctx context.Context, req Request) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("build memory system block: %w", err)
 	}
+	if systemBlock == "" {
+		return "", nil
+	}
+	return "\n" + systemBlock + "\n", nil
+}
+
+// prefetchBlock renders task-scoped retrieved memory. It varies per task, so it
+// belongs in the volatile suffix, after the cache breakpoint.
+func (c *Core) prefetchBlock(ctx context.Context, req Request) (string, error) {
+	if c.memory == nil {
+		return "", nil
+	}
 	prefetched, err := c.memory.Prefetch(ctx, req.Task)
 	if err != nil {
 		return "", fmt.Errorf("prefetch memory: %w", err)
 	}
-	var b strings.Builder
-	if systemBlock != "" {
-		b.WriteString("\n")
-		b.WriteString(systemBlock)
-		b.WriteString("\n")
+	if len(prefetched) == 0 {
+		return "", nil
 	}
-	if len(prefetched) > 0 {
-		b.WriteString("Prefetched memory:\n")
-		for _, entry := range prefetched {
-			b.WriteString("- ")
-			b.WriteString(entry.Content)
-			b.WriteString("\n")
-		}
+	var b strings.Builder
+	b.WriteString("Prefetched memory:\n")
+	for _, entry := range prefetched {
+		b.WriteString("- ")
+		b.WriteString(entry.Content)
+		b.WriteString("\n")
 	}
 	return b.String(), nil
 }
