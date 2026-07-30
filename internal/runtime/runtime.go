@@ -411,8 +411,9 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		prompt += planInstruction
 	}
 	// basePrompt is the fixed task framing (system + task). It is reused verbatim
-	// as the head of every tool-round prompt, so it is the stable prefix that
-	// drives the provider prompt-cache breakpoint (InferenceRequest.StablePrefixLen).
+	// as the head of every tool-round prompt (message[0]); its leading stable
+	// section drives the provider prompt-cache breakpoint via
+	// pinCachePrefix -> message[0].StablePrefixLen (see stablePrefixLen above).
 	basePrompt := prompt
 	convo := newConversation(basePrompt, task.Images)
 	convo.pinCachePrefix(stablePrefixLen)
@@ -713,8 +714,10 @@ func firstNonEmptyLine(s string) string {
 
 // generate sends the accumulated exchange and offers the run's effective tools.
 // The request carries Messages (never Prompt): the model has to see the calls it
-// already made, and no cache breakpoint is set because an append-only exchange
-// is already a stable prefix for providers that cache automatically.
+// already made. message[0] carries StablePrefixLen (set via pinCachePrefix), so
+// the adapter places a prompt-cache breakpoint at the stable head of the task
+// framing; the rest of the append-only exchange stays a stable prefix for
+// providers that also cache automatically.
 func (r *Runtime) generate(ctx context.Context, requestID string, taskID string, convo *conversation, tools *tool.Registry) (port.InferenceResponse, error) {
 	req := port.InferenceRequest{
 		RequestID: requestID,

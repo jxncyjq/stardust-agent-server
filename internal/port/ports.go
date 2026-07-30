@@ -29,9 +29,10 @@ type InferenceRequest struct {
 	// something a re-sent single user message cannot express, and whose absence
 	// let a model re-issue the same call indefinitely.
 	//
-	// Multi-turn requests set no cache breakpoint: the exchange is append-only,
-	// so its leading messages are already a stable prefix for providers that do
-	// automatic prefix caching.
+	// The first message may carry its own StablePrefixLen to place an explicit
+	// prompt-cache breakpoint at the stable head of the task framing; later user
+	// turns leave it zero and stay append-only, already a stable prefix for
+	// providers that also cache automatically.
 	Messages []InferenceMessage
 }
 
