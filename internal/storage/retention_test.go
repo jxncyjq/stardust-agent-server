@@ -143,4 +143,16 @@ func TestRetentionPurgesEpisodicMemory(t *testing.T) {
 	if len(audits) != 1 || audits[0].Action != "storage.retention.apply" {
 		t.Fatalf("ListAuditEvents() = %+v, want single storage.retention.apply", audits)
 	}
+
+	// The 2-character CJK query above only exercises the main table (its
+	// LIKE fallback), so it cannot detect an orphaned episodic_memory_fts
+	// row left behind by a purge that deleted from episodic_memory but not
+	// its FTS index. Assert the FTS table directly to lock the two in sync.
+	var ftsCount int
+	if err := repo.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM episodic_memory_fts`).Scan(&ftsCount); err != nil {
+		t.Fatalf("count episodic_memory_fts: %v", err)
+	}
+	if ftsCount != 1 {
+		t.Fatalf("episodic_memory_fts not purged in sync with episodic_memory: want 1 row, got %d", ftsCount)
+	}
 }

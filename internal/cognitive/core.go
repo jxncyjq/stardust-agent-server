@@ -232,11 +232,40 @@ func (c *Core) prefetchBlock(ctx context.Context, req Request) (string, error) {
 		b.WriteString("- (source:")
 		b.WriteString(entry.ID)
 		b.WriteString(") ")
-		b.WriteString(entry.Content)
+		b.WriteString(neutralizeMemoryFence(entry.Content))
 		b.WriteString("\n")
 	}
 	b.WriteString("</memory-context>\n")
 	return b.String(), nil
+}
+
+// neutralizeMemoryFence strips any literal memory-context fence delimiters
+// from retrieved content so a stored episode can never forge the boundary
+// that separates quarantined memory from real prompt structure. Episodic
+// content is attacker-influenceable (e.g. a failed task's Input can end up
+// distilled into memory), so without this a malicious entry could close the
+// fence early with a forged "</memory-context>", inject fabricated system
+// instructions, then reopen with "<memory-context>" to keep the rendered
+// prompt looking well-formed. Matching is case-insensitive: a model reads
+// the tag literally regardless of casing, so any casing must be neutralized.
+func neutralizeMemoryFence(s string) string {
+	out := s
+	for _, tag := range []string{"</memory-context>", "<memory-context>"} {
+		for {
+			idx := indexFold(out, tag)
+			if idx < 0 {
+				break
+			}
+			out = out[:idx] + "[memory-context]" + out[idx+len(tag):]
+		}
+	}
+	return out
+}
+
+// indexFold is a case-insensitive variant of strings.Index. The fence tags
+// are pure ASCII, so a simple ASCII-lowercasing comparison is sufficient.
+func indexFold(s, sub string) int {
+	return strings.Index(strings.ToLower(s), strings.ToLower(sub))
 }
 
 func conversationBlock(turns []domain.ConversationTurn) string {
