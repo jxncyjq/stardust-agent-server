@@ -56,6 +56,15 @@ type ToolGate interface {
 	Resolve(ctx context.Context, task domain.Task, call domain.ToolCall, tools *tool.Registry) (allow bool, err error)
 }
 
+// EpisodeRecorder captures a one-line-of-effort summary of a finished task into
+// episodic memory. It is best-effort and MUST NOT block or fail the task: the
+// implementation does its own async work + timeout + logging, so RecordEpisode
+// returns immediately and never errors. A nil recorder disables episode
+// recording entirely (valid, zero-behaviour-change default).
+type EpisodeRecorder interface {
+	RecordEpisode(agent domain.Agent, task domain.Task, outcome string, content string)
+}
+
 type Config struct {
 	Maas           port.MaasInferenceClient
 	Audit          port.AuditLog
@@ -124,6 +133,11 @@ type Config struct {
 	// loop's accumulated prompt tokens exceed it. 0 disables compaction
 	// (default), matching config.RuntimeConfig.CompactTokenThreshold.
 	CompactTokenThreshold int
+	// EpisodeRecorder is an optional hook invoked once per finished task (success
+	// in finishRun, failure in recordLearningFailure) with a one-line-of-effort
+	// summary for episodic memory. Nil disables it; the runtime never depends on
+	// its outcome.
+	EpisodeRecorder EpisodeRecorder
 }
 
 // SkillUsageRecorder is the usage sidecar skill.UsageStore satisfies.
@@ -166,6 +180,7 @@ type Runtime struct {
 	disabledTools         []string
 	debug                 bool
 	compactTokenThreshold int
+	episodeRecorder       EpisodeRecorder
 }
 
 // loopState is the mutable state threaded through the tool-execution loop.
@@ -303,6 +318,16 @@ func NewRuntime(cfg Config) *Runtime {
 		capabilitySkills:      cfg.CapabilitySkills,
 		disabledTools:         cfg.DisabledTools,
 		compactTokenThreshold: cfg.CompactTokenThreshold,
+		episodeRecorder:       cfg.EpisodeRecorder,
+	}
+}
+
+// recordEpisode is the nil-safe entry point into the optional EpisodeRecorder
+// hook. A nil recorder (the default) makes this a no-op, so callers never need
+// to guard the call themselves.
+func (r *Runtime) recordEpisode(agent domain.Agent, task domain.Task, outcome string, content string) {
+	if r.episodeRecorder != nil {
+		r.episodeRecorder.RecordEpisode(agent, task, outcome, content)
 	}
 }
 
@@ -670,6 +695,7 @@ func (r *Runtime) finishRun(ctx context.Context, requestID string, agent domain.
 	if err := r.publishLearning(ctx, agent, task, evolution.SignalSuccess, "", false); err != nil {
 		return domain.TaskRun{}, fmt.Errorf("publish learning success event: %w", err)
 	}
+	r.recordEpisode(agent, task, "success", st.resp.Text)
 	return run, nil
 }
 
@@ -978,6 +1004,7 @@ func (r *Runtime) recordLearningFailure(ctx context.Context, agent domain.Agent,
 			"reason", reason,
 			"error", err)
 	}
+	r.recordEpisode(agent, task, "failure:"+reason, task.Input)
 }
 
 func (r *Runtime) publishLearning(ctx context.Context, agent domain.Agent, task domain.Task, signal evolution.SignalKind, reason string, lightweight bool) error {

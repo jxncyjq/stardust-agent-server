@@ -1007,6 +1007,101 @@ func TestSQLiteListSkillsRoundTrip(t *testing.T) {
 	}
 }
 
+func TestSchemaHasEpisodicMemoryTables(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := openTestSQLiteRepository(t)
+
+	for _, name := range []string{"episodic_memory", "episodic_memory_fts"} {
+		var got string
+		if err := repo.db.QueryRowContext(ctx,
+			`SELECT name FROM sqlite_master WHERE name = ?`, name).Scan(&got); err != nil {
+			t.Fatalf("table %q not found: %v", name, err)
+		}
+	}
+
+	var version int
+	if err := repo.db.QueryRowContext(ctx,
+		`SELECT MAX(version) FROM schema_migrations`).Scan(&version); err != nil {
+		t.Fatalf("read schema version: %v", err)
+	}
+	if version < 7 {
+		t.Fatalf("schema version = %d, want >= 7", version)
+	}
+}
+
+func TestEpisodicMemoryAddAndSearch(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := openTestSQLiteRepository(t)
+
+	add := func(id, content string) {
+		t.Helper()
+		if err := repo.AddEpisodicMemory(ctx, domain.MemoryEntry{
+			ID: id, AgentID: "a1", TaskID: "t-" + id, Content: content, CreatedAt: time.Now(),
+		}); err != nil {
+			t.Fatalf("AddEpisodicMemory(%s): %v", id, err)
+		}
+	}
+	add("e1", "团体保险 保全服务 加减人")
+	add("e2", "prompt cache 稳定前缀 冻结快照")
+
+	// 关键词命中
+	hits, err := repo.SearchEpisodicMemory(ctx, "保全服务怎么办理", 5)
+	if err != nil {
+		t.Fatalf("SearchEpisodicMemory: %v", err)
+	}
+	if len(hits) == 0 || hits[0].ID != "e1" {
+		t.Fatalf("expected e1 top hit, got %+v", hits)
+	}
+	// round-trip 字段完整
+	if hits[0].Content == "" || hits[0].AgentID != "a1" || hits[0].TaskID != "t-e1" {
+		t.Fatalf("entry fields not round-tripped: %+v", hits[0])
+	}
+
+	// 空查询 → 回退最近 topK（按 created_at DESC）
+	recent, err := repo.SearchEpisodicMemory(ctx, "", 1)
+	if err != nil {
+		t.Fatalf("SearchEpisodicMemory empty: %v", err)
+	}
+	if len(recent) != 1 {
+		t.Fatalf("empty query topK=1 → want 1 recent, got %d", len(recent))
+	}
+
+	// topK 上界
+	all, _ := repo.SearchEpisodicMemory(ctx, "", 10)
+	if len(all) != 2 {
+		t.Fatalf("want 2 total, got %d", len(all))
+	}
+
+	// topK<=0 → 空
+	none, err := repo.SearchEpisodicMemory(ctx, "保全", 0)
+	if err != nil || none != nil {
+		t.Fatalf("topK=0 → want (nil,nil), got (%v,%v)", none, err)
+	}
+
+	// 2 字 CJK 查询命中更长内容子串（trigram 单独做不到，靠 LIKE 补）
+	add("e3", "保全服务办理流程说明")
+	short, err := repo.SearchEpisodicMemory(ctx, "保全", 5)
+	if err != nil {
+		t.Fatalf("SearchEpisodicMemory short CJK: %v", err)
+	}
+	foundE3 := false
+	for _, h := range short {
+		if h.ID == "e3" {
+			foundE3 = true
+		}
+	}
+	if !foundE3 {
+		t.Fatalf(`2-char CJK query "保全" must hit content substring, got %+v`, short)
+	}
+
+	// 含 FTS5 特殊字符的查询不得报错（稳健性）
+	if _, err := repo.SearchEpisodicMemory(ctx, `"; DROP -- (保全)*`, 5); err != nil {
+		t.Fatalf("special-char query must not error: %v", err)
+	}
+}
+
 func openTestSQLiteRepository(t *testing.T) *SQLiteRepository {
 	t.Helper()
 	repo, err := OpenSQLite(context.Background(), filepath.Join(t.TempDir(), "agent.db"))

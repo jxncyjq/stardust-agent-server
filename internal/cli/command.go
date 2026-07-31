@@ -1602,6 +1602,7 @@ func newDataRetentionCommand(out io.Writer) *cobra.Command {
 	var auditDays int
 	var runtimeDays int
 	var qualityDays int
+	var episodicDays int
 	var apply bool
 	cmd := &cobra.Command{
 		Use:   "retention",
@@ -1626,6 +1627,7 @@ func newDataRetentionCommand(out io.Writer) *cobra.Command {
 				AuditMaxAge:          daysDuration(auditDays),
 				RuntimeEventMaxAge:   daysDuration(runtimeDays),
 				QualityHistoryMaxAge: daysDuration(qualityDays),
+				EpisodicMaxAge:       daysDuration(episodicDays),
 				DryRun:               !apply,
 			}
 			var plan storage.RetentionPlan
@@ -1639,11 +1641,12 @@ func newDataRetentionCommand(out io.Writer) *cobra.Command {
 			}
 			_, err = fmt.Fprintf(
 				out,
-				"retention dry_run=%t audit_events_deleted=%d runtime_events_deleted=%d quality_history_deleted=%d\n",
+				"retention dry_run=%t audit_events_deleted=%d runtime_events_deleted=%d quality_history_deleted=%d episodic_memory_deleted=%d\n",
 				plan.DryRun,
 				plan.AuditEventsDeleted,
 				plan.RuntimeEventsDeleted,
 				plan.QualityHistoryDeleted,
+				plan.EpisodicDeleted,
 			)
 			return err
 		},
@@ -1652,6 +1655,7 @@ func newDataRetentionCommand(out io.Writer) *cobra.Command {
 	cmd.Flags().IntVar(&auditDays, "audit-days", 0, "delete audit events older than this many days")
 	cmd.Flags().IntVar(&runtimeDays, "runtime-days", 0, "delete runtime events older than this many days")
 	cmd.Flags().IntVar(&qualityDays, "quality-days", 0, "delete quality history older than this many days")
+	cmd.Flags().IntVar(&episodicDays, "episodic-days", 0, "delete episodic memory older than this many days")
 	cmd.Flags().BoolVar(&apply, "apply", false, "apply the retention plan instead of dry-running it")
 	return cmd
 }
@@ -1896,6 +1900,7 @@ func buildDefaultRunnerConfig(
 	logger *slog.Logger,
 	capabilitySkills capability.Provider,
 	skillUsage agentruntime.SkillUsageRecorder,
+	episodeRecorder agentruntime.EpisodeRecorder,
 ) agentruntime.Config {
 	return agentruntime.Config{
 		Maas:             maas,
@@ -1909,6 +1914,7 @@ func buildDefaultRunnerConfig(
 		Logger:           logger,
 		CapabilitySkills: capabilitySkills,
 		SkillUsage:       skillUsage,
+		EpisodeRecorder:  episodeRecorder,
 		DisabledTools:    runtimeSettings.DisabledTools,
 		Debug:            runtimeSettings.Debug,
 		// Compaction must be enabled here as well as on the resolver path: this
@@ -2128,6 +2134,10 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// It stays nil for the non-sqlite drivers, mirroring messageStore/taskSink
 	// below — there is no durable session history to read back for those.
 	var conversationTurns agentruntime.ConversationTurnLister
+	// episodicStore backs the cognitive memory provider's Add/Search calls. It
+	// stays nil here for the non-sqlite drivers and is given an in-memory
+	// fallback below, mirroring taskSink/conversationTurns/messageStore above.
+	var episodicStore memory.EpisodicStore
 	// skillUsage is the shared usage sidecar: the skill System records activity on
 	// it as skills are selected into task context, and the Curator sweep reads it
 	// to age idle skills. Sharing one instance connects the two.
@@ -2139,6 +2149,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		sessionSearcher = repo
 		taskSink = repo
 		conversationTurns = repo
+		episodicStore = memory.NewPersistentEpisodicStore(repo)
 		curator, err := skill.NewCurator(skill.CuratorConfig{Repository: repo, Usage: skillUsage})
 		if err != nil {
 			closeStore()
@@ -2148,6 +2159,11 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	}
 	if auditLog == nil {
 		auditLog = adapter.NewMemoryAuditLog()
+	}
+	if episodicStore == nil {
+		// 非 sqlite 部署：无持久后端，退回进程内存 episodic 存储（重启即失，
+		// 与 taskSink/conversationTurns 对非 sqlite 驱动留空的语义一致）。
+		episodicStore = memory.NewEpisodicMemoryStore(adapter.KeywordEmbeddingProvider{})
 	}
 
 	logger := opts.Logger
@@ -2226,6 +2242,25 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// Suspended->Running so the coordinator's resume scan re-dispatches it. It
 	// also drives the background timeout sweep and the restart reconcile below.
 	approvalCoordinator := manualgate.NewApprovalCoordinator(toolGateStore, liveTasks, manualgate.WithCoordinatorSink(approvalSink))
+	// defaultMaas is built here (moved ahead of its previous position below the
+	// resolver) so episodeRecorder can use it as the distillation client — the
+	// resolver needs episodeRecorder already constructed to wire it into
+	// AgentRuntimeResolverConfig.EpisodeRecorder.
+	defaultMaas, err := adapter.NewMaasClientFromProfile(cfg.Maas, "")
+	if err != nil {
+		closeStore()
+		return ServeResult{}, err
+	}
+	if defaultMaas == nil {
+		defaultMaas = adapter.NewRecordingMaas(cfg.Runtime.DemoResponse)
+	}
+	// episodeRecorder distills each resolver-built per-agent runtime's finished
+	// tasks (success/failure, via runtime.Config.EpisodeRecorder's hooks) into
+	// the episodic store, off the task's critical path. It writes into the SAME
+	// episodicStore instance the cognitive memory provider (episodicMemory,
+	// below) reads from, so a recorded episode is retrievable by later tasks'
+	// Prefetch.
+	episodeRecorder := newEpisodeRecorder(defaultMaas, episodicStore, logger)
 	resolver := agentruntime.NewAgentRuntimeResolver(agentruntime.AgentRuntimeResolverConfig{
 		Registry:          registry,
 		RootConfig:        cfg,
@@ -2239,15 +2274,8 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		Logger:            logger,
 		SkillUsage:        skillUsage,
 		ConversationTurns: conversationTurns,
+		EpisodeRecorder:   episodeRecorder,
 	})
-	defaultMaas, err := adapter.NewMaasClientFromProfile(cfg.Maas, "")
-	if err != nil {
-		closeStore()
-		return ServeResult{}, err
-	}
-	if defaultMaas == nil {
-		defaultMaas = adapter.NewRecordingMaas(cfg.Runtime.DemoResponse)
-	}
 	defaultDisplay := tuiDisplayConfig(cfg.Maas, "", "")
 	defaultContext, err := buildRunContextPrefix(ctx, cfg, false, defaultDisplay.ModelName)
 	if err != nil {
@@ -2259,7 +2287,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// it, and the cognitive Core (L4) reads them back when building context, so
 	// failures distilled by the background scan resurface as capability hints.
 	capabilityStore := memory.NewCapabilityMemoryStore()
-	episodicMemory := newEpisodicMemoryProvider(memory.NewEpisodicMemoryStore(adapter.KeywordEmbeddingProvider{}), 3)
+	episodicMemory := newEpisodicMemoryProvider(episodicStore, 3)
 	gepCycle := evolution.NewGepCycle(evolution.GepCycleConfig{
 		Extractor:       evolution.NewSignalExtractor(),
 		Distiller:       evolution.DefaultDistillationOperator{},
@@ -2307,6 +2335,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 			defaultMaas, auditLog, workflowEvents, defaultCore,
 			cfg.Runtime, checkpointStore, manualGate, logger, capabilitySkills,
 			skillUsage,
+			episodeRecorder,
 		),
 		contextRoot:      cfg.ContextFiles.Root,
 		audit:            auditLog,

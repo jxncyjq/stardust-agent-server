@@ -117,6 +117,51 @@ func TestResolverInjectsSkillUsage(t *testing.T) {
 	}
 }
 
+// TestResolverInjectsEpisodeRecorder guards B3 Task 3's resolver wiring: a
+// resolver constructed with EpisodeRecorder must pass it through to every
+// per-agent *Runtime it builds, mirroring TestResolverInjectsSkillUsage.
+// Without this wiring, a resolver-built runtime's task success/failure hooks
+// (see runtime.go's recordEpisode) silently no-op for every per-agent task,
+// so no episodic memory is ever written for delegated/child agents.
+func TestResolverInjectsEpisodeRecorder(t *testing.T) {
+	t.Parallel()
+
+	recorder := &fakeEpisodeRecorder{}
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
+			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep"},
+		}),
+		RootConfig: config.Config{Runtime: config.RuntimeConfig{MaxToolRounds: 1}},
+		Audit:      adapter.NewMemoryAuditLog(),
+		Events:     adapter.NewMemoryEventBus(),
+		MaasFactory: func(string) (MaasRunnerFactoryResult, error) {
+			return MaasRunnerFactoryResult{Client: &resolverCaptureMaas{response: "ok"}}, nil
+		},
+		EpisodeRecorder: recorder,
+	})
+
+	_, runner, ok, err := resolver.ResolveTaskRunner(context.Background(), domain.Task{
+		ID:      "task-episode",
+		AgentID: "researcher",
+	})
+	if err != nil {
+		t.Fatalf("ResolveTaskRunner error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatalf("ResolveTaskRunner ok = false, want true")
+	}
+	rt, isRuntime := runner.(*Runtime)
+	if !isRuntime {
+		t.Fatalf("runner type = %T, want *Runtime", runner)
+	}
+	if rt.episodeRecorder == nil {
+		t.Fatalf("resolver runtime missing episodeRecorder, want non-nil (recorder)")
+	}
+	if rt.episodeRecorder != EpisodeRecorder(recorder) {
+		t.Fatalf("resolver runtime episodeRecorder = %v, want the same recorder %v", rt.episodeRecorder, recorder)
+	}
+}
+
 // TestAgentToolRootPrefersTaskWorkingDir guards Task 7's sandbox-root
 // priority: a task carrying a non-empty WorkingDir always wins over both the
 // agent's and the root config's configured ContextFiles.Root, since the

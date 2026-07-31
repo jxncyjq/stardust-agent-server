@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stardust/legion-agent/internal/adapter"
@@ -83,6 +84,92 @@ func TestRuntimeRunTaskPublishesLightweightFailureLearningEvent(t *testing.T) {
 	}
 	if !hasLearningMessagePart(runtimeEvents, "lightweight=true") {
 		t.Fatalf("Runtime learning failure event missing lightweight=true: %#v", runtimeEvents)
+	}
+}
+
+// fakeEpisodeRecorder is a test double for EpisodeRecorder: it records every
+// call it receives (outcome, content, task ID) under a mutex so tests can
+// assert on them after RunTask returns.
+type fakeEpisodeRecorder struct {
+	mu    sync.Mutex
+	calls []struct{ outcome, content, taskID string }
+}
+
+func (f *fakeEpisodeRecorder) RecordEpisode(_ domain.Agent, task domain.Task, outcome, content string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, struct{ outcome, content, taskID string }{outcome, content, task.ID})
+}
+
+func TestRuntimeRecordsSuccessEpisode(t *testing.T) {
+	t.Parallel()
+
+	rec := &fakeEpisodeRecorder{}
+	runner := NewRuntime(Config{
+		Maas:            adapter.NewRecordingMaas("done"),
+		Audit:           adapter.NewMemoryAuditLog(),
+		Events:          adapter.NewMemoryEventBus(),
+		EpisodeRecorder: rec,
+	})
+
+	_, err := runner.RunTask(context.Background(), domain.Agent{ID: "agent-1"}, domain.Task{
+		ID:      "task-episode-success",
+		AgentID: "agent-1",
+		Input:   "say done",
+	})
+	if err != nil {
+		t.Fatalf("RunTask() error = %v, want nil", err)
+	}
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.calls) != 1 {
+		t.Fatalf("EpisodeRecorder calls = %d, want 1: %+v", len(rec.calls), rec.calls)
+	}
+	if rec.calls[0].outcome != "success" {
+		t.Fatalf("EpisodeRecorder call outcome = %q, want %q", rec.calls[0].outcome, "success")
+	}
+	if rec.calls[0].taskID != "task-episode-success" {
+		t.Fatalf("EpisodeRecorder call taskID = %q, want %q", rec.calls[0].taskID, "task-episode-success")
+	}
+	if rec.calls[0].content != "done" {
+		t.Fatalf("EpisodeRecorder call content = %q, want the task's result text %q", rec.calls[0].content, "done")
+	}
+}
+
+func TestRuntimeRecordsFailureEpisode(t *testing.T) {
+	t.Parallel()
+
+	rec := &fakeEpisodeRecorder{}
+	runner := NewRuntime(Config{
+		Maas:            failingMaas{},
+		Audit:           adapter.NewMemoryAuditLog(),
+		Events:          adapter.NewMemoryEventBus(),
+		EpisodeRecorder: rec,
+	})
+
+	_, err := runner.RunTask(context.Background(), domain.Agent{ID: "agent-1"}, domain.Task{
+		ID:      "task-episode-failure",
+		AgentID: "agent-1",
+		Input:   "fail inference",
+	})
+	if err == nil {
+		t.Fatalf("RunTask() error = nil, want error")
+	}
+
+	rec.mu.Lock()
+	defer rec.mu.Unlock()
+	if len(rec.calls) != 1 {
+		t.Fatalf("EpisodeRecorder calls = %d, want 1: %+v", len(rec.calls), rec.calls)
+	}
+	if !strings.HasPrefix(rec.calls[0].outcome, "failure:") {
+		t.Fatalf("EpisodeRecorder call outcome = %q, want failure:<reason> prefix", rec.calls[0].outcome)
+	}
+	if rec.calls[0].taskID != "task-episode-failure" {
+		t.Fatalf("EpisodeRecorder call taskID = %q, want %q", rec.calls[0].taskID, "task-episode-failure")
+	}
+	if rec.calls[0].content != "fail inference" {
+		t.Fatalf("EpisodeRecorder call content = %q, want the task's input %q", rec.calls[0].content, "fail inference")
 	}
 }
 

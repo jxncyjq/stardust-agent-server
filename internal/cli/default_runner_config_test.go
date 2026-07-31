@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/stardust/legion-agent/internal/config"
+	"github.com/stardust/legion-agent/internal/domain"
 	agentruntime "github.com/stardust/legion-agent/internal/runtime"
 	"github.com/stardust/legion-agent/internal/skill"
 )
@@ -30,6 +31,7 @@ func TestBuildDefaultRunnerConfigWiresSkillUsage(t *testing.T) {
 		config.RuntimeConfig{MaxToolRounds: 3, LazyTools: true},
 		nil, nil, nil, nil,
 		usage,
+		nil,
 	)
 
 	if cfg.SkillUsage == nil {
@@ -45,5 +47,40 @@ func TestBuildDefaultRunnerConfigWiresSkillUsage(t *testing.T) {
 	}
 	if !cfg.LazyTools {
 		t.Errorf("buildDefaultRunnerConfig().LazyTools = false, want true")
+	}
+}
+
+// fakeEpisodeRecorder is a minimal agentruntime.EpisodeRecorder test double
+// used only to prove the field flows through buildDefaultRunnerConfig; it
+// records nothing and is never invoked by this test.
+type fakeEpisodeRecorder struct{}
+
+func (fakeEpisodeRecorder) RecordEpisode(domain.Agent, domain.Task, string, string) {}
+
+// TestBuildDefaultRunnerConfigWiresEpisodeRecorder guards the default-runner
+// half of the B3 review fix: the EpisodeRecorder constructed in
+// BuildServeService (newEpisodeRecorder, wired into the resolver path via
+// AgentRuntimeResolverConfig.EpisodeRecorder) must also reach
+// defaultTaskRunner.runtimeCfg, or default-agent tasks — the GUI's primary
+// path, since defaultCore.WithMemory shares the same episodicStore the
+// recorder writes into — never record an episode despite the read side
+// querying it on every later task's Prefetch.
+func TestBuildDefaultRunnerConfigWiresEpisodeRecorder(t *testing.T) {
+	t.Parallel()
+
+	rec := fakeEpisodeRecorder{}
+	cfg := buildDefaultRunnerConfig(
+		nil, nil, nil, nil,
+		config.RuntimeConfig{},
+		nil, nil, nil, nil,
+		nil,
+		rec,
+	)
+
+	if cfg.EpisodeRecorder == nil {
+		t.Fatal("buildDefaultRunnerConfig().EpisodeRecorder = nil, want the shared episode recorder")
+	}
+	if cfg.EpisodeRecorder != agentruntime.EpisodeRecorder(rec) {
+		t.Fatalf("buildDefaultRunnerConfig().EpisodeRecorder = %v, want %v", cfg.EpisodeRecorder, rec)
 	}
 }

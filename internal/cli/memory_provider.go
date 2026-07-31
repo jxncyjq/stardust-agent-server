@@ -8,18 +8,20 @@ import (
 	"github.com/stardust/legion-agent/internal/memory"
 )
 
-// episodicMemoryProvider adapts an *memory.EpisodicMemoryStore to the
-// cognitive.MemoryProvider interface expected by the cognitive Core. The
-// episodic store exposes Add/Search over an embedding index; the Core wants a
-// SystemPromptBlock plus a per-task Prefetch. Episodic memory carries no
-// agent-scoped system block, so SystemPromptBlock is intentionally empty, and
-// Prefetch maps to a bounded similarity Search over the task input.
+// episodicMemoryProvider adapts a memory.EpisodicStore (either the in-memory
+// *memory.EpisodicMemoryStore or the SQLite-backed
+// *memory.PersistentEpisodicStore) to the cognitive.MemoryProvider interface
+// expected by the cognitive Core. The episodic store exposes Add/Search over
+// an embedding index; the Core wants a SystemPromptBlock plus a per-task
+// Prefetch. Episodic memory carries no agent-scoped system block, so
+// SystemPromptBlock is intentionally empty, and Prefetch maps to a bounded
+// similarity Search over the task input.
 type episodicMemoryProvider struct {
-	store *memory.EpisodicMemoryStore
+	store memory.EpisodicStore
 	topK  int
 }
 
-func newEpisodicMemoryProvider(store *memory.EpisodicMemoryStore, topK int) *episodicMemoryProvider {
+func newEpisodicMemoryProvider(store memory.EpisodicStore, topK int) *episodicMemoryProvider {
 	if topK <= 0 {
 		topK = 3
 	}
