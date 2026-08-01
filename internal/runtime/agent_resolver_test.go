@@ -895,7 +895,10 @@ func TestRecentTurnsForTaskTruncatesAndFailsLoud(t *testing.T) {
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
-	if len([]rune(got[0].Content)) > 60 { // 10 + 截断标记裕量
+	if !strings.Contains(got[0].Content, "硬截断") { // 10 + 硬截断 footer（双语，含计数）
+		t.Fatalf("content not truncated: %d runes, %q", len([]rune(got[0].Content)), got[0].Content)
+	}
+	if len([]rune(got[0].Content)) > 400 { // 10 + footer 裕量，仍需远小于原始 100 字符
 		t.Fatalf("content not truncated: %d runes", len([]rune(got[0].Content)))
 	}
 

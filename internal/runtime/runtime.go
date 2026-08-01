@@ -889,17 +889,28 @@ func dedupKey(call domain.ToolCall) string {
 	return b.String()
 }
 
-// truncateText caps a single piece of text to maxChars runes, appending a marker
-// noting how much was dropped. maxChars <= 0 disables truncation.
+// truncateText caps text at maxChars runes. When it truncates, it appends a
+// self-describing footer stating this is a HARD truncation (a context-budget
+// limit, not a data or parameter problem) so the model does not misread a cut
+// result as "wrong arguments" and retry with different parameters — the failure
+// mode that ran one task to 60 tool calls / 831.7k input (session-…955100). The
+// footer names the shown and total rune counts so the model knows how much it is
+// missing. maxChars<=0 disables truncation.
 func truncateText(text string, maxChars int) string {
 	if maxChars <= 0 {
 		return text
 	}
 	runes := []rune(text)
-	if len(runes) <= maxChars {
+	total := len(runes)
+	if total <= maxChars {
 		return text
 	}
-	return string(runes[:maxChars]) + fmt.Sprintf("\n…[truncated %d chars]", len(runes)-maxChars)
+	return string(runes[:maxChars]) + fmt.Sprintf(
+		"\n\n──────── [输出被硬截断 / OUTPUT HARD-TRUNCATED] ────────\n"+
+			"这是硬截断（上下文预算限制），非数据或参数问题——换参数或换工具重试不会有帮助。\n"+
+			"This is a hard truncation (a context-budget limit), not a data/parameter problem; retrying with different arguments or tools will not help.\n"+
+			"显示 %d / 共 %d 字符（rune）。\n",
+		maxChars, total)
 }
 
 type noopEventBus struct{}

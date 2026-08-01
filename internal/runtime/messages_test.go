@@ -65,11 +65,22 @@ func TestConversationTruncatesOversizedToolResult(t *testing.T) {
 	calls := []domain.ToolCall{{ID: "c1", Name: "read_file"}}
 
 	convo.appendAssistant("", calls)
+	// 100 runes of content, truncated to 10 → footer must appear.
 	convo.appendToolResults(calls, []domain.ToolResult{{CallID: "c1", Success: true, Output: strings.Repeat("x", 100)}}, 10)
 
 	msgs := convo.render(0)
-	if !strings.Contains(msgs[2].Content, "truncated") {
-		t.Fatalf("tool content = %q, want a truncation marker", msgs[2].Content)
+	content := msgs[2].Content
+	if !strings.Contains(content, "硬截断") {
+		t.Fatalf("tool content = %q, want the hard-truncation self-description", content)
+	}
+	if !strings.Contains(content, "重试") {
+		t.Fatalf("footer must tell the model retrying won't help, got %q", content)
+	}
+	if !strings.Contains(content, "10") || !strings.Contains(content, "100") {
+		t.Fatalf("footer must state shown/total rune counts, got %q", content)
+	}
+	if !strings.HasPrefix(content, strings.Repeat("x", 10)) {
+		t.Fatalf("preview head (first 10 runes) missing, got %q", content)
 	}
 }
 
