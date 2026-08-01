@@ -9,6 +9,9 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"time"
+
+	"github.com/stardust/legion-agent/internal/domain"
 )
 
 // SearchResult is one web search hit returned to the model.
@@ -104,6 +107,62 @@ func (p *searxngProvider) Search(ctx context.Context, query string, limit int, e
 		})
 	}
 	return out, nil
+}
+
+func webSearchDescriptor(defaultLimit int, timeout time.Duration) Descriptor {
+	return Descriptor{
+		Name:        "web_search",
+		Description: fmt.Sprintf("Search the web via the configured SearXNG instance. Returns up to %d results (title, url, description). Supports SearXNG-passthrough operators like site:example.com and filetype:pdf.", defaultLimit),
+		RiskLevel:   "medium",
+		Timeout:     timeout,
+		Group:       "web",
+		Sensitive:   true, // outbound network access
+		InputSchema: map[string]any{
+			"type":     "object",
+			"required": []string{"query"},
+			"properties": map[string]any{
+				"query":  map[string]any{"type": "string", "description": "Search query. May include SearXNG operators (site:, filetype:, intitle:, -term)."},
+				"limit":  map[string]any{"type": "string", "description": fmt.Sprintf("Optional max results (1-20, default %d).", defaultLimit)},
+				"engine": map[string]any{"type": "string", "description": "Optional engine: baidu, google, bing, or empty for the instance default. Overrides web.search_engine."},
+			},
+		},
+	}
+}
+
+// registerWebSearchTool registers web_search only when a SearXNG URL is set.
+func registerWebSearchTool(registry *Registry, opts WebToolOptions) {
+	if strings.TrimSpace(opts.SearxngURL) == "" {
+		return
+	}
+	provider := &searxngProvider{
+		baseURL:       opts.SearxngURL,
+		defaultEngine: opts.SearchEngine,
+		client:        &http.Client{Timeout: opts.SearchTimeout},
+	}
+	registry.RegisterDescriptor(webSearchDescriptor(opts.SearchDefaultLimit, opts.SearchTimeout),
+		HandlerFunc(func(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
+			return handleWebSearch(ctx, provider, opts, call)
+		}))
+}
+
+func handleWebSearch(ctx context.Context, provider SearchProvider, opts WebToolOptions, call domain.ToolCall) (domain.ToolResult, error) {
+	query := strings.TrimSpace(call.Arguments["query"])
+	if query == "" {
+		return webFailure(call.ID, "query is required"), nil
+	}
+	limit, err := parseSearchLimit(call.Arguments["limit"], opts.SearchDefaultLimit)
+	if err != nil {
+		return webFailure(call.ID, err.Error()), nil
+	}
+	results, err := provider.Search(ctx, query, limit, call.Arguments["engine"])
+	if err != nil {
+		return webFailure(call.ID, fmt.Sprintf("web_search failed: %v", err)), nil
+	}
+	encoded, err := json.Marshal(map[string]any{"results": results})
+	if err != nil {
+		return domain.ToolResult{}, fmt.Errorf("marshal web_search results: %w", err)
+	}
+	return domain.ToolResult{CallID: call.ID, Success: true, Output: string(encoded)}, nil
 }
 
 // parseSearchLimit reads the optional string "limit" argument, clamping to

@@ -90,9 +90,11 @@ func (o WebToolOptions) normalized() WebToolOptions {
 	return o
 }
 
-// RegisterWebTools registers the fetch_url tool on registry when opts.Enabled is
-// true. It is a no-op when registry is nil or the tool is disabled.
-func RegisterWebTools(registry *Registry, opts WebToolOptions) {
+// RegisterWebTools registers fetch_url, and — when configured — web_search and
+// web_extract, on registry. toolRoot is the tool sandbox root; web_extract
+// writes full-page cache files under toolRoot so read_file can page them back.
+// It is a no-op when registry is nil or opts.Enabled is false.
+func RegisterWebTools(registry *Registry, opts WebToolOptions, toolRoot string) {
 	if registry == nil || !opts.Enabled {
 		return
 	}
@@ -101,6 +103,8 @@ func RegisterWebTools(registry *Registry, opts WebToolOptions) {
 	registry.RegisterDescriptor(fetchURLDescriptor(opts.Timeout), HandlerFunc(func(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
 		return handleFetchURL(ctx, client, opts, call)
 	}))
+	registerWebSearchTool(registry, opts)
+	registerWebExtractTool(registry, opts, client, toolRoot)
 }
 
 func fetchURLDescriptor(timeout time.Duration) Descriptor {

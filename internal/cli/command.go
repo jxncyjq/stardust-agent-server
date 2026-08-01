@@ -1991,7 +1991,7 @@ func (d *defaultTaskRunner) RunTask(ctx context.Context, agent domain.Agent, tas
 		tool.WithProjectRoot(root))
 	tool.RegisterTaskLedgerTools(tools, d.taskLedger)
 	tool.RegisterAgentMessageTools(tools, d.messageStore)
-	tool.RegisterWebTools(tools, d.webOptions)
+	tool.RegisterWebTools(tools, d.webOptions, root)
 	tool.RegisterSessionSearchTool(tools, d.sessionSearcher)
 	agentruntime.RegisterMoAConsultTool(tools, d.maasResolver)
 	runtimeCfg := d.runtimeCfg

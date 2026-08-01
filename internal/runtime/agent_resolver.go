@@ -241,7 +241,7 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		tool.WithProjectRoot(toolRoot))
 	tool.RegisterTaskLedgerTools(tools, r.taskLedger)
 	tool.RegisterAgentMessageTools(tools, r.messageStore)
-	tool.RegisterWebTools(tools, webToolOptions(r.rootConfig.Web))
+	tool.RegisterWebTools(tools, webToolOptions(r.rootConfig.Web), toolRoot)
 	recentTurns, err := r.recentTurnsForTask(ctx, task)
 	if err != nil {
 		return domain.Agent{}, nil, false, err

@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stardust/legion-agent/internal/domain"
 )
 
 func TestSearxngProviderParsesResults(t *testing.T) {
@@ -100,5 +102,50 @@ func TestSearxngProviderHTTPErrorFailsLoud(t *testing.T) {
 	p := &searxngProvider{baseURL: server.URL, client: &http.Client{Timeout: 5 * time.Second}}
 	if _, err := p.Search(context.Background(), "x", 5, ""); err == nil {
 		t.Fatal("expected error on HTTP 500, got nil")
+	}
+}
+
+func TestWebSearchHandler(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[{"title":"T","url":"https://t.example","content":"C"}]}`))
+	}))
+	defer server.Close()
+
+	registry := NewRegistry(NewStaticPolicy(DecisionAllow), nil, NoopGuardrails{})
+	RegisterWebTools(registry, WebToolOptions{Enabled: true, SearxngURL: server.URL}, t.TempDir())
+
+	res, err := registry.Execute(context.Background(), domain.Agent{ID: "a", Role: "developer"}, domain.ToolCall{
+		ID: "c1", Name: "web_search", Arguments: map[string]string{"query": "hello"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.Success {
+		t.Fatalf("expected success, got error %q", res.Error)
+	}
+	if !strings.Contains(res.Output, "t.example") || !strings.Contains(res.Output, "\"position\"") {
+		t.Errorf("output missing expected fields: %q", res.Output)
+	}
+}
+
+func TestWebSearchNotRegisteredWithoutURL(t *testing.T) {
+	registry := NewRegistry(NewStaticPolicy(DecisionAllow), nil, NoopGuardrails{})
+	RegisterWebTools(registry, WebToolOptions{Enabled: true}, t.TempDir())
+	for _, d := range registry.Descriptors() {
+		if d.Name == "web_search" {
+			t.Fatal("web_search must not register when SearxngURL is empty")
+		}
+	}
+}
+
+func TestWebSearchMissingQueryFails(t *testing.T) {
+	registry := NewRegistry(NewStaticPolicy(DecisionAllow), nil, NoopGuardrails{})
+	RegisterWebTools(registry, WebToolOptions{Enabled: true, SearxngURL: "http://127.0.0.1:1"}, t.TempDir())
+	_, err := registry.Execute(context.Background(), domain.Agent{ID: "a", Role: "developer"}, domain.ToolCall{
+		ID: "c1", Name: "web_search", Arguments: map[string]string{},
+	})
+	if err == nil {
+		t.Fatal("expected error for missing required query")
 	}
 }

@@ -34,6 +34,8 @@ var gateable = []GateableTool{
 	{"send_message", "向其他 agent 发送消息"},
 	{"session_search", "跨会话检索历史（仅编排者）"},
 	{"update_task", "更新一个任务的状态"},
+	{"web_extract", "抓取网页 URL 的正文内容"},
+	{"web_search", "通过 SearXNG 搜索网页"},
 	{"write_file", "写入/创建一个文件"},
 }
 
