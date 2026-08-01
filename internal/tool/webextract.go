@@ -2,15 +2,20 @@ package tool
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/port"
 )
 
 const webExtractMaxURLs = 5
@@ -136,6 +141,93 @@ func extractOne(ctx context.Context, client *http.Client, opts WebToolOptions, t
 	if err != nil {
 		return extractResult{URL: rawURL, Error: fmt.Sprintf("fetch %s: %v", parsed.Redacted(), err)}
 	}
-	// Task 6 inserts base64 stripping + truncate/cache here.
+	text = truncateAndCache(toolRoot, opts.ExtractCacheDir, parsed.String(), text, charLimit)
 	return extractResult{URL: rawURL, Content: text}
+}
+
+// webExtractCacheFileMax bounds a single cached full-text file so a giant page
+// cannot write unbounded bytes to the workspace.
+const webExtractCacheFileMax = 2_000_000
+
+// truncateAndCache returns the model-facing text for one page. Within charLimit
+// it returns content whole. Larger content is head(75%)+tail(25%) truncated,
+// the full text written under toolRoot/<cacheDir>/<slug>-<hash>.md (validated by
+// the workspace guard), and a footer appended pointing read_file at the file.
+// A cache write failure is logged-in-band (footer says so) but never fatal.
+func truncateAndCache(toolRoot, cacheDir, rawURL, content string, charLimit int) string {
+	runes := []rune(content)
+	if len(runes) <= charLimit {
+		return content
+	}
+	head := int(float64(charLimit) * 0.75)
+	tail := charLimit - head
+	model := string(runes[:head]) + "\n\n[... middle omitted — see footer ...]\n\n" + string(runes[len(runes)-tail:])
+
+	relPath, writeErr := writeExtractCache(toolRoot, cacheDir, rawURL, content)
+	footer := "\n\n──────── [TRUNCATED] ────────\n" +
+		fmt.Sprintf("Showing %d of %d chars.\n", head+tail, len(runes))
+	if writeErr == nil {
+		footer += fmt.Sprintf("Full text saved. To read the omitted middle: read_file path=%q offset=%d\n", relPath, head)
+	} else {
+		footer += "Full text could not be cached; re-run web_extract on a more specific URL or use fetch_url.\n"
+	}
+	return model + footer
+}
+
+// writeExtractCache writes content to toolRoot/cacheDir/<slug>-<hash>.md, guarded
+// to stay inside toolRoot, and returns the path RELATIVE to toolRoot (what
+// read_file expects). Errors are returned, not swallowed.
+func writeExtractCache(toolRoot, cacheDir, rawURL, content string) (string, error) {
+	absRoot, err := filepath.Abs(toolRoot)
+	if err != nil {
+		return "", fmt.Errorf("resolve tool root %q: %w", toolRoot, err)
+	}
+	host := "page"
+	if u, err := url.Parse(rawURL); err == nil && u.Hostname() != "" {
+		host = strings.ReplaceAll(u.Hostname(), ":", "_")
+	}
+	slug := sanitizeSlug(host)
+	sum := sha256.Sum256([]byte(rawURL))
+	name := fmt.Sprintf("%s-%s.md", slug, hex.EncodeToString(sum[:])[:10])
+	dir := filepath.Join(absRoot, cacheDir)
+	target := filepath.Join(dir, name)
+
+	guard := port.NewWorkspacePathGuard(absRoot)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create cache dir: %w", err)
+	}
+	if _, err := guard.Check(context.Background(), target); err != nil {
+		return "", fmt.Errorf("cache path escapes workspace: %w", err)
+	}
+	if len(content) > webExtractCacheFileMax {
+		content = content[:webExtractCacheFileMax] + "\n\n[... stored copy capped ...]"
+	}
+	if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
+		return "", fmt.Errorf("write cache file: %w", err)
+	}
+	rel, err := filepath.Rel(absRoot, target)
+	if err != nil {
+		return "", fmt.Errorf("relativize cache path: %w", err)
+	}
+	return filepath.ToSlash(rel), nil
+}
+
+func sanitizeSlug(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		return "page"
+	}
+	if len(out) > 60 {
+		out = out[:60]
+	}
+	return out
 }
