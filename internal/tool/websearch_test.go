@@ -139,6 +139,29 @@ func TestWebSearchNotRegisteredWithoutURL(t *testing.T) {
 	}
 }
 
+func TestWebSearchReachesPrivateSearxng(t *testing.T) {
+	// httptest 监听 127.0.0.1（私网/回环）。若 web_search 误用了 SSRF-guarded
+	// client，这里会失败——正是要防的回归。
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"results":[{"title":"ok","url":"https://ok.example","content":"c"}]}`))
+	}))
+	defer server.Close()
+
+	registry := NewRegistry(NewStaticPolicy(DecisionAllow), nil, NoopGuardrails{})
+	// 注意 AllowPrivateHosts=false（默认），仍应能连自建 SearXNG。
+	RegisterWebTools(registry, WebToolOptions{Enabled: true, SearxngURL: server.URL}, t.TempDir())
+	res, err := registry.Execute(context.Background(), domain.Agent{ID: "a", Role: "developer"}, domain.ToolCall{
+		ID: "c1", Name: "web_search", Arguments: map[string]string{"query": "x"},
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !res.Success {
+		t.Fatalf("web_search must reach a private SearXNG instance, got error %q", res.Error)
+	}
+}
+
 func TestWebSearchMissingQueryFails(t *testing.T) {
 	registry := NewRegistry(NewStaticPolicy(DecisionAllow), nil, NoopGuardrails{})
 	RegisterWebTools(registry, WebToolOptions{Enabled: true, SearxngURL: "http://127.0.0.1:1"}, t.TempDir())
