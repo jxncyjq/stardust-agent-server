@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -25,7 +27,7 @@ var (
 	// mdBase64Image 匹配 markdown 图片里的 base64 源，保留 alt 文本。
 	mdBase64Image = regexp.MustCompile(`!\[([^\]]*)\]\(\s*data:image/[^;]+;base64,[A-Za-z0-9+/=\s]+\)`)
 	// bareBase64Image 匹配裸/括号内的 base64 图片数据。
-	bareBase64Image = regexp.MustCompile(`\(?\s*data:image/[^;]+;base64,[A-Za-z0-9+/=]+\)?`)
+	bareBase64Image = regexp.MustCompile(`\(?\s*data:image/[^;]+;base64,[A-Za-z0-9+/=\s]+\)?`)
 	// secretInURL 匹配常见凭据前缀，命中则拒绝抓取该 URL。前缀集刻意保守，避免误伤普通 URL。
 	secretInURL = regexp.MustCompile(`(sk-[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[A-Z0-9]{16})`)
 )
@@ -137,9 +139,15 @@ func handleWebExtract(ctx context.Context, client *http.Client, opts WebToolOpti
 		if convErr != nil {
 			return webFailure(call.ID, fmt.Sprintf("char_limit must be an integer, got %q", raw)), nil
 		}
-		if v >= 500 && v <= 3500 {
-			charLimit = v
+		// A non-integer is fail-loud above; an in-type out-of-range value is clamped
+		// to [500,3500] (mirrors parseSearchLimit) rather than silently ignored.
+		if v < 500 {
+			v = 500
 		}
+		if v > 3500 {
+			v = 3500
+		}
+		charLimit = v
 	}
 
 	results := make([]extractResult, 0, len(urls))
@@ -182,7 +190,13 @@ func extractOne(ctx context.Context, client *http.Client, opts WebToolOptions, t
 		return extractResult{URL: rawURL, Error: fmt.Sprintf("fetch %s: %v", parsed.Redacted(), err)}
 	}
 	text = stripBase64Images(text)
-	text = truncateAndCache(toolRoot, opts.ExtractCacheDir, parsed.String(), text, charLimit)
+	text, err = truncateAndCache(toolRoot, opts.ExtractCacheDir, parsed.String(), text, charLimit)
+	if err != nil {
+		// A sandbox-escape while caching is a security-relevant failure, not a
+		// benign degradation: surface it on the per-URL failure channel (Error)
+		// and do NOT return the truncated body as if the fetch succeeded.
+		return extractResult{URL: rawURL, Error: err.Error()}
+	}
 	return extractResult{URL: rawURL, Content: text}
 }
 
@@ -194,25 +208,43 @@ const webExtractCacheFileMax = 2_000_000
 // it returns content whole. Larger content is head(75%)+tail(25%) truncated,
 // the full text written under toolRoot/<cacheDir>/<slug>-<hash>.md (validated by
 // the workspace guard), and a footer appended pointing read_file at the file.
-// A cache write failure is logged-in-band (footer says so) but never fatal.
-func truncateAndCache(toolRoot, cacheDir, rawURL, content string, charLimit int) string {
+//
+// Failure handling follows the fail-loud 铁律: a sandbox-escape write error
+// (ErrPathOutsideWorkspace) is a security-relevant "本不该发生" condition and is
+// returned as a Go error so the caller can surface it on the per-URL failure
+// channel — never downgraded to a soft footer. Any other write error (disk full,
+// read-only mount) MAY degrade gracefully to an in-band footer, but is recorded
+// via the project logger at Warn so it is never silently swallowed.
+func truncateAndCache(toolRoot, cacheDir, rawURL, content string, charLimit int) (string, error) {
 	runes := []rune(content)
 	if len(runes) <= charLimit {
-		return content
+		return content, nil
 	}
 	head := int(float64(charLimit) * 0.75)
 	tail := charLimit - head
 	model := string(runes[:head]) + "\n\n[... middle omitted — see footer ...]\n\n" + string(runes[len(runes)-tail:])
 
 	relPath, writeErr := writeExtractCache(toolRoot, cacheDir, rawURL, content)
+	if writeErr != nil && errors.Is(writeErr, port.ErrPathOutsideWorkspace) {
+		return "", fmt.Errorf("web_extract cache path escaped workspace sandbox for %s: %w", rawURL, writeErr)
+	}
 	footer := "\n\n──────── [TRUNCATED] ────────\n" +
 		fmt.Sprintf("Showing %d of %d chars.\n", head+tail, len(runes))
 	if writeErr == nil {
 		footer += fmt.Sprintf("Full text saved. To read the omitted middle: read_file path=%q offset=%d\n", relPath, head)
 	} else {
+		// Non-escape write failure (disk full / read-only mount). Graceful in-band
+		// degradation is allowed, but the 铁律 forbids silently dropping the error.
+		// We log via slog.Default() rather than threading a *slog.Logger from
+		// RegisterWebTools through 4 internal signatures and ~13 call sites
+		// (production + tests): that is genuinely invasive, and slog.Default() is
+		// already this project's structured channel (see cli/command.go's
+		// closeRepositoryLogging(slog.Default(), ...)).
+		slog.Default().Warn("web_extract cache write failed; returning truncated body without cache file",
+			"url", rawURL, "path", cacheDir, "error", writeErr)
 		footer += "Full text could not be cached; re-run web_extract on a more specific URL or use fetch_url.\n"
 	}
-	return model + footer
+	return model + footer, nil
 }
 
 // writeExtractCache writes content to toolRoot/cacheDir/<slug>-<hash>.md, guarded
@@ -233,15 +265,21 @@ func writeExtractCache(toolRoot, cacheDir, rawURL, content string) (string, erro
 	dir := filepath.Join(absRoot, cacheDir)
 	target := filepath.Join(dir, name)
 
+	// The guard must be authoritative over ALL filesystem side effects: check the
+	// target BEFORE any mkdir, or a traversal cacheDir (e.g. "../../evil") would
+	// have its directory created before the guard could reject it. Check resolves
+	// the nearest existing ancestor for not-yet-existing targets, so checking
+	// target here also covers dir (its parent). Only after the guard passes do we
+	// create the directory and write the file.
 	guard := port.NewWorkspacePathGuard(absRoot)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return "", fmt.Errorf("create cache dir: %w", err)
-	}
 	if _, err := guard.Check(context.Background(), target); err != nil {
 		return "", fmt.Errorf("cache path escapes workspace: %w", err)
 	}
-	if len(content) > webExtractCacheFileMax {
-		content = content[:webExtractCacheFileMax] + "\n\n[... stored copy capped ...]"
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", fmt.Errorf("create cache dir: %w", err)
+	}
+	if runes := []rune(content); len(runes) > webExtractCacheFileMax {
+		content = string(runes[:webExtractCacheFileMax]) + "\n\n[... stored copy capped ...]"
 	}
 	if err := os.WriteFile(target, []byte(content), 0o644); err != nil {
 		return "", fmt.Errorf("write cache file: %w", err)
@@ -267,8 +305,8 @@ func sanitizeSlug(s string) string {
 	if out == "" {
 		return "page"
 	}
-	if len(out) > 60 {
-		out = out[:60]
+	if r := []rune(out); len(r) > 60 {
+		out = string(r[:60])
 	}
 	return out
 }

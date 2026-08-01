@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -122,6 +124,58 @@ func TestWebExtractTruncatesAndCaches(t *testing.T) {
 	}
 	if !rf.Success || !strings.Contains(rf.Output, "X") {
 		t.Fatalf("read_file could not read cached full text: success=%v out=%q", rf.Success, rf.Output[:minInt(200, len(rf.Output))])
+	}
+}
+
+func TestWebExtractCacheDirTraversalBlocked(t *testing.T) {
+	big := strings.Repeat("Y", 20000) // 触发落盘分支（远超 3000 预算）
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		_, _ = w.Write([]byte(big))
+	}))
+	defer server.Close()
+
+	toolRoot := t.TempDir()
+	registry := NewRegistry(NewStaticPolicy(DecisionAllow), nil, NoopGuardrails{})
+	RegisterWebTools(registry, WebToolOptions{
+		Enabled:           true,
+		AllowPrivateHosts: true,
+		ExtractCharLimit:  3000,
+		ExtractCacheDir:   "../../escape",
+	}, toolRoot)
+
+	res, err := webExtract(t, registry, map[string]string{"urls": server.URL})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	var payload struct {
+		Results []extractResult `json:"results"`
+	}
+	if err := json.Unmarshal([]byte(res.Output), &payload); err != nil {
+		t.Fatalf("unmarshal web_extract output: %v", err)
+	}
+	if len(payload.Results) == 0 {
+		t.Fatalf("no results in output: %q", res.Output)
+	}
+	got := payload.Results[0]
+
+	if got.Error == "" {
+		t.Fatalf("expected a per-URL sandbox-escape error, got content=%q", got.Content)
+	}
+	if !strings.Contains(got.Error, "sandbox") && !strings.Contains(got.Error, "escape") && !strings.Contains(got.Error, "workspace") {
+		t.Errorf("error should name the sandbox/workspace escape, got %q", got.Error)
+	}
+	// A sandbox violation must NOT be reported as content-bearing success.
+	if got.Content != "" {
+		t.Errorf("expected no whole-page content on sandbox escape, got %q", got.Content)
+	}
+
+	// The guard runs BEFORE os.MkdirAll, so no directory may be created outside
+	// the tool root. "../../escape" from toolRoot resolves two levels up.
+	escapeDir := filepath.Join(toolRoot, "..", "..", "escape")
+	if _, statErr := os.Stat(escapeDir); !os.IsNotExist(statErr) {
+		t.Errorf("escape dir was created outside tool root: %s (stat err=%v)", escapeDir, statErr)
 	}
 }
 

@@ -137,7 +137,19 @@ func registerWebSearchTool(registry *Registry, opts WebToolOptions) {
 	provider := &searxngProvider{
 		baseURL:       opts.SearxngURL,
 		defaultEngine: opts.SearchEngine,
-		client:        &http.Client{Timeout: opts.SearchTimeout},
+		client: &http.Client{
+			Timeout: opts.SearchTimeout,
+			// Cap redirect chains (mirrors webMaxRedirects). We intentionally do NOT
+			// re-validate redirect hosts here: the SearXNG instance is trusted
+			// operator config and is commonly on a private address, so host SSRF
+			// checks are deliberately skipped — only the count is bounded.
+			CheckRedirect: func(_ *http.Request, via []*http.Request) error {
+				if len(via) >= webMaxRedirects {
+					return fmt.Errorf("searxng: stopped after %d redirects", webMaxRedirects)
+				}
+				return nil
+			},
+		},
 	}
 	registry.RegisterDescriptor(webSearchDescriptor(opts.SearchDefaultLimit, opts.SearchTimeout),
 		HandlerFunc(func(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
