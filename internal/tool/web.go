@@ -131,29 +131,10 @@ func handleFetchURL(ctx context.Context, client *http.Client, opts WebToolOption
 		maxBytes = parsedMax
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
-	if err != nil {
-		return webFailure(call.ID, fmt.Sprintf("build request: %v", err)), nil
-	}
-	req.Header.Set("User-Agent", webDefaultUserAgent)
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8")
-
-	resp, err := client.Do(req)
+	output, truncated, err := fetchPage(ctx, client, parsed.String(), maxBytes, parseWebBool(call.Arguments["raw"]))
 	if err != nil {
 		return webFailure(call.ID, fmt.Sprintf("fetch %s: %v", parsed.Redacted(), err)), nil
 	}
-	defer func() { _ = resp.Body.Close() }()
-
-	body, truncated, err := readLimited(resp.Body, maxBytes)
-	if err != nil {
-		return webFailure(call.ID, fmt.Sprintf("read response body: %v", err)), nil
-	}
-
-	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
-		return webFailure(call.ID, fmt.Sprintf("upstream returned status %d for %s", resp.StatusCode, parsed.Redacted())), nil
-	}
-
-	output := renderResponse(resp.Header.Get("Content-Type"), body, parseWebBool(call.Arguments["raw"]))
 	if truncated {
 		output += webTruncationMarker
 	}
@@ -166,6 +147,36 @@ func renderResponse(contentType string, body []byte, raw bool) string {
 		return extractReadableText(body)
 	}
 	return string(body)
+}
+
+// fetchPage GETs rawURL with client and returns the rendered body plus whether
+// it was truncated at maxBytes. HTML is reduced to readable text unless raw is
+// true; JSON/plain text are returned as-is. A non-2xx/3xx status, a transport
+// error, or a body read error is returned as an error (the caller decides how
+// to surface it). The caller is responsible for SSRF/allowlist pre-checks on
+// rawURL before calling; client's dialer provides the dial-time defense.
+func fetchPage(ctx context.Context, client *http.Client, rawURL string, maxBytes int64, raw bool) (string, bool, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
+	if err != nil {
+		return "", false, fmt.Errorf("build request: %w", err)
+	}
+	req.Header.Set("User-Agent", webDefaultUserAgent)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/json,text/plain;q=0.9,*/*;q=0.8")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, truncated, err := readLimited(resp.Body, maxBytes)
+	if err != nil {
+		return "", false, fmt.Errorf("read response body: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 400 {
+		return "", false, fmt.Errorf("upstream returned status %d", resp.StatusCode)
+	}
+	return renderResponse(resp.Header.Get("Content-Type"), body, raw), truncated, nil
 }
 
 func readLimited(reader io.Reader, maxBytes int64) ([]byte, bool, error) {
