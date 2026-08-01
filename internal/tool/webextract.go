@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +20,42 @@ import (
 )
 
 const webExtractMaxURLs = 5
+
+var (
+	// mdBase64Image 匹配 markdown 图片里的 base64 源，保留 alt 文本。
+	mdBase64Image = regexp.MustCompile(`!\[([^\]]*)\]\(\s*data:image/[^;]+;base64,[A-Za-z0-9+/=\s]+\)`)
+	// bareBase64Image 匹配裸/括号内的 base64 图片数据。
+	bareBase64Image = regexp.MustCompile(`\(?\s*data:image/[^;]+;base64,[A-Za-z0-9+/=]+\)?`)
+	// secretInURL 匹配常见凭据前缀，命中则拒绝抓取该 URL。前缀集刻意保守，避免误伤普通 URL。
+	secretInURL = regexp.MustCompile(`(sk-[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[A-Z0-9]{16})`)
+)
+
+// stripBase64Images replaces inline base64 image blobs with labeled placeholders
+// so image bytes never reach the model, while keeping any alt text and real
+// http(s) image links intact.
+func stripBase64Images(text string) string {
+	text = mdBase64Image.ReplaceAllStringFunc(text, func(m string) string {
+		sub := mdBase64Image.FindStringSubmatch(m)
+		alt := strings.TrimSpace(sub[1])
+		if alt != "" {
+			return "[IMAGE: " + alt + "]"
+		}
+		return "[IMAGE]"
+	})
+	return bareBase64Image.ReplaceAllString(text, "[IMAGE]")
+}
+
+// urlHasEmbeddedSecret reports whether rawURL (decoded) contains an API-key-like
+// token. Such URLs are refused before any fetch.
+func urlHasEmbeddedSecret(rawURL string) bool {
+	if secretInURL.MatchString(rawURL) {
+		return true
+	}
+	if decoded, err := url.QueryUnescape(rawURL); err == nil {
+		return secretInURL.MatchString(decoded)
+	}
+	return false
+}
 
 // extractResult is one page's result returned to the model.
 type extractResult struct {
@@ -132,6 +169,9 @@ func extractOne(ctx context.Context, client *http.Client, opts WebToolOptions, t
 	if scheme := strings.ToLower(parsed.Scheme); scheme != "http" && scheme != "https" {
 		return extractResult{URL: rawURL, Error: fmt.Sprintf("unsupported scheme %q", parsed.Scheme)}
 	}
+	if urlHasEmbeddedSecret(rawURL) {
+		return extractResult{URL: rawURL, Error: "blocked: URL appears to contain an API key or token; secrets must not be sent in URLs"}
+	}
 	if !opts.AllowPrivateHosts {
 		if err := checkURLHostAllowed(parsed); err != nil {
 			return extractResult{URL: rawURL, Error: err.Error()}
@@ -141,6 +181,7 @@ func extractOne(ctx context.Context, client *http.Client, opts WebToolOptions, t
 	if err != nil {
 		return extractResult{URL: rawURL, Error: fmt.Sprintf("fetch %s: %v", parsed.Redacted(), err)}
 	}
+	text = stripBase64Images(text)
 	text = truncateAndCache(toolRoot, opts.ExtractCacheDir, parsed.String(), text, charLimit)
 	return extractResult{URL: rawURL, Content: text}
 }

