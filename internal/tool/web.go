@@ -48,6 +48,13 @@ type WebToolOptions struct {
 	// Allowlist, when non-empty, restricts fetches to these domains or their
 	// subdomains. Empty means any public domain is allowed.
 	Allowlist []string
+	// SearxngURL 为空表示不注册 web_search。
+	SearxngURL         string
+	SearchEngine       string
+	SearchDefaultLimit int
+	SearchTimeout      time.Duration
+	ExtractCharLimit   int
+	ExtractCacheDir    string
 }
 
 func (o WebToolOptions) normalized() WebToolOptions {
@@ -65,6 +72,21 @@ func (o WebToolOptions) normalized() WebToolOptions {
 		}
 	}
 	o.Allowlist = allowlist
+	if o.SearchTimeout <= 0 {
+		o.SearchTimeout = 15 * time.Second
+	}
+	if o.SearchDefaultLimit <= 0 || o.SearchDefaultLimit > 20 {
+		o.SearchDefaultLimit = 5
+	}
+	if o.ExtractCharLimit < 500 {
+		o.ExtractCharLimit = 3000
+	}
+	if o.ExtractCharLimit > 3500 {
+		o.ExtractCharLimit = 3500
+	}
+	if strings.TrimSpace(o.ExtractCacheDir) == "" {
+		o.ExtractCacheDir = ".stardust/web_cache"
+	}
 	return o
 }
 

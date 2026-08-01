@@ -271,11 +271,17 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 // webToolOptions maps the web config block onto the tool package options.
 func webToolOptions(cfg config.WebToolConfig) tool.WebToolOptions {
 	return tool.WebToolOptions{
-		Enabled:           cfg.Enabled,
-		AllowPrivateHosts: cfg.AllowPrivateHosts,
-		Timeout:           time.Duration(cfg.TimeoutSeconds) * time.Second,
-		MaxBytes:          int64(cfg.MaxResponseKB) * 1024,
-		Allowlist:         cfg.Allowlist,
+		Enabled:            cfg.Enabled,
+		AllowPrivateHosts:  cfg.AllowPrivateHosts,
+		Timeout:            time.Duration(cfg.TimeoutSeconds) * time.Second,
+		MaxBytes:           int64(cfg.MaxResponseKB) * 1024,
+		Allowlist:          cfg.Allowlist,
+		SearxngURL:         cfg.SearxngURL,
+		SearchEngine:       cfg.SearchEngine,
+		SearchDefaultLimit: cfg.SearchDefaultLimit,
+		SearchTimeout:      time.Duration(cfg.SearchTimeoutSeconds) * time.Second,
+		ExtractCharLimit:   cfg.ExtractCharLimit,
+		ExtractCacheDir:    cfg.ExtractCacheDir,
 	}
 }
 

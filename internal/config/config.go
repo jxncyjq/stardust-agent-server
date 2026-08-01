@@ -51,6 +51,16 @@ type WebToolConfig struct {
 	TimeoutSeconds    int      `json:"timeout_seconds"`
 	MaxResponseKB     int      `json:"max_response_kb"`
 	Allowlist         []string `json:"allowlist"`
+
+	// web_search (SearXNG) —— SearxngURL 为空则 web_search 不注册。
+	SearxngURL           string `json:"searxng_url"`
+	SearchEngine         string `json:"search_engine"`          // baidu|google|bing|空=实例默认
+	SearchDefaultLimit   int    `json:"search_default_limit"`   // 默认 5，上限 20
+	SearchTimeoutSeconds int    `json:"search_timeout_seconds"` // 默认 15
+
+	// web_extract
+	ExtractCharLimit int    `json:"extract_char_limit"` // 内联预算，clamp [500,3500]，默认 3000
+	ExtractCacheDir  string `json:"extract_cache_dir"`  // 相对 toolRoot，默认 .stardust/web_cache
 }
 
 type MaasConfig struct {
@@ -312,11 +322,17 @@ func defaultConfig() Config {
 			DoneStatuses:    []string{"done", "cancelled"},
 		},
 		Web: WebToolConfig{
-			Enabled:           true,
-			AllowPrivateHosts: false,
-			TimeoutSeconds:    20,
-			MaxResponseKB:     512,
-			Allowlist:         []string{},
+			Enabled:              true,
+			AllowPrivateHosts:    false,
+			TimeoutSeconds:       20,
+			MaxResponseKB:        512,
+			Allowlist:            []string{},
+			SearxngURL:           "",
+			SearchEngine:         "",
+			SearchDefaultLimit:   5,
+			SearchTimeoutSeconds: 15,
+			ExtractCharLimit:     3000,
+			ExtractCacheDir:      ".stardust/web_cache",
 		},
 		Evolution: EvolutionConfig{
 			DegradationThreshold:   0.2,
