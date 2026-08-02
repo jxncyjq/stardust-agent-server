@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"log/slog"
 	"testing"
 
 	"github.com/stardust/legion-agent/internal/domain"
@@ -19,7 +20,7 @@ func TestMessageSnapshotRoundTrip(t *testing.T) {
 	convo := newConversation("base", []string{"data:image/png;base64,AA"})
 	calls := []domain.ToolCall{{ID: "c1", Name: "read_file", Arguments: map[string]string{"path": "a.txt"}}}
 	convo.appendAssistant("thinking", calls)
-	convo.appendToolResults(calls, []domain.ToolResult{{CallID: "c1", Success: true, Output: "hi"}}, 0)
+	convo.appendToolResults(calls, []domain.ToolResult{{CallID: "c1", Success: true, Output: "hi"}}, 0, "", defaultToolResultCacheDir, slog.Default())
 
 	restored := restoreConversation(snapshotMessages(convo))
 

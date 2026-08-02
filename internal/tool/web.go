@@ -53,8 +53,6 @@ type WebToolOptions struct {
 	SearchEngine       string
 	SearchDefaultLimit int
 	SearchTimeout      time.Duration
-	ExtractCharLimit   int
-	ExtractCacheDir    string
 }
 
 func (o WebToolOptions) normalized() WebToolOptions {
@@ -78,23 +76,15 @@ func (o WebToolOptions) normalized() WebToolOptions {
 	if o.SearchDefaultLimit <= 0 || o.SearchDefaultLimit > 20 {
 		o.SearchDefaultLimit = 5
 	}
-	if o.ExtractCharLimit < 500 {
-		o.ExtractCharLimit = 3000
-	}
-	if o.ExtractCharLimit > 3500 {
-		o.ExtractCharLimit = 3500
-	}
-	if strings.TrimSpace(o.ExtractCacheDir) == "" {
-		o.ExtractCacheDir = ".stardust/web_cache"
-	}
 	return o
 }
 
 // RegisterWebTools registers fetch_url, and — when configured — web_search and
-// web_extract, on registry. toolRoot is the tool sandbox root; web_extract
-// writes full-page cache files under toolRoot so read_file can page them back.
-// It is a no-op when registry is nil or opts.Enabled is false.
-func RegisterWebTools(registry *Registry, opts WebToolOptions, toolRoot string) {
+// web_extract, on registry. Oversized web_extract results are handled uniformly
+// by the runtime tool loop (renderToolResultContent); the web tools no longer
+// cache at the tool level. It is a no-op when registry is nil or opts.Enabled is
+// false.
+func RegisterWebTools(registry *Registry, opts WebToolOptions) {
 	if registry == nil || !opts.Enabled {
 		return
 	}
@@ -104,7 +94,7 @@ func RegisterWebTools(registry *Registry, opts WebToolOptions, toolRoot string) 
 		return handleFetchURL(ctx, client, opts, call)
 	}))
 	registerWebSearchTool(registry, opts)
-	registerWebExtractTool(registry, opts, client, toolRoot)
+	registerWebExtractTool(registry, opts, client)
 }
 
 func fetchURLDescriptor(timeout time.Duration) Descriptor {

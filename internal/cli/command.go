@@ -1991,11 +1991,12 @@ func (d *defaultTaskRunner) RunTask(ctx context.Context, agent domain.Agent, tas
 		tool.WithProjectRoot(root))
 	tool.RegisterTaskLedgerTools(tools, d.taskLedger)
 	tool.RegisterAgentMessageTools(tools, d.messageStore)
-	tool.RegisterWebTools(tools, d.webOptions, root)
+	tool.RegisterWebTools(tools, d.webOptions)
 	tool.RegisterSessionSearchTool(tools, d.sessionSearcher)
 	agentruntime.RegisterMoAConsultTool(tools, d.maasResolver)
 	runtimeCfg := d.runtimeCfg
 	runtimeCfg.Tools = tools
+	runtimeCfg.ToolRoot = root
 	turns, err := agentruntime.RecentTurnsForTask(ctx, d.conversationTurns, d.sessionCfg, task)
 	if err != nil {
 		return domain.TaskRun{}, err
@@ -2039,8 +2040,6 @@ func webToolOptions(cfg config.WebToolConfig) tool.WebToolOptions {
 		SearchEngine:       cfg.SearchEngine,
 		SearchDefaultLimit: cfg.SearchDefaultLimit,
 		SearchTimeout:      time.Duration(cfg.SearchTimeoutSeconds) * time.Second,
-		ExtractCharLimit:   cfg.ExtractCharLimit,
-		ExtractCacheDir:    cfg.ExtractCacheDir,
 	}
 }
 

@@ -16,7 +16,7 @@ import (
 func newWebRegistry(t *testing.T, opts WebToolOptions) *Registry {
 	t.Helper()
 	registry := NewRegistry(NewStaticPolicy(DecisionAllow), nil, NoopGuardrails{})
-	RegisterWebTools(registry, opts, t.TempDir())
+	RegisterWebTools(registry, opts)
 	return registry
 }
 
@@ -199,7 +199,7 @@ func TestFetchURLAllowPrivateHostsReachesLocal(t *testing.T) {
 
 func TestFetchURLDisabledNotRegistered(t *testing.T) {
 	registry := NewRegistry(NewStaticPolicy(DecisionAllow), nil, NoopGuardrails{})
-	RegisterWebTools(registry, WebToolOptions{Enabled: false}, t.TempDir())
+	RegisterWebTools(registry, WebToolOptions{Enabled: false})
 	_, err := fetchURL(t, registry, map[string]string{"url": "http://example.com"})
 	if err == nil {
 		t.Fatalf("expected fetch_url to be unregistered when disabled")

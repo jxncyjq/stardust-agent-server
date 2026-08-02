@@ -113,7 +113,7 @@ func TestWebSearchHandler(t *testing.T) {
 	defer server.Close()
 
 	registry := NewRegistry(NewStaticPolicy(DecisionAllow), nil, NoopGuardrails{})
-	RegisterWebTools(registry, WebToolOptions{Enabled: true, SearxngURL: server.URL}, t.TempDir())
+	RegisterWebTools(registry, WebToolOptions{Enabled: true, SearxngURL: server.URL})
 
 	res, err := registry.Execute(context.Background(), domain.Agent{ID: "a", Role: "developer"}, domain.ToolCall{
 		ID: "c1", Name: "web_search", Arguments: map[string]string{"query": "hello"},
@@ -131,7 +131,7 @@ func TestWebSearchHandler(t *testing.T) {
 
 func TestWebSearchNotRegisteredWithoutURL(t *testing.T) {
 	registry := NewRegistry(NewStaticPolicy(DecisionAllow), nil, NoopGuardrails{})
-	RegisterWebTools(registry, WebToolOptions{Enabled: true}, t.TempDir())
+	RegisterWebTools(registry, WebToolOptions{Enabled: true})
 	for _, d := range registry.Descriptors() {
 		if d.Name == "web_search" {
 			t.Fatal("web_search must not register when SearxngURL is empty")
@@ -150,7 +150,7 @@ func TestWebSearchReachesPrivateSearxng(t *testing.T) {
 
 	registry := NewRegistry(NewStaticPolicy(DecisionAllow), nil, NoopGuardrails{})
 	// 注意 AllowPrivateHosts=false（默认），仍应能连自建 SearXNG。
-	RegisterWebTools(registry, WebToolOptions{Enabled: true, SearxngURL: server.URL}, t.TempDir())
+	RegisterWebTools(registry, WebToolOptions{Enabled: true, SearxngURL: server.URL})
 	res, err := registry.Execute(context.Background(), domain.Agent{ID: "a", Role: "developer"}, domain.ToolCall{
 		ID: "c1", Name: "web_search", Arguments: map[string]string{"query": "x"},
 	})
@@ -164,7 +164,7 @@ func TestWebSearchReachesPrivateSearxng(t *testing.T) {
 
 func TestWebSearchMissingQueryFails(t *testing.T) {
 	registry := NewRegistry(NewStaticPolicy(DecisionAllow), nil, NoopGuardrails{})
-	RegisterWebTools(registry, WebToolOptions{Enabled: true, SearxngURL: "http://127.0.0.1:1"}, t.TempDir())
+	RegisterWebTools(registry, WebToolOptions{Enabled: true, SearxngURL: "http://127.0.0.1:1"})
 	_, err := registry.Execute(context.Background(), domain.Agent{ID: "a", Role: "developer"}, domain.ToolCall{
 		ID: "c1", Name: "web_search", Arguments: map[string]string{},
 	})
