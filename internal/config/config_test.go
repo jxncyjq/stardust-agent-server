@@ -545,12 +545,6 @@ func TestDefaultConfigWebSearchFields(t *testing.T) {
 	if cfg.Web.SearchDefaultLimit != 5 {
 		t.Errorf("SearchDefaultLimit = %d, want 5", cfg.Web.SearchDefaultLimit)
 	}
-	if cfg.Web.ExtractCharLimit != 3000 {
-		t.Errorf("ExtractCharLimit = %d, want 3000", cfg.Web.ExtractCharLimit)
-	}
-	if cfg.Web.ExtractCacheDir != ".stardust/web_cache" {
-		t.Errorf("ExtractCacheDir = %q, want .stardust/web_cache", cfg.Web.ExtractCacheDir)
-	}
 	if cfg.Web.SearchTimeoutSeconds != 15 {
 		t.Errorf("SearchTimeoutSeconds = %d, want 15", cfg.Web.SearchTimeoutSeconds)
 	}

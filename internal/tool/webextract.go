@@ -62,8 +62,8 @@ type extractResult struct {
 // registerWebExtractTool registers web_extract. client is the SSRF-guarded HTTP
 // client shared with fetch_url. Oversized results are handled uniformly by the
 // runtime tool loop (renderToolResultContent), so web_extract no longer caches
-// at the tool level and ignores toolRoot.
-func registerWebExtractTool(registry *Registry, opts WebToolOptions, client *http.Client, _toolRoot string) {
+// at the tool level.
+func registerWebExtractTool(registry *Registry, opts WebToolOptions, client *http.Client) {
 	registry.RegisterDescriptor(webExtractDescriptor(opts.Timeout),
 		HandlerFunc(func(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
 			return handleWebExtract(ctx, client, opts, call)

@@ -50,7 +50,7 @@ func productionToolRegistryForTest(t *testing.T) *tool.Registry {
 	}
 	tool.RegisterTaskLedgerTools(tools, ledger)
 	tool.RegisterAgentMessageTools(tools, driftGuardMessageStore{})
-	tool.RegisterWebTools(tools, tool.WebToolOptions{Enabled: true}, t.TempDir())
+	tool.RegisterWebTools(tools, tool.WebToolOptions{Enabled: true})
 	tool.RegisterSessionSearchTool(tools, driftGuardMessageSearcher{})
 	RegisterMoAConsultTool(tools, mapResolver{})
 

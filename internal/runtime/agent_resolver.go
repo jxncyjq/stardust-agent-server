@@ -241,7 +241,7 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		tool.WithProjectRoot(toolRoot))
 	tool.RegisterTaskLedgerTools(tools, r.taskLedger)
 	tool.RegisterAgentMessageTools(tools, r.messageStore)
-	tool.RegisterWebTools(tools, webToolOptions(r.rootConfig.Web), toolRoot)
+	tool.RegisterWebTools(tools, webToolOptions(r.rootConfig.Web))
 	recentTurns, err := r.recentTurnsForTask(ctx, task)
 	if err != nil {
 		return domain.Agent{}, nil, false, err
@@ -281,8 +281,6 @@ func webToolOptions(cfg config.WebToolConfig) tool.WebToolOptions {
 		SearchEngine:       cfg.SearchEngine,
 		SearchDefaultLimit: cfg.SearchDefaultLimit,
 		SearchTimeout:      time.Duration(cfg.SearchTimeoutSeconds) * time.Second,
-		ExtractCharLimit:   cfg.ExtractCharLimit,
-		ExtractCacheDir:    cfg.ExtractCacheDir,
 	}
 }
 

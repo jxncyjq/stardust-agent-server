@@ -34,9 +34,11 @@ const (
 //     result whose cache would create a persist→read→persist loop): plain
 //     self-describing truncation via truncateText (P0), no disk write.
 //
-// A cache write failure is never fatal: it is logged at Warn (fail-loud 铁律
-// requires recording, not swallowing) and the result falls back to plain
-// truncation so the model still gets a usable, self-describing answer.
+// A cache write failure is never fatal: it is logged (fail-loud 铁律 requires
+// recording, not swallowing) and the result falls back to plain truncation so
+// the model still gets a usable, self-describing answer. A sandbox-escape
+// failure (port.ErrPathOutsideWorkspace, "本不该发生") is logged at Error; other
+// write failures (disk full, etc.) at Warn.
 func renderToolResultContent(toolName, content string, maxResultChars int, toolRoot, cacheDir string, logger *slog.Logger) string {
 	if maxResultChars <= 0 {
 		return content
@@ -54,15 +56,20 @@ func renderToolResultContent(toolName, content string, maxResultChars int, toolR
 		if logger == nil {
 			logger = slog.Default()
 		}
-		logger.Warn("tool result cache write failed; falling back to plain truncation",
-			"tool", toolName, "cache_dir", cacheDir, "error", err,
-			"sandbox_escape", errors.Is(err, port.ErrPathOutsideWorkspace))
+		escaped := errors.Is(err, port.ErrPathOutsideWorkspace)
+		msg := "tool result cache write failed; falling back to plain truncation"
+		attrs := []any{"tool", toolName, "cache_dir", cacheDir, "error", err, "sandbox_escape", escaped}
+		if escaped {
+			logger.Error(msg, attrs...)
+		} else {
+			logger.Warn(msg, attrs...)
+		}
 		return truncateText(content, maxResultChars)
 	}
 	return string(runes[:maxResultChars]) + fmt.Sprintf(
 		"\n\n──────── [输出被硬截断 / OUTPUT HARD-TRUNCATED] ────────\n"+
-			"这是硬截断（上下文预算限制），非数据或参数问题——重试不会有帮助。全文已完整保存。\n"+
-			"This is a hard truncation; retrying won't help. The full text is saved.\n"+
+			"这是硬截断（上下文预算限制），非数据或参数问题——重试不会有帮助。已保存全文，可用 read_file 翻页续读。\n"+
+			"This is a hard truncation; retrying won't help. The result is saved to a file — page through it with read_file.\n"+
 			"显示 %d / 共 %d 字符（rune）。\n"+
 			"取回剩余：read_file path=%q offset=%d\n",
 		maxResultChars, total, relPath, maxResultChars)

@@ -10,10 +10,10 @@ import (
 	"github.com/stardust/legion-agent/internal/domain"
 )
 
-func newExtractRegistry(t *testing.T, toolRoot string) *Registry {
+func newExtractRegistry(t *testing.T) *Registry {
 	t.Helper()
 	registry := NewRegistry(NewStaticPolicy(DecisionAllow), nil, NoopGuardrails{})
-	RegisterWebTools(registry, WebToolOptions{Enabled: true, AllowPrivateHosts: true}, toolRoot)
+	RegisterWebTools(registry, WebToolOptions{Enabled: true, AllowPrivateHosts: true})
 	return registry
 }
 
@@ -31,7 +31,7 @@ func TestWebExtractInlineSmallPage(t *testing.T) {
 	}))
 	defer server.Close()
 
-	registry := newExtractRegistry(t, t.TempDir())
+	registry := newExtractRegistry(t)
 	res, err := webExtract(t, registry, map[string]string{"urls": server.URL})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -55,7 +55,7 @@ func TestWebExtractOrderAndMultiple(t *testing.T) {
 	defer s1.Close()
 	defer s2.Close()
 
-	registry := newExtractRegistry(t, t.TempDir())
+	registry := newExtractRegistry(t)
 	res, err := webExtract(t, registry, map[string]string{"urls": s1.URL + "," + s2.URL})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -68,7 +68,7 @@ func TestWebExtractOrderAndMultiple(t *testing.T) {
 }
 
 func TestWebExtractRejectsMoreThanFive(t *testing.T) {
-	registry := newExtractRegistry(t, t.TempDir())
+	registry := newExtractRegistry(t)
 	urls := strings.Join([]string{"http://a.example", "http://b.example", "http://c.example", "http://d.example", "http://e.example", "http://f.example"}, ",")
 	res, err := webExtract(t, registry, map[string]string{"urls": urls})
 	if err != nil {
@@ -80,7 +80,7 @@ func TestWebExtractRejectsMoreThanFive(t *testing.T) {
 }
 
 func TestWebExtractMissingURLsFails(t *testing.T) {
-	registry := newExtractRegistry(t, t.TempDir())
+	registry := newExtractRegistry(t)
 	_, err := webExtract(t, registry, map[string]string{})
 	if err == nil {
 		t.Fatal("expected error for missing required urls")
@@ -95,7 +95,7 @@ func TestWebExtractReturnsFullContentNoToolLevelTruncation(t *testing.T) {
 	}))
 	defer server.Close()
 
-	registry := newExtractRegistry(t, t.TempDir())
+	registry := newExtractRegistry(t)
 	res, err := webExtract(t, registry, map[string]string{"urls": server.URL})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -118,7 +118,7 @@ func TestWebExtractStripsBase64Images(t *testing.T) {
 	}))
 	defer server.Close()
 
-	registry := newExtractRegistry(t, t.TempDir())
+	registry := newExtractRegistry(t)
 	res, err := webExtract(t, registry, map[string]string{"urls": server.URL})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -132,7 +132,7 @@ func TestWebExtractStripsBase64Images(t *testing.T) {
 }
 
 func TestWebExtractBlocksSecretInURL(t *testing.T) {
-	registry := newExtractRegistry(t, t.TempDir())
+	registry := newExtractRegistry(t)
 	res, err := webExtract(t, registry, map[string]string{"urls": "https://evil.example/?k=sk-ABCDEFGHIJKLMNOPQRSTUVWX"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)

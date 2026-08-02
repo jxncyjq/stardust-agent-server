@@ -238,7 +238,7 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 	tools := tool.NewWorkspaceRegistry(toolRoot, audit, tool.WithAgentsInjection(opts.ToolMaxFileChars, homeDir))
 	tool.RegisterTaskLedgerTools(tools, opts.TaskLedger)
 	tool.RegisterAgentMessageTools(tools, opts.MessageStore)
-	tool.RegisterWebTools(tools, opts.WebTools, toolRoot)
+	tool.RegisterWebTools(tools, opts.WebTools)
 	runner := runtime.NewRuntime(runtime.Config{
 		Maas:              maas,
 		Audit:             audit,
