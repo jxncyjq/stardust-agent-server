@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"fmt"
+	"log/slog"
 	"slices"
 	"sort"
 	"strings"
@@ -59,8 +60,11 @@ func (c *conversation) appendAssistant(text string, calls []domain.ToolCall) {
 // appendToolResults records one tool turn per executed call, paired by call ID.
 // A failed call is reported to the model as its own tool turn rather than being
 // dropped: the model needs to see the failure to recover, and a provider
-// rejects an assistant tool call left unanswered.
-func (c *conversation) appendToolResults(calls []domain.ToolCall, results []domain.ToolResult, maxResultChars int) {
+// rejects an assistant tool call left unanswered. Oversized successful results
+// are cached to toolRoot/cacheDir and replaced with a preview + read_file footer
+// (renderToolResultContent); an empty toolRoot or a read_file result degrades to
+// plain self-describing truncation.
+func (c *conversation) appendToolResults(calls []domain.ToolCall, results []domain.ToolResult, maxResultChars int, toolRoot, cacheDir string, logger *slog.Logger) {
 	byID := make(map[string]domain.ToolResult, len(results))
 	for _, res := range results {
 		byID[res.CallID] = res
@@ -77,7 +81,7 @@ func (c *conversation) appendToolResults(calls []domain.ToolCall, results []doma
 		c.messages = append(c.messages, port.InferenceMessage{
 			Role:       port.RoleTool,
 			ToolCallID: call.ID,
-			Content:    truncateText(content, maxResultChars),
+			Content:    renderToolResultContent(call.Name, content, maxResultChars, toolRoot, cacheDir, logger),
 		})
 	}
 }

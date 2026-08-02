@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -15,7 +16,7 @@ func TestConversationRecordsAssistantToolCallsThenResults(t *testing.T) {
 	calls := []domain.ToolCall{{ID: "c1", Name: "read_file", Arguments: map[string]string{"path": "a.txt"}}}
 
 	convo.appendAssistant("", calls)
-	convo.appendToolResults(calls, []domain.ToolResult{{CallID: "c1", Success: true, Output: "content"}}, 0)
+	convo.appendToolResults(calls, []domain.ToolResult{{CallID: "c1", Success: true, Output: "content"}}, 0, "", defaultToolResultCacheDir, slog.Default())
 
 	msgs := convo.render(0)
 	if len(msgs) != 3 {
@@ -50,7 +51,7 @@ func TestConversationKeepsRepeatedIdenticalCallsAsDistinctTurns(t *testing.T) {
 	for i := range 3 {
 		calls := []domain.ToolCall{{ID: fmt.Sprintf("c%d", i), Name: "read_file", Arguments: map[string]string{"path": "a.txt"}}}
 		convo.appendAssistant("", calls)
-		convo.appendToolResults(calls, []domain.ToolResult{{CallID: calls[0].ID, Success: true, Output: "same"}}, 0)
+		convo.appendToolResults(calls, []domain.ToolResult{{CallID: calls[0].ID, Success: true, Output: "same"}}, 0, "", defaultToolResultCacheDir, slog.Default())
 	}
 
 	msgs := convo.render(0)
@@ -66,7 +67,7 @@ func TestConversationTruncatesOversizedToolResult(t *testing.T) {
 
 	convo.appendAssistant("", calls)
 	// 100 runes of content, truncated to 10 → footer must appear.
-	convo.appendToolResults(calls, []domain.ToolResult{{CallID: "c1", Success: true, Output: strings.Repeat("x", 100)}}, 10)
+	convo.appendToolResults(calls, []domain.ToolResult{{CallID: "c1", Success: true, Output: strings.Repeat("x", 100)}}, 10, "", defaultToolResultCacheDir, slog.Default())
 
 	msgs := convo.render(0)
 	content := msgs[2].Content
@@ -84,6 +85,22 @@ func TestConversationTruncatesOversizedToolResult(t *testing.T) {
 	}
 }
 
+func TestAppendToolResultsCachesOversizedNonReadFile(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	convo := newConversation("base", nil)
+	calls := []domain.ToolCall{{ID: "c1", Name: "fetch_url"}}
+	convo.appendAssistant("", calls)
+	convo.appendToolResults(calls,
+		[]domain.ToolResult{{CallID: "c1", Success: true, Output: strings.Repeat("X", 20000)}},
+		4000, root, defaultToolResultCacheDir, slog.Default())
+
+	msgs := convo.render(0)
+	if !strings.Contains(msgs[2].Content, ".stardust/tool_results") || !strings.Contains(msgs[2].Content, "read_file") {
+		t.Fatalf("oversized fetch_url result should be cached with a read_file footer, got %q", msgs[2].Content)
+	}
+}
+
 // A failed tool must reach the model as its own tool turn: it has to see the
 // failure to recover from it, and the provider requires every tool call to be
 // answered.
@@ -93,7 +110,7 @@ func TestConversationRecordsFailedToolAsToolMessage(t *testing.T) {
 	calls := []domain.ToolCall{{ID: "c1", Name: "read_file"}}
 
 	convo.appendAssistant("", calls)
-	convo.appendToolResults(calls, []domain.ToolResult{{CallID: "c1", Success: false, Error: "no such file"}}, 0)
+	convo.appendToolResults(calls, []domain.ToolResult{{CallID: "c1", Success: false, Error: "no such file"}}, 0, "", defaultToolResultCacheDir, slog.Default())
 
 	msgs := convo.render(0)
 	if msgs[2].Role != port.RoleTool || !strings.Contains(msgs[2].Content, "no such file") {
@@ -109,7 +126,7 @@ func TestRenderFoldsOldestToolOutputWhenOverBudget(t *testing.T) {
 	for i := range 5 {
 		calls := []domain.ToolCall{{ID: fmt.Sprintf("c%d", i), Name: "read_file"}}
 		convo.appendAssistant("", calls)
-		convo.appendToolResults(calls, []domain.ToolResult{{CallID: calls[0].ID, Success: true, Output: strings.Repeat("x", 1000)}}, 0)
+		convo.appendToolResults(calls, []domain.ToolResult{{CallID: calls[0].ID, Success: true, Output: strings.Repeat("x", 1000)}}, 0, "", defaultToolResultCacheDir, slog.Default())
 	}
 
 	msgs := convo.render(2000)
@@ -147,7 +164,7 @@ func TestRenderLeavesExchangeAloneWithinBudget(t *testing.T) {
 	convo := newConversation("base", nil)
 	calls := []domain.ToolCall{{ID: "c1", Name: "read_file"}}
 	convo.appendAssistant("", calls)
-	convo.appendToolResults(calls, []domain.ToolResult{{CallID: "c1", Success: true, Output: "small"}}, 0)
+	convo.appendToolResults(calls, []domain.ToolResult{{CallID: "c1", Success: true, Output: "small"}}, 0, "", defaultToolResultCacheDir, slog.Default())
 
 	msgs := convo.render(10000)
 
@@ -162,7 +179,7 @@ func TestRepeatedCallStreakCountsIdenticalConsecutiveRounds(t *testing.T) {
 	for i := range 3 {
 		calls := []domain.ToolCall{{ID: fmt.Sprintf("c%d", i), Name: "read_file", Arguments: map[string]string{"path": "a.txt"}}}
 		convo.appendAssistant("", calls)
-		convo.appendToolResults(calls, []domain.ToolResult{{CallID: calls[0].ID, Success: true, Output: "same"}}, 0)
+		convo.appendToolResults(calls, []domain.ToolResult{{CallID: calls[0].ID, Success: true, Output: "same"}}, 0, "", defaultToolResultCacheDir, slog.Default())
 	}
 
 	pending := []domain.ToolCall{{ID: "c3", Name: "read_file", Arguments: map[string]string{"path": "a.txt"}}}
@@ -178,7 +195,7 @@ func TestRepeatedCallStreakResetsOnDifferentArguments(t *testing.T) {
 	for _, path := range []string{"a.txt", "a.txt", "b.txt"} {
 		calls := []domain.ToolCall{{ID: "c-" + path, Name: "read_file", Arguments: map[string]string{"path": path}}}
 		convo.appendAssistant("", calls)
-		convo.appendToolResults(calls, []domain.ToolResult{{CallID: calls[0].ID, Success: true, Output: "x"}}, 0)
+		convo.appendToolResults(calls, []domain.ToolResult{{CallID: calls[0].ID, Success: true, Output: "x"}}, 0, "", defaultToolResultCacheDir, slog.Default())
 	}
 
 	pending := []domain.ToolCall{{ID: "c-next", Name: "read_file", Arguments: map[string]string{"path": "c.txt"}}}

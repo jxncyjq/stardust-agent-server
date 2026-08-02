@@ -513,7 +513,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 			r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonToolError)
 			return domain.TaskRun{}, fmt.Errorf("execute model tool calls: %w", err)
 		}
-		st.convo.appendToolResults(calls, results, r.maxToolResultChars)
+		st.convo.appendToolResults(calls, results, r.maxToolResultChars, r.toolRoot, defaultToolResultCacheDir, r.logger)
 		// A load_capabilities in this round changed the pinned block; surface the
 		// new definitions as their own turn rather than re-sending the whole
 		// block every round.
