@@ -103,10 +103,11 @@ func (a *App) RunDemo(ctx context.Context) (DemoResult, error) {
 	audit := adapter.NewMemoryAuditLog()
 	events := adapter.NewMemoryEventBus()
 	runner := runtime.NewRuntime(runtime.Config{
-		Maas:   maas,
-		Audit:  audit,
-		Events: events,
-		Tools:  tool.NewWorkspaceRegistry(".", audit),
+		Maas:     maas,
+		Audit:    audit,
+		Events:   events,
+		Tools:    tool.NewWorkspaceRegistry(".", audit),
+		ToolRoot: ".",
 	})
 	task := domain.Task{
 		ID:        "demo-task",
@@ -244,6 +245,7 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 		Events:            events,
 		ContextBuilder:    contextBuilder,
 		Tools:             tools,
+		ToolRoot:          toolRoot,
 		MaxToolRounds:     opts.MaxToolRounds,
 		LazyTools:         opts.LazyTools,
 		ConversationTurns: opts.ConversationTurns,

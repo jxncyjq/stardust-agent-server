@@ -83,7 +83,14 @@ type Config struct {
 	// falls back to safe defaults.
 	MaxToolResultChars int
 	MaxPromptChars     int
-	ConversationTurns  []domain.ConversationTurn
+	// ToolRoot is the tool sandbox root for THIS run (task.WorkingDir, or the
+	// context root fallback). When non-empty, an oversized tool result is cached
+	// to ToolRoot/.stardust/tool_results/ so read_file can page it back; empty
+	// means no sandbox (tests / no workspace) and results fall back to plain
+	// self-describing truncation. Every production NewRuntime is built per-task,
+	// so a fixed field is correct.
+	ToolRoot          string
+	ConversationTurns []domain.ConversationTurn
 	// Delegation controls. Role is "orchestrator" (may spawn sub-tasks) or "leaf"
 	// (may not); an empty Role at the root (Depth 0) defaults to orchestrator, and
 	// spawned children default to leaf. Depth is the current delegation depth (0
@@ -164,6 +171,7 @@ type Runtime struct {
 	maxToolRounds         int
 	maxToolResultChars    int
 	maxPromptChars        int
+	toolRoot              string
 	lazyTools             bool
 	conversationTurns     []domain.ConversationTurn
 	interrupted           atomic.Bool
@@ -304,6 +312,7 @@ func NewRuntime(cfg Config) *Runtime {
 		maxToolRounds:         normalizeMaxToolRounds(cfg.MaxToolRounds),
 		maxToolResultChars:    normalizePositive(cfg.MaxToolResultChars, defaultMaxToolResultChars),
 		maxPromptChars:        normalizePositive(cfg.MaxPromptChars, defaultMaxPromptChars),
+		toolRoot:              cfg.ToolRoot,
 		lazyTools:             cfg.LazyTools,
 		conversationTurns:     append([]domain.ConversationTurn(nil), cfg.ConversationTurns...),
 		role:                  role,

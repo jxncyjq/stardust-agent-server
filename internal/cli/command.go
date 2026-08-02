@@ -1996,6 +1996,7 @@ func (d *defaultTaskRunner) RunTask(ctx context.Context, agent domain.Agent, tas
 	agentruntime.RegisterMoAConsultTool(tools, d.maasResolver)
 	runtimeCfg := d.runtimeCfg
 	runtimeCfg.Tools = tools
+	runtimeCfg.ToolRoot = root
 	turns, err := agentruntime.RecentTurnsForTask(ctx, d.conversationTurns, d.sessionCfg, task)
 	if err != nil {
 		return domain.TaskRun{}, err
