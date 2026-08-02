@@ -2,11 +2,8 @@ package tool
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -90,92 +87,24 @@ func TestWebExtractMissingURLsFails(t *testing.T) {
 	}
 }
 
-func TestWebExtractTruncatesAndCaches(t *testing.T) {
-	big := strings.Repeat("X", 20000) // 远超默认 3000 预算
+func TestWebExtractReturnsFullContentNoToolLevelTruncation(t *testing.T) {
+	big := strings.Repeat("Z", 20000)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain")
 		_, _ = w.Write([]byte(big))
 	}))
 	defer server.Close()
 
-	toolRoot := t.TempDir()
-	registry := tool_NewFileReadWriteWorkspaceRegistryForTest(t, toolRoot)
-	RegisterWebTools(registry, WebToolOptions{Enabled: true, AllowPrivateHosts: true, ExtractCharLimit: 3000}, toolRoot)
-
-	res, err := registry.Execute(context.Background(), domain.Agent{ID: "a", Role: "developer"}, domain.ToolCall{
-		ID: "c1", Name: "web_extract", Arguments: map[string]string{"urls": server.URL},
-	})
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if !strings.Contains(res.Output, "[TRUNCATED]") {
-		t.Fatalf("expected truncation footer, got %q", res.Output[:minInt(400, len(res.Output))])
-	}
-	if !strings.Contains(res.Output, "read_file") || !strings.Contains(res.Output, ".stardust/web_cache") {
-		t.Fatalf("footer missing read_file hint or cache path: %q", res.Output)
-	}
-
-	rel := extractCachePathFromFooter(t, res.Output)
-	rf, err := registry.Execute(context.Background(), domain.Agent{ID: "a", Role: "developer"}, domain.ToolCall{
-		ID: "c2", Name: "read_file", Arguments: map[string]string{"path": rel},
-	})
-	if err != nil {
-		t.Fatalf("read_file error: %v", err)
-	}
-	if !rf.Success || !strings.Contains(rf.Output, "X") {
-		t.Fatalf("read_file could not read cached full text: success=%v out=%q", rf.Success, rf.Output[:minInt(200, len(rf.Output))])
-	}
-}
-
-func TestWebExtractCacheDirTraversalBlocked(t *testing.T) {
-	big := strings.Repeat("Y", 20000) // 触发落盘分支（远超 3000 预算）
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "text/plain")
-		_, _ = w.Write([]byte(big))
-	}))
-	defer server.Close()
-
-	toolRoot := t.TempDir()
-	registry := NewRegistry(NewStaticPolicy(DecisionAllow), nil, NoopGuardrails{})
-	RegisterWebTools(registry, WebToolOptions{
-		Enabled:           true,
-		AllowPrivateHosts: true,
-		ExtractCharLimit:  3000,
-		ExtractCacheDir:   "../../escape",
-	}, toolRoot)
-
+	registry := newExtractRegistry(t, t.TempDir())
 	res, err := webExtract(t, registry, map[string]string{"urls": server.URL})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-
-	var payload struct {
-		Results []extractResult `json:"results"`
+	if strings.Contains(res.Output, "TRUNCATED") || strings.Contains(res.Output, "tool_results") {
+		t.Fatalf("web_extract must not truncate/cache at tool level anymore: %q", res.Output[:min(300, len(res.Output))])
 	}
-	if err := json.Unmarshal([]byte(res.Output), &payload); err != nil {
-		t.Fatalf("unmarshal web_extract output: %v", err)
-	}
-	if len(payload.Results) == 0 {
-		t.Fatalf("no results in output: %q", res.Output)
-	}
-	got := payload.Results[0]
-
-	if got.Error == "" {
-		t.Fatalf("expected a per-URL sandbox-escape error, got content=%q", got.Content)
-	}
-	if !strings.Contains(got.Error, "sandbox") && !strings.Contains(got.Error, "escape") && !strings.Contains(got.Error, "workspace") {
-		t.Errorf("error should name the sandbox/workspace escape, got %q", got.Error)
-	}
-	// A sandbox violation must NOT be reported as content-bearing success.
-	if got.Content != "" {
-		t.Errorf("expected no whole-page content on sandbox escape, got %q", got.Content)
-	}
-
-	// The guard runs BEFORE os.MkdirAll, so no directory may be created outside
-	// the tool root. "../../escape" from toolRoot resolves two levels up.
-	escapeDir := filepath.Join(toolRoot, "..", "..", "escape")
-	if _, statErr := os.Stat(escapeDir); !os.IsNotExist(statErr) {
-		t.Errorf("escape dir was created outside tool root: %s (stat err=%v)", escapeDir, statErr)
+	if !strings.Contains(res.Output, strings.Repeat("Z", 20000)) {
+		t.Fatalf("full 20000-char content should pass through")
 	}
 }
 
@@ -211,44 +140,4 @@ func TestWebExtractBlocksSecretInURL(t *testing.T) {
 	if !strings.Contains(res.Output, "secret") && !strings.Contains(res.Output, "key") {
 		t.Errorf("expected secret-in-URL block, got %q", res.Output)
 	}
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func tool_NewFileReadWriteWorkspaceRegistryForTest(t *testing.T, root string) *Registry {
-	t.Helper()
-	return NewFileReadWriteWorkspaceRegistry(root, nil)
-}
-
-func extractCachePathFromFooter(t *testing.T, out string) string {
-	t.Helper()
-	// out is the JSON tool output; the footer lives inside results[0].content
-	// where its %q double-quotes are JSON-escaped. Decode first, then apply the
-	// read_file path marker to the raw (unescaped) footer text.
-	var payload struct {
-		Results []extractResult `json:"results"`
-	}
-	if err := json.Unmarshal([]byte(out), &payload); err != nil {
-		t.Fatalf("unmarshal web_extract output: %v", err)
-	}
-	if len(payload.Results) == 0 {
-		t.Fatalf("no results in web_extract output: %q", out)
-	}
-	content := payload.Results[0].Content
-	const marker = `read_file path="`
-	i := strings.Index(content, marker)
-	if i < 0 {
-		t.Fatalf("footer has no read_file path marker: %q", content)
-	}
-	rest := content[i+len(marker):]
-	j := strings.IndexByte(rest, '"')
-	if j < 0 {
-		t.Fatalf("footer read_file path not quoted: %q", rest)
-	}
-	return rest[:j]
 }
