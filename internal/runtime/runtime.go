@@ -205,7 +205,13 @@ type loopState struct {
 	convo *conversation
 	// repeatGuard counts non-consecutive repeats of each tool-call signature
 	// across the whole task (see messages.go). One per RunTask.
-	repeatGuard      *repeatGuard
+	repeatGuard *repeatGuard
+	// toolNameGuard counts calls per tool NAME (ignoring arguments) across the
+	// task, backing the toolLoopCap runaway guard that the name+arguments
+	// repeatGuard cannot see. toolFailGuard counts per-name FAILURES for the
+	// same-tool-failure warning. Both one per RunTask, like repeatGuard.
+	toolNameGuard    *repeatGuard
+	toolFailGuard    *repeatGuard
 	loaded           []loadedEntry
 	resp             port.InferenceResponse
 	promptTokens     int
@@ -425,6 +431,8 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 				images:           cp.Images,
 				tools:            effTools,
 				repeatGuard:      newRepeatGuard(),
+				toolNameGuard:    newRepeatGuard(),
+				toolFailGuard:    newRepeatGuard(),
 				// The resumed prompt's catalog is already baked into cp.BasePrompt
 				// from the first run; this rebuilds the dispatch-side catalog so a
 				// load_capabilities issued in a resumed round still resolves, scoped
@@ -469,6 +477,8 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		images:           task.Images,
 		tools:            effTools,
 		repeatGuard:      newRepeatGuard(),
+		toolNameGuard:    newRepeatGuard(),
+		toolFailGuard:    newRepeatGuard(),
 		catalog:          catalog,
 	}
 	return r.runToolLoop(ctx, requestID, agent, task, st)
