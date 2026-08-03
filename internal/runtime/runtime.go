@@ -517,6 +517,16 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// whether or not they were interleaved. The streak guard still owns the
 		// earlier consecutive *warning* (repeatWarnStreak=3 < repeatWarnCount=4).
 		repeatCount := st.repeatGuard.record(callsKey(calls))
+		// P2: per-tool-name loop cap. repeatGuard/streak key on callsKey
+		// (name+arguments) and so miss "same tool, different args" runaways;
+		// this counts by tool NAME only. Recorded before executing this round so
+		// the count reflects every call the model has made, including now.
+		capHit := ""
+		for _, c := range calls {
+			if st.toolNameGuard.record(c.Name) >= toolLoopCap {
+				capHit = c.Name
+			}
+		}
 		st.convo.appendAssistant(st.resp.Text, calls)
 		results, err := r.executeToolCalls(ctx, agent, task, &st)
 		if err != nil {
@@ -528,6 +538,20 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// new definitions as their own turn rather than re-sending the whole
 		// block every round.
 		st.convo.syncLoaded(renderLoaded(st.loaded))
+		if capHit != "" {
+			if err := r.events.Publish(ctx, domain.RuntimeEvent{
+				Type:      "tool_loop_broken",
+				TaskID:    task.ID,
+				Message:   fmt.Sprintf("工具 %s 调用次数达上限(%d)，已停止工具循环", capHit, toolLoopCap),
+				CreatedAt: time.Now(),
+			}); err != nil {
+				return domain.TaskRun{}, fmt.Errorf("publish tool loop cap event: %w", err)
+			}
+			r.logger.Warn("tool loop broken: per-tool call cap reached",
+				"task_id", task.ID, "tool", capHit, "cap", toolLoopCap)
+			loopCut = true
+			break
+		}
 		if streak >= repeatAbortStreak || repeatCount >= repeatAbortCount {
 			// The model is not making progress: it has asked for exactly the same
 			// calls this many rounds running and the results are already in its
