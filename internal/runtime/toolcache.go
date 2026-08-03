@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
 )
 
@@ -108,6 +109,45 @@ func writeToolResultCache(toolRoot, cacheDir, toolName, content string) (string,
 		return "", fmt.Errorf("relativize cache path: %w", err)
 	}
 	return filepath.ToSlash(rel), nil
+}
+
+// sessionCacheDir returns the tool-result cache dir for a task, isolated by
+// session: <defaultToolResultCacheDir>/<sanitized session key>. The key is
+// task.SessionID, falling back to task.ID, then to "no-session" (a task always
+// has an ID, so the final fallback guards the impossible rather than silently
+// defaulting). Isolating by session keeps one session's cached tool output out
+// of another session's file tools (list_files/read_file/search_content share
+// the sandbox root) and makes per-session cleanup possible.
+func sessionCacheDir(task domain.Task) string {
+	key := strings.TrimSpace(task.SessionID)
+	if key == "" {
+		key = strings.TrimSpace(task.ID)
+	}
+	if key == "" {
+		key = "no-session"
+	}
+	return filepath.Join(defaultToolResultCacheDir, sanitizeCacheSegment(key))
+}
+
+// sanitizeCacheSegment keeps only filename-safe chars from a path segment (a
+// session or task id). IDs are already safe (e.g. "session-1785…",
+// "gui-task-…"); this is a defensive guard mirroring sanitizeToolName. An
+// all-illegal segment degrades to "session" rather than an empty path element.
+func sanitizeCacheSegment(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	if out == "" {
+		return "session"
+	}
+	return out
 }
 
 // sanitizeToolName keeps only filename-safe chars from a tool name for the cache

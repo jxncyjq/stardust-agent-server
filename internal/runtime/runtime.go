@@ -533,7 +533,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 			r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonToolError)
 			return domain.TaskRun{}, fmt.Errorf("execute model tool calls: %w", err)
 		}
-		st.convo.appendToolResults(calls, results, r.maxToolResultChars, r.toolRoot, defaultToolResultCacheDir, r.logger)
+		st.convo.appendToolResults(calls, results, r.maxToolResultChars, r.toolRoot, sessionCacheDir(task), r.logger)
 		// P2: same-tool failure warning. Count failures by tool NAME (not
 		// callsKey) so "same tool, different args" failing repeatedly is caught.
 		// Warn only — the loop cap is the hard stop.
