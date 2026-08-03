@@ -205,7 +205,13 @@ type loopState struct {
 	convo *conversation
 	// repeatGuard counts non-consecutive repeats of each tool-call signature
 	// across the whole task (see messages.go). One per RunTask.
-	repeatGuard      *repeatGuard
+	repeatGuard *repeatGuard
+	// toolNameGuard counts calls per tool NAME (ignoring arguments) across the
+	// task, backing the toolLoopCap runaway guard that the name+arguments
+	// repeatGuard cannot see. toolFailGuard counts per-name FAILURES for the
+	// same-tool-failure warning. Both one per RunTask, like repeatGuard.
+	toolNameGuard    *repeatGuard
+	toolFailGuard    *repeatGuard
 	loaded           []loadedEntry
 	resp             port.InferenceResponse
 	promptTokens     int
@@ -425,6 +431,8 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 				images:           cp.Images,
 				tools:            effTools,
 				repeatGuard:      newRepeatGuard(),
+				toolNameGuard:    newRepeatGuard(),
+				toolFailGuard:    newRepeatGuard(),
 				// The resumed prompt's catalog is already baked into cp.BasePrompt
 				// from the first run; this rebuilds the dispatch-side catalog so a
 				// load_capabilities issued in a resumed round still resolves, scoped
@@ -469,6 +477,8 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		images:           task.Images,
 		tools:            effTools,
 		repeatGuard:      newRepeatGuard(),
+		toolNameGuard:    newRepeatGuard(),
+		toolFailGuard:    newRepeatGuard(),
 		catalog:          catalog,
 	}
 	return r.runToolLoop(ctx, requestID, agent, task, st)
@@ -507,6 +517,16 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// whether or not they were interleaved. The streak guard still owns the
 		// earlier consecutive *warning* (repeatWarnStreak=3 < repeatWarnCount=4).
 		repeatCount := st.repeatGuard.record(callsKey(calls))
+		// P2: per-tool-name loop cap. repeatGuard/streak key on callsKey
+		// (name+arguments) and so miss "same tool, different args" runaways;
+		// this counts by tool NAME only. Recorded before executing this round so
+		// the count reflects every call the model has made, including now.
+		capHit := ""
+		for _, c := range calls {
+			if st.toolNameGuard.record(c.Name) >= toolLoopCap {
+				capHit = c.Name
+			}
+		}
 		st.convo.appendAssistant(st.resp.Text, calls)
 		results, err := r.executeToolCalls(ctx, agent, task, &st)
 		if err != nil {
@@ -514,10 +534,41 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 			return domain.TaskRun{}, fmt.Errorf("execute model tool calls: %w", err)
 		}
 		st.convo.appendToolResults(calls, results, r.maxToolResultChars, r.toolRoot, defaultToolResultCacheDir, r.logger)
+		// P2: same-tool failure warning. Count failures by tool NAME (not
+		// callsKey) so "same tool, different args" failing repeatedly is caught.
+		// Warn only — the loop cap is the hard stop.
+		nameByID := make(map[string]string, len(calls))
+		for _, c := range calls {
+			nameByID[c.ID] = c.Name
+		}
+		for _, res := range results {
+			if res.Success {
+				continue
+			}
+			if st.toolFailGuard.record(nameByID[res.CallID]) == toolSameFailWarn {
+				st.convo.appendUser(fmt.Sprintf(
+					"[系统] 工具 %s 已累计失败 %d 次。不要再用不同参数反复重试它：检查最近的错误信息、验证假设，改用其他工具，或基于已有信息直接作答。",
+					nameByID[res.CallID], toolSameFailWarn))
+			}
+		}
 		// A load_capabilities in this round changed the pinned block; surface the
 		// new definitions as their own turn rather than re-sending the whole
 		// block every round.
 		st.convo.syncLoaded(renderLoaded(st.loaded))
+		if capHit != "" {
+			if err := r.events.Publish(ctx, domain.RuntimeEvent{
+				Type:      "tool_loop_broken",
+				TaskID:    task.ID,
+				Message:   fmt.Sprintf("工具 %s 调用次数达上限(%d)，已停止工具循环", capHit, toolLoopCap),
+				CreatedAt: time.Now(),
+			}); err != nil {
+				return domain.TaskRun{}, fmt.Errorf("publish tool loop cap event: %w", err)
+			}
+			r.logger.Warn("tool loop broken: per-tool call cap reached",
+				"task_id", task.ID, "tool", capHit, "cap", toolLoopCap)
+			loopCut = true
+			break
+		}
 		if streak >= repeatAbortStreak || repeatCount >= repeatAbortCount {
 			// The model is not making progress: it has asked for exactly the same
 			// calls this many rounds running and the results are already in its

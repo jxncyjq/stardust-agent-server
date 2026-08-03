@@ -242,3 +242,19 @@ func TestRepeatGuardCountsNonConsecutive(t *testing.T) {
 		t.Fatalf("A#3=%d want 3", n)
 	}
 }
+
+func TestRepeatGuardCountsPerToolName(t *testing.T) {
+	g := newRepeatGuard()
+	if n := g.record("fetch_url"); n != 1 {
+		t.Fatalf("first record = %d, want 1", n)
+	}
+	if n := g.record("fetch_url"); n != 2 {
+		t.Fatalf("second record = %d, want 2", n)
+	}
+	if n := g.record("read_file"); n != 1 {
+		t.Fatalf("different tool name resets its own count, got %d, want 1", n)
+	}
+	if n := g.record("fetch_url"); n != 3 {
+		t.Fatalf("third fetch_url = %d, want 3", n)
+	}
+}
