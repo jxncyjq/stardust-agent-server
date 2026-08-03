@@ -534,6 +534,23 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 			return domain.TaskRun{}, fmt.Errorf("execute model tool calls: %w", err)
 		}
 		st.convo.appendToolResults(calls, results, r.maxToolResultChars, r.toolRoot, defaultToolResultCacheDir, r.logger)
+		// P2: same-tool failure warning. Count failures by tool NAME (not
+		// callsKey) so "same tool, different args" failing repeatedly is caught.
+		// Warn only — the loop cap is the hard stop.
+		nameByID := make(map[string]string, len(calls))
+		for _, c := range calls {
+			nameByID[c.ID] = c.Name
+		}
+		for _, res := range results {
+			if res.Success {
+				continue
+			}
+			if st.toolFailGuard.record(nameByID[res.CallID]) == toolSameFailWarn {
+				st.convo.appendUser(fmt.Sprintf(
+					"[系统] 工具 %s 已累计失败 %d 次。不要再用不同参数反复重试它：检查最近的错误信息、验证假设，改用其他工具，或基于已有信息直接作答。",
+					nameByID[res.CallID], toolSameFailWarn))
+			}
+		}
 		// A load_capabilities in this round changed the pinned block; surface the
 		// new definitions as their own turn rather than re-sending the whole
 		// block every round.
