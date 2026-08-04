@@ -2,6 +2,7 @@ package browser
 
 import (
 	"context"
+	"log/slog"
 	"net"
 	"net/url"
 	"strconv"
@@ -29,6 +30,11 @@ type Runtime struct {
 	cfg           RuntimeConfig
 	hubs          *hubRegistry
 	screencasters *sync.Map // sessionID(string) → *screencaster；仅有订阅者时活跃
+	// lifecycles 按会话惰性持有一把 lifecycle 锁（sessionID → *sync.Mutex）：把该会话
+	// 「订阅者计数检查 + hub 增删 + screencaster Start/Store/Stop/LoadAndDelete」这整段
+	// start/stop 决策串行化，杜绝并发订阅/取消导致的 double-start、miss-start 或
+	// cancel 与 Store 交错留下孤儿 screencaster。零值可用，供 struct-literal 构造的测试直接用。
+	lifecycles sync.Map
 }
 
 var _ RuntimeAPI = (*Runtime)(nil)
@@ -73,17 +79,35 @@ func (hr *hubRegistry) drop(sessionID string) {
 	delete(hr.byID, sessionID)
 }
 
+// lifecycleMu 返回该会话的 lifecycle 锁（惰性创建）。所有对该会话 screencast 的
+// start/stop 决策都必须在这把锁下完成，使订阅者计数检查与 Store/LoadAndDelete 不可交错。
+func (r *Runtime) lifecycleMu(sessionID string) *sync.Mutex {
+	m, _ := r.lifecycles.LoadOrStore(sessionID, &sync.Mutex{})
+	return m.(*sync.Mutex)
+}
+
 // Subscribe 实现 RuntimeAPI：会话必须存在。第一个订阅者接入时开 screencast，
 // 最后一个断开（取消后订阅者数归零）时停 screencast——不看视图不推帧。
+//
+// 整段「hub.Subscribe + 计数检查 + start」以及取消函数里的「hubCancel + 计数检查 + stop」
+// 都在会话 lifecycle 锁下串行执行（TOCTOU 修复）：两个并发订阅者不会都看到 count==1 而
+// double-start，取消也不会与另一路的 Store 交错留下孤儿 screencaster。
 func (r *Runtime) Subscribe(sessionID string) (<-chan StreamEvent, func(), error) {
 	sess, ok := r.sessions.Get(sessionID)
 	if !ok {
 		return nil, nil, NewBrowserError(CodeContextEvicted, "unknown session "+sessionID)
 	}
 	hub := r.hubs.get(sessionID)
+	lm := r.lifecycleMu(sessionID)
+	lm.Lock()
 	ch, hubCancel := hub.Subscribe()
-	r.maybeStartScreencast(sess, hub)
+	if hub.SubscriberCount() == 1 {
+		r.startScreencastLocked(sess, hub)
+	}
+	lm.Unlock()
 	cancel := func() {
+		lm.Lock()
+		defer lm.Unlock()
 		hubCancel()
 		if hub.SubscriberCount() == 0 {
 			r.stopScreencast(sessionID)
@@ -92,20 +116,23 @@ func (r *Runtime) Subscribe(sessionID string) (<-chan StreamEvent, func(), error
 	return ch, cancel, nil
 }
 
-// maybeStartScreencast 在这是会话第一个订阅者且有活跃 page 时开 screencast。
-// 已有别的订阅者说明 screencast 已在跑，直接返回。start 失败不致命：
-// 观测/进度仍走 SSE，只是暂时没有帧。
-func (r *Runtime) maybeStartScreencast(sess *Session, hub *Hub) {
-	if r.screencasters == nil || hub.SubscriberCount() != 1 {
+// startScreencastLocked 为会话活跃 page 开 screencast 并登记。调用方须已持有该会话的
+// lifecycle 锁且已判定这是第一个订阅者。无 screencasters（struct-literal 测试构造）或
+// 无活跃 page 时静默跳过。screencast 只服务于「看」这个视图，start 失败不致命：观测/进度
+// 仍走 SSE，只是暂时没有帧——但按 fail-loud 铁律不再吞错，记 Warn 后继续。
+func (r *Runtime) startScreencastLocked(sess *Session, hub *Hub) {
+	if r.screencasters == nil {
 		return
 	}
 	page := r.pageOf(sess)
 	if page == nil {
 		return
 	}
-	sc := newScreencaster(r.cfg.ScreencastFPS)
+	sc := newScreencaster(r.cfg.ScreencastFPS, sess.ID)
 	r.screencasters.Store(sess.ID, sc)
-	_ = sc.Start(page, hub)
+	if err := sc.Start(page, hub); err != nil {
+		slog.Warn("browser: start screencast failed", "session", sess.ID, "err", err)
+	}
 }
 
 // stopScreencast 停止并释放会话的 screencaster（无则幂等）。
@@ -120,11 +147,17 @@ func (r *Runtime) stopScreencast(sessionID string) {
 
 // restartScreencastIfActive 在会话仍有订阅者时按新活跃 page 重启 screencast。
 // 换页（Open 复用会话再导航）后旧 page 的帧流失效，需绑到新 page。无订阅者则不动。
+//
+// 与 Subscribe/cancel 共用同一把会话 lifecycle 锁：把「计数检查 + stop 旧 + start 新」
+// 整段串行化，避免与并发的订阅/取消交错（TOCTOU 修复）。
 func (r *Runtime) restartScreencastIfActive(sess *Session) {
 	if r.screencasters == nil {
 		return
 	}
 	hub := r.hubs.get(sess.ID)
+	lm := r.lifecycleMu(sess.ID)
+	lm.Lock()
+	defer lm.Unlock()
 	if hub.SubscriberCount() == 0 {
 		return
 	}
@@ -133,17 +166,26 @@ func (r *Runtime) restartScreencastIfActive(sess *Session) {
 	if page == nil {
 		return
 	}
-	sc := newScreencaster(r.cfg.ScreencastFPS)
+	sc := newScreencaster(r.cfg.ScreencastFPS, sess.ID)
 	r.screencasters.Store(sess.ID, sc)
-	_ = sc.Start(page, hub)
+	if err := sc.Start(page, hub); err != nil {
+		slog.Warn("browser: restart screencast failed", "session", sess.ID, "err", err)
+	}
 }
 
 // pageOf 取会话活跃页的 *rod.Page（与 activePage 的断言一致），无则 nil。
+// M2：ActivePage 由 Open 在 sess 锁下写，这里在同一把锁下读，避免与在途 Open 竞态。
 func (r *Runtime) pageOf(sess *Session) *rod.Page {
-	if sess == nil || sess.ActivePage == nil || sess.ActivePage.page == nil {
+	if sess == nil {
 		return nil
 	}
-	p, _ := sess.ActivePage.page.(*rod.Page)
+	var p *rod.Page
+	sess.WithLock(func() {
+		if sess.ActivePage == nil || sess.ActivePage.page == nil {
+			return
+		}
+		p, _ = sess.ActivePage.page.(*rod.Page)
+	})
 	return p
 }
 

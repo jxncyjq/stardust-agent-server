@@ -3,6 +3,7 @@ package browser
 import (
 	"context"
 	"encoding/base64"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -18,14 +19,16 @@ type screencaster struct {
 	stop        func()
 	minInterval time.Duration // 限帧率：两帧之间最小间隔
 	lastSent    time.Time
+	sessionID   string // 仅用于日志定位（fail-loud 记 Warn 时带上会话）
 }
 
 // newScreencaster 建一个节流到 fps 帧率的 screencaster；fps<=0 时回落到默认 8fps。
-func newScreencaster(fps int) *screencaster {
+// sessionID 仅用于 fail-loud 日志定位。
+func newScreencaster(fps int, sessionID string) *screencaster {
 	if fps <= 0 {
 		fps = 8
 	}
-	return &screencaster{minInterval: time.Second / time.Duration(fps)}
+	return &screencaster{minInterval: time.Second / time.Duration(fps), sessionID: sessionID}
 }
 
 // Start 在 page 上开 CDP screencast，把节流后的帧作为 EventFrame 发到 hub。
@@ -54,7 +57,10 @@ func (s *screencaster) Start(page *rod.Page, hub *Hub) error {
 	evPage := page.Context(ctx) // 帧消费循环绑到可取消 ctx；取消即停
 	wait := evPage.EachEvent(func(e *proto.PageScreencastFrame) {
 		// 先 ack，让 CDP 继续推下一帧（不 ack 会卡住流）。ack 走原始 page（ctx 未取消）。
-		_ = proto.PageScreencastFrameAck{SessionID: e.SessionID}.Call(page)
+		// ack 失败不致命（下一帧的 ack 或换页重启可恢复），但按 fail-loud 铁律不吞错，记 Warn。
+		if err := (proto.PageScreencastFrameAck{SessionID: e.SessionID}).Call(page); err != nil {
+			slog.Warn("browser: screencast frame ack failed", "session", s.sessionID, "err", err)
+		}
 		s.mu.Lock()
 		now := time.Now()
 		if now.Sub(s.lastSent) < s.minInterval {
