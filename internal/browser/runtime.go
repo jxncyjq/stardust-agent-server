@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/go-rod/rod"
@@ -42,14 +43,22 @@ func (r *Runtime) Open(ctx context.Context, req OpenReq) (OpenObservation, error
 	if err := r.checkURL(req.URL); err != nil {
 		return OpenObservation{}, err
 	}
-	sess, _ := r.sessions.Get(req.SessionID)
-	if sess == nil {
+	// I4 fail-loud：只有 SessionID 为空才新建。传了非空但查无此 Session 说明它已被
+	// 回收/失效，静默 mint 一个新 Session 会掩盖状态漂移——按 CONTEXT_EVICTED 报错。
+	var sess *Session
+	if req.SessionID == "" {
 		sess = r.sessions.Create(req.TaskID)
 		c, err := r.mgr.AcquireContext(ContextOpts{})
 		if err != nil {
 			return OpenObservation{}, err
 		}
 		sess.Context = c
+	} else {
+		s, ok := r.sessions.Get(req.SessionID)
+		if !ok {
+			return OpenObservation{}, NewBrowserError(CodeContextEvicted, "unknown session "+req.SessionID)
+		}
+		sess = s
 	}
 	if sess.Context == nil || sess.Context.browser == nil {
 		return OpenObservation{}, NewBrowserError(CodeContextEvicted, "session "+sess.ID+" has no browser context")
@@ -66,8 +75,14 @@ func (r *Runtime) Open(ctx context.Context, req OpenReq) (OpenObservation, error
 			opErr = NewBrowserError(CodeNavigationTimeout, "wait load "+req.URL+": "+err.Error())
 			return
 		}
+		// I5：复用 Session 再次导航时，先关掉旧活跃页，否则旧 page 泄漏。
+		if sess.ActivePage != nil {
+			if old, ok := sess.ActivePage.page.(*rod.Page); ok && old != nil {
+				_ = old.Close() // best-effort；新页已是活跃目标，旧页关闭失败不影响本次导航
+			}
+		}
 		sess.ActivePage = &pageHandle{page: page}
-		obs = r.observe(page)
+		obs, opErr = r.observe(page, sess)
 	})
 	if opErr != nil {
 		return OpenObservation{}, opErr
@@ -82,7 +97,11 @@ func (r *Runtime) Read(ctx context.Context, req ReadReq) (Observation, error) {
 		return Observation{}, err
 	}
 	var obs Observation
-	sess.WithLock(func() { obs = r.observe(page) })
+	var opErr error
+	sess.WithLock(func() { obs, opErr = r.observe(page, sess) })
+	if opErr != nil {
+		return Observation{}, opErr
+	}
 	return obs, nil
 }
 
@@ -95,7 +114,7 @@ func (r *Runtime) Click(ctx context.Context, req ClickReq) (Observation, error) 
 	var obs Observation
 	var opErr error
 	sess.WithLock(func() {
-		el, err := r.elementByRef(page, req.Ref)
+		el, err := r.elementByRef(page, sess, req.Ref)
 		if err != nil {
 			opErr = err
 			return
@@ -104,8 +123,8 @@ func (r *Runtime) Click(ctx context.Context, req ClickReq) (Observation, error) 
 			opErr = NewBrowserError(CodeElementNotFound, "click ref "+req.Ref+": "+err.Error())
 			return
 		}
-		_ = page.WaitLoad()
-		obs = r.observe(page)
+		_ = page.WaitLoad() // best-effort：点击可能不触发导航，等不到 load 不算失败（M1 有意保留）
+		obs, opErr = r.observe(page, sess)
 	})
 	if opErr != nil {
 		return Observation{}, opErr
@@ -122,7 +141,7 @@ func (r *Runtime) Type(ctx context.Context, req TypeReq) (Observation, error) {
 	var obs Observation
 	var opErr error
 	sess.WithLock(func() {
-		el, err := r.elementByRef(page, req.Ref)
+		el, err := r.elementByRef(page, sess, req.Ref)
 		if err != nil {
 			opErr = err
 			return
@@ -136,9 +155,9 @@ func (r *Runtime) Type(ctx context.Context, req TypeReq) (Observation, error) {
 				opErr = NewBrowserError(CodeElementNotFound, "submit ref "+req.Ref+": "+err.Error())
 				return
 			}
-			_ = page.WaitLoad()
+			_ = page.WaitLoad() // best-effort：提交可能不触发导航（M1 有意保留）
 		}
-		obs = r.observe(page)
+		obs, opErr = r.observe(page, sess)
 	})
 	if opErr != nil {
 		return Observation{}, opErr
@@ -150,8 +169,13 @@ func (r *Runtime) Type(ctx context.Context, req TypeReq) (Observation, error) {
 func (r *Runtime) Close(ctx context.Context, req CloseReq) error {
 	if req.SessionID != "" {
 		if sess, ok := r.sessions.Get(req.SessionID); ok {
-			_ = r.mgr.ReleaseContext(sess.Context)
+			// 不吞 ReleaseContext 的错误（CLAUDE.md §0）：即使释放失败也把 Session
+			// 从内存表删掉（进程级 Close 时进程整体回收），但错误照常上报。
+			relErr := r.mgr.ReleaseContext(sess.Context)
 			r.sessions.Delete(req.SessionID)
+			if relErr != nil {
+				return NewBrowserErrorWrap(CodeContextEvicted, "release session "+req.SessionID, relErr)
+			}
 			return nil
 		}
 		return NewBrowserError(CodeContextEvicted, "unknown session "+req.SessionID)
@@ -178,31 +202,59 @@ func (r *Runtime) activePage(sessionID string) (*Session, *rod.Page, error) {
 	return sess, page, nil
 }
 
-// observe 抽 CDP a11y 树 → 裁剪观测。只保留未被 Ignored 的节点，交互性按 role 近似判定。
-func (r *Runtime) observe(page *rod.Page) Observation {
+// observe 抽 CDP a11y 树 → 裁剪观测，并把每个分配到 ref 的节点的 BackendDOMNodeID
+// 记进 sess.Refs（ref → backendNodeID 字符串），供 elementByRef 在动作时精确定位。
+//
+// C1 fail-loud：AX 树抽取失败不再返回「(a11y unavailable)」的假观测冒充成功，而是
+// 返回 error，让 Open/Read/Click/Type 如实失败。
+//
+// I3 精确映射：ref 的分配顺序与 BuildObservation 完全一致（interactive && visible、
+// 按输入顺序），因此这里对同一 keep 过滤收集的 keptBackend 与 obs.Elements 一一对齐，
+// e1、e2… 各自绑定到当时那个节点的 backendNodeID，杜绝按 DOM 位置重查导致的错位。
+func (r *Runtime) observe(page *rod.Page, sess *Session) (Observation, error) {
 	tree, err := proto.AccessibilityGetFullAXTree{}.Call(page)
 	if err != nil {
-		return Observation{Text: "(a11y unavailable)"}
+		return Observation{}, NewBrowserErrorWrap(CodeContextEvicted, "get a11y tree", err)
 	}
 	var raw []RawA11yNode
+	var keptBackend []proto.DOMBackendNodeID
 	for _, n := range tree.Nodes {
 		if n.Ignored {
 			continue
 		}
 		role := axValueString(n.Role)
-		name := axValueString(n.Name)
-		raw = append(raw, RawA11yNode{
+		node := RawA11yNode{
 			Role:        role,
-			Name:        name,
+			Name:        axValueString(n.Name),
 			Value:       axValueString(n.Value),
 			Interactive: isInteractiveRole(role),
 			Visible:     true, // Phase 1 近似：未被 Ignored 视为可见
-		})
+		}
+		raw = append(raw, node)
+		// 复刻 BuildObservation 的 keep 判据（interactive && visible），按同序收集
+		// backendNodeID，保证与后续分配的 ref 对齐。
+		if node.Interactive && node.Visible {
+			keptBackend = append(keptBackend, n.BackendDOMNodeID)
+		}
 	}
-	return BuildObservation(raw, ObservationBudget{MaxElements: r.cfg.MaxElements})
+	obs := BuildObservation(raw, ObservationBudget{MaxElements: r.cfg.MaxElements})
+	if sess != nil {
+		// 每次观测重建 ref 表：清掉上一轮的 ref → backendNodeID，避免旧页遗留的高号
+		// ref 指向失效节点。observe 始终在会话锁下调用，重建安全。
+		sess.Refs = make(map[string]string, len(obs.Elements))
+		for i, e := range obs.Elements {
+			if i >= len(keptBackend) {
+				break // 理论不达：obs.Elements 是 keptBackend 的前缀（可能因预算截断变短）
+			}
+			sess.Refs[e.Ref] = strconv.Itoa(int(keptBackend[i]))
+		}
+	}
+	return obs, nil
 }
 
 // axValueString 把 CDP AX 属性值渲染成纯字符串（gson.JSON.Str() 对字符串值最贴切）。
+// M4 Phase-1 取舍：仅对字符串型 AX 值有效，非字符串值（bool/number/token 列表等）
+// 会渲染成空串——可接受，后续 Phase 再按类型细化。
 func axValueString(v *proto.AccessibilityAXValue) string {
 	if v == nil {
 		return ""
@@ -218,29 +270,33 @@ func isInteractiveRole(role string) bool {
 	return false
 }
 
-// elementByRef 把观测里的 ref 映射回页面元素。Phase 1 近似实现：按 ref 序号在
-// 当前可交互元素列表里取第 n 个（与 observe 的顺序一致）。Phase 2 换成
-// backendNodeID 稳定映射（见 spec §3.5，需在 observe 时记 BackendDOMNodeID）。
-func (r *Runtime) elementByRef(page *rod.Page, ref string) (*rod.Element, error) {
-	obs := r.observe(page)
-	idx := -1
-	for i, e := range obs.Elements {
-		if e.Ref == ref {
-			idx = i
-			break
-		}
-	}
-	if idx < 0 {
+// elementByRef 把观测里的 ref 精确映射回页面元素：用上一次 observe 记进 sess.Refs 的
+// BackendDOMNodeID 经 CDP DOMResolveNode 解析成远端对象再取元素。
+//
+// I3 修复：旧实现按「a11y 树的 keep 顺序 → 分配 ref」，动作时却用一个不同的 CSS 选择器
+// 按 DOM 顺序重查并按位置取第 n 个——两者元素集合与顺序都可能不同，ref 会指到错的元素。
+// 现在直接锁定当时那个节点，ref → 元素严格一一对应，不再依赖位置。
+func (r *Runtime) elementByRef(page *rod.Page, sess *Session, ref string) (*rod.Element, error) {
+	idStr, ok := sess.Refs[ref]
+	if !ok {
 		return nil, NewBrowserError(CodeElementNotFound, "ref "+ref+" not found; re-read")
 	}
-	els, err := page.Elements("a, button, input, textarea, select, [role=button], [role=link]")
+	id, err := strconv.Atoi(idStr)
 	if err != nil {
-		return nil, NewBrowserError(CodeElementNotFound, "ref "+ref+" lookup failed: "+err.Error())
+		return nil, NewBrowserErrorWrap(CodeElementNotFound, "ref "+ref+" has invalid backend node id "+idStr, err)
 	}
-	if idx >= len(els) {
-		return nil, NewBrowserError(CodeElementNotFound, "ref "+ref+" stale; re-read")
+	resolved, err := proto.DOMResolveNode{BackendNodeID: proto.DOMBackendNodeID(id)}.Call(page)
+	if err != nil {
+		return nil, NewBrowserErrorWrap(CodeElementNotFound, "ref "+ref+" resolve node; re-read", err)
 	}
-	return els[idx], nil
+	if resolved.Object == nil {
+		return nil, NewBrowserError(CodeElementNotFound, "ref "+ref+" resolved to no object; re-read")
+	}
+	el, err := page.ElementFromObject(resolved.Object)
+	if err != nil {
+		return nil, NewBrowserErrorWrap(CodeElementNotFound, "ref "+ref+" element from object; re-read", err)
+	}
+	return el, nil
 }
 
 // checkURL 做协议白名单 + 私网/回环/链路本地地址的 SSRF 基础拦截（AllowPrivateHosts 放开后者）。
@@ -263,7 +319,8 @@ func (r *Runtime) checkURL(raw string) error {
 		return NewBrowserError(CodePrivateHostBlocked, "resolve "+host+": "+err.Error())
 	}
 	for _, ip := range ips {
-		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+		// M3：IsUnspecified 覆盖 0.0.0.0 / ::（未指定地址，常被用来绕过回环/私网拦截）。
+		if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
 			return NewBrowserError(CodePrivateHostBlocked, "host "+host+" resolves to private ip "+ip.String())
 		}
 	}

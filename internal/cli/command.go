@@ -1959,12 +1959,14 @@ type defaultTaskRunner struct {
 	messageStore    tool.AgentMessageStore
 	sessionSearcher tool.MessageSearcher
 	webOptions      tool.WebToolOptions
-	// browserCfg gates the built-in browser tools on the default-agent path.
-	// Off by default; when Enabled, RunTask builds a browser runtime per task
-	// and registers browser_* onto that task's registry (a construction
-	// failure fails the run, never a silent skip — CLAUDE.md fail-loud).
-	browserCfg   config.BrowserConfig
-	maasResolver agentruntime.ModelResolver
+	// browserRuntime is the ONE shared browser runtime (one Chromium process)
+	// injected at serve assembly when cfg.Browser.Enabled. RunTask registers
+	// browser_* onto each task's registry against this shared instance rather
+	// than launching a browser per task (that would leak a Chromium process on
+	// every default-agent task — see BuildServeService for the single Close on
+	// shutdown). Nil means browser tools are off (a no-op registration).
+	browserRuntime browser.RuntimeAPI
+	maasResolver   agentruntime.ModelResolver
 	// toolMaxFileChars and homeDir configure on-demand subtree agents.md
 	// injection (tool.WithAgentsInjection) on the tool registry RunTask builds
 	// per call. Both are resolved once at serve assembly (see resolveHomeDir).
@@ -2001,12 +2003,9 @@ func (d *defaultTaskRunner) RunTask(ctx context.Context, agent domain.Agent, tas
 	tool.RegisterTaskLedgerTools(tools, d.taskLedger)
 	tool.RegisterAgentMessageTools(tools, d.messageStore)
 	tool.RegisterWebTools(tools, d.webOptions)
-	if d.browserCfg.Enabled {
-		brt, err := browser.NewRuntime(browser.RuntimeConfig{Headless: d.browserCfg.Headless, BinPath: d.browserCfg.BinPath})
-		if err != nil {
-			return domain.TaskRun{}, fmt.Errorf("init browser runtime: %w", err)
-		}
-		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: brt})
+	if d.browserRuntime != nil {
+		// Shared runtime injected at serve assembly; no per-task browser launch.
+		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: d.browserRuntime})
 	}
 	tool.RegisterSessionSearchTool(tools, d.sessionSearcher)
 	agentruntime.RegisterMoAConsultTool(tools, d.maasResolver)
@@ -2282,6 +2281,21 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// below) reads from, so a recorded episode is retrievable by later tasks'
 	// Prefetch.
 	episodeRecorder := newEpisodeRecorder(defaultMaas, episodicStore, logger)
+	// One shared browser runtime (= one Chromium process) for the whole daemon,
+	// launched here at serve assembly and injected into BOTH task-runner paths
+	// (the resolver's per-agent runtimes and the default runner). Previously each
+	// path launched a Chromium per task, leaking a browser process on every task.
+	// It is closed once on shutdown via ServeResult.Close below. Nil when browser
+	// tools are disabled, which the registration sites treat as a no-op.
+	var sharedBrowser browser.RuntimeAPI
+	if cfg.Browser.Enabled {
+		brt, err := browser.NewRuntime(browser.RuntimeConfig{Headless: cfg.Browser.Headless, BinPath: cfg.Browser.BinPath})
+		if err != nil {
+			closeStore()
+			return ServeResult{}, fmt.Errorf("init browser runtime: %w", err)
+		}
+		sharedBrowser = brt
+	}
 	resolver := agentruntime.NewAgentRuntimeResolver(agentruntime.AgentRuntimeResolverConfig{
 		Registry:          registry,
 		RootConfig:        cfg,
@@ -2296,6 +2310,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		SkillUsage:        skillUsage,
 		ConversationTurns: conversationTurns,
 		EpisodeRecorder:   episodeRecorder,
+		BrowserRuntime:    sharedBrowser,
 	})
 	defaultDisplay := tuiDisplayConfig(cfg.Maas, "", "")
 	defaultContext, err := buildRunContextPrefix(ctx, cfg, false, defaultDisplay.ModelName)
@@ -2364,7 +2379,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		messageStore:     messageStore,
 		sessionSearcher:  sessionSearcher,
 		webOptions:       webToolOptions(cfg.Web),
-		browserCfg:       cfg.Browser,
+		browserRuntime:   sharedBrowser,
 		maasResolver:     maasProfileResolver{cfg: cfg.Maas},
 		toolMaxFileChars: cfg.ContextFiles.MaxFileChars,
 		homeDir:          resolveHomeDir(logger),
@@ -2585,6 +2600,14 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		// task goroutine can never write to an already-closed store.
 		Close: func() {
 			coordinator.Wait()
+			// Tear down the one shared Chromium process after in-flight tasks
+			// have drained (coordinator.Wait above), so no task can still be
+			// driving the browser when it closes.
+			if sharedBrowser != nil {
+				if err := sharedBrowser.Close(context.Background(), browser.CloseReq{}); err != nil {
+					logger.Warn("close browser runtime", "error", err)
+				}
+			}
 			if err := platformEvents.Close(); err != nil {
 				logger.Warn("close platform event bus", "error", err)
 			}

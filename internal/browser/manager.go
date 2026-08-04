@@ -64,18 +64,33 @@ func (m *Manager) AcquireContext(_ ContextOpts) (*BrowserContext, error) {
 	return &BrowserContext{id: fmt.Sprintf("ctx-%d", m.seq), browser: incog}, nil
 }
 
-// ReleaseContext 关闭 Context 的所有 page 并释放。
+// ReleaseContext 关闭 Context 的所有 page 并释放整个 incognito Context。
+//
+// 关键：仅关 page 不会释放 incognito BrowserContext —— go-rod v0.116.2 里
+// incognito 浏览器的 Browser.Close() 才会 dispose 其 BrowserContext，遗漏它就会
+// 每个 Session 泄漏一个上下文。故关完 page 后必须 c.browser.Close()。
+// 不静默吞错（CLAUDE.md §0 fail-loud）：Pages() 报错也照常 Close，并把两处错误合并返回。
 func (m *Manager) ReleaseContext(c *BrowserContext) error {
 	if c == nil || c.browser == nil {
 		return nil
 	}
-	pages, err := c.browser.Pages()
-	if err == nil {
+	pages, pagesErr := c.browser.Pages()
+	if pagesErr == nil {
 		for _, p := range pages {
-			_ = p.Close()
+			_ = p.Close() // best-effort；随后 Close 整个 Context 会一并回收
 		}
 	}
-	return nil
+	closeErr := c.browser.Close()
+	switch {
+	case pagesErr != nil && closeErr != nil:
+		return fmt.Errorf("release context %s: list pages: %v; close context: %w", c.id, pagesErr, closeErr)
+	case pagesErr != nil:
+		return fmt.Errorf("release context %s: list pages: %w", c.id, pagesErr)
+	case closeErr != nil:
+		return fmt.Errorf("release context %s: close context: %w", c.id, closeErr)
+	default:
+		return nil
+	}
 }
 
 // Close 关闭浏览器进程。

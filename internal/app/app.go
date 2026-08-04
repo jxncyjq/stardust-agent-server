@@ -252,6 +252,14 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 		if err != nil {
 			return DemoResult{}, fmt.Errorf("init browser runtime: %w", err)
 		}
+		// RunTask is the one-shot path: App has no daemon lifecycle and runs a
+		// single task per call, so the browser it launches is closed when that
+		// task returns — otherwise every RunTask would leak a Chromium process.
+		defer func() {
+			if cerr := brt.Close(context.Background(), browser.CloseReq{}); cerr != nil {
+				taskLogger.Warn("close browser runtime", "error", cerr)
+			}
+		}()
 		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: brt})
 	}
 	runner := runtime.NewRuntime(runtime.Config{

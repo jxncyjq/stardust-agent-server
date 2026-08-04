@@ -16,16 +16,30 @@ const (
 )
 
 // BrowserError 携带语义码，供工具层映射到 domain.ToolResult.Error。
+// Err 为可选的底层原因；非空时保留错误链（errors.Is/As 可穿透），符合 fail-loud。
 type BrowserError struct {
 	Code Code
 	Msg  string
+	Err  error // 底层原因，可为 nil
 }
 
 func (e *BrowserError) Error() string {
+	if e.Err != nil {
+		return fmt.Sprintf("%s: %s: %v", e.Code, e.Msg, e.Err)
+	}
 	return fmt.Sprintf("%s: %s", e.Code, e.Msg)
 }
+
+// Unwrap 暴露底层原因，使 errors.Is/As 能穿透语义码错误。
+func (e *BrowserError) Unwrap() error { return e.Err }
 
 // NewBrowserError 构造一个带语义码的错误。
 func NewBrowserError(code Code, msg string) *BrowserError {
 	return &BrowserError{Code: code, Msg: msg}
+}
+
+// NewBrowserErrorWrap 构造一个带语义码且包住底层原因的错误（等价于 %w 包装），
+// 供 fail-loud 场景保留完整错误链。
+func NewBrowserErrorWrap(code Code, msg string, err error) *BrowserError {
+	return &BrowserError{Code: code, Msg: msg, Err: err}
 }
