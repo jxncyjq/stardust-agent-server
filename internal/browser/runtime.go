@@ -24,6 +24,9 @@ type RuntimeConfig struct {
 	ScreencastFPS     int           // screencast 限帧率（<=0 时 screencaster 回落到默认 8fps）
 	SessionTTL        time.Duration // 会话空闲超过此时长即回收物理 Context；<=0 关闭 TTL 回收
 	ReapInterval      time.Duration // reaper 后台扫描间隔；<=0 回落到默认 60s
+	// Store 是可选的会话持久化端口：非 nil 时装配写穿并在启动时从盘加载已存会话
+	// （Context=nil 懒重建）；nil = 纯内存，Phase 1/2 行为不变。
+	Store BrowserSessionStore
 }
 
 // Runtime 是 RuntimeAPI 的 go-rod 实现。
@@ -38,6 +41,9 @@ type Runtime struct {
 	// start/stop 决策串行化，杜绝并发订阅/取消导致的 double-start、miss-start 或
 	// cancel 与 Store 交错留下孤儿 screencaster。零值可用，供 struct-literal 构造的测试直接用。
 	lifecycles sync.Map
+	// reaperCancel 取消后台 TTL reaper goroutine 的 ctx；全量 Close（SessionID=="" 分支）时调用。
+	// struct-literal 构造的测试为 nil，Close 全量分支对 nil 安全。
+	reaperCancel context.CancelFunc
 }
 
 var _ RuntimeAPI = (*Runtime)(nil)
@@ -48,13 +54,32 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Runtime{
+	r := &Runtime{
 		mgr:           mgr,
 		sessions:      NewSessionStore(),
 		cfg:           cfg,
 		hubs:          newHubRegistry(),
 		screencasters: &sync.Map{},
-	}, nil
+	}
+	// 可选持久化：装配写穿端口 + 从盘加载已存会话（Context=nil，懒重建），
+	// 使进程重启后仍能识别历史会话 id（否则会误判 CONTEXT_EVICTED）。nil 时全跳过（Phase 1/2）。
+	if cfg.Store != nil {
+		r.sessions.SetPersist(cfg.Store)
+		if recs, err := cfg.Store.List(); err != nil {
+			// 加载失败不致命：退化成「历史会话未知」，但仍可服务新会话——记 Warn 便于排查。
+			slog.Warn("browser: load persisted sessions failed", "err", err)
+		} else {
+			for _, rec := range recs {
+				r.sessions.Adopt(rec)
+			}
+		}
+	}
+	// 起后台 TTL reaper：用可取消 ctx，全量 Close 时 cancel。SessionTTL<=0 时 startReaper
+	// 内部直接返回（不起 goroutine），但 reaperCancel 仍登记，Close 调用对其安全。
+	reaperCtx, cancel := context.WithCancel(context.Background())
+	r.reaperCancel = cancel
+	r.startReaper(reaperCtx)
+	return r, nil
 }
 
 // hubRegistry 按会话 id 惰性持有 Hub。并发安全。
@@ -232,22 +257,26 @@ func (r *Runtime) Open(ctx context.Context, req OpenReq) (OpenObservation, error
 	if err := r.checkURL(req.URL); err != nil {
 		return OpenObservation{}, err
 	}
-	// I4 fail-loud：只有 SessionID 为空才新建。传了非空但查无此 Session 说明它已被
-	// 回收/失效，静默 mint 一个新 Session 会掩盖状态漂移——按 CONTEXT_EVICTED 报错。
+	// I4 fail-loud：只有 SessionID 为空才新建。传了非空但查无此 Session（内存无且 DB 无）
+	// 说明它已被彻底回收/失效，静默 mint 一个新 Session 会掩盖状态漂移——按 CONTEXT_EVICTED
+	// 报错。启动时 Adopt 已把持久会话纳入内存，故「内存有但 Context==nil」是被 TTL 回收或
+	// 重启后的懒态，走下方 rebuildContext 重建（恢复登录 cookies），而非报错。
 	var sess *Session
 	if req.SessionID == "" {
 		sess = r.sessions.Create(req.TaskID)
-		c, err := r.mgr.AcquireContext(ContextOpts{})
-		if err != nil {
-			return OpenObservation{}, err
-		}
-		sess.Context = c
 	} else {
 		s, ok := r.sessions.Get(req.SessionID)
 		if !ok {
 			return OpenObservation{}, NewBrowserError(CodeContextEvicted, "unknown session "+req.SessionID)
 		}
 		sess = s
+	}
+	// 确保有物理 Context：新建会话或被回收（Context==nil）的会话都在此获取/重建 Context
+	// 并恢复登录 cookies；随后的导航即带着 cookies 打开目标页，登录态得以延续。
+	if sess.Context == nil {
+		if err := r.rebuildContext(sess); err != nil {
+			return OpenObservation{}, err
+		}
 	}
 	if sess.Context == nil || sess.Context.browser == nil {
 		return OpenObservation{}, NewBrowserError(CodeContextEvicted, "session "+sess.ID+" has no browser context")
@@ -282,6 +311,34 @@ func (r *Runtime) Open(ctx context.Context, req OpenReq) (OpenObservation, error
 	// 换页后活跃 page 变了：若已有订阅者，把 screencast 重绑到新 page。
 	r.restartScreencastIfActive(sess)
 	return OpenObservation{SessionID: sess.ID, Observation: obs}, nil
+}
+
+// rebuildContext 为一个 Context==nil 的会话获取新 incognito Context 并（若有持久快照）
+// 恢复登录 cookies。cookies 用 SetCookies 灌到 browser（Context）级——调用方随后导航到同域
+// 时浏览器即带上它们，登录态恢复。恢复失败（快照损坏/SetCookies 报错）记 Warn 不致命：
+// 登录态尽力恢复，恢复不了也应给出一个可用的空白 Context，不能让整个 Open 失败。
+// AcquireContext 失败则返回 error（无 Context 无法继续导航）。
+func (r *Runtime) rebuildContext(sess *Session) error {
+	c, err := r.mgr.AcquireContext(ContextOpts{})
+	if err != nil {
+		return err
+	}
+	if store := r.sessions.persist; store != nil {
+		rec, ok, err := store.Get(sess.ID)
+		switch {
+		case err != nil:
+			slog.Warn("browser: rebuild load storage state failed", "session", sess.ID, "err", err)
+		case ok && rec.StorageState != "":
+			cookies, err := unmarshalStorageState(rec.StorageState)
+			if err != nil {
+				slog.Warn("browser: rebuild bad storage state", "session", sess.ID, "err", err)
+			} else if err := r.restoreCookies(c.browser, cookies); err != nil {
+				slog.Warn("browser: rebuild restore cookies failed", "session", sess.ID, "err", err)
+			}
+		}
+	}
+	sess.WithLock(func() { sess.Context = c })
+	return nil
 }
 
 // Read 只读地重新抽取当前活跃页的 a11y 观测。
@@ -380,6 +437,10 @@ func (r *Runtime) Close(ctx context.Context, req CloseReq) error {
 			return nil
 		}
 		return NewBrowserError(CodeContextEvicted, "unknown session "+req.SessionID)
+	}
+	// 全量关闭：先停后台 reaper（避免它在进程 Close 后仍访问已释放的 Manager），再关进程。
+	if r.reaperCancel != nil {
+		r.reaperCancel()
 	}
 	r.mgr.Close()
 	return nil

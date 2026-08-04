@@ -3,6 +3,8 @@ package browser
 import (
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -70,6 +72,43 @@ func (st *SessionStore) Create(taskID string) *Session {
 		}
 	}
 	return sess
+}
+
+// Adopt 把一条持久化记录纳入内存表，Context=nil（懒重建，首次访问时由 rebuildContext 补齐），
+// 且不回写持久层——本方法是「从持久层加载」，回写会形成无谓的自我覆盖。
+//
+// 维护 seq 单调：若 rec.ID 形如 sess-<N>，把 st.seq 抬到至少 N。否则重启后 Adopt 了 sess-3，
+// 之后一次 Create 会从 seq=0 铸出 sess-1，与已存会话撞号。
+func (st *SessionStore) Adopt(rec SessionRecord) *Session {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	sess := &Session{
+		ID:         rec.ID,
+		TaskID:     rec.TaskID,
+		ActiveURL:  rec.ActiveURL,
+		Refs:       make(map[string]string),
+		CreatedAt:  rec.CreatedAt,
+		LastUsedAt: rec.LastUsedAt,
+	}
+	st.byID[rec.ID] = sess
+	if n, ok := parseSessionSeq(rec.ID); ok && n > st.seq {
+		st.seq = n
+	}
+	return sess
+}
+
+// parseSessionSeq 解析 "sess-<N>" 形式 id 的数字后缀，供 Adopt 维护 seq 单调。
+// 不匹配前缀或后缀非数字时返回 (0,false)——非本类命名的 id 不参与 seq 计算。
+func parseSessionSeq(id string) (int, bool) {
+	const prefix = "sess-"
+	if !strings.HasPrefix(id, prefix) {
+		return 0, false
+	}
+	n, err := strconv.Atoi(id[len(prefix):])
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 // Snapshot 返回当前所有会话指针的浅拷贝切片，供并发安全遍历（reaper 用）：
