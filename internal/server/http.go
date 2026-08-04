@@ -76,6 +76,17 @@ type SkillManager interface {
 	Uninstall(ctx context.Context, name string) error
 }
 
+// TaskInterrupter cancels a running task's tool-loop mid-flight. It is
+// satisfied directly by *agentruntime.Coordinator (Interrupt(taskID string)
+// error); the interface exists so the HTTP layer stays testable without
+// pulling in the full coordinator. Interrupt returns an error when the task
+// is not currently running (already finished / never started / unknown) so
+// the handler can fail loud with 404 instead of pretending an interrupt
+// happened.
+type TaskInterrupter interface {
+	Interrupt(taskID string) error
+}
+
 // ApprovalDecider records a human approve/deny decision on a Manual-mode tool
 // approval ticket and returns the updated ticket. It is satisfied by
 // manualgate.ApprovalCoordinator; the server package depends only on this
@@ -99,6 +110,7 @@ type Config struct {
 	Skills              SkillManager
 	ToolApprovals       ApprovalDecider
 	ApprovalTickets     ApprovalLister
+	TaskInterrupter     TaskInterrupter
 	Readiness           ReadinessChecker
 	AdminToken          string
 	PublicHealthEnabled bool
@@ -142,6 +154,7 @@ type HTTPServer struct {
 	skills              SkillManager
 	toolApprovals       ApprovalDecider
 	approvalTickets     ApprovalLister
+	taskInterrupter     TaskInterrupter
 	readiness           ReadinessChecker
 	adminToken          string
 	publicHealthEnabled bool
@@ -195,6 +208,7 @@ func NewHTTPServer(cfg Config) *HTTPServer {
 		skills:              cfg.Skills,
 		toolApprovals:       cfg.ToolApprovals,
 		approvalTickets:     cfg.ApprovalTickets,
+		taskInterrupter:     cfg.TaskInterrupter,
 		readiness:           cfg.Readiness,
 		adminToken:          cfg.AdminToken,
 		publicHealthEnabled: cfg.PublicHealthEnabled,
@@ -277,6 +291,8 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleGetTaskResult(rec, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/tasks/") && strings.Contains(r.URL.Path, "/approvals/"):
 		s.handleDecideApproval(rec, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/tasks/") && strings.HasSuffix(r.URL.Path, "/interrupt"):
+		s.handleInterruptTask(rec, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/tasks/"):
 		s.handleGetTask(rec, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/workflows":
@@ -1416,6 +1432,29 @@ func firstNonEmptyString(values ...string) string {
 
 func newAgentMessageID() string {
 	return "http-msg-" + time.Now().UTC().Format("20060102-150405.000000000")
+}
+
+// handleInterruptTask cancels a running task's tool-loop mid-flight so the
+// caller (the GUI's stop button) can stop token spend without waiting for the
+// model to finish. Path: POST /v1/tasks/{taskID}/interrupt. Responds 204 when
+// the interrupt was delivered, 404 when the task is not currently running
+// (already finished / unknown) -- the fail-loud contract means a not-running
+// task must not be reported as a successful interrupt.
+func (s *HTTPServer) handleInterruptTask(w http.ResponseWriter, r *http.Request) {
+	if s.taskInterrupter == nil {
+		writeError(w, http.StatusServiceUnavailable, "task interrupter is unavailable")
+		return
+	}
+	taskID := strings.Trim(strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/tasks/"), "/interrupt"), "/")
+	if taskID == "" {
+		writeError(w, http.StatusBadRequest, "task id is required")
+		return
+	}
+	if err := s.taskInterrupter.Interrupt(taskID); err != nil {
+		writeError(w, http.StatusNotFound, err.Error())
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // handleDecideApproval records a human approve/deny on a Manual-mode tool

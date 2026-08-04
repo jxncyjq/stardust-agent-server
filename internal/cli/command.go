@@ -2529,6 +2529,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		Metrics:             metrics,
 		ToolApprovals:       approvalCoordinator,
 		ApprovalTickets:     toolGateStore,
+		TaskInterrupter:     coordinator,
 		Diagnostics: observability.NewDiagnostics(observability.DiagnosticsConfig{
 			Version:             "dev",
 			StorageDriver:       cfg.Storage.Driver,
