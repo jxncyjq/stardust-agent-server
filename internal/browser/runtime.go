@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/input"
@@ -25,6 +26,7 @@ type Runtime struct {
 	mgr      *Manager
 	sessions *SessionStore
 	cfg      RuntimeConfig
+	hubs     *hubRegistry
 }
 
 var _ RuntimeAPI = (*Runtime)(nil)
@@ -35,7 +37,55 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Runtime{mgr: mgr, sessions: NewSessionStore(), cfg: cfg}, nil
+	return &Runtime{mgr: mgr, sessions: NewSessionStore(), cfg: cfg, hubs: newHubRegistry()}, nil
+}
+
+// hubRegistry 按会话 id 惰性持有 Hub。并发安全。
+type hubRegistry struct {
+	mu   sync.Mutex
+	byID map[string]*Hub
+}
+
+func newHubRegistry() *hubRegistry { return &hubRegistry{byID: make(map[string]*Hub)} }
+
+func (hr *hubRegistry) get(sessionID string) *Hub {
+	hr.mu.Lock()
+	defer hr.mu.Unlock()
+	h, ok := hr.byID[sessionID]
+	if !ok {
+		h = NewHub(64)
+		hr.byID[sessionID] = h
+	}
+	return h
+}
+
+func (hr *hubRegistry) drop(sessionID string) {
+	hr.mu.Lock()
+	defer hr.mu.Unlock()
+	delete(hr.byID, sessionID)
+}
+
+// Subscribe 实现 RuntimeAPI：会话必须存在。
+func (r *Runtime) Subscribe(sessionID string) (<-chan StreamEvent, func(), error) {
+	if _, ok := r.sessions.Get(sessionID); !ok {
+		return nil, nil, NewBrowserError(CodeContextEvicted, "unknown session "+sessionID)
+	}
+	hub := r.hubs.get(sessionID)
+	ch, cancel := hub.Subscribe()
+	return ch, cancel, nil
+}
+
+// emitProgress 往会话 Hub 发一条 progress 事件（无订阅者也安全——Hub 仍分配 seq/缓冲）。
+func (r *Runtime) emitProgress(sessionID, action, status, ref string) {
+	r.hubs.get(sessionID).Publish(StreamEvent{
+		Type: EventProgress,
+		Data: map[string]any{"action": action, "status": status, "ref": ref},
+	})
+}
+
+// emitObservation 往会话 Hub 发一条 observation 事件。
+func (r *Runtime) emitObservation(sessionID string, obs Observation) {
+	r.hubs.get(sessionID).Publish(StreamEvent{Type: EventObservation, Data: obs})
 }
 
 // Open 导航到 req.URL：复用或新建 Session + incognito Context，返回首次观测与 session id。
@@ -87,6 +137,8 @@ func (r *Runtime) Open(ctx context.Context, req OpenReq) (OpenObservation, error
 	if opErr != nil {
 		return OpenObservation{}, opErr
 	}
+	r.emitObservation(sess.ID, obs)
+	r.emitProgress(sess.ID, "open", "done", "")
 	return OpenObservation{SessionID: sess.ID, Observation: obs}, nil
 }
 
@@ -102,6 +154,7 @@ func (r *Runtime) Read(ctx context.Context, req ReadReq) (Observation, error) {
 	if opErr != nil {
 		return Observation{}, opErr
 	}
+	r.emitObservation(req.SessionID, obs)
 	return obs, nil
 }
 
@@ -129,6 +182,8 @@ func (r *Runtime) Click(ctx context.Context, req ClickReq) (Observation, error) 
 	if opErr != nil {
 		return Observation{}, opErr
 	}
+	r.emitProgress(req.SessionID, "click", "done", req.Ref)
+	r.emitObservation(req.SessionID, obs)
 	return obs, nil
 }
 
@@ -162,6 +217,8 @@ func (r *Runtime) Type(ctx context.Context, req TypeReq) (Observation, error) {
 	if opErr != nil {
 		return Observation{}, opErr
 	}
+	r.emitProgress(req.SessionID, "type", "done", req.Ref)
+	r.emitObservation(req.SessionID, obs)
 	return obs, nil
 }
 
@@ -173,6 +230,7 @@ func (r *Runtime) Close(ctx context.Context, req CloseReq) error {
 			// 从内存表删掉（进程级 Close 时进程整体回收），但错误照常上报。
 			relErr := r.mgr.ReleaseContext(sess.Context)
 			r.sessions.Delete(req.SessionID)
+			r.hubs.drop(req.SessionID)
 			if relErr != nil {
 				return NewBrowserErrorWrap(CodeContextEvicted, "release session "+req.SessionID, relErr)
 			}

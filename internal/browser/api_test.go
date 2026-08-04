@@ -8,11 +8,14 @@ import (
 // fakeRuntime 是一个满足 RuntimeAPI 的空实现，仅用于锁定接口签名。
 type fakeRuntime struct{}
 
-func (fakeRuntime) Open(context.Context, OpenReq) (OpenObservation, error) { return OpenObservation{}, nil }
-func (fakeRuntime) Read(context.Context, ReadReq) (Observation, error)     { return Observation{}, nil }
-func (fakeRuntime) Click(context.Context, ClickReq) (Observation, error)   { return Observation{}, nil }
-func (fakeRuntime) Type(context.Context, TypeReq) (Observation, error)     { return Observation{}, nil }
-func (fakeRuntime) Close(context.Context, CloseReq) error                  { return nil }
+func (fakeRuntime) Open(context.Context, OpenReq) (OpenObservation, error) {
+	return OpenObservation{}, nil
+}
+func (fakeRuntime) Read(context.Context, ReadReq) (Observation, error)   { return Observation{}, nil }
+func (fakeRuntime) Click(context.Context, ClickReq) (Observation, error) { return Observation{}, nil }
+func (fakeRuntime) Type(context.Context, TypeReq) (Observation, error)   { return Observation{}, nil }
+func (fakeRuntime) Close(context.Context, CloseReq) error                { return nil }
+func (fakeRuntime) Subscribe(string) (<-chan StreamEvent, func(), error) { return nil, func() {}, nil }
 
 func TestRuntimeAPISatisfied(t *testing.T) {
 	var _ RuntimeAPI = fakeRuntime{}

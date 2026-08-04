@@ -127,3 +127,7 @@ func (driftGuardBrowserRuntime) Type(context.Context, browser.TypeReq) (browser.
 func (driftGuardBrowserRuntime) Close(context.Context, browser.CloseReq) error {
 	return nil
 }
+
+func (driftGuardBrowserRuntime) Subscribe(string) (<-chan browser.StreamEvent, func(), error) {
+	return nil, func() {}, nil
+}
