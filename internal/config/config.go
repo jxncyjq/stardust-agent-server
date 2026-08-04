@@ -31,6 +31,7 @@ type Config struct {
 	Workspace    WorkspaceConfig    `json:"workspace"`
 	Tasks        TasksConfig        `json:"tasks"`
 	Web          WebToolConfig      `json:"web"`
+	Browser      BrowserConfig      `json:"browser"`
 	Evolution    EvolutionConfig    `json:"evolution"`
 }
 
@@ -57,6 +58,13 @@ type WebToolConfig struct {
 	SearchEngine         string `json:"search_engine"`          // baidu|google|bing|空=实例默认
 	SearchDefaultLimit   int    `json:"search_default_limit"`   // 默认 5，上限 20
 	SearchTimeoutSeconds int    `json:"search_timeout_seconds"` // 默认 15
+}
+
+// BrowserConfig 配置内置浏览器运行时。默认关闭——开启需运行环境有可用 Chromium。
+type BrowserConfig struct {
+	Enabled  bool   `json:"enabled"`
+	Headless bool   `json:"headless"`
+	BinPath  string `json:"bin_path"` // 可选：指向系统 Chrome/Edge，绕过 go-rod 自动下载
 }
 
 type MaasConfig struct {

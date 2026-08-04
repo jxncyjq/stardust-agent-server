@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/stardust/legion-agent/internal/agentregistry"
+	"github.com/stardust/legion-agent/internal/browser"
 	"github.com/stardust/legion-agent/internal/capability"
 	"github.com/stardust/legion-agent/internal/cognitive"
 	"github.com/stardust/legion-agent/internal/config"
@@ -72,6 +73,12 @@ type AgentRuntimeResolverConfig struct {
 	// into the episodic store, mirroring Config.EpisodeRecorder on the default
 	// runtime. Nil disables episodic recording for those runtimes.
 	EpisodeRecorder EpisodeRecorder
+	// BrowserRuntime is the ONE shared browser runtime (one Chromium process)
+	// injected at serve assembly when RootConfig.Browser.Enabled. Per-agent
+	// runtimes register browser_* against this shared instance rather than
+	// launching a Chromium per task — launching per task leaked a browser
+	// process on every worker task. Nil means browser tools are off.
+	BrowserRuntime browser.RuntimeAPI
 }
 
 type AgentRuntimeResolver struct {
@@ -88,6 +95,7 @@ type AgentRuntimeResolver struct {
 	skillUsage        SkillUsageRecorder
 	conversationTurns ConversationTurnLister
 	episodeRecorder   EpisodeRecorder
+	browserRuntime    browser.RuntimeAPI
 }
 
 func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolver {
@@ -105,6 +113,7 @@ func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolv
 		skillUsage:        cfg.SkillUsage,
 		conversationTurns: cfg.ConversationTurns,
 		episodeRecorder:   cfg.EpisodeRecorder,
+		browserRuntime:    cfg.BrowserRuntime,
 	}
 }
 
@@ -242,6 +251,10 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 	tool.RegisterTaskLedgerTools(tools, r.taskLedger)
 	tool.RegisterAgentMessageTools(tools, r.messageStore)
 	tool.RegisterWebTools(tools, webToolOptions(r.rootConfig.Web))
+	if r.browserRuntime != nil {
+		// Shared runtime injected at serve assembly; no per-task browser launch.
+		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: r.browserRuntime})
+	}
 	recentTurns, err := r.recentTurnsForTask(ctx, task)
 	if err != nil {
 		return domain.Agent{}, nil, false, err

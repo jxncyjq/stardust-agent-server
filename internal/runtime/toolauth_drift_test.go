@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stardust/legion-agent/internal/browser"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/taskledger"
 	"github.com/stardust/legion-agent/internal/tool"
@@ -51,6 +52,7 @@ func productionToolRegistryForTest(t *testing.T) *tool.Registry {
 	tool.RegisterTaskLedgerTools(tools, ledger)
 	tool.RegisterAgentMessageTools(tools, driftGuardMessageStore{})
 	tool.RegisterWebTools(tools, tool.WebToolOptions{Enabled: true})
+	tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: driftGuardBrowserRuntime{}})
 	tool.RegisterSessionSearchTool(tools, driftGuardMessageSearcher{})
 	RegisterMoAConsultTool(tools, mapResolver{})
 
@@ -98,4 +100,30 @@ func (driftGuardMessageSearcher) ScrollMessages(context.Context, string, string,
 
 func (driftGuardMessageSearcher) BrowseSessions(context.Context, int) ([]domain.AgentSession, error) {
 	return nil, nil
+}
+
+// driftGuardBrowserRuntime is a registration-only browser.RuntimeAPI double:
+// RegisterBrowserTools only needs a non-nil runtime to register its
+// descriptors, and this test never executes a tool handler, so the methods
+// are never actually invoked.
+type driftGuardBrowserRuntime struct{}
+
+func (driftGuardBrowserRuntime) Open(context.Context, browser.OpenReq) (browser.OpenObservation, error) {
+	return browser.OpenObservation{}, nil
+}
+
+func (driftGuardBrowserRuntime) Read(context.Context, browser.ReadReq) (browser.Observation, error) {
+	return browser.Observation{}, nil
+}
+
+func (driftGuardBrowserRuntime) Click(context.Context, browser.ClickReq) (browser.Observation, error) {
+	return browser.Observation{}, nil
+}
+
+func (driftGuardBrowserRuntime) Type(context.Context, browser.TypeReq) (browser.Observation, error) {
+	return browser.Observation{}, nil
+}
+
+func (driftGuardBrowserRuntime) Close(context.Context, browser.CloseReq) error {
+	return nil
 }
