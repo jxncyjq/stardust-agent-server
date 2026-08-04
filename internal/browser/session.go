@@ -2,6 +2,7 @@ package browser
 
 import (
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -26,20 +27,23 @@ func (s *Session) WithLock(fn func()) {
 	fn()
 }
 
-// SessionStore 是 Session 的内存 CRUD（Phase 3 再加落盘）。
+// SessionStore 是 Session 的内存 CRUD，可选写穿到持久化端口（persist）。
 type SessionStore struct {
-	mu   sync.Mutex
-	seq  int
-	byID map[string]*Session
+	mu      sync.Mutex
+	seq     int
+	byID    map[string]*Session
+	persist BrowserSessionStore // nil = 纯内存（Phase 1/2 行为不变）
 }
 
 func NewSessionStore() *SessionStore {
 	return &SessionStore{byID: make(map[string]*Session)}
 }
 
+// SetPersist 装配可选持久化端口（nil = 纯内存，Phase 1/2 行为不变）。
+func (st *SessionStore) SetPersist(p BrowserSessionStore) { st.persist = p }
+
 func (st *SessionStore) Create(taskID string) *Session {
 	st.mu.Lock()
-	defer st.mu.Unlock()
 	st.seq++
 	sess := &Session{
 		ID:         fmt.Sprintf("sess-%d", st.seq),
@@ -49,6 +53,21 @@ func (st *SessionStore) Create(taskID string) *Session {
 		LastUsedAt: time.Now(),
 	}
 	st.byID[sess.ID] = sess
+	persist := st.persist
+	st.mu.Unlock()
+
+	// 写穿：先内存后落盘，落盘失败记 Warn 不致命——会话已在内存可用，
+	// 元数据丢了可从下次动作或重启列表恢复（storageState 的落盘顺序相反，见 reaper）。
+	if persist != nil {
+		if err := persist.Save(SessionRecord{
+			ID:         sess.ID,
+			TaskID:     sess.TaskID,
+			CreatedAt:  sess.CreatedAt,
+			LastUsedAt: sess.LastUsedAt,
+		}); err != nil {
+			slog.Warn("browser: persist session on create failed", "session", sess.ID, "err", err)
+		}
+	}
 	return sess
 }
 
@@ -61,8 +80,16 @@ func (st *SessionStore) Get(id string) (*Session, bool) {
 
 func (st *SessionStore) Delete(id string) {
 	st.mu.Lock()
-	defer st.mu.Unlock()
 	delete(st.byID, id)
+	persist := st.persist
+	st.mu.Unlock()
+
+	// 写穿删除：best-effort，落盘失败记 Warn 不致命。
+	if persist != nil {
+		if err := persist.Delete(id); err != nil {
+			slog.Warn("browser: persist session delete failed", "session", id, "err", err)
+		}
+	}
 }
 
 // pageHandle 封装当前活跃页。page 存放 *rod.Page（runtime.go 以类型断言取回），
