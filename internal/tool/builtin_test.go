@@ -55,6 +55,61 @@ func TestReadOnlyWorkspaceRegistryListFilesReturnsCompleteDirectoryListing(t *te
 	}
 }
 
+func TestReadOnlyWorkspaceRegistryListFilesMissingDirectoryReturnsGuidance(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	// The workspace root exists, but the requested subdirectory does not — the
+	// exact shape that made the model retry invented "packages/*" paths.
+	if err := os.WriteFile(filepath.Join(root, "README.md"), []byte("x\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile error = %v, want nil", err)
+	}
+
+	registry := NewFileReadOnlyWorkspaceRegistry(root, nil)
+	result, err := registry.Execute(context.Background(), domain.Agent{Role: "developer"}, domain.ToolCall{
+		ID:        "call-missing",
+		Name:      "list_files",
+		Arguments: map[string]string{"directory": "packages/canvas-lark"},
+	})
+	if err != nil {
+		t.Fatalf("Registry.Execute(list_files) error = %v, want nil", err)
+	}
+	if result.Success {
+		t.Fatalf("list_files on a missing directory must not succeed; got Success=true Output=%q", result.Output)
+	}
+	for _, want := range []string{"does not exist", "list_files"} {
+		if !strings.Contains(result.Error, want) {
+			t.Fatalf("list_files missing-dir Error = %q, want to contain %q", result.Error, want)
+		}
+	}
+	// Must not fall back to the cryptic empty listing that hid the real cause.
+	if strings.Contains(result.Output, "no files") {
+		t.Fatalf("missing-dir result must be guided failure, not a 'no files' listing: Output=%q", result.Output)
+	}
+}
+
+func TestReadOnlyWorkspaceRegistryListFilesOnFileReturnsGuidance(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "main.go"), []byte("package main\n"), 0o600); err != nil {
+		t.Fatalf("WriteFile error = %v, want nil", err)
+	}
+
+	registry := NewFileReadOnlyWorkspaceRegistry(root, nil)
+	result, err := registry.Execute(context.Background(), domain.Agent{Role: "developer"}, domain.ToolCall{
+		ID:        "call-file",
+		Name:      "list_files",
+		Arguments: map[string]string{"directory": "main.go"},
+	})
+	if err != nil {
+		t.Fatalf("Registry.Execute(list_files) error = %v, want nil", err)
+	}
+	if result.Success || !strings.Contains(result.Error, "is a file") {
+		t.Fatalf("list_files on a file must fail with 'is a file' guidance; got Success=%v Error=%q", result.Success, result.Error)
+	}
+}
+
 func TestReadOnlyWorkspaceRegistryToolSchemasAreOpenAICompatibleObjects(t *testing.T) {
 	t.Parallel()
 
