@@ -65,6 +65,10 @@ type BrowserConfig struct {
 	Enabled  bool   `json:"enabled"`
 	Headless bool   `json:"headless"`
 	BinPath  string `json:"bin_path"` // 可选：指向系统 Chrome/Edge，绕过 go-rod 自动下载
+	// SessionTTLSeconds 是浏览器会话的空闲回收阈值（秒）。0 = 不回收（reaper 关闭）。
+	SessionTTLSeconds int `json:"session_ttl_seconds"`
+	// ReapIntervalSeconds 是 reaper 后台扫描间隔（秒）。0 = 默认 60s。
+	ReapIntervalSeconds int `json:"reap_interval_seconds"`
 }
 
 type MaasConfig struct {

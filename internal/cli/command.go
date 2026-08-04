@@ -2289,7 +2289,19 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// tools are disabled, which the registration sites treat as a no-op.
 	var sharedBrowser browser.RuntimeAPI
 	if cfg.Browser.Enabled {
-		brt, err := browser.NewRuntime(browser.RuntimeConfig{Headless: cfg.Browser.Headless, BinPath: cfg.Browser.BinPath})
+		// Phase 3: 会话持久化。TTL/间隔以秒配置，此处转 time.Duration。当后端是
+		// SQLite 时注入一个把 browser_sessions 表桥到端口的适配器，让登录态跨进程
+		// 重启存活；非 SQLite 驱动拿不到 repo，Store 保持 nil（纯内存，Phase 1/2 行为）。
+		runtimeCfg := browser.RuntimeConfig{
+			Headless:     cfg.Browser.Headless,
+			BinPath:      cfg.Browser.BinPath,
+			SessionTTL:   time.Duration(cfg.Browser.SessionTTLSeconds) * time.Second,
+			ReapInterval: time.Duration(cfg.Browser.ReapIntervalSeconds) * time.Second,
+		}
+		if repo, ok := taskStore.(*storage.SQLiteRepository); ok {
+			runtimeCfg.Store = newSQLiteBrowserStore(repo)
+		}
+		brt, err := browser.NewRuntime(runtimeCfg)
 		if err != nil {
 			closeStore()
 			return ServeResult{}, fmt.Errorf("init browser runtime: %w", err)
