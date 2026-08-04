@@ -37,6 +37,11 @@ var gateable = []GateableTool{
 	{"web_extract", "抓取网页 URL 的正文内容"},
 	{"web_search", "通过 SearXNG 搜索网页"},
 	{"write_file", "写入/创建一个文件"},
+	{"browser_open", "在内置浏览器中打开一个 URL"},
+	{"browser_read", "读取当前页面的可访问性树观测"},
+	{"browser_click", "点击页面上由 ref 标识的元素"},
+	{"browser_type", "向由 ref 标识的元素输入文本"},
+	{"browser_close", "关闭一个浏览器会话"},
 }
 
 // GateableTools returns the canonical gateable tools, sorted by name.
