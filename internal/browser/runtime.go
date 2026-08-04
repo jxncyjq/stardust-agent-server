@@ -213,6 +213,29 @@ func (r *Runtime) activeURLOf(sess *Session) string {
 	return u
 }
 
+// touch 记录一次成功动作：在会话锁下刷新 LastUsedAt，随后（装配了持久层时）尽力把
+// active_url + 最近使用时间写穿到 DB，让 reaper 按「空闲时长」而非「创建至今」判定回收，
+// 从而不再误回收正在使用的会话。落盘 best-effort，失败记 Warn 不致命。
+//
+// 并发约定：调用方不得在已持有 sess.mu 时调用——本函数内部自锁刷新字段（若再入会死锁）。
+// DB 写穿在锁外执行，只用不可变的 sess.ID 与锁内快照下来的 url/now，缩短持锁时长。
+func (r *Runtime) touch(sess *Session) {
+	if sess == nil {
+		return
+	}
+	now := time.Now()
+	var activeURL string
+	sess.WithLock(func() {
+		sess.LastUsedAt = now
+		activeURL = sess.ActiveURL
+	})
+	if store := r.sessions.persist; store != nil {
+		if err := store.Touch(sess.ID, activeURL, now); err != nil {
+			slog.Warn("browser: touch persist failed", "session", sess.ID, "err", err)
+		}
+	}
+}
+
 // pageOf 取会话活跃页的 *rod.Page（与 activePage 的断言一致），无则 nil。
 // M2：ActivePage 由 Open 在 sess 锁下写，这里在同一把锁下读，避免与在途 Open 竞态。
 func (r *Runtime) pageOf(sess *Session) *rod.Page {
@@ -271,19 +294,24 @@ func (r *Runtime) Open(ctx context.Context, req OpenReq) (OpenObservation, error
 		}
 		sess = s
 	}
-	// 确保有物理 Context：新建会话或被回收（Context==nil）的会话都在此获取/重建 Context
-	// 并恢复登录 cookies；随后的导航即带着 cookies 打开目标页，登录态得以延续。
-	if sess.Context == nil {
-		if err := r.rebuildContext(sess); err != nil {
-			return OpenObservation{}, err
-		}
-	}
-	if sess.Context == nil || sess.Context.browser == nil {
-		return OpenObservation{}, NewBrowserError(CodeContextEvicted, "session "+sess.ID+" has no browser context")
-	}
+	// 确保有物理 Context 并完成导航：整段「Context==nil 判定 → rebuild（获取+恢复 cookies）→
+	// 读 sess.Context.browser 导航」都在同一把会话锁下执行，使 Context 的判定与使用观察到一致状态，
+	// 与 reaper 的 evictSession（同样在会话锁下置 Context=nil）严格串行，杜绝「判定非 nil 后被回收
+	// 置 nil 再解引用」的竞态崩溃。rebuildContextLocked 在锁内经 go-rod 获取 Context 属有意为之
+	// （相对 evict 串行化）。
 	var obs Observation
 	var opErr error
 	sess.WithLock(func() {
+		if sess.Context == nil {
+			if err := r.rebuildContextLocked(sess); err != nil {
+				opErr = err
+				return
+			}
+		}
+		if sess.Context == nil || sess.Context.browser == nil {
+			opErr = NewBrowserError(CodeContextEvicted, "session "+sess.ID+" has no browser context")
+			return
+		}
 		page, err := sess.Context.browser.Page(proto.TargetCreateTarget{URL: req.URL})
 		if err != nil {
 			opErr = NewBrowserError(CodeNavigationTimeout, "open "+req.URL+": "+err.Error())
@@ -306,6 +334,7 @@ func (r *Runtime) Open(ctx context.Context, req OpenReq) (OpenObservation, error
 	if opErr != nil {
 		return OpenObservation{}, opErr
 	}
+	r.touch(sess) // 成功动作：刷新 LastUsedAt（+落盘），使 reaper 按空闲时长而非创建至今判定
 	r.emitObservation(sess.ID, obs)
 	r.emitProgress(sess.ID, "open", "done", "")
 	// 换页后活跃 page 变了：若已有订阅者，把 screencast 重绑到新 page。
@@ -313,12 +342,16 @@ func (r *Runtime) Open(ctx context.Context, req OpenReq) (OpenObservation, error
 	return OpenObservation{SessionID: sess.ID, Observation: obs}, nil
 }
 
-// rebuildContext 为一个 Context==nil 的会话获取新 incognito Context 并（若有持久快照）
+// rebuildContextLocked 为一个 Context==nil 的会话获取新 incognito Context 并（若有持久快照）
 // 恢复登录 cookies。cookies 用 SetCookies 灌到 browser（Context）级——调用方随后导航到同域
 // 时浏览器即带上它们，登录态恢复。恢复失败（快照损坏/SetCookies 报错）记 Warn 不致命：
 // 登录态尽力恢复，恢复不了也应给出一个可用的空白 Context，不能让整个 Open 失败。
 // AcquireContext 失败则返回 error（无 Context 无法继续导航）。
-func (r *Runtime) rebuildContext(sess *Session) error {
+//
+// 并发约定：调用方（Open）须已持有 sess.mu——本函数直接写 sess.Context、读 sess.ActiveURL，
+// 不再自锁（若自锁会与持锁调用方再入死锁）。在锁内经 go-rod 获取 Context 属有意为之，使重建
+// 与 evict 串行。
+func (r *Runtime) rebuildContextLocked(sess *Session) error {
 	c, err := r.mgr.AcquireContext(ContextOpts{})
 	if err != nil {
 		return err
@@ -337,7 +370,14 @@ func (r *Runtime) rebuildContext(sess *Session) error {
 			}
 		}
 	}
-	sess.WithLock(func() { sess.Context = c })
+	sess.Context = c
+	// MINOR：重建成功即把 DB 行的 evicted 标记清掉（TouchBrowserSession 置 evicted=0），
+	// 否则重启恢复的会话被重建后 DB 仍显示 evicted=true。best-effort，失败记 Warn 不致命。
+	if store := r.sessions.persist; store != nil {
+		if err := store.Touch(sess.ID, sess.ActiveURL, time.Now()); err != nil {
+			slog.Warn("browser: rebuild touch (clear evicted) failed", "session", sess.ID, "err", err)
+		}
+	}
 	return nil
 }
 
@@ -353,6 +393,7 @@ func (r *Runtime) Read(ctx context.Context, req ReadReq) (Observation, error) {
 	if opErr != nil {
 		return Observation{}, opErr
 	}
+	r.touch(sess) // 成功动作：刷新 LastUsedAt（+落盘），避免正在使用的会话被 reaper 回收
 	r.emitObservation(req.SessionID, obs)
 	return obs, nil
 }
@@ -381,6 +422,7 @@ func (r *Runtime) Click(ctx context.Context, req ClickReq) (Observation, error) 
 	if opErr != nil {
 		return Observation{}, opErr
 	}
+	r.touch(sess) // 成功动作：刷新 LastUsedAt（+落盘），避免正在使用的会话被 reaper 回收
 	r.emitProgress(req.SessionID, "click", "done", req.Ref)
 	r.emitObservation(req.SessionID, obs)
 	return obs, nil
@@ -416,6 +458,7 @@ func (r *Runtime) Type(ctx context.Context, req TypeReq) (Observation, error) {
 	if opErr != nil {
 		return Observation{}, opErr
 	}
+	r.touch(sess) // 成功动作：刷新 LastUsedAt（+落盘），避免正在使用的会话被 reaper 回收
 	r.emitProgress(req.SessionID, "type", "done", req.Ref)
 	r.emitObservation(req.SessionID, obs)
 	return obs, nil
@@ -427,7 +470,14 @@ func (r *Runtime) Close(ctx context.Context, req CloseReq) error {
 		if sess, ok := r.sessions.Get(req.SessionID); ok {
 			// 不吞 ReleaseContext 的错误（CLAUDE.md §0）：即使释放失败也把 Session
 			// 从内存表删掉（进程级 Close 时进程整体回收），但错误照常上报。
-			relErr := r.mgr.ReleaseContext(sess.Context)
+			// Context 的读取 + 置 nil 在会话锁下进行，与 reaper 的 evictSession 串行，
+			// 避免与并发回收交错读写 Context 造成数据竞争。
+			var relErr error
+			sess.WithLock(func() {
+				relErr = r.mgr.ReleaseContext(sess.Context)
+				sess.Context = nil
+				sess.ActivePage = nil
+			})
 			r.sessions.Delete(req.SessionID)
 			r.stopScreencast(req.SessionID) // 停帧流，须在 drop hub 前
 			r.hubs.drop(req.SessionID)
@@ -438,9 +488,18 @@ func (r *Runtime) Close(ctx context.Context, req CloseReq) error {
 		}
 		return NewBrowserError(CodeContextEvicted, "unknown session "+req.SessionID)
 	}
-	// 全量关闭：先停后台 reaper（避免它在进程 Close 后仍访问已释放的 Manager），再关进程。
+	// 全量关闭：先停后台 reaper（避免它在进程 Close 后仍访问已释放的 Manager）。
 	if r.reaperCancel != nil {
 		r.reaperCancel()
+	}
+	// 装配了持久层时，把仍有 live Context 的会话逐个 evict（抓 cookies → 落盘 Evicted 记录 →
+	// 释放 Context），使干净关停（未经 TTL 回收）的活跃会话的登录态也能落盘，重启后可恢复；
+	// 否则这些会话的 cookies 从未落盘，重启即丢登录。纯内存（persist==nil）无处落盘，跳过。
+	// evictSession 自身在会话锁下执行且此时 reaper 已停，不与其它路径竞争。
+	if r.sessions.persist != nil {
+		for _, sess := range r.sessions.Snapshot() {
+			r.evictSession(sess)
+		}
 	}
 	r.mgr.Close()
 	return nil
@@ -449,17 +508,32 @@ func (r *Runtime) Close(ctx context.Context, req CloseReq) error {
 // ---- 内部 ----
 
 // activePage 取出 Session 与其活跃 go-rod 页；缺 Session 或缺活跃页均按 CONTEXT_EVICTED 报错。
+//
+// 并发不变量：sess.ActivePage 的读取在会话锁下进行——reaper 的 evictSession 在同一把锁下把
+// ActivePage 置 nil，故此处不会与回收交错读到撕裂状态或 nil 解引用。取到的 *rod.Page 交回后，
+// 调用方（Read/Click/Type）会在自己的会话锁区间内使用它；若期间被回收，最坏是页面已关、动作
+// 如实返回 error（fail-loud），而非数据竞争。
 func (r *Runtime) activePage(sessionID string) (*Session, *rod.Page, error) {
 	sess, ok := r.sessions.Get(sessionID)
 	if !ok {
 		return nil, nil, NewBrowserError(CodeContextEvicted, "unknown session "+sessionID)
 	}
-	if sess.ActivePage == nil || sess.ActivePage.page == nil {
-		return nil, nil, NewBrowserError(CodeContextEvicted, "session "+sessionID+" has no active page")
-	}
-	page, ok := sess.ActivePage.page.(*rod.Page)
-	if !ok {
-		return nil, nil, NewBrowserError(CodeContextEvicted, "session "+sessionID+" active page has wrong type")
+	var page *rod.Page
+	var err error
+	sess.WithLock(func() {
+		if sess.ActivePage == nil || sess.ActivePage.page == nil {
+			err = NewBrowserError(CodeContextEvicted, "session "+sessionID+" has no active page")
+			return
+		}
+		p, ok := sess.ActivePage.page.(*rod.Page)
+		if !ok {
+			err = NewBrowserError(CodeContextEvicted, "session "+sessionID+" active page has wrong type")
+			return
+		}
+		page = p
+	})
+	if err != nil {
+		return nil, nil, err
 	}
 	return sess, page, nil
 }

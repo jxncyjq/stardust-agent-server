@@ -48,6 +48,9 @@ func unmarshalStorageState(js string) ([]CookieState, error) {
 
 // captureCookies 从会话的 incognito browser 抓当前 cookies，转成可序列化的 CookieState。
 // 无 Context/browser（已回收）返回 (nil, nil)——抓不到不是错误，调用方按空快照处理。
+//
+// 并发约定：读 sess.Context/browser，调用方须已持有 sess.mu（生产路径 evictSession 在锁下调用）；
+// 本函数自身不加锁，避免与持锁调用方再入死锁。
 func (r *Runtime) captureCookies(sess *Session) ([]CookieState, error) {
 	if sess == nil || sess.Context == nil || sess.Context.browser == nil {
 		return nil, nil
