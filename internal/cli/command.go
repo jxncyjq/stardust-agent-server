@@ -2296,6 +2296,16 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		}
 		sharedBrowser = brt
 	}
+	// browserStream carries the shared browser runtime to the HTTP layer's SSE
+	// endpoint. sharedBrowser's static type is browser.RuntimeAPI, but the SSE
+	// handler needs the wider server.BrowserStreamer (Subscribe + ReplaySince),
+	// which the concrete *browser.Runtime satisfies. The assertion holds when
+	// browser tools are enabled; when disabled sharedBrowser is nil, browserStream
+	// stays nil, and the endpoint reports 503.
+	var browserStream server.BrowserStreamer
+	if bs, ok := sharedBrowser.(server.BrowserStreamer); ok {
+		browserStream = bs
+	}
 	resolver := agentruntime.NewAgentRuntimeResolver(agentruntime.AgentRuntimeResolverConfig{
 		Registry:          registry,
 		RootConfig:        cfg,
@@ -2546,6 +2556,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		WorkflowEngine:      workflowEngine,
 		WorkflowEvents:      workflowEvents,
 		PlatformEvents:      platformEvents,
+		Browser:             browserStream,
 		Readiness:           readiness,
 		WorkspaceRoot:       workspaceRoot,
 		AdminToken:          cfg.Server.AdminToken,

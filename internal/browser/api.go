@@ -44,4 +44,8 @@ type RuntimeAPI interface {
 	Click(ctx context.Context, req ClickReq) (Observation, error)
 	Type(ctx context.Context, req TypeReq) (Observation, error)
 	Close(ctx context.Context, req CloseReq) error
+
+	// Subscribe 返回一个会话的流事件通道与取消函数。用于前端观看 Agent 浏览过程。
+	// 未知会话返回错误。
+	Subscribe(sessionID string) (<-chan StreamEvent, func(), error)
 }

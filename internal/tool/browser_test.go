@@ -31,6 +31,9 @@ func (f *fakeBrowserRuntime) Type(context.Context, browser.TypeReq) (browser.Obs
 	return browser.Observation{Text: "typed"}, nil
 }
 func (f *fakeBrowserRuntime) Close(context.Context, browser.CloseReq) error { return nil }
+func (f *fakeBrowserRuntime) Subscribe(string) (<-chan browser.StreamEvent, func(), error) {
+	return nil, func() {}, nil
+}
 
 func newBrowserRegistry(t *testing.T, rt browser.RuntimeAPI) *Registry {
 	t.Helper()
