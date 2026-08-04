@@ -19,14 +19,16 @@ type RuntimeConfig struct {
 	BinPath           string
 	AllowPrivateHosts bool // 仅测试放开；生产默认 false（SSRF 基础拦截）
 	MaxElements       int
+	ScreencastFPS     int // screencast 限帧率（<=0 时 screencaster 回落到默认 8fps）
 }
 
 // Runtime 是 RuntimeAPI 的 go-rod 实现。
 type Runtime struct {
-	mgr      *Manager
-	sessions *SessionStore
-	cfg      RuntimeConfig
-	hubs     *hubRegistry
+	mgr           *Manager
+	sessions      *SessionStore
+	cfg           RuntimeConfig
+	hubs          *hubRegistry
+	screencasters *sync.Map // sessionID(string) → *screencaster；仅有订阅者时活跃
 }
 
 var _ RuntimeAPI = (*Runtime)(nil)
@@ -37,7 +39,13 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Runtime{mgr: mgr, sessions: NewSessionStore(), cfg: cfg, hubs: newHubRegistry()}, nil
+	return &Runtime{
+		mgr:           mgr,
+		sessions:      NewSessionStore(),
+		cfg:           cfg,
+		hubs:          newHubRegistry(),
+		screencasters: &sync.Map{},
+	}, nil
 }
 
 // hubRegistry 按会话 id 惰性持有 Hub。并发安全。
@@ -65,14 +73,78 @@ func (hr *hubRegistry) drop(sessionID string) {
 	delete(hr.byID, sessionID)
 }
 
-// Subscribe 实现 RuntimeAPI：会话必须存在。
+// Subscribe 实现 RuntimeAPI：会话必须存在。第一个订阅者接入时开 screencast，
+// 最后一个断开（取消后订阅者数归零）时停 screencast——不看视图不推帧。
 func (r *Runtime) Subscribe(sessionID string) (<-chan StreamEvent, func(), error) {
-	if _, ok := r.sessions.Get(sessionID); !ok {
+	sess, ok := r.sessions.Get(sessionID)
+	if !ok {
 		return nil, nil, NewBrowserError(CodeContextEvicted, "unknown session "+sessionID)
 	}
 	hub := r.hubs.get(sessionID)
-	ch, cancel := hub.Subscribe()
+	ch, hubCancel := hub.Subscribe()
+	r.maybeStartScreencast(sess, hub)
+	cancel := func() {
+		hubCancel()
+		if hub.SubscriberCount() == 0 {
+			r.stopScreencast(sessionID)
+		}
+	}
 	return ch, cancel, nil
+}
+
+// maybeStartScreencast 在这是会话第一个订阅者且有活跃 page 时开 screencast。
+// 已有别的订阅者说明 screencast 已在跑，直接返回。start 失败不致命：
+// 观测/进度仍走 SSE，只是暂时没有帧。
+func (r *Runtime) maybeStartScreencast(sess *Session, hub *Hub) {
+	if r.screencasters == nil || hub.SubscriberCount() != 1 {
+		return
+	}
+	page := r.pageOf(sess)
+	if page == nil {
+		return
+	}
+	sc := newScreencaster(r.cfg.ScreencastFPS)
+	r.screencasters.Store(sess.ID, sc)
+	_ = sc.Start(page, hub)
+}
+
+// stopScreencast 停止并释放会话的 screencaster（无则幂等）。
+func (r *Runtime) stopScreencast(sessionID string) {
+	if r.screencasters == nil {
+		return
+	}
+	if v, ok := r.screencasters.LoadAndDelete(sessionID); ok {
+		v.(*screencaster).Stop()
+	}
+}
+
+// restartScreencastIfActive 在会话仍有订阅者时按新活跃 page 重启 screencast。
+// 换页（Open 复用会话再导航）后旧 page 的帧流失效，需绑到新 page。无订阅者则不动。
+func (r *Runtime) restartScreencastIfActive(sess *Session) {
+	if r.screencasters == nil {
+		return
+	}
+	hub := r.hubs.get(sess.ID)
+	if hub.SubscriberCount() == 0 {
+		return
+	}
+	r.stopScreencast(sess.ID)
+	page := r.pageOf(sess)
+	if page == nil {
+		return
+	}
+	sc := newScreencaster(r.cfg.ScreencastFPS)
+	r.screencasters.Store(sess.ID, sc)
+	_ = sc.Start(page, hub)
+}
+
+// pageOf 取会话活跃页的 *rod.Page（与 activePage 的断言一致），无则 nil。
+func (r *Runtime) pageOf(sess *Session) *rod.Page {
+	if sess == nil || sess.ActivePage == nil || sess.ActivePage.page == nil {
+		return nil
+	}
+	p, _ := sess.ActivePage.page.(*rod.Page)
+	return p
 }
 
 // ReplaySince 返回会话 Hub 中 seq>lastID 的缓冲 status 事件，供 SSE 断线重连补发。
@@ -149,6 +221,8 @@ func (r *Runtime) Open(ctx context.Context, req OpenReq) (OpenObservation, error
 	}
 	r.emitObservation(sess.ID, obs)
 	r.emitProgress(sess.ID, "open", "done", "")
+	// 换页后活跃 page 变了：若已有订阅者，把 screencast 重绑到新 page。
+	r.restartScreencastIfActive(sess)
 	return OpenObservation{SessionID: sess.ID, Observation: obs}, nil
 }
 
@@ -240,6 +314,7 @@ func (r *Runtime) Close(ctx context.Context, req CloseReq) error {
 			// 从内存表删掉（进程级 Close 时进程整体回收），但错误照常上报。
 			relErr := r.mgr.ReleaseContext(sess.Context)
 			r.sessions.Delete(req.SessionID)
+			r.stopScreencast(req.SessionID) // 停帧流，须在 drop hub 前
 			r.hubs.drop(req.SessionID)
 			if relErr != nil {
 				return NewBrowserErrorWrap(CodeContextEvicted, "release session "+req.SessionID, relErr)
