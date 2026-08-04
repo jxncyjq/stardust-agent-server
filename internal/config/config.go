@@ -75,6 +75,11 @@ type MaasProfile struct {
 	// Optional; defaults to false (byte-for-byte identical requests), so only
 	// enable it for providers that honor Anthropic-style cache_control.
 	PromptCache bool `json:"prompt_cache,omitempty"`
+	// ContextLength is the model's context window in tokens, used by the GUI to
+	// show the active model's context size. Optional (0 = unset); the GUI shows
+	// "context 未设" when absent. Data-driven per the 数值必须数据驱动 铁律 —— the
+	// provider /models API does not return it.
+	ContextLength int `json:"context_length"`
 }
 
 type StorageConfig struct {
