@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/stardust/legion-agent/internal/agentregistry"
+	"github.com/stardust/legion-agent/internal/browser"
 	"github.com/stardust/legion-agent/internal/capability"
 	"github.com/stardust/legion-agent/internal/cognitive"
 	"github.com/stardust/legion-agent/internal/config"
@@ -242,6 +243,13 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 	tool.RegisterTaskLedgerTools(tools, r.taskLedger)
 	tool.RegisterAgentMessageTools(tools, r.messageStore)
 	tool.RegisterWebTools(tools, webToolOptions(r.rootConfig.Web))
+	if r.rootConfig.Browser.Enabled {
+		brt, err := browser.NewRuntime(browser.RuntimeConfig{Headless: r.rootConfig.Browser.Headless, BinPath: r.rootConfig.Browser.BinPath})
+		if err != nil {
+			return domain.Agent{}, nil, false, fmt.Errorf("init browser runtime: %w", err)
+		}
+		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: brt})
+	}
 	recentTurns, err := r.recentTurnsForTask(ctx, task)
 	if err != nil {
 		return domain.Agent{}, nil, false, err

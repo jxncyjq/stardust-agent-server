@@ -24,6 +24,7 @@ import (
 	"github.com/stardust/legion-agent/internal/agentregistry"
 	"github.com/stardust/legion-agent/internal/app"
 	"github.com/stardust/legion-agent/internal/approval"
+	"github.com/stardust/legion-agent/internal/browser"
 	"github.com/stardust/legion-agent/internal/capability"
 	"github.com/stardust/legion-agent/internal/cognitive"
 	"github.com/stardust/legion-agent/internal/config"
@@ -148,6 +149,7 @@ func newRunCommand(application *app.App, out io.Writer) *cobra.Command {
 					MaxToolRounds:    cfg.Runtime.MaxToolRounds,
 					LazyTools:        cfg.Runtime.LazyTools,
 					WebTools:         webToolOptions(cfg.Web),
+					Browser:          cfg.Browser,
 					DisabledTools:    cfg.Runtime.DisabledTools,
 				})
 			default:
@@ -551,6 +553,7 @@ func runTUITask(ctx context.Context, application *app.App, cfg tuiTaskRunConfig)
 		LazyTools:         cfg.Config.Runtime.LazyTools,
 		ConversationTurns: cfg.ConversationTurns,
 		WebTools:          webToolOptions(cfg.Config.Web),
+		Browser:           cfg.Config.Browser,
 		ToolGate:          cfg.ToolGate,
 		Checkpoints:       cfg.Checkpoints,
 		DisabledTools:     cfg.Config.Runtime.DisabledTools,
@@ -641,6 +644,7 @@ func runMentionedTUIAgentTask(ctx context.Context, application *app.App, cfg tui
 		LazyTools:         cfg.Config.Runtime.LazyTools,
 		ConversationTurns: cfg.ConversationTurns,
 		WebTools:          webToolOptions(cfg.Config.Web),
+		Browser:           cfg.Config.Browser,
 		ToolGate:          cfg.ToolGate,
 		Checkpoints:       cfg.Checkpoints,
 		DisabledTools:     cfg.Config.Runtime.DisabledTools,
@@ -1955,7 +1959,12 @@ type defaultTaskRunner struct {
 	messageStore    tool.AgentMessageStore
 	sessionSearcher tool.MessageSearcher
 	webOptions      tool.WebToolOptions
-	maasResolver    agentruntime.ModelResolver
+	// browserCfg gates the built-in browser tools on the default-agent path.
+	// Off by default; when Enabled, RunTask builds a browser runtime per task
+	// and registers browser_* onto that task's registry (a construction
+	// failure fails the run, never a silent skip — CLAUDE.md fail-loud).
+	browserCfg   config.BrowserConfig
+	maasResolver agentruntime.ModelResolver
 	// toolMaxFileChars and homeDir configure on-demand subtree agents.md
 	// injection (tool.WithAgentsInjection) on the tool registry RunTask builds
 	// per call. Both are resolved once at serve assembly (see resolveHomeDir).
@@ -1992,6 +2001,13 @@ func (d *defaultTaskRunner) RunTask(ctx context.Context, agent domain.Agent, tas
 	tool.RegisterTaskLedgerTools(tools, d.taskLedger)
 	tool.RegisterAgentMessageTools(tools, d.messageStore)
 	tool.RegisterWebTools(tools, d.webOptions)
+	if d.browserCfg.Enabled {
+		brt, err := browser.NewRuntime(browser.RuntimeConfig{Headless: d.browserCfg.Headless, BinPath: d.browserCfg.BinPath})
+		if err != nil {
+			return domain.TaskRun{}, fmt.Errorf("init browser runtime: %w", err)
+		}
+		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: brt})
+	}
 	tool.RegisterSessionSearchTool(tools, d.sessionSearcher)
 	agentruntime.RegisterMoAConsultTool(tools, d.maasResolver)
 	runtimeCfg := d.runtimeCfg
@@ -2348,6 +2364,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		messageStore:     messageStore,
 		sessionSearcher:  sessionSearcher,
 		webOptions:       webToolOptions(cfg.Web),
+		browserCfg:       cfg.Browser,
 		maasResolver:     maasProfileResolver{cfg: cfg.Maas},
 		toolMaxFileChars: cfg.ContextFiles.MaxFileChars,
 		homeDir:          resolveHomeDir(logger),

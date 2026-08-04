@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/stardust/legion-agent/internal/adapter"
+	"github.com/stardust/legion-agent/internal/browser"
 	"github.com/stardust/legion-agent/internal/cognitive"
+	"github.com/stardust/legion-agent/internal/config"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/memory"
 	"github.com/stardust/legion-agent/internal/observability"
@@ -67,6 +69,12 @@ type RunTaskOptions struct {
 	LazyTools         bool
 	ConversationTurns []domain.ConversationTurn
 	WebTools          tool.WebToolOptions
+	// Browser gates the built-in browser tools (browser_open/read/click/type/
+	// close). Disabled by default: enabling requires a usable Chromium in the
+	// runtime environment. When Enabled, RunTask constructs a browser runtime
+	// and registers the tools onto the per-task registry; a construction
+	// failure is fatal to the run (fail-loud), never silently skipped.
+	Browser config.BrowserConfig
 	// ToolGate gates each tool call for this run's runtime (approval flows,
 	// e.g. the TUI's in-process synchronous 方案 Y gate — see
 	// internal/tui.NewApprovalGate). Nil never suspends or blocks (Auto
@@ -239,6 +247,13 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 	tool.RegisterTaskLedgerTools(tools, opts.TaskLedger)
 	tool.RegisterAgentMessageTools(tools, opts.MessageStore)
 	tool.RegisterWebTools(tools, opts.WebTools)
+	if opts.Browser.Enabled {
+		brt, err := browser.NewRuntime(browser.RuntimeConfig{Headless: opts.Browser.Headless, BinPath: opts.Browser.BinPath})
+		if err != nil {
+			return DemoResult{}, fmt.Errorf("init browser runtime: %w", err)
+		}
+		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: brt})
+	}
 	runner := runtime.NewRuntime(runtime.Config{
 		Maas:              maas,
 		Audit:             audit,
