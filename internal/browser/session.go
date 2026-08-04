@@ -13,6 +13,7 @@ type Session struct {
 	TaskID     string
 	Context    *BrowserContext   // 回收后为 nil
 	ActivePage *pageHandle       // 当前活跃页（Task 6 定义 pageHandle）
+	ActiveURL  string            // 当前地址（Open 成功导航后写入）；TTL 回收落盘 + 重启恢复据此重新导航
 	Refs       map[string]string // ref → CDP backendNodeID/selector，会话内稳定
 	CreatedAt  time.Time
 	LastUsedAt time.Time
@@ -69,6 +70,18 @@ func (st *SessionStore) Create(taskID string) *Session {
 		}
 	}
 	return sess
+}
+
+// Snapshot 返回当前所有会话指针的浅拷贝切片，供并发安全遍历（reaper 用）：
+// 只在锁内复制指针，遍历/回收发生在锁外，避免回收时持锁调用外部（CDP/落盘）。
+func (st *SessionStore) Snapshot() []*Session {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	out := make([]*Session, 0, len(st.byID))
+	for _, s := range st.byID {
+		out = append(out, s)
+	}
+	return out
 }
 
 func (st *SessionStore) Get(id string) (*Session, bool) {

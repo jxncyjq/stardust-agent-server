@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/input"
@@ -20,7 +21,9 @@ type RuntimeConfig struct {
 	BinPath           string
 	AllowPrivateHosts bool // 仅测试放开；生产默认 false（SSRF 基础拦截）
 	MaxElements       int
-	ScreencastFPS     int // screencast 限帧率（<=0 时 screencaster 回落到默认 8fps）
+	ScreencastFPS     int           // screencast 限帧率（<=0 时 screencaster 回落到默认 8fps）
+	SessionTTL        time.Duration // 会话空闲超过此时长即回收物理 Context；<=0 关闭 TTL 回收
+	ReapInterval      time.Duration // reaper 后台扫描间隔；<=0 回落到默认 60s
 }
 
 // Runtime 是 RuntimeAPI 的 go-rod 实现。
@@ -173,6 +176,18 @@ func (r *Runtime) restartScreencastIfActive(sess *Session) {
 	}
 }
 
+// activeURLOf 在会话锁下读会话当前地址（Open 成功导航后写入 sess.ActiveURL）。
+// 供 evictSession 落盘 storageState 时带上 active_url，重启恢复时据此重新导航。
+// nil 会话返回空串。
+func (r *Runtime) activeURLOf(sess *Session) string {
+	if sess == nil {
+		return ""
+	}
+	var u string
+	sess.WithLock(func() { u = sess.ActiveURL })
+	return u
+}
+
 // pageOf 取会话活跃页的 *rod.Page（与 activePage 的断言一致），无则 nil。
 // M2：ActivePage 由 Open 在 sess 锁下写，这里在同一把锁下读，避免与在途 Open 竞态。
 func (r *Runtime) pageOf(sess *Session) *rod.Page {
@@ -256,6 +271,7 @@ func (r *Runtime) Open(ctx context.Context, req OpenReq) (OpenObservation, error
 			}
 		}
 		sess.ActivePage = &pageHandle{page: page}
+		sess.ActiveURL = req.URL // 记录当前地址：TTL 回收落盘、重启恢复时用它重新导航
 		obs, opErr = r.observe(page, sess)
 	})
 	if opErr != nil {
