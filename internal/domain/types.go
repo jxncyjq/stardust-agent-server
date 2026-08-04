@@ -21,6 +21,7 @@ const (
 	TaskDone          TaskStatus = "done"
 	TaskFailed        TaskStatus = "failed"
 	TaskSuspended     TaskStatus = "suspended"
+	TaskCancelled     TaskStatus = "cancelled"
 )
 
 // 会话/任务工作模式。Manual 把有副作用工具挡在人工审批后；Plan 只提供只读工具、
