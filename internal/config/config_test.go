@@ -540,6 +540,17 @@ func TestRuntimeConfigCompactThresholdParses(t *testing.T) {
 	}
 }
 
+func TestMaasProfileContextLength(t *testing.T) {
+	raw := `{"maas":{"profiles":{"dev":{"model":"deepseek-v4-flash","context_length":128000}}}}`
+	var cfg Config
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := cfg.Maas.Profiles["dev"].ContextLength; got != 128000 {
+		t.Fatalf("ContextLength = %d, want 128000", got)
+	}
+}
+
 func TestDefaultConfigWebSearchFields(t *testing.T) {
 	cfg := defaultConfig()
 	if cfg.Web.SearchDefaultLimit != 5 {
