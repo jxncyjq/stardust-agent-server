@@ -65,7 +65,8 @@ func (st *SessionStore) Delete(id string) {
 	delete(st.byID, id)
 }
 
-// pageHandle 由 Task 6 填充为对 go-rod page 的封装。
+// pageHandle 封装当前活跃页。page 存放 *rod.Page（runtime.go 以类型断言取回），
+// 保持 interface{} 是为了让 session.go 不直接依赖 go-rod，隔离平台无关层。
 type pageHandle struct {
-	page interface{} // Task 6 替换为 *rod.Page
+	page interface{} // 实际存 *rod.Page
 }
