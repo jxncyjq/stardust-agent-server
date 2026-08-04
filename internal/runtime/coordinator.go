@@ -317,42 +317,53 @@ func (c *Coordinator) runAssigned(ctx context.Context, taskToRun domain.Task) (d
 		if errors.Is(err, context.Canceled) {
 			// The run was interrupted mid-flight (Interrupt cancelled taskCtx, so
 			// the runtime's generate/executeToolCalls returned ctx.Err()). Land
-			// the task in Cancelled — a first-class terminal outcome, NOT Failed.
-			//
-			// ctx here is the cancelled taskCtx; every cleanup step below would
-			// fail immediately with context.Canceled if it inherited that
-			// cancellation. context.WithoutCancel (Go 1.21+) severs the cancel
-			// signal while keeping any values, so the transition, audit and
-			// unlock still run to completion.
-			finishCtx := context.WithoutCancel(ctx)
-			if txErr := c.scheduler.Transition(finishCtx, taskToRun.ID, domain.TaskCancelled); txErr != nil {
-				return domain.Task{}, false, fmt.Errorf("cancel task %s: %w", taskToRun.ID, txErr)
-			}
-			if auErr := c.appendAudit(finishCtx, taskToRun.ID, "task_cancelled"); auErr != nil {
-				return domain.Task{}, false, auErr
-			}
-			if _, unlockErr := c.locks.Unlock(finishCtx, taskToRun.ID, c.agent.ID); unlockErr != nil {
-				return domain.Task{}, false, fmt.Errorf("release lock on cancel for task %s: %w", taskToRun.ID, unlockErr)
-			}
-			// Announce the cancellation on the event stream so a client waiting on
-			// the task (the GUI) wakes on task_cancelled rather than hanging until
-			// timeout. Publishing on finishCtx keeps it alive past the cancel.
-			if c.events != nil {
-				if evErr := c.events.Publish(finishCtx, domain.RuntimeEvent{
-					Type:      RuntimeEventTaskCancelled,
-					TaskID:    taskToRun.ID,
-					Message:   "task interrupted",
-					CreatedAt: time.Now(),
-				}); evErr != nil {
-					return domain.Task{}, false, fmt.Errorf("publish cancel event for task %s: %w", taskToRun.ID, evErr)
-				}
-			}
-			return c.currentTask(finishCtx, taskToRun.ID)
+			// the task in Cancelled — a first-class terminal outcome, NOT Failed —
+			// via the shared landCancelled helper (also used by runResume) so both
+			// dispatch paths stay in lockstep.
+			return c.landCancelled(ctx, taskToRun.ID)
 		}
 		c.failTask(ctx, taskToRun.ID)
 		return domain.Task{}, false, fmt.Errorf("run task: %w", err)
 	}
 	return c.afterRun(ctx, taskToRun, runnerAgent, run)
+}
+
+// landCancelled transitions an interrupted task to Cancelled and cleans up. It
+// must be called with the OUTER (possibly-cancelled) ctx; it uses
+// context.WithoutCancel internally so the transition/audit/unlock/publish still
+// complete after the task's own context was cancelled. Shared by the fresh
+// (runAssigned) and resume (runResume) dispatch paths so a cancel lands
+// identically no matter which one dispatched the run.
+//
+// ctx here is the cancelled taskCtx; every cleanup step below would fail
+// immediately with context.Canceled if it inherited that cancellation.
+// context.WithoutCancel (Go 1.21+) severs the cancel signal while keeping any
+// values, so the transition, audit and unlock still run to completion.
+func (c *Coordinator) landCancelled(ctx context.Context, taskID string) (domain.Task, bool, error) {
+	finishCtx := context.WithoutCancel(ctx)
+	if txErr := c.scheduler.Transition(finishCtx, taskID, domain.TaskCancelled); txErr != nil {
+		return domain.Task{}, false, fmt.Errorf("cancel task %s: %w", taskID, txErr)
+	}
+	if auErr := c.appendAudit(finishCtx, taskID, "task_cancelled"); auErr != nil {
+		return domain.Task{}, false, auErr
+	}
+	if _, unlockErr := c.locks.Unlock(finishCtx, taskID, c.agent.ID); unlockErr != nil {
+		return domain.Task{}, false, fmt.Errorf("release lock on cancel for task %s: %w", taskID, unlockErr)
+	}
+	// Announce the cancellation on the event stream so a client waiting on the
+	// task (the GUI) wakes on task_cancelled rather than hanging until timeout.
+	// Publishing on finishCtx keeps it alive past the cancel.
+	if c.events != nil {
+		if evErr := c.events.Publish(finishCtx, domain.RuntimeEvent{
+			Type:      RuntimeEventTaskCancelled,
+			TaskID:    taskID,
+			Message:   "task interrupted",
+			CreatedAt: time.Now(),
+		}); evErr != nil {
+			return domain.Task{}, false, fmt.Errorf("publish cancel event for task %s: %w", taskID, evErr)
+		}
+	}
+	return c.currentTask(finishCtx, taskID)
 }
 
 // afterRun finishes a task after its runner has produced a result: evaluate the
@@ -473,11 +484,26 @@ func (c *Coordinator) resumeScan(ctx context.Context) error {
 			continue // an active worker already holds it
 		}
 		c.wg.Add(1)
-		go func(rt domain.Task) {
+		// Like the fresh-dispatch loop, the resume runs under its own cancellable
+		// child of the shared ctx and registers its cancel func under cancelMu, so
+		// Interrupt can stop a resumed task's tool-loop alone. Registered before
+		// the goroutine starts and removed in its defer, so it is reachable exactly
+		// while the resume is in flight.
+		taskCtx, cancel := context.WithCancel(ctx)
+		c.cancelMu.Lock()
+		c.cancels[t.ID] = cancel
+		c.cancelMu.Unlock()
+		go func(rt domain.Task, taskCtx context.Context, cancel context.CancelFunc) {
 			defer c.wg.Done()
 			defer func() { <-c.sem }()
 			defer c.unmarkResuming(rt.ID)
-			if _, _, err := c.runResume(ctx, rt); err != nil {
+			defer func() {
+				c.cancelMu.Lock()
+				delete(c.cancels, rt.ID)
+				c.cancelMu.Unlock()
+				cancel()
+			}()
+			if _, _, err := c.runResume(taskCtx, rt); err != nil {
 				// Goroutine top-level: never swallow. runResume already transitioned
 				// the task to Failed (or re-suspended it) on error; record the reason
 				// so a failed resume is diagnosable rather than vanishing.
@@ -502,7 +528,7 @@ func (c *Coordinator) resumeScan(ctx context.Context) error {
 						"error", err)
 				}
 			}
-		}(t)
+		}(t, taskCtx, cancel)
 	}
 	return nil
 }
@@ -544,6 +570,12 @@ func (c *Coordinator) runResume(ctx context.Context, t domain.Task) (domain.Task
 				return domain.Task{}, false, fmt.Errorf("release lock on re-suspend for task %s: %w", t.ID, err)
 			}
 			return c.currentTask(ctx, t.ID)
+		}
+		if errors.Is(err, context.Canceled) {
+			// The resumed run was interrupted mid-flight (Interrupt cancelled the
+			// per-task ctx). Land it Cancelled — a first-class terminal outcome,
+			// NOT Failed — via the same shared helper the fresh path uses.
+			return c.landCancelled(ctx, t.ID)
 		}
 		c.failTask(ctx, t.ID)
 		return domain.Task{}, false, fmt.Errorf("resume run task %s: %w", t.ID, err)
