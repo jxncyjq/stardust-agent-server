@@ -492,6 +492,49 @@ func (failingMaas) Generate(context.Context, port.InferenceRequest) (port.Infere
 	return port.InferenceResponse{}, errors.New("inference unavailable")
 }
 
+// cancelSignalMaas blocks its inference until the context is cancelled, then
+// returns ctx.Err(), standing in for a provider call stopped mid-flight. It
+// closes started once it is actually inside Generate so a test can cancel only
+// after the run has reached the inference call.
+type cancelSignalMaas struct{ started chan struct{} }
+
+func (m *cancelSignalMaas) Generate(ctx context.Context, _ port.InferenceRequest) (port.InferenceResponse, error) {
+	close(m.started)
+	<-ctx.Done()
+	return port.InferenceResponse{}, ctx.Err()
+}
+
+// TestRuntimeRunTaskPropagatesContextCanceled pins risk point 2 of the
+// interrupt feature: a cancelled context must surface out of RunTask as an
+// error that errors.Is(context.Canceled), so the coordinator's cancel 分流
+// (errors.Is(err, context.Canceled)) matches and lands the task in Cancelled.
+// If the runtime ever wrapped ctx.Canceled behind its own sentinel with %v
+// instead of %w, this fails.
+func TestRuntimeRunTaskPropagatesContextCanceled(t *testing.T) {
+	t.Parallel()
+
+	maas := &cancelSignalMaas{started: make(chan struct{})}
+	runner := NewRuntime(Config{
+		Maas:   maas,
+		Audit:  adapter.NewMemoryAuditLog(),
+		Events: adapter.NewMemoryEventBus(),
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := runner.RunTask(ctx, domain.Agent{ID: "a1"}, domain.Task{ID: "t1", Input: "x"})
+		errCh <- err
+	}()
+
+	<-maas.started
+	cancel()
+	err := <-errCh
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("RunTask on cancelled ctx err = %v, want errors.Is(context.Canceled)", err)
+	}
+}
+
 type captureMaas struct {
 	response  string
 	reasoning string

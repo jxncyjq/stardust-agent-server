@@ -25,6 +25,15 @@ import (
 // fields after it. The cause therefore travels here, unabridged.
 const RuntimeEventTaskFailed = "task_failed"
 
+// RuntimeEventTaskCancelled announces that a running task was interrupted and
+// transitioned to Cancelled. An interrupted run neither reaches the runtime's
+// task_completed (it returned context.Canceled before finishRun) nor the
+// coordinator's task_failed path (cancel is not a failure), so without this
+// event a client waiting on the task would see no terminal signal and hang
+// until its own timeout. It mirrors task_failed as the cancel-path terminal
+// beacon on the event stream.
+const RuntimeEventTaskCancelled = "task_cancelled"
+
 type TaskRunner interface {
 	RunTask(context.Context, domain.Agent, domain.Task) (domain.TaskRun, error)
 }
@@ -98,6 +107,16 @@ type Coordinator struct {
 	// within-process guard that closes the gap the lock alone leaves open.
 	resumingMu sync.Mutex
 	resuming   map[string]bool
+
+	// cancelMu/cancels hold the per-task cancel funcs of currently-dispatched
+	// runs, so Interrupt can stop a specific task's tool-loop mid-flight by
+	// cancelling only its context (not the shared coordinator ctx). An entry
+	// exists exactly for the window a task's goroutine is in runAssigned:
+	// registered before the goroutine starts, deleted in its defer. All access
+	// is guarded by cancelMu — the dispatch goroutine registers, Interrupt
+	// reads, and the goroutine's defer deletes, concurrently.
+	cancelMu sync.Mutex
+	cancels  map[string]context.CancelFunc
 }
 
 func NewCoordinator(cfg CoordinatorConfig) *Coordinator {
@@ -124,6 +143,7 @@ func NewCoordinator(cfg CoordinatorConfig) *Coordinator {
 		logger:             cfg.Logger,
 		sem:                make(chan struct{}, cfg.MaxWorkers),
 		resuming:           make(map[string]bool),
+		cancels:            make(map[string]context.CancelFunc),
 	}
 }
 
@@ -176,16 +196,33 @@ func (c *Coordinator) Heartbeat(ctx context.Context) (domain.Task, bool, error) 
 			return domain.Task{}, dispatched, nil
 		}
 		c.wg.Add(1)
-		go func(t domain.Task) {
+		// Each task runs under its own cancellable child of the shared ctx so
+		// Interrupt can stop this task's tool-loop alone. The cancel func is
+		// registered before the goroutine starts and removed in its defer, so it
+		// is reachable exactly while the task is in flight.
+		taskCtx, cancel := context.WithCancel(ctx)
+		c.cancelMu.Lock()
+		c.cancels[taskToRun.ID] = cancel
+		c.cancelMu.Unlock()
+		go func(t domain.Task, taskCtx context.Context, cancel context.CancelFunc) {
 			defer c.wg.Done()
 			defer func() { <-c.sem }()
-			if _, _, err := c.runAssigned(ctx, t); err != nil {
+			defer func() {
+				c.cancelMu.Lock()
+				delete(c.cancels, t.ID)
+				c.cancelMu.Unlock()
+				cancel()
+			}()
+			if _, _, err := c.runAssigned(taskCtx, t); err != nil {
 				// Goroutine top-level: never swallow. runAssigned already
-				// transitioned the task to Failed on error; record why, so a
-				// failed run is diagnosable rather than vanishing.
+				// transitioned the task to Failed (or Cancelled) on error;
+				// record why, so a failed run is diagnosable rather than
+				// vanishing. reportRunFailure runs under the shared ctx (not the
+				// per-task taskCtx) so a cancel-driven cleanup path can still
+				// report even after taskCtx is cancelled.
 				c.reportRunFailure(ctx, t.ID, err)
 			}
-		}(taskToRun)
+		}(taskToRun, taskCtx, cancel)
 		dispatched = true
 	}
 }
@@ -276,6 +313,41 @@ func (c *Coordinator) runAssigned(ctx context.Context, taskToRun domain.Task) (d
 				return domain.Task{}, false, fmt.Errorf("release lock on suspend for task %s: %w", taskToRun.ID, err)
 			}
 			return c.currentTask(ctx, taskToRun.ID)
+		}
+		if errors.Is(err, context.Canceled) {
+			// The run was interrupted mid-flight (Interrupt cancelled taskCtx, so
+			// the runtime's generate/executeToolCalls returned ctx.Err()). Land
+			// the task in Cancelled — a first-class terminal outcome, NOT Failed.
+			//
+			// ctx here is the cancelled taskCtx; every cleanup step below would
+			// fail immediately with context.Canceled if it inherited that
+			// cancellation. context.WithoutCancel (Go 1.21+) severs the cancel
+			// signal while keeping any values, so the transition, audit and
+			// unlock still run to completion.
+			finishCtx := context.WithoutCancel(ctx)
+			if txErr := c.scheduler.Transition(finishCtx, taskToRun.ID, domain.TaskCancelled); txErr != nil {
+				return domain.Task{}, false, fmt.Errorf("cancel task %s: %w", taskToRun.ID, txErr)
+			}
+			if auErr := c.appendAudit(finishCtx, taskToRun.ID, "task_cancelled"); auErr != nil {
+				return domain.Task{}, false, auErr
+			}
+			if _, unlockErr := c.locks.Unlock(finishCtx, taskToRun.ID, c.agent.ID); unlockErr != nil {
+				return domain.Task{}, false, fmt.Errorf("release lock on cancel for task %s: %w", taskToRun.ID, unlockErr)
+			}
+			// Announce the cancellation on the event stream so a client waiting on
+			// the task (the GUI) wakes on task_cancelled rather than hanging until
+			// timeout. Publishing on finishCtx keeps it alive past the cancel.
+			if c.events != nil {
+				if evErr := c.events.Publish(finishCtx, domain.RuntimeEvent{
+					Type:      RuntimeEventTaskCancelled,
+					TaskID:    taskToRun.ID,
+					Message:   "task interrupted",
+					CreatedAt: time.Now(),
+				}); evErr != nil {
+					return domain.Task{}, false, fmt.Errorf("publish cancel event for task %s: %w", taskToRun.ID, evErr)
+				}
+			}
+			return c.currentTask(finishCtx, taskToRun.ID)
 		}
 		c.failTask(ctx, taskToRun.ID)
 		return domain.Task{}, false, fmt.Errorf("run task: %w", err)
@@ -541,6 +613,22 @@ func (c *Coordinator) appendAudit(ctx context.Context, taskID string, action str
 	}); err != nil {
 		return fmt.Errorf("append %s audit event: %w", action, err)
 	}
+	return nil
+}
+
+// Interrupt cancels the running task's context, stopping its tool-loop
+// mid-flight. The task's goroutine then observes context.Canceled out of
+// RunTask and lands the task in Cancelled. Returns an error when the task is
+// not currently running (already finished / never started) — the caller
+// surfaces it rather than pretending an interrupt happened.
+func (c *Coordinator) Interrupt(taskID string) error {
+	c.cancelMu.Lock()
+	cancel, ok := c.cancels[taskID]
+	c.cancelMu.Unlock()
+	if !ok {
+		return fmt.Errorf("task %q is not running; cannot interrupt", taskID)
+	}
+	cancel()
 	return nil
 }
 

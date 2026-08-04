@@ -199,7 +199,8 @@ func canTransition(current domain.TaskStatus, next domain.TaskStatus) bool {
 	case domain.TaskRunning:
 		return next == domain.TaskQualityReview ||
 			next == domain.TaskSuspended ||
-			next == domain.TaskFailed
+			next == domain.TaskFailed ||
+			next == domain.TaskCancelled
 	case domain.TaskSuspended:
 		return next == domain.TaskRunning
 	case domain.TaskQualityReview:

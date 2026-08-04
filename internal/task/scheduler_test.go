@@ -97,6 +97,38 @@ func TestSchedulerTransitionRejectsInvalidJump(t *testing.T) {
 	}
 }
 
+func TestSchedulerTransitionAllowsRunningToCancelled(t *testing.T) {
+	t.Parallel()
+
+	scheduler := NewScheduler()
+	task := domain.Task{
+		ID:        "task-1",
+		CompanyID: "company-1",
+		AgentID:   "agent-1",
+		Status:    domain.TaskAssigned,
+	}
+	if err := scheduler.Add(context.Background(), task); err != nil {
+		t.Fatalf("Add(%q) error = %v, want nil", task.ID, err)
+	}
+
+	if err := scheduler.Transition(context.Background(), "task-1", domain.TaskRunning); err != nil {
+		t.Fatalf("Transition(%q, %q) error = %v, want nil", "task-1", domain.TaskRunning, err)
+	}
+	// A running task's interrupt lands it in Cancelled; that transition must be
+	// legal or Coordinator.Interrupt could never finish the task.
+	if err := scheduler.Transition(context.Background(), "task-1", domain.TaskCancelled); err != nil {
+		t.Fatalf("Transition(%q, %q) error = %v, want nil", "task-1", domain.TaskCancelled, err)
+	}
+
+	got, ok, err := scheduler.Get(context.Background(), "task-1")
+	if err != nil || !ok {
+		t.Fatalf("Get(%q) ok=%v err=%v", "task-1", ok, err)
+	}
+	if got.Status != domain.TaskCancelled {
+		t.Fatalf("task status = %q, want %q", got.Status, domain.TaskCancelled)
+	}
+}
+
 func TestSchedulerListReturnsAddedTasksInOrder(t *testing.T) {
 	t.Parallel()
 
