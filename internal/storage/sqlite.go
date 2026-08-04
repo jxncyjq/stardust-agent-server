@@ -40,7 +40,9 @@ var ErrAgentSessionNotFound = errors.New("agent session not found")
 // filesystem directory a session is bound to.
 // Version 7 added the episodic_memory table and episodic_memory_fts FTS5 index
 // backing Lane B episodic memory.
-const CurrentSchemaVersion = 7
+// Version 8 added the browser_sessions table persisting agent browser session
+// login state (cookies) across process restarts for the Phase 3 browser feature.
+const CurrentSchemaVersion = 8
 
 type WorkflowState struct {
 	Definition workflow.Definition `json:"definition"`
@@ -2060,5 +2062,14 @@ var schemaStatements = []string{
 		task_id UNINDEXED,
 		created_at UNINDEXED,
 		tokenize = 'trigram'
+	)`,
+	`CREATE TABLE IF NOT EXISTS browser_sessions (
+		id            TEXT PRIMARY KEY,
+		task_id       TEXT NOT NULL DEFAULT '',
+		active_url    TEXT NOT NULL DEFAULT '',
+		storage_state TEXT NOT NULL DEFAULT '',
+		created_at    TEXT NOT NULL,
+		last_used_at  TEXT NOT NULL,
+		evicted       INTEGER NOT NULL DEFAULT 0
 	)`,
 }
