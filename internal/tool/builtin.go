@@ -952,6 +952,27 @@ func listFilesTool(ctx context.Context, rootPath string, guard port.WorkspacePat
 	if err != nil {
 		return domain.ToolResult{}, err
 	}
+	// A non-existent target is the common cause of a confusing empty listing: the
+	// model guessed a path (e.g. a "packages/*" monorepo layout that isn't there)
+	// and WalkDir returned only a cryptic OS "cannot find the path" notice. Detect
+	// it up front and return actionable guidance so the model lists the real root
+	// instead of retrying more invented paths.
+	if info, statErr := os.Stat(root); os.IsNotExist(statErr) {
+		return domain.ToolResult{
+			CallID:  call.ID,
+			Success: false,
+			Error: fmt.Sprintf("directory %q does not exist under the workspace root; "+
+				"call list_files with no directory (or directory=\".\") to see the actual layout first", directory),
+		}, nil
+	} else if statErr != nil {
+		return domain.ToolResult{}, fmt.Errorf("list files: stat %q: %w", directory, statErr)
+	} else if !info.IsDir() {
+		return domain.ToolResult{
+			CallID:  call.ID,
+			Success: false,
+			Error:   fmt.Sprintf("%q is a file, not a directory; use read_file to read it", directory),
+		}, nil
+	}
 	var entries []string
 	var notices []string
 	truncated := false
