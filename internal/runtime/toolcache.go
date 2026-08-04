@@ -86,6 +86,14 @@ func writeToolResultCache(toolRoot, cacheDir, toolName, content string) (string,
 	if err != nil {
 		return "", fmt.Errorf("resolve tool root %q: %w", toolRoot, err)
 	}
+	// Guard against a doubled .stardust: cacheDir carries a ".stardust/" prefix
+	// (defaultToolResultCacheDir), but if toolRoot is ITSELF a .stardust directory
+	// — the user pointed a session's working_dir at the .stardust folder — joining
+	// them yields <root>/.stardust/.stardust/tool_results. Drop the redundant
+	// prefix so it lands at <root=.stardust>/tool_results/... in that case.
+	if filepath.Base(absRoot) == ".stardust" {
+		cacheDir = strings.TrimPrefix(filepath.ToSlash(cacheDir), ".stardust/")
+	}
 	sum := sha256.Sum256([]byte(content))
 	name := fmt.Sprintf("%s-%s.md", sanitizeToolName(toolName), hex.EncodeToString(sum[:])[:10])
 	dir := filepath.Join(absRoot, cacheDir)

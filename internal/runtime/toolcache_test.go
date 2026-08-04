@@ -164,3 +164,42 @@ func footerCachePath(t *testing.T, out string) string {
 	}
 	return rest[:j]
 }
+
+// TestWriteToolResultCacheAvoidsDoubleStardust guards the fix for a user who
+// pointed a session's working_dir at the .stardust folder itself: without the
+// guard, joining a .stardust toolRoot with the ".stardust/tool_results" cacheDir
+// produced <root>/.stardust/.stardust/tool_results. The cache must land directly
+// under the .stardust root (no doubled segment).
+func TestWriteToolResultCacheAvoidsDoubleStardust(t *testing.T) {
+	root := filepath.Join(t.TempDir(), ".stardust")
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	rel, err := writeToolResultCache(root, sessionCacheDir(domain.Task{SessionID: "s1"}), "fetch_url", strings.Repeat("X", 100))
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	slash := filepath.ToSlash(rel)
+	if strings.Contains(slash, ".stardust/") {
+		t.Fatalf("rel path must not re-add .stardust under a .stardust root, got %q", rel)
+	}
+	if !strings.HasPrefix(slash, "tool_results/") {
+		t.Fatalf("expected tool_results/... under the .stardust root, got %q", rel)
+	}
+	if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(rel))); err != nil {
+		t.Fatalf("cache file missing at resolved path: %v", err)
+	}
+}
+
+// TestWriteToolResultCacheNormalRootKeepsStardust confirms the guard does NOT
+// change the normal case: a non-.stardust toolRoot still nests under .stardust.
+func TestWriteToolResultCacheNormalRootKeepsStardust(t *testing.T) {
+	root := t.TempDir()
+	rel, err := writeToolResultCache(root, sessionCacheDir(domain.Task{SessionID: "s1"}), "fetch_url", strings.Repeat("X", 100))
+	if err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if !strings.HasPrefix(filepath.ToSlash(rel), ".stardust/tool_results/") {
+		t.Fatalf("normal root should nest under .stardust/tool_results, got %q", rel)
+	}
+}
