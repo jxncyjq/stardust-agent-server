@@ -96,13 +96,17 @@ type ApprovalDecider interface {
 }
 
 type Config struct {
-	Tasks               TaskStore
-	Agents              AgentCatalog
-	Workflows           WaitingWorkflowStore
-	WorkflowStates      WorkflowStateStore
-	WorkflowEngine      *workflow.Engine
-	WorkflowEvents      port.EventBus
-	PlatformEvents      *observability.EventBus
+	Tasks          TaskStore
+	Agents         AgentCatalog
+	Workflows      WaitingWorkflowStore
+	WorkflowStates WorkflowStateStore
+	WorkflowEngine *workflow.Engine
+	WorkflowEvents port.EventBus
+	PlatformEvents *observability.EventBus
+	// Browser is the per-session browser stream source backing the SSE endpoint
+	// /v1/browser/sessions/{id}/stream. It is optional: when nil the endpoint
+	// reports 503. Satisfied by *browser.Runtime (Subscribe + ReplaySince).
+	Browser             BrowserStreamer
 	Audit               port.AuditLog
 	QualityEvals        QualityEvalStore
 	Sessions            SessionStore
@@ -147,6 +151,7 @@ type HTTPServer struct {
 	workflowEngine      *workflow.Engine
 	workflowEvents      port.EventBus
 	platformEvents      *observability.EventBus
+	browser             BrowserStreamer
 	audit               port.AuditLog
 	qualityEvals        QualityEvalStore
 	sessions            SessionStore
@@ -201,6 +206,7 @@ func NewHTTPServer(cfg Config) *HTTPServer {
 		workflowEngine:      cfg.WorkflowEngine,
 		workflowEvents:      cfg.WorkflowEvents,
 		platformEvents:      cfg.PlatformEvents,
+		browser:             cfg.Browser,
 		audit:               cfg.Audit,
 		qualityEvals:        cfg.QualityEvals,
 		sessions:            cfg.Sessions,
@@ -261,6 +267,8 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(rec, http.StatusOK, BuildOpenAPISpec())
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/events":
 		s.handleEvents(rec, r)
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/browser/sessions/") && strings.HasSuffix(r.URL.Path, "/stream"):
+		s.handleBrowserStream(rec, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/approvals":
 		s.handleListApprovals(rec, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/audit-events":

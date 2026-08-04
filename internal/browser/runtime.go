@@ -75,6 +75,16 @@ func (r *Runtime) Subscribe(sessionID string) (<-chan StreamEvent, func(), error
 	return ch, cancel, nil
 }
 
+// ReplaySince 返回会话 Hub 中 seq>lastID 的缓冲 status 事件，供 SSE 断线重连补发。
+// 未知会话返回 nil（补发是尽力而为：会话不存在则无可补，实时订阅另经 Subscribe 报错）。
+// 该方法不属于 RuntimeAPI 接口，仅让 *Runtime 满足 server.BrowserStreamer。
+func (r *Runtime) ReplaySince(sessionID string, lastID uint64) []StreamEvent {
+	if _, ok := r.sessions.Get(sessionID); !ok {
+		return nil
+	}
+	return r.hubs.get(sessionID).ReplaySince(lastID)
+}
+
 // emitProgress 往会话 Hub 发一条 progress 事件（无订阅者也安全——Hub 仍分配 seq/缓冲）。
 func (r *Runtime) emitProgress(sessionID, action, status, ref string) {
 	r.hubs.get(sessionID).Publish(StreamEvent{
