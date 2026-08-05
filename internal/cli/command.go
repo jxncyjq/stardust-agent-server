@@ -2640,12 +2640,25 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		}),
 	})
 
+	// httpHandler is the top-level handler served on the listener. In service
+	// mode it is the bare mux; in loopback/App hardening mode it is additionally
+	// wrapped with LoopbackOriginGuard below so an Origin check guards every
+	// route (including the SSE endpoints) on top of the Bearer token check.
+	var httpHandler http.Handler = httpServer
+
 	// Now that the listener has bound (and the real port for the "127.0.0.1:0"
 	// GUI case is known), write the handshake file so a local frontend can read
-	// {baseURL, token} and self-connect with the Bearer token. A handshake write
-	// failure is non-fatal: the server still runs, the frontend just can't
-	// auto-connect — so we log a Warn instead of aborting startup.
+	// {baseURL, token} and self-connect with the Bearer token, and wrap the
+	// handler with the Origin guard. A handshake write failure is non-fatal: the
+	// server still runs, the frontend just can't auto-connect — so we log a Warn
+	// instead of aborting startup.
 	if loopbackHardening && adminToken != "" {
+		baseURL := "http://" + listener.Addr().String()
+		// Origin guard is outermost so it fronts the whole mux — every route,
+		// including /v1/browser/sessions/{id}/stream and /v1/events. Only in
+		// loopback hardening mode; service mode keeps the bare handler.
+		httpHandler = server.LoopbackOriginGuard(httpServer, baseURL)
+
 		handshakeFile := cfg.Server.HandshakeFile
 		if handshakeFile == "" {
 			dir := browser.NewPlatformAdapter().AppDataDir()
@@ -2656,7 +2669,6 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 			}
 		}
 		if handshakeFile != "" {
-			baseURL := "http://" + listener.Addr().String()
 			if err := server.WriteHandshake(handshakeFile, server.Handshake{BaseURL: baseURL, Token: adminToken}); err != nil {
 				logger.Warn("write loopback handshake", "path", handshakeFile, "err", err)
 			} else {
@@ -2669,7 +2681,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		Config:    cfg,
 		Scheduler: background,
 		HTTPServer: &http.Server{
-			Handler: httpServer,
+			Handler: httpHandler,
 		},
 		Listener: listener,
 		Logger:   logger,
