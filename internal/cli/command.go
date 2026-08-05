@@ -2669,6 +2669,9 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 			}
 		}
 		if handshakeFile != "" {
+			if err := os.MkdirAll(filepath.Dir(handshakeFile), 0o755); err != nil {
+				logger.Warn("create handshake parent dir", "path", handshakeFile, "err", err)
+			}
 			if err := server.WriteHandshake(handshakeFile, server.Handshake{BaseURL: baseURL, Token: adminToken}); err != nil {
 				logger.Warn("write loopback handshake", "path", handshakeFile, "err", err)
 			} else {

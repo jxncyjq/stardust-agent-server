@@ -117,11 +117,11 @@ type ServerConfig struct {
 	// one-time bearer token is minted per startup (when AdminToken is unset) and
 	// a handshake file is written so a local frontend can auto-connect. It is
 	// also implied automatically when the server binds to a loopback address.
-	LoopbackHardening bool `json:"loopback_hardening" yaml:"loopback_hardening"`
+	LoopbackHardening bool `json:"loopback_hardening"`
 	// HandshakeFile is where the {baseURL, token} handshake is written in
 	// loopback hardening mode. Empty means the default under the platform
 	// AppDataDir (handshake.json).
-	HandshakeFile string `json:"handshake_file" yaml:"handshake_file"`
+	HandshakeFile string `json:"handshake_file"`
 }
 
 type ServiceConfig struct {

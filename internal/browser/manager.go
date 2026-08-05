@@ -64,7 +64,7 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 			l = l.Set(flags.Flag(name))
 		}
 	}
-	l = l.Headless(cfg.Headless)
+	l = l.HeadlessNew(cfg.Headless)
 	if binPath != "" {
 		l = l.Bin(binPath)
 	}

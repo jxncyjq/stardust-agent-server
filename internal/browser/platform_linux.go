@@ -25,7 +25,7 @@ func (linuxAdapter) ResolveChromiumPath() string {
 
 func (linuxAdapter) DefaultLaunchArgs() []string {
 	// --no-sandbox 在容器/无 userns 环境常需，但有安全代价——默认不加，由 Phase 5 沙箱策略决定。
-	return []string{"--disable-gpu", "--no-first-run", "--no-default-browser-check", "--headless=new"}
+	return []string{"--disable-gpu", "--no-first-run", "--no-default-browser-check"}
 }
 
 func (linuxAdapter) KillProcess(pid int, graceful bool) error {
