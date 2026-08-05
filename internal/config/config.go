@@ -113,6 +113,15 @@ type ServerConfig struct {
 	// endpoints; see server.Config.RequireIdentity for the exact scope.
 	RequireIdentity bool   `json:"require_identity"`
 	RequestIDHeader string `json:"request_id_header"`
+	// LoopbackHardening enables the App/GUI-mode loopback hardening path: a
+	// one-time bearer token is minted per startup (when AdminToken is unset) and
+	// a handshake file is written so a local frontend can auto-connect. It is
+	// also implied automatically when the server binds to a loopback address.
+	LoopbackHardening bool `json:"loopback_hardening"`
+	// HandshakeFile is where the {baseURL, token} handshake is written in
+	// loopback hardening mode. Empty means the default under the platform
+	// AppDataDir (handshake.json).
+	HandshakeFile string `json:"handshake_file"`
 }
 
 type ServiceConfig struct {
