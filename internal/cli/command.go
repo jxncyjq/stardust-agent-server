@@ -2120,6 +2120,27 @@ func distinctSessionBases(ctx context.Context, sessions SessionLister, workspace
 	return bases, nil
 }
 
+// isLoopbackAddr reports whether addr binds to a loopback-only interface
+// (127.0.0.0/8, ::1, or the hostname "localhost"). A blank host — e.g. ":8080"
+// or "0.0.0.0:8080", meaning all interfaces — is not loopback, so service-mode
+// deployments do not accidentally trip the App-mode hardening path.
+func isLoopbackAddr(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	switch host {
+	case "":
+		return false
+	case "localhost":
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
+}
+
 // BuildServeService constructs and returns a ready-to-Start service from the
 // same dependency wiring as newServeCommand, but without cobra.
 func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, error) {
@@ -2131,8 +2152,28 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	if addr == "" {
 		addr = cfg.Server.ListenAddr
 	}
+	guiDefaultAddr := false
 	if addr == "" {
 		addr = "127.0.0.1:0" // random port for GUI mode
+		guiDefaultAddr = true
+	}
+
+	// App/GUI loopback hardening: when the server runs in GUI mode (no addr
+	// configured, so it defaulted to a random loopback port) or when hardening is
+	// explicitly requested via config, and no AdminToken is set, mint a one-time
+	// bearer token per startup so a local frontend can auto-connect without a
+	// pre-shared secret. An explicitly configured AdminToken is always respected.
+	// Auto-hardening is deliberately scoped to the GUI-defaulted loopback bind
+	// (not any loopback --addr) so an explicit `serve --addr 127.0.0.1:port`
+	// keeps its existing open local-serve behavior unless LoopbackHardening is on.
+	loopbackHardening := cfg.Server.LoopbackHardening || (guiDefaultAddr && isLoopbackAddr(addr))
+	adminToken := cfg.Server.AdminToken
+	if loopbackHardening && adminToken == "" {
+		tok, err := server.GenerateLoopbackToken()
+		if err != nil {
+			return ServeResult{}, fmt.Errorf("generate loopback token: %w", err)
+		}
+		adminToken = tok
 	}
 
 	taskStore, workflowStore, sessionStore, readiness, closeStore, err := serviceStores(ctx, cfg)
@@ -2571,7 +2612,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		Browser:             browserStream,
 		Readiness:           readiness,
 		WorkspaceRoot:       workspaceRoot,
-		AdminToken:          cfg.Server.AdminToken,
+		AdminToken:          adminToken,
 		PublicHealthEnabled: cfg.Server.PublicHealthEnabled,
 		RequireIdentity:     cfg.Server.RequireIdentity,
 		RequestIDHeader:     cfg.Server.RequestIDHeader,
@@ -2591,13 +2632,39 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 			StoragePath:         cfg.Storage.Path,
 			MaasBaseURL:         cfg.Maas.BaseURL,
 			MaasAPIKey:          cfg.Maas.APIKey,
-			AdminToken:          cfg.Server.AdminToken,
+			AdminToken:          adminToken,
 			RuntimeDemoResponse: cfg.Runtime.DemoResponse,
 			SchedulerEnabled:    true,
 			SchedulerRunning:    true,
 			Metrics:             metrics,
 		}),
 	})
+
+	// Now that the listener has bound (and the real port for the "127.0.0.1:0"
+	// GUI case is known), write the handshake file so a local frontend can read
+	// {baseURL, token} and self-connect with the Bearer token. A handshake write
+	// failure is non-fatal: the server still runs, the frontend just can't
+	// auto-connect — so we log a Warn instead of aborting startup.
+	if loopbackHardening && adminToken != "" {
+		handshakeFile := cfg.Server.HandshakeFile
+		if handshakeFile == "" {
+			dir := browser.NewPlatformAdapter().AppDataDir()
+			if err := os.MkdirAll(dir, 0o755); err != nil {
+				logger.Warn("create handshake dir", "dir", dir, "err", err)
+			} else {
+				handshakeFile = filepath.Join(dir, "handshake.json")
+			}
+		}
+		if handshakeFile != "" {
+			baseURL := "http://" + listener.Addr().String()
+			if err := server.WriteHandshake(handshakeFile, server.Handshake{BaseURL: baseURL, Token: adminToken}); err != nil {
+				logger.Warn("write loopback handshake", "path", handshakeFile, "err", err)
+			} else {
+				logger.Info("wrote loopback handshake", "path", handshakeFile, "baseURL", baseURL)
+			}
+		}
+	}
+
 	svc, err := service.New(service.ServiceConfig{
 		Config:    cfg,
 		Scheduler: background,
