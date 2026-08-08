@@ -47,7 +47,8 @@ func TestScreencastEmitsFrames(t *testing.T) {
 	}
 }
 
-// systemChromeForTest 返回本机可用 Chrome 路径（go-rod 自动下载在部分 Windows 环境损坏）。
+// systemChromeForTest 经 PAL 定位本机 Chromium/Chrome，跨 OS 可移植
+// （go-rod 自动下载在部分 Windows 环境损坏）。返回 "" 时 go-rod 自动下载。
 func systemChromeForTest() string {
-	return `C:\Program Files\Google\Chrome\Application\chrome.exe`
+	return NewPlatformAdapter().ResolveChromiumPath()
 }
