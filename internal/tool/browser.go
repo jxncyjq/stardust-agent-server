@@ -8,10 +8,19 @@ import (
 	"github.com/stardust/legion-agent/internal/domain"
 )
 
+// BrowserEventSink 是 tool 层对“发浏览器会话生命周期事件”的最小依赖（可选）。
+// nil 表示不发（不破坏无事件总线的场景/测试）。实现方（cli 层）负责桥到平台 EventBus。
+type BrowserEventSink interface {
+	SessionOpened(ctx context.Context, sessionID, taskID, url string)
+	SessionClosed(ctx context.Context, sessionID string)
+}
+
 // BrowserToolOptions 见 spec §2.2。Enabled 为 false 时 RegisterBrowserTools 是 no-op。
 type BrowserToolOptions struct {
 	Enabled bool
 	Runtime browser.RuntimeAPI
+	// Events 可选：非 nil 时在 browser_open/close 成功后发会话生命周期事件；nil 表示不发。
+	Events BrowserEventSink
 }
 
 // RegisterBrowserTools 注册 browser_open/read/click/type/close。照 RegisterWebTools 语义：
@@ -30,6 +39,9 @@ func RegisterBrowserTools(registry *Registry, opts BrowserToolOptions) {
 		out, err := rt.Open(ctx, browser.OpenReq{URL: url, SessionID: call.Arguments["session_id"]})
 		if err != nil {
 			return failure(call.ID, err.Error()), nil
+		}
+		if opts.Events != nil {
+			opts.Events.SessionOpened(ctx, out.SessionID, "", url)
 		}
 		return success(call.ID, fmt.Sprintf("session_id: %s\n%s", out.SessionID, out.Observation.Text)), nil
 	}))
@@ -65,6 +77,9 @@ func RegisterBrowserTools(registry *Registry, opts BrowserToolOptions) {
 	registry.RegisterDescriptor(browserCloseDescriptor(), HandlerFunc(func(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
 		if err := rt.Close(ctx, browser.CloseReq{SessionID: call.Arguments["session_id"]}); err != nil {
 			return failure(call.ID, err.Error()), nil
+		}
+		if opts.Events != nil {
+			opts.Events.SessionClosed(ctx, call.Arguments["session_id"])
 		}
 		return success(call.ID, "ok"), nil
 	}))

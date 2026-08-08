@@ -1974,7 +1974,11 @@ type defaultTaskRunner struct {
 	// every default-agent task — see BuildServeService for the single Close on
 	// shutdown). Nil means browser tools are off (a no-op registration).
 	browserRuntime browser.RuntimeAPI
-	maasResolver   agentruntime.ModelResolver
+	// browserEvents is the optional sink bridging browser session lifecycle
+	// notifications onto the platform event bus behind /v1/events (nil = do not
+	// publish). Resolved once at serve assembly where platformEvents exists.
+	browserEvents tool.BrowserEventSink
+	maasResolver  agentruntime.ModelResolver
 	// toolMaxFileChars and homeDir configure on-demand subtree agents.md
 	// injection (tool.WithAgentsInjection) on the tool registry RunTask builds
 	// per call. Both are resolved once at serve assembly (see resolveHomeDir).
@@ -2013,7 +2017,7 @@ func (d *defaultTaskRunner) RunTask(ctx context.Context, agent domain.Agent, tas
 	tool.RegisterWebTools(tools, d.webOptions)
 	if d.browserRuntime != nil {
 		// Shared runtime injected at serve assembly; no per-task browser launch.
-		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: d.browserRuntime})
+		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: d.browserRuntime, Events: d.browserEvents})
 	}
 	tool.RegisterSessionSearchTool(tools, d.sessionSearcher)
 	agentruntime.RegisterMoAConsultTool(tools, d.maasResolver)
@@ -2451,7 +2455,11 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		sessionSearcher:  sessionSearcher,
 		webOptions:       webToolOptions(cfg.Web),
 		browserRuntime:   sharedBrowser,
-		maasResolver:     maasProfileResolver{cfg: cfg.Maas},
+		// Bridge browser session lifecycle events onto platformEvents (/v1/events)
+		// so the GUI browser view can discover active sessions. The sink nil-guards
+		// its bus, so this is safe even if platformEvents were nil.
+		browserEvents: newPlatformBrowserEventSink(platformEvents, logger),
+		maasResolver:  maasProfileResolver{cfg: cfg.Maas},
 		toolMaxFileChars: cfg.ContextFiles.MaxFileChars,
 		homeDir:          resolveHomeDir(logger),
 		// Same store the resolver path uses, so both runners read one history.
