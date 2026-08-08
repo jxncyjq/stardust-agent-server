@@ -30,7 +30,7 @@ func TestBrowserStreamE2EObservationProgressFrame(t *testing.T) {
 
 	rt, err := browser.NewRuntime(browser.RuntimeConfig{
 		Headless: true, AllowPrivateHosts: true,
-		BinPath: `C:\Program Files\Google\Chrome\Application\chrome.exe`,
+		BinPath: systemChromeForTest(),
 	})
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
@@ -87,4 +87,10 @@ func TestBrowserStreamE2EObservationProgressFrame(t *testing.T) {
 	if !seenProgress || !seenObs || !seenFrame {
 		t.Fatalf("missing events: progress=%v obs=%v frame=%v", seenProgress, seenObs, seenFrame)
 	}
+}
+
+// systemChromeForTest 经 PAL 定位本机 Chromium/Chrome，跨 OS 可移植
+// （go-rod 自动下载在部分 Windows 环境损坏）。返回 "" 时 go-rod 自动下载。
+func systemChromeForTest() string {
+	return browser.NewPlatformAdapter().ResolveChromiumPath()
 }

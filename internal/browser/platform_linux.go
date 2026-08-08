@@ -24,8 +24,14 @@ func (linuxAdapter) ResolveChromiumPath() string {
 }
 
 func (linuxAdapter) DefaultLaunchArgs() []string {
-	// --no-sandbox 在容器/无 userns 环境常需，但有安全代价——默认不加，由 Phase 5 沙箱策略决定。
-	return []string{"--disable-gpu", "--no-first-run", "--no-default-browser-check"}
+	// --no-sandbox：容器/CI/无 user-namespaces 的 Linux 上，Chromium 内部 zygote 沙箱
+	// 无法初始化（ZygoteHostImpl::Init fatal），必须关闭内部沙箱；服务模式目标本就是
+	// Linux 服务器（多在容器内），真正的隔离边界由外层 OS 沙箱 WrapWithSandbox（Phase 5）
+	// 提供，而非 Chromium 内部沙箱。--disable-dev-shm-usage 规避 CI 上 /dev/shm 过小导致的崩溃。
+	return []string{
+		"--disable-gpu", "--no-first-run", "--no-default-browser-check",
+		"--no-sandbox", "--disable-dev-shm-usage",
+	}
 }
 
 func (linuxAdapter) KillProcess(pid int, graceful bool) error {

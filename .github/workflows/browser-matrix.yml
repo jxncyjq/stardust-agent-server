@@ -1,0 +1,38 @@
+name: Browser Matrix
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "internal/browser/**"
+      - "internal/server/**"
+      - ".github/workflows/browser-matrix.yml"
+  pull_request:
+    paths:
+      - "internal/browser/**"
+      - "internal/server/**"
+      - ".github/workflows/browser-matrix.yml"
+  workflow_dispatch:
+
+jobs:
+  browser-e2e:
+    name: Browser e2e (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@v1
+      - name: Cross-compile check
+        run: go build ./internal/browser/...
+      - name: Browser unit tests
+        run: go test ./internal/browser/ ./internal/server/
+      - name: Browser chromium e2e
+        run: go test -tags chromium ./internal/browser/ ./internal/server/ -run "TestE2E|TestRuntime|TestScreencast|TestRebuild|TestCaptureRestore|TestBrowserStreamE2E|TestManager" -count=1

@@ -1881,6 +1881,14 @@ type ServeResult struct {
 	Service  *service.Service
 	Listener net.Listener
 	Close    func()
+	// Token is the one-time bearer token minted in loopback-hardening mode
+	// (empty when hardening is off or a token is not required). An in-process
+	// consumer (the Wails GUI) reads it to send Authorization: Bearer on its
+	// SSE bridge and HTTP calls against the hardened serve.
+	Token string
+	// BaseURL is the address the service actually listens on (including the
+	// randomly assigned port), for in-process consumers and the handshake.
+	BaseURL string
 }
 
 // buildDefaultRunnerConfig assembles the agentruntime.Config template for the
@@ -2646,6 +2654,11 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// route (including the SSE endpoints) on top of the Bearer token check.
 	var httpHandler http.Handler = httpServer
 
+	// baseURL is the real listen address (with the resolved port for the
+	// "127.0.0.1:0" GUI case). Computed once here and shared by the handshake
+	// branch below and the ServeResult returned to in-process consumers.
+	baseURL := "http://" + listener.Addr().String()
+
 	// Now that the listener has bound (and the real port for the "127.0.0.1:0"
 	// GUI case is known), write the handshake file so a local frontend can read
 	// {baseURL, token} and self-connect with the Bearer token, and wrap the
@@ -2653,7 +2666,6 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// server still runs, the frontend just can't auto-connect — so we log a Warn
 	// instead of aborting startup.
 	if loopbackHardening && adminToken != "" {
-		baseURL := "http://" + listener.Addr().String()
 		// Origin guard is outermost so it fronts the whole mux — every route,
 		// including /v1/browser/sessions/{id}/stream and /v1/events. Only in
 		// loopback hardening mode; service mode keeps the bare handler.
@@ -2697,6 +2709,11 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	return ServeResult{
 		Service:  svc,
 		Listener: listener,
+		// Token is the minted one-time token in loopback-hardening mode; it is
+		// "" when hardening is off or an explicit AdminToken path leaves it
+		// unset, which correctly signals "no token needed" to the consumer.
+		Token:   adminToken,
+		BaseURL: baseURL,
 		// Close drains in-flight task goroutines before releasing storage.
 		// Service.Start only returns once the background scheduler (and thus
 		// task dispatch) has stopped, so by the time Close runs no new tasks
