@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -237,6 +238,11 @@ type loopState struct {
 	// run cannot load a sensitive tool that was filtered out of tools. Nil under
 	// the eager protocol, which offers native schemas and never load_capabilities.
 	catalog *capability.Catalog
+	// generatedFiles collects workspace-relative paths of files this task wrote
+	// via write_file, in first-seen order with duplicates removed. Populated in
+	// executeToolCalls's success branch, surfaced by finishRun onto both the
+	// task_completed RuntimeEvent and the returned TaskRun.
+	generatedFiles []string
 }
 
 // effectiveTools returns the tool registry a run should use: in Plan mode only
@@ -721,6 +727,7 @@ func (r *Runtime) finishRun(ctx context.Context, requestID string, agent domain.
 		CompletionTokens: st.completionTokens,
 		CachedTokens:     st.cachedTokens,
 		TotalTokens:      st.totalTokens,
+		GeneratedFiles:   st.generatedFiles,
 	}
 	if err := r.audit.Append(ctx, domain.AuditEvent{
 		ID:          task.ID + ":audit-1",
@@ -743,6 +750,7 @@ func (r *Runtime) finishRun(ctx context.Context, requestID string, agent domain.
 		TotalTokens:      st.totalTokens,
 		ElapsedMs:        ended.Sub(st.started).Milliseconds(),
 		CreatedAt:        time.Now(),
+		GeneratedFiles:   st.generatedFiles,
 	}); err != nil {
 		return domain.TaskRun{}, fmt.Errorf("publish task completed event: %w", err)
 	}
@@ -914,6 +922,19 @@ func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task
 			continue
 		}
 		results = append(results, result)
+		if call.Name == "write_file" {
+			raw, ok := call.Arguments["path"]
+			if !ok || strings.TrimSpace(raw) == "" {
+				// write_file's contract always carries a path; a reported success
+				// without one is an invariant violation, not an optional field.
+				return nil, fmt.Errorf("write_file for task %s reported success without a path argument", task.ID)
+			}
+			rel, err := workspaceRelPath(task.WorkingDir, raw)
+			if err != nil {
+				return nil, fmt.Errorf("normalize generated file %q for task %s: %w", raw, task.ID, err)
+			}
+			st.generatedFiles = appendUniqueStr(st.generatedFiles, rel)
+		}
 		if err := r.events.Publish(ctx, domain.RuntimeEvent{
 			Type:      "tool_result",
 			TaskID:    task.ID,
@@ -932,6 +953,38 @@ func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task
 		}
 	}
 	return results, nil
+}
+
+// workspaceRelPath normalizes a write_file path (relative, or absolute within
+// root) to a slash path relative to root. An empty root (unbound session)
+// yields the cleaned slash path as-is. It errors if the result escapes root.
+func workspaceRelPath(root, p string) (string, error) {
+	if strings.TrimSpace(root) == "" {
+		return filepath.ToSlash(filepath.Clean(p)), nil
+	}
+	abs := p
+	if !filepath.IsAbs(abs) {
+		abs = filepath.Join(root, p)
+	}
+	rel, err := filepath.Rel(root, filepath.Clean(abs))
+	if err != nil {
+		return "", err
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q escapes workspace root", p)
+	}
+	return filepath.ToSlash(rel), nil
+}
+
+// appendUniqueStr appends v to xs unless it is already present, preserving
+// first-seen order. Used to dedupe write_file paths into loopState.generatedFiles.
+func appendUniqueStr(xs []string, v string) []string {
+	for _, x := range xs {
+		if x == v {
+			return xs
+		}
+	}
+	return append(xs, v)
 }
 
 // dedupKey identifies a tool call by its name and arguments, so two reads of the

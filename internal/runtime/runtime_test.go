@@ -1024,3 +1024,136 @@ func findAuditEvent(events []domain.AuditEvent, action string) (domain.AuditEven
 	}
 	return domain.AuditEvent{}, false
 }
+
+// findRuntimeEvent returns the first runtime event with the given type,
+// failing the test immediately if none is found.
+func findRuntimeEvent(t *testing.T, events []domain.RuntimeEvent, eventType string) domain.RuntimeEvent {
+	t.Helper()
+	for _, event := range events {
+		if event.Type == eventType {
+			return event
+		}
+	}
+	t.Fatalf("runtime events missing %s: %#v", eventType, events)
+	return domain.RuntimeEvent{}
+}
+
+// writeFileCaptureMaas drives a fixed sequence of tool-call rounds so
+// TestRuntimeCapturesGeneratedFilesFromWriteFile can exercise: two write_file
+// calls to the same path (the second a duplicate), one write_file call whose
+// handler fails, and one non-write_file tool call — before answering with
+// plain text on the final round.
+type writeFileCaptureMaas struct {
+	prompts []string
+}
+
+func (m *writeFileCaptureMaas) Generate(ctx context.Context, req port.InferenceRequest) (port.InferenceResponse, error) {
+	if err := ctx.Err(); err != nil {
+		return port.InferenceResponse{}, err
+	}
+	m.prompts = append(m.prompts, testsupport.RequestText(req))
+	switch len(m.prompts) {
+	case 1:
+		return port.InferenceResponse{ToolCalls: []domain.ToolCall{{
+			ID:        "c1",
+			Name:      "write_file",
+			Arguments: map[string]string{"path": "out/a.txt", "content": "hi"},
+		}}}, nil
+	case 2:
+		return port.InferenceResponse{ToolCalls: []domain.ToolCall{{
+			ID:        "c2",
+			Name:      "lookup",
+			Arguments: map[string]string{"query": "x"},
+		}}}, nil
+	case 3:
+		// Duplicate of round 1's path: must not appear twice in GeneratedFiles.
+		return port.InferenceResponse{ToolCalls: []domain.ToolCall{{
+			ID:        "c3",
+			Name:      "write_file",
+			Arguments: map[string]string{"path": "out/a.txt", "content": "hi again"},
+		}}}, nil
+	case 4:
+		// The registered handler fails this one; a failed write_file must not
+		// contribute to GeneratedFiles.
+		return port.InferenceResponse{ToolCalls: []domain.ToolCall{{
+			ID:        "c4",
+			Name:      "write_file",
+			Arguments: map[string]string{"path": "out/bad.txt", "content": "boom"},
+		}}}, nil
+	default:
+		return port.InferenceResponse{Text: "all done"}, nil
+	}
+}
+
+// TestRuntimeCapturesGeneratedFilesFromWriteFile drives a full RunTask through
+// a tool loop with (in order): a successful write_file, an unrelated
+// successful tool call, a duplicate successful write_file to the same path,
+// and a write_file whose handler fails. It asserts the finished task's
+// GeneratedFiles — on both the returned domain.TaskRun and the task_completed
+// domain.RuntimeEvent — contains exactly the unique successful write_file path,
+// in first-seen order: the duplicate, the failure, and the non-write_file call
+// must all be excluded.
+func TestRuntimeCapturesGeneratedFilesFromWriteFile(t *testing.T) {
+	t.Parallel()
+
+	maas := &writeFileCaptureMaas{}
+	audit := adapter.NewMemoryAuditLog()
+	events := adapter.NewMemoryEventBus()
+	registry := tool.NewRegistry(
+		tool.NewExecutionPolicy(tool.ExecutionPolicyConfig{AutoAllowTools: []string{"write_file", "lookup"}}),
+		tool.PermissionEnforcerFunc(func(domain.Agent, domain.ToolCall) error { return nil }),
+		tool.NoopGuardrails{},
+	).WithAuditLog(audit)
+	registry.RegisterDescriptor(tool.Descriptor{
+		Name:        "write_file",
+		Description: "write test data",
+		InputSchema: map[string]any{
+			"required": []string{"path", "content"},
+			"properties": map[string]any{
+				"path":    map[string]any{"type": "string"},
+				"content": map[string]any{"type": "string"},
+			},
+		},
+	}, tool.HandlerFunc(func(_ context.Context, call domain.ToolCall) (domain.ToolResult, error) {
+		if call.Arguments["path"] == "out/bad.txt" {
+			return domain.ToolResult{}, fmt.Errorf("simulated write failure for %s", call.Arguments["path"])
+		}
+		return domain.ToolResult{CallID: call.ID, Success: true, Output: "wrote " + call.Arguments["path"]}, nil
+	}))
+	registry.RegisterDescriptor(tool.Descriptor{
+		Name:        "lookup",
+		Description: "lookup test data",
+		InputSchema: map[string]any{
+			"required":   []string{"query"},
+			"properties": map[string]any{"query": map[string]any{"type": "string"}},
+		},
+	}, tool.HandlerFunc(func(_ context.Context, call domain.ToolCall) (domain.ToolResult, error) {
+		return domain.ToolResult{CallID: call.ID, Success: true, Output: "data"}, nil
+	}))
+
+	runner := NewRuntime(Config{
+		Maas:          maas,
+		Audit:         audit,
+		Events:        events,
+		Tools:         registry,
+		MaxToolRounds: 6,
+	})
+
+	run, err := runner.RunTask(context.Background(), domain.Agent{ID: "agent-1", Role: "developer"}, domain.Task{
+		ID:    "task-generated-files",
+		Input: "write some files",
+	})
+	if err != nil {
+		t.Fatalf("RunTask() error = %v, want nil", err)
+	}
+
+	if got := run.GeneratedFiles; len(got) != 1 || got[0] != "out/a.txt" {
+		t.Fatalf("TaskRun.GeneratedFiles = %#v, want [\"out/a.txt\"]", got)
+	}
+
+	runtimeEvents := mustRuntimeEvents(t, events)
+	completed := findRuntimeEvent(t, runtimeEvents, "task_completed")
+	if got := completed.GeneratedFiles; len(got) != 1 || got[0] != "out/a.txt" {
+		t.Fatalf("task_completed event GeneratedFiles = %#v, want [\"out/a.txt\"]", got)
+	}
+}
