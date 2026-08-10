@@ -946,10 +946,12 @@ func (r *SQLiteRepository) ListTaskRuns(ctx context.Context, taskID string) ([]d
 func (r *SQLiteRepository) AppendAuditEvent(ctx context.Context, event domain.AuditEvent) error {
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO audit_events (
-			id, request_id, subject_type, subject_id, action, hash, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?)
+			id, request_id, subject_type, subject_id, action, hash, created_at,
+			prompt_tokens, completion_tokens, cached_tokens, total_tokens
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO NOTHING
-	`, event.ID, event.RequestID, event.SubjectType, event.SubjectID, event.Action, event.Hash, formatTime(event.CreatedAt))
+	`, event.ID, event.RequestID, event.SubjectType, event.SubjectID, event.Action, event.Hash, formatTime(event.CreatedAt),
+		event.PromptTokens, event.CompletionTokens, event.CachedTokens, event.TotalTokens)
 	if err != nil {
 		return fmt.Errorf("append audit event %q: %w", event.ID, err)
 	}
@@ -958,7 +960,8 @@ func (r *SQLiteRepository) AppendAuditEvent(ctx context.Context, event domain.Au
 
 func (r *SQLiteRepository) ListAuditEvents(ctx context.Context) ([]domain.AuditEvent, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, request_id, subject_type, subject_id, action, hash, created_at
+		SELECT id, request_id, subject_type, subject_id, action, hash, created_at,
+			prompt_tokens, completion_tokens, cached_tokens, total_tokens
 		FROM audit_events
 		ORDER BY created_at, id
 	`)
@@ -971,7 +974,8 @@ func (r *SQLiteRepository) ListAuditEvents(ctx context.Context) ([]domain.AuditE
 	for rows.Next() {
 		var event domain.AuditEvent
 		var createdAt string
-		if err := rows.Scan(&event.ID, &event.RequestID, &event.SubjectType, &event.SubjectID, &event.Action, &event.Hash, &createdAt); err != nil {
+		if err := rows.Scan(&event.ID, &event.RequestID, &event.SubjectType, &event.SubjectID, &event.Action, &event.Hash, &createdAt,
+			&event.PromptTokens, &event.CompletionTokens, &event.CachedTokens, &event.TotalTokens); err != nil {
 			return nil, fmt.Errorf("scan audit event: %w", err)
 		}
 		parsed, err := parseTime(createdAt)
