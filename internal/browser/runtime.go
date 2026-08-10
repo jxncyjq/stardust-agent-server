@@ -2,6 +2,7 @@ package browser
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/url"
@@ -700,4 +701,104 @@ func (r *Runtime) takeoverOf(sess *Session) bool {
 	var v bool
 	sess.WithLock(func() { v = sess.takeover })
 	return v
+}
+
+// InjectInput 把一批归一化输入事件注入会话活跃页（接管必须先开，否则拒）。
+// 每批先整体校验，再读一次当前视口宽高，把 0..1 坐标 × px 后经 go-rod 派发。
+// 与 Read/Click 等一样在会话锁下取活跃页，但注入本身在锁外执行（go-rod 调用可能阻塞，
+// 不宜久持会话锁）——接管期间 Agent 写动作已被门控，无并发写者，故锁外注入安全。
+func (r *Runtime) InjectInput(sessionID string, events []InputEvent) error {
+	if err := validateInputEvents(events); err != nil {
+		return NewBrowserErrorWrap(CodeElementNotFound, "invalid input batch", err)
+	}
+	sess, page, err := r.activePage(sessionID)
+	if err != nil {
+		return err
+	}
+	if !r.takeoverOf(sess) {
+		return NewBrowserError(CodeTakeover, "session "+sessionID+" not under takeover; enable takeover before injecting")
+	}
+	vw, vh, err := viewportSize(page)
+	if err != nil {
+		return NewBrowserErrorWrap(CodeContextEvicted, "read viewport for injection", err)
+	}
+	for i, ev := range events {
+		if err := injectOne(page, ev, vw, vh); err != nil {
+			return NewBrowserErrorWrap(CodeElementNotFound, fmt.Sprintf("inject event %d (%s)", i, ev.Type), err)
+		}
+	}
+	r.touch(sess) // 人工也算活跃：刷新 LastUsedAt，避免接管中会话被 reaper 回收
+	return nil
+}
+
+// viewportSize 读当前视口的 CSS 像素宽高（window.innerWidth/innerHeight）。
+func viewportSize(page *rod.Page) (float64, float64, error) {
+	res, err := page.Eval("() => ({w: window.innerWidth, h: window.innerHeight})")
+	if err != nil {
+		return 0, 0, err
+	}
+	w := res.Value.Get("w").Num()
+	h := res.Value.Get("h").Num()
+	if w <= 0 || h <= 0 {
+		return 0, 0, fmt.Errorf("non-positive viewport %vx%v", w, h)
+	}
+	return w, h, nil
+}
+
+// injectOne 把一条归一化事件 × 视口 px 后派发到 go-rod。鼠标类先 MoveTo 定位再动作。
+func injectOne(page *rod.Page, ev InputEvent, vw, vh float64) error {
+	px := proto.Point{X: ev.X * vw, Y: ev.Y * vh}
+	switch ev.Type {
+	case "mousemove":
+		return page.Mouse.MoveTo(px)
+	case "mousedown":
+		if err := page.Mouse.MoveTo(px); err != nil {
+			return err
+		}
+		return page.Mouse.Down(mouseButton(ev.Button), 1)
+	case "mouseup":
+		if err := page.Mouse.MoveTo(px); err != nil {
+			return err
+		}
+		return page.Mouse.Up(mouseButton(ev.Button), 1)
+	case "click":
+		if err := page.Mouse.MoveTo(px); err != nil {
+			return err
+		}
+		return page.Mouse.Click(mouseButton(ev.Button), 1)
+	case "wheel":
+		if err := page.Mouse.MoveTo(px); err != nil {
+			return err
+		}
+		return page.Mouse.Scroll(ev.DeltaX, ev.DeltaY, 1)
+	case "keydown":
+		k, err := keyToInputKey(ev.Key)
+		if err != nil {
+			return err
+		}
+		return page.Keyboard.Press(k)
+	case "keyup":
+		k, err := keyToInputKey(ev.Key)
+		if err != nil {
+			return err
+		}
+		return page.Keyboard.Release(k)
+	case "char":
+		return page.InsertText(ev.Text)
+	default:
+		// validateInputEvents 已挡掉未知类型；到这里属编程错误。
+		return fmt.Errorf("unhandled input type %q", ev.Type)
+	}
+}
+
+// mouseButton 把事件 button 名映射到 go-rod 常量；空/未知回落 left（validate 已挡未知非空值）。
+func mouseButton(name string) proto.InputMouseButton {
+	switch name {
+	case "right":
+		return proto.InputMouseButtonRight
+	case "middle":
+		return proto.InputMouseButtonMiddle
+	default:
+		return proto.InputMouseButtonLeft
+	}
 }
