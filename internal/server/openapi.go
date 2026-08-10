@@ -66,6 +66,7 @@ func BuildOpenAPISpec() OpenAPISpec {
 			"/v1/skills/update":                   {Post: openAPIOperation("updateSkill", "Update skill", true)},
 			"/v1/skills/uninstall":                {Post: openAPIOperation("uninstallSkill", "Uninstall skill", true)},
 			"/v1/events":                          {Get: openAPIOperation("subscribeEvents", "Subscribe platform events", true)},
+			"/v1/files":                           {Get: openAPIOperation("getFile", "Stream a generated file from a session's working directory", true)},
 		},
 		Components: OpenAPIComponents{
 			Schemas: map[string]any{

@@ -9,8 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -137,10 +140,19 @@ type Config struct {
 	// workspaceRoot argument). Session deletion joins it with the session key
 	// to locate the directory to remove alongside the DB row (spec §4.0).
 	WorkspaceRoot string
-	Logger        *slog.Logger
-	Metrics       *observability.MetricsRecorder
-	Diagnostics   *observability.Diagnostics
-	Traces        *observability.TraceRecorder
+	// FileBaseURL is the public base URL (no trailing slash) that fileURL
+	// prepends to generated-file links when the agent server is not on the
+	// same origin as its caller (e.g. a deployed GUI). Empty means the
+	// caller resolves the relative "/v1/files?..." path against this
+	// server's own origin, which is the loopback/single-machine default.
+	// Mirrors config.ServerConfig.FileBaseURL; bridged at the assembly site
+	// in internal/cli/command.go since server.Config intentionally does not
+	// import internal/config.
+	FileBaseURL string
+	Logger      *slog.Logger
+	Metrics     *observability.MetricsRecorder
+	Diagnostics *observability.Diagnostics
+	Traces      *observability.TraceRecorder
 }
 
 type HTTPServer struct {
@@ -166,6 +178,7 @@ type HTTPServer struct {
 	policy              security.Policy
 	requestIDHeader     string
 	workspaceRoot       string
+	fileBaseURL         string
 	logger              *slog.Logger
 	metrics             *observability.MetricsRecorder
 	diagnostics         *observability.Diagnostics
@@ -221,6 +234,7 @@ func NewHTTPServer(cfg Config) *HTTPServer {
 		policy:              security.NewPolicy(cfg.RequireIdentity),
 		requestIDHeader:     requestIDHeader,
 		workspaceRoot:       cfg.WorkspaceRoot,
+		fileBaseURL:         cfg.FileBaseURL,
 		logger:              observability.WithComponent(logger, "server"),
 		metrics:             cfg.Metrics,
 		diagnostics:         cfg.Diagnostics,
@@ -277,6 +291,8 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleRuntimeEvents(rec, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/quality/evals":
 		s.handleQualityEvals(rec, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/files":
+		s.handleServeFile(rec, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/sessions":
 		s.handleCreateSession(rec, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/sessions":
@@ -593,6 +609,97 @@ func (s *HTTPServer) handleDeleteSession(w http.ResponseWriter, r *http.Request)
 	observability.WithRequestID(s.logger, requestIDFromContext(r.Context())).Info("session deleted",
 		"session_id", sessionID, "dir", sessionDir)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleServeFile streams a generated file for read-only preview/download,
+// confined to the requesting session's working directory. Auth is enforced
+// centrally by HTTPServer.authorized (called for every route before the
+// switch dispatches here), so this handler does not re-check the Authorization
+// header.
+func (s *HTTPServer) handleServeFile(w http.ResponseWriter, r *http.Request) {
+	if s.sessions == nil {
+		writeError(w, http.StatusServiceUnavailable, "session store is unavailable")
+		return
+	}
+	q := r.URL.Query()
+	sessionID := strings.TrimSpace(q.Get("session_id"))
+	rel := q.Get("path")
+	if sessionID == "" || strings.TrimSpace(rel) == "" {
+		writeError(w, http.StatusBadRequest, "session_id and path are required")
+		return
+	}
+	session, ok, err := s.sessions.GetAgentSession(r.Context(), sessionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("load session: %v", err))
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	root := strings.TrimSpace(session.WorkingDir)
+	if root == "" {
+		writeError(w, http.StatusNotFound, "session has no working directory")
+		return
+	}
+	abs, err := resolveInWorkspace(root, rel)
+	if err != nil {
+		writeError(w, http.StatusForbidden, "path outside workspace")
+		return
+	}
+	info, err := os.Stat(abs)
+	if err != nil || info.IsDir() {
+		writeError(w, http.StatusNotFound, "file not found")
+		return
+	}
+	f, err := os.Open(abs)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "file not found")
+		return
+	}
+	defer f.Close()
+	ctype := mime.TypeByExtension(filepath.Ext(abs))
+	if ctype == "" {
+		ctype = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ctype)
+	if q.Get("download") == "1" {
+		w.Header().Set("Content-Disposition", "attachment; filename=\""+filepath.Base(abs)+"\"")
+	}
+	http.ServeContent(w, r, filepath.Base(abs), info.ModTime(), f)
+}
+
+// resolveInWorkspace joins rel onto root and refuses any path escaping root,
+// so a caller cannot pass "../../etc/passwd" (or similar) to read outside the
+// session's working directory.
+func resolveInWorkspace(root, rel string) (string, error) {
+	abs := filepath.Clean(filepath.Join(root, rel))
+	rp, err := filepath.Rel(root, abs)
+	if err != nil {
+		return "", fmt.Errorf("resolve %q against workspace root %q: %w", rel, root, err)
+	}
+	if rp == ".." || strings.HasPrefix(rp, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q outside workspace root", rel)
+	}
+	return abs, nil
+}
+
+// fileURL builds a link for a generated file. Absolute when FileBaseURL is
+// configured (deployment), else a relative "/v1/files?..." path the loopback
+// frontend resolves against its own base URL. Never persisted -- callers
+// build it fresh from the session id and relative path each time.
+func (s *HTTPServer) fileURL(sessionID, relPath string, download bool) string {
+	v := url.Values{}
+	v.Set("session_id", sessionID)
+	v.Set("path", relPath)
+	if download {
+		v.Set("download", "1")
+	}
+	rel := "/v1/files?" + v.Encode()
+	if s.fileBaseURL != "" {
+		return s.fileBaseURL + rel
+	}
+	return rel
 }
 
 func (s *HTTPServer) handleAgentMessages(w http.ResponseWriter, r *http.Request) {

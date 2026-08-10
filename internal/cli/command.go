@@ -2628,6 +2628,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		Browser:             browserStream,
 		Readiness:           readiness,
 		WorkspaceRoot:       workspaceRoot,
+		FileBaseURL:         cfg.Server.FileBaseURL,
 		AdminToken:          adminToken,
 		PublicHealthEnabled: cfg.Server.PublicHealthEnabled,
 		RequireIdentity:     cfg.Server.RequireIdentity,
