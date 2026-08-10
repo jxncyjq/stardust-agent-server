@@ -96,3 +96,35 @@ func TestHandleTakeoverBearer(t *testing.T) {
 		t.Fatalf("status = %d, want 401 without bearer", rec.Code)
 	}
 }
+
+func TestHandleInputNotUnderTakeover409(t *testing.T) {
+	fb := &fakeBrowser{
+		injectErr: browser.NewBrowserError(browser.CodeTakeover, "session sess-1 not under takeover"),
+	}
+	s := newBrowserTestServer(fb)
+	body, _ := json.Marshal(map[string]any{
+		"events": []browser.InputEvent{{Type: "click", X: 0.5, Y: 0.5, Button: "left"}},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/browser/sessions/sess-1/input", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleInputOtherError400(t *testing.T) {
+	fb := &fakeBrowser{
+		injectErr: browser.NewBrowserError(browser.CodeElementNotFound, "invalid input batch"),
+	}
+	s := newBrowserTestServer(fb)
+	body, _ := json.Marshal(map[string]any{
+		"events": []browser.InputEvent{{Type: "click", X: 0.5, Y: 0.5, Button: "left"}},
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/browser/sessions/sess-1/input", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+}
