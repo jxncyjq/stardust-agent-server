@@ -1047,7 +1047,7 @@ func (s *HTTPServer) handleGetTaskResult(w http.ResponseWriter, r *http.Request)
 	// deterministic ("<taskID>:assistant"), and the insert is exactly-once, so
 	// repeated polling of this endpoint yields a single assistant turn.
 	if task.Status == domain.TaskDone && strings.TrimSpace(task.SessionID) != "" && strings.TrimSpace(result) != "" {
-		if err := s.recordAssistantTurn(r.Context(), task, result); err != nil {
+		if err := s.recordAssistantTurn(r.Context(), task, result, usage); err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("record assistant turn: %v", err))
 			return
 		}
@@ -1065,21 +1065,26 @@ func (s *HTTPServer) handleGetTaskResult(w http.ResponseWriter, r *http.Request)
 }
 
 // recordAssistantTurn persists the model answer for a completed task exactly
-// once, keyed by "<taskID>:assistant". A nil session store while a task carries a
-// session id is an inconsistent state and is surfaced as an error rather than
-// ignored.
-func (s *HTTPServer) recordAssistantTurn(ctx context.Context, task domain.Task, result string) error {
+// once, keyed by "<taskID>:assistant", together with the token usage reported
+// for that task so conversation history carries the same counts as the task
+// result response. A nil session store while a task carries a session id is an
+// inconsistent state and is surfaced as an error rather than ignored.
+func (s *HTTPServer) recordAssistantTurn(ctx context.Context, task domain.Task, result string, usage taskUsage) error {
 	if s.sessions == nil {
 		return fmt.Errorf("session store is unavailable")
 	}
 	turn := domain.ConversationTurn{
-		ID:        task.ID + ":assistant",
-		SessionID: task.SessionID,
-		TaskID:    task.ID,
-		AgentID:   task.AgentID,
-		Role:      domain.ConversationRoleAssistant,
-		Content:   result,
-		CreatedAt: time.Now(),
+		ID:               task.ID + ":assistant",
+		SessionID:        task.SessionID,
+		TaskID:           task.ID,
+		AgentID:          task.AgentID,
+		Role:             domain.ConversationRoleAssistant,
+		Content:          result,
+		PromptTokens:     usage.PromptTokens,
+		CompletionTokens: usage.CompletionTokens,
+		CachedTokens:     usage.CachedTokens,
+		TotalTokens:      usage.TotalTokens,
+		CreatedAt:        time.Now(),
 	}
 	if _, err := s.sessions.AppendConversationTurnIfAbsent(ctx, turn); err != nil {
 		return err

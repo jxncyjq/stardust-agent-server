@@ -143,3 +143,92 @@ func TestHTTPServerTaskItemRoutesNotShadowedByList(t *testing.T) {
 		t.Fatalf("GET /v1/tasks/{id}/result = %#v, want answer text for task-item-1", result)
 	}
 }
+
+// captureSessionStore is a minimal SessionStore stub that records the turn
+// passed to AppendConversationTurnIfAbsent so tests can assert on exactly what
+// the HTTP layer persisted, without pulling in a real storage backend.
+type captureSessionStore struct {
+	appended []domain.ConversationTurn
+}
+
+func (c *captureSessionStore) ListAgentSessions(ctx context.Context, companyID string, agentID string) ([]domain.AgentSession, error) {
+	return nil, nil
+}
+
+func (c *captureSessionStore) ListConversationTurns(ctx context.Context, sessionID string, limit int) ([]domain.ConversationTurn, error) {
+	return nil, nil
+}
+
+func (c *captureSessionStore) GetAgentSession(ctx context.Context, sessionID string) (domain.AgentSession, bool, error) {
+	return domain.AgentSession{}, false, nil
+}
+
+func (c *captureSessionStore) SaveAgentSession(ctx context.Context, session domain.AgentSession) error {
+	return nil
+}
+
+func (c *captureSessionStore) DeleteAgentSession(ctx context.Context, sessionID string) error {
+	return nil
+}
+
+func (c *captureSessionStore) AppendConversationTurnIfAbsent(ctx context.Context, turn domain.ConversationTurn) (bool, error) {
+	c.appended = append(c.appended, turn)
+	return true, nil
+}
+
+// TestHTTPServerTaskResultPersistsAssistantTurnWithTokenUsage guards that the
+// assistant conversation turn recorded when GET /v1/tasks/{id}/result observes
+// a completed, session-bound task carries the same token counts reported in the
+// response body — not zeros. Regression coverage for the token-usage
+// persistence gap: recordAssistantTurn previously built the turn without any
+// of the usage fields from taskResult.
+func TestHTTPServerTaskResultPersistsAssistantTurnWithTokenUsage(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	scheduler := task.NewScheduler()
+	events := adapter.NewMemoryEventBus()
+	sessions := &captureSessionStore{}
+	srv := NewHTTPServer(Config{Tasks: scheduler, WorkflowEvents: events, Sessions: sessions})
+	if err := scheduler.Add(ctx, domain.Task{
+		ID:        "task-tokens-1",
+		CompanyID: "company-1",
+		SessionID: "session-tokens-1",
+		AgentID:   "agent-tokens-1",
+		Status:    domain.TaskDone,
+		Input:     "hi",
+	}); err != nil {
+		t.Fatalf("scheduler.Add error = %v, want nil", err)
+	}
+	if err := events.Publish(ctx, domain.RuntimeEvent{
+		Type:             "task_completed",
+		TaskID:           "task-tokens-1",
+		Message:          "answer text",
+		PromptTokens:     1200,
+		CompletionTokens: 340,
+		CachedTokens:     800,
+		TotalTokens:      1540,
+	}); err != nil {
+		t.Fatalf("events.Publish error = %v, want nil", err)
+	}
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/tasks/task-tokens-1/result", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/tasks/{id}/result status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	if len(sessions.appended) != 1 {
+		t.Fatalf("appended turns = %d, want 1 (%#v)", len(sessions.appended), sessions.appended)
+	}
+	got := sessions.appended[0]
+	want := domain.ConversationTurn{
+		PromptTokens:     1200,
+		CompletionTokens: 340,
+		CachedTokens:     800,
+		TotalTokens:      1540,
+	}
+	if got.PromptTokens != want.PromptTokens || got.CompletionTokens != want.CompletionTokens ||
+		got.CachedTokens != want.CachedTokens || got.TotalTokens != want.TotalTokens {
+		t.Fatalf("persisted assistant turn tokens = %#v, want %#v", got, want)
+	}
+}
