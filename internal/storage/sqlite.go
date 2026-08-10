@@ -398,9 +398,11 @@ func (r *SQLiteRepository) AppendConversationTurn(ctx context.Context, turn doma
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO conversation_turns (
-			id, session_id, task_id, agent_id, model_profile, role, content, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, turn.ID, turn.SessionID, turn.TaskID, turn.AgentID, turn.ModelProfile, string(turn.Role), turn.Content, formatTime(turn.CreatedAt)); err != nil {
+			id, session_id, task_id, agent_id, model_profile, role, content, created_at,
+			prompt_tokens, completion_tokens, cached_tokens, total_tokens
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, turn.ID, turn.SessionID, turn.TaskID, turn.AgentID, turn.ModelProfile, string(turn.Role), turn.Content, formatTime(turn.CreatedAt),
+		turn.PromptTokens, turn.CompletionTokens, turn.CachedTokens, turn.TotalTokens); err != nil {
 		return fmt.Errorf("append conversation turn %q: %w", turn.ID, err)
 	}
 	if err := indexConversationTurn(ctx, tx, turn); err != nil {
@@ -433,9 +435,11 @@ func (r *SQLiteRepository) AppendConversationTurnIfAbsent(ctx context.Context, t
 	defer tx.Rollback()
 	res, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO conversation_turns (
-			id, session_id, task_id, agent_id, model_profile, role, content, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-	`, turn.ID, turn.SessionID, turn.TaskID, turn.AgentID, turn.ModelProfile, string(turn.Role), turn.Content, formatTime(turn.CreatedAt))
+			id, session_id, task_id, agent_id, model_profile, role, content, created_at,
+			prompt_tokens, completion_tokens, cached_tokens, total_tokens
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, turn.ID, turn.SessionID, turn.TaskID, turn.AgentID, turn.ModelProfile, string(turn.Role), turn.Content, formatTime(turn.CreatedAt),
+		turn.PromptTokens, turn.CompletionTokens, turn.CachedTokens, turn.TotalTokens)
 	if err != nil {
 		return false, fmt.Errorf("append conversation turn %q if absent: %w", turn.ID, err)
 	}
@@ -464,7 +468,8 @@ func (r *SQLiteRepository) AppendConversationTurnIfAbsent(ctx context.Context, t
 
 func (r *SQLiteRepository) ListConversationTurns(ctx context.Context, sessionID string, limit int) ([]domain.ConversationTurn, error) {
 	query := `
-		SELECT id, session_id, task_id, agent_id, model_profile, role, content, created_at
+		SELECT id, session_id, task_id, agent_id, model_profile, role, content, created_at,
+			prompt_tokens, completion_tokens, cached_tokens, total_tokens
 		FROM conversation_turns
 		WHERE session_id = ?
 		ORDER BY created_at DESC, id DESC
@@ -1770,7 +1775,8 @@ func scanConversationTurn(row scanner) (domain.ConversationTurn, error) {
 	var turn domain.ConversationTurn
 	var role string
 	var createdAt string
-	if err := row.Scan(&turn.ID, &turn.SessionID, &turn.TaskID, &turn.AgentID, &turn.ModelProfile, &role, &turn.Content, &createdAt); err != nil {
+	if err := row.Scan(&turn.ID, &turn.SessionID, &turn.TaskID, &turn.AgentID, &turn.ModelProfile, &role, &turn.Content, &createdAt,
+		&turn.PromptTokens, &turn.CompletionTokens, &turn.CachedTokens, &turn.TotalTokens); err != nil {
 		return domain.ConversationTurn{}, err
 	}
 	parsedCreatedAt, err := parseTime(createdAt)
