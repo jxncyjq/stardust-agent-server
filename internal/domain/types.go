@@ -117,6 +117,12 @@ type AuditEvent struct {
 	Action      string    `json:"action"`
 	Hash        string    `json:"hash"`
 	CreatedAt   time.Time `json:"created_at"`
+	// Token counts are meaningful only on model_inference_completed events; other
+	// actions carry 0 (a legitimate optional per the row's action, not a fallback).
+	PromptTokens     int `json:"prompt_tokens,omitempty"`
+	CompletionTokens int `json:"completion_tokens,omitempty"`
+	CachedTokens     int `json:"cached_tokens,omitempty"`
+	TotalTokens      int `json:"total_tokens,omitempty"`
 }
 
 type MemoryEntry struct {
@@ -176,6 +182,12 @@ type ConversationTurn struct {
 	Role         ConversationRole `json:"role"`
 	Content      string           `json:"content"`
 	CreatedAt    time.Time        `json:"created_at"`
+	// Token counts are meaningful only on assistant turns; user turns carry 0
+	// (a legitimate optional per the turn's role, not a fallback).
+	PromptTokens     int `json:"prompt_tokens,omitempty"`
+	CompletionTokens int `json:"completion_tokens,omitempty"`
+	CachedTokens     int `json:"cached_tokens,omitempty"`
+	TotalTokens      int `json:"total_tokens,omitempty"`
 }
 
 type AgentMessageType string

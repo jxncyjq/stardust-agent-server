@@ -196,6 +196,42 @@ func TestRuntimeUsesNoopPortsWhenAuditAndEventsMissing(t *testing.T) {
 	}
 }
 
+func TestRuntimeRecordsTokenUsageOnModelInferenceCompletedAudit(t *testing.T) {
+	t.Parallel()
+
+	maas := &captureMaas{
+		response:         "done",
+		promptTokens:     11,
+		completionTokens: 22,
+		cachedTokens:     3,
+		totalTokens:      33,
+	}
+	audit := adapter.NewMemoryAuditLog()
+	runner := NewRuntime(Config{
+		Maas:   maas,
+		Audit:  audit,
+		Events: adapter.NewMemoryEventBus(),
+	})
+
+	_, err := runner.RunTask(context.Background(), domain.Agent{ID: "agent-1"}, domain.Task{
+		ID:    "task-token-audit",
+		Input: "do the task",
+	})
+	if err != nil {
+		t.Fatalf("RunTask() error = %v, want nil", err)
+	}
+
+	auditEvents := mustAuditEvents(t, audit)
+	event, ok := findAuditEvent(auditEvents, "model_inference_completed")
+	if !ok {
+		t.Fatalf("audit events missing model_inference_completed: %#v", auditEvents)
+	}
+	if event.PromptTokens != 11 || event.CompletionTokens != 22 || event.CachedTokens != 3 || event.TotalTokens != 33 {
+		t.Fatalf("model_inference_completed audit tokens = %d/%d/%d/%d, want 11/22/3/33",
+			event.PromptTokens, event.CompletionTokens, event.CachedTokens, event.TotalTokens)
+	}
+}
+
 func TestRuntimeMissingMaasReturnsErrMaasUnavailable(t *testing.T) {
 	t.Parallel()
 
@@ -539,6 +575,14 @@ type captureMaas struct {
 	response  string
 	reasoning string
 	prompt    string
+
+	// Usage fields let tests assert that token counts flow from the
+	// InferenceResponse through loopState into persisted audit/events.
+	// Zero by default, so existing captureMaas callers are unaffected.
+	promptTokens     int
+	completionTokens int
+	cachedTokens     int
+	totalTokens      int
 }
 
 type toolCallingMaas struct {
@@ -716,7 +760,14 @@ func (m *captureMaas) Generate(ctx context.Context, req port.InferenceRequest) (
 		return port.InferenceResponse{}, err
 	}
 	m.prompt = testsupport.RequestText(req)
-	return port.InferenceResponse{Text: m.response, ReasoningSummary: m.reasoning}, nil
+	return port.InferenceResponse{
+		Text:             m.response,
+		ReasoningSummary: m.reasoning,
+		PromptTokens:     m.promptTokens,
+		CompletionTokens: m.completionTokens,
+		CachedTokens:     m.cachedTokens,
+		TotalTokens:      m.totalTokens,
+	}, nil
 }
 
 // mustAuditEvents reads the audit log's events, failing the test immediately
@@ -961,4 +1012,15 @@ func hasRuntimeAuditAction(events []domain.AuditEvent, action string) bool {
 		}
 	}
 	return false
+}
+
+// findAuditEvent returns the first audit event with the given action, and
+// whether one was found.
+func findAuditEvent(events []domain.AuditEvent, action string) (domain.AuditEvent, bool) {
+	for _, event := range events {
+		if event.Action == action {
+			return event, true
+		}
+	}
+	return domain.AuditEvent{}, false
 }

@@ -694,13 +694,17 @@ func (r *Runtime) finishRun(ctx context.Context, requestID string, agent domain.
 		return domain.TaskRun{}, fmt.Errorf("publish inference completed event: %w", err)
 	}
 	if err := r.audit.Append(ctx, domain.AuditEvent{
-		ID:          task.ID + ":model-audit-1",
-		RequestID:   requestID,
-		SubjectType: "model",
-		SubjectID:   task.ID,
-		Action:      "model_inference_completed",
-		Hash:        "memory",
-		CreatedAt:   time.Now(),
+		ID:               task.ID + ":model-audit-1",
+		RequestID:        requestID,
+		SubjectType:      "model",
+		SubjectID:        task.ID,
+		Action:           "model_inference_completed",
+		Hash:             "memory",
+		PromptTokens:     st.promptTokens,
+		CompletionTokens: st.completionTokens,
+		CachedTokens:     st.cachedTokens,
+		TotalTokens:      st.totalTokens,
+		CreatedAt:        time.Now(),
 	}); err != nil {
 		return domain.TaskRun{}, fmt.Errorf("append model audit event: %w", err)
 	}
