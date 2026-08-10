@@ -27,7 +27,7 @@ func TestManualGateDenyThenResume(t *testing.T) {
 		writeCalled = true
 		return domain.ToolResult{Success: true, Output: "wrote"}, nil
 	}))
-	maas := &oneToolThenTextMaas{toolName: "write_file"}
+	maas := &oneToolThenTextMaas{toolName: "write_file", toolArgs: map[string]string{"path": "out/a.txt"}}
 	r := NewRuntime(Config{Maas: maas, Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
 		Tools: reg, Checkpoints: cpStore, ToolGate: gate})
 	task := domain.Task{ID: "t1", SessionID: "s1", AgentID: "a1", Status: domain.TaskRunning, Mode: domain.ModeManual, Input: "go"}
@@ -63,7 +63,7 @@ func TestManualGateApproveThenResume(t *testing.T) {
 		writeCalled = true
 		return domain.ToolResult{Success: true, Output: "wrote"}, nil
 	}))
-	maas := &oneToolThenTextMaas{toolName: "write_file"}
+	maas := &oneToolThenTextMaas{toolName: "write_file", toolArgs: map[string]string{"path": "out/a.txt"}}
 	r := NewRuntime(Config{Maas: maas, Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
 		Tools: reg, Checkpoints: cpStore, ToolGate: gate})
 	task := domain.Task{ID: "t1", SessionID: "s1", AgentID: "a1", Status: domain.TaskRunning, Mode: domain.ModeManual, Input: "go"}

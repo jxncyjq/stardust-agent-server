@@ -1,0 +1,307 @@
+package server
+
+import (
+	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stardust/legion-agent/internal/adapter"
+	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/task"
+)
+
+// TestHTTPServerTaskResultIncludesGeneratedFilesWithLinks guards that the
+// task-result response surfaces the task_completed event's GeneratedFiles as
+// linked DTOs (path/url/download_url/name), built via the same fileURL
+// contract Task 5 introduced, rather than as bare relative paths.
+func TestHTTPServerTaskResultIncludesGeneratedFilesWithLinks(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := openServerTestRepo(t)
+	scheduler := task.NewScheduler()
+	events := adapter.NewMemoryEventBus()
+	srv := NewHTTPServer(Config{Tasks: scheduler, Sessions: repo, WorkflowEvents: events})
+
+	if err := repo.SaveAgentSession(ctx, domain.AgentSession{
+		ID:        "session-gf-1",
+		CompanyID: "company-1",
+		AgentID:   "default-agent",
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("SaveAgentSession error = %v, want nil", err)
+	}
+
+	if err := scheduler.Add(ctx, domain.Task{
+		ID:        "task-gf-1",
+		CompanyID: "company-1",
+		SessionID: "session-gf-1",
+		Status:    domain.TaskDone,
+		Input:     "写一个报告",
+	}); err != nil {
+		t.Fatalf("scheduler.Add error = %v, want nil", err)
+	}
+	if err := events.Publish(ctx, domain.RuntimeEvent{
+		Type:           "task_completed",
+		TaskID:         "task-gf-1",
+		Message:        "已生成报告",
+		GeneratedFiles: []string{"out/report.md"},
+	}); err != nil {
+		t.Fatalf("events.Publish error = %v, want nil", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/tasks/task-gf-1/result", nil)
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET result status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var got taskResultResponse
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("Decode(result response) error = %v, want nil", err)
+	}
+	if len(got.GeneratedFiles) != 1 {
+		t.Fatalf("GeneratedFiles = %#v, want exactly 1 entry", got.GeneratedFiles)
+	}
+	gf := got.GeneratedFiles[0]
+	wantURL := srv.fileURL("session-gf-1", "out/report.md", false)
+	wantDownloadURL := srv.fileURL("session-gf-1", "out/report.md", true)
+	if gf.Path != "out/report.md" || gf.URL != wantURL || gf.DownloadURL != wantDownloadURL || gf.Name != "report.md" {
+		t.Fatalf("GeneratedFiles[0] = %#v, want path=out/report.md url=%q download_url=%q name=report.md", gf, wantURL, wantDownloadURL)
+	}
+}
+
+// TestHTTPServerTaskResultGeneratedFilesEmptyIsEmptyArray guards that a task
+// with no generated files serializes generated_files as [] rather than null,
+// so GUI clients that .map() over the field do not need a nil guard.
+func TestHTTPServerTaskResultGeneratedFilesEmptyIsEmptyArray(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	scheduler := task.NewScheduler()
+	events := adapter.NewMemoryEventBus()
+	srv := NewHTTPServer(Config{Tasks: scheduler, WorkflowEvents: events})
+
+	if err := scheduler.Add(ctx, domain.Task{
+		ID:        "task-gf-empty",
+		CompanyID: "company-1",
+		Status:    domain.TaskDone,
+		Input:     "say hi",
+	}); err != nil {
+		t.Fatalf("scheduler.Add error = %v, want nil", err)
+	}
+	if err := events.Publish(ctx, domain.RuntimeEvent{
+		Type:    "task_completed",
+		TaskID:  "task-gf-empty",
+		Message: "hi",
+	}); err != nil {
+		t.Fatalf("events.Publish error = %v, want nil", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/tasks/task-gf-empty/result", nil)
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET result status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !containsEmptyArrayField(rec.Body.Bytes(), "generated_files") {
+		t.Fatalf("response body = %s, want generated_files serialized as []", rec.Body.String())
+	}
+	var got taskResultResponse
+	if err := json.NewDecoder(rec.Body).Decode(&got); err != nil {
+		t.Fatalf("Decode(result response) error = %v, want nil", err)
+	}
+	if got.GeneratedFiles == nil || len(got.GeneratedFiles) != 0 {
+		t.Fatalf("GeneratedFiles = %#v, want non-nil empty slice", got.GeneratedFiles)
+	}
+}
+
+// containsEmptyArrayField does a light textual check that the given JSON
+// field is serialized as "field":[] in the raw body, distinguishing an
+// explicit empty array from a field that was omitted or serialized as null.
+func containsEmptyArrayField(body []byte, field string) bool {
+	return strings.Contains(string(body), `"`+field+`":[]`)
+}
+
+// TestHTTPServerCompletedTaskPersistsGeneratedFilesOnAssistantTurn guards that
+// the relative GeneratedFiles paths (not the linked DTOs) are what land on the
+// persisted assistant conversation turn, since the turn is replayed later and
+// links must be rebuilt fresh from fileURL rather than baked in at write time.
+func TestHTTPServerCompletedTaskPersistsGeneratedFilesOnAssistantTurn(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := openServerTestRepo(t)
+	scheduler := task.NewScheduler()
+	events := adapter.NewMemoryEventBus()
+	srv := NewHTTPServer(Config{Tasks: scheduler, Sessions: repo, WorkflowEvents: events})
+
+	session := domain.AgentSession{
+		ID:        "session-gf-turn-1",
+		CompanyID: "default-company",
+		AgentID:   "default-agent",
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+	if err := repo.SaveAgentSession(ctx, session); err != nil {
+		t.Fatalf("SaveAgentSession error = %v, want nil", err)
+	}
+	if err := scheduler.Add(ctx, domain.Task{
+		ID:        "task-gf-turn-1",
+		CompanyID: "default-company",
+		AgentID:   "default-agent",
+		SessionID: "session-gf-turn-1",
+		Status:    domain.TaskDone,
+		Input:     "写文件",
+	}); err != nil {
+		t.Fatalf("scheduler.Add error = %v, want nil", err)
+	}
+	if err := events.Publish(ctx, domain.RuntimeEvent{
+		Type:           "task_completed",
+		TaskID:         "task-gf-turn-1",
+		Message:        "写好了",
+		GeneratedFiles: []string{"docs/a.md", "out/b.csv"},
+	}); err != nil {
+		t.Fatalf("events.Publish error = %v, want nil", err)
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/tasks/task-gf-turn-1/result", nil)
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET result status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	turns, err := repo.ListConversationTurns(ctx, "session-gf-turn-1", 0)
+	if err != nil {
+		t.Fatalf("ListConversationTurns error = %v, want nil", err)
+	}
+	var assistant *domain.ConversationTurn
+	for i := range turns {
+		if turns[i].Role == domain.ConversationRoleAssistant {
+			assistant = &turns[i]
+		}
+	}
+	if assistant == nil {
+		t.Fatalf("turns = %#v, want an assistant turn", turns)
+	}
+	if len(assistant.GeneratedFiles) != 2 || assistant.GeneratedFiles[0] != "docs/a.md" || assistant.GeneratedFiles[1] != "out/b.csv" {
+		t.Fatalf("assistant turn GeneratedFiles = %#v, want [docs/a.md out/b.csv]", assistant.GeneratedFiles)
+	}
+}
+
+// TestHTTPServerSessionTurnsIncludeGeneratedFilesWithLinks guards that the
+// history-turns endpoint (GET /v1/sessions/{id}/turns), consumed directly by
+// the GUI to reload history, surfaces each turn's GeneratedFiles as linked
+// DTOs rather than the bare relative paths stored in sqlite.
+func TestHTTPServerSessionTurnsIncludeGeneratedFilesWithLinks(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := openServerTestRepo(t)
+	createdAt := time.Now()
+	session := domain.AgentSession{
+		ID:        "session-gf-history-1",
+		CompanyID: "company-1",
+		AgentID:   "agent-1",
+		CreatedAt: createdAt,
+		UpdatedAt: createdAt,
+	}
+	if err := repo.SaveAgentSession(ctx, session); err != nil {
+		t.Fatalf("SaveAgentSession error = %v, want nil", err)
+	}
+	if err := repo.AppendConversationTurn(ctx, domain.ConversationTurn{
+		ID:             "turn-gf-history-1",
+		SessionID:      session.ID,
+		TaskID:         "task-1",
+		AgentID:        "agent-1",
+		Role:           domain.ConversationRoleAssistant,
+		Content:        "已完成",
+		CreatedAt:      createdAt.Add(time.Second),
+		GeneratedFiles: []string{"out/report.md"},
+	}); err != nil {
+		t.Fatalf("AppendConversationTurn error = %v, want nil", err)
+	}
+	srv := NewHTTPServer(Config{Sessions: repo})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/sessions/session-gf-history-1/turns", nil)
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET turns status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	// Decode loosely (not into domain.ConversationTurn) because the response
+	// shape's generated_files field is now an array of link DTOs, not bare
+	// strings -- the exact augmentation this test verifies.
+	var turns []struct {
+		ID             string          `json:"id"`
+		SessionID      string          `json:"session_id"`
+		Role           string          `json:"role"`
+		Content        string          `json:"content"`
+		GeneratedFiles []GeneratedFile `json:"generated_files"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&turns); err != nil {
+		t.Fatalf("Decode(turns) error = %v, want nil", err)
+	}
+	if len(turns) != 1 {
+		t.Fatalf("turns = %#v, want exactly 1", turns)
+	}
+	got := turns[0]
+	// Existing fields must remain intact (least-breaking augmentation).
+	if got.ID != "turn-gf-history-1" || got.SessionID != session.ID || got.Role != string(domain.ConversationRoleAssistant) || got.Content != "已完成" {
+		t.Fatalf("turn base fields = %#v, want existing fields preserved", got)
+	}
+	if len(got.GeneratedFiles) != 1 {
+		t.Fatalf("turn GeneratedFiles = %#v, want exactly 1 entry", got.GeneratedFiles)
+	}
+	gf := got.GeneratedFiles[0]
+	wantURL := srv.fileURL(session.ID, "out/report.md", false)
+	wantDownloadURL := srv.fileURL(session.ID, "out/report.md", true)
+	if gf.Path != "out/report.md" || gf.URL != wantURL || gf.DownloadURL != wantDownloadURL || gf.Name != "report.md" {
+		t.Fatalf("turn GeneratedFiles[0] = %#v, want path=out/report.md url=%q download_url=%q name=report.md", gf, wantURL, wantDownloadURL)
+	}
+}
+
+// TestHTTPServerSessionTurnsGeneratedFilesEmptyIsEmptyArray guards that a
+// turn with no generated files serializes generated_files as [] not null on
+// the history endpoint, matching the task-result endpoint's contract.
+func TestHTTPServerSessionTurnsGeneratedFilesEmptyIsEmptyArray(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo := openServerTestRepo(t)
+	createdAt := time.Now()
+	session := domain.AgentSession{
+		ID:        "session-gf-history-empty",
+		CompanyID: "company-1",
+		AgentID:   "agent-1",
+		CreatedAt: createdAt,
+		UpdatedAt: createdAt,
+	}
+	if err := repo.SaveAgentSession(ctx, session); err != nil {
+		t.Fatalf("SaveAgentSession error = %v, want nil", err)
+	}
+	if err := repo.AppendConversationTurn(ctx, domain.ConversationTurn{
+		ID:        "turn-gf-history-empty",
+		SessionID: session.ID,
+		TaskID:    "task-1",
+		AgentID:   "agent-1",
+		Role:      domain.ConversationRoleUser,
+		Content:   "你好",
+		CreatedAt: createdAt.Add(time.Second),
+	}); err != nil {
+		t.Fatalf("AppendConversationTurn error = %v, want nil", err)
+	}
+	srv := NewHTTPServer(Config{Sessions: repo})
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/v1/sessions/session-gf-history-empty/turns", nil)
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET turns status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !containsEmptyArrayField(rec.Body.Bytes(), "generated_files") {
+		t.Fatalf("response body = %s, want generated_files serialized as []", rec.Body.String())
+	}
+}

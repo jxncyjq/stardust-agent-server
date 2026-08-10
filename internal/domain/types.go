@@ -93,6 +93,9 @@ type TaskRun struct {
 	CompletionTokens int       `json:"completion_tokens,omitempty"`
 	CachedTokens     int       `json:"cached_tokens,omitempty"`
 	TotalTokens      int       `json:"total_tokens,omitempty"`
+	// GeneratedFiles are workspace-relative paths of files the task produced via
+	// write_file. Empty when the task wrote no files.
+	GeneratedFiles []string `json:"generated_files,omitempty"`
 }
 
 type ToolCall struct {
@@ -143,10 +146,14 @@ type RuntimeEvent struct {
 	// prompt cache. It is contract-optional: providers that do not report
 	// prompt_tokens_details leave it at zero, which legitimately means "no
 	// cache hit reported" rather than a fabricated default.
-	CachedTokens int       `json:"cached_tokens,omitempty"`
-	TotalTokens  int       `json:"total_tokens,omitempty"`
-	ElapsedMs    int64     `json:"elapsed_ms,omitempty"`
-	CreatedAt    time.Time `json:"created_at"`
+	CachedTokens int   `json:"cached_tokens,omitempty"`
+	TotalTokens  int   `json:"total_tokens,omitempty"`
+	ElapsedMs    int64 `json:"elapsed_ms,omitempty"`
+	// GeneratedFiles carries workspace-relative paths of files the task produced
+	// via write_file; populated on the task_completed event. Empty for events
+	// that produced no files (a legitimate optional, not a fallback).
+	GeneratedFiles []string  `json:"generated_files,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
 }
 
 type ConversationRole string
@@ -188,6 +195,10 @@ type ConversationTurn struct {
 	CompletionTokens int `json:"completion_tokens,omitempty"`
 	CachedTokens     int `json:"cached_tokens,omitempty"`
 	TotalTokens      int `json:"total_tokens,omitempty"`
+	// GeneratedFiles are workspace-relative paths of files this turn's task
+	// produced via write_file; persisted as JSON. Empty for user turns / tasks
+	// that wrote no files (a legitimate optional per role/task, not a fallback).
+	GeneratedFiles []string `json:"generated_files,omitempty"`
 }
 
 type AgentMessageType string

@@ -396,13 +396,20 @@ func (r *SQLiteRepository) AppendConversationTurn(ctx context.Context, turn doma
 		return fmt.Errorf("begin append conversation turn %q: %w", turn.ID, err)
 	}
 	defer tx.Rollback()
+	gf, err := json.Marshal(turn.GeneratedFiles)
+	if err != nil {
+		return fmt.Errorf("marshal generated files for turn %q: %w", turn.ID, err)
+	}
+	if turn.GeneratedFiles == nil {
+		gf = []byte("[]")
+	}
 	if _, err := tx.ExecContext(ctx, `
 		INSERT INTO conversation_turns (
 			id, session_id, task_id, agent_id, model_profile, role, content, created_at,
-			prompt_tokens, completion_tokens, cached_tokens, total_tokens
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			prompt_tokens, completion_tokens, cached_tokens, total_tokens, generated_files
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, turn.ID, turn.SessionID, turn.TaskID, turn.AgentID, turn.ModelProfile, string(turn.Role), turn.Content, formatTime(turn.CreatedAt),
-		turn.PromptTokens, turn.CompletionTokens, turn.CachedTokens, turn.TotalTokens); err != nil {
+		turn.PromptTokens, turn.CompletionTokens, turn.CachedTokens, turn.TotalTokens, string(gf)); err != nil {
 		return fmt.Errorf("append conversation turn %q: %w", turn.ID, err)
 	}
 	if err := indexConversationTurn(ctx, tx, turn); err != nil {
@@ -433,13 +440,20 @@ func (r *SQLiteRepository) AppendConversationTurnIfAbsent(ctx context.Context, t
 		return false, fmt.Errorf("begin append conversation turn %q if absent: %w", turn.ID, err)
 	}
 	defer tx.Rollback()
+	gf, err := json.Marshal(turn.GeneratedFiles)
+	if err != nil {
+		return false, fmt.Errorf("marshal generated files for turn %q: %w", turn.ID, err)
+	}
+	if turn.GeneratedFiles == nil {
+		gf = []byte("[]")
+	}
 	res, err := tx.ExecContext(ctx, `
 		INSERT OR IGNORE INTO conversation_turns (
 			id, session_id, task_id, agent_id, model_profile, role, content, created_at,
-			prompt_tokens, completion_tokens, cached_tokens, total_tokens
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			prompt_tokens, completion_tokens, cached_tokens, total_tokens, generated_files
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	`, turn.ID, turn.SessionID, turn.TaskID, turn.AgentID, turn.ModelProfile, string(turn.Role), turn.Content, formatTime(turn.CreatedAt),
-		turn.PromptTokens, turn.CompletionTokens, turn.CachedTokens, turn.TotalTokens)
+		turn.PromptTokens, turn.CompletionTokens, turn.CachedTokens, turn.TotalTokens, string(gf))
 	if err != nil {
 		return false, fmt.Errorf("append conversation turn %q if absent: %w", turn.ID, err)
 	}
@@ -469,7 +483,7 @@ func (r *SQLiteRepository) AppendConversationTurnIfAbsent(ctx context.Context, t
 func (r *SQLiteRepository) ListConversationTurns(ctx context.Context, sessionID string, limit int) ([]domain.ConversationTurn, error) {
 	query := `
 		SELECT id, session_id, task_id, agent_id, model_profile, role, content, created_at,
-			prompt_tokens, completion_tokens, cached_tokens, total_tokens
+			prompt_tokens, completion_tokens, cached_tokens, total_tokens, generated_files
 		FROM conversation_turns
 		WHERE session_id = ?
 		ORDER BY created_at DESC, id DESC
@@ -1680,6 +1694,7 @@ var columnMigrations = []columnMigration{
 	{table: "conversation_turns", column: "completion_tokens", stmt: `ALTER TABLE conversation_turns ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0`},
 	{table: "conversation_turns", column: "cached_tokens", stmt: `ALTER TABLE conversation_turns ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0`},
 	{table: "conversation_turns", column: "total_tokens", stmt: `ALTER TABLE conversation_turns ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0`},
+	{table: "conversation_turns", column: "generated_files", stmt: `ALTER TABLE conversation_turns ADD COLUMN generated_files TEXT NOT NULL DEFAULT '[]'`},
 }
 
 // applyColumnMigrations runs the additive ALTER TABLE migrations idempotently.
@@ -1775,8 +1790,9 @@ func scanConversationTurn(row scanner) (domain.ConversationTurn, error) {
 	var turn domain.ConversationTurn
 	var role string
 	var createdAt string
+	var gfRaw string
 	if err := row.Scan(&turn.ID, &turn.SessionID, &turn.TaskID, &turn.AgentID, &turn.ModelProfile, &role, &turn.Content, &createdAt,
-		&turn.PromptTokens, &turn.CompletionTokens, &turn.CachedTokens, &turn.TotalTokens); err != nil {
+		&turn.PromptTokens, &turn.CompletionTokens, &turn.CachedTokens, &turn.TotalTokens, &gfRaw); err != nil {
 		return domain.ConversationTurn{}, err
 	}
 	parsedCreatedAt, err := parseTime(createdAt)
@@ -1785,6 +1801,9 @@ func scanConversationTurn(row scanner) (domain.ConversationTurn, error) {
 	}
 	turn.Role = domain.ConversationRole(role)
 	turn.CreatedAt = parsedCreatedAt
+	if err := json.Unmarshal([]byte(gfRaw), &turn.GeneratedFiles); err != nil {
+		return domain.ConversationTurn{}, fmt.Errorf("unmarshal generated files for turn %q: %w", turn.ID, err)
+	}
 	return turn, nil
 }
 
@@ -1919,7 +1938,8 @@ var schemaStatements = []string{
 		prompt_tokens INTEGER NOT NULL DEFAULT 0,
 		completion_tokens INTEGER NOT NULL DEFAULT 0,
 		cached_tokens INTEGER NOT NULL DEFAULT 0,
-		total_tokens INTEGER NOT NULL DEFAULT 0
+		total_tokens INTEGER NOT NULL DEFAULT 0,
+		generated_files TEXT NOT NULL DEFAULT '[]'
 	)`,
 	// conversation_turns_fts is a full-text index over conversation turn content,
 	// backing the session_search tool (discovery mode). The non-content columns

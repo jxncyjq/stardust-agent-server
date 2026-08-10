@@ -30,6 +30,11 @@ func (g *alwaysSuspendGate) Resolve(context.Context, domain.Task, domain.ToolCal
 // in text on every subsequent round.
 type oneToolThenTextMaas struct {
 	toolName string
+	// toolArgs are the arguments sent with the round-1 call. Nil defaults to an
+	// empty map; tests exercising a tool named "write_file" must set a "path"
+	// entry, since the runtime's tool loop treats a pathless write_file success
+	// as an invariant violation (see runtime.go executeToolCalls).
+	toolArgs map[string]string
 	calls    int
 }
 
@@ -39,7 +44,11 @@ func (m *oneToolThenTextMaas) Generate(ctx context.Context, req port.InferenceRe
 	}
 	m.calls++
 	if m.calls == 1 {
-		return port.InferenceResponse{ToolCalls: []domain.ToolCall{{ID: "c1", Name: m.toolName, Arguments: map[string]string{}}}}, nil
+		args := m.toolArgs
+		if args == nil {
+			args = map[string]string{}
+		}
+		return port.InferenceResponse{ToolCalls: []domain.ToolCall{{ID: "c1", Name: m.toolName, Arguments: args}}}, nil
 	}
 	return port.InferenceResponse{Text: "done"}, nil
 }

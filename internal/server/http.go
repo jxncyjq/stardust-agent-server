@@ -9,8 +9,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"mime"
 	"net/http"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -137,10 +140,19 @@ type Config struct {
 	// workspaceRoot argument). Session deletion joins it with the session key
 	// to locate the directory to remove alongside the DB row (spec §4.0).
 	WorkspaceRoot string
-	Logger        *slog.Logger
-	Metrics       *observability.MetricsRecorder
-	Diagnostics   *observability.Diagnostics
-	Traces        *observability.TraceRecorder
+	// FileBaseURL is the public base URL (no trailing slash) that fileURL
+	// prepends to generated-file links when the agent server is not on the
+	// same origin as its caller (e.g. a deployed GUI). Empty means the
+	// caller resolves the relative "/v1/files?..." path against this
+	// server's own origin, which is the loopback/single-machine default.
+	// Mirrors config.ServerConfig.FileBaseURL; bridged at the assembly site
+	// in internal/cli/command.go since server.Config intentionally does not
+	// import internal/config.
+	FileBaseURL string
+	Logger      *slog.Logger
+	Metrics     *observability.MetricsRecorder
+	Diagnostics *observability.Diagnostics
+	Traces      *observability.TraceRecorder
 }
 
 type HTTPServer struct {
@@ -166,6 +178,7 @@ type HTTPServer struct {
 	policy              security.Policy
 	requestIDHeader     string
 	workspaceRoot       string
+	fileBaseURL         string
 	logger              *slog.Logger
 	metrics             *observability.MetricsRecorder
 	diagnostics         *observability.Diagnostics
@@ -221,6 +234,7 @@ func NewHTTPServer(cfg Config) *HTTPServer {
 		policy:              security.NewPolicy(cfg.RequireIdentity),
 		requestIDHeader:     requestIDHeader,
 		workspaceRoot:       cfg.WorkspaceRoot,
+		fileBaseURL:         cfg.FileBaseURL,
 		logger:              observability.WithComponent(logger, "server"),
 		metrics:             cfg.Metrics,
 		diagnostics:         cfg.Diagnostics,
@@ -277,6 +291,8 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleRuntimeEvents(rec, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/quality/evals":
 		s.handleQualityEvals(rec, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/files":
+		s.handleServeFile(rec, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/sessions":
 		s.handleCreateSession(rec, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/sessions":
@@ -407,7 +423,7 @@ func (s *HTTPServer) handleListSessions(w http.ResponseWriter, r *http.Request) 
 
 func (s *HTTPServer) handleListSessionTurns(w http.ResponseWriter, r *http.Request) {
 	if s.sessions == nil {
-		writeJSON(w, http.StatusOK, []domain.ConversationTurn{})
+		writeJSON(w, http.StatusOK, []conversationTurnResponse{})
 		return
 	}
 	sessionID := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/v1/sessions/"), "/turns")
@@ -429,7 +445,52 @@ func (s *HTTPServer) handleListSessionTurns(w http.ResponseWriter, r *http.Reque
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("list session turns: %v", err))
 		return
 	}
-	writeJSON(w, http.StatusOK, turns)
+	writeJSON(w, http.StatusOK, s.conversationTurnResponses(turns))
+}
+
+// conversationTurnResponse mirrors domain.ConversationTurn field-for-field,
+// except GeneratedFiles is the linked DTO form instead of bare relative
+// paths, so the GUI's history reload can render download/open links without
+// a second round trip. All other fields keep their existing json tags so
+// consumers of the plain turn shape are unaffected.
+type conversationTurnResponse struct {
+	ID               string                  `json:"id"`
+	SessionID        string                  `json:"session_id"`
+	TaskID           string                  `json:"task_id"`
+	AgentID          string                  `json:"agent_id"`
+	ModelProfile     string                  `json:"model_profile"`
+	Role             domain.ConversationRole `json:"role"`
+	Content          string                  `json:"content"`
+	CreatedAt        time.Time               `json:"created_at"`
+	PromptTokens     int                     `json:"prompt_tokens,omitempty"`
+	CompletionTokens int                     `json:"completion_tokens,omitempty"`
+	CachedTokens     int                     `json:"cached_tokens,omitempty"`
+	TotalTokens      int                     `json:"total_tokens,omitempty"`
+	GeneratedFiles   []GeneratedFile         `json:"generated_files"`
+}
+
+// conversationTurnResponses maps persisted turns to their response shape,
+// resolving each turn's generated files into links via fileURL.
+func (s *HTTPServer) conversationTurnResponses(turns []domain.ConversationTurn) []conversationTurnResponse {
+	out := make([]conversationTurnResponse, 0, len(turns))
+	for _, turn := range turns {
+		out = append(out, conversationTurnResponse{
+			ID:               turn.ID,
+			SessionID:        turn.SessionID,
+			TaskID:           turn.TaskID,
+			AgentID:          turn.AgentID,
+			ModelProfile:     turn.ModelProfile,
+			Role:             turn.Role,
+			Content:          turn.Content,
+			CreatedAt:        turn.CreatedAt,
+			PromptTokens:     turn.PromptTokens,
+			CompletionTokens: turn.CompletionTokens,
+			CachedTokens:     turn.CachedTokens,
+			TotalTokens:      turn.TotalTokens,
+			GeneratedFiles:   s.generatedFilesDTO(turn.SessionID, turn.GeneratedFiles),
+		})
+	}
+	return out
 }
 
 // sessionIDFromPath extracts the {id} segment from /v1/sessions/{id}. It returns
@@ -593,6 +654,97 @@ func (s *HTTPServer) handleDeleteSession(w http.ResponseWriter, r *http.Request)
 	observability.WithRequestID(s.logger, requestIDFromContext(r.Context())).Info("session deleted",
 		"session_id", sessionID, "dir", sessionDir)
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleServeFile streams a generated file for read-only preview/download,
+// confined to the requesting session's working directory. Auth is enforced
+// centrally by HTTPServer.authorized (called for every route before the
+// switch dispatches here), so this handler does not re-check the Authorization
+// header.
+func (s *HTTPServer) handleServeFile(w http.ResponseWriter, r *http.Request) {
+	if s.sessions == nil {
+		writeError(w, http.StatusServiceUnavailable, "session store is unavailable")
+		return
+	}
+	q := r.URL.Query()
+	sessionID := strings.TrimSpace(q.Get("session_id"))
+	rel := q.Get("path")
+	if sessionID == "" || strings.TrimSpace(rel) == "" {
+		writeError(w, http.StatusBadRequest, "session_id and path are required")
+		return
+	}
+	session, ok, err := s.sessions.GetAgentSession(r.Context(), sessionID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("load session: %v", err))
+		return
+	}
+	if !ok {
+		writeError(w, http.StatusNotFound, "session not found")
+		return
+	}
+	root := strings.TrimSpace(session.WorkingDir)
+	if root == "" {
+		writeError(w, http.StatusNotFound, "session has no working directory")
+		return
+	}
+	abs, err := resolveInWorkspace(root, rel)
+	if err != nil {
+		writeError(w, http.StatusForbidden, "path outside workspace")
+		return
+	}
+	info, err := os.Stat(abs)
+	if err != nil || info.IsDir() {
+		writeError(w, http.StatusNotFound, "file not found")
+		return
+	}
+	f, err := os.Open(abs)
+	if err != nil {
+		writeError(w, http.StatusNotFound, "file not found")
+		return
+	}
+	defer f.Close()
+	ctype := mime.TypeByExtension(filepath.Ext(abs))
+	if ctype == "" {
+		ctype = "application/octet-stream"
+	}
+	w.Header().Set("Content-Type", ctype)
+	if q.Get("download") == "1" {
+		w.Header().Set("Content-Disposition", "attachment; filename=\""+filepath.Base(abs)+"\"")
+	}
+	http.ServeContent(w, r, filepath.Base(abs), info.ModTime(), f)
+}
+
+// resolveInWorkspace joins rel onto root and refuses any path escaping root,
+// so a caller cannot pass "../../etc/passwd" (or similar) to read outside the
+// session's working directory.
+func resolveInWorkspace(root, rel string) (string, error) {
+	abs := filepath.Clean(filepath.Join(root, rel))
+	rp, err := filepath.Rel(root, abs)
+	if err != nil {
+		return "", fmt.Errorf("resolve %q against workspace root %q: %w", rel, root, err)
+	}
+	if rp == ".." || strings.HasPrefix(rp, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("path %q outside workspace root", rel)
+	}
+	return abs, nil
+}
+
+// fileURL builds a link for a generated file. Absolute when FileBaseURL is
+// configured (deployment), else a relative "/v1/files?..." path the loopback
+// frontend resolves against its own base URL. Never persisted -- callers
+// build it fresh from the session id and relative path each time.
+func (s *HTTPServer) fileURL(sessionID, relPath string, download bool) string {
+	v := url.Values{}
+	v.Set("session_id", sessionID)
+	v.Set("path", relPath)
+	if download {
+		v.Set("download", "1")
+	}
+	rel := "/v1/files?" + v.Encode()
+	if s.fileBaseURL != "" {
+		return s.fileBaseURL + rel
+	}
+	return rel
 }
 
 func (s *HTTPServer) handleAgentMessages(w http.ResponseWriter, r *http.Request) {
@@ -989,14 +1141,26 @@ func (s *HTTPServer) handleGetTask(w http.ResponseWriter, r *http.Request) {
 }
 
 type taskResultResponse struct {
-	TaskID           string `json:"task_id"`
-	Status           string `json:"status"`
-	Result           string `json:"result"`
-	PromptTokens     int    `json:"prompt_tokens"`
-	CompletionTokens int    `json:"completion_tokens"`
-	CachedTokens     int    `json:"cached_tokens"`
-	TotalTokens      int    `json:"total_tokens"`
-	ElapsedMs        int64  `json:"elapsed_ms"`
+	TaskID           string          `json:"task_id"`
+	Status           string          `json:"status"`
+	Result           string          `json:"result"`
+	PromptTokens     int             `json:"prompt_tokens"`
+	CompletionTokens int             `json:"completion_tokens"`
+	CachedTokens     int             `json:"cached_tokens"`
+	TotalTokens      int             `json:"total_tokens"`
+	ElapsedMs        int64           `json:"elapsed_ms"`
+	GeneratedFiles   []GeneratedFile `json:"generated_files"`
+}
+
+// GeneratedFile is the linked view of a workspace-relative path a task wrote
+// via write_file. URL/DownloadURL are built fresh from fileURL on every
+// response rather than persisted, so a later FileBaseURL change is reflected
+// immediately without a data migration.
+type GeneratedFile struct {
+	Path        string `json:"path"`
+	URL         string `json:"url"`
+	DownloadURL string `json:"download_url"`
+	Name        string `json:"name"`
 }
 
 // taskUsage is the token/timing breakdown scanned from the task_completed
@@ -1036,7 +1200,7 @@ func (s *HTTPServer) handleGetTaskResult(w http.ResponseWriter, r *http.Request)
 	if !s.requireCompanyAccess(w, r, task.CompanyID, "task", task.ID) {
 		return
 	}
-	result, usage, err := s.taskResult(taskID)
+	result, usage, generatedFiles, err := s.taskResult(taskID)
 	if err != nil {
 		observability.WithRequestID(s.logger, requestIDFromContext(r.Context())).Error("read task result failed", "task_id", taskID, "error", err)
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("task result: %v", err))
@@ -1047,7 +1211,7 @@ func (s *HTTPServer) handleGetTaskResult(w http.ResponseWriter, r *http.Request)
 	// deterministic ("<taskID>:assistant"), and the insert is exactly-once, so
 	// repeated polling of this endpoint yields a single assistant turn.
 	if task.Status == domain.TaskDone && strings.TrimSpace(task.SessionID) != "" && strings.TrimSpace(result) != "" {
-		if err := s.recordAssistantTurn(r.Context(), task, result, usage); err != nil {
+		if err := s.recordAssistantTurn(r.Context(), task, result, usage, generatedFiles); err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("record assistant turn: %v", err))
 			return
 		}
@@ -1061,15 +1225,17 @@ func (s *HTTPServer) handleGetTaskResult(w http.ResponseWriter, r *http.Request)
 		CachedTokens:     usage.CachedTokens,
 		TotalTokens:      usage.TotalTokens,
 		ElapsedMs:        usage.ElapsedMs,
+		GeneratedFiles:   s.generatedFilesDTO(task.SessionID, generatedFiles),
 	})
 }
 
 // recordAssistantTurn persists the model answer for a completed task exactly
-// once, keyed by "<taskID>:assistant", together with the token usage reported
-// for that task so conversation history carries the same counts as the task
-// result response. A nil session store while a task carries a session id is an
+// once, keyed by "<taskID>:assistant", together with the token usage and the
+// workspace-relative generated file paths reported for that task, so
+// conversation history carries the same counts and files as the task result
+// response. A nil session store while a task carries a session id is an
 // inconsistent state and is surfaced as an error rather than ignored.
-func (s *HTTPServer) recordAssistantTurn(ctx context.Context, task domain.Task, result string, usage taskUsage) error {
+func (s *HTTPServer) recordAssistantTurn(ctx context.Context, task domain.Task, result string, usage taskUsage, generatedFiles []string) error {
 	if s.sessions == nil {
 		return fmt.Errorf("session store is unavailable")
 	}
@@ -1085,6 +1251,7 @@ func (s *HTTPServer) recordAssistantTurn(ctx context.Context, task domain.Task, 
 		CachedTokens:     usage.CachedTokens,
 		TotalTokens:      usage.TotalTokens,
 		CreatedAt:        time.Now(),
+		GeneratedFiles:   generatedFiles,
 	}
 	if _, err := s.sessions.AppendConversationTurnIfAbsent(ctx, turn); err != nil {
 		return err
@@ -1093,19 +1260,20 @@ func (s *HTTPServer) recordAssistantTurn(ctx context.Context, task domain.Task, 
 }
 
 // taskResult scans the runtime event bus for the task_completed event of the
-// given task and returns its answer text, total token usage, and elapsed time
-// in milliseconds. The task_completed event is the only place these values are
-// exposed because TaskRun is not persisted. A failure to read the event bus is
-// returned rather than reported as an empty result: an empty answer on a done
-// task is indistinguishable from "the task produced nothing", which would let a
+// given task and returns its answer text, total token usage, elapsed time in
+// milliseconds, and the workspace-relative paths of any files the task wrote.
+// The task_completed event is the only place these values are exposed because
+// TaskRun is not persisted. A failure to read the event bus is returned rather
+// than reported as an empty result: an empty answer on a done task is
+// indistinguishable from "the task produced nothing", which would let a
 // backing-store outage surface to the GUI as a silently truncated answer.
-func (s *HTTPServer) taskResult(taskID string) (result string, usage taskUsage, err error) {
+func (s *HTTPServer) taskResult(taskID string) (result string, usage taskUsage, generatedFiles []string, err error) {
 	if s.workflowEvents == nil {
-		return "", taskUsage{}, nil
+		return "", taskUsage{}, nil, nil
 	}
 	events, err := s.workflowEvents.Events()
 	if err != nil {
-		return "", taskUsage{}, fmt.Errorf("read runtime events for task %q: %w", taskID, err)
+		return "", taskUsage{}, nil, fmt.Errorf("read runtime events for task %q: %w", taskID, err)
 	}
 	for _, event := range events {
 		if event.TaskID == taskID && event.Type == "task_completed" {
@@ -1117,9 +1285,27 @@ func (s *HTTPServer) taskResult(taskID string) (result string, usage taskUsage, 
 				TotalTokens:      event.TotalTokens,
 				ElapsedMs:        event.ElapsedMs,
 			}
+			generatedFiles = event.GeneratedFiles
 		}
 	}
-	return result, usage, nil
+	return result, usage, generatedFiles, nil
+}
+
+// generatedFilesDTO maps workspace-relative paths to their linked DTO form,
+// building URL/DownloadURL fresh via fileURL for the given session. It always
+// returns a non-nil slice so the field serializes as [] rather than null when
+// rels is empty.
+func (s *HTTPServer) generatedFilesDTO(sessionID string, rels []string) []GeneratedFile {
+	out := make([]GeneratedFile, 0, len(rels))
+	for _, rel := range rels {
+		out = append(out, GeneratedFile{
+			Path:        rel,
+			URL:         s.fileURL(sessionID, rel, false),
+			DownloadURL: s.fileURL(sessionID, rel, true),
+			Name:        filepath.Base(rel),
+		})
+	}
+	return out
 }
 
 // runtimeEventsLimit caps how many of the most recent runtime events are
