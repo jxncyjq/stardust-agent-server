@@ -493,9 +493,12 @@ func (r *Runtime) Close(ctx context.Context, req CloseReq) error {
 			// 避免与并发回收交错读写 Context 造成数据竞争。
 			var relErr error
 			sess.WithLock(func() {
-				relErr = r.mgr.ReleaseContext(sess.Context)
+				if sess.Context != nil {
+					relErr = r.mgr.ReleaseContext(sess.Context)
+				}
 				sess.Context = nil
 				sess.ActivePage = nil
+				sess.takeover = false // 关闭即退接管，防标志悬挂
 			})
 			r.sessions.Delete(req.SessionID)
 			r.stopScreencast(req.SessionID) // 停帧流，须在 drop hub 前
@@ -706,7 +709,11 @@ func (r *Runtime) takeoverOf(sess *Session) bool {
 // InjectInput 把一批归一化输入事件注入会话活跃页（接管必须先开，否则拒）。
 // 每批先整体校验，再读一次当前视口宽高，把 0..1 坐标 × px 后经 go-rod 派发。
 // 与 Read/Click 等一样在会话锁下取活跃页，但注入本身在锁外执行（go-rod 调用可能阻塞，
-// 不宜久持会话锁）——接管期间 Agent 写动作已被门控，无并发写者，故锁外注入安全。
+// 不宜久持会话锁）。这不是「无并发写者」的强保证：接管期间 Agent 写动作已被门控，
+// reaper 也会跳过接管中的会话（reapIdle）、Close 会清接管标志（Close 的 per-session
+// 分支），常见的并发写者路径已被排除；但显式对本会话调用 Close（并发的
+// Close(sessionID)）在本批次注入进行中仍可能发生——不会造成内存不安全，只会让批次里
+// 下一次 go-rod 调用因 Context/页已释放而 fail-loud 报错（错误被包装上报，不会静默）。
 func (r *Runtime) InjectInput(sessionID string, events []InputEvent) error {
 	if err := validateInputEvents(events); err != nil {
 		return NewBrowserErrorWrap(CodeElementNotFound, "invalid input batch", err)

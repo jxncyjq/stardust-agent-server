@@ -79,3 +79,17 @@ func TestSetTakeoverUnknownSession(t *testing.T) {
 		t.Fatalf("want CONTEXT_EVICTED, got %v", err)
 	}
 }
+
+// TestCloseClearsTakeover：Close 的 per-session 分支须在删表前把 takeover 标志清零，
+// 防止标志悬挂。会话无 Context（无 Chromium）时 ReleaseContext 不应被调用（否则 nil
+// 解引用），Close 仍须成功把会话从表里删掉——用「删后 SetTakeover 必须报错」来证明。
+func TestCloseClearsTakeover(t *testing.T) {
+	r, sess := newTakeoverRuntime(t)
+	_ = r.SetTakeover(sess.ID, true)
+	// per-session Close：nil Context 下 ReleaseContext 可能返回 error，这里只关心标志被清。
+	_ = r.Close(context.Background(), CloseReq{SessionID: sess.ID})
+	// 会话已从表删除；再置接管应因未知会话报错，证明其不再残留。
+	if err := r.SetTakeover(sess.ID, true); err == nil {
+		t.Fatal("closed session should be gone, SetTakeover must error")
+	}
+}

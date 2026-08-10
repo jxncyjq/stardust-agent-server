@@ -19,10 +19,22 @@ func (r *Runtime) reapIdle(now time.Time) []string {
 	}
 	var reaped []string
 	for _, sess := range r.sessions.Snapshot() { // Snapshot: 复制指针，避免遍历时改 map / 持锁回收
-		// LastUsedAt 在会话锁下读：动作路径（touch/Open/Read/Click/Type）在锁下写它，
-		// reaper 在锁下读它，二者对该字段的访问互斥，避免数据竞争（-race clean）。
+		// LastUsedAt 与 takeover 都在同一次会话锁获取下读：动作路径（touch/Open/Read/Click/
+		// Type/SetTakeover）在锁下写它们，reaper 在锁下读，二者对这些字段的访问互斥，
+		// 避免数据竞争（-race clean），也不必为 takeover 再多拿一次锁。
 		var last time.Time
-		sess.WithLock(func() { last = sess.LastUsedAt })
+		var takeover bool
+		sess.WithLock(func() {
+			last = sess.LastUsedAt
+			takeover = sess.takeover
+		})
+		// SetTakeover 不刷新 LastUsedAt，所以一个正被人工接管的会话完全可能同时判定为
+		// 「空闲超时」。此时也绝不能回收：用户可能正在填验证码、正在阅读页面，回收会把
+		// Context 从其脚下关掉。接管标志由 Close 清零（见 runtime.go），故不存在标志
+		// 悬挂导致会话永久免疫回收的问题。
+		if takeover {
+			continue
+		}
 		if now.Sub(last) < r.cfg.SessionTTL {
 			continue // 未空闲够久
 		}
