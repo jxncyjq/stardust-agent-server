@@ -50,6 +50,13 @@ func validateInputEvents(events []InputEvent) error {
 			if ev.Button != "" && !buttonNames[ev.Button] {
 				return fmt.Errorf("event %d (%s): bad button %q", i, ev.Type, ev.Button)
 			}
+			if ev.Type == "wheel" {
+				for _, d := range []float64{ev.DeltaX, ev.DeltaY} {
+					if math.IsNaN(d) || math.IsInf(d, 0) {
+						return fmt.Errorf("event %d (wheel): non-finite delta %v", i, d)
+					}
+				}
+			}
 		case ev.Type == "keydown" || ev.Type == "keyup":
 			if ev.Key == "" {
 				return fmt.Errorf("event %d (%s): missing key", i, ev.Type)
@@ -57,7 +64,13 @@ func validateInputEvents(events []InputEvent) error {
 			if len(ev.Key) > maxKeyLen {
 				return fmt.Errorf("event %d (%s): key too long", i, ev.Type)
 			}
+			if _, err := keyToInputKey(ev.Key); err != nil {
+				return fmt.Errorf("event %d (%s): %w", i, ev.Type, err)
+			}
 		case ev.Type == "char":
+			if ev.Text == "" {
+				return fmt.Errorf("event %d (char): empty text", i)
+			}
 			if len(ev.Text) > maxTextLen {
 				return fmt.Errorf("event %d (char): text too long", i)
 			}

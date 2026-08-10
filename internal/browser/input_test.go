@@ -1,6 +1,7 @@
 package browser
 
 import (
+	"math"
 	"strings"
 	"testing"
 
@@ -33,6 +34,46 @@ func TestValidateInputEventsRejects(t *testing.T) {
 		if err := validateInputEvents([]InputEvent{ev}); err == nil {
 			t.Errorf("%s: expected rejection, got nil", name)
 		}
+	}
+}
+
+func TestValidateInputEventsRejectsUnmappableKey(t *testing.T) {
+	if err := validateInputEvents([]InputEvent{
+		{Type: "keydown", Key: "F13Nonsense"},
+	}); err == nil {
+		t.Fatal("unmappable key should be rejected before injection")
+	}
+}
+
+func TestValidateInputEventsRejectsMixedBatchOnUnmappableKey(t *testing.T) {
+	// Documents whole-batch-reject: the click must never be applied because
+	// validation runs (and fails) before any event is injected.
+	if err := validateInputEvents([]InputEvent{
+		{Type: "click", X: 0.5, Y: 0.5},
+		{Type: "keydown", Key: "NotAKey"},
+	}); err == nil {
+		t.Fatal("batch with unmappable key should be rejected as a whole")
+	}
+}
+
+func TestValidateInputEventsRejectsNonFiniteWheelDelta(t *testing.T) {
+	if err := validateInputEvents([]InputEvent{
+		{Type: "wheel", X: 0.5, Y: 0.5, DeltaY: math.Inf(1)},
+	}); err == nil {
+		t.Fatal("wheel with +Inf DeltaY should be rejected")
+	}
+	if err := validateInputEvents([]InputEvent{
+		{Type: "wheel", X: 0.5, Y: 0.5, DeltaX: math.NaN()},
+	}); err == nil {
+		t.Fatal("wheel with NaN DeltaX should be rejected")
+	}
+}
+
+func TestValidateInputEventsRejectsEmptyCharText(t *testing.T) {
+	if err := validateInputEvents([]InputEvent{
+		{Type: "char", Text: ""},
+	}); err == nil {
+		t.Fatal("char with empty text should be rejected")
 	}
 }
 
