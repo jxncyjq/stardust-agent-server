@@ -82,14 +82,25 @@ func TestSetTakeoverUnknownSession(t *testing.T) {
 
 // TestCloseClearsTakeover：Close 的 per-session 分支须在删表前把 takeover 标志清零，
 // 防止标志悬挂。会话无 Context（无 Chromium）时 ReleaseContext 不应被调用（否则 nil
-// 解引用），Close 仍须成功把会话从表里删掉——用「删后 SetTakeover 必须报错」来证明。
+// 解引用），Close 仍须成功把会话从表里删掉。
+// 直接在活跃指针上验证标志被清，而非仅通过会话删除来间接验证。
 func TestCloseClearsTakeover(t *testing.T) {
 	r, sess := newTakeoverRuntime(t)
-	_ = r.SetTakeover(sess.ID, true)
-	// per-session Close：nil Context 下 ReleaseContext 可能返回 error，这里只关心标志被清。
+	// 前置条件：设置 takeover=true 并验证
+	if err := r.SetTakeover(sess.ID, true); err != nil {
+		t.Fatalf("SetTakeover(true): %v", err)
+	}
+	if !r.takeoverOf(sess) {
+		t.Fatal("precondition: takeover flag should be true before Close")
+	}
+	// 执行 Close：per-session 分支，nil Context 下可能返回 error，这里只关心标志被清。
 	_ = r.Close(context.Background(), CloseReq{SessionID: sess.ID})
-	// 会话已从表删除；再置接管应因未知会话报错，证明其不再残留。
+	// 主要检查：直接验证活跃指针上的标志已清（即使会话已从表删除，指针仍有效）。
+	if r.takeoverOf(sess) {
+		t.Fatal("takeover flag should be cleared on the live session pointer after Close")
+	}
+	// 次要检查：会话已从表删除；再置接管应因未知会话报错。
 	if err := r.SetTakeover(sess.ID, true); err == nil {
-		t.Fatal("closed session should be gone, SetTakeover must error")
+		t.Fatal("closed session should be removed from store, SetTakeover must error")
 	}
 }
