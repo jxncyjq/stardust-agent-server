@@ -1663,6 +1663,14 @@ var columnMigrations = []columnMigration{
 		column: "working_dir",
 		stmt:   `ALTER TABLE agent_sessions ADD COLUMN working_dir TEXT NOT NULL DEFAULT ''`,
 	},
+	{table: "audit_events", column: "prompt_tokens", stmt: `ALTER TABLE audit_events ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0`},
+	{table: "audit_events", column: "completion_tokens", stmt: `ALTER TABLE audit_events ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0`},
+	{table: "audit_events", column: "cached_tokens", stmt: `ALTER TABLE audit_events ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0`},
+	{table: "audit_events", column: "total_tokens", stmt: `ALTER TABLE audit_events ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0`},
+	{table: "conversation_turns", column: "prompt_tokens", stmt: `ALTER TABLE conversation_turns ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0`},
+	{table: "conversation_turns", column: "completion_tokens", stmt: `ALTER TABLE conversation_turns ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0`},
+	{table: "conversation_turns", column: "cached_tokens", stmt: `ALTER TABLE conversation_turns ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0`},
+	{table: "conversation_turns", column: "total_tokens", stmt: `ALTER TABLE conversation_turns ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0`},
 }
 
 // applyColumnMigrations runs the additive ALTER TABLE migrations idempotently.
@@ -1897,7 +1905,11 @@ var schemaStatements = []string{
 		model_profile TEXT NOT NULL,
 		role TEXT NOT NULL,
 		content TEXT NOT NULL,
-		created_at TEXT NOT NULL
+		created_at TEXT NOT NULL,
+		prompt_tokens INTEGER NOT NULL DEFAULT 0,
+		completion_tokens INTEGER NOT NULL DEFAULT 0,
+		cached_tokens INTEGER NOT NULL DEFAULT 0,
+		total_tokens INTEGER NOT NULL DEFAULT 0
 	)`,
 	// conversation_turns_fts is a full-text index over conversation turn content,
 	// backing the session_search tool (discovery mode). The non-content columns
@@ -1950,7 +1962,11 @@ var schemaStatements = []string{
 		subject_id TEXT NOT NULL,
 		action TEXT NOT NULL,
 		hash TEXT NOT NULL,
-		created_at TEXT NOT NULL
+		created_at TEXT NOT NULL,
+		prompt_tokens INTEGER NOT NULL DEFAULT 0,
+		completion_tokens INTEGER NOT NULL DEFAULT 0,
+		cached_tokens INTEGER NOT NULL DEFAULT 0,
+		total_tokens INTEGER NOT NULL DEFAULT 0
 	)`,
 	`CREATE TABLE IF NOT EXISTS runtime_events (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
