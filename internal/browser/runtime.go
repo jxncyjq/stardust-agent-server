@@ -277,6 +277,14 @@ func (r *Runtime) emitObservation(sessionID string, obs Observation) {
 
 // Open 导航到 req.URL：复用或新建 Session + incognito Context，返回首次观测与 session id。
 func (r *Runtime) Open(ctx context.Context, req OpenReq) (OpenObservation, error) {
+	// 接管门控：会话接管中时 Agent 的写动作退让（read/screenshot 不受此限）。
+	// 置于函数最前，先于 checkURL 的 DNS 解析等任何副作用。传了 SessionID 才可能接管；
+	// 空 SessionID 是新建会话，天然不在接管态。
+	if req.SessionID != "" {
+		if sess, ok := r.sessions.Get(req.SessionID); ok && r.takeoverOf(sess) {
+			return OpenObservation{}, NewBrowserError(CodeTakeover, "session "+req.SessionID+" under manual takeover")
+		}
+	}
 	if err := r.checkURL(req.URL); err != nil {
 		return OpenObservation{}, err
 	}
@@ -400,6 +408,11 @@ func (r *Runtime) Read(ctx context.Context, req ReadReq) (Observation, error) {
 
 // Click 点击 ref 指向的元素，等待可能的导航后返回新观测。
 func (r *Runtime) Click(ctx context.Context, req ClickReq) (Observation, error) {
+	// 接管门控：与 Open 一致，先于 activePage（activePage 无活跃页时返回 nil sess，
+	// 此时才检查会读不到接管标志），直接查会话表判断。
+	if sess, ok := r.sessions.Get(req.SessionID); ok && r.takeoverOf(sess) {
+		return Observation{}, NewBrowserError(CodeTakeover, "session "+req.SessionID+" under manual takeover")
+	}
 	sess, page, err := r.activePage(req.SessionID)
 	if err != nil {
 		return Observation{}, err
@@ -430,6 +443,11 @@ func (r *Runtime) Click(ctx context.Context, req ClickReq) (Observation, error) 
 
 // Type 向 ref 指向的元素输入文本；Submit 为真则输入后按回车提交。
 func (r *Runtime) Type(ctx context.Context, req TypeReq) (Observation, error) {
+	// 接管门控：与 Open/Click 一致，先于 activePage（activePage 无活跃页时返回 nil sess，
+	// 此时才检查会读不到接管标志），直接查会话表判断。
+	if sess, ok := r.sessions.Get(req.SessionID); ok && r.takeoverOf(sess) {
+		return Observation{}, NewBrowserError(CodeTakeover, "session "+req.SessionID+" under manual takeover")
+	}
 	sess, page, err := r.activePage(req.SessionID)
 	if err != nil {
 		return Observation{}, err
