@@ -30,6 +30,41 @@ func TestReapIdleSelectsExpired(t *testing.T) {
 	}
 }
 
+// TestReapIdleSkipsTakeover：SetTakeover 不刷新 LastUsedAt，所以一个正被人工接管的会话
+// 完全可能同时「空闲超时」——此时 reapIdle 也不得回收它，否则会在用户操作过程中
+// （如正在填验证码、正在阅读页面）把浏览器 Context 从其脚下关掉。同样空闲、但未接管
+// 的会话应照常被回收，证明本用例不是把 TTL 判定整体关掉了。
+func TestReapIdleSkipsTakeover(t *testing.T) {
+	rt := &Runtime{sessions: NewSessionStore(), hubs: newHubRegistry(), cfg: RuntimeConfig{SessionTTL: time.Minute}}
+	now := time.Now()
+
+	takenOver := rt.sessions.Create("t")
+	takenOver.WithLock(func() { takenOver.LastUsedAt = now.Add(-time.Hour) }) // 远超 TTL
+	if err := rt.SetTakeover(takenOver.ID, true); err != nil {
+		t.Fatalf("SetTakeover: %v", err)
+	}
+
+	idle := rt.sessions.Create("t")
+	idle.WithLock(func() { idle.LastUsedAt = now.Add(-time.Hour) }) // 同样远超 TTL，但未接管
+
+	reaped := rt.reapIdle(now)
+
+	for _, id := range reaped {
+		if id == takenOver.ID {
+			t.Fatalf("taken-over session %s must not be reaped, got reaped=%v", takenOver.ID, reaped)
+		}
+	}
+	found := false
+	for _, id := range reaped {
+		if id == idle.ID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("equally-idle non-takeover session %s should still be reaped, got %v", idle.ID, reaped)
+	}
+}
+
 // TestConcurrentActionAndReapNoRace 回归 CRITICAL 竞态：reaper 回收路径（evictSession/reapIdle）
 // 与动作路径（touch/pageOf/activeURLOf）并发访问同一会话的 Context/ActivePage/LastUsedAt，
 // 全部须在会话锁下进行。会话 Context==nil，evictSession 锁内早返回（nil 安全，无需真 go-rod），

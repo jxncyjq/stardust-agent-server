@@ -2,6 +2,7 @@ package browser
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net"
 	"net/url"
@@ -277,6 +278,14 @@ func (r *Runtime) emitObservation(sessionID string, obs Observation) {
 
 // Open 导航到 req.URL：复用或新建 Session + incognito Context，返回首次观测与 session id。
 func (r *Runtime) Open(ctx context.Context, req OpenReq) (OpenObservation, error) {
+	// 接管门控：会话接管中时 Agent 的写动作退让（read/screenshot 不受此限）。
+	// 置于函数最前，先于 checkURL 的 DNS 解析等任何副作用。传了 SessionID 才可能接管；
+	// 空 SessionID 是新建会话，天然不在接管态。
+	if req.SessionID != "" {
+		if sess, ok := r.sessions.Get(req.SessionID); ok && r.takeoverOf(sess) {
+			return OpenObservation{}, NewBrowserError(CodeTakeover, "session "+req.SessionID+" under manual takeover")
+		}
+	}
 	if err := r.checkURL(req.URL); err != nil {
 		return OpenObservation{}, err
 	}
@@ -400,6 +409,11 @@ func (r *Runtime) Read(ctx context.Context, req ReadReq) (Observation, error) {
 
 // Click 点击 ref 指向的元素，等待可能的导航后返回新观测。
 func (r *Runtime) Click(ctx context.Context, req ClickReq) (Observation, error) {
+	// 接管门控：与 Open 一致，先于 activePage（activePage 无活跃页时返回 nil sess，
+	// 此时才检查会读不到接管标志），直接查会话表判断。
+	if sess, ok := r.sessions.Get(req.SessionID); ok && r.takeoverOf(sess) {
+		return Observation{}, NewBrowserError(CodeTakeover, "session "+req.SessionID+" under manual takeover")
+	}
 	sess, page, err := r.activePage(req.SessionID)
 	if err != nil {
 		return Observation{}, err
@@ -430,6 +444,11 @@ func (r *Runtime) Click(ctx context.Context, req ClickReq) (Observation, error) 
 
 // Type 向 ref 指向的元素输入文本；Submit 为真则输入后按回车提交。
 func (r *Runtime) Type(ctx context.Context, req TypeReq) (Observation, error) {
+	// 接管门控：与 Open/Click 一致，先于 activePage（activePage 无活跃页时返回 nil sess，
+	// 此时才检查会读不到接管标志），直接查会话表判断。
+	if sess, ok := r.sessions.Get(req.SessionID); ok && r.takeoverOf(sess) {
+		return Observation{}, NewBrowserError(CodeTakeover, "session "+req.SessionID+" under manual takeover")
+	}
 	sess, page, err := r.activePage(req.SessionID)
 	if err != nil {
 		return Observation{}, err
@@ -474,9 +493,12 @@ func (r *Runtime) Close(ctx context.Context, req CloseReq) error {
 			// 避免与并发回收交错读写 Context 造成数据竞争。
 			var relErr error
 			sess.WithLock(func() {
-				relErr = r.mgr.ReleaseContext(sess.Context)
+				if sess.Context != nil {
+					relErr = r.mgr.ReleaseContext(sess.Context)
+				}
 				sess.Context = nil
 				sess.ActivePage = nil
+				sess.takeover = false // 关闭即退接管，防标志悬挂
 			})
 			r.sessions.Delete(req.SessionID)
 			r.stopScreencast(req.SessionID) // 停帧流，须在 drop hub 前
@@ -661,4 +683,129 @@ func (r *Runtime) checkURL(raw string) error {
 		}
 	}
 	return nil
+}
+
+// SetTakeover 置/清会话的人工接管标志（会话锁下）。enabled=false 恢复 Agent。
+// 未知会话按 CONTEXT_EVICTED 报错（不静默成功——fail-loud）。
+func (r *Runtime) SetTakeover(sessionID string, enabled bool) error {
+	sess, ok := r.sessions.Get(sessionID)
+	if !ok {
+		return NewBrowserError(CodeContextEvicted, "unknown session "+sessionID)
+	}
+	sess.WithLock(func() { sess.takeover = enabled })
+	return nil
+}
+
+// takeoverOf 在会话锁下读接管标志。nil 会话视为未接管。
+func (r *Runtime) takeoverOf(sess *Session) bool {
+	if sess == nil {
+		return false
+	}
+	var v bool
+	sess.WithLock(func() { v = sess.takeover })
+	return v
+}
+
+// InjectInput 把一批归一化输入事件注入会话活跃页（接管必须先开，否则拒）。
+// 每批先整体校验，再读一次当前视口宽高，把 0..1 坐标 × px 后经 go-rod 派发。
+// 与 Read/Click 等一样在会话锁下取活跃页，但注入本身在锁外执行（go-rod 调用可能阻塞，
+// 不宜久持会话锁）。这不是「无并发写者」的强保证：接管期间 Agent 写动作已被门控，
+// reaper 也会跳过接管中的会话（reapIdle）、Close 会清接管标志（Close 的 per-session
+// 分支），常见的并发写者路径已被排除；但显式对本会话调用 Close（并发的
+// Close(sessionID)）在本批次注入进行中仍可能发生——不会造成内存不安全，只会让批次里
+// 下一次 go-rod 调用因 Context/页已释放而 fail-loud 报错（错误被包装上报，不会静默）。
+func (r *Runtime) InjectInput(sessionID string, events []InputEvent) error {
+	if err := validateInputEvents(events); err != nil {
+		return NewBrowserErrorWrap(CodeElementNotFound, "invalid input batch", err)
+	}
+	sess, page, err := r.activePage(sessionID)
+	if err != nil {
+		return err
+	}
+	if !r.takeoverOf(sess) {
+		return NewBrowserError(CodeTakeover, "session "+sessionID+" not under takeover; enable takeover before injecting")
+	}
+	vw, vh, err := viewportSize(page)
+	if err != nil {
+		return NewBrowserErrorWrap(CodeContextEvicted, "read viewport for injection", err)
+	}
+	for i, ev := range events {
+		if err := injectOne(page, ev, vw, vh); err != nil {
+			return NewBrowserErrorWrap(CodeElementNotFound, fmt.Sprintf("inject event %d (%s)", i, ev.Type), err)
+		}
+	}
+	r.touch(sess) // 人工也算活跃：刷新 LastUsedAt，避免接管中会话被 reaper 回收
+	return nil
+}
+
+// viewportSize 读当前视口的 CSS 像素宽高（window.innerWidth/innerHeight）。
+func viewportSize(page *rod.Page) (float64, float64, error) {
+	res, err := page.Eval("() => ({w: window.innerWidth, h: window.innerHeight})")
+	if err != nil {
+		return 0, 0, err
+	}
+	w := res.Value.Get("w").Num()
+	h := res.Value.Get("h").Num()
+	if w <= 0 || h <= 0 {
+		return 0, 0, fmt.Errorf("non-positive viewport %vx%v", w, h)
+	}
+	return w, h, nil
+}
+
+// injectOne 把一条归一化事件 × 视口 px 后派发到 go-rod。鼠标类先 MoveTo 定位再动作。
+func injectOne(page *rod.Page, ev InputEvent, vw, vh float64) error {
+	px := proto.Point{X: ev.X * vw, Y: ev.Y * vh}
+	switch ev.Type {
+	case "mousemove":
+		return page.Mouse.MoveTo(px)
+	case "mousedown":
+		if err := page.Mouse.MoveTo(px); err != nil {
+			return err
+		}
+		return page.Mouse.Down(mouseButton(ev.Button), 1)
+	case "mouseup":
+		if err := page.Mouse.MoveTo(px); err != nil {
+			return err
+		}
+		return page.Mouse.Up(mouseButton(ev.Button), 1)
+	case "click":
+		if err := page.Mouse.MoveTo(px); err != nil {
+			return err
+		}
+		return page.Mouse.Click(mouseButton(ev.Button), 1)
+	case "wheel":
+		if err := page.Mouse.MoveTo(px); err != nil {
+			return err
+		}
+		return page.Mouse.Scroll(ev.DeltaX, ev.DeltaY, 1)
+	case "keydown":
+		k, err := keyToInputKey(ev.Key)
+		if err != nil {
+			return err
+		}
+		return page.Keyboard.Press(k)
+	case "keyup":
+		k, err := keyToInputKey(ev.Key)
+		if err != nil {
+			return err
+		}
+		return page.Keyboard.Release(k)
+	case "char":
+		return page.InsertText(ev.Text)
+	default:
+		// validateInputEvents 已挡掉未知类型；到这里属编程错误。
+		return fmt.Errorf("unhandled input type %q", ev.Type)
+	}
+}
+
+// mouseButton 把事件 button 名映射到 go-rod 常量；空/未知回落 left（validate 已挡未知非空值）。
+func mouseButton(name string) proto.InputMouseButton {
+	switch name {
+	case "right":
+		return proto.InputMouseButtonRight
+	case "middle":
+		return proto.InputMouseButtonMiddle
+	default:
+		return proto.InputMouseButtonLeft
+	}
 }

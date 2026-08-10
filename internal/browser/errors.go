@@ -6,13 +6,14 @@ import "fmt"
 type Code string
 
 const (
-	CodeElementNotFound   Code = "ELEMENT_NOT_FOUND"   // ref 失效，建议重新 read
-	CodeNavigationTimeout Code = "NAVIGATION_TIMEOUT"  // 导航超时，建议重试或换策略
-	CodeBlockedByCaptcha  Code = "BLOCKED_BY_CAPTCHA"  // 遇验证码
-	CodeDownloadTooLarge  Code = "DOWNLOAD_TOO_LARGE"  // 超文件上限
-	CodeContextEvicted    Code = "CONTEXT_EVICTED"     // Context 被回收，需重建 Session
-	CodeProtocolBlocked   Code = "PROTOCOL_BLOCKED"    // 危险协议被拦（file://、chrome://、data:）
-	CodePrivateHostBlocked Code = "PRIVATE_HOST_BLOCKED" // 私网地址被 SSRF 拦截
+	CodeElementNotFound    Code = "ELEMENT_NOT_FOUND"      // ref 失效，建议重新 read
+	CodeNavigationTimeout  Code = "NAVIGATION_TIMEOUT"     // 导航超时，建议重试或换策略
+	CodeBlockedByCaptcha   Code = "BLOCKED_BY_CAPTCHA"     // 遇验证码
+	CodeDownloadTooLarge   Code = "DOWNLOAD_TOO_LARGE"     // 超文件上限
+	CodeContextEvicted     Code = "CONTEXT_EVICTED"        // Context 被回收，需重建 Session
+	CodeProtocolBlocked    Code = "PROTOCOL_BLOCKED"       // 危险协议被拦（file://、chrome://、data:）
+	CodePrivateHostBlocked Code = "PRIVATE_HOST_BLOCKED"   // 私网地址被 SSRF 拦截
+	CodeTakeover           Code = "SESSION_UNDER_TAKEOVER" // 会话被人工接管，Agent 写动作暂挡
 )
 
 // BrowserError 携带语义码，供工具层映射到 domain.ToolResult.Error。

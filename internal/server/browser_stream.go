@@ -17,6 +17,10 @@ import (
 type BrowserStreamer interface {
 	Subscribe(sessionID string) (<-chan browser.StreamEvent, func(), error)
 	ReplaySince(sessionID string, lastID uint64) []browser.StreamEvent
+	// SetTakeover 置/清会话人工接管标志；InjectInput 注入一批归一化输入事件。
+	// 二者仅具体 *browser.Runtime 满足（同 ReplaySince），不进 browser.RuntimeAPI。
+	SetTakeover(sessionID string, enabled bool) error
+	InjectInput(sessionID string, events []browser.InputEvent) error
 }
 
 // parseBrowserSessionID 从 /v1/browser/sessions/{id}/stream 抽 id。

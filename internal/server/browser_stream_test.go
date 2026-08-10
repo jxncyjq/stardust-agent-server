@@ -26,6 +26,13 @@ func (f *fakeStreamer) ReplaySince(sessionID string, lastID uint64) []browser.St
 	return f.replay
 }
 
+// SetTakeover/InjectInput：本文件仅测 SSE 推流路径，不需要真实行为，
+// 存在仅为满足扩展后的 BrowserStreamer 接口（B5）。
+func (f *fakeStreamer) SetTakeover(sessionID string, enabled bool) error { return nil }
+func (f *fakeStreamer) InjectInput(sessionID string, events []browser.InputEvent) error {
+	return nil
+}
+
 func TestBrowserStreamWritesSSEEvents(t *testing.T) {
 	f := &fakeStreamer{ch: make(chan browser.StreamEvent, 4)}
 	srv := &HTTPServer{browser: f}
