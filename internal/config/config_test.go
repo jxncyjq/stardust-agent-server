@@ -551,6 +551,83 @@ func TestMaasProfileContextLength(t *testing.T) {
 	}
 }
 
+// TestLoadServerFileBaseURLConfig validates that a configured
+// server.file_base_url loads and that a trailing slash is trimmed, so
+// callers can safely concatenate "/v1/files?..." onto it without a double
+// slash.
+func TestLoadServerFileBaseURLConfig(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "agent.json")
+	body := `{
+		"server": {
+			"file_base_url": "https://agent.example.com/"
+		}
+	}`
+	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", path, err)
+	}
+
+	cfg, err := Load(context.Background(), Options{Path: path})
+	if err != nil {
+		t.Fatalf("Load(%q) error = %v, want nil", path, err)
+	}
+	if cfg.Server.FileBaseURL != "https://agent.example.com" {
+		t.Fatalf("Load(%q).Server.FileBaseURL = %q, want trailing slash trimmed", path, cfg.Server.FileBaseURL)
+	}
+}
+
+// TestLoadServerFileBaseURLAbsentDefaultsToEmpty pins the contract that an
+// absent server.file_base_url is a legitimate optional default (empty
+// string), not an error — generated-file links then stay relative paths.
+func TestLoadServerFileBaseURLAbsentDefaultsToEmpty(t *testing.T) {
+	t.Parallel()
+
+	cfg, err := Load(context.Background(), Options{Path: ""})
+	if err != nil {
+		t.Fatalf("Load(default) error = %v, want nil", err)
+	}
+	if cfg.Server.FileBaseURL != "" {
+		t.Fatalf("Load(default).Server.FileBaseURL = %q, want empty default", cfg.Server.FileBaseURL)
+	}
+}
+
+// TestLoadServerFileBaseURLInvalidFailsLoud validates that an invalid
+// server.file_base_url (unparseable or non-http(s) scheme) causes Load to
+// fail loud with an error mentioning file_base_url, rather than silently
+// keeping a broken value.
+func TestLoadServerFileBaseURLInvalidFailsLoud(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		value string
+	}{
+		{"not a url", "not a url"},
+		{"unsupported scheme", "ftp://x"},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join(t.TempDir(), "agent.json")
+			body := `{"server": {"file_base_url": "` + tc.value + `"}}`
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatalf("WriteFile(%q) error = %v, want nil", path, err)
+			}
+
+			_, err := Load(context.Background(), Options{Path: path})
+			if err == nil {
+				t.Fatalf("Load(%q) with file_base_url %q should return error, got nil", path, tc.value)
+			}
+			if !strings.Contains(err.Error(), "file_base_url") {
+				t.Fatalf("Load error %q should mention file_base_url", err.Error())
+			}
+		})
+	}
+}
+
 func TestDefaultConfigWebSearchFields(t *testing.T) {
 	cfg := defaultConfig()
 	if cfg.Web.SearchDefaultLimit != 5 {

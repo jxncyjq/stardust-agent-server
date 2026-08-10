@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/stardust/legion-agent/internal/toolauth"
 )
@@ -122,6 +124,11 @@ type ServerConfig struct {
 	// loopback hardening mode. Empty means the default under the platform
 	// AppDataDir (handshake.json).
 	HandshakeFile string `json:"handshake_file"`
+	// FileBaseURL is the public base for generated-file links (no trailing slash),
+	// e.g. "https://agent.example.com". Empty (default) means links are returned
+	// as relative paths ("/v1/files?..."), which the loopback frontend resolves
+	// against its own known base URL. Deployment sets a domain here.
+	FileBaseURL string `json:"file_base_url,omitempty"`
 }
 
 type ServiceConfig struct {
@@ -262,6 +269,21 @@ func Load(ctx context.Context, opts Options) (Config, error) {
 		if !gateableNames[name] {
 			return Config{}, fmt.Errorf("unknown disabled tool %q", name)
 		}
+	}
+
+	// Validate server.file_base_url: contract-optional (empty = relative-path
+	// links), but a non-empty value must be a valid http(s) URL — fail-loud
+	// rather than silently keeping a broken base for generated-file links.
+	if cfg.Server.FileBaseURL != "" {
+		trimmed := strings.TrimRight(cfg.Server.FileBaseURL, "/")
+		parsed, err := url.Parse(trimmed)
+		if err != nil {
+			return Config{}, fmt.Errorf("server.file_base_url %q invalid: %w", cfg.Server.FileBaseURL, err)
+		}
+		if parsed.Scheme != "http" && parsed.Scheme != "https" {
+			return Config{}, fmt.Errorf("server.file_base_url %q invalid: unsupported scheme %q", cfg.Server.FileBaseURL, parsed.Scheme)
+		}
+		cfg.Server.FileBaseURL = trimmed
 	}
 
 	return cfg, nil
