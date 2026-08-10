@@ -662,3 +662,24 @@ func (r *Runtime) checkURL(raw string) error {
 	}
 	return nil
 }
+
+// SetTakeover 置/清会话的人工接管标志（会话锁下）。enabled=false 恢复 Agent。
+// 未知会话按 CONTEXT_EVICTED 报错（不静默成功——fail-loud）。
+func (r *Runtime) SetTakeover(sessionID string, enabled bool) error {
+	sess, ok := r.sessions.Get(sessionID)
+	if !ok {
+		return NewBrowserError(CodeContextEvicted, "unknown session "+sessionID)
+	}
+	sess.WithLock(func() { sess.takeover = enabled })
+	return nil
+}
+
+// takeoverOf 在会话锁下读接管标志。nil 会话视为未接管。
+func (r *Runtime) takeoverOf(sess *Session) bool {
+	if sess == nil {
+		return false
+	}
+	var v bool
+	sess.WithLock(func() { v = sess.takeover })
+	return v
+}

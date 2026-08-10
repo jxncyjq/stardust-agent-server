@@ -20,6 +20,10 @@ type Session struct {
 	CreatedAt  time.Time
 	LastUsedAt time.Time
 
+	// takeover 为真时该会话进入人工接管：Agent 的写动作（Open/Click/Type）被挡，
+	// 只有前端注入的输入能写。会话锁（mu）下读写，与 Context/ActivePage 同一把锁。
+	takeover bool
+
 	mu sync.Mutex // 会话内串行锁（spec §3.3 关键决策）
 }
 
