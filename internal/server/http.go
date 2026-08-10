@@ -283,6 +283,10 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleEvents(rec, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/browser/sessions/") && strings.HasSuffix(r.URL.Path, "/stream"):
 		s.handleBrowserStream(rec, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/browser/sessions/") && strings.HasSuffix(r.URL.Path, "/takeover"):
+		s.handleBrowserTakeover(rec, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/browser/sessions/") && strings.HasSuffix(r.URL.Path, "/input"):
+		s.handleBrowserInput(rec, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/approvals":
 		s.handleListApprovals(rec, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/audit-events":
