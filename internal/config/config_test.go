@@ -637,3 +637,16 @@ func TestDefaultConfigWebSearchFields(t *testing.T) {
 		t.Errorf("SearchTimeoutSeconds = %d, want 15", cfg.Web.SearchTimeoutSeconds)
 	}
 }
+
+func TestBrowserSnapshotDefaults(t *testing.T) {
+	cfg := defaultConfig()
+	if cfg.Browser.SnapshotRuneThreshold != 15000 {
+		t.Fatalf("SnapshotRuneThreshold = %d, want 15000", cfg.Browser.SnapshotRuneThreshold)
+	}
+	if cfg.Browser.MaxElements != 100 {
+		t.Fatalf("MaxElements = %d, want 100", cfg.Browser.MaxElements)
+	}
+	if cfg.Browser.SnapshotTTLHours != 24 {
+		t.Fatalf("SnapshotTTLHours = %d, want 24", cfg.Browser.SnapshotTTLHours)
+	}
+}

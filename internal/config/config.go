@@ -71,6 +71,14 @@ type BrowserConfig struct {
 	SessionTTLSeconds int `json:"session_ttl_seconds"`
 	// ReapIntervalSeconds 是 reaper 后台扫描间隔（秒）。0 = 默认 60s。
 	ReapIntervalSeconds int `json:"reap_interval_seconds"`
+	// MaxElements 是 a11y 观测保留的最大可交互元素数（次级硬上限）。0 = 默认 100。
+	MaxElements int `json:"max_elements"`
+	// SnapshotRuneThreshold 是渲染文本触发降级的 rune 阈值。0 = 关闭降级。
+	SnapshotRuneThreshold int `json:"snapshot_rune_threshold"`
+	// SnapshotTTLHours 是落盘全文快照保留时长（小时）。0 = 不清理。
+	SnapshotTTLHours int `json:"snapshot_ttl_hours"`
+	// SnapshotArchiveDir 是相对工具根的落盘子目录。空 = 默认 .legion/browser/snapshots。
+	SnapshotArchiveDir string `json:"snapshot_archive_dir"`
 }
 
 type MaasConfig struct {
@@ -375,6 +383,12 @@ func defaultConfig() Config {
 			SearchEngine:         "",
 			SearchDefaultLimit:   5,
 			SearchTimeoutSeconds: 15,
+		},
+		Browser: BrowserConfig{
+			MaxElements:           100,
+			SnapshotRuneThreshold: 15000,
+			SnapshotTTLHours:      24,
+			SnapshotArchiveDir:    ".legion/browser/snapshots",
 		},
 		Evolution: EvolutionConfig{
 			DegradationThreshold:   0.2,
