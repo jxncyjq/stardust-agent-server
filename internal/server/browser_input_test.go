@@ -18,6 +18,12 @@ type fakeBrowser struct {
 	}
 	injected  [][]browser.InputEvent
 	injectErr error
+	viewport  struct {
+		id     string
+		width  int
+		height int
+	}
+	viewportErr error
 }
 
 func (f *fakeBrowser) Subscribe(string) (<-chan browser.StreamEvent, func(), error) {
@@ -37,6 +43,17 @@ func (f *fakeBrowser) InjectInput(id string, events []browser.InputEvent) error 
 		return f.injectErr
 	}
 	f.injected = append(f.injected, events)
+	return nil
+}
+func (f *fakeBrowser) SetViewport(id string, width, height int) error {
+	if f.viewportErr != nil {
+		return f.viewportErr
+	}
+	f.viewport = struct {
+		id     string
+		width  int
+		height int
+	}{id, width, height}
 	return nil
 }
 
@@ -126,5 +143,41 @@ func TestHandleInputOtherError400(t *testing.T) {
 	s.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestHandleViewportSetsSize(t *testing.T) {
+	fb := &fakeBrowser{}
+	s := newBrowserTestServer(fb)
+	body, _ := json.Marshal(map[string]int{"width": 620, "height": 800})
+	req := httptest.NewRequest(http.MethodPost, "/v1/browser/sessions/sess-1/viewport", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	if fb.viewport.id != "sess-1" || fb.viewport.width != 620 || fb.viewport.height != 800 {
+		t.Fatalf("SetViewport not called as expected: %+v", fb.viewport)
+	}
+}
+
+func TestHandleViewportErrorMaps400(t *testing.T) {
+	fb := &fakeBrowser{viewportErr: browser.NewBrowserError(browser.CodeElementNotFound, "viewport out of range")}
+	s := newBrowserTestServer(fb)
+	req := httptest.NewRequest(http.MethodPost, "/v1/browser/sessions/sess-1/viewport", bytes.NewReader([]byte(`{"width":1,"height":1}`)))
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestHandleViewportNilBrowser503(t *testing.T) {
+	s := NewHTTPServer(Config{}) // Browser nil
+	req := httptest.NewRequest(http.MethodPost, "/v1/browser/sessions/sess-1/viewport", bytes.NewReader([]byte(`{"width":620,"height":800}`)))
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503", rec.Code)
 	}
 }

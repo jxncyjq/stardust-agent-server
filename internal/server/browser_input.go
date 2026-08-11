@@ -35,6 +35,35 @@ type inputRequest struct {
 	Events []browser.InputEvent `json:"events"`
 }
 
+type viewportRequest struct {
+	Width  int `json:"width"`
+	Height int `json:"height"`
+}
+
+// handleBrowserViewport 把会话视口设为请求的 width×height，使帧填满 GUI 面板（消除
+// letterbox）。auth 由 HTTPServer.authorized 统一守。范围/无会话/无活跃页 → 400。
+func (s *HTTPServer) handleBrowserViewport(w http.ResponseWriter, r *http.Request) {
+	if s.browser == nil {
+		writeError(w, http.StatusServiceUnavailable, "browser runtime is unavailable")
+		return
+	}
+	id, _, ok := parseBrowserActionID(r.URL.Path)
+	if !ok {
+		writeError(w, http.StatusNotFound, "bad browser viewport path")
+		return
+	}
+	var req viewportRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid viewport request")
+		return
+	}
+	if err := s.browser.SetViewport(id, req.Width, req.Height); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"session_id": id, "width": req.Width, "height": req.Height})
+}
+
 // handleBrowserTakeover 置/清会话接管标志。auth 由 HTTPServer.authorized 统一守。
 func (s *HTTPServer) handleBrowserTakeover(w http.ResponseWriter, r *http.Request) {
 	if s.browser == nil {

@@ -738,6 +738,38 @@ func (r *Runtime) InjectInput(sessionID string, events []InputEvent) error {
 	return nil
 }
 
+// viewport 尺寸边界：下界避免退化视口，上界是防呆上限（面板尺寸算错或恶意调用
+// 不得请求超大渲染面。）
+const (
+	minViewportPx = 100
+	maxViewportPx = 8192
+)
+
+// SetViewport 把会话视口覆盖为 width×height CSS px，使 screencast 帧的宽高比与 GUI
+// 面板一致、填满面板而无 letterbox（帧面随设备度量变化，screencaster 未设
+// MaxWidth/MaxHeight）。活跃页在会话锁下读取（同 InjectInput），CDP 调用在锁外执行。
+// 若 screencast 正在运行则重启一次，让下一帧立即反映新尺寸。
+func (r *Runtime) SetViewport(sessionID string, width, height int) error {
+	if width < minViewportPx || width > maxViewportPx || height < minViewportPx || height > maxViewportPx {
+		return NewBrowserError(CodeElementNotFound, fmt.Sprintf("viewport %dx%d out of range [%d,%d]", width, height, minViewportPx, maxViewportPx))
+	}
+	// activePage 拿一次会话锁返回活跃页（同 InjectInput）。绝不能改回 sess.WithLock(pageOf)：
+	// pageOf 内部自己拿会话锁，再套一层 WithLock 会重入死锁（Go 互斥锁不可重入）。
+	sess, page, err := r.activePage(sessionID)
+	if err != nil {
+		return err
+	}
+	if err := page.SetViewport(&proto.EmulationSetDeviceMetricsOverride{
+		Width:             width,
+		Height:            height,
+		DeviceScaleFactor: 1,
+	}); err != nil {
+		return NewBrowserErrorWrap(CodeContextEvicted, "set viewport", err)
+	}
+	r.restartScreencastIfActive(sess)
+	return nil
+}
+
 // viewportSize 读当前视口的 CSS 像素宽高（window.innerWidth/innerHeight）。
 func viewportSize(page *rod.Page) (float64, float64, error) {
 	res, err := page.Eval("() => ({w: window.innerWidth, h: window.innerHeight})")

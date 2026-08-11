@@ -21,6 +21,8 @@ type BrowserStreamer interface {
 	// 二者仅具体 *browser.Runtime 满足（同 ReplaySince），不进 browser.RuntimeAPI。
 	SetTakeover(sessionID string, enabled bool) error
 	InjectInput(sessionID string, events []browser.InputEvent) error
+	// SetViewport 把会话视口设为 width×height CSS px，使帧填满 GUI 面板。
+	SetViewport(sessionID string, width, height int) error
 }
 
 // parseBrowserSessionID 从 /v1/browser/sessions/{id}/stream 抽 id。
