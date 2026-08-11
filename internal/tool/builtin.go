@@ -391,6 +391,11 @@ func NewWorkspaceRegistry(root string, audit port.AuditLog, opts ...WorkspaceReg
 			"developer:web_search":          true,
 			"developer:web_extract":         true,
 			"developer:session_search":      true,
+			"developer:browser_open":        true,
+			"developer:browser_read":        true,
+			"developer:browser_click":       true,
+			"developer:browser_type":        true,
+			"developer:browser_close":       true,
 		}, nil),
 		NoopGuardrails{},
 	).WithAuditLog(audit).WithOutputSanitizer(quality.NewOutputSanitizer())
@@ -535,6 +540,11 @@ func NewFileReadWriteWorkspaceRegistry(root string, audit port.AuditLog, opts ..
 			"developer:web_search":          true,
 			"developer:web_extract":         true,
 			"developer:session_search":      true,
+			"developer:browser_open":        true,
+			"developer:browser_read":        true,
+			"developer:browser_click":       true,
+			"developer:browser_type":        true,
+			"developer:browser_close":       true,
 		}, nil),
 		NoopGuardrails{},
 	).WithAuditLog(audit).WithOutputSanitizer(quality.NewOutputSanitizer())
