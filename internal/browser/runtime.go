@@ -28,6 +28,12 @@ type RuntimeConfig struct {
 	// Store 是可选的会话持久化端口：非 nil 时装配写穿并在启动时从盘加载已存会话
 	// （Context=nil 懒重建）；nil = 纯内存，Phase 1/2 行为不变。
 	Store BrowserSessionStore
+	// 快照降级（Task: browser-snapshot-degradation）。
+	Extractor             SnapshotExtractor // 可空：nil 则超阈快照只截断不抽取
+	Archive               SnapshotArchive   // 可空：nil 时 NewRuntime 装配 fileSnapshotArchive
+	SnapshotRuneThreshold int               // 渲染文本超此 rune 数触发降级；<=0 关闭降级
+	SnapshotTTL           time.Duration     // 落盘全文保留时长；<=0 不清理
+	SnapshotArchiveDir    string            // 相对工具根的落盘子目录；空=默认
 }
 
 // Runtime 是 RuntimeAPI 的 go-rod 实现。
@@ -61,6 +67,11 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 		cfg:           cfg,
 		hubs:          newHubRegistry(),
 		screencasters: &sync.Map{},
+	}
+	// 快照降级：开启阈值且未显式注入 Archive 时，装配默认文件落盘（相对工具根子目录）。
+	// 赋给 r.cfg（副本）而非局部 cfg，确保 observe 经 r.cfg.Archive 读到。
+	if cfg.SnapshotRuneThreshold > 0 && r.cfg.Archive == nil {
+		r.cfg.Archive = newFileSnapshotArchive(cfg.SnapshotArchiveDir)
 	}
 	// 可选持久化：装配写穿端口 + 从盘加载已存会话（Context=nil，懒重建），
 	// 使进程重启后仍能识别历史会话 id（否则会误判 CONTEXT_EVICTED）。nil 时全跳过（Phase 1/2）。
@@ -338,7 +349,7 @@ func (r *Runtime) Open(ctx context.Context, req OpenReq) (OpenObservation, error
 		}
 		sess.ActivePage = &pageHandle{page: page}
 		sess.ActiveURL = req.URL // 记录当前地址：TTL 回收落盘、重启恢复时用它重新导航
-		obs, opErr = r.observe(page, sess)
+		obs, opErr = r.observe(ctx, page, sess, req.UserTask, req.ToolRoot)
 	})
 	if opErr != nil {
 		return OpenObservation{}, opErr
@@ -398,7 +409,7 @@ func (r *Runtime) Read(ctx context.Context, req ReadReq) (Observation, error) {
 	}
 	var obs Observation
 	var opErr error
-	sess.WithLock(func() { obs, opErr = r.observe(page, sess) })
+	sess.WithLock(func() { obs, opErr = r.observe(ctx, page, sess, req.UserTask, req.ToolRoot) })
 	if opErr != nil {
 		return Observation{}, opErr
 	}
@@ -431,7 +442,7 @@ func (r *Runtime) Click(ctx context.Context, req ClickReq) (Observation, error) 
 			return
 		}
 		_ = page.WaitLoad() // best-effort：点击可能不触发导航，等不到 load 不算失败（M1 有意保留）
-		obs, opErr = r.observe(page, sess)
+		obs, opErr = r.observe(ctx, page, sess, req.UserTask, req.ToolRoot)
 	})
 	if opErr != nil {
 		return Observation{}, opErr
@@ -472,7 +483,7 @@ func (r *Runtime) Type(ctx context.Context, req TypeReq) (Observation, error) {
 			}
 			_ = page.WaitLoad() // best-effort：提交可能不触发导航（M1 有意保留）
 		}
-		obs, opErr = r.observe(page, sess)
+		obs, opErr = r.observe(ctx, page, sess, req.UserTask, req.ToolRoot)
 	})
 	if opErr != nil {
 		return Observation{}, opErr
@@ -569,7 +580,7 @@ func (r *Runtime) activePage(sessionID string) (*Session, *rod.Page, error) {
 // I3 精确映射：ref 的分配顺序与 BuildObservation 完全一致（interactive && visible、
 // 按输入顺序），因此这里对同一 keep 过滤收集的 keptBackend 与 obs.Elements 一一对齐，
 // e1、e2… 各自绑定到当时那个节点的 backendNodeID，杜绝按 DOM 位置重查导致的错位。
-func (r *Runtime) observe(page *rod.Page, sess *Session) (Observation, error) {
+func (r *Runtime) observe(ctx context.Context, page *rod.Page, sess *Session, userTask, toolRoot string) (Observation, error) {
 	tree, err := proto.AccessibilityGetFullAXTree{}.Call(page)
 	if err != nil {
 		return Observation{}, NewBrowserErrorWrap(CodeContextEvicted, "get a11y tree", err)
@@ -607,7 +618,9 @@ func (r *Runtime) observe(page *rod.Page, sess *Session) (Observation, error) {
 			sess.Refs[e.Ref] = strconv.Itoa(int(keptBackend[i]))
 		}
 	}
-	return obs, nil
+	return DegradeObservation(ctx, obs, userTask, toolRoot,
+		DegradeDeps{Extractor: r.cfg.Extractor, Archive: r.cfg.Archive},
+		r.cfg.SnapshotRuneThreshold)
 }
 
 // axValueString 把 CDP AX 属性值渲染成纯字符串（gson.JSON.Str() 对字符串值最贴切）。

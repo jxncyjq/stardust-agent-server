@@ -248,7 +248,15 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 	tool.RegisterAgentMessageTools(tools, opts.MessageStore)
 	tool.RegisterWebTools(tools, opts.WebTools)
 	if opts.Browser.Enabled {
-		brt, err := browser.NewRuntime(browser.RuntimeConfig{Headless: opts.Browser.Headless, BinPath: opts.Browser.BinPath})
+		brt, err := browser.NewRuntime(browser.RuntimeConfig{
+			Headless:              opts.Browser.Headless,
+			BinPath:               opts.Browser.BinPath,
+			MaxElements:           opts.Browser.MaxElements,
+			SnapshotRuneThreshold: opts.Browser.SnapshotRuneThreshold,
+			SnapshotTTL:           time.Duration(opts.Browser.SnapshotTTLHours) * time.Hour,
+			SnapshotArchiveDir:    opts.Browser.SnapshotArchiveDir,
+			Extractor:             adapter.NewMaasSnapshotExtractor(maas),
+		})
 		if err != nil {
 			return DemoResult{}, fmt.Errorf("init browser runtime: %w", err)
 		}
@@ -260,7 +268,7 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 				taskLogger.Warn("close browser runtime", "error", cerr)
 			}
 		}()
-		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: brt})
+		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: brt, ToolRoot: toolRoot})
 	}
 	runner := runtime.NewRuntime(runtime.Config{
 		Maas:              maas,

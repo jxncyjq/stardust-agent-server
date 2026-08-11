@@ -2017,7 +2017,7 @@ func (d *defaultTaskRunner) RunTask(ctx context.Context, agent domain.Agent, tas
 	tool.RegisterWebTools(tools, d.webOptions)
 	if d.browserRuntime != nil {
 		// Shared runtime injected at serve assembly; no per-task browser launch.
-		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: d.browserRuntime, Events: d.browserEvents})
+		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: d.browserRuntime, Events: d.browserEvents, ToolRoot: root})
 	}
 	tool.RegisterSessionSearchTool(tools, d.sessionSearcher)
 	agentruntime.RegisterMoAConsultTool(tools, d.maasResolver)
@@ -2346,10 +2346,15 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		// SQLite 时注入一个把 browser_sessions 表桥到端口的适配器，让登录态跨进程
 		// 重启存活；非 SQLite 驱动拿不到 repo，Store 保持 nil（纯内存，Phase 1/2 行为）。
 		runtimeCfg := browser.RuntimeConfig{
-			Headless:     cfg.Browser.Headless,
-			BinPath:      cfg.Browser.BinPath,
-			SessionTTL:   time.Duration(cfg.Browser.SessionTTLSeconds) * time.Second,
-			ReapInterval: time.Duration(cfg.Browser.ReapIntervalSeconds) * time.Second,
+			Headless:              cfg.Browser.Headless,
+			BinPath:               cfg.Browser.BinPath,
+			SessionTTL:            time.Duration(cfg.Browser.SessionTTLSeconds) * time.Second,
+			ReapInterval:          time.Duration(cfg.Browser.ReapIntervalSeconds) * time.Second,
+			MaxElements:           cfg.Browser.MaxElements,
+			SnapshotRuneThreshold: cfg.Browser.SnapshotRuneThreshold,
+			SnapshotTTL:           time.Duration(cfg.Browser.SnapshotTTLHours) * time.Hour,
+			SnapshotArchiveDir:    cfg.Browser.SnapshotArchiveDir,
+			Extractor:             adapter.NewMaasSnapshotExtractor(defaultMaas),
 		}
 		if repo, ok := taskStore.(*storage.SQLiteRepository); ok {
 			runtimeCfg.Store = newSQLiteBrowserStore(repo)

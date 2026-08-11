@@ -253,7 +253,7 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 	tool.RegisterWebTools(tools, webToolOptions(r.rootConfig.Web))
 	if r.browserRuntime != nil {
 		// Shared runtime injected at serve assembly; no per-task browser launch.
-		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: r.browserRuntime})
+		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: r.browserRuntime, ToolRoot: toolRoot})
 	}
 	recentTurns, err := r.recentTurnsForTask(ctx, task)
 	if err != nil {

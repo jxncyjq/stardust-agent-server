@@ -133,6 +133,7 @@ func stringifyArgument(value any) string {
 // drawn from one scoped source: a Plan-mode run dispatches and loads against its
 // read-only subset, never a broader set than it offered.
 func (r *Runtime) dispatchToolCall(ctx context.Context, agent domain.Agent, task domain.Task, call domain.ToolCall, st *loopState) (domain.ToolResult, error) {
+	ctx = tool.WithUserTask(ctx, task.Input)
 	tools := st.tools
 	if r.toolGate != nil {
 		allow, err := r.toolGate.Resolve(ctx, task, call, tools)
