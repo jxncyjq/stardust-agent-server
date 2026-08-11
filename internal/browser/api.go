@@ -7,23 +7,31 @@ type OpenReq struct {
 	URL       string
 	SessionID string // 空则新建 Session
 	TaskID    string // 新建时绑定
+	UserTask  string // 当前 agent 任务文本，供超阈快照按任务抽取；空则跳过抽取
+	ToolRoot  string // 与 read_file 同源的工具根，落盘全文使其可被翻页
 }
 
 type ReadReq struct {
 	SessionID string
 	Mode      string // 空=默认 a11y 树；本 Phase 只实现 a11y
+	UserTask  string // 当前 agent 任务文本，供超阈快照按任务抽取；空则跳过抽取
+	ToolRoot  string // 与 read_file 同源的工具根，落盘全文使其可被翻页
 }
 
 type ClickReq struct {
 	SessionID string
 	Ref       string
+	UserTask  string // 当前 agent 任务文本，供超阈快照按任务抽取；空则跳过抽取
+	ToolRoot  string // 与 read_file 同源的工具根，落盘全文使其可被翻页
 }
 
 type TypeReq struct {
 	SessionID string
 	Ref       string
 	Text      string
-	Submit    bool // true 则输入后回车提交
+	Submit    bool   // true 则输入后回车提交
+	UserTask  string // 当前 agent 任务文本，供超阈快照按任务抽取；空则跳过抽取
+	ToolRoot  string // 与 read_file 同源的工具根，落盘全文使其可被翻页
 }
 
 type CloseReq struct {
