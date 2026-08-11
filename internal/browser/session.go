@@ -25,6 +25,11 @@ type Session struct {
 	takeover bool
 
 	mu sync.Mutex // 会话内串行锁（spec §3.3 关键决策）
+	// inputMu 串行化本会话的输入注入。注入本身在 mu 之外执行（go-rod 调用可能阻塞，
+	// 不宜久持会话锁），但一批注入会顺序改写共享的 page.Mouse 状态（当前坐标/按下的键）；
+	// 若接管期间多个并发批次交错，press/release 顺序被打乱，Chrome 便合成不出干净的
+	// click。inputMu 只挡「并发注入」这一路，不与 mu/observe/reaper 争锁。
+	inputMu sync.Mutex
 }
 
 // WithLock 在会话串行锁下执行 fn——同 Session 动作串行，跨 Session 并行。
