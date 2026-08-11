@@ -260,7 +260,7 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 				taskLogger.Warn("close browser runtime", "error", cerr)
 			}
 		}()
-		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: brt})
+		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: brt, ToolRoot: toolRoot})
 	}
 	runner := runtime.NewRuntime(runtime.Config{
 		Maas:              maas,

@@ -2017,7 +2017,7 @@ func (d *defaultTaskRunner) RunTask(ctx context.Context, agent domain.Agent, tas
 	tool.RegisterWebTools(tools, d.webOptions)
 	if d.browserRuntime != nil {
 		// Shared runtime injected at serve assembly; no per-task browser launch.
-		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: d.browserRuntime, Events: d.browserEvents})
+		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: d.browserRuntime, Events: d.browserEvents, ToolRoot: root})
 	}
 	tool.RegisterSessionSearchTool(tools, d.sessionSearcher)
 	agentruntime.RegisterMoAConsultTool(tools, d.maasResolver)

@@ -21,6 +21,8 @@ type BrowserToolOptions struct {
 	Runtime browser.RuntimeAPI
 	// Events 可选：非 nil 时在 browser_open/close 成功后发会话生命周期事件；nil 表示不发。
 	Events BrowserEventSink
+	// ToolRoot 与 read_file 同源的工具根；落盘全文快照使其可被 read_file 翻页。
+	ToolRoot string
 }
 
 // RegisterBrowserTools 注册 browser_open/read/click/type/close。照 RegisterWebTools 语义：
@@ -36,7 +38,7 @@ func RegisterBrowserTools(registry *Registry, opts BrowserToolOptions) {
 		if url == "" {
 			return failure(call.ID, "url is required"), nil
 		}
-		out, err := rt.Open(ctx, browser.OpenReq{URL: url, SessionID: call.Arguments["session_id"]})
+		out, err := rt.Open(ctx, browser.OpenReq{URL: url, SessionID: call.Arguments["session_id"], UserTask: UserTaskFromContext(ctx), ToolRoot: opts.ToolRoot})
 		if err != nil {
 			return failure(call.ID, err.Error()), nil
 		}
@@ -47,7 +49,7 @@ func RegisterBrowserTools(registry *Registry, opts BrowserToolOptions) {
 	}))
 
 	registry.RegisterDescriptor(browserReadDescriptor(), HandlerFunc(func(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
-		obs, err := rt.Read(ctx, browser.ReadReq{SessionID: call.Arguments["session_id"], Mode: call.Arguments["mode"]})
+		obs, err := rt.Read(ctx, browser.ReadReq{SessionID: call.Arguments["session_id"], Mode: call.Arguments["mode"], UserTask: UserTaskFromContext(ctx), ToolRoot: opts.ToolRoot})
 		if err != nil {
 			return failure(call.ID, err.Error()), nil
 		}
@@ -55,7 +57,7 @@ func RegisterBrowserTools(registry *Registry, opts BrowserToolOptions) {
 	}))
 
 	registry.RegisterDescriptor(browserClickDescriptor(), HandlerFunc(func(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
-		obs, err := rt.Click(ctx, browser.ClickReq{SessionID: call.Arguments["session_id"], Ref: call.Arguments["ref"]})
+		obs, err := rt.Click(ctx, browser.ClickReq{SessionID: call.Arguments["session_id"], Ref: call.Arguments["ref"], UserTask: UserTaskFromContext(ctx), ToolRoot: opts.ToolRoot})
 		if err != nil {
 			return failure(call.ID, err.Error()), nil
 		}
@@ -67,6 +69,7 @@ func RegisterBrowserTools(registry *Registry, opts BrowserToolOptions) {
 		obs, err := rt.Type(ctx, browser.TypeReq{
 			SessionID: call.Arguments["session_id"], Ref: call.Arguments["ref"],
 			Text: call.Arguments["text"], Submit: submit,
+			UserTask: UserTaskFromContext(ctx), ToolRoot: opts.ToolRoot,
 		})
 		if err != nil {
 			return failure(call.ID, err.Error()), nil
