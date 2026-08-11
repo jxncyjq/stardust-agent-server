@@ -742,6 +742,11 @@ func (r *Runtime) InjectInput(sessionID string, events []InputEvent) error {
 	if err != nil {
 		return NewBrowserErrorWrap(CodeContextEvicted, "read viewport for injection", err)
 	}
+	// 串行化本会话的注入：injectOne 顺序改写共享的 page.Mouse（坐标/按下的键），
+	// 并发批次交错会打乱 press/release 顺序，令 Chrome 合成不出 click（接管点击失效）。
+	// inputMu 只挡并发注入，不碰会话锁，故不阻塞 observe/reaper。
+	sess.inputMu.Lock()
+	defer sess.inputMu.Unlock()
 	for i, ev := range events {
 		if err := injectOne(page, ev, vw, vh); err != nil {
 			return NewBrowserErrorWrap(CodeElementNotFound, fmt.Sprintf("inject event %d (%s)", i, ev.Type), err)
