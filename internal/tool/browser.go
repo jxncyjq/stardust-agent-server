@@ -38,7 +38,7 @@ func RegisterBrowserTools(registry *Registry, opts BrowserToolOptions) {
 		if url == "" {
 			return failure(call.ID, "url is required"), nil
 		}
-		out, err := rt.Open(ctx, browser.OpenReq{URL: url, SessionID: call.Arguments["session_id"], UserTask: UserTaskFromContext(ctx), ToolRoot: opts.ToolRoot})
+		out, err := rt.Open(ctx, browser.OpenReq{URL: url, SessionID: call.Arguments["session_id"], ChatSessionID: ChatSessionFromContext(ctx), UserTask: UserTaskFromContext(ctx), ToolRoot: opts.ToolRoot})
 		if err != nil {
 			return failure(call.ID, err.Error()), nil
 		}
