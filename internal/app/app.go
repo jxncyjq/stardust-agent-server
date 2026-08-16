@@ -14,6 +14,7 @@ import (
 	"github.com/stardust/legion-agent/internal/cognitive"
 	"github.com/stardust/legion-agent/internal/config"
 	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/lifecycle"
 	"github.com/stardust/legion-agent/internal/memory"
 	"github.com/stardust/legion-agent/internal/observability"
 	"github.com/stardust/legion-agent/internal/port"
@@ -34,7 +35,11 @@ type DemoResult struct {
 	AuditActions     []string
 }
 
-type App struct{}
+type App struct {
+	// ledger records which owner must revoke which runtime resource. Static
+	// assembly registers under the "app" owner; plugin instances get their own.
+	ledger *lifecycle.Ledger
+}
 
 type RunTaskOptions struct {
 	TaskID        string
@@ -103,7 +108,13 @@ type TaskSink interface {
 }
 
 func New() *App {
-	return &App{}
+	return &App{ledger: lifecycle.NewLedger()}
+}
+
+// PluginResources reports the live revocable resources per owner. It answers
+// "the plugin loaded but nothing happened" without reading code.
+func (a *App) PluginResources() map[lifecycle.Owner][]string {
+	return a.ledger.Snapshot()
 }
 
 func (a *App) RunDemo(ctx context.Context) (DemoResult, error) {
