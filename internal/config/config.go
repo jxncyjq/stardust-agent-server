@@ -96,6 +96,13 @@ type MaasProfile struct {
 	// marks the stable task-framing prefix with a cache_control breakpoint.
 	// Optional; defaults to false (byte-for-byte identical requests), so only
 	// enable it for providers that honor Anthropic-style cache_control.
+	//
+	// Measured 2026-08-16 against DeepSeek: cache_control is accepted (HTTP 200)
+	// and IGNORED. DeepSeek caches automatically by longest common token prefix
+	// from token 0, and credits nothing for a partial head match — an appended
+	// tail hit 2048 tokens while a mid-list insertion of the same size hit 0.
+	// So on DeepSeek this flag buys nothing; what pays there is keeping the
+	// prefix stable, not marking it.
 	PromptCache bool `json:"prompt_cache,omitempty"`
 	// ContextLength is the model's context window in tokens, used by the GUI to
 	// show the active model's context size. Optional (0 = unset); the GUI shows
