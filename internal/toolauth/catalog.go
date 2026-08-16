@@ -44,19 +44,24 @@ var gateable = []GateableTool{
 	{"browser_close", "关闭一个浏览器会话"},
 }
 
-// GateableTools returns the canonical gateable tools, sorted by name.
+// GateableTools returns the gateable tools — the builtin table plus every
+// runtime contribution (see Contribute) — sorted by name.
 func GateableTools() []GateableTool {
-	out := make([]GateableTool, len(gateable))
-	copy(out, gateable)
+	extra := contributedTools()
+	out := make([]GateableTool, 0, len(gateable)+len(extra))
+	out = append(out, gateable...)
+	out = append(out, extra...)
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
 // GateableToolNames returns the gateable tool names as a set, for validating a
-// disabled_tools list.
+// disabled_tools list. It covers runtime contributions as well as builtins: a
+// name missing here is a tool no per-agent config can disable.
 func GateableToolNames() map[string]bool {
-	names := make(map[string]bool, len(gateable))
-	for _, t := range gateable {
+	all := GateableTools()
+	names := make(map[string]bool, len(all))
+	for _, t := range all {
 		names[t.Name] = true
 	}
 	return names
