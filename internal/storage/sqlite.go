@@ -962,15 +962,26 @@ func (r *SQLiteRepository) ListTaskRuns(ctx context.Context, taskID string) ([]d
 // failed on the primary key), so nothing is lost here that was previously kept;
 // what changed is that the loss is now quiet. Recording them properly needs a
 // distinguishing part in the id, not a different conflict policy.
+// auditOrigin normalises an unset origin to the agent default, so the column
+// never holds a blank that a forensic query would have to guess at. A caller
+// that means "the agent" and one that forgot to set it are the same case here:
+// the agent is what every path did before attribution existed.
+func auditOrigin(origin string) string {
+	if origin == "" {
+		return domain.OriginAgent
+	}
+	return origin
+}
+
 func (r *SQLiteRepository) AppendAuditEvent(ctx context.Context, event domain.AuditEvent) error {
 	_, err := r.db.ExecContext(ctx, `
 		INSERT INTO audit_events (
 			id, request_id, subject_type, subject_id, action, hash, created_at,
-			prompt_tokens, completion_tokens, cached_tokens, total_tokens
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			prompt_tokens, completion_tokens, cached_tokens, total_tokens, origin
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO NOTHING
 	`, event.ID, event.RequestID, event.SubjectType, event.SubjectID, event.Action, event.Hash, formatTime(event.CreatedAt),
-		event.PromptTokens, event.CompletionTokens, event.CachedTokens, event.TotalTokens)
+		event.PromptTokens, event.CompletionTokens, event.CachedTokens, event.TotalTokens, auditOrigin(event.Origin))
 	if err != nil {
 		return fmt.Errorf("append audit event %q: %w", event.ID, err)
 	}
@@ -980,7 +991,7 @@ func (r *SQLiteRepository) AppendAuditEvent(ctx context.Context, event domain.Au
 func (r *SQLiteRepository) ListAuditEvents(ctx context.Context) ([]domain.AuditEvent, error) {
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT id, request_id, subject_type, subject_id, action, hash, created_at,
-			prompt_tokens, completion_tokens, cached_tokens, total_tokens
+			prompt_tokens, completion_tokens, cached_tokens, total_tokens, origin
 		FROM audit_events
 		ORDER BY created_at, id
 	`)
@@ -994,7 +1005,8 @@ func (r *SQLiteRepository) ListAuditEvents(ctx context.Context) ([]domain.AuditE
 		var event domain.AuditEvent
 		var createdAt string
 		if err := rows.Scan(&event.ID, &event.RequestID, &event.SubjectType, &event.SubjectID, &event.Action, &event.Hash, &createdAt,
-			&event.PromptTokens, &event.CompletionTokens, &event.CachedTokens, &event.TotalTokens); err != nil {
+			&event.PromptTokens, &event.CompletionTokens, &event.CachedTokens, &event.TotalTokens,
+			&event.Origin); err != nil {
 			return nil, fmt.Errorf("scan audit event: %w", err)
 		}
 		parsed, err := parseTime(createdAt)
@@ -1690,6 +1702,10 @@ var columnMigrations = []columnMigration{
 	{table: "audit_events", column: "completion_tokens", stmt: `ALTER TABLE audit_events ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0`},
 	{table: "audit_events", column: "cached_tokens", stmt: `ALTER TABLE audit_events ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0`},
 	{table: "audit_events", column: "total_tokens", stmt: `ALTER TABLE audit_events ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0`},
+	// Rows written before attribution existed were all agent-initiated, so the
+	// default backfills them correctly rather than leaving a blank that reads
+	// as "unknown".
+	{table: "audit_events", column: "origin", stmt: `ALTER TABLE audit_events ADD COLUMN origin TEXT NOT NULL DEFAULT 'agent'`},
 	{table: "conversation_turns", column: "prompt_tokens", stmt: `ALTER TABLE conversation_turns ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0`},
 	{table: "conversation_turns", column: "completion_tokens", stmt: `ALTER TABLE conversation_turns ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0`},
 	{table: "conversation_turns", column: "cached_tokens", stmt: `ALTER TABLE conversation_turns ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0`},
@@ -1996,7 +2012,8 @@ var schemaStatements = []string{
 		prompt_tokens INTEGER NOT NULL DEFAULT 0,
 		completion_tokens INTEGER NOT NULL DEFAULT 0,
 		cached_tokens INTEGER NOT NULL DEFAULT 0,
-		total_tokens INTEGER NOT NULL DEFAULT 0
+		total_tokens INTEGER NOT NULL DEFAULT 0,
+		origin TEXT NOT NULL DEFAULT 'agent'
 	)`,
 	`CREATE TABLE IF NOT EXISTS runtime_events (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,

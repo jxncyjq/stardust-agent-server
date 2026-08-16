@@ -343,6 +343,7 @@ func (r *Registry) appendAudit(ctx context.Context, agent domain.Agent, call dom
 		Action:      action,
 		Hash:        agent.ID,
 		CreatedAt:   time.Now(),
+		Origin:      CallOriginFrom(ctx),
 	}); err != nil {
 		return fmt.Errorf("append %s audit event: %w", action, err)
 	}

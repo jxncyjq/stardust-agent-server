@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"fmt"
 	"strings"
 	"time"
 )
@@ -120,12 +121,28 @@ type AuditEvent struct {
 	Action      string    `json:"action"`
 	Hash        string    `json:"hash"`
 	CreatedAt   time.Time `json:"created_at"`
+	// Origin attributes the event to whoever initiated it: "agent" for the
+	// agent's own work, "delegate:depth-N" for a delegated sub-run, and
+	// "plugin:<name>" once a contributor drives calls of its own. Without it a
+	// forensic pass over a time window cannot tell whose calls it is reading.
+	Origin string `json:"origin,omitempty"`
 	// Token counts are meaningful only on model_inference_completed events; other
 	// actions carry 0 (a legitimate optional per the row's action, not a fallback).
 	PromptTokens     int `json:"prompt_tokens,omitempty"`
 	CompletionTokens int `json:"completion_tokens,omitempty"`
 	CachedTokens     int `json:"cached_tokens,omitempty"`
 	TotalTokens      int `json:"total_tokens,omitempty"`
+}
+
+// OriginAgent attributes an audit event to the agent's own work. It is the
+// default so an unattributed event reads as the agent rather than as an empty
+// string meaning "unknown".
+const OriginAgent = "agent"
+
+// DelegateOrigin returns the audit origin for a delegated sub-run at depth.
+// Depth is what distinguishes a child's calls from its parent's in one trail.
+func DelegateOrigin(depth int) string {
+	return fmt.Sprintf("delegate:depth-%d", depth)
 }
 
 type MemoryEntry struct {

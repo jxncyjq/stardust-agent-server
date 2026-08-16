@@ -158,6 +158,12 @@ func stringifyArgument(value any) string {
 func (r *Runtime) dispatchToolCall(ctx context.Context, agent domain.Agent, task domain.Task, call domain.ToolCall, st *loopState) (domain.ToolResult, error) {
 	ctx = tool.WithUserTask(ctx, task.Input)
 	ctx = tool.WithChatSession(ctx, task.SessionID)
+	// A delegated sub-run's calls land in the same audit trail as its parent's.
+	// Marking them by depth is what lets a forensic pass over a time window tell
+	// the two apart; depth 0 is the agent's own work and keeps the default.
+	if r.depth > 0 {
+		ctx = tool.WithCallOrigin(ctx, domain.DelegateOrigin(r.depth))
+	}
 	tools := st.tools
 	if r.toolGate != nil {
 		allow, err := r.toolGate.Resolve(ctx, task, call, tools)
