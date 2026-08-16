@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 	"time"
 
 	"github.com/stardust/legion-agent/internal/domain"
@@ -52,6 +53,11 @@ type Registry struct {
 	guards    Guardrails
 	audit     port.AuditLog
 	sanitizer port.OutputSanitizer
+
+	// mu guards handlers and describes. Registration used to happen only during
+	// assembly; plugins register and revoke while the agent is running, so reads
+	// on the execution path now race writes without it.
+	mu        sync.RWMutex
 	handlers  map[string]Handler
 	describes map[string]Descriptor
 }
@@ -66,13 +72,55 @@ func NewRegistry(policy Policy, enforcer PermissionEnforcer, guards Guardrails) 
 	}
 }
 
-func (r *Registry) Register(name string, handler Handler) {
-	r.RegisterDescriptor(Descriptor{Name: name}, handler)
+// Register adds a tool under name and returns its revoke function. See
+// RegisterDescriptor for the duplicate-name contract.
+func (r *Registry) Register(name string, handler Handler) func() {
+	return r.RegisterDescriptor(Descriptor{Name: name}, handler)
 }
 
-func (r *Registry) RegisterDescriptor(descriptor Descriptor, handler Handler) {
+// RegisterDescriptor adds one tool and returns the function that removes it.
+// The revoke function is idempotent and frees the name for reuse.
+//
+// Registering a name that is already registered panics. Two contributors
+// fighting over one model-facing name is never a valid state: silently
+// overwriting turns which implementation the model reaches into a load-order
+// lottery, and the loser's registration would never be revocable. Deliberate
+// override goes through Replace.
+func (r *Registry) RegisterDescriptor(descriptor Descriptor, handler Handler) func() {
+	r.mu.Lock()
+	if _, exists := r.handlers[descriptor.Name]; exists {
+		r.mu.Unlock()
+		panic(fmt.Sprintf("tool: duplicate registration for %q", descriptor.Name))
+	}
 	r.handlers[descriptor.Name] = handler
 	r.describes[descriptor.Name] = descriptor
+	r.mu.Unlock()
+	return r.revokeFunc(descriptor.Name)
+}
+
+// Replace installs handler under descriptor.Name whether or not the name is
+// taken, and returns the function that removes it. It does NOT restore the
+// previous registration: reinstating a handler whose owner may already be gone
+// would resurrect exactly the stale implementation this design removes.
+func (r *Registry) Replace(descriptor Descriptor, handler Handler) func() {
+	r.mu.Lock()
+	r.handlers[descriptor.Name] = handler
+	r.describes[descriptor.Name] = descriptor
+	r.mu.Unlock()
+	return r.revokeFunc(descriptor.Name)
+}
+
+// revokeFunc returns an idempotent remover for name.
+func (r *Registry) revokeFunc(name string) func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			r.mu.Lock()
+			delete(r.handlers, name)
+			delete(r.describes, name)
+			r.mu.Unlock()
+		})
+	}
 }
 
 // Subset returns a new registry that shares this registry's policy, enforcer,
@@ -87,12 +135,14 @@ func (r *Registry) Subset(names ...string) *Registry {
 	for _, name := range names {
 		allow[name] = true
 	}
+	r.mu.RLock()
 	for name, handler := range r.handlers {
 		if allow[name] {
 			sub.handlers[name] = handler
 			sub.describes[name] = r.describes[name]
 		}
 	}
+	r.mu.RUnlock()
 	return sub
 }
 
@@ -106,16 +156,20 @@ func (r *Registry) Without(names ...string) *Registry {
 	for _, name := range names {
 		remove[name] = true
 	}
+	r.mu.RLock()
 	keep := make([]string, 0, len(r.describes))
 	for name := range r.describes {
 		if !remove[name] {
 			keep = append(keep, name)
 		}
 	}
+	r.mu.RUnlock()
 	return r.Subset(keep...)
 }
 
 func (r *Registry) Descriptors() []Descriptor {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	descriptors := make([]Descriptor, 0, len(r.describes))
 	for _, descriptor := range r.describes {
 		descriptors = append(descriptors, descriptor)
@@ -126,6 +180,8 @@ func (r *Registry) Descriptors() []Descriptor {
 // SafeToolNames 返回已注册工具中 NOT 敏感（且非 lazy 协议 meta 工具）的排序名。
 // Plan 模式恰好提供这个集合，使规划运行无法触及有副作用工具。
 func (r *Registry) SafeToolNames() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	names := make([]string, 0, len(r.describes))
 	for name, descriptor := range r.describes {
 		if descriptor.Sensitive {
@@ -151,11 +207,13 @@ func (r *Registry) WithOutputSanitizer(sanitizer port.OutputSanitizer) *Registry
 }
 
 func (r *Registry) Execute(ctx context.Context, agent domain.Agent, call domain.ToolCall) (domain.ToolResult, error) {
+	r.mu.RLock()
 	handler, ok := r.handlers[call.Name]
+	descriptor := r.describes[call.Name]
+	r.mu.RUnlock()
 	if !ok {
 		return domain.ToolResult{}, fmt.Errorf("%w: %s", ErrToolNotFound, call.Name)
 	}
-	descriptor := r.describes[call.Name]
 	if call.RiskLevel == "" {
 		call.RiskLevel = descriptor.RiskLevel
 	}
