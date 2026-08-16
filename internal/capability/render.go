@@ -11,6 +11,10 @@ import "strings"
 //
 // An empty catalog renders to the empty string rather than an empty block --
 // an empty listing would tell the model it has capabilities when it has none.
+//
+// A group heading is emitted at every group change AND at every origin
+// boundary, so a plugin group sharing a builtin group's name gets its own
+// heading instead of its entries reading as builtin capabilities.
 func Render(entries []Entry) string {
 	if len(entries) == 0 {
 		return ""
@@ -18,12 +22,22 @@ func Render(entries []Entry) string {
 	var b strings.Builder
 	b.WriteString("\n\n<available_capabilities>\n")
 	group := ""
+	origin := OriginBuiltin
+	first := true
 	for _, entry := range entries {
-		if entry.Group != group {
+		// A heading is emitted whenever either key changes. Origin matters even
+		// when the group name repeats: a plugin group sharing a builtin group's
+		// name is a different section, and merging them would present a plugin
+		// capability as a builtin one. The `first` flag is load-bearing -- with
+		// origin in the comparison the zero value alone no longer guarantees a
+		// heading for the opening entry.
+		if first || entry.Group != group || entry.Origin != origin {
 			group = entry.Group
+			origin = entry.Origin
 			b.WriteString(group)
 			b.WriteString(":\n")
 		}
+		first = false
 		b.WriteString("  - ")
 		b.WriteString(entry.Name)
 		b.WriteString(": ")
