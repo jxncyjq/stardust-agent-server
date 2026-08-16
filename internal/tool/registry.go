@@ -48,6 +48,12 @@ func (f HandlerFunc) Execute(ctx context.Context, call domain.ToolCall) (domain.
 }
 
 type Registry struct {
+	// parent is nil for a root registry. A derived view holds a REFERENCE to
+	// its parent and resolves at call time, never a copy of its handlers: a
+	// copy keeps answering after the parent revokes the tool.
+	parent *Registry
+	filter *filter
+
 	policy    Policy
 	enforcer  PermissionEnforcer
 	guards    Guardrails
@@ -123,74 +129,131 @@ func (r *Registry) revokeFunc(name string) func() {
 	}
 }
 
-// Subset returns a new registry that shares this registry's policy, enforcer,
-// guardrails, audit log, and sanitizer but exposes only the named tools. Names
-// with no matching handler are ignored. It backs delegated sub-agents that must
-// run with a narrowed tool set instead of inheriting the full parent registry.
+// filter is one scope's view over what it inherits. allow == nil means no
+// allow-list, so unlisted inherited tools stay visible; deny always removes.
+type filter struct {
+	allow map[string]bool
+	deny  map[string]bool
+}
+
+// admits reports whether an inherited name survives this filter.
+func (f *filter) admits(name string) bool {
+	if f == nil {
+		return true
+	}
+	if f.deny[name] {
+		return false
+	}
+	if f.allow != nil && !f.allow[name] {
+		return false
+	}
+	return true
+}
+
+// Subset returns a VIEW over this registry exposing only the named tools plus
+// whatever the view registers itself. It shares this registry's policy,
+// enforcer, guardrails, audit log and sanitizer. Names with no matching handler
+// are ignored, and a tool registered on the parent later is visible only if it
+// was named here. It backs delegated sub-agents that must run with a narrowed
+// tool set.
+//
+// The view resolves through its parent on every call, so revoking a tool on the
+// parent removes it from every derived view at once.
 func (r *Registry) Subset(names ...string) *Registry {
-	sub := NewRegistry(r.policy, r.enforcer, r.guards)
-	sub.audit = r.audit
-	sub.sanitizer = r.sanitizer
 	allow := make(map[string]bool, len(names))
 	for _, name := range names {
 		allow[name] = true
 	}
-	r.mu.RLock()
-	for name, handler := range r.handlers {
-		if allow[name] {
-			sub.handlers[name] = handler
-			sub.describes[name] = r.describes[name]
-		}
-	}
-	r.mu.RUnlock()
-	return sub
+	return r.view(&filter{allow: allow})
 }
 
-// Without returns a new registry exposing every registered tool except the
-// named ones. It shares this registry's policy, enforcer, guardrails, audit log
-// and sanitizer (like Subset). Names with no matching tool are ignored:
-// disabling a tool an agent never had is a legitimate no-op, not an error. It
-// never mutates the receiver.
+// Without returns a VIEW exposing every inherited tool except the named ones,
+// including tools registered on the parent after this call. Names with no
+// matching tool are ignored: disabling a tool an agent never had is a
+// legitimate no-op, not an error. It never mutates the receiver.
 func (r *Registry) Without(names ...string) *Registry {
-	remove := make(map[string]bool, len(names))
+	deny := make(map[string]bool, len(names))
 	for _, name := range names {
-		remove[name] = true
+		deny[name] = true
 	}
+	return r.view(&filter{deny: deny})
+}
+
+// view builds a child registry that inherits through f.
+func (r *Registry) view(f *filter) *Registry {
+	return &Registry{
+		parent:    r,
+		filter:    f,
+		policy:    r.policy,
+		enforcer:  r.enforcer,
+		guards:    r.guards,
+		audit:     r.audit,
+		sanitizer: r.sanitizer,
+		handlers:  make(map[string]Handler),
+		describes: make(map[string]Descriptor),
+	}
+}
+
+// resolve returns the handler and descriptor this registry currently exposes
+// for name. Own registrations win and bypass the filter — a delegated scope
+// keeps the tools it answers itself — while inherited ones must pass it.
+func (r *Registry) resolve(name string) (Handler, Descriptor, bool) {
 	r.mu.RLock()
-	keep := make([]string, 0, len(r.describes))
-	for name := range r.describes {
-		if !remove[name] {
-			keep = append(keep, name)
+	handler, ok := r.handlers[name]
+	descriptor := r.describes[name]
+	r.mu.RUnlock()
+	if ok {
+		return handler, descriptor, true
+	}
+	if r.parent == nil || !r.filter.admits(name) {
+		return nil, Descriptor{}, false
+	}
+	return r.parent.resolve(name)
+}
+
+// visible collects every descriptor this registry exposes into out, inherited
+// first so own registrations shadow same-named inherited ones.
+func (r *Registry) visible(out map[string]Descriptor) {
+	if r.parent != nil {
+		inherited := make(map[string]Descriptor)
+		r.parent.visible(inherited)
+		for name, descriptor := range inherited {
+			if r.filter.admits(name) {
+				out[name] = descriptor
+			}
 		}
 	}
+	r.mu.RLock()
+	for name, descriptor := range r.describes {
+		out[name] = descriptor
+	}
 	r.mu.RUnlock()
-	return r.Subset(keep...)
 }
 
 func (r *Registry) Descriptors() []Descriptor {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	descriptors := make([]Descriptor, 0, len(r.describes))
-	for _, descriptor := range r.describes {
+	collected := make(map[string]Descriptor)
+	r.visible(collected)
+	descriptors := make([]Descriptor, 0, len(collected))
+	for _, descriptor := range collected {
 		descriptors = append(descriptors, descriptor)
 	}
+	sort.Slice(descriptors, func(i, j int) bool { return descriptors[i].Name < descriptors[j].Name })
 	return descriptors
 }
 
 // SafeToolNames 返回已注册工具中 NOT 敏感（且非 lazy 协议 meta 工具）的排序名。
 // Plan 模式恰好提供这个集合，使规划运行无法触及有副作用工具。
 func (r *Registry) SafeToolNames() []string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	names := make([]string, 0, len(r.describes))
-	for name, descriptor := range r.describes {
+	descriptors := r.Descriptors()
+	names := make([]string, 0, len(descriptors))
+	for _, descriptor := range descriptors {
 		if descriptor.Sensitive {
 			continue
 		}
-		if name == "list_tools" || name == "call_tool" {
+		if descriptor.Name == "list_tools" || descriptor.Name == "call_tool" {
 			continue
 		}
-		names = append(names, name)
+		names = append(names, descriptor.Name)
 	}
 	sort.Strings(names)
 	return names
@@ -207,10 +270,7 @@ func (r *Registry) WithOutputSanitizer(sanitizer port.OutputSanitizer) *Registry
 }
 
 func (r *Registry) Execute(ctx context.Context, agent domain.Agent, call domain.ToolCall) (domain.ToolResult, error) {
-	r.mu.RLock()
-	handler, ok := r.handlers[call.Name]
-	descriptor := r.describes[call.Name]
-	r.mu.RUnlock()
+	handler, descriptor, ok := r.resolve(call.Name)
 	if !ok {
 		return domain.ToolResult{}, fmt.Errorf("%w: %s", ErrToolNotFound, call.Name)
 	}
