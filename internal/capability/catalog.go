@@ -50,6 +50,42 @@ type Entry struct {
 	Group   string
 	Summary string
 	Kind    Kind
+	// Origin partitions the catalog; the zero value is OriginBuiltin, so a
+	// provider that predates plugins needs no change. See Origin.
+	Origin Origin
+}
+
+// Origin says whether a capability ships with the agent or comes from a
+// dynamically loaded plugin. It is the catalog's primary sort key, ahead of
+// group and name.
+//
+// The ordering is a prompt-cache property, not cosmetics: the rendered catalog
+// sits at the head of the request, and DeepSeek-style caching matches the
+// longest common prefix from the very first token. Sorting every plugin entry
+// after every builtin one confines a plugin load or unload to the tail of that
+// prefix, so everything before it still hits the cache. A plugin group whose
+// name happens to sort early (say "aaa-jira") must not be able to move the
+// change point into the middle of the builtin listing -- hence a dedicated key
+// rather than a naming convention.
+type Origin uint8
+
+const (
+	// OriginBuiltin is the zero value: an entry that ships with the agent.
+	OriginBuiltin Origin = iota
+	// OriginPlugin is an entry contributed by a dynamically loaded plugin.
+	OriginPlugin
+)
+
+// String returns the lowercase name used in diagnostics.
+func (o Origin) String() string {
+	switch o {
+	case OriginBuiltin:
+		return "builtin"
+	case OriginPlugin:
+		return "plugin"
+	default:
+		return fmt.Sprintf("origin(%d)", uint8(o))
+	}
 }
 
 // Validate reports why an entry may not enter the catalog. Every field is
@@ -87,13 +123,13 @@ type Catalog struct {
 }
 
 // NewCatalog returns a Catalog over the given providers. Provider order does
-// not affect output: entries are sorted by group then name.
+// not affect output: entries are sorted by origin, then group, then name.
 func NewCatalog(providers ...Provider) *Catalog {
 	return &Catalog{providers: providers}
 }
 
 // Entries returns every provider's entries, validated, checked for duplicate
-// names, and sorted by (group, name).
+// names, and sorted by (origin, group, name).
 //
 // The ordering is not cosmetic: the rendered catalog goes into the prompt's
 // cached prefix, so any instability in it costs a cache miss on every round.
@@ -117,6 +153,9 @@ func (c *Catalog) Entries(ctx context.Context) ([]Entry, error) {
 		}
 	}
 	sort.Slice(all, func(i, j int) bool {
+		if all[i].Origin != all[j].Origin {
+			return all[i].Origin < all[j].Origin
+		}
 		if all[i].Group == all[j].Group {
 			return all[i].Name < all[j].Name
 		}
