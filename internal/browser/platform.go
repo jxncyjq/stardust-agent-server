@@ -15,7 +15,7 @@ type PlatformAdapter interface {
 	AvailableSystemMemory() uint64
 
 	// 文件系统
-	AppDataDir() string           // XDG / ~/Library / %LOCALAPPDATA%
+	AppDataDir() string // XDG / ~/Library / %LOCALAPPDATA%
 	CacheDir() string
 	ToNativePath(posix string) string
 	SafeDelete(path string) error // Windows 强制锁：先关句柄/重试

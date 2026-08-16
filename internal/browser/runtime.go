@@ -289,14 +289,6 @@ func (r *Runtime) emitObservation(sessionID string, obs Observation) {
 
 // Open 导航到 req.URL：复用或新建 Session + incognito Context，返回首次观测与 session id。
 func (r *Runtime) Open(ctx context.Context, req OpenReq) (OpenObservation, error) {
-	// 接管门控：会话接管中时 Agent 的写动作退让（read/screenshot 不受此限）。
-	// 置于函数最前，先于 checkURL 的 DNS 解析等任何副作用。传了 SessionID 才可能接管；
-	// 空 SessionID 是新建会话，天然不在接管态。
-	if req.SessionID != "" {
-		if sess, ok := r.sessions.Get(req.SessionID); ok && r.takeoverOf(sess) {
-			return OpenObservation{}, NewBrowserError(CodeTakeover, "session "+req.SessionID+" under manual takeover")
-		}
-	}
 	if err := r.checkURL(req.URL); err != nil {
 		return OpenObservation{}, err
 	}
@@ -305,14 +297,29 @@ func (r *Runtime) Open(ctx context.Context, req OpenReq) (OpenObservation, error
 	// 报错。启动时 Adopt 已把持久会话纳入内存，故「内存有但 Context==nil」是被 TTL 回收或
 	// 重启后的懒态，走下方 rebuildContext 重建（恢复登录 cookies），而非报错。
 	var sess *Session
-	if req.SessionID == "" {
-		sess = r.sessions.Create(req.TaskID)
-	} else {
+	switch {
+	case req.SessionID != "":
 		s, ok := r.sessions.Get(req.SessionID)
 		if !ok {
 			return OpenObservation{}, NewBrowserError(CodeContextEvicted, "unknown session "+req.SessionID)
 		}
 		sess = s
+	case req.ChatSessionID != "":
+		// 复用绑定到该 chat session 的既有浏览器会话（Context 可能为 nil，下方懒重建），
+		// 使同一对话内浏览器会话 id 不随每条新消息自增、人工接管态延续；无绑定则新建并绑定。
+		if s, ok := r.sessions.FindByChatSession(req.ChatSessionID); ok {
+			sess = s
+		} else {
+			sess = r.sessions.Create(req.TaskID)
+			r.sessions.BindChat(sess.ID, req.ChatSessionID)
+		}
+	default:
+		sess = r.sessions.Create(req.TaskID)
+	}
+	// 接管门控（在会话解析之后）：接管中的会话拒绝 Agent 的写动作——包括经 ChatSessionID
+	// 复用到一个正被人工接管的会话时（read/screenshot 不受此限）。
+	if r.takeoverOf(sess) {
+		return OpenObservation{}, NewBrowserError(CodeTakeover, "session "+sess.ID+" under manual takeover")
 	}
 	// 确保有物理 Context 并完成导航：整段「Context==nil 判定 → rebuild（获取+恢复 cookies）→
 	// 读 sess.Context.browser 导航」都在同一把会话锁下执行，使 Context 的判定与使用观察到一致状态，
@@ -742,6 +749,11 @@ func (r *Runtime) InjectInput(sessionID string, events []InputEvent) error {
 	if err != nil {
 		return NewBrowserErrorWrap(CodeContextEvicted, "read viewport for injection", err)
 	}
+	// 串行化本会话的注入：injectOne 顺序改写共享的 page.Mouse（坐标/按下的键），
+	// 并发批次交错会打乱 press/release 顺序，令 Chrome 合成不出 click（接管点击失效）。
+	// inputMu 只挡并发注入，不碰会话锁，故不阻塞 observe/reaper。
+	sess.inputMu.Lock()
+	defer sess.inputMu.Unlock()
 	for i, ev := range events {
 		if err := injectOne(page, ev, vw, vh); err != nil {
 			return NewBrowserErrorWrap(CodeElementNotFound, fmt.Sprintf("inject event %d (%s)", i, ev.Type), err)

@@ -13,8 +13,8 @@ func node(role, name string, interactive, visible bool) RawA11yNode {
 func TestBuildObservationKeepsInteractiveVisibleAssignsStableRef(t *testing.T) {
 	raw := []RawA11yNode{
 		node("button", "搜索", true, true),
-		node("StaticText", "无关文本", false, true),     // 非交互 → 丢弃
-		node("link", "隐藏链接", true, false),           // 不可见 → 丢弃
+		node("StaticText", "无关文本", false, true), // 非交互 → 丢弃
+		node("link", "隐藏链接", true, false),       // 不可见 → 丢弃
 		node("textbox", "关键词框", true, true),
 	}
 	obs := BuildObservation(raw, ObservationBudget{MaxElements: 50})

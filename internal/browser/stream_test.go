@@ -44,7 +44,7 @@ func TestHubReplaySinceReturnsMissedStatusNotFrames(t *testing.T) {
 	h.Publish(StreamEvent{Type: EventObservation}) // seq1
 	h.Publish(StreamEvent{Type: EventFrame})       // seq2 (不缓)
 	h.Publish(StreamEvent{Type: EventProgress})    // seq3
-	replay := h.ReplaySince(1)                      // 要 seq>1 的 status
+	replay := h.ReplaySince(1)                     // 要 seq>1 的 status
 	if len(replay) != 1 || replay[0].Type != EventProgress || replay[0].Seq != 3 {
 		t.Fatalf("replay = %+v, want just progress seq=3", replay)
 	}

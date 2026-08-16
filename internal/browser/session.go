@@ -24,7 +24,17 @@ type Session struct {
 	// 只有前端注入的输入能写。会话锁（mu）下读写，与 Context/ActivePage 同一把锁。
 	takeover bool
 
+	// ChatSessionID 是该浏览器会话绑定的 chat/对话 session id（空=不绑定）。同一 chat
+	// session 内的多次 browser_open 据此复用同一个浏览器会话，使会话 id 不随每条新消息
+	// 自增、人工接管状态跨消息存活。仅在 SessionStore 锁（st.mu）下读写，不走 sess.mu。
+	ChatSessionID string
+
 	mu sync.Mutex // 会话内串行锁（spec §3.3 关键决策）
+	// inputMu 串行化本会话的输入注入。注入本身在 mu 之外执行（go-rod 调用可能阻塞，
+	// 不宜久持会话锁），但一批注入会顺序改写共享的 page.Mouse 状态（当前坐标/按下的键）；
+	// 若接管期间多个并发批次交错，press/release 顺序被打乱，Chrome 便合成不出干净的
+	// click。inputMu 只挡「并发注入」这一路，不与 mu/observe/reaper 争锁。
+	inputMu sync.Mutex
 }
 
 // WithLock 在会话串行锁下执行 fn——同 Session 动作串行，跨 Session 并行。
@@ -39,11 +49,47 @@ type SessionStore struct {
 	mu      sync.Mutex
 	seq     int
 	byID    map[string]*Session
+	byChat  map[string]string   // chatSessionID -> 浏览器会话 id（同 chat session 复用）
 	persist BrowserSessionStore // nil = 纯内存（Phase 1/2 行为不变）
 }
 
 func NewSessionStore() *SessionStore {
-	return &SessionStore{byID: make(map[string]*Session)}
+	return &SessionStore{byID: make(map[string]*Session), byChat: make(map[string]string)}
+}
+
+// BindChat 把浏览器会话绑定到一个 chat session，使同 chat session 内后续 Open 复用它。
+// chatID 为空则 no-op（不绑定）。会话的 ChatSessionID 只在本锁下写。
+func (st *SessionStore) BindChat(sessionID, chatID string) {
+	if chatID == "" {
+		return
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	if s, ok := st.byID[sessionID]; ok {
+		s.ChatSessionID = chatID
+	}
+	st.byChat[chatID] = sessionID
+}
+
+// FindByChatSession 返回绑定到该 chat session 的浏览器会话（含 Context==nil 的已回收
+// 会话——供 Open 懒重建后复用，登录态与接管态得以延续）。chatID 为空、无绑定、或绑定
+// 悬挂（指向已删会话）时返回 ok=false（后者顺手清理悬挂绑定）。
+func (st *SessionStore) FindByChatSession(chatID string) (*Session, bool) {
+	if chatID == "" {
+		return nil, false
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	id, ok := st.byChat[chatID]
+	if !ok {
+		return nil, false
+	}
+	s, ok := st.byID[id]
+	if !ok {
+		delete(st.byChat, chatID) // 悬挂绑定：会话已删，清理
+		return nil, false
+	}
+	return s, true
 }
 
 // SetPersist 装配可选持久化端口（nil = 纯内存，Phase 1/2 行为不变）。
@@ -136,6 +182,10 @@ func (st *SessionStore) Get(id string) (*Session, bool) {
 
 func (st *SessionStore) Delete(id string) {
 	st.mu.Lock()
+	// 解绑 chat 索引：仅当该 chat 仍指向本会话时删（避免误删已改指向新会话的绑定）。
+	if s, ok := st.byID[id]; ok && s.ChatSessionID != "" && st.byChat[s.ChatSessionID] == id {
+		delete(st.byChat, s.ChatSessionID)
+	}
 	delete(st.byID, id)
 	persist := st.persist
 	st.mu.Unlock()

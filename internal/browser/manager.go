@@ -94,33 +94,25 @@ func (m *Manager) AcquireContext(_ ContextOpts) (*BrowserContext, error) {
 	return &BrowserContext{id: fmt.Sprintf("ctx-%d", m.seq), browser: incog}, nil
 }
 
-// ReleaseContext 关闭 Context 的所有 page 并释放整个 incognito Context。
+// ReleaseContext 释放整个 incognito BrowserContext（连同其内的所有 page）。
 //
-// 关键：仅关 page 不会释放 incognito BrowserContext —— go-rod v0.116.2 里
-// incognito 浏览器的 Browser.Close() 才会 dispose 其 BrowserContext，遗漏它就会
-// 每个 Session 泄漏一个上下文。故关完 page 后必须 c.browser.Close()。
-// 不静默吞错（CLAUDE.md §0 fail-loud）：Pages() 报错也照常 Close，并把两处错误合并返回。
+// 只调 c.browser.Close()：go-rod 对 incognito 浏览器（BrowserContextID 非空）的
+// Close() 发 Target.disposeBrowserContext，销毁【该 context】及其内的全部 page，
+// 精确按 context 作用域，无泄漏。
+//
+// 绝不能再手动 c.browser.Pages() 逐页 Close：go-rod v0.116.2 的 Browser.Pages()
+// 用【无 filter】的 Target.getTargets，返回的是所有 incognito context 的 page；逐个
+// Close 会把其它活跃会话的 page 一并关掉，令那些会话的 page context 被取消——
+// 接管注入 / 读取随后即报 "context canceled"（本会话未被回收、ActivePage 仍指向死
+// page）。此前的实现正是如此，导致「多会话并发时回收一个会话会点不动另一个会话的页面」。
 func (m *Manager) ReleaseContext(c *BrowserContext) error {
 	if c == nil || c.browser == nil {
 		return nil
 	}
-	pages, pagesErr := c.browser.Pages()
-	if pagesErr == nil {
-		for _, p := range pages {
-			_ = p.Close() // best-effort；随后 Close 整个 Context 会一并回收
-		}
+	if err := c.browser.Close(); err != nil {
+		return fmt.Errorf("release context %s: close context: %w", c.id, err)
 	}
-	closeErr := c.browser.Close()
-	switch {
-	case pagesErr != nil && closeErr != nil:
-		return fmt.Errorf("release context %s: list pages: %v; close context: %w", c.id, pagesErr, closeErr)
-	case pagesErr != nil:
-		return fmt.Errorf("release context %s: list pages: %w", c.id, pagesErr)
-	case closeErr != nil:
-		return fmt.Errorf("release context %s: close context: %w", c.id, closeErr)
-	default:
-		return nil
-	}
+	return nil
 }
 
 // Close 关闭浏览器进程。
