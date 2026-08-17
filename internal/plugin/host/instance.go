@@ -7,6 +7,7 @@ package host
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/stardust/legion-agent/internal/plugin/abi"
@@ -65,11 +66,12 @@ func Compile(ctx context.Context, rt wazero.Runtime, wasm []byte) (wazero.Compil
 
 // Instance is one instantiation of a compiled Legion plugin module: a live
 // wazero module together with its three resolved ABI exports
-// (abi.ExportAlloc, abi.ExportFree, abi.ExportInvoke). An Instance is not
-// safe for concurrent use — callers must serialize Invoke calls against a
-// given Instance.
+// (abi.ExportAlloc, abi.ExportFree, abi.ExportInvoke) and its linear memory.
+// An Instance is not safe for concurrent use — callers must serialize Invoke
+// calls against a given Instance.
 type Instance struct {
 	mod    api.Module
+	mem    api.Memory
 	alloc  api.Function
 	free   api.Function
 	invoke api.Function
@@ -82,14 +84,28 @@ type Instance struct {
 // and with WithName(""), so that instantiating the same CompiledModule more
 // than once — as an instance pool does — never collides on module name.
 //
-// It resolves the three ABI exports and fails, naming the missing export, if
-// any of them is absent.
-func NewInstance(ctx context.Context, rt wazero.Runtime, compiled wazero.CompiledModule) (*Instance, error) {
+// It resolves the three ABI exports plus the guest's linear memory and
+// fails, naming what is absent, if any of them is missing. The exports are
+// checked before the memory, so a guest missing both is reported by export
+// name — the more specific fault.
+func NewInstance(ctx context.Context, rt wazero.Runtime, compiled wazero.CompiledModule) (inst *Instance, err error) {
 	mod, err := rt.InstantiateModule(ctx, compiled,
 		wazero.NewModuleConfig().WithStartFunctions("_initialize").WithName(""))
 	if err != nil {
 		return nil, fmt.Errorf("instantiate plugin module: %w", err)
 	}
+	// A module that fails validation below is never handed to a caller, so
+	// nothing would ever close it: release it here instead of leaking it
+	// until the whole Runtime is closed. A failing close is joined onto the
+	// validation error rather than dropped.
+	defer func() {
+		if err == nil {
+			return
+		}
+		if cerr := mod.Close(ctx); cerr != nil {
+			err = errors.Join(err, fmt.Errorf("close rejected plugin module: %w", cerr))
+		}
+	}()
 
 	alloc := mod.ExportedFunction(abi.ExportAlloc)
 	if alloc == nil {
@@ -104,7 +120,24 @@ func NewInstance(ctx context.Context, rt wazero.Runtime, compiled wazero.Compile
 		return nil, fmt.Errorf("instantiate plugin module: missing export %q", abi.ExportInvoke)
 	}
 
-	return &Instance{mod: mod, alloc: alloc, free: free, invoke: invoke}, nil
+	// Memory is as mandatory as the three exports: Invoke writes request
+	// bodies into it and reads response bodies out of it. It must be checked
+	// here rather than relied upon at call time, because wazero's
+	// api.Module.Memory documents "nil if there are none" but implements it
+	// as a bare field read — for a module with no memory that is a nil
+	// *wasm.MemoryInstance boxed inside a non-nil api.Memory interface, so a
+	// plain nil check misses it and the first Read/Write panics the host
+	// process instead of failing this call. Gate on the module's exported
+	// memory definitions instead: a wasm module has at most one memory, and a
+	// wasm32-wasip1 guest must export it (the WASI application ABI requires a
+	// memory export named "memory"), so a non-empty definition map means
+	// Memory() is a usable memory.
+	mem := mod.Memory()
+	if mem == nil || len(mod.ExportedMemoryDefinitions()) == 0 {
+		return nil, fmt.Errorf("instantiate plugin module: guest exports no linear memory")
+	}
+
+	return &Instance{mod: mod, mem: mem, alloc: alloc, free: free, invoke: invoke}, nil
 }
 
 // Invoke calls the guest's plugin_invoke export with op and the request body
@@ -132,9 +165,10 @@ func (i *Instance) Invoke(ctx context.Context, op int32, in []byte) (out []byte,
 		if ptr == 0 {
 			return nil, fmt.Errorf("alloc %d bytes: guest returned null pointer", len(in))
 		}
-		if !i.mod.Memory().Write(uint32(ptr), in) {
-			return nil, fmt.Errorf("write %d bytes at %d: out of range", len(in), ptr)
-		}
+		// Registered before the write below, not after: from this point on the
+		// guest holds a reservation that leaks unless it is freed, and the
+		// write is itself a step that can fail.
+		//
 		// Free the input with a cancellation-scrubbed context: if ctx is
 		// already cancelled by the time this defer runs, calling free with
 		// ctx unchanged would itself fail immediately and leak the guest
@@ -144,13 +178,16 @@ func (i *Instance) Invoke(ctx context.Context, op int32, in []byte) (out []byte,
 				// A free call failing means wazero closed the module (a
 				// trap or context-death aborts the whole module, not just
 				// this call); the Instance must not be reused even though
-				// the earlier invoke succeeded.
+				// the earlier invoke succeeded. The failure is joined onto
+				// any primary error rather than dropped when one exists:
+				// this is the diagnostic for a guest whose allocator died.
 				i.dead = true
-				if err == nil {
-					err = fmt.Errorf("free input %d bytes at %d: %w", len(in), ptr, ferr)
-				}
+				err = errors.Join(err, fmt.Errorf("free input %d bytes at %d: %w", len(in), ptr, ferr))
 			}
 		}()
+		if !i.mem.Write(uint32(ptr), in) {
+			return nil, fmt.Errorf("write %d bytes at %d: out of range", len(in), ptr)
+		}
 	}
 
 	res, ierr := i.invoke.Call(ctx, uint64(uint32(op)), ptr, uint64(len(in)))
@@ -164,9 +201,17 @@ func (i *Instance) Invoke(ctx context.Context, op int32, in []byte) (out []byte,
 		return nil, nil
 	}
 
-	buf, ok := i.mod.Memory().Read(outPtr, outLen)
+	buf, ok := i.mem.Read(outPtr, outLen)
 	if !ok {
-		return nil, fmt.Errorf("read result at %d len %d: out of range", outPtr, outLen)
+		// The guest handed back a region outside its own memory: its result
+		// allocation (whatever it really is) still has to be released, and a
+		// guest whose result pointers are out of range is not fit for reuse.
+		rerr := fmt.Errorf("read result at %d len %d: out of range", outPtr, outLen)
+		if _, ferr := i.free.Call(context.WithoutCancel(ctx), uint64(outPtr), uint64(outLen)); ferr != nil {
+			rerr = errors.Join(rerr, fmt.Errorf("free result %d bytes at %d: %w", outLen, outPtr, ferr))
+		}
+		i.dead = true
+		return nil, rerr
 	}
 	// Copy immediately: buf aliases the guest's linear memory directly, and
 	// that memory can grow (and therefore move) or be reused by the guest's
@@ -184,23 +229,40 @@ func (i *Instance) Invoke(ctx context.Context, op int32, in []byte) (out []byte,
 	return result, nil
 }
 
-// Dead reports whether the Instance's underlying module has been closed,
-// either explicitly via Close or implicitly by wazero closing it in
-// response to a call failure (most notably ctx cancellation during Invoke;
-// see NewRuntime's WithCloseOnContextDone). Once Dead reports true the
-// Instance must not be reused.
+// Dead reports whether this Instance must no longer be used, which is true
+// in two independent cases:
+//
+//   - a call on it failed (a guest trap, a failed alloc/free, ctx
+//     cancellation during Invoke) or Close was called, both of which the
+//     Instance records itself;
+//   - wazero closed the underlying module without any call reporting an
+//     error. wazero documents this for a runtime built with
+//     WithCloseOnContextDone (see NewRuntime): a context completion closes
+//     the module, and a caller must check for closure "even if you didn't
+//     formerly receive a sys.ExitError" — so a ctx that goes Done just as an
+//     Invoke returns successfully leaves a closed module behind.
+//
+// The second case is why Dead consults the module itself and not only the
+// Instance's own flag: a pool handing out instances on the strength of
+// Dead() == false must never hand out a closed one.
 func (i *Instance) Dead() bool {
-	return i.dead
+	return i.dead || i.mod.IsClosed()
 }
 
 // Close closes the Instance's underlying module, releasing the resources
-// wazero holds for it. Close is idempotent: closing an Instance that is
-// already Dead — whether from a prior Close call or from wazero closing the
-// module on its own — is a no-op that returns nil.
+// wazero holds for it (its filesystem context, its memory buffer and its
+// compiled code closer). Close is idempotent: wazero's own
+// CloseWithExitCode is a no-op on an already-closed module, so calling Close
+// twice — or calling it on an Instance that is already Dead — returns nil
+// without doing damage.
+//
+// Close always calls through to wazero even when the Instance is already
+// Dead, because the paths that kill an Instance do not release its
+// resources: a guest trap leaves the module fully open, and a module closed
+// by ctx completion has its resource release deferred until a real close.
+// Those are exactly the instances a pool discards, so skipping the call
+// would leak wazero resources for the common failure case.
 func (i *Instance) Close(ctx context.Context) error {
-	if i.dead {
-		return nil
-	}
 	i.dead = true
 	if err := i.mod.Close(ctx); err != nil {
 		return fmt.Errorf("close plugin module: %w", err)
