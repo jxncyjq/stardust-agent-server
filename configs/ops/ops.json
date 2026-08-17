@@ -1,0 +1,22 @@
+{
+  "id": "ops",
+  "role": "ops",
+  "maas_profile": "fast",
+  "context_files": {
+    "enabled": true,
+    "root": ".",
+    "agents_path": "AGENTS.md",
+    "soul_path": "configs/ops/SOUL.md",
+    "tools_path": "configs/ops/TOOLS.md",
+    "user_path": "configs/ops/USER.md",
+    "memory_path": "configs/ops/MEMORY.md",
+    "max_file_chars": 20000
+  },
+  "workspace": {
+    "docs_root": "docs/writing",
+    "memory_root": "memory/ops"
+  },
+  "skills": {
+    "install_root": "skills/ops"
+  }
+}
