@@ -123,7 +123,26 @@ func TestPoolNeverHandsOutAnInstanceATimeoutKilled(t *testing.T) {
 
 	killed := mustAcquire(t, p)
 	killByTimeout(t, killed)
+
+	// Count the closes of the corpse: discarding it means closing it, not just
+	// dropping the pointer. killed.Dead() is already true here (killByTimeout
+	// asserts it), so asserting Dead() after the release would prove nothing —
+	// only the disposer being called does. closeInstance is the package's seam
+	// for that, and the substitute still performs the real close.
+	var killedCloses int
+	originalClose := closeInstance
+	closeInstance = func(ctx context.Context, i *Instance) error {
+		if i == killed {
+			killedCloses++
+		}
+		return originalClose(ctx, i)
+	}
+	t.Cleanup(func() { closeInstance = originalClose })
+
 	p.release(killed)
+	if killedCloses != 1 {
+		t.Errorf("release closed the discarded instance %d times, want exactly 1", killedCloses)
+	}
 
 	fresh := mustAcquire(t, p)
 	if fresh == killed {
@@ -137,12 +156,6 @@ func TestPoolNeverHandsOutAnInstanceATimeoutKilled(t *testing.T) {
 
 	if got := created(); got != 2 {
 		t.Errorf("factory called %d times, want 2 (the original plus one replacement for the killed instance)", got)
-	}
-	// Discarding means closing too, not just dropping the pointer: some
-	// failures kill an Instance while leaving its module open, so a discarded
-	// instance that was never closed would leak wazero resources.
-	if !killed.Dead() {
-		t.Error("the discarded instance was not closed")
 	}
 
 	if err := p.drain(context.Background()); err != nil {
@@ -283,18 +296,36 @@ func TestPoolWakesAQueuedAcquireWhenDrainBegins(t *testing.T) {
 
 	held := mustAcquire(t, p)
 
+	// The hand-off is a channel rather than a sleep: the goroutine signals
+	// immediately before it calls acquire, so the test proceeds once that
+	// acquire is under way instead of once a sleep guessed long enough. The
+	// sleep was worse than slow — being too short would not have failed here,
+	// it would have quietly demoted this test to a copy of
+	// TestPoolAcquireAfterDrainFailsImmediately.
+	//
+	// What the signal proves is that the acquire has started; that it has
+	// reached the park inside it is not observable from outside the pool
+	// without instrumenting the pool itself, which is not worth it for this
+	// test. What is observable is asserted below.
 	queued := make(chan error, 1)
+	acquiring := make(chan struct{})
 	go func() {
+		close(acquiring)
 		inst, err := p.acquire(context.Background())
 		if inst != nil {
 			p.release(inst)
 		}
 		queued <- err
 	}()
-	// Give the second caller time to reach the queue; without this the drain
-	// below could win the race and the test would only re-cover
-	// TestPoolAcquireAfterDrainFailsImmediately.
-	time.Sleep(200 * time.Millisecond)
+	<-acquiring
+
+	// And the queue is a state the test can see, not an assumption: the only
+	// instance is checked out, so free is empty and the caller above cannot be
+	// served by the pool at all — the only thing that can end its wait is drain
+	// waking it.
+	if got := len(p.free); got != 0 {
+		t.Fatalf("len(p.free) = %d while the pool's only instance was checked out, want 0: the caller is not queueing for anything", got)
+	}
 
 	drained := make(chan error, 1)
 	go func() { drained <- p.drain(context.Background()) }()
@@ -344,7 +375,11 @@ func TestPoolServesConcurrentCallersWithoutSharingAnInstance(t *testing.T) {
 		concurrent    int
 		maxConcurrent int
 	)
-	failures := make(chan error, goroutines*rounds)
+	// Two reports per round is the worst case (a shared-instance report does
+	// not return, so an invoke report can follow it), and nothing drains this
+	// channel until after wg.Wait() — sized for one report per round, a
+	// thoroughly broken pool would hang the test instead of failing it.
+	failures := make(chan error, goroutines*rounds*2)
 
 	begin := make(chan struct{})
 	var wg sync.WaitGroup
@@ -481,9 +516,45 @@ func TestPoolDrainClosesEveryPooledInstance(t *testing.T) {
 		t.Errorf("factory called %d times for two slots, want 2", got)
 	}
 
-	if err := p.drain(context.Background()); err == nil {
-		t.Error("a second drain reported success; it cannot vouch for the first drain's wait")
+	err := p.drain(context.Background())
+	if err == nil {
+		t.Fatal("a second drain reported success; it cannot vouch for the first drain's wait")
 	}
+	// The rejection is a sentinel, so a caller can tell "someone else owns this
+	// pool's convergence" from a convergence that was attempted and failed.
+	if !errors.Is(err, errDrainAlreadyStarted) {
+		t.Errorf("second drain error %q does not carry errDrainAlreadyStarted", err)
+	}
+}
+
+// TestPoolAcquirePanicsOnAFactoryThatReturnsTheSameInstanceTwice pins the one
+// caller-supplied hook that can break the pool's central guarantee: a factory
+// that hands back an instance the pool already has would put one Instance in
+// two slots, and Instance is not safe for concurrent use. The pool does not
+// hand that out and hope — it stops.
+func TestPoolAcquirePanicsOnAFactoryThatReturnsTheSameInstanceTwice(t *testing.T) {
+	rt, compiled := newTestFixture(t, testMemoryPages)
+
+	shared, err := NewInstance(context.Background(), rt, compiled)
+	if err != nil {
+		t.Fatalf("NewInstance: %v", err)
+	}
+	p := newPool(2, func() (*Instance, error) { return shared, nil })
+
+	first := mustAcquire(t, p)
+	if first != shared {
+		t.Fatalf("acquire returned %p, want the factory's instance %p", first, shared)
+	}
+
+	// The pool is abandoned after the panic (see
+	// TestPoolAcquirePanicsOnAFactoryThatReturnsNothing): the second acquire
+	// dies holding a slot and an in-flight registration.
+	defer func() {
+		if recover() == nil {
+			t.Error("acquire returned normally for a factory that returned an already checked-out instance, want a panic")
+		}
+	}()
+	_, _ = p.acquire(context.Background())
 }
 
 // TestPoolDrainNeverCreatesAnInstance covers the lazy-slot case: a pool that
@@ -633,6 +704,12 @@ func TestNewPoolPanicsOnAnUnusableConfiguration(t *testing.T) {
 func TestPoolAcquirePanicsOnAFactoryThatReturnsNothing(t *testing.T) {
 	p := newPool(1, func() (*Instance, error) { return nil, nil })
 
+	// The pool is deliberately abandoned once the panic is recovered: acquire
+	// died with the slot taken out of free and its in-flight registration still
+	// standing, which is correct for a terminal invariant violation but leaves
+	// the pool unusable. Do not extend this test with another acquire or a
+	// drain — drain would wait forever for an in-flight call that no longer
+	// exists and the package would time out instead of failing.
 	defer func() {
 		if recover() == nil {
 			t.Error("acquire returned normally for a factory that returned (nil, nil), want a panic")
@@ -641,10 +718,32 @@ func TestPoolAcquirePanicsOnAFactoryThatReturnsNothing(t *testing.T) {
 	_, _ = p.acquire(context.Background())
 }
 
+// newForeignInstance builds a live instance that belongs to no pool, for the
+// "release something this pool never handed out" cases. Its runtime is closed
+// by newTestFixture's cleanup.
+func newForeignInstance(t *testing.T) *Instance {
+	t.Helper()
+
+	rt, compiled := newTestFixture(t, testMemoryPages)
+	inst, err := NewInstance(context.Background(), rt, compiled)
+	if err != nil {
+		t.Fatalf("NewInstance for a foreign instance: %v", err)
+	}
+	return inst
+}
+
 // TestPoolReleaseRejectsWhatItNeverHandedOut covers release's own invariant
-// assertions. Both cases are caller bugs that would otherwise corrupt the
-// pool's accounting silently — a nil instance would occupy a slot forever,
-// and a double release would let two callers hold one instance.
+// assertions. Every case is a caller bug that would otherwise corrupt the
+// pool's accounting silently: it would put a second entry into free, so two
+// later acquires would hand one Instance to two goroutines (Instance is not
+// safe for concurrent use) and in-flight would reach zero while a call was
+// still running, letting drain close an instance a caller is inside.
+//
+// The cases deliberately include pools that are not fully free — a pool of two
+// with one slot still checked out, and a pool of one with its only slot checked
+// out. Inferring the violation from how full the free channel happens to be
+// catches neither: the erroneous entry simply fits, and the corruption is
+// silent. release therefore consults what is actually checked out.
 func TestPoolReleaseRejectsWhatItNeverHandedOut(t *testing.T) {
 	t.Run("nil instance", func(t *testing.T) {
 		p, _ := newPoolFixture(t, 1)
@@ -669,5 +768,74 @@ func TestPoolReleaseRejectsWhatItNeverHandedOut(t *testing.T) {
 			}
 		}()
 		p.release(inst)
+	})
+
+	t.Run("released twice while another slot is checked out", func(t *testing.T) {
+		p, _ := newPoolFixture(t, 2)
+
+		first := mustAcquire(t, p)
+		second := mustAcquire(t, p)
+		if first == second {
+			t.Fatal("a pool of two slots handed the same instance to two callers")
+		}
+		p.release(first)
+
+		// free now holds one of two entries, so the erroneous second release
+		// would fit into it — and the pool would hold "first" twice.
+		defer func() {
+			if recover() == nil {
+				// The pool is corrupt now (first sits in two slots), so the
+				// checks below would report a pool that has already failed.
+				t.Fatal("a second release of the same instance returned normally although the pool had a free slot, want a panic")
+			}
+			if got := len(p.free); got != 1 {
+				t.Errorf("len(p.free) = %d after the rejected release, want 1: the pool was corrupted instead of rejecting it", got)
+			}
+			p.release(second)
+			if err := p.drain(context.Background()); err != nil {
+				t.Errorf("drain after the rejected release: %v", err)
+			}
+		}()
+		p.release(first)
+	})
+
+	t.Run("foreign instance, no slot free", func(t *testing.T) {
+		p, _ := newPoolFixture(t, 1)
+
+		held := mustAcquire(t, p)
+		foreign := newForeignInstance(t)
+
+		// free is empty, so the send of a foreign instance would succeed and
+		// the pool would hand out an instance it never created.
+		defer func() {
+			if recover() == nil {
+				// The pool holds an instance it never created; releasing held
+				// on top of that would overflow its single slot.
+				t.Fatal("release of a foreign instance returned normally, want a panic")
+			}
+			p.release(held)
+			if err := p.drain(context.Background()); err != nil {
+				t.Errorf("drain after the rejected release: %v", err)
+			}
+		}()
+		p.release(foreign)
+	})
+
+	t.Run("foreign instance while another slot is checked out", func(t *testing.T) {
+		p, _ := newPoolFixture(t, 2)
+
+		held := mustAcquire(t, p)
+		foreign := newForeignInstance(t)
+
+		defer func() {
+			if recover() == nil {
+				t.Fatal("release of a foreign instance returned normally although the pool had a free slot, want a panic")
+			}
+			p.release(held)
+			if err := p.drain(context.Background()); err != nil {
+				t.Errorf("drain after the rejected release: %v", err)
+			}
+		}()
+		p.release(foreign)
 	})
 }

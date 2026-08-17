@@ -13,6 +13,12 @@ import (
 // from a real failure with errors.Is.
 var errPoolDraining = errors.New("pool is draining")
 
+// errDrainAlreadyStarted is what a second drain reports. It is a sentinel so a
+// caller can tell "someone else already owns this pool's convergence" from a
+// convergence that was attempted and failed, which is a different operational
+// situation with a different response.
+var errDrainAlreadyStarted = errors.New("pool drain already started")
+
 // pool hands out a bounded set of plugin Instances, one caller at a time per
 // instance, and converges its in-flight calls on shutdown.
 //
@@ -36,7 +42,10 @@ var errPoolDraining = errors.New("pool is draining")
 //   - release must be called exactly once per successful acquire, with the
 //     instance that acquire returned. Both halves are invariants, not
 //     courtesies: violating them corrupts the pool's slot accounting, so
-//     release panics rather than corrupting it quietly.
+//     release panics rather than corrupting it quietly. The pool tracks which
+//     instances are checked out (see checkedOut), so a nil, foreign or
+//     repeated release is detected exactly, whatever the pool's size and
+//     whatever else is checked out at the time.
 //
 // Instances are created lazily. newPool cannot report a factory failure (it
 // returns no error, deliberately: a pool is cheap and a guest instantiation is
@@ -48,8 +57,9 @@ type pool struct {
 	// what lets drain collect every slot without blocking.
 	size int
 
-	// factory builds one new instance. It is called by acquire, never by
-	// newPool or drain, and never while any pool lock is held.
+	// factory builds one new instance, and must build a fresh one on every
+	// call (see newPool). It is called by acquire, never by newPool or drain,
+	// and never while any pool lock is held.
 	factory func() (*Instance, error)
 
 	// free is the pool's semaphore and its instance store in one: it holds
@@ -74,6 +84,21 @@ type pool struct {
 	// the test, drain could then set the flag and see a zero counter, and the
 	// acquire's Add would land after drain had already declared convergence.
 	closing bool
+	// checkedOut is the set of instances currently handed out to a caller, and
+	// it is the pool's slot accounting made exact: acquire adds an instance on
+	// every path that returns one, release removes it, so membership means
+	// "one entry of free is missing because this instance holds it".
+	//
+	// It exists so that release can tell an honest hand-back from a caller bug
+	// — a nil instance, an instance this pool never created, or a second
+	// release of one it already took back — by asking the record instead of
+	// inferring from how full free happens to be. Inference only works when
+	// every other slot is idle; at size > 1 a double release would otherwise
+	// fit into a free channel that still has room, put the same instance in
+	// two slots, and hand it to two callers at once.
+	//
+	// Guarded by mu.
+	checkedOut map[*Instance]struct{}
 	// disposeErrs collects failures from closes that happened where nobody
 	// could be told: release has no error return, and the instance it
 	// discards still has to be closed. drain joins these onto its own result,
@@ -90,6 +115,16 @@ type pool struct {
 // newPool creates a pool of size slots, each of which will hold one instance
 // built by factory on first use.
 //
+// factory must return a freshly built Instance on every call. Returning the
+// same *Instance twice — memoizing it, or handing back one the pool already
+// holds — would put one instance in two slots and so aim it at the pool's
+// central guarantee: Instance is not safe for concurrent use, and this is the
+// one caller-supplied hook that can break the exclusivity the pool provides.
+// The pool does not trust the contract silently — an instance that would be
+// checked out to a second caller while the first still holds it panics (see
+// markCheckedOut) — but it cannot repair such a factory, so the contract is
+// the caller's to keep.
+//
 // size must be greater than zero and factory must be non-nil: a zero-size pool
 // could never serve a call and a pool with no factory could never fill a slot,
 // so both are programming errors with no sensible default — newPool panics
@@ -104,10 +139,11 @@ func newPool(size int, factory func() (*Instance, error)) *pool {
 	}
 
 	p := &pool{
-		size:    size,
-		factory: factory,
-		free:    make(chan *Instance, size),
-		closed:  make(chan struct{}),
+		size:       size,
+		factory:    factory,
+		free:       make(chan *Instance, size),
+		closed:     make(chan struct{}),
+		checkedOut: make(map[*Instance]struct{}, size),
 	}
 	// Prime every slot as empty: the slot exists from the start (it is the
 	// semaphore), the instance in it does not.
@@ -165,6 +201,7 @@ func (p *pool) acquire(ctx context.Context) (*Instance, error) {
 	// anything.
 
 	if slot != nil {
+		p.markCheckedOut(slot)
 		return slot, nil
 	}
 
@@ -180,7 +217,24 @@ func (p *pool) acquire(ctx context.Context) (*Instance, error) {
 	if inst == nil {
 		panic("host: pool.acquire: factory returned a nil Instance and a nil error")
 	}
+	p.markCheckedOut(inst)
 	return inst, nil
+}
+
+// markCheckedOut records that inst is now the calling goroutine's, so release
+// can prove it is being handed back by the caller who took it. An instance
+// that is already recorded means the factory handed out an instance the pool
+// still holds (see newPool's contract), which would put one Instance in two
+// slots — so it is a violated invariant, not a condition to recover from.
+func (p *pool) markCheckedOut(inst *Instance) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if _, dup := p.checkedOut[inst]; dup {
+		panic(fmt.Sprintf("host: pool.acquire: instance %p is already checked out; "+
+			"the factory must return a fresh Instance on every call", inst))
+	}
+	p.checkedOut[inst] = struct{}{}
 }
 
 // enter registers one caller with inflight unless the pool is draining, in
@@ -201,6 +255,11 @@ func (p *pool) enter() error {
 // release hands an instance back. inst must be the instance a matching
 // acquire returned, and it must be handed back exactly once; the caller must
 // not use it afterwards.
+//
+// That precondition is checked, not assumed: release consults the pool's
+// checked-out set (see takeBack), so a nil, foreign or repeated release panics
+// exactly, at any pool size, instead of duplicating an entry and letting two
+// callers share one Instance.
 //
 // A dead instance is discarded instead of pooled — the pool's first invariant.
 // wazero's WithCloseOnContextDone interrupts a call whose context expires by
@@ -224,9 +283,7 @@ func (p *pool) enter() error {
 // close is recorded on the pool and joined onto drain's result rather than
 // swallowed.
 func (p *pool) release(inst *Instance) {
-	if inst == nil {
-		panic("host: pool.release: instance is nil; release must be handed the instance acquire returned")
-	}
+	p.takeBack(inst)
 
 	slot := inst
 	if inst.Dead() {
@@ -240,17 +297,39 @@ func (p *pool) release(inst *Instance) {
 	// woken by inflight reaching zero goes straight on to collect every slot
 	// and would otherwise block on a short channel.
 	//
-	// A full channel here means this release has no matching checked-out slot
-	// — a double release, or a release of something this pool never handed out
-	// — which would let two callers hold one instance. That is an invariant
-	// violation, not a runtime condition, so it panics rather than blocking
-	// forever on the send.
+	// The send cannot block: takeBack above proved this instance held one of
+	// free's entries, and that entry is the one being returned here. A full
+	// channel would therefore mean the pool's entry conservation is broken —
+	// entries created or duplicated somewhere — so it panics instead of
+	// blocking forever and turning a bug into a hang.
 	select {
 	case p.free <- slot:
 	default:
-		panic("host: pool.release: every slot is already free; release was called without a matching acquire")
+		panic("host: pool.release: free is full although this instance held a slot; pool entry accounting is corrupt")
 	}
 	p.inflight.Done()
+}
+
+// takeBack removes inst from the checked-out set, and panics if it was not
+// there. Absence is the exact test for every way release can be misused: a nil
+// instance, an instance this pool never handed out, and a second release of one
+// already handed back all fail it, whatever the pool's size and whatever else
+// is checked out at the time.
+//
+// Panicking is the point. Each of those is a caller bug that would otherwise
+// duplicate an entry in free, so two later acquires would hand one Instance to
+// two goroutines and inflight would reach zero while a call was still running —
+// letting drain close an instance a caller is inside. Corrupting the pool
+// quietly is strictly worse than stopping here.
+func (p *pool) takeBack(inst *Instance) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if _, ok := p.checkedOut[inst]; !ok {
+		panic(fmt.Sprintf("host: pool.release: instance %p is not checked out of this pool; "+
+			"release must be called exactly once per successful acquire, with the instance acquire returned", inst))
+	}
+	delete(p.checkedOut, inst)
 }
 
 // recordDisposeErr stores a close failure that had nowhere to be returned, for
@@ -274,7 +353,9 @@ func (p *pool) recordDisposeErr(err error) {
 //     call into a truncated one;
 //  3. every pooled instance is closed. Because in-flight is zero and no new
 //     acquire can start, every slot is back in free by now, so collecting all
-//     of them cannot block.
+//     of them cannot block — and a slot that is missing all the same is a
+//     broken invariant, which drain reports by panicking rather than by
+//     waiting forever for it.
 //
 // Errors are reported, never swallowed: each failing close is joined, together
 // with any failure release could not return (see recordDisposeErr), into
@@ -287,15 +368,17 @@ func (p *pool) recordDisposeErr(err error) {
 // wazero Runtime they belong to (which Activate files in the lifecycle ledger)
 // is what reclaims those.
 //
-// drain must be called at most once. A second call returns an error: the
-// convergence belongs to the first call, so answering "drained" without having
-// waited would be a guess, and closing an already-closed channel would panic.
+// drain must be called at most once. A second call returns
+// errDrainAlreadyStarted: the convergence belongs to the first call, so
+// answering "drained" without having waited would be a guess, and closing an
+// already-closed channel would panic. It is a sentinel so a caller can tell
+// that case from a convergence that was really attempted and failed.
 func (p *pool) drain(ctx context.Context) error {
 	p.mu.Lock()
 	if p.closing {
 		p.mu.Unlock()
-		return errors.New("drain plugin instance pool: already draining; drain must be called at most once, " +
-			"and only its first caller waits for in-flight calls")
+		return fmt.Errorf("drain plugin instance pool: %w; drain must be called at most once, "+
+			"and only its first caller waits for in-flight calls", errDrainAlreadyStarted)
 	}
 	p.closing = true
 	close(p.closed)
@@ -325,8 +408,18 @@ func (p *pool) drain(ctx context.Context) error {
 	var errs []error
 	for i := 0; i < p.size; i++ {
 		// Cannot block: in-flight is zero and closing bars new callers, so all
-		// p.size slots are in the channel.
-		inst := <-p.free
+		// p.size entries are in the channel. A missing entry would mean that
+		// premise is broken — an entry lost, or an in-flight caller never
+		// counted — and waiting for it would hang shutdown with no diagnostic,
+		// which is the worst way for a pool to fail. So it says so and stops,
+		// the same stance release takes on the sending side.
+		var inst *Instance
+		select {
+		case inst = <-p.free:
+		default:
+			panic(fmt.Sprintf("host: pool.drain: only %d of %d slots came back after in-flight reached zero; "+
+				"pool entry accounting is corrupt", i, p.size))
+		}
 		if inst == nil {
 			continue
 		}

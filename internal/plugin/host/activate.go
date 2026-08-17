@@ -105,7 +105,9 @@ type Plugin struct {
 // (TestActivateReportsAFailureWhileRollingBack,
 // TestPoolDrainReportsACloseFailure) — forcing wazero's own Close to fail from
 // outside this package is not practically reachable. Production code never
-// overrides it.
+// overrides it. Substituting it is only safe while no test in this package
+// calls t.Parallel(): several tests already swap it and restore it via
+// t.Cleanup, which a parallel test would race under -race.
 var closeInstance = func(ctx context.Context, inst *Instance) error { return inst.Close(ctx) }
 
 // Activate brings one plugin up as a sequence of steps, each of which files
