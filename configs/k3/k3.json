@@ -1,0 +1,21 @@
+{
+  "id": "k3",
+  "role": "k3",
+  "maas_profile": "kimik3",
+  "context_files": {
+    "enabled": true,
+    "root": ".",
+    "agents_path": "AGENTS.md",
+    "soul_path": "configs/k3/SOUL.md",
+    "tools_path": "configs/k3/TOOLS.md",
+    "user_path": "configs/k3/USER.md",
+    "memory_path": "configs/k3/MEMORY.md"
+  },
+  "workspace": {
+    "docs_root": "docs/k3",
+    "memory_root": "memory/k3"
+  },
+  "skills": {
+    "install_root": "skills/k3"
+  }
+}

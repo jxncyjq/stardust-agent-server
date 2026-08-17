@@ -27,6 +27,12 @@ func (g WorkspacePathGuard) Check(ctx context.Context, path string) (string, err
 	if err := g.checkLexical(clean); err != nil {
 		return "", err
 	}
+	// Some spellings stay lexically inside the root yet do not address a file in
+	// it — Windows device names and alternate data streams. Containment cannot
+	// see them, so the platform check runs alongside it, not instead of it.
+	if err := checkPlatform(clean); err != nil {
+		return "", err
+	}
 	// A lexical check alone is not a boundary: it only proves the *spelling* of
 	// the path stays inside the root. A symlink inside the workspace pointing
 	// out of it spells fine, and the caller's os.Open then follows it straight
@@ -43,7 +49,12 @@ func (g WorkspacePathGuard) Check(ctx context.Context, path string) (string, err
 func (g WorkspacePathGuard) checkLexical(clean string) error {
 	rel, err := filepath.Rel(g.root, clean)
 	if err != nil {
-		return fmt.Errorf("check path relation: %w", err)
+		// Rel fails when the two paths share no common base it can express: a
+		// different volume, or a prefix form like \\?\C:\… that Clean leaves
+		// alone. A path whose relation to the root cannot be computed cannot be
+		// shown to be inside it, and "cannot prove inside" is outside.
+		return fmt.Errorf("%w: %s cannot be related to the workspace root: %w",
+			ErrPathOutsideWorkspace, clean, err)
 	}
 	if rel == "." {
 		return nil

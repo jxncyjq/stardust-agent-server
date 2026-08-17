@@ -527,10 +527,13 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// (name+arguments) and so miss "same tool, different args" runaways;
 		// this counts by tool NAME only. Recorded before executing this round so
 		// the count reflects every call the model has made, including now.
+		// Count the tool the model actually reached, not the call_tool wrapper
+		// the lazy protocol reaches it through: see guardedToolName.
 		capHit := ""
 		for _, c := range calls {
-			if st.toolNameGuard.record(c.Name) >= toolLoopCap {
-				capHit = c.Name
+			guarded := guardedToolName(c)
+			if st.toolNameGuard.record(guarded) >= toolLoopCap {
+				capHit = guarded
 			}
 		}
 		st.convo.appendAssistant(st.resp.Text, calls)
@@ -545,7 +548,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// Warn only — the loop cap is the hard stop.
 		nameByID := make(map[string]string, len(calls))
 		for _, c := range calls {
-			nameByID[c.ID] = c.Name
+			nameByID[c.ID] = guardedToolName(c)
 		}
 		for _, res := range results {
 			if res.Success {
