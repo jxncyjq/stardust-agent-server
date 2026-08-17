@@ -221,27 +221,33 @@ func TestInvokeManifest(t *testing.T) {
 	}
 }
 
-// TestInvokeCallTool covers the real abi.OpCallTool op: the fixture echoes
-// the input's "args" field back under a "result" key.
+// TestInvokeCallTool covers the real abi.OpCallTool op at the Instance level:
+// the fixture answers a tool call with a JSON domain.ToolResult whose output
+// echoes the tool name and the arguments it was handed (see testdata/README.md).
+// What the HOST does with that answer is contribute_test.go's business; this
+// test only pins that a real call body travels into the guest and a readable
+// answer comes back out.
 func TestInvokeCallTool(t *testing.T) {
 	inst := newTestInstance(t, testMemoryPages)
 	ctx := context.Background()
 
-	out, err := inst.Invoke(ctx, abi.OpCallTool, []byte(`{"tool":"echo_tool","args":{"x":1}}`))
+	out, err := inst.Invoke(ctx, abi.OpCallTool, []byte(`{"call_id":"c1","tool":"echo_tool","arguments":{"x":"1"}}`))
 	if err != nil {
 		t.Fatalf("Invoke: %v", err)
 	}
 
 	var got struct {
-		Result struct {
-			X int `json:"x"`
-		} `json:"result"`
+		Success bool   `json:"success"`
+		Output  string `json:"output"`
 	}
 	if err := json.Unmarshal(out, &got); err != nil {
 		t.Fatalf("decode result %s: %v", out, err)
 	}
-	if got.Result.X != 1 {
-		t.Errorf("Invoke(OpCallTool) result.x = %d, want 1", got.Result.X)
+	if !got.Success {
+		t.Errorf("Invoke(OpCallTool) success = false, want true (body %s)", out)
+	}
+	if want := `echo_tool:{"x":"1"}`; got.Output != want {
+		t.Errorf("Invoke(OpCallTool) output = %q, want %q", got.Output, want)
 	}
 }
 

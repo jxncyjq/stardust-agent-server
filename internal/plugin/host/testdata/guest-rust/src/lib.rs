@@ -105,15 +105,56 @@ pub extern "C" fn plugin_invoke(op: i32, ptr: i32, size: i32) -> i64 {
         0 => write_out(
             br#"{"name":"legion-test-plugin","version":"0.1.0","provides":["echo_tool"]}"#,
         ),
-        // abi.OpCallTool: input is a JSON tool call {"tool":...,"args":...};
-        // echo args back under "result".
+        // abi.OpCallTool: the host hands over a JSON call
+        // {"call_id":...,"tool":...,"arguments":{...}} and expects a JSON
+        // domain.ToolResult back (see ../README.md).
+        //
+        // "call_id" is deliberately answered with a fixed wrong value: the
+        // host owns the correlation id and overwrites whatever the guest
+        // returns, and a guest that never returns the right one is what proves
+        // it does.
         1 => {
             let v: serde_json::Value = match serde_json::from_slice(&input) {
                 Ok(v) => v,
-                Err(_) => return write_out(br#"{"error":"bad json"}"#),
+                Err(_) => {
+                    return write_out(
+                        br#"{"call_id":"guest-call-id","success":false,"error":"bad json"}"#,
+                    )
+                }
             };
-            let args = v.get("args").cloned().unwrap_or(serde_json::Value::Null);
-            let out = serde_json::json!({ "result": args });
+            let tool = v.get("tool").and_then(|x| x.as_str()).unwrap_or("");
+            if tool.is_empty() {
+                return write_out(
+                    br#"{"call_id":"guest-call-id","success":false,"error":"missing tool"}"#,
+                );
+            }
+            let args = v
+                .get("arguments")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            // An argument named "malformed" makes the guest answer with a body
+            // that is valid JSON but not a ToolResult, so the host's decode
+            // failure has a fixture instead of only a unit test.
+            if args.get("malformed").is_some() {
+                return write_out(br#"{"unexpected":"shape"}"#);
+            }
+            // An argument named "fail" makes the guest answer with a FAILED
+            // ToolResult carrying its value as the reason: the tool's own
+            // failure, which the host must pass on rather than turn into a
+            // host error.
+            if let Some(reason) = args.get("fail").and_then(|x| x.as_str()) {
+                let out = serde_json::json!({
+                    "call_id": "guest-call-id",
+                    "success": false,
+                    "error": reason,
+                });
+                return write_out(out.to_string().as_bytes());
+            }
+            let out = serde_json::json!({
+                "call_id": "guest-call-id",
+                "success": true,
+                "output": format!("{}:{}", tool, args),
+            });
             write_out(out.to_string().as_bytes())
         }
         // test-only: echo/JSON round trip.

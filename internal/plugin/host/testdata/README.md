@@ -51,7 +51,7 @@ the other tests stand on.
 | op | name                | defined in         | behavior |
 |----|---------------------|---------------------|----------|
 | 0  | `abi.OpManifest`    | `internal/plugin/abi` | input ignored; returns `{"name":"legion-test-plugin","version":"0.1.0","provides":["echo_tool"]}` |
-| 1  | `abi.OpCallTool`    | `internal/plugin/abi` | input is a JSON tool call `{"tool":...,"args":...}`; returns `{"result": <args>}` |
+| 1  | `abi.OpCallTool`    | `internal/plugin/abi` | input is a JSON tool call `{"call_id":...,"tool":...,"arguments":{...}}`; returns a JSON `domain.ToolResult` (see below) |
 | 90 | test-only echo      | `internal/plugin/host` test files | parses `{"name":string,"n":int}`, returns `{"greeting":"hello <name>","doubled":<n*2>}` |
 | 91 | test-only probe     | `internal/plugin/host` test files | input ignored; returns `{"initialized":bool,"alloc_calls":int,"free_calls":int,"slow_free_calls":int,"in_ptr":int,"in_len":int}` (see below) |
 | 92 | test-only arm slow free | `internal/plugin/host` test files | input `{"spin_iters":int}`; arms the **next** `plugin_free` call to spin that many iterations, then returns `{"armed":true,"spin_iters":<n>}`. Missing `spin_iters` returns `{"error":"missing spin_iters"}` |
@@ -65,6 +65,26 @@ the other tests stand on.
 Ops 90-99 are test-only: their numeric constants are declared unexported in
 `internal/plugin/host`'s `_test.go` files, not in the production `abi`
 package.
+
+### Op 1's tool result
+
+Op 1 is the guest side of a contributed tool call (`internal/plugin/host`'s
+`contribute.go`). The host sends `guestToolCall`
+(`{"call_id":…,"tool":…,"arguments":{…}}`) and expects a JSON
+`domain.ToolResult` back. The fixture answers:
+
+| arguments | answer |
+|---|---|
+| (anything else) | `{"call_id":"guest-call-id","success":true,"output":"<tool>:<arguments as compact JSON>"}` |
+| contains `fail` (string) | `{"call_id":"guest-call-id","success":false,"error":"<that string>"}` — the tool's own failure, which the host must pass on as a result rather than as a Go error |
+| contains `malformed` | `{"unexpected":"shape"}` — valid JSON that is not a `ToolResult`, so the host's strict decode must report it instead of handing on an empty result |
+| (`tool` missing/empty) | `{"call_id":"guest-call-id","success":false,"error":"missing tool"}` |
+| (input is not JSON) | `{"call_id":"guest-call-id","success":false,"error":"bad json"}` |
+
+`call_id` is **always** answered with the literal `guest-call-id`, never with
+the id the host sent. That is deliberate: the host owns the correlation id and
+overwrites whatever the guest returns, so a fixture that echoed the right one
+could not tell a host that overwrites it from one that trusts the guest.
 
 ### Op 91's report
 
