@@ -53,6 +53,8 @@ type Spec struct {
 	Wasm []byte
 
 	// Provides lists the tool names the host claims this plugin contributes.
+	// It must be non-empty: in this phase a plugin exists to contribute
+	// tools, and an empty Provides would make the cross-check below vacuous.
 	// Every one of them must appear in the guest's own manifest; a guest that
 	// declares MORE than the host claims is not a conflict, because the host
 	// only ever contributes what it claims here.
@@ -77,8 +79,11 @@ type Spec struct {
 // guest declared, and the one live Instance activation created.
 //
 // A Plugin owns no teardown of its own. Every resource activation created is
-// filed in the lifecycle.Ledger under the owner it was activated for, so
-// revoking a plugin is ledger.DisposeOwner(owner) and nothing else.
+// filed in the lifecycle.Ledger under the owner it was activated for, so once
+// Activate has returned successfully, revoking the plugin is
+// ledger.DisposeOwner(owner) and nothing else — Activate's owner-exclusivity
+// precondition (see its doc comment) guarantees nothing else is filed under
+// that owner alongside it.
 type Plugin struct {
 	// Name is Spec.Name, which activation has proven equals Manifest.Name.
 	Name string
@@ -92,8 +97,18 @@ type Plugin struct {
 	Instance *Instance
 }
 
+// closeInstance performs the wazero close behind the instance's ledger
+// disposer. It is a package-level function value rather than a direct call
+// to *Instance.Close only so activate_test.go can substitute a failing
+// implementation and prove that a disposer failure during rollback is joined
+// onto the activation error instead of dropped
+// (TestActivateReportsAFailureWhileRollingBack) — forcing wazero's own Close
+// to fail from outside this package is not practically reachable. Production
+// code never overrides it.
+var closeInstance = func(ctx context.Context, inst *Instance) error { return inst.Close(ctx) }
+
 // Activate brings one plugin up as a sequence of steps, each of which files
-// its revocation under owner before the next step can fail:
+// its own one-shot revocation handle before the next step can fail:
 //
 //  1. create the plugin's wazero runtime (file it), so the memory cap is in
 //     force before any guest code is compiled;
@@ -110,11 +125,25 @@ type Plugin struct {
 // whose host manifest disagrees with its guest is exactly the failure that
 // must exercise the rollback, so the rollback path cannot rot into dead code.
 //
-// On any failure Activate rolls back everything already filed under owner, in
-// reverse order (lifecycle.Ledger.DisposeOwner), and returns an error — never
-// a partially activated Plugin. A failure while rolling back is itself
-// reported: it is joined onto the activation error rather than replacing or
-// hiding it.
+// Owner exclusivity is a precondition, not a courtesy: owner must belong to
+// this activation alone. Activate refuses to start if
+// ledger.Snapshot()[owner] is already non-empty, naming the owner and the
+// entries already filed under it, rather than silently tearing them down. A
+// caller reloading a plugin under a stable owner (a hot-reload keeping
+// "plugin:foo" across activations, for instance) MUST dispose the previous
+// activation before calling Activate again with the same owner.
+//
+// On any failure Activate rolls back only the entries THIS CALL filed, in
+// reverse order, using the one-shot revoke handle lifecycle.Ledger.Add
+// returned for each of them — never lifecycle.Ledger.DisposeOwner(owner),
+// which would also destroy anything else filed under owner (the exact
+// failure mode the owner-exclusivity precondition above and this rollback
+// scoping both exist to prevent: a hot-reload's failed cross-check must
+// never tear down the live plugin it was trying to replace). A failure while
+// rolling back is itself reported: every revoke error is joined
+// (errors.Join) onto the activation error rather than replacing or hiding
+// it, and none is dropped. Activate never returns a partially activated
+// Plugin.
 //
 // Activate does NOT register the plugin's tools. Tool contribution is a
 // separate step with its own revocation, and it is not part of the sequence
@@ -125,6 +154,11 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 	}
 	if owner == "" {
 		return nil, fmt.Errorf("activate plugin %q: owner is empty; every filed resource needs an owner to revoke it", spec.Name)
+	}
+	if held := ledger.Snapshot()[owner]; len(held) != 0 {
+		return nil, fmt.Errorf("activate plugin %q: owner %s already holds %v; owner must be exclusive to a single "+
+			"activation — dispose the previous activation before activating a new one under the same owner",
+			spec.Name, owner, held)
 	}
 	if err := validateSpec(spec); err != nil {
 		return nil, err
@@ -141,13 +175,20 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 	// on arrival and leak what it was supposed to release.
 	disposeCtx := context.WithoutCancel(ctx)
 
+	// revokers holds the one-shot handle lifecycle.Ledger.Add returns for
+	// every entry THIS CALL files, in filing order. Only these are rolled back
+	// on failure — see the owner-exclusivity paragraph above.
+	var revokers []func() error
+
 	committed := false
 	defer func() {
 		if committed {
 			return
 		}
-		if derr := ledger.DisposeOwner(owner); derr != nil {
-			err = errors.Join(err, fmt.Errorf("roll back activation of plugin %q: %w", spec.Name, derr))
+		for i := len(revokers) - 1; i >= 0; i-- {
+			if derr := revokers[i](); derr != nil {
+				err = errors.Join(err, fmt.Errorf("roll back activation of plugin %q: %w", spec.Name, derr))
+			}
 		}
 	}()
 
@@ -157,12 +198,12 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 	// fail. Closing the runtime also closes the host module and any instance
 	// created from it, which is why it is filed FIRST and therefore disposed
 	// LAST.
-	ledger.Add(owner, ledgerLabelRuntime, func() error {
+	revokers = append(revokers, ledger.Add(owner, ledgerLabelRuntime, func() error {
 		if cerr := rt.Close(disposeCtx); cerr != nil {
 			return fmt.Errorf("close wasm runtime of plugin %q: %w", spec.Name, cerr)
 		}
 		return nil
-	})
+	}))
 
 	// The CompiledModule needs no ledger entry of its own: wazero ties it to the
 	// runtime that compiled it, so the runtime's disposer releases it too.
@@ -171,7 +212,7 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 		return nil, fmt.Errorf("activate plugin %q: %w", spec.Name, err)
 	}
 	if err := CheckImports(compiled, spec.Grant); err != nil {
-		return nil, fmt.Errorf("activate plugin %q: check imports: %w", spec.Name, err)
+		return nil, fmt.Errorf("activate plugin %q: %w", spec.Name, err)
 	}
 	if _, err := BuildHostModule(ctx, rt, spec.Grant, spec.Deps); err != nil {
 		return nil, fmt.Errorf("activate plugin %q: %w", spec.Name, err)
@@ -181,12 +222,12 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 	if err != nil {
 		return nil, fmt.Errorf("activate plugin %q: %w", spec.Name, err)
 	}
-	ledger.Add(owner, ledgerLabelInstance, func() error {
-		if cerr := inst.Close(disposeCtx); cerr != nil {
+	revokers = append(revokers, ledger.Add(owner, ledgerLabelInstance, func() error {
+		if cerr := closeInstance(disposeCtx, inst); cerr != nil {
 			return fmt.Errorf("close instance of plugin %q: %w", spec.Name, cerr)
 		}
 		return nil
-	})
+	}))
 
 	// Read and cross-check AFTER the instance is filed: a mismatch must be a
 	// failure with something to roll back (see the doc comment above, and
@@ -217,6 +258,10 @@ func validateSpec(spec Spec) error {
 	if spec.MemoryPages == 0 {
 		return fmt.Errorf("activate plugin %q: Spec.MemoryPages is 0; the guest memory cap is a required sizing decision", spec.Name)
 	}
+	if len(spec.Provides) == 0 {
+		return fmt.Errorf("activate plugin %q: Spec.Provides is empty; a plugin exists to contribute tools, "+
+			"and a cross-check against nothing is not a check", spec.Name)
+	}
 	for i, provided := range spec.Provides {
 		if provided == "" {
 			return fmt.Errorf("activate plugin %q: Spec.Provides[%d] is empty; remove the entry or give it a tool name", spec.Name, i)
@@ -229,22 +274,50 @@ func validateSpec(spec Spec) error {
 	return nil
 }
 
-// readManifest asks the guest to describe itself. The empty body is not a
-// legal answer here: abi.OpManifest's contract is a JSON document, and a guest
-// that returns nothing has not answered.
+// readManifest asks the guest to describe itself and decodes what it
+// returns. The actual decoding is decodeManifest, split out so its error
+// branches can be table-tested without an Instance or a compiled guest
+// module.
 func readManifest(ctx context.Context, inst *Instance) (Manifest, error) {
 	body, err := inst.Invoke(ctx, abi.OpManifest, nil)
 	if err != nil {
 		return Manifest{}, fmt.Errorf("read self-description (op %d): %w", abi.OpManifest, err)
 	}
+	manifest, err := decodeManifest(body)
+	if err != nil {
+		return Manifest{}, fmt.Errorf("read self-description (op %d): %w", abi.OpManifest, err)
+	}
+	return manifest, nil
+}
+
+// decodeManifest parses a guest's raw self-description body. The empty body
+// is not a legal answer: abi.OpManifest's contract is a JSON document, and a
+// guest that returns nothing has not answered — this is reachable in
+// production, not theoretical, because Instance.Invoke returns (nil, nil)
+// whenever the guest's packed result length is 0.
+func decodeManifest(body []byte) (Manifest, error) {
 	if len(body) == 0 {
-		return Manifest{}, fmt.Errorf("read self-description (op %d): guest returned no body", abi.OpManifest)
+		return Manifest{}, errors.New("guest returned no body")
 	}
 	var manifest Manifest
 	if err := json.Unmarshal(body, &manifest); err != nil {
-		return Manifest{}, fmt.Errorf("decode self-description %s: %w", body, err)
+		return Manifest{}, fmt.Errorf("decode self-description %s: %w", quoteForError(body), err)
 	}
 	return manifest, nil
+}
+
+// quoteForError renders guest-controlled bytes safely for an error message.
+// body is bounded only by Spec.MemoryPages and may contain newlines or other
+// control characters, so it is %q-escaped rather than spliced in raw, and
+// capped to its first 256 bytes (plus a total-length suffix) so a guest that
+// fills its whole memory cap with garbage cannot inflate the error — and,
+// eventually, the log line Task 6 writes it to — to match.
+func quoteForError(body []byte) string {
+	const max = 256
+	if len(body) <= max {
+		return fmt.Sprintf("%q", body)
+	}
+	return fmt.Sprintf("%q (truncated from %d bytes)", body[:max], len(body))
 }
 
 // crossCheck holds the host's claims about a plugin against what the guest

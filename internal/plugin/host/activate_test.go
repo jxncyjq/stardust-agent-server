@@ -1,6 +1,7 @@
 package host
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"strings"
@@ -49,6 +50,10 @@ func fixtureSpec(t *testing.T) Spec {
 // hostcallSpec is a Spec for testdata/hostcall.wasm, which imports every
 // legion host function. Its op 0 is not the manifest op, so it self-describes
 // as an unsupported-op error envelope — that is what makes it useful here.
+// Provides names a placeholder tool only to satisfy validateSpec's
+// non-empty-Provides precondition (Minor 4): every test using hostcallSpec
+// fails before crossCheck ever looks at Provides (at CheckImports, or at the
+// manifest's missing name), so its actual value is irrelevant to them.
 func hostcallSpec(t *testing.T) Spec {
 	t.Helper()
 
@@ -59,6 +64,7 @@ func hostcallSpec(t *testing.T) Spec {
 	return Spec{
 		Name:        testPluginName,
 		Wasm:        wasmBytes,
+		Provides:    []string{"unused_placeholder_tool"},
 		MemoryPages: testMemoryPages,
 	}
 }
@@ -165,12 +171,21 @@ func TestActivateFilesTheInstanceBeforeReadingTheManifest(t *testing.T) {
 	var atInvoke []string
 	seen := false
 	listener := experimental.FunctionListenerFunc(func(
-		_ context.Context, _ api.Module, _ api.FunctionDefinition, _ []uint64, _ experimental.StackIterator,
+		_ context.Context, _ api.Module, _ api.FunctionDefinition, params []uint64, _ experimental.StackIterator,
 	) {
 		mu.Lock()
 		defer mu.Unlock()
 		if seen {
 			return // only the first call — the manifest read — is the interesting one
+		}
+		// Confirm this really is the manifest read (params[0] is the op wazero
+		// received, packed the same way Instance.Invoke sends it) before
+		// recording anything: a future Activate that invokes some other op
+		// first must not be able to keep this test green while pinning the
+		// wrong call. If op never matches, seen stays false and the "listener
+		// never fired" guard below catches it.
+		if len(params) == 0 || params[0] != uint64(uint32(abi.OpManifest)) {
+			return
 		}
 		seen = true
 		atInvoke = ledger.Snapshot()[testOwner]
@@ -400,15 +415,33 @@ func TestActivateRejectsAnUnusableSelfDescription(t *testing.T) {
 // TestActivateReportsAFailureWhileRollingBack asserts the rollback does not
 // swallow a disposer failure and does not lose the activation error either:
 // both must reach the caller.
+//
+// The failing disposer here is one Activate itself filed (the instance's),
+// not a foreign entry pre-filed under the owner: since rollback is now
+// handle-scoped (Important 1) and Activate refuses to start under a
+// non-empty owner, pre-filing a "hostile" entry under testOwner — as this
+// test used to — would be rejected by the owner-exclusivity precondition
+// before Activate ever reached the failure this test wants to exercise.
+// closeInstance is swapped for the duration of the test to force that.
 func TestActivateReportsAFailureWhileRollingBack(t *testing.T) {
+	ctx, guestClosed := watchGuestClose(context.Background())
 	ledger := lifecycle.NewLedger()
-	disposeErr := errors.New("hostile disposer refused")
-	ledger.Add(testOwner, "hostile", func() error { return disposeErr })
+
+	disposeErr := errors.New("hostile close refused")
+	originalCloseInstance := closeInstance
+	closeInstance = func(ctx context.Context, inst *Instance) error {
+		// Still release the real wazero resources — a disposer that reports a
+		// failure has not thereby earned the right to leak the module it was
+		// supposed to close.
+		_ = originalCloseInstance(ctx, inst)
+		return disposeErr
+	}
+	t.Cleanup(func() { closeInstance = originalCloseInstance })
 
 	spec := fixtureSpec(t)
 	spec.Provides = []string{"absent_tool"}
 
-	p, err := Activate(context.Background(), ledger, testOwner, spec)
+	p, err := Activate(ctx, ledger, testOwner, spec)
 	if err == nil {
 		t.Fatal("Activate succeeded although the host claims a tool the guest does not declare")
 	}
@@ -422,6 +455,42 @@ func TestActivateReportsAFailureWhileRollingBack(t *testing.T) {
 		t.Errorf("error %q lost the activation failure while reporting the rollback failure", err)
 	}
 	assertOwnerRolledBack(t, ledger, testOwner)
+	if !guestClosed.Load() {
+		t.Error("the guest module was never closed: a failing disposer must still run the real close, " +
+			"not skip it because it also reports an error")
+	}
+}
+
+// TestActivateRejectsAReusedOwner covers Important 1's other half: the
+// fail-loud precondition. A caller that reuses an owner already holding
+// entries — the realistic case being a hot-reload that forgot to dispose the
+// previous activation first — must be refused loudly, naming the owner and
+// what is already filed under it, rather than having Activate silently tear
+// those entries down (which is what the old DisposeOwner(owner)-based
+// rollback would have done on any later failure).
+func TestActivateRejectsAReusedOwner(t *testing.T) {
+	ledger := lifecycle.NewLedger()
+	ledger.Add(testOwner, "preexisting", func() error { return nil })
+
+	p, err := Activate(context.Background(), ledger, testOwner, fixtureSpec(t))
+	if err == nil {
+		t.Fatal("Activate succeeded although the owner already holds an entry")
+	}
+	if p != nil {
+		t.Errorf("Activate returned a plugin (%+v) together with an error", p)
+	}
+	msg := err.Error()
+	for _, want := range []string{string(testOwner), "preexisting"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("error %q does not mention %q", msg, want)
+		}
+	}
+	// The precondition must reject before doing anything, not roll anything
+	// back: the pre-filed entry is foreign to this call and must be left
+	// exactly as it was.
+	if labels := ledger.Snapshot()[testOwner]; len(labels) != 1 || labels[0] != "preexisting" {
+		t.Errorf("ledger.Snapshot()[%s] = %v, want only the pre-filed entry, untouched", testOwner, labels)
+	}
 }
 
 // TestActivateRejectsAnInvalidSpec covers the assembly-time invariants: every
@@ -451,6 +520,8 @@ func TestActivateRejectsAnInvalidSpec(t *testing.T) {
 		{name: "empty name", owner: testOwner, mutate: func(s *Spec) { s.Name = "" }, want: "Name"},
 		{name: "no wasm", owner: testOwner, mutate: func(s *Spec) { s.Wasm = nil }, want: "Wasm"},
 		{name: "zero memory pages", owner: testOwner, mutate: func(s *Spec) { s.MemoryPages = 0 }, want: "MemoryPages"},
+		{name: "nil provides", owner: testOwner, mutate: func(s *Spec) { s.Provides = nil }, want: "Provides"},
+		{name: "empty provides slice", owner: testOwner, mutate: func(s *Spec) { s.Provides = []string{} }, want: "Provides"},
 		{name: "empty provides entry", owner: testOwner, mutate: func(s *Spec) { s.Provides = []string{""} }, want: "Provides"},
 		{
 			name:   "conflicting deps plugin name",
@@ -485,4 +556,92 @@ func TestActivateRejectsAnInvalidSpec(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDecodeManifest covers decodeManifest's error branches directly
+// (Minor 2): the empty-body case is reachable in production whenever
+// Instance.Invoke returns (nil, nil) — a zero-length packed result — and no
+// existing fixture's op 0 exercises it or the invalid-JSON case, so this
+// table test exists precisely to give both an "确实返回 error" assertion
+// without a Rust fixture rebuild.
+func TestDecodeManifest(t *testing.T) {
+	tests := []struct {
+		name    string
+		body    []byte
+		want    Manifest
+		wantErr string
+	}{
+		{name: "nil body", body: nil, wantErr: "guest returned no body"},
+		{name: "empty body", body: []byte{}, wantErr: "guest returned no body"},
+		{name: "truncated JSON object", body: []byte("{"), wantErr: "decode self-description"},
+		{name: "JSON array instead of an object", body: []byte("[]"), wantErr: "decode self-description"},
+		{
+			name: "valid manifest",
+			body: []byte(`{"name":"legion-test-plugin","version":"0.1.0","provides":["echo_tool"]}`),
+			want: Manifest{Name: "legion-test-plugin", Version: "0.1.0", Provides: []string{"echo_tool"}},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := decodeManifest(tc.body)
+			if tc.wantErr != "" {
+				if err == nil {
+					t.Fatalf("decodeManifest(%q) succeeded, want an error containing %q", tc.body, tc.wantErr)
+				}
+				if !strings.Contains(err.Error(), tc.wantErr) {
+					t.Errorf("decodeManifest(%q) error = %q, want it to contain %q", tc.body, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("decodeManifest(%q): %v", tc.body, err)
+			}
+			if got.Name != tc.want.Name || got.Version != tc.want.Version || strings.Join(got.Provides, ",") != strings.Join(tc.want.Provides, ",") {
+				t.Errorf("decodeManifest(%q) = %+v, want %+v", tc.body, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestDecodeManifestQuotesAndTruncatesAnUnusableBody covers Minor 3: body is
+// whatever the guest wrote, bounded only by Spec.MemoryPages, and may carry
+// control characters — it must never be spliced into an error raw, and a
+// long body must be capped rather than inflating the error (and, once Task 6
+// logs it, the log line) to match.
+func TestDecodeManifestQuotesAndTruncatesAnUnusableBody(t *testing.T) {
+	t.Run("control characters are escaped, not literal", func(t *testing.T) {
+		body := []byte("not json\x01\n\x02")
+
+		_, err := decodeManifest(body)
+		if err == nil {
+			t.Fatal("decodeManifest succeeded on non-JSON bytes")
+		}
+		msg := err.Error()
+		if strings.ContainsRune(msg, '\x01') {
+			t.Errorf("error %q contains the raw control byte instead of an escaped one", msg)
+		}
+		if strings.ContainsRune(msg, '\n') {
+			t.Errorf("error %q contains a literal newline instead of an escaped one", msg)
+		}
+		if !strings.Contains(msg, `\x01`) {
+			t.Errorf("error %q does not show the control byte escaped via %%q", msg)
+		}
+	})
+
+	t.Run("a long body is truncated", func(t *testing.T) {
+		body := append([]byte("{"), bytes.Repeat([]byte("a"), 1000)...) // invalid JSON, 1001 bytes total
+
+		_, err := decodeManifest(body)
+		if err == nil {
+			t.Fatal("decodeManifest succeeded on invalid JSON")
+		}
+		msg := err.Error()
+		if len(msg) > 600 {
+			t.Errorf("error is %d bytes long; want the guest body capped rather than spliced in full: %s", len(msg), msg)
+		}
+		if !strings.Contains(msg, "1001 bytes") {
+			t.Errorf("error %q does not report the untruncated body length", msg)
+		}
+	})
 }
