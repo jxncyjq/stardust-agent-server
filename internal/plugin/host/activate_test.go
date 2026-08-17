@@ -12,6 +12,7 @@ import (
 	"github.com/stardust/legion-agent/internal/lifecycle"
 	"github.com/stardust/legion-agent/internal/plugin/abi"
 	"github.com/stardust/legion-agent/internal/plugin/perm"
+	"github.com/stardust/legion-agent/internal/tool"
 	"github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/experimental"
 )
@@ -32,6 +33,11 @@ const testOwner lifecycle.Owner = "plugin:legion-test-plugin"
 // fixtureSpec is a Spec that activates testdata/plugin.wasm successfully: the
 // host claims exactly the one tool the guest declares, and nothing is granted
 // (the fixture imports no host function, so an empty Grant needs no Deps).
+//
+// Registry is a fresh one per call, so an activation test's contributed tools
+// cannot be seen by another test's registry. The gateable catalog cannot be
+// isolated that way — toolauth.Contribute is process-global — so every test that
+// activates successfully MUST dispose its owner (see newContribution).
 func fixtureSpec(t *testing.T) Spec {
 	t.Helper()
 
@@ -40,20 +46,23 @@ func fixtureSpec(t *testing.T) Spec {
 		t.Fatalf("read fixture wasm: %v", err)
 	}
 	return Spec{
-		Name:        fixtureManifestName,
-		Wasm:        wasmBytes,
-		Provides:    []string{fixtureProvidedTool},
-		MemoryPages: testMemoryPages,
+		Name:         fixtureManifestName,
+		Wasm:         wasmBytes,
+		Tools:        []tool.Descriptor{fixtureDescriptor()},
+		Registry:     tool.NewRegistry(nil, nil, nil),
+		MaxInstances: 1,
+		MemoryPages:  testMemoryPages,
 	}
 }
 
 // hostcallSpec is a Spec for testdata/hostcall.wasm, which imports every
 // legion host function. Its op 0 is not the manifest op, so it self-describes
 // as an unsupported-op error envelope — that is what makes it useful here.
-// Provides names a placeholder tool only to satisfy validateSpec's
-// non-empty-Provides precondition (Minor 4): every test using hostcallSpec
-// fails before crossCheck ever looks at Provides (at CheckImports, or at the
-// manifest's missing name), so its actual value is irrelevant to them.
+// Tools names a placeholder tool only to satisfy validateSpec's non-empty-Tools
+// precondition (Minor 4): every test using hostcallSpec fails before crossCheck
+// ever looks at Tools (at CheckImports, or at the manifest's missing name), so
+// its actual value is irrelevant to them — and no test using it ever reaches the
+// contribution step, so the placeholder never enters the gateable catalog.
 func hostcallSpec(t *testing.T) Spec {
 	t.Helper()
 
@@ -62,10 +71,16 @@ func hostcallSpec(t *testing.T) Spec {
 		t.Fatalf("read hostcall fixture wasm: %v", err)
 	}
 	return Spec{
-		Name:        testPluginName,
-		Wasm:        wasmBytes,
-		Provides:    []string{"unused_placeholder_tool"},
-		MemoryPages: testMemoryPages,
+		Name: testPluginName,
+		Wasm: wasmBytes,
+		Tools: []tool.Descriptor{{
+			Name:        "unused_placeholder_tool",
+			Description: "placeholder",
+			Group:       "plugins",
+		}},
+		Registry:     tool.NewRegistry(nil, nil, nil),
+		MaxInstances: 1,
+		MemoryPages:  testMemoryPages,
 	}
 }
 
@@ -93,11 +108,12 @@ func assertOwnerRolledBack(t *testing.T, ledger *lifecycle.Ledger, owner lifecyc
 }
 
 // TestActivateFilesRuntimeAndInstance covers the happy path: the manifest the
-// guest declares is returned, the instance is live, and both the runtime and
-// the instance are filed under the owner so a later DisposeOwner can revoke
+// guest declares is returned, the plugin answers a call, and every resource
+// activation created — runtime, instance, instance pool, and the two entries per
+// contributed tool — is filed under the owner so a later DisposeOwner can revoke
 // them.
 func TestActivateFilesRuntimeAndInstance(t *testing.T) {
-	ctx := context.Background()
+	ctx, guestClosed := watchGuestClose(context.Background())
 	ledger := lifecycle.NewLedger()
 
 	p, err := Activate(ctx, ledger, testOwner, fixtureSpec(t))
@@ -116,26 +132,29 @@ func TestActivateFilesRuntimeAndInstance(t *testing.T) {
 	if len(p.Manifest.Provides) != 1 || p.Manifest.Provides[0] != fixtureProvidedTool {
 		t.Errorf("Plugin.Manifest.Provides = %v, want [%q]", p.Manifest.Provides, fixtureProvidedTool)
 	}
-	if p.Instance == nil {
-		t.Fatal("Plugin.Instance is nil")
-	}
-	if p.Instance.Dead() {
-		t.Error("Plugin.Instance is dead right after activation")
+	if p.pool == nil {
+		t.Fatal("Plugin.pool is nil")
 	}
 
-	// The instance must be usable, not merely non-nil: activation reads the
-	// manifest through it, so an instance that no longer answers would make the
-	// happy path a shell.
-	out, err := p.Instance.Invoke(ctx, opEcho, []byte(`{"name":"legion","n":21}`))
+	// The plugin must be usable, not merely activated: this call runs on an
+	// instance the pool builds for it, so a plugin whose guest no longer answers
+	// would make the happy path a shell.
+	out, err := p.pool.call(ctx, opEcho, []byte(`{"name":"legion","n":21}`))
 	if err != nil {
-		t.Fatalf("Invoke(opEcho) on the activated instance: %v", err)
+		t.Fatalf("call(opEcho) on the activated plugin: %v", err)
 	}
 	if !strings.Contains(string(out), `"doubled":42`) {
-		t.Errorf("Invoke(opEcho) = %s, want it to contain \"doubled\":42", out)
+		t.Errorf("call(opEcho) = %s, want it to contain \"doubled\":42", out)
 	}
 
 	labels := ledger.Snapshot()[testOwner]
-	want := []string{ledgerLabelRuntime, ledgerLabelInstance}
+	want := []string{
+		ledgerLabelRuntime,
+		ledgerLabelInstance,
+		ledgerLabelPool,
+		"tool:" + fixtureProvidedTool,
+		gateableLabel(fixtureProvidedTool),
+	}
 	if len(labels) != len(want) {
 		t.Fatalf("ledger.Snapshot()[%s] = %v, want %v", testOwner, labels, want)
 	}
@@ -151,8 +170,11 @@ func TestActivateFilesRuntimeAndInstance(t *testing.T) {
 	if labels := ledger.Snapshot()[testOwner]; len(labels) != 0 {
 		t.Errorf("after DisposeOwner ledger still holds %v", labels)
 	}
-	if !p.Instance.Dead() {
-		t.Error("after DisposeOwner the instance is not dead: its disposer did not close it")
+	if !guestClosed.Load() {
+		t.Error("after DisposeOwner no guest module was closed: the disposers were dropped rather than run")
+	}
+	if _, err := p.pool.call(context.Background(), opEcho, nil); err == nil {
+		t.Error("the plugin still answers a call after DisposeOwner, want an error: its pool was not drained")
 	}
 }
 
@@ -208,8 +230,8 @@ func TestActivateFilesTheInstanceBeforeReadingTheManifest(t *testing.T) {
 		t.Fatalf("Activate: %v", err)
 	}
 	t.Cleanup(func() { _ = ledger.DisposeOwner(testOwner) })
-	if p.Instance == nil {
-		t.Fatal("Plugin.Instance is nil")
+	if p.pool == nil {
+		t.Fatal("Plugin.pool is nil")
 	}
 
 	mu.Lock()
@@ -244,7 +266,7 @@ func TestActivateProvidesMismatchRollsBack(t *testing.T) {
 	ledger.Add(other, "unrelated", func() error { return nil })
 
 	spec := fixtureSpec(t)
-	spec.Provides = []string{"absent_tool"}
+	spec.Tools = []tool.Descriptor{{Name: "absent_tool", Description: "not declared by the guest", Group: "plugins"}}
 
 	p, err := Activate(ctx, ledger, testOwner, spec)
 	if err == nil {
@@ -439,7 +461,7 @@ func TestActivateReportsAFailureWhileRollingBack(t *testing.T) {
 	t.Cleanup(func() { closeInstance = originalCloseInstance })
 
 	spec := fixtureSpec(t)
-	spec.Provides = []string{"absent_tool"}
+	spec.Tools = []tool.Descriptor{{Name: "absent_tool", Description: "not declared by the guest", Group: "plugins"}}
 
 	p, err := Activate(ctx, ledger, testOwner, spec)
 	if err == nil {
@@ -502,10 +524,12 @@ func TestActivateRejectsAnInvalidSpec(t *testing.T) {
 		t.Fatalf("read fixture wasm: %v", err)
 	}
 	valid := Spec{
-		Name:        fixtureManifestName,
-		Wasm:        wasmBytes,
-		Provides:    []string{fixtureProvidedTool},
-		MemoryPages: testMemoryPages,
+		Name:         fixtureManifestName,
+		Wasm:         wasmBytes,
+		Tools:        []tool.Descriptor{fixtureDescriptor()},
+		Registry:     tool.NewRegistry(nil, nil, nil),
+		MaxInstances: 1,
+		MemoryPages:  testMemoryPages,
 	}
 
 	tests := []struct {
@@ -520,9 +544,35 @@ func TestActivateRejectsAnInvalidSpec(t *testing.T) {
 		{name: "empty name", owner: testOwner, mutate: func(s *Spec) { s.Name = "" }, want: "Name"},
 		{name: "no wasm", owner: testOwner, mutate: func(s *Spec) { s.Wasm = nil }, want: "Wasm"},
 		{name: "zero memory pages", owner: testOwner, mutate: func(s *Spec) { s.MemoryPages = 0 }, want: "MemoryPages"},
-		{name: "nil provides", owner: testOwner, mutate: func(s *Spec) { s.Provides = nil }, want: "Provides"},
-		{name: "empty provides slice", owner: testOwner, mutate: func(s *Spec) { s.Provides = []string{} }, want: "Provides"},
-		{name: "empty provides entry", owner: testOwner, mutate: func(s *Spec) { s.Provides = []string{""} }, want: "Provides"},
+		{name: "nil tools", owner: testOwner, mutate: func(s *Spec) { s.Tools = nil }, want: "Tools"},
+		{name: "empty tools slice", owner: testOwner, mutate: func(s *Spec) { s.Tools = []tool.Descriptor{} }, want: "Tools"},
+		{
+			name:   "tool with no name",
+			owner:  testOwner,
+			mutate: func(s *Spec) { s.Tools = []tool.Descriptor{{Description: "d", Group: "g"}} },
+			want:   "Name",
+		},
+		{
+			name:   "tool with no description",
+			owner:  testOwner,
+			mutate: func(s *Spec) { s.Tools = []tool.Descriptor{{Name: fixtureProvidedTool, Group: "g"}} },
+			want:   "Description",
+		},
+		{
+			name:   "tool with no group",
+			owner:  testOwner,
+			mutate: func(s *Spec) { s.Tools = []tool.Descriptor{{Name: fixtureProvidedTool, Description: "d"}} },
+			want:   "Group",
+		},
+		{
+			name:   "duplicate tool name",
+			owner:  testOwner,
+			mutate: func(s *Spec) { s.Tools = []tool.Descriptor{fixtureDescriptor(), fixtureDescriptor()} },
+			want:   "twice",
+		},
+		{name: "nil registry", owner: testOwner, mutate: func(s *Spec) { s.Registry = nil }, want: "Registry"},
+		{name: "zero max instances", owner: testOwner, mutate: func(s *Spec) { s.MaxInstances = 0 }, want: "MaxInstances"},
+		{name: "negative max instances", owner: testOwner, mutate: func(s *Spec) { s.MaxInstances = -1 }, want: "MaxInstances"},
 		{
 			name:   "conflicting deps plugin name",
 			owner:  testOwner,

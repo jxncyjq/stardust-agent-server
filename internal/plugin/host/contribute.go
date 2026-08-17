@@ -1,0 +1,183 @@
+package host
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/lifecycle"
+	"github.com/stardust/legion-agent/internal/plugin/abi"
+	"github.com/stardust/legion-agent/internal/tool"
+	"github.com/stardust/legion-agent/internal/toolauth"
+)
+
+// gateableLabel is the ledger label a tool's gateable-catalog entry is filed
+// under. It is spelled in one place so a ledger snapshot — the answer to
+// "the plugin loaded, so what did it actually leave behind?" — and this file can
+// never disagree.
+func gateableLabel(toolName string) string { return "gateable:" + toolName }
+
+// pluginCallOrigin renders the audit call origin of work a plugin drives:
+// "plugin:<name>". It is the single spelling of that format, shared with the
+// call_tool host function (hostCalls.callTool), because a forensic pass over the
+// audit trail selects on it.
+func pluginCallOrigin(pluginName string) string { return "plugin:" + pluginName }
+
+// guestCaller runs one operation against a plugin's guest, on an instance the
+// call owns exclusively for its whole duration.
+//
+// It is an interface for two reasons. It names what a contributed tool's handler
+// may do with the instance pool — one call, and the acquire/release discipline
+// kept for it (see pool.call) — rather than handing every handler the pool's
+// panic-happy contract to keep itself. And it is the seam a test substitutes
+// (guestCallerFunc, in contribute_test.go): what the handler adds around a guest
+// call is a ctx marking and a JSON contract, and driving those through wazero
+// would prove less about them, not more. *pool is the only production
+// implementation.
+type guestCaller interface {
+	call(ctx context.Context, op int32, in []byte) ([]byte, error)
+}
+
+// guestToolCall is the JSON request the host hands a guest for abi.OpCallTool.
+//
+// It is deliberately the mirror image of callToolRequest, the guest→host
+// direction of the same idea (see hostcall.go): the same field names, so a
+// plugin author reads one shape whichever way a tool call travels. CallID is
+// sent so a guest can correlate its own logs with the host's; it is not what the
+// host reads back — see pluginToolHandler.
+type guestToolCall struct {
+	CallID    string            `json:"call_id,omitempty"`
+	Tool      string            `json:"tool"`
+	Arguments map[string]string `json:"arguments,omitempty"`
+}
+
+// contributeTools registers every tool spec.Tools claims. Each one is three
+// things, filed under the one owner:
+//
+//  1. the tool enters spec.Registry, so the model can call it
+//     (tool.RegisterOwned);
+//  2. its name enters the gateable catalog (toolauth.Contribute), which is what
+//     a per-agent disabled_tools list resolves against. Without this step the
+//     tool is callable but no agent config can disable it — an authorization
+//     bypass, not a missing row in the config UI;
+//  3. the handler marks its context with the plugin's call origin, so everything
+//     the guest drives from inside the call — a tool call back through call_tool
+//     — is attributed to the plugin in the audit trail rather than to the agent.
+//
+// keep receives the one-shot revoke handle of every ledger entry filed here, in
+// filing order, so the caller can roll them back. It is called as each entry is
+// filed rather than once at the end, because this function's failure mode is a
+// PANIC: a tool name already taken is fail-loud in the registry and in the
+// gateable catalog alike (neither can be shared by two contributors), so a
+// contribution can die half-way through. What was already filed must still be
+// revocable then — Activate's rollback runs on the way out of the panic and
+// revokes exactly what keep collected.
+func contributeTools(
+	ledger *lifecycle.Ledger,
+	owner lifecycle.Owner,
+	spec Spec,
+	guest guestCaller,
+	keep func(revoke func() error),
+) {
+	for _, descriptor := range spec.Tools {
+		handler := pluginToolHandler(spec.Name, descriptor.Name, guest)
+		keep(tool.RegisterOwned(ledger, owner, spec.Registry, descriptor, handler))
+
+		// Step 2, and it is not optional: without it the tool is callable and
+		// ungateable, so a per-agent disabled_tools list naming it is rejected as
+		// an unknown tool and the tool stays reachable for every agent.
+		undo := toolauth.Contribute(toolauth.GateableTool{
+			Name:        descriptor.Name,
+			Description: descriptor.Description,
+		})
+		keep(ledger.Add(owner, gateableLabel(descriptor.Name), func() error {
+			undo()
+			return nil
+		}))
+	}
+}
+
+// pluginToolHandler builds the handler behind one contributed tool: it hands the
+// call to the plugin's guest and reads the guest's answer back as a
+// domain.ToolResult.
+//
+// toolName is the descriptor's name, not call.Name: the registry dispatches by
+// name, so the two are equal, and taking the authoritative one means the guest
+// is always asked for the tool this handler was registered as.
+func pluginToolHandler(pluginName, toolName string, guest guestCaller) tool.Handler {
+	return tool.HandlerFunc(func(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
+		// Step 3: mark the ctx BEFORE the guest is entered. Everything the guest
+		// reaches from inside this call — a tool call back through call_tool —
+		// runs under it, and that marking is what keeps the plugin's own calls
+		// distinguishable from the agent's in the audit trail.
+		ctx = tool.WithCallOrigin(ctx, pluginCallOrigin(pluginName))
+
+		request, err := json.Marshal(guestToolCall{
+			CallID:    call.ID,
+			Tool:      toolName,
+			Arguments: call.Arguments,
+		})
+		if err != nil {
+			// Unreachable for these field types (strings and a map of strings),
+			// and still not swallowed: a request the host cannot encode is not a
+			// call that was made, and answering with an empty result would report
+			// it as a tool that ran and produced nothing.
+			return domain.ToolResult{}, fmt.Errorf("encode call of plugin %q tool %q: %w",
+				pluginName, toolName, err)
+		}
+		body, err := guest.call(ctx, abi.OpCallTool, request)
+		if err != nil {
+			return domain.ToolResult{}, fmt.Errorf("call plugin %q tool %q: %w", pluginName, toolName, err)
+		}
+		result, err := decodeToolResult(body)
+		if err != nil {
+			return domain.ToolResult{}, fmt.Errorf("call plugin %q tool %q: %w", pluginName, toolName, err)
+		}
+		// The correlation id belongs to the host. The guest is told which call it
+		// is answering (see guestToolCall) but never gets to choose it, so a
+		// plugin cannot attach its answer to somebody else's call.
+		result.CallID = call.ID
+		return result, nil
+	})
+}
+
+// decodeToolResult reads a guest's answer to abi.OpCallTool.
+//
+// Decoding is strict, and every failure is an error rather than an empty
+// ToolResult: an answer nobody could read, handed on as a zero value, would
+// reach the model as a tool that succeeded and produced nothing.
+//
+//   - An empty body is not an answer: abi's contract for this op is a JSON
+//     document, and Instance.Invoke returns (nil, nil) whenever the guest's
+//     packed result length is 0, so this is reachable in production rather than
+//     theoretical.
+//   - Unknown fields are refused, because a body of the wrong shape decodes into
+//     a zero ToolResult without complaint — a guest answering {"result":…} would
+//     otherwise look like a successless success.
+//   - Trailing data is refused for the same reason: silently taking the first of
+//     two documents is a choice made on the guest's behalf.
+//   - A result marked unsuccessful with no Error is refused: "it failed", with no
+//     reason, is the one answer nothing downstream can act on.
+func decodeToolResult(body []byte) (domain.ToolResult, error) {
+	if len(body) == 0 {
+		return domain.ToolResult{}, errors.New("guest returned no body")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+
+	var result domain.ToolResult
+	if err := decoder.Decode(&result); err != nil {
+		return domain.ToolResult{}, fmt.Errorf("decode tool result %s: %w", quoteForError(body), err)
+	}
+	if decoder.More() {
+		return domain.ToolResult{}, fmt.Errorf("decode tool result %s: trailing data after the JSON document",
+			quoteForError(body))
+	}
+	if !result.Success && result.Error == "" {
+		return domain.ToolResult{}, fmt.Errorf("guest reported a failed call with no reason: %s", quoteForError(body))
+	}
+	return result, nil
+}

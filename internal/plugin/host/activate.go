@@ -11,6 +11,7 @@ import (
 	"github.com/stardust/legion-agent/internal/lifecycle"
 	"github.com/stardust/legion-agent/internal/plugin/abi"
 	"github.com/stardust/legion-agent/internal/plugin/perm"
+	"github.com/stardust/legion-agent/internal/tool"
 )
 
 // The ledger labels Activate files its resources under. They name the thing
@@ -19,14 +20,15 @@ import (
 const (
 	ledgerLabelRuntime  = "wasm-runtime"
 	ledgerLabelInstance = "wasm-instance"
+	ledgerLabelPool     = "wasm-instance-pool"
 )
 
 // Manifest is a plugin's self-description, read from the guest itself through
 // abi.OpManifest rather than taken on trust from deployment configuration.
 //
 // Provides lists the tool names the guest says it implements. The host's own
-// claim about a plugin (Spec.Provides) is cross-checked against it during
-// activation, which is the point of asking the guest at all.
+// claim about a plugin (the names in Spec.Tools) is cross-checked against it
+// during activation, which is the point of asking the guest at all.
 //
 // Name and Version are both mandatory: the host claims a name of its own and
 // compares it, and while it claims no version, a plugin that cannot say which
@@ -52,13 +54,40 @@ type Spec struct {
 	// belongs to whoever assembles the Spec, not to activation.
 	Wasm []byte
 
-	// Provides lists the tool names the host claims this plugin contributes.
-	// It must be non-empty: in this phase a plugin exists to contribute
-	// tools, and an empty Provides would make the cross-check below vacuous.
-	// Every one of them must appear in the guest's own manifest; a guest that
-	// declares MORE than the host claims is not a conflict, because the host
-	// only ever contributes what it claims here.
-	Provides []string
+	// Tools describes the tools the host claims this plugin contributes, as the
+	// descriptors they are registered with. The descriptors come from the host
+	// side on purpose: the deployment declares what a plugin contributes and
+	// with what schema, risk level and catalog group, while the guest's own
+	// manifest lists plain names. A guest cannot describe itself into a lower
+	// risk level or a group it was not given.
+	//
+	// It must be non-empty: in this phase a plugin exists to contribute tools,
+	// and an empty Tools would make the cross-check below vacuous. Every NAME
+	// in it must appear in the guest's own manifest; a guest that declares MORE
+	// than the host claims is not a conflict, because the host only ever
+	// contributes what it claims here. Name, Description and Group are all
+	// required of each descriptor (see validateSpec).
+	Tools []tool.Descriptor
+
+	// Registry is where Tools are registered, and therefore what the model
+	// reaches them through. It is required.
+	//
+	// It is normally the same registry as Deps.Tools — one registry, which the
+	// plugin's tools enter and which the plugin's own call_tool calls go out
+	// through. Keeping them separate fields is deliberate: Deps.Tools is what a
+	// granted capability needs (and is only required when the tool capability is
+	// granted), while this is what activation itself needs, and a deployment may
+	// legitimately let a plugin contribute into a registry while giving its
+	// call_tool a narrower view of it.
+	Registry *tool.Registry
+
+	// MaxInstances is how many of this plugin's calls may be in the guest at
+	// once: the size of the instance pool the contributed tools are served
+	// from. It must be at least 1 and has no default — one guest instance
+	// serves one call at a time (an Instance is not safe for concurrent use),
+	// so this is the plugin's concurrency, a sizing decision the deployment
+	// owns.
+	MaxInstances int
 
 	// Grant is the capability set this deployment authorizes. Ungranted host
 	// functions are absent from the plugin's host module, so a guest importing
@@ -76,7 +105,8 @@ type Spec struct {
 }
 
 // Plugin is an activated plugin: its host-side identity, the manifest the
-// guest declared, and the one live Instance activation created.
+// guest declared, and the pool of guest instances its contributed tools are
+// served from.
 //
 // A Plugin owns no teardown of its own. Every resource activation created is
 // filed in the lifecycle.Ledger under the owner it was activated for, so once
@@ -91,10 +121,12 @@ type Plugin struct {
 	// Manifest is what the guest declared about itself.
 	Manifest Manifest
 
-	// Instance is the plugin's single live instance. Instance methods are not
-	// safe for concurrent use; serializing calls is the caller's job until
-	// an instance pool takes it over.
-	Instance *Instance
+	// pool serves the plugin's contributed tools: one instance per concurrent
+	// call, sized by Spec.MaxInstances. It is unexported because a plugin is
+	// reached through its tools — activation registers them (see
+	// contributeTools), and the handlers it registered hold this pool — so
+	// nothing outside this package needs to invoke a guest directly.
+	pool *pool
 }
 
 // closeInstance performs the wazero close behind the instance's ledger
@@ -122,9 +154,14 @@ var closeInstance = func(ctx context.Context, inst *Instance) error { return ins
 //  4. build the host module with exactly the granted capabilities;
 //  5. instantiate the guest (file it);
 //  6. read the guest's self-description via abi.OpManifest;
-//  7. cross-check that self-description against spec.
+//  7. cross-check that self-description against spec;
+//  8. create the instance pool the plugin's tools are served from and file its
+//     drain;
+//  9. contribute the plugin's tools (see contributeTools), which files one
+//     registry entry and one gateable-catalog entry per tool.
 //
-// The cross-check is deliberately last, AFTER the instance is filed: a plugin
+// The cross-check is deliberately before the pool and the contribution, and
+// AFTER the instance is filed: a plugin
 // whose host manifest disagrees with its guest is exactly the failure that
 // must exercise the rollback, so the rollback path cannot rot into dead code.
 //
@@ -146,11 +183,15 @@ var closeInstance = func(ctx context.Context, inst *Instance) error { return ins
 // rolling back is itself reported: every revoke error is joined
 // (errors.Join) onto the activation error rather than replacing or hiding
 // it, and none is dropped. Activate never returns a partially activated
-// Plugin.
+// Plugin. That holds for a PANIC as well: the contribution step is fail-loud on
+// a tool name another contributor already owns, and the rollback runs on the way
+// out of it, so a panicking activation leaves nothing filed either.
 //
-// Activate does NOT register the plugin's tools. Tool contribution is a
-// separate step with its own revocation, and it is not part of the sequence
-// above.
+// Once Activate has returned, the plugin IS its tools: they are in
+// spec.Registry, they are gateable, and every call to one of them is served by
+// the instance pool through the handler contributeTools registered. Revoking all
+// of that — tools, gateable entries, pool, instance, runtime, in that order — is
+// ledger.DisposeOwner(owner) and nothing else.
 func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Owner, spec Spec) (_ *Plugin, err error) {
 	if ledger == nil {
 		return nil, fmt.Errorf("activate plugin %q: ledger is nil; activation has nowhere to file its rollback", spec.Name)
@@ -182,6 +223,11 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 	// every entry THIS CALL files, in filing order. Only these are rolled back
 	// on failure — see the owner-exclusivity paragraph above.
 	var revokers []func() error
+	// keep records one handle. It is passed to contributeTools, whose failure
+	// mode is a panic part-way through a list of tools: collecting each handle as
+	// it is filed is what lets the rollback below revoke the tools that were
+	// registered before the failing one.
+	keep := func(revoke func() error) { revokers = append(revokers, revoke) }
 
 	committed := false
 	defer func() {
@@ -243,8 +289,38 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 		return nil, fmt.Errorf("activate plugin %q: %w", spec.Name, err)
 	}
 
+	// The pool's instances are built lazily, by the calls that need them, so its
+	// factory must NOT hold ctx: activation's context is typically the request
+	// that loaded the plugin, and it is long dead by the time a model calls one
+	// of the plugin's tools. wazero would then either refuse to instantiate or
+	// close the fresh module immediately (see NewRuntime's
+	// WithCloseOnContextDone), so every tool call would fail for a reason that
+	// has nothing to do with the call.
+	instantiateCtx := context.WithoutCancel(ctx)
+	instances := newPool(spec.MaxInstances, func() (*Instance, error) {
+		return NewInstance(instantiateCtx, rt, compiled)
+	})
+	// Filed AFTER the runtime and the instance precisely so that reverse-order
+	// disposal runs it BEFORE them: drain converges the calls that are inside the
+	// guest right now, and closing the runtime underneath them would truncate a
+	// tool call in flight. The wait is bounded by each in-flight call's own
+	// context (a tool descriptor's Timeout, or whatever the caller passed), not
+	// by a deadline invented here, so disposeCtx carries no cancellation of its
+	// own.
+	revokers = append(revokers, ledger.Add(owner, ledgerLabelPool, func() error {
+		if derr := instances.drain(disposeCtx); derr != nil {
+			return fmt.Errorf("drain instance pool of plugin %q: %w", spec.Name, derr)
+		}
+		return nil
+	}))
+
+	// Contribution is the last step, so a tool name another contributor already
+	// owns rolls back everything above it — including the tools registered
+	// before the failing one.
+	contributeTools(ledger, owner, spec, instances, keep)
+
 	committed = true
-	return &Plugin{Name: spec.Name, Manifest: manifest, Instance: inst}, nil
+	return &Plugin{Name: spec.Name, Manifest: manifest, pool: instances}, nil
 }
 
 // validateSpec rejects a Spec that cannot describe a real activation. These
@@ -261,14 +337,38 @@ func validateSpec(spec Spec) error {
 	if spec.MemoryPages == 0 {
 		return fmt.Errorf("activate plugin %q: Spec.MemoryPages is 0; the guest memory cap is a required sizing decision", spec.Name)
 	}
-	if len(spec.Provides) == 0 {
-		return fmt.Errorf("activate plugin %q: Spec.Provides is empty; a plugin exists to contribute tools, "+
+	if spec.Registry == nil {
+		return fmt.Errorf("activate plugin %q: Spec.Registry is nil; the plugin's tools have no registry to enter, "+
+			"so activating it would load a plugin nothing can call", spec.Name)
+	}
+	if spec.MaxInstances < 1 {
+		return fmt.Errorf("activate plugin %q: Spec.MaxInstances is %d; how many calls this plugin may serve at once "+
+			"is a required sizing decision with no default (one instance serves one call at a time)",
+			spec.Name, spec.MaxInstances)
+	}
+	if len(spec.Tools) == 0 {
+		return fmt.Errorf("activate plugin %q: Spec.Tools is empty; a plugin exists to contribute tools, "+
 			"and a cross-check against nothing is not a check", spec.Name)
 	}
-	for i, provided := range spec.Provides {
-		if provided == "" {
-			return fmt.Errorf("activate plugin %q: Spec.Provides[%d] is empty; remove the entry or give it a tool name", spec.Name, i)
+	claimed := make(map[string]struct{}, len(spec.Tools))
+	for i, descriptor := range spec.Tools {
+		switch {
+		case descriptor.Name == "":
+			return fmt.Errorf("activate plugin %q: Spec.Tools[%d].Name is empty; remove the entry or give it a tool name",
+				spec.Name, i)
+		case descriptor.Description == "":
+			return fmt.Errorf("activate plugin %q: Spec.Tools[%d] (%q) has no Description; it is the line the "+
+				"per-agent config UI shows for a gateable tool, so an empty one leaves an unexplained switch",
+				spec.Name, i, descriptor.Name)
+		case descriptor.Group == "":
+			return fmt.Errorf("activate plugin %q: Spec.Tools[%d] (%q) has no Group; an unplaced tool cannot be "+
+				"listed in the capability catalog, so the model would never see it", spec.Name, i, descriptor.Name)
 		}
+		if _, dup := claimed[descriptor.Name]; dup {
+			return fmt.Errorf("activate plugin %q: Spec.Tools claims %q twice; one name is one tool, and the second "+
+				"registration would be refused half-way through the contribution", spec.Name, descriptor.Name)
+		}
+		claimed[descriptor.Name] = struct{}{}
 	}
 	if spec.Deps.PluginName != "" && spec.Deps.PluginName != spec.Name {
 		return fmt.Errorf("activate plugin %q: Deps.PluginName is %q; the plugin's identity must be spelled once "+
@@ -345,17 +445,22 @@ func crossCheck(spec Spec, manifest Manifest) error {
 	for _, provided := range manifest.Provides {
 		declared[provided] = struct{}{}
 	}
+	// The host's claim is the NAMES of the descriptors it is about to register:
+	// the rest of a descriptor (schema, risk level, group) is the deployment's to
+	// state and nothing the guest could confirm.
+	claimed := make([]string, 0, len(spec.Tools))
 	var missing []string
-	for _, claimed := range spec.Provides {
-		if _, ok := declared[claimed]; !ok {
-			missing = append(missing, claimed)
+	for _, descriptor := range spec.Tools {
+		claimed = append(claimed, descriptor.Name)
+		if _, ok := declared[descriptor.Name]; !ok {
+			missing = append(missing, descriptor.Name)
 		}
 	}
 	if len(missing) > 0 {
 		sort.Strings(missing)
 		return fmt.Errorf("cross-check manifest: host claims plugin %q provides %v, "+
 			"guest declares %v; not declared by the guest: %v",
-			spec.Name, spec.Provides, manifest.Provides, missing)
+			spec.Name, claimed, manifest.Provides, missing)
 	}
 	return nil
 }

@@ -221,6 +221,30 @@ func (p *pool) acquire(ctx context.Context) (*Instance, error) {
 	return inst, nil
 }
 
+// call runs one guest operation on an instance nobody else can touch while it
+// runs, and is how everything outside this file uses the pool (see guestCaller):
+// acquire once, release exactly once on the success path, never on the acquire
+// error path. Those are invariants release enforces by panicking, so keeping
+// them lives here, in one place, rather than at every call site.
+//
+// The instance is released whether the call succeeded or not: release is what
+// discards a dead instance (a trapped guest, a call wazero interrupted) and
+// closes it, so an error path that skipped it would leak the corpse and lose the
+// slot for the pool's whole lifetime.
+func (p *pool) call(ctx context.Context, op int32, in []byte) ([]byte, error) {
+	inst, err := p.acquire(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer p.release(inst)
+
+	out, err := inst.Invoke(ctx, op, in)
+	if err != nil {
+		return nil, fmt.Errorf("invoke plugin guest op %d: %w", op, err)
+	}
+	return out, nil
+}
+
 // markCheckedOut records that inst is now the calling goroutine's, so release
 // can prove it is being handed back by the caller who took it. An instance
 // that is already recorded means the factory handed out an instance the pool

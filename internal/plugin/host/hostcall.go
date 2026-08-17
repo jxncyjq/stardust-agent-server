@@ -483,7 +483,7 @@ func (h hostCalls) callTool(ctx context.Context, m api.Module, ptr, length uint3
 		return h.writeError(ctx, m, CodeInvalidRequest, "call_tool: tool must not be empty")
 	}
 
-	callCtx := tool.WithCallOrigin(ctx, "plugin:"+h.deps.PluginName)
+	callCtx := tool.WithCallOrigin(ctx, pluginCallOrigin(h.deps.PluginName))
 	result, err := h.deps.Tools.Execute(callCtx, h.deps.Agent, domain.ToolCall{
 		ID:        req.CallID,
 		Name:      req.Tool,
