@@ -48,6 +48,13 @@ type Grant struct {
 	// port.WorkspacePathGuard rooted at each entry, so that the allowlist holds
 	// under symlinks instead of being a lexical prefix test a link inside an
 	// allowed directory could walk out of.
+	//
+	// That guard demands containment both lexically and after resolving
+	// symlinks, so an entry naming a symlinked directory refuses a path spelled
+	// through the link's real location (and the reverse): spell an entry the way
+	// the plugin will spell its paths, or name the resolved directory on both
+	// sides. The refusal is fail-closed and comes from the repository's one path
+	// guard, which is the point of reusing it.
 	AllowedPaths []string
 }
 

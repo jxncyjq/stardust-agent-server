@@ -3,6 +3,7 @@ package host
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -44,10 +45,8 @@ const (
 
 // RuntimeEventCallFailed is the runtime event type published when a plugin call
 // fails, matching the design doc's plugin/call_failed. The failure category
-// travels in the event message as "category=<c>" (see CategoryDenied),
-// following the encoding evolution.NewLearningRuntimeEvent already uses for
-// structured RuntimeEvent fields — domain.RuntimeEvent has no category column
-// and this task is not the place to add one.
+// travels inside the event message; formatCallFailedMessage and
+// EventHasCategory are the only two places that know how.
 const RuntimeEventCallFailed = "plugin/call_failed"
 
 // CategoryDenied is the plugin/call_failed category for a call a host function
@@ -55,6 +54,39 @@ const RuntimeEventCallFailed = "plugin/call_failed"
 // is counted separately from plugin faults: a denial means the plugin
 // overstepped, not that it is broken.
 const CategoryDenied = "denied"
+
+// eventCategoryToken renders a failure category as the token it travels as
+// inside a plugin/call_failed message. It is the ONE place the encoding is
+// spelled.
+//
+// The category is not a field of its own because domain.RuntimeEvent has none:
+// internal/domain/types.go gives it Type/TaskID/Message/token counters/ElapsedMs
+// and no metadata map, and adding one would change the persisted runtime_events
+// schema. Until that changes, every emitter goes through
+// formatCallFailedMessage and every consumer (a denial counter, a test) through
+// EventHasCategory, so the format has a single definition to change.
+func eventCategoryToken(category string) string {
+	return "category=" + category
+}
+
+// formatCallFailedMessage renders the message of a plugin/call_failed event,
+// with the failure category leading it (see eventCategoryToken).
+func formatCallFailedMessage(category, plugin, hostFunc, reason string) string {
+	return fmt.Sprintf("%s plugin=%s host_function=%s reason=%s",
+		eventCategoryToken(category), plugin, hostFunc, reason)
+}
+
+// EventHasCategory reports whether event is a plugin/call_failed event of the
+// given failure category (CategoryDenied and the like).
+//
+// It is the supported way to read a category back: see formatCallFailedMessage
+// for why the category lives in the message text rather than in a field.
+func EventHasCategory(event domain.RuntimeEvent, category string) bool {
+	if event.Type != RuntimeEventCallFailed {
+		return false
+	}
+	return strings.HasPrefix(event.Message, eventCategoryToken(category)+" ")
+}
 
 // Log levels the guest passes to the log host function, mapped onto slog.
 const (
@@ -69,6 +101,63 @@ const (
 // NewRuntime), so an unbounded copy would trap the plugin on a large download
 // rather than telling it what happened.
 const httpResponseByteLimit = 1 << 20
+
+// readFileByteLimit caps how much of a file read_file copies into guest memory.
+// It exists for the same reason httpResponseByteLimit does, and answers the same
+// way: the response states that it was truncated instead of leaving the guest
+// with a clipped body it would parse as complete.
+const readFileByteLimit = 1 << 20
+
+// httpMaxRedirects caps the redirect chain http_request will follow, matching
+// the cap internal/tool/web.go applies to the agent's own web tool. A chain
+// this long is a misbehaving upstream, and each extra hop is another host to
+// re-authorize.
+const httpMaxRedirects = 10
+
+// errRedirectDenied is the sentinel a grant-aware CheckRedirect returns when a
+// redirect would leave Grant.AllowedHosts. net/http wraps it in a *url.Error,
+// whose Unwrap makes it reachable with errors.Is, which is how httpRequest tells
+// a refused hop apart from a transport failure and reports it as a denial rather
+// than as a host error.
+var errRedirectDenied = errors.New("redirect target is not authorized by this plugin's grant")
+
+// redirectGuardedClient returns a copy of client whose redirect policy
+// re-validates every hop against g.
+//
+// The allowlist check on the request URL is not enough on its own: Go's client
+// follows redirects to ARBITRARY hosts, so an allowed host answering
+// "302 Location: http://169.254.169.254/…" would otherwise fetch an internal
+// address and hand its body to the guest, with no denial and no event. The
+// allowlist is this module's gate, so the module installs the check rather than
+// trusting the injected client to carry it (internal/tool/web.go:280 does the
+// same per-hop revalidation for the agent's web tool).
+//
+// The copy is shallow and deliberate: the caller's client keeps its own policy
+// (a deployment's SSRF-guarded transport and timeout are copied along, and its
+// own CheckRedirect is called after this one rather than replaced, so nothing a
+// deployment configured is silently dropped).
+func redirectGuardedClient(g perm.Grant, client *http.Client) *http.Client {
+	guarded := *client
+	inherited := client.CheckRedirect
+	guarded.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= httpMaxRedirects {
+			return fmt.Errorf("stopped after %d redirects", httpMaxRedirects)
+		}
+		if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+			return fmt.Errorf("%w: scheme %q is not reachable through the http capability",
+				errRedirectDenied, req.URL.Scheme)
+		}
+		if !g.HostAllowed(req.URL.Hostname()) {
+			return fmt.Errorf("%w: host %q is not in this plugin's allowed_hosts",
+				errRedirectDenied, req.URL.Hostname())
+		}
+		if inherited != nil {
+			return inherited(req, via)
+		}
+		return nil
+	}
+	return &guarded
+}
 
 // hostCalls is the receiver behind every registered host function: one
 // plugin's grant plus the dependencies its capabilities need.
@@ -89,13 +178,21 @@ type errorBody struct {
 
 // log implements "log(level i32, ptr i32, len i32)": it writes the guest's
 // message to the host logger at the mapped level. It has no return value, so
-// its own failures (an unreadable message region, an unknown level) are
-// reported to the host logger at Error rather than silently dropped.
+// its own failures (an unreadable message region, an empty message, an unknown
+// level) are reported to the host logger at Error rather than silently dropped.
 func (h hostCalls) log(_ context.Context, m api.Module, level, ptr, length uint32) {
 	logger := h.deps.Logger.With("plugin", h.deps.PluginName)
 	message, err := readGuestBytes(m, ptr, length)
 	if err != nil {
 		logger.Error("plugin log call: message region is unreadable", "error", err)
+		return
+	}
+	if len(message) == 0 {
+		// readGuestBytes maps an empty region to no bytes, which is a legal thing
+		// for a guest to pass but not a thing this function can do anything with:
+		// emitting a blank line at the requested level would hide the broken
+		// caller behind what looks like a log entry.
+		logger.Error("plugin log call: the guest passed no message", "level", level)
 		return
 	}
 	switch level {
@@ -194,7 +291,9 @@ type httpResponseBody struct {
 // The http capability being granted is only the first check: this function
 // also refuses any URL whose host is not in Grant.AllowedHosts and any scheme
 // other than http/https, returning CodeDenied and publishing a
-// plugin/call_failed{category=denied} event.
+// plugin/call_failed{category=denied} event. A redirect leaving the allowlist is
+// refused the same way, because the client BuildHostModule hands this function
+// re-validates every hop (see redirectGuardedClient).
 func (h hostCalls) httpRequest(ctx context.Context, m api.Module, ptr, length uint32) uint64 {
 	raw, err := readGuestBytes(m, ptr, length)
 	if err != nil {
@@ -236,6 +335,15 @@ func (h hostCalls) httpRequest(ctx context.Context, m api.Module, ptr, length ui
 	}
 	resp, err := h.deps.HTTP.Do(httpReq)
 	if err != nil {
+		// A refused redirect is a denial, not an upstream fault: the plugin asked
+		// for a host it is not authorized to reach, it just asked via a Location
+		// header. net/http returns the 3xx response alongside the error and has
+		// already closed its body, so there is nothing to close here.
+		if errors.Is(err, errRedirectDenied) {
+			return h.deny(ctx, m, funcHTTPRequest,
+				fmt.Sprintf("%s %s was redirected outside this plugin's allowed_hosts: %v",
+					req.Method, req.URL, err))
+		}
 		return h.writeError(ctx, m, CodeHostError, fmt.Sprintf("http_request %s %s: %v", req.Method, req.URL, err))
 	}
 	defer func() {
@@ -264,13 +372,21 @@ func (h hostCalls) httpRequest(ctx context.Context, m api.Module, ptr, length ui
 }
 
 // readFile implements "read_file(ptr i32, len i32) -> i64" with a JSON request
-// {"path":string} and a JSON response {"path":string,"content":string}.
+// {"path":string} and a JSON response
+// {"path":string,"content":string,"truncated":bool}.
 //
 // The path goes through two checks, in this order: port.WorkspacePathGuard —
 // the repository's single path boundary, which resolves symlinks and rejects
 // the Windows device-name and alternate-data-stream spellings — and then
 // Grant.AllowedPaths. Either refusal is CodeDenied plus a
-// plugin/call_failed{category=denied} event.
+// plugin/call_failed{category=denied} event. A call cancelled while those checks
+// run is NOT a denial: it is reported as CodeHostError with no denial event, so a
+// shutdown is never counted against the plugin.
+//
+// The content is capped at readFileByteLimit and truncation is stated, exactly
+// as httpRequest states it: the guest chooses the path, so an unbounded
+// os.ReadFile would let it allocate an arbitrary file in the host and then die
+// on the guest-side allocator instead of being told what happened.
 func (h hostCalls) readFile(ctx context.Context, m api.Module, ptr, length uint32) uint64 {
 	raw, err := readGuestBytes(m, ptr, length)
 	if err != nil {
@@ -288,21 +404,49 @@ func (h hostCalls) readFile(ctx context.Context, m api.Module, ptr, length uint3
 
 	checked, err := h.deps.FS.Check(ctx, req.Path)
 	if err != nil {
+		if callWasCancelled(ctx, err) {
+			return h.writeError(ctx, m, CodeHostError,
+				fmt.Sprintf("read_file %q: the call was cancelled: %v", req.Path, err))
+		}
 		return h.deny(ctx, m, funcReadFile,
 			fmt.Sprintf("path %q rejected by the workspace guard: %v", req.Path, err))
 	}
 	if err := checkAllowedPath(ctx, h.grant, checked); err != nil {
+		if callWasCancelled(ctx, err) {
+			return h.writeError(ctx, m, CodeHostError,
+				fmt.Sprintf("read_file %q: the call was cancelled: %v", req.Path, err))
+		}
 		return h.deny(ctx, m, funcReadFile, err.Error())
 	}
 
-	content, err := os.ReadFile(checked)
+	file, err := os.Open(checked)
 	if err != nil {
 		return h.writeError(ctx, m, CodeHostError, fmt.Sprintf("read_file %q: %v", req.Path, err))
+	}
+	defer func() {
+		if cerr := file.Close(); cerr != nil {
+			h.deps.Logger.Warn("plugin read_file: closing the file failed",
+				"plugin", h.deps.PluginName, "path", req.Path, "error", cerr)
+		}
+	}()
+	// One byte past the limit distinguishes "exactly at the limit" from
+	// "clipped", so Truncated states the truth instead of guessing.
+	content, err := io.ReadAll(io.LimitReader(file, readFileByteLimit+1))
+	if err != nil {
+		return h.writeError(ctx, m, CodeHostError, fmt.Sprintf("read_file %q: %v", req.Path, err))
+	}
+	truncated := len(content) > readFileByteLimit
+	if truncated {
+		content = content[:readFileByteLimit]
 	}
 	return h.writeJSON(ctx, m, struct {
 		Path    string `json:"path"`
 		Content string `json:"content"`
-	}{Path: req.Path, Content: string(content)})
+		// Truncated reports that the file was longer than readFileByteLimit and
+		// Content holds only its first bytes, so a plugin never reads a clipped
+		// file as a whole one.
+		Truncated bool `json:"truncated,omitempty"`
+	}{Path: req.Path, Content: string(content), Truncated: truncated})
 }
 
 // callToolRequest is the JSON request of the call_tool host function.
@@ -365,7 +509,9 @@ func (h hostCalls) callTool(ctx context.Context, m api.Module, ptr, length uint3
 // An empty allowlist denies everything (an fs grant with no allowed_paths is a
 // plugin that may call read_file and reach nothing), and so does a malformed
 // empty entry — filepath.Clean("") is ".", which would silently widen the grant
-// to the process working directory.
+// to the process working directory. BuildHostModule rejects an empty entry
+// outright, so a module built through it can never reach that skip; it stays here
+// because this function must be fail-closed on its own terms.
 func checkAllowedPath(ctx context.Context, g perm.Grant, path string) error {
 	if len(g.AllowedPaths) == 0 {
 		return fmt.Errorf("path %q is refused: this plugin has no allowed_paths", path)
@@ -379,6 +525,20 @@ func checkAllowedPath(ctx context.Context, g perm.Grant, path string) error {
 		}
 	}
 	return fmt.Errorf("path %q is not inside any of this plugin's allowed_paths %v", path, g.AllowedPaths)
+}
+
+// callWasCancelled reports whether a failure from the path checks is the
+// ambient cancellation of the call rather than a refusal of the path.
+//
+// port.WorkspacePathGuard.Check returns ctx.Err() before it looks at the path at
+// all, so without this distinction a shutdown mid-call would reach the guest as
+// DENIED and be published as plugin/call_failed{category=denied} — a security
+// refusal attributed to a plugin that did nothing wrong, and one more denial for
+// whoever counts them. Everything that is NOT cancellation stays a denial,
+// including a guard failure this host cannot classify: "cannot prove the path is
+// allowed" is a refusal.
+func callWasCancelled(ctx context.Context, err error) bool {
+	return ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // namespacedKey qualifies a guest-supplied kv key with the plugin's own
@@ -397,8 +557,8 @@ func (h hostCalls) deny(ctx context.Context, m api.Module, hostFunc, reason stri
 }
 
 // publishDenial emits the denial telemetry. The category travels inside the
-// message because domain.RuntimeEvent has no category field; TaskID is left
-// empty on purpose — a host module belongs to a plugin for its whole lifetime,
+// message (see formatCallFailedMessage) because domain.RuntimeEvent has no
+// category field; TaskID is left empty on purpose — a host module belongs to a plugin for its whole lifetime,
 // so there is no one task to attribute its denials to, and the plugin name is
 // the subject that matters.
 //
@@ -410,9 +570,8 @@ func (h hostCalls) publishDenial(ctx context.Context, hostFunc, reason string) {
 	h.deps.Logger.Warn("plugin host call denied",
 		"plugin", h.deps.PluginName, "host_function", hostFunc, "reason", reason)
 	event := domain.RuntimeEvent{
-		Type: RuntimeEventCallFailed,
-		Message: fmt.Sprintf("category=%s plugin=%s host_function=%s reason=%s",
-			CategoryDenied, h.deps.PluginName, hostFunc, reason),
+		Type:      RuntimeEventCallFailed,
+		Message:   formatCallFailedMessage(CategoryDenied, h.deps.PluginName, hostFunc, reason),
 		CreatedAt: time.Now(),
 	}
 	if err := h.deps.Events.Publish(ctx, event); err != nil {

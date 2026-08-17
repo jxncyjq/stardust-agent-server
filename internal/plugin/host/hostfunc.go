@@ -103,6 +103,13 @@ type Deps struct {
 	// HTTP performs http_request's outbound calls. Passing a client with a
 	// timeout (and, where the deployment needs one, an SSRF-guarded dialer) is
 	// the caller's decision, not this package's.
+	//
+	// The redirect policy is NOT the caller's decision: BuildHostModule copies
+	// the client and installs a CheckRedirect that re-validates every hop
+	// against Grant.AllowedHosts, because a client that follows redirects
+	// anywhere would walk straight out of the allowlist. The client passed here
+	// is left untouched, and its own CheckRedirect (if any) still runs after
+	// that check.
 	HTTP *http.Client
 
 	// FS is the workspace boundary read_file resolves paths against. This is
@@ -138,7 +145,9 @@ type Deps struct {
 // flags are only half of the enforcement, though: being granted http says
 // nothing about which hosts are reachable, so the granted functions check
 // their arguments against Grant.AllowedHosts / Grant.AllowedPaths on every
-// call.
+// call. When http is granted, deps.HTTP is copied and given a redirect policy
+// that applies the same allowlist to every hop (see redirectGuardedClient), so
+// the argument check cannot be walked around with a Location header.
 //
 // Every capability g grants must have its dependencies present in deps.
 // A granted capability with a missing dependency is an assembly-time
@@ -149,6 +158,13 @@ type Deps struct {
 func BuildHostModule(ctx context.Context, rt wazero.Runtime, g perm.Grant, deps Deps) (api.Module, error) {
 	if err := validateDeps(g, deps); err != nil {
 		return nil, err
+	}
+
+	if g.HTTP {
+		// The allowlist is this module's gate, so the module — not the caller —
+		// makes sure a redirect cannot step around it. deps is a value, so the
+		// caller's Deps and its client are unchanged.
+		deps.HTTP = redirectGuardedClient(g, deps.HTTP)
 	}
 
 	calls := hostCalls{grant: g, deps: deps}
@@ -310,12 +326,25 @@ func validateDeps(g perm.Grant, deps Deps) error {
 	if g.HTTP && deps.HTTP == nil {
 		return fmt.Errorf("build host module: capability %q is granted but Deps.HTTP is nil", capHTTP)
 	}
-	if g.FS && deps.FS == (port.WorkspacePathGuard{}) {
-		// The zero guard is not a guard rooted at the filesystem root: it has
-		// no root at all, and every Check against it would be decided by
-		// filepath.Clean("") == ".", i.e. by the process working directory.
-		return fmt.Errorf("build host module: capability %q is granted but Deps.FS is the zero "+
-			"WorkspacePathGuard; pass port.NewWorkspacePathGuard(root)", capFS)
+	if g.FS {
+		if deps.FS == (port.WorkspacePathGuard{}) {
+			// The zero guard is not a guard rooted at the filesystem root: it has
+			// no root at all, and every Check against it would be decided by
+			// filepath.Clean("") == ".", i.e. by the process working directory.
+			return fmt.Errorf("build host module: capability %q is granted but Deps.FS is the zero "+
+				"WorkspacePathGuard; pass port.NewWorkspacePathGuard(root)", capFS)
+		}
+		for i, allowed := range g.AllowedPaths {
+			// An empty entry is fail-closed at call time (checkAllowedPath skips
+			// it rather than letting filepath.Clean("") == "." widen the grant to
+			// the working directory), but a deployment that shipped one would
+			// never find out: read_file would just refuse paths the operator
+			// believes are allowed. Refuse to build instead.
+			if allowed == "" {
+				return fmt.Errorf("build host module: capability %q is granted but "+
+					"Grant.AllowedPaths[%d] is empty; remove the entry or give it a path", capFS, i)
+			}
+		}
 	}
 	if (g.HTTP || g.FS) && deps.Events == nil {
 		return fmt.Errorf("build host module: capabilities %q/%q can deny a call and must report it, "+

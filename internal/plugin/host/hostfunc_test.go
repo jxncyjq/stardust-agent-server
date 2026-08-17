@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/stardust/legion-agent/internal/adapter"
@@ -210,7 +212,12 @@ func decodeHostError(t *testing.T, out []byte) hostError {
 }
 
 // deniedEvents returns the plugin/call_failed events whose category is
-// "denied".
+// CategoryDenied.
+//
+// It reads the category through EventHasCategory rather than matching the
+// message text itself: the encoding has exactly one definition (see
+// eventCategoryToken), and a test that hand-rolled the substring would be a
+// second one.
 func deniedEvents(t *testing.T, env *testEnv) []domain.RuntimeEvent {
 	t.Helper()
 	all, err := env.events.Events()
@@ -219,7 +226,7 @@ func deniedEvents(t *testing.T, env *testEnv) []domain.RuntimeEvent {
 	}
 	var denied []domain.RuntimeEvent
 	for _, ev := range all {
-		if ev.Type == RuntimeEventCallFailed && strings.Contains(ev.Message, "category=denied") {
+		if EventHasCategory(ev, CategoryDenied) {
 			denied = append(denied, ev)
 		}
 	}
@@ -380,77 +387,92 @@ func TestCheckImportNamesRejectsUnknownHostImport(t *testing.T) {
 // missing would produce a host function that cannot do its job, so the build
 // must fail loudly instead.
 func TestBuildHostModuleFailsWhenGrantedCapabilityLacksDependency(t *testing.T) {
+	// wantMessage is the QUALIFIED field name ("Deps.KV", not "KV"). Some of
+	// these errors embed the grant with %+v, which prints Grant's own field names
+	// (Log:, Config:, KV:, HTTP:, FS:, Tool:) — so a bare field word would match
+	// even if the implementation returned an unrelated error, and the assertion
+	// would be vacuous. Nothing in a Grant renders as "Deps.…".
 	cases := []struct {
-		name     string
-		grant    perm.Grant
-		mutate   func(*Deps)
-		wantWord string
+		name        string
+		grant       perm.Grant
+		mutate      func(*Deps)
+		mutateGrant func(*perm.Grant)
+		wantMessage string
 	}{
 		{
-			name:     "log without a logger",
-			grant:    perm.Grant{Log: true},
-			mutate:   func(d *Deps) { d.Logger = nil },
-			wantWord: "Logger",
+			name:        "log without a logger",
+			grant:       perm.Grant{Log: true},
+			mutate:      func(d *Deps) { d.Logger = nil },
+			wantMessage: "Deps.Logger",
 		},
 		{
-			name:     "config without config json",
-			grant:    perm.Grant{Config: true},
-			mutate:   func(d *Deps) { d.Config = nil },
-			wantWord: "Config",
+			name:        "config without config json",
+			grant:       perm.Grant{Config: true},
+			mutate:      func(d *Deps) { d.Config = nil },
+			wantMessage: "Deps.Config",
 		},
 		{
-			name:     "config with invalid json",
-			grant:    perm.Grant{Config: true},
-			mutate:   func(d *Deps) { d.Config = json.RawMessage(`{"broken":`) },
-			wantWord: "Config",
+			name:        "config with invalid json",
+			grant:       perm.Grant{Config: true},
+			mutate:      func(d *Deps) { d.Config = json.RawMessage(`{"broken":`) },
+			wantMessage: "Deps.Config",
 		},
 		{
-			name:     "kv without a store",
-			grant:    perm.Grant{KV: true},
-			mutate:   func(d *Deps) { d.KV = nil },
-			wantWord: "KV",
+			name:        "kv without a store",
+			grant:       perm.Grant{KV: true},
+			mutate:      func(d *Deps) { d.KV = nil },
+			wantMessage: "Deps.KV",
 		},
 		{
-			name:     "http without a client",
-			grant:    perm.Grant{HTTP: true, AllowedHosts: []string{"example.com"}},
-			mutate:   func(d *Deps) { d.HTTP = nil },
-			wantWord: "HTTP",
+			name:        "http without a client",
+			grant:       perm.Grant{HTTP: true, AllowedHosts: []string{"example.com"}},
+			mutate:      func(d *Deps) { d.HTTP = nil },
+			wantMessage: "Deps.HTTP",
 		},
 		{
-			name:     "http without an event bus",
-			grant:    perm.Grant{HTTP: true, AllowedHosts: []string{"example.com"}},
-			mutate:   func(d *Deps) { d.Events = nil },
-			wantWord: "Events",
+			name:        "http without an event bus",
+			grant:       perm.Grant{HTTP: true, AllowedHosts: []string{"example.com"}},
+			mutate:      func(d *Deps) { d.Events = nil },
+			wantMessage: "Deps.Events",
 		},
 		{
-			name:     "fs without a path guard",
-			grant:    perm.Grant{FS: true, AllowedPaths: []string{"/tmp"}},
-			mutate:   func(d *Deps) { d.FS = port.WorkspacePathGuard{} },
-			wantWord: "FS",
+			name:        "fs without a path guard",
+			grant:       perm.Grant{FS: true, AllowedPaths: []string{"/tmp"}},
+			mutate:      func(d *Deps) { d.FS = port.WorkspacePathGuard{} },
+			wantMessage: "Deps.FS",
 		},
 		{
-			name:     "fs without an event bus",
-			grant:    perm.Grant{FS: true, AllowedPaths: []string{"/tmp"}},
-			mutate:   func(d *Deps) { d.Events = nil },
-			wantWord: "Events",
+			name:        "fs without an event bus",
+			grant:       perm.Grant{FS: true, AllowedPaths: []string{"/tmp"}},
+			mutate:      func(d *Deps) { d.Events = nil },
+			wantMessage: "Deps.Events",
 		},
 		{
-			name:     "tool without a registry",
-			grant:    perm.Grant{Tool: true},
-			mutate:   func(d *Deps) { d.Tools = nil },
-			wantWord: "Tools",
+			// A shipped-empty allowlist entry is fail-closed at call time, so the
+			// only way a deployment learns about it is the build refusing.
+			name:        "fs with an empty allowed_paths entry",
+			grant:       perm.Grant{FS: true},
+			mutateGrant: func(g *perm.Grant) { g.AllowedPaths = []string{"/tmp", ""} },
+			mutate:      func(*Deps) {},
+			wantMessage: "Grant.AllowedPaths[1]",
 		},
 		{
-			name:     "tool without an agent identity",
-			grant:    perm.Grant{Tool: true},
-			mutate:   func(d *Deps) { d.Agent = domain.Agent{} },
-			wantWord: "Agent",
+			name:        "tool without a registry",
+			grant:       perm.Grant{Tool: true},
+			mutate:      func(d *Deps) { d.Tools = nil },
+			wantMessage: "Deps.Tools",
 		},
 		{
-			name:     "any capability without a plugin name",
-			grant:    perm.Grant{Log: true},
-			mutate:   func(d *Deps) { d.PluginName = "" },
-			wantWord: "PluginName",
+			name:        "tool without an agent identity",
+			grant:       perm.Grant{Tool: true},
+			mutate:      func(d *Deps) { d.Agent = domain.Agent{} },
+			wantMessage: "Deps.Agent",
+		},
+		{
+			name:        "any capability without a plugin name",
+			grant:       perm.Grant{Log: true},
+			mutate:      func(d *Deps) { d.PluginName = "" },
+			wantMessage: "Deps.PluginName",
 		},
 	}
 	for _, tc := range cases {
@@ -458,17 +480,21 @@ func TestBuildHostModuleFailsWhenGrantedCapabilityLacksDependency(t *testing.T) 
 			env := newTestEnv(t)
 			deps := env.deps
 			tc.mutate(&deps)
+			grant := tc.grant
+			if tc.mutateGrant != nil {
+				tc.mutateGrant(&grant)
+			}
 
 			ctx := context.Background()
 			rt := NewRuntime(ctx, testMemoryPages)
 			t.Cleanup(func() { _ = rt.Close(context.Background()) })
 
-			mod, err := BuildHostModule(ctx, rt, tc.grant, deps)
+			mod, err := BuildHostModule(ctx, rt, grant, deps)
 			if err == nil {
 				t.Fatalf("BuildHostModule returned a module (%v) with a missing dependency, want an error", mod != nil)
 			}
-			if !strings.Contains(err.Error(), tc.wantWord) {
-				t.Errorf("error %q does not name the missing dependency %q", err, tc.wantWord)
+			if !strings.Contains(err.Error(), tc.wantMessage) {
+				t.Errorf("error %q does not name the missing dependency %q", err, tc.wantMessage)
 			}
 		})
 	}
@@ -505,6 +531,29 @@ func TestLogWritesToTheHostLogger(t *testing.T) {
 	}
 	if got := env.logs.String(); !strings.Contains(got, "plugin says hello") || !strings.Contains(got, testPluginName) {
 		t.Errorf("host log = %q, want it to carry the guest message and the plugin name", got)
+	}
+}
+
+// TestLogWithNoMessageIsReportedAsAnAnomaly covers the empty-region case: log
+// has no return value, so a guest that passed no message can only be surfaced
+// through the host logger. A blank line at the requested level would hide it.
+func TestLogWithNoMessageIsReportedAsAnAnomaly(t *testing.T) {
+	env := newTestEnv(t)
+	inst := newHostcallInstance(t, fullGrant(), env.deps)
+
+	out, err := inst.Invoke(context.Background(), opCallLog, nil)
+	if err != nil {
+		t.Fatalf("Invoke(log with no message): %v", err)
+	}
+	if len(out) != 0 {
+		t.Errorf("Invoke(log) returned body %s, want none (log has no return value)", out)
+	}
+	got := env.logs.String()
+	if !strings.Contains(got, "no message") {
+		t.Errorf("host log = %q, want it to say the guest passed no message", got)
+	}
+	if !strings.Contains(got, "level=ERROR") {
+		t.Errorf("host log = %q, want the anomaly reported at ERROR, not as a log line at the guest's level", got)
 	}
 }
 
@@ -684,6 +733,123 @@ func TestHTTPRequestDeniesANonHTTPScheme(t *testing.T) {
 	}
 }
 
+// TestHTTPRequestDeniesARedirectToAnUnlistedHost covers the allowlist bypass a
+// single check on the request URL does not close: an allowed host answering
+// "302 Location: <internal address>" would otherwise be followed by the client
+// and its body handed to the guest with no denial at all.
+//
+// Both servers listen on 127.0.0.1, so the redirect target is genuinely
+// reachable — only its hostname spelling ("localhost") is outside the allowlist.
+// That way the test fails by DELIVERING the second body if the per-hop check is
+// removed, instead of passing because the target happened to be unreachable.
+func TestHTTPRequestDeniesARedirectToAnUnlistedHost(t *testing.T) {
+	var reached atomic.Bool
+	const internalBody = "internal metadata body"
+	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reached.Store(true)
+		_, _ = w.Write([]byte(internalBody))
+	}))
+	defer internal.Close()
+
+	internalURL, err := url.Parse(internal.URL)
+	if err != nil {
+		t.Fatalf("parse internal server URL: %v", err)
+	}
+	unlisted := "http://localhost:" + internalURL.Port() + "/latest/meta-data"
+
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, unlisted, http.StatusFound)
+	}))
+	defer redirector.Close()
+
+	redirectorURL, err := url.Parse(redirector.URL)
+	if err != nil {
+		t.Fatalf("parse redirector URL: %v", err)
+	}
+	if redirectorURL.Hostname() == "localhost" {
+		t.Skipf("the test server is reachable as %q, which is the spelling this test needs to be UNlisted",
+			redirectorURL.Hostname())
+	}
+
+	env := newTestEnv(t)
+	grant := fullGrant()
+	grant.AllowedHosts = []string{redirectorURL.Hostname()}
+	inst := newHostcallInstance(t, grant, env.deps)
+
+	req, err := json.Marshal(map[string]any{"method": "GET", "url": redirector.URL})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	out, err := inst.Invoke(context.Background(), opCallHTTPRequest, req)
+	if err != nil {
+		t.Fatalf("Invoke(http_request): %v", err)
+	}
+	if strings.Contains(string(out), internalBody) {
+		t.Fatalf("http_request followed a redirect out of allowed_hosts and returned the target's body: %s", out)
+	}
+	if got := decodeHostError(t, out); got.Code != CodeDenied {
+		t.Errorf("http_request redirected to an unlisted host returned code %q, want %q (body %s)",
+			got.Code, CodeDenied, out)
+	}
+	if reached.Load() {
+		t.Error("the redirect target was fetched even though its host is not in allowed_hosts")
+	}
+	denied := deniedEvents(t, env)
+	if len(denied) != 1 {
+		t.Fatalf("published %d plugin/call_failed{denied} events, want exactly 1 (all: %v)", len(denied), denied)
+	}
+	if !strings.Contains(denied[0].Message, "http_request") || !strings.Contains(denied[0].Message, testPluginName) {
+		t.Errorf("denial event message %q must name the host function and the plugin", denied[0].Message)
+	}
+}
+
+// TestHTTPRequestFollowsARedirectWithinTheAllowlist is the positive control for
+// the test above: the per-hop check refuses hops that LEAVE the allowlist, it
+// does not refuse redirects as such.
+func TestHTTPRequestFollowsARedirectWithinTheAllowlist(t *testing.T) {
+	const finalBody = "the final body"
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/final" {
+			_, _ = w.Write([]byte(finalBody))
+			return
+		}
+		http.Redirect(w, r, "/final", http.StatusFound)
+	}))
+	defer server.Close()
+
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse test server URL: %v", err)
+	}
+
+	env := newTestEnv(t)
+	grant := fullGrant()
+	grant.AllowedHosts = []string{parsed.Hostname()}
+	inst := newHostcallInstance(t, grant, env.deps)
+
+	req, err := json.Marshal(map[string]any{"method": "GET", "url": server.URL + "/start"})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	out, err := inst.Invoke(context.Background(), opCallHTTPRequest, req)
+	if err != nil {
+		t.Fatalf("Invoke(http_request): %v", err)
+	}
+	var resp struct {
+		Status int    `json:"status"`
+		Body   string `json:"body"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatalf("decode http_request response %s: %v", out, err)
+	}
+	if resp.Status != http.StatusOK || resp.Body != finalBody {
+		t.Errorf("http_request response = %s, want status 200 and the redirected body", out)
+	}
+	if len(deniedEvents(t, env)) != 0 {
+		t.Errorf("a redirect inside allowed_hosts published a denial event: %v", deniedEvents(t, env))
+	}
+}
+
 func TestReadFileReadsAnAllowedPath(t *testing.T) {
 	env := newTestEnv(t)
 	allowedDir := filepath.Join(env.root, "allowed")
@@ -857,6 +1023,116 @@ func TestReadFileDeniesASymlinkIntoTheWorkspaceOutsideTheAllowlist(t *testing.T)
 	}
 }
 
+// TestReadFileDeniesAnAllowedPathOutsideTheWorkspace pins the workspace-guard
+// leg of the fs check, and it is the only test that does.
+//
+// Every other fs test puts allowed_paths INSIDE the workspace root, where the
+// allowlist check (a guard rooted deeper) refuses the same paths on its own — so
+// deleting Deps.FS.Check would leave them all green. Here allowed_paths points
+// OUTSIDE the root, which is exactly the misconfiguration only the guard-first
+// ordering catches: the allowlist is satisfied, and the call must still be
+// refused because the workspace boundary is not the plugin's to widen.
+func TestReadFileDeniesAnAllowedPathOutsideTheWorkspace(t *testing.T) {
+	env := newTestEnv(t)
+	outsideDir := filepath.Join(filepath.Dir(env.root), "outside-allowed")
+	if err := os.MkdirAll(outsideDir, 0o755); err != nil {
+		t.Fatalf("create the out-of-workspace allowed dir: %v", err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(outsideDir) })
+	const secret = "readable only if the workspace guard is skipped"
+	target := filepath.Join(outsideDir, "misconfigured.txt")
+	if err := os.WriteFile(target, []byte(secret), 0o644); err != nil {
+		t.Fatalf("write the out-of-workspace file: %v", err)
+	}
+
+	grant := fullGrant()
+	// The misconfiguration under test: an allowlist entry outside the workspace.
+	grant.AllowedPaths = []string{outsideDir}
+	inst := newHostcallInstance(t, grant, env.deps)
+
+	req, err := json.Marshal(map[string]string{"path": target})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	out, err := inst.Invoke(context.Background(), opCallReadFile, req)
+	if err != nil {
+		t.Fatalf("Invoke(read_file): %v", err)
+	}
+	if strings.Contains(string(out), secret) {
+		t.Fatalf("read_file honored an allowed_paths entry outside the workspace root "+
+			"and returned the file's content: %s", out)
+	}
+	if got := decodeHostError(t, out); got.Code != CodeDenied {
+		t.Errorf("read_file(allowed_paths outside the workspace) returned code %q, want %q (body %s)",
+			got.Code, CodeDenied, out)
+	}
+	denied := deniedEvents(t, env)
+	if len(denied) != 1 {
+		t.Fatalf("published %d plugin/call_failed{denied} events, want exactly 1 (all: %v)", len(denied), denied)
+	}
+	if !strings.Contains(denied[0].Message, "read_file") {
+		t.Errorf("denial event message %q must name the host function", denied[0].Message)
+	}
+}
+
+// TestReadFileCapsTheContentAtTheByteLimit covers the size cap: the guest picks
+// the path, so an unbounded read would allocate an arbitrary file in the host
+// and then die on the guest's allocator. The response states the truncation the
+// same way http_request's does, so a plugin never reads a clipped file as whole.
+func TestReadFileCapsTheContentAtTheByteLimit(t *testing.T) {
+	env := newTestEnv(t)
+	allowedDir := filepath.Join(env.root, "allowed")
+	if err := os.MkdirAll(allowedDir, 0o755); err != nil {
+		t.Fatalf("create allowed dir: %v", err)
+	}
+
+	cases := []struct {
+		name          string
+		size          int
+		wantLen       int
+		wantTruncated bool
+	}{
+		{name: "exactly at the limit", size: readFileByteLimit, wantLen: readFileByteLimit},
+		{name: "over the limit", size: readFileByteLimit + 512, wantLen: readFileByteLimit, wantTruncated: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			target := filepath.Join(allowedDir, "big.txt")
+			if err := os.WriteFile(target, bytes.Repeat([]byte("a"), tc.size), 0o644); err != nil {
+				t.Fatalf("write the oversized file: %v", err)
+			}
+			t.Cleanup(func() { _ = os.Remove(target) })
+
+			grant := fullGrant()
+			grant.AllowedPaths = []string{allowedDir}
+			inst := newHostcallInstance(t, grant, env.deps)
+
+			req, err := json.Marshal(map[string]string{"path": target})
+			if err != nil {
+				t.Fatalf("marshal request: %v", err)
+			}
+			out, err := inst.Invoke(context.Background(), opCallReadFile, req)
+			if err != nil {
+				t.Fatalf("Invoke(read_file): %v", err)
+			}
+			var resp struct {
+				Content   string `json:"content"`
+				Truncated bool   `json:"truncated"`
+			}
+			if err := json.Unmarshal(out, &resp); err != nil {
+				t.Fatalf("decode read_file response (%d bytes): %v", len(out), err)
+			}
+			if len(resp.Content) != tc.wantLen {
+				t.Errorf("read_file returned %d bytes of content, want %d", len(resp.Content), tc.wantLen)
+			}
+			if resp.Truncated != tc.wantTruncated {
+				t.Errorf("read_file reported truncated=%v for a %d-byte file, want %v",
+					resp.Truncated, tc.size, tc.wantTruncated)
+			}
+		})
+	}
+}
+
 // TestCheckAllowedPathIsFailClosed covers the allowlist containment rules
 // directly, including the two malformed-allowlist cases that must not widen a
 // grant: no entries at all, and an empty entry (filepath.Clean("") == ".").
@@ -915,6 +1191,67 @@ func TestCheckAllowedPathIsFailClosed(t *testing.T) {
 			}
 			if !tc.wantErr && err != nil {
 				t.Fatalf("checkAllowedPath(%s) = %v, want nil", tc.path, err)
+			}
+		})
+	}
+}
+
+// TestEventHasCategoryReadsBackWhatTheEmitterWrote pins the two halves of the
+// category encoding against each other, so the one place that spells it stays
+// the one place that reads it (see eventCategoryToken).
+func TestEventHasCategoryReadsBackWhatTheEmitterWrote(t *testing.T) {
+	emitted := domain.RuntimeEvent{
+		Type:    RuntimeEventCallFailed,
+		Message: formatCallFailedMessage(CategoryDenied, testPluginName, "read_file", "some reason"),
+	}
+	if !EventHasCategory(emitted, CategoryDenied) {
+		t.Errorf("EventHasCategory(%q, %q) = false, want true", emitted.Message, CategoryDenied)
+	}
+	if EventHasCategory(emitted, "fault") {
+		t.Errorf("EventHasCategory(%q, \"fault\") = true, want false", emitted.Message)
+	}
+	// A reason that merely mentions a category must not be read as one, and
+	// neither must an event of another type.
+	sneaky := domain.RuntimeEvent{
+		Type:    RuntimeEventCallFailed,
+		Message: formatCallFailedMessage("fault", testPluginName, "read_file", "category=denied"),
+	}
+	if EventHasCategory(sneaky, CategoryDenied) {
+		t.Errorf("EventHasCategory read the category out of the reason text: %q", sneaky.Message)
+	}
+	other := domain.RuntimeEvent{Type: "plugin/other", Message: emitted.Message}
+	if EventHasCategory(other, CategoryDenied) {
+		t.Errorf("EventHasCategory matched an event of type %q", other.Type)
+	}
+}
+
+// TestCallWasCancelledSeparatesShutdownFromDenial pins the classification
+// read_file uses: the workspace guard returns ctx.Err() before it inspects the
+// path, and a cancelled call must not be reported (or counted) as a denial.
+func TestCallWasCancelledSeparatesShutdownFromDenial(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	cases := []struct {
+		name string
+		ctx  context.Context
+		err  error
+		want bool
+	}{
+		{name: "a cancelled context", ctx: cancelled, err: cancelled.Err(), want: true},
+		{name: "a cancellation error on a live context", ctx: context.Background(), err: context.Canceled, want: true},
+		{name: "a deadline error on a live context", ctx: context.Background(), err: context.DeadlineExceeded, want: true},
+		{
+			name: "a genuine path refusal",
+			ctx:  context.Background(),
+			err:  fmt.Errorf("check path: %w", port.ErrPathOutsideWorkspace),
+			want: false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := callWasCancelled(tc.ctx, tc.err); got != tc.want {
+				t.Errorf("callWasCancelled(%v) = %v, want %v", tc.err, got, tc.want)
 			}
 		})
 	}
