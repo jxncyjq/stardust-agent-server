@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/domain"
@@ -34,12 +35,18 @@ func contributionAgent() domain.Agent {
 // (activation cross-checks it against the guest's manifest); everything else is
 // the deployment's claim about the tool, which is exactly what Spec.Tools
 // carries.
+//
+// Timeout is not decoration: validateSpec requires a positive one because it is
+// the only bound on a call inside the guest, and it is also what bounds the
+// teardown drain (see drainDeadline). It is generous here so that a slow machine
+// cannot make the happy-path tests flaky.
 func fixtureDescriptor() tool.Descriptor {
 	return tool.Descriptor{
 		Name:        fixtureProvidedTool,
 		Description: "回显插件工具（测试夹具）",
 		Group:       "plugins",
 		RiskLevel:   "low",
+		Timeout:     30 * time.Second,
 	}
 }
 
@@ -128,7 +135,6 @@ func TestContributedToolIsCallableAndGateable(t *testing.T) {
 	labels := c.ledger.Snapshot()[testOwner]
 	want := []string{
 		ledgerLabelRuntime,
-		ledgerLabelInstance,
 		ledgerLabelPool,
 		"tool:" + fixtureProvidedTool,
 		gateableLabel(fixtureProvidedTool),
@@ -171,8 +177,8 @@ func TestDisposeOwnerRemovesTheContributedTool(t *testing.T) {
 
 // TestDisposeOwnerStopsTheGuestFromBeingCalled pins the disposal ORDER the
 // ledger's reverse-order contract gives us: the pool is drained before the
-// instance and the runtime are closed, so a call that arrives afterwards is
-// refused by the pool rather than reaching a closed wazero module.
+// runtime is closed, so a call that arrives afterwards is refused by the pool
+// rather than reaching a closed wazero module.
 func TestDisposeOwnerStopsTheGuestFromBeingCalled(t *testing.T) {
 	c := newContribution(t)
 

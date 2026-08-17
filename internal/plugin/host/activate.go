@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/stardust/legion-agent/internal/lifecycle"
 	"github.com/stardust/legion-agent/internal/plugin/abi"
@@ -18,10 +19,75 @@ import (
 // being revoked, so a "plugin loaded but nothing happened" report can be
 // answered from lifecycle.Ledger.Snapshot alone.
 const (
-	ledgerLabelRuntime  = "wasm-runtime"
-	ledgerLabelInstance = "wasm-instance"
-	ledgerLabelPool     = "wasm-instance-pool"
+	ledgerLabelRuntime = "wasm-runtime"
+	ledgerLabelPool    = "wasm-instance-pool"
 )
+
+// drainGrace is how much longer than the longest in-flight call teardown waits
+// for a plugin's instance pool to converge (see drainDeadline).
+//
+// It is a package-level variable rather than a constant only so a test can
+// shrink it and prove teardown is bounded without spending the real grace
+// waiting (TestDisposeOwnerDoesNotHangOnAnUnboundedGuestCall). Production code
+// never overrides it. Substituting it is only safe while no test in this package
+// calls t.Parallel() — the same condition closeInstance carries.
+var drainGrace = 5 * time.Second
+
+// drainDeadline is the bound teardown puts on a plugin's pool drain: the
+// longest Timeout any of its tools carries, plus drainGrace.
+//
+// The bound has to compose with the per-tool timeouts rather than be an
+// independent number. Registry.Execute cancels a tool call once its
+// descriptor's Timeout expires, wazero's WithCloseOnContextDone then interrupts
+// the guest, and the handler's release is what lets drain converge — so a drain
+// deadline SHORTER than an in-flight call's own timeout would expire first and
+// report a leak that was about to resolve itself. Waiting the longest tool
+// timeout is therefore the floor; drainGrace on top is the slack for the
+// interrupt, the handler's unwind and the release to actually happen.
+//
+// validateSpec guarantees every descriptor carries a positive Timeout, so the
+// result is always greater than drainGrace.
+func drainDeadline(tools []tool.Descriptor) time.Duration {
+	longest := time.Duration(0)
+	for _, descriptor := range tools {
+		if descriptor.Timeout > longest {
+			longest = descriptor.Timeout
+		}
+	}
+	return longest + drainGrace
+}
+
+// ActivationRollbackError is the value a panicking Activate re-panics with when
+// its own rollback ALSO failed.
+//
+// It exists because a rollback failure has nowhere else to go on that path: the
+// panic is unwinding, so Activate's error return is never delivered, and a
+// failure to close the plugin's wazero runtime or converge its pool would
+// otherwise vanish at the exact moment it matters most. Both halves travel
+// together — the panic that aborted the activation and every failure rolling it
+// back hit — so a caller that recovers sees the cause and the leak in one value.
+//
+// Recovering callers can reach the rollback failures with errors.Is/errors.As
+// (see Unwrap); the panic that caused the activation to abort is Panic.
+type ActivationRollbackError struct {
+	// Panic is the value Activate was unwinding when the rollback ran. It is
+	// typically the fail-loud panic of a duplicate tool name (see
+	// contributeTools).
+	Panic any
+
+	// Rollback is every failure the rollback itself hit, joined.
+	Rollback error
+}
+
+// Error reports both halves: what aborted the activation, and what rolling it
+// back failed to release.
+func (e *ActivationRollbackError) Error() string {
+	return fmt.Sprintf("activation panicked (%v), and rolling it back also failed: %v", e.Panic, e.Rollback)
+}
+
+// Unwrap returns the joined rollback failures, so a recovering caller can test
+// them with errors.Is and errors.As.
+func (e *ActivationRollbackError) Unwrap() error { return e.Rollback }
 
 // Manifest is a plugin's self-description, read from the guest itself through
 // abi.OpManifest rather than taken on trust from deployment configuration.
@@ -65,8 +131,14 @@ type Spec struct {
 	// and an empty Tools would make the cross-check below vacuous. Every NAME
 	// in it must appear in the guest's own manifest; a guest that declares MORE
 	// than the host claims is not a conflict, because the host only ever
-	// contributes what it claims here. Name, Description and Group are all
-	// required of each descriptor (see validateSpec).
+	// contributes what it claims here.
+	//
+	// Name, Description, Group and Timeout are all required of each descriptor,
+	// with no defaults (see validateSpec). Timeout is required because it is the
+	// ONLY bound on a call inside the guest: Registry.Execute applies a timeout
+	// only when the descriptor carries a positive one, so a descriptor without it
+	// would let a plugin call that never returns run forever — and hold up the
+	// pool drain that teardown waits for (see drainDeadline).
 	Tools []tool.Descriptor
 
 	// Registry is where Tools are registered, and therefore what the model
@@ -129,12 +201,14 @@ type Plugin struct {
 	pool *pool
 }
 
-// closeInstance performs the wazero close behind the instance's ledger
-// disposer, and behind the pool's discard and drain closes. It is a
-// package-level function value rather than a direct call to *Instance.Close
-// only so tests can substitute a failing implementation and prove that a
-// close failure is reported instead of dropped
+// closeInstance performs the wazero close behind every place an Instance is
+// released: the pool's discard of a dead instance, and the closes its drain
+// does — which, since activation keeps no instance of its own, covers every
+// guest instance a plugin ever has. It is a package-level function value rather
+// than a direct call to *Instance.Close only so tests can substitute a failing
+// implementation and prove that a close failure is reported instead of dropped
 // (TestActivateReportsAFailureWhileRollingBack,
+// TestActivateCarriesARollbackFailureOutOfAPanic,
 // TestPoolDrainReportsACloseFailure) — forcing wazero's own Close to fail from
 // outside this package is not practically reachable. Production code never
 // overrides it. Substituting it is only safe while no test in this package
@@ -152,18 +226,25 @@ var closeInstance = func(ctx context.Context, inst *Instance) error { return ins
 //     unauthorized import is reported as the capability a deployment would
 //     have to grant, not as wazero's raw link failure;
 //  4. build the host module with exactly the granted capabilities;
-//  5. instantiate the guest (file it);
-//  6. read the guest's self-description via abi.OpManifest;
+//  5. create the instance pool every call into this plugin is served from, and
+//     file its drain;
+//  6. read the guest's self-description via abi.OpManifest — on an instance from
+//     that pool, so no guest instance ever exists outside it;
 //  7. cross-check that self-description against spec;
-//  8. create the instance pool the plugin's tools are served from and file its
-//     drain;
-//  9. contribute the plugin's tools (see contributeTools), which files one
+//  8. contribute the plugin's tools (see contributeTools), which files one
 //     registry entry and one gateable-catalog entry per tool.
 //
-// The cross-check is deliberately before the pool and the contribution, and
-// AFTER the instance is filed: a plugin
-// whose host manifest disagrees with its guest is exactly the failure that
-// must exercise the rollback, so the rollback path cannot rot into dead code.
+// The self-description is read and cross-checked deliberately AFTER the pool is
+// filed and before the contribution: a plugin whose host manifest disagrees with
+// its guest is exactly the failure that must exercise the rollback, so the
+// rollback path cannot rot into dead code
+// (TestActivateFilesThePoolBeforeReadingTheManifest pins that ordering).
+//
+// Reading the manifest through the pool rather than from a separate instance is
+// what keeps a plugin's instance count at spec.MaxInstances instead of
+// 1 + MaxInstances: an activation-owned instance would sit idle for the plugin's
+// whole life while every call was served from the pool, doubling a
+// MaxInstances=1 plugin's guest memory for nothing.
 //
 // Owner exclusivity is a precondition, not a courtesy: owner must belong to
 // this activation alone. Activate refuses to start if
@@ -183,14 +264,23 @@ var closeInstance = func(ctx context.Context, inst *Instance) error { return ins
 // rolling back is itself reported: every revoke error is joined
 // (errors.Join) onto the activation error rather than replacing or hiding
 // it, and none is dropped. Activate never returns a partially activated
-// Plugin. That holds for a PANIC as well: the contribution step is fail-loud on
-// a tool name another contributor already owns, and the rollback runs on the way
-// out of it, so a panicking activation leaves nothing filed either.
+// Plugin.
+//
+// None is dropped on a PANIC either, and that path takes a different shape
+// because there is no error return to join onto. The contribution step is
+// fail-loud on a tool name another contributor already owns, and the rollback
+// runs on the way out of that panic; if the rollback itself fails, Activate
+// recovers, wraps the original panic value together with the joined rollback
+// failures in an *ActivationRollbackError, and panics with THAT. So a panicking
+// activation leaves nothing filed, and a rollback failure during the panic —
+// a wazero runtime that refused to close, a pool that would not converge — is
+// carried out with the panic instead of disappearing into a return value nobody
+// will ever read. A panic whose rollback succeeded propagates unchanged.
 //
 // Once Activate has returned, the plugin IS its tools: they are in
 // spec.Registry, they are gateable, and every call to one of them is served by
 // the instance pool through the handler contributeTools registered. Revoking all
-// of that — tools, gateable entries, pool, instance, runtime, in that order — is
+// of that — tools, gateable entries, pool (drained), runtime, in that order — is
 // ledger.DisposeOwner(owner) and nothing else.
 func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Owner, spec Spec) (_ *Plugin, err error) {
 	if ledger == nil {
@@ -234,11 +324,27 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 		if committed {
 			return
 		}
+		var rollbackErrs []error
 		for i := len(revokers) - 1; i >= 0; i-- {
 			if derr := revokers[i](); derr != nil {
-				err = errors.Join(err, fmt.Errorf("roll back activation of plugin %q: %w", spec.Name, derr))
+				rollbackErrs = append(rollbackErrs, fmt.Errorf("roll back activation of plugin %q: %w", spec.Name, derr))
 			}
 		}
+		joined := errors.Join(rollbackErrs...)
+		if joined == nil {
+			// Nothing to report. recover() is deliberately NOT called on this
+			// path: a panic whose rollback succeeded must propagate exactly as it
+			// was thrown.
+			return
+		}
+		if p := recover(); p != nil {
+			// The named return is never delivered while a panic unwinds, so
+			// joining onto it here would drop the rollback failure at the one
+			// moment it matters most (the plugin's runtime may still be open).
+			// Carry both out instead — see ActivationRollbackError.
+			panic(&ActivationRollbackError{Panic: p, Rollback: joined})
+		}
+		err = errors.Join(err, joined)
 	}()
 
 	rt := NewRuntime(ctx, spec.MemoryPages)
@@ -267,28 +373,6 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 		return nil, fmt.Errorf("activate plugin %q: %w", spec.Name, err)
 	}
 
-	inst, err := NewInstance(ctx, rt, compiled)
-	if err != nil {
-		return nil, fmt.Errorf("activate plugin %q: %w", spec.Name, err)
-	}
-	keep(ledger.Add(owner, ledgerLabelInstance, func() error {
-		if cerr := closeInstance(disposeCtx, inst); cerr != nil {
-			return fmt.Errorf("close instance of plugin %q: %w", spec.Name, cerr)
-		}
-		return nil
-	}))
-
-	// Read and cross-check AFTER the instance is filed: a mismatch must be a
-	// failure with something to roll back (see the doc comment above, and
-	// TestActivateFilesTheInstanceBeforeReadingTheManifest, which pins it).
-	manifest, err := readManifest(ctx, inst)
-	if err != nil {
-		return nil, fmt.Errorf("activate plugin %q: %w", spec.Name, err)
-	}
-	if err := crossCheck(spec, manifest); err != nil {
-		return nil, fmt.Errorf("activate plugin %q: %w", spec.Name, err)
-	}
-
 	// The pool's instances are built lazily, by the calls that need them, so its
 	// factory must NOT hold ctx: activation's context is typically the request
 	// that loaded the plugin, and it is long dead by the time a model calls one
@@ -302,19 +386,39 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 	instances := newPool(spec.MaxInstances, func() (*Instance, error) {
 		return NewInstance(instantiateCtx, rt, compiled)
 	})
-	// Filed AFTER the runtime and the instance precisely so that reverse-order
-	// disposal runs it BEFORE them: drain converges the calls that are inside the
-	// guest right now, and closing the runtime underneath them would truncate a
-	// tool call in flight. The wait is bounded by each in-flight call's own
-	// context (a tool descriptor's Timeout, or whatever the caller passed), not
-	// by a deadline invented here, so disposeCtx carries no cancellation of its
-	// own.
+	// Filed AFTER the runtime precisely so that reverse-order disposal runs it
+	// BEFORE it: drain converges the calls that are inside the guest right now,
+	// and closing the runtime underneath them would truncate a tool call in
+	// flight. The wait is bounded — see drainDeadline for how the bound is chosen
+	// so that it composes with each in-flight call's own timeout — and expiry is
+	// a reported failure: the error reaches whoever called DisposeOwner, because
+	// a drain that did not converge means guest work outlived the plugin and
+	// that must be recorded, never shrugged off.
+	drainBound := drainDeadline(spec.Tools)
 	keep(ledger.Add(owner, ledgerLabelPool, func() error {
-		if derr := instances.drain(disposeCtx); derr != nil {
-			return fmt.Errorf("drain instance pool of plugin %q: %w", spec.Name, derr)
+		drainCtx, cancel := context.WithTimeout(disposeCtx, drainBound)
+		defer cancel()
+		if derr := instances.drain(drainCtx); derr != nil {
+			return fmt.Errorf("drain instance pool of plugin %q (waited %s): %w", spec.Name, drainBound, derr)
 		}
 		return nil
 	}))
+
+	// Read and cross-check AFTER the pool's drain is filed: a mismatch must be a
+	// failure with something to roll back (see the doc comment above, and
+	// TestActivateFilesThePoolBeforeReadingTheManifest, which pins it).
+	//
+	// The read goes through the pool, so the instance it builds is the same one
+	// the plugin's tool calls will use rather than an extra one activation keeps
+	// alive forever. instances.call takes the pool's acquire/release discipline
+	// with it (see pool.call).
+	manifest, err := readManifest(ctx, instances)
+	if err != nil {
+		return nil, fmt.Errorf("activate plugin %q: %w", spec.Name, err)
+	}
+	if err := crossCheck(spec, manifest); err != nil {
+		return nil, fmt.Errorf("activate plugin %q: %w", spec.Name, err)
+	}
 
 	// Contribution is the last step, so a tool name another contributor already
 	// owns rolls back everything above it — including the tools registered
@@ -365,6 +469,17 @@ func validateSpec(spec Spec) error {
 		case descriptor.Group == "":
 			return fmt.Errorf("activate plugin %q: Spec.Tools[%d] (%q) has no Group; an unplaced tool cannot be "+
 				"listed in the capability catalog, so the model would never see it", spec.Name, i, descriptor.Name)
+		case descriptor.Timeout <= 0:
+			// No default here for the same reason MemoryPages and MaxInstances
+			// have none, plus a sharper one: Registry.Execute applies a timeout
+			// only when the descriptor carries a positive one, so this is the ONLY
+			// bound on a call inside the guest. Without it a plugin call that never
+			// returns runs forever and holds up the pool drain teardown waits for
+			// (see drainDeadline).
+			return fmt.Errorf("activate plugin %q: Spec.Tools[%d] (%q) has Timeout %s; a plugin tool needs a "+
+				"positive timeout with no default, because it is the only bound on a call inside the guest "+
+				"and an unbounded one would also block this plugin's teardown",
+				spec.Name, i, descriptor.Name, descriptor.Timeout)
 		}
 		if _, dup := claimed[descriptor.Name]; dup {
 			return fmt.Errorf("activate plugin %q: Spec.Tools claims %q twice; one name is one tool, and the second "+
@@ -383,8 +498,13 @@ func validateSpec(spec Spec) error {
 // returns. The actual decoding is decodeManifest, split out so its error
 // branches can be table-tested without an Instance or a compiled guest
 // module.
-func readManifest(ctx context.Context, inst *Instance) (Manifest, error) {
-	body, err := inst.Invoke(ctx, abi.OpManifest, nil)
+//
+// It takes a guestCaller rather than an *Instance because activation reads the
+// manifest through the plugin's own instance pool: the pool is the only place a
+// guest instance lives (see Activate), and pool.call is what keeps its
+// acquire/release discipline.
+func readManifest(ctx context.Context, guest guestCaller) (Manifest, error) {
+	body, err := guest.call(ctx, abi.OpManifest, nil)
 	if err != nil {
 		return Manifest{}, fmt.Errorf("read self-description (op %d): %w", abi.OpManifest, err)
 	}

@@ -8,11 +8,13 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stardust/legion-agent/internal/lifecycle"
 	"github.com/stardust/legion-agent/internal/plugin/abi"
 	"github.com/stardust/legion-agent/internal/plugin/perm"
 	"github.com/stardust/legion-agent/internal/tool"
+	"github.com/stardust/legion-agent/internal/toolauth"
 	"github.com/tetratelabs/wazero/api"
 	"github.com/tetratelabs/wazero/experimental"
 )
@@ -77,6 +79,7 @@ func hostcallSpec(t *testing.T) Spec {
 			Name:        "unused_placeholder_tool",
 			Description: "placeholder",
 			Group:       "plugins",
+			Timeout:     time.Second,
 		}},
 		Registry:     tool.NewRegistry(nil, nil, nil),
 		MaxInstances: 1,
@@ -88,11 +91,40 @@ func hostcallSpec(t *testing.T) Spec {
 // module instantiated with it. A rollback that only forgot its ledger entries
 // without running their disposers would leave the guest module open, and the
 // ledger snapshot alone cannot see that.
+//
+// It answers "was any module of this activation closed?", which is deliberately
+// coarse: the notifier carries no module identity, and an activation closes its
+// wasi, host and guest modules alike. Counting a SPECIFIC disposer's closes is
+// countInstanceCloses' job.
 func watchGuestClose(ctx context.Context) (context.Context, *atomic.Bool) {
 	var closed atomic.Bool
 	notified := experimental.WithCloseNotifier(ctx, experimental.CloseNotifyFunc(
 		func(context.Context, uint32) { closed.Store(true) }))
 	return notified, &closed
+}
+
+// countInstanceCloses swaps closeInstance for a wrapper that counts its calls
+// and still performs the real close, and returns the counter.
+//
+// It exists because watchGuestClose cannot tell WHICH module was closed, so an
+// assertion built on it passes if any disposer ran. closeInstance is only ever
+// reached for a plugin Instance (the pool's discard and its drain), so counting
+// it — and asserting the exact expected number — pins that the instance
+// disposers specifically ran, and that each instance was closed exactly once.
+//
+// Safe only while no test in this package calls t.Parallel(); see
+// closeInstance's own comment.
+func countInstanceCloses(t *testing.T) *atomic.Int64 {
+	t.Helper()
+
+	var closes atomic.Int64
+	original := closeInstance
+	closeInstance = func(ctx context.Context, inst *Instance) error {
+		closes.Add(1)
+		return original(ctx, inst)
+	}
+	t.Cleanup(func() { closeInstance = original })
+	return &closes
 }
 
 // assertOwnerRolledBack asserts that nothing remains filed under owner. That
@@ -107,13 +139,18 @@ func assertOwnerRolledBack(t *testing.T, ledger *lifecycle.Ledger, owner lifecyc
 	}
 }
 
-// TestActivateFilesRuntimeAndInstance covers the happy path: the manifest the
+// TestActivateFilesRuntimeAndPool covers the happy path: the manifest the
 // guest declares is returned, the plugin answers a call, and every resource
-// activation created — runtime, instance, instance pool, and the two entries per
+// activation created — runtime, instance pool, and the two entries per
 // contributed tool — is filed under the owner so a later DisposeOwner can revoke
 // them.
-func TestActivateFilesRuntimeAndInstance(t *testing.T) {
+func TestActivateFilesRuntimeAndPool(t *testing.T) {
 	ctx, guestClosed := watchGuestClose(context.Background())
+	// The pool holds every guest instance this plugin has (MaxInstances is 1, and
+	// the manifest read went through the pool too), so teardown must close
+	// exactly one of them — counted rather than merely observed, because
+	// guestClosed cannot say which module a close belonged to.
+	instanceCloses := countInstanceCloses(t)
 	ledger := lifecycle.NewLedger()
 
 	p, err := Activate(ctx, ledger, testOwner, fixtureSpec(t))
@@ -150,7 +187,6 @@ func TestActivateFilesRuntimeAndInstance(t *testing.T) {
 	labels := ledger.Snapshot()[testOwner]
 	want := []string{
 		ledgerLabelRuntime,
-		ledgerLabelInstance,
 		ledgerLabelPool,
 		"tool:" + fixtureProvidedTool,
 		gateableLabel(fixtureProvidedTool),
@@ -173,20 +209,29 @@ func TestActivateFilesRuntimeAndInstance(t *testing.T) {
 	if !guestClosed.Load() {
 		t.Error("after DisposeOwner no guest module was closed: the disposers were dropped rather than run")
 	}
+	if got := instanceCloses.Load(); got != 1 {
+		t.Errorf("closeInstance ran %d times across teardown, want exactly 1: the plugin's only guest instance "+
+			"is the pooled one, and the drain disposer is what must close it", got)
+	}
 	if _, err := p.pool.call(context.Background(), opEcho, nil); err == nil {
 		t.Error("the plugin still answers a call after DisposeOwner, want an error: its pool was not drained")
 	}
 }
 
-// TestActivateFilesTheInstanceBeforeReadingTheManifest pins the ordering the
+// TestActivateFilesThePoolBeforeReadingTheManifest pins the ordering the
 // rollback tests depend on, which their own assertions cannot see: closing the
 // plugin's runtime closes the guest module too, so "mismatch left nothing
-// filed" looks identical whether the instance was filed before the cross-check
-// or after it. This test looks at the ledger from INSIDE the manifest read —
-// wazero notifies a function listener before plugin_invoke runs — so moving
-// the cross-check (and the read that feeds it) ahead of the instance's
+// filed" looks identical whether the pool's drain was filed before the
+// cross-check or after it. This test looks at the ledger from INSIDE the
+// manifest read — wazero notifies a function listener before plugin_invoke runs
+// — so moving the cross-check (and the read that feeds it) ahead of the pool's
 // ledger.Add fails here.
-func TestActivateFilesTheInstanceBeforeReadingTheManifest(t *testing.T) {
+//
+// The pool is what the instance used to be: activation no longer keeps an
+// instance of its own (the manifest read borrows one from the pool), so the pool
+// entry is the resource that must already be filed when the cross-check can
+// fail.
+func TestActivateFilesThePoolBeforeReadingTheManifest(t *testing.T) {
 	ledger := lifecycle.NewLedger()
 
 	var mu sync.Mutex
@@ -241,14 +286,14 @@ func TestActivateFilesTheInstanceBeforeReadingTheManifest(t *testing.T) {
 	}
 	found := false
 	for _, label := range atInvoke {
-		if label == ledgerLabelInstance {
+		if label == ledgerLabelPool {
 			found = true
 		}
 	}
 	if !found {
 		t.Errorf("at the manifest read the ledger held %v, want it to already hold %q: "+
-			"the manifest cross-check must fail with the instance filed, or its rollback path is dead code",
-			atInvoke, ledgerLabelInstance)
+			"the manifest cross-check must fail with the pool filed, or its rollback path is dead code",
+			atInvoke, ledgerLabelPool)
 	}
 }
 
@@ -266,7 +311,12 @@ func TestActivateProvidesMismatchRollsBack(t *testing.T) {
 	ledger.Add(other, "unrelated", func() error { return nil })
 
 	spec := fixtureSpec(t)
-	spec.Tools = []tool.Descriptor{{Name: "absent_tool", Description: "not declared by the guest", Group: "plugins"}}
+	spec.Tools = []tool.Descriptor{{
+		Name:        "absent_tool",
+		Description: "not declared by the guest",
+		Group:       "plugins",
+		Timeout:     time.Second,
+	}}
 
 	p, err := Activate(ctx, ledger, testOwner, spec)
 	if err == nil {
@@ -461,7 +511,12 @@ func TestActivateReportsAFailureWhileRollingBack(t *testing.T) {
 	t.Cleanup(func() { closeInstance = originalCloseInstance })
 
 	spec := fixtureSpec(t)
-	spec.Tools = []tool.Descriptor{{Name: "absent_tool", Description: "not declared by the guest", Group: "plugins"}}
+	spec.Tools = []tool.Descriptor{{
+		Name:        "absent_tool",
+		Description: "not declared by the guest",
+		Group:       "plugins",
+		Timeout:     time.Second,
+	}}
 
 	p, err := Activate(ctx, ledger, testOwner, spec)
 	if err == nil {
@@ -480,6 +535,165 @@ func TestActivateReportsAFailureWhileRollingBack(t *testing.T) {
 	if !guestClosed.Load() {
 		t.Error("the guest module was never closed: a failing disposer must still run the real close, " +
 			"not skip it because it also reports an error")
+	}
+}
+
+// TestActivateCarriesARollbackFailureOutOfAPanic is the panic-path half of the
+// test above, and the assertion is specifically that the dispose failure is
+// OBSERVABLE rather than that a panic happened.
+//
+// Joining a rollback failure onto the named return works only when the function
+// returns: while a panic unwinds, that return value is never delivered, so a
+// runtime or an instance that refused to close would vanish exactly when the
+// plugin is in its worst state — half torn down, with a leak nobody was told
+// about. Activate therefore recovers, and re-panics with an
+// *ActivationRollbackError carrying both halves.
+//
+// The panic is real, not injected: a tool name the gateable catalog already
+// holds makes toolauth.Contribute fail loud, which is the failure this task
+// introduced into Activate's call graph.
+func TestActivateCarriesARollbackFailureOutOfAPanic(t *testing.T) {
+	revoke := toolauth.Contribute(toolauth.GateableTool{
+		Name:        fixtureProvidedTool,
+		Description: "someone else claimed this name",
+	})
+	t.Cleanup(revoke)
+
+	disposeErr := errors.New("hostile close refused")
+	originalCloseInstance := closeInstance
+	closeInstance = func(ctx context.Context, inst *Instance) error {
+		// Release the real wazero resources anyway: a disposer that reports a
+		// failure has not earned the right to leak the module too.
+		_ = originalCloseInstance(ctx, inst)
+		return disposeErr
+	}
+	t.Cleanup(func() { closeInstance = originalCloseInstance })
+
+	ledger := lifecycle.NewLedger()
+	t.Cleanup(func() { _ = ledger.DisposeOwner(testOwner) })
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("Activate did not panic although the tool name is already gateable")
+		}
+		carried, ok := r.(*ActivationRollbackError)
+		if !ok {
+			t.Fatalf("panic value is %T (%v), want *ActivationRollbackError: a rollback failure during a "+
+				"panic has no error return to travel on, so it must travel with the panic", r, r)
+		}
+		if !errors.Is(carried, disposeErr) {
+			t.Errorf("panic %v does not carry the dispose failure %v: it was swallowed while unwinding",
+				carried, disposeErr)
+		}
+		if !strings.Contains(carried.Error(), fixtureProvidedTool) {
+			t.Errorf("panic %v lost the original panic (the conflict over %q) while reporting the rollback failure",
+				carried, fixtureProvidedTool)
+		}
+		if carried.Panic == nil {
+			t.Error("ActivationRollbackError.Panic is nil, want the panic that aborted the activation")
+		}
+		assertOwnerRolledBack(t, ledger, testOwner)
+	}()
+
+	_, _ = Activate(context.Background(), ledger, testOwner, fixtureSpec(t))
+}
+
+// TestDisposeOwnerDoesNotHangOnAnUnboundedGuestCall pins that teardown is
+// bounded. The pool's drain waits for in-flight calls to converge, and a guest
+// call has no bound of its own here — op 99 is a pure-compute infinite loop and
+// the context it runs under never expires — so an unbounded drain would hold
+// DisposeOwner (and with it the close of the plugin's runtime) forever.
+//
+// The bound is not silent either: a drain that did not converge is reported
+// through DisposeOwner's error, because guest work outliving its plugin is
+// exactly the thing an operator has to hear about.
+//
+// drainGrace is shrunk for the duration so the test spends milliseconds rather
+// than the production grace; the deadline itself is still computed the
+// production way (see drainDeadline).
+func TestDisposeOwnerDoesNotHangOnAnUnboundedGuestCall(t *testing.T) {
+	originalGrace := drainGrace
+	drainGrace = 100 * time.Millisecond
+	t.Cleanup(func() { drainGrace = originalGrace })
+
+	// Signalled from inside the guest, so the drain below is guaranteed to have
+	// an in-flight call to wait for without polling or sleeping: wazero notifies
+	// a function listener before plugin_invoke's body runs.
+	entered := make(chan struct{})
+	var once sync.Once
+	listener := experimental.FunctionListenerFunc(func(
+		_ context.Context, _ api.Module, _ api.FunctionDefinition, params []uint64, _ experimental.StackIterator,
+	) {
+		if len(params) == 0 || params[0] != uint64(uint32(opBusyLoop)) {
+			return // the manifest read comes through here too
+		}
+		once.Do(func() { close(entered) })
+	})
+	ctx := experimental.WithFunctionListenerFactory(context.Background(),
+		experimental.FunctionListenerFactoryFunc(func(def api.FunctionDefinition) experimental.FunctionListener {
+			for _, exported := range def.ExportNames() {
+				if exported == abi.ExportInvoke {
+					return listener
+				}
+			}
+			return nil
+		}))
+
+	ledger := lifecycle.NewLedger()
+	t.Cleanup(func() { _ = ledger.DisposeOwner(testOwner) })
+
+	spec := fixtureSpec(t)
+	descriptor := fixtureDescriptor()
+	descriptor.Timeout = 20 * time.Millisecond
+	spec.Tools = []tool.Descriptor{descriptor}
+
+	p, err := Activate(ctx, ledger, testOwner, spec)
+	if err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+
+	call := make(chan error, 1)
+	go func() {
+		// context.Background(): the call this drain has to survive is one with no
+		// deadline of its own, which is the whole point.
+		_, cerr := p.pool.call(context.Background(), opBusyLoop, nil)
+		call <- cerr
+	}()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the busy-loop call never reached the guest: this test cannot see the hang it claims to prevent")
+	}
+
+	disposed := make(chan error, 1)
+	go func() { disposed <- ledger.DisposeOwner(testOwner) }()
+	select {
+	case derr := <-disposed:
+		if derr == nil {
+			t.Fatal("DisposeOwner reported success although an in-flight guest call never converged: " +
+				"an unconverged drain must be reported, not shrugged off")
+		}
+		for _, want := range []string{"drain instance pool", fixtureManifestName, "in-flight"} {
+			if !strings.Contains(derr.Error(), want) {
+				t.Errorf("DisposeOwner error %q does not mention %q", derr, want)
+			}
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("DisposeOwner did not return: teardown is unbounded, so one guest call that never returns " +
+			"hangs the plugin's whole teardown behind it")
+	}
+
+	// And the loop must not outlive teardown: closing the plugin's runtime is
+	// what interrupts a guest the drain gave up waiting for.
+	select {
+	case cerr := <-call:
+		if cerr == nil {
+			t.Error("the unbounded guest call returned no error although teardown closed the runtime under it")
+		}
+	case <-time.After(10 * time.Second):
+		t.Error("the busy-looping guest call is still running after teardown: closing the runtime did not " +
+			"interrupt it, so the drain's deadline only moved the leak")
 	}
 }
 
@@ -563,6 +777,23 @@ func TestActivateRejectsAnInvalidSpec(t *testing.T) {
 			owner:  testOwner,
 			mutate: func(s *Spec) { s.Tools = []tool.Descriptor{{Name: fixtureProvidedTool, Description: "d"}} },
 			want:   "Group",
+		},
+		{
+			// The only bound on a call inside the guest (Registry.Execute applies
+			// a timeout only for a positive one), and therefore also what keeps
+			// the teardown drain finite. No default.
+			name:   "tool with no timeout",
+			owner:  testOwner,
+			mutate: func(s *Spec) { s.Tools = []tool.Descriptor{{Name: fixtureProvidedTool, Description: "d", Group: "g"}} },
+			want:   "Timeout",
+		},
+		{
+			name:  "tool with a negative timeout",
+			owner: testOwner,
+			mutate: func(s *Spec) {
+				s.Tools = []tool.Descriptor{{Name: fixtureProvidedTool, Description: "d", Group: "g", Timeout: -time.Second}}
+			},
+			want: "Timeout",
 		},
 		{
 			name:   "duplicate tool name",

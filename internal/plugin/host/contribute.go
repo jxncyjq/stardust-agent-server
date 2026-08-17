@@ -75,6 +75,14 @@ type guestToolCall struct {
 // contribution can die half-way through. What was already filed must still be
 // revocable then — Activate's rollback runs on the way out of the panic and
 // revokes exactly what keep collected.
+//
+// keep must be non-nil, and that is checked before anything is contributed: a
+// nil keep means every handle this function produces is dropped, so a panic
+// part-way through the list would leak exactly what keep exists to make
+// revocable. It is a programming error with no sensible default, so it panics
+// here — the stance newPool takes on a nil factory and lifecycle.Ledger.Add on a
+// nil dispose — rather than nil-dereferencing at the first tool with a message
+// that names none of this.
 func contributeTools(
 	ledger *lifecycle.Ledger,
 	owner lifecycle.Owner,
@@ -82,6 +90,11 @@ func contributeTools(
 	guest guestCaller,
 	keep func(revoke func() error),
 ) {
+	if keep == nil {
+		panic(fmt.Sprintf("host: contributeTools: keep is nil for plugin %q; the revoke handles of every "+
+			"contributed tool would be dropped, so a panicking contribution could not be rolled back", spec.Name))
+	}
+
 	for _, descriptor := range spec.Tools {
 		handler := pluginToolHandler(spec.Name, descriptor.Name, guest)
 		keep(tool.RegisterOwned(ledger, owner, spec.Registry, descriptor, handler))
