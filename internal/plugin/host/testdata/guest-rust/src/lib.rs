@@ -168,6 +168,11 @@ pub extern "C" fn plugin_invoke(op: i32, ptr: i32, size: i32) -> i64 {
         // plugin_free refuses the pointer (see above), so the host's cleanup
         // of this bogus region is a no-op rather than a corrupt dealloc.
         93 => 0xFFFF_0000_0000_0010u64 as i64,
+        // test-only: empty result. Returns PackResult(0, 0) directly (no
+        // allocation, no write_out) so the host exercises Invoke's
+        // outLen == 0 -> (nil, nil) branch, which the ABI declares a
+        // contract-legal "no return body" outcome rather than an error.
+        94 => 0i64,
         // test-only: memory bomb. Keeps allocating until the host's page
         // limit traps the guest; must never return normally under a cap.
         98 => {

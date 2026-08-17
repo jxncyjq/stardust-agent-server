@@ -67,8 +67,9 @@ func Compile(ctx context.Context, rt wazero.Runtime, wasm []byte) (wazero.Compil
 // Instance is one instantiation of a compiled Legion plugin module: a live
 // wazero module together with its three resolved ABI exports
 // (abi.ExportAlloc, abi.ExportFree, abi.ExportInvoke) and its linear memory.
-// An Instance is not safe for concurrent use — callers must serialize Invoke
-// calls against a given Instance.
+// An Instance is not safe for concurrent use — callers must serialize all
+// calls on a given Instance: Invoke, Dead and Close all touch unsynchronized
+// state (the dead flag).
 type Instance struct {
 	mod    api.Module
 	mem    api.Memory
@@ -151,8 +152,11 @@ func NewInstance(ctx context.Context, rt wazero.Runtime, compiled wazero.Compile
 // If ctx is cancelled or its deadline expires while a call is in flight,
 // wazero closes the underlying module (see NewRuntime's
 // WithCloseOnContextDone); Invoke returns an error and the Instance becomes
-// permanently Dead. A dead Instance must be discarded — every subsequent
-// Invoke call on it fails.
+// permanently Dead. A dead Instance must be discarded, but a subsequent
+// Invoke call on one is NOT guaranteed to fail: some failures (a guest trap,
+// an unreadable result) mark the Instance Dead while leaving its module open,
+// so Invoke can still succeed against it. Dead is therefore the authority a
+// caller — in particular a pool — must consult, not Invoke's return value.
 func (i *Instance) Invoke(ctx context.Context, op int32, in []byte) (out []byte, err error) {
 	var ptr uint64
 	if len(in) > 0 {

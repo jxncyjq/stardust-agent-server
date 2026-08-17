@@ -41,6 +41,7 @@ tests stand on.
 | 91 | test-only probe     | `internal/plugin/host` test files | input ignored; returns `{"initialized":bool,"alloc_calls":int,"free_calls":int,"slow_free_calls":int,"in_ptr":int,"in_len":int}` (see below) |
 | 92 | test-only arm slow free | `internal/plugin/host` test files | input `{"spin_iters":int}`; arms the **next** `plugin_free` call to spin that many iterations, then returns `{"armed":true,"spin_iters":<n>}`. Missing `spin_iters` returns `{"error":"missing spin_iters"}` |
 | 93 | test-only bogus result | `internal/plugin/host` test files | allocates nothing and returns a packed result whose pointer (`0xFFFF0000`) is far outside linear memory, so the host's result read fails |
+| 94 | test-only empty result | `internal/plugin/host` test files | input ignored; allocates nothing and returns `PackResult(0, 0)` directly (raw `0i64`, no `write_out`), exercising `Invoke`'s `outLen == 0 -> (nil, nil)` branch |
 | 97 | test-only unknown op | `internal/plugin/host` test files | reserved and deliberately **not** implemented: it falls through to the unsupported-op branch, so the host's unknown-op test does not depend on a low literal a future `abi` op could claim |
 | 98 | test-only mem bomb  | `internal/plugin/host` test files | allocates 1MiB chunks in a loop until trapped by the host's memory page cap; never returns normally under a cap |
 | 99 | test-only busy loop | `internal/plugin/host` test files | pure-compute infinite loop (`black_box`-guarded so LLVM cannot delete it); only stops via host-side context cancellation |

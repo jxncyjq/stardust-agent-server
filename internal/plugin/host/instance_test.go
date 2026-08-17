@@ -27,6 +27,7 @@ const (
 	opProbe       int32 = 91 // report the guest's host-observable instrumentation
 	opArmSlowFree int32 = 92 // make the next plugin_free call spin
 	opBogusResult int32 = 93 // return a result pointer outside linear memory
+	opEmptyResult int32 = 94 // return PackResult(0, 0): the contract-legal "no body" outcome
 	opUnknown     int32 = 97 // reserved: deliberately not implemented by the guest
 	opMemBomb     int32 = 98 // allocate until the memory page cap traps
 	opBusyLoop    int32 = 99 // pure-compute infinite loop
@@ -451,11 +452,25 @@ func TestInvokeFreesInputAfterContextCancellation(t *testing.T) {
 
 	cctx, cancel := context.WithCancel(bg)
 	defer cancel()
-	timer := time.AfterFunc(cancelAfter, cancel)
+	// cancelAt records when the AfterFunc callback actually ran, not just when
+	// it was scheduled: on a single-P runner the guest's spin can hold the
+	// only P in wazero-generated code, where Go's async preemption finds no
+	// safe point, so this goroutine may not run until the spin returns. The
+	// test reads cancelAt after Invoke returns, so guard it with a mutex
+	// against the AfterFunc goroutine's write.
+	var cancelAtMu sync.Mutex
+	var cancelAt time.Time
+	timer := time.AfterFunc(cancelAfter, func() {
+		cancelAtMu.Lock()
+		cancelAt = time.Now()
+		cancelAtMu.Unlock()
+		cancel()
+	})
 	defer timer.Stop()
 
 	start := time.Now()
 	out, err := inst.Invoke(cctx, opArmSlowFree, armBody(iters))
+	returnedAt := time.Now()
 	elapsed := time.Since(start)
 
 	if err != nil {
@@ -484,6 +499,23 @@ func TestInvokeFreesInputAfterContextCancellation(t *testing.T) {
 	if elapsed < cancelAfter+100*time.Millisecond {
 		t.Errorf("Invoke took only %v but cancellation was scheduled at %v: the guest's slow plugin_free did not "+
 			"outlast the cancellation, so the input free is not proven to have run after ctx was Done", elapsed, cancelAfter)
+	}
+	// The two controls above establish wall-clock ordering (Invoke ran long
+	// enough, and cctx ended up Done), but not causal ordering: both are
+	// satisfiable even if cancel() had not actually run before the deferred
+	// input free began — e.g. on a single-P runner where the AfterFunc
+	// goroutine only gets scheduled once the guest's spin returns. Asserting
+	// cancelAt is meaningfully before Invoke's return turns this from an
+	// inference into a direct check that cancellation landed with margin to
+	// spare before cleanup ran.
+	cancelAtMu.Lock()
+	gotCancelAt := cancelAt
+	cancelAtMu.Unlock()
+	if gotCancelAt.IsZero() {
+		t.Errorf("cancel() never ran (the AfterFunc callback did not fire) before Invoke returned")
+	} else if margin := returnedAt.Sub(gotCancelAt); margin < 100*time.Millisecond {
+		t.Errorf("cancel() ran only %v before Invoke returned (returnedAt=%v, cancelAt=%v); want at least 100ms of "+
+			"margin, so cancellation is not proven to have run before the deferred input free began", margin, returnedAt, gotCancelAt)
 	}
 	// Two spins: the calibration call and the probe call.
 	if got := readProbe(t, inst); got.SlowFreeCalls != 2 {
@@ -772,6 +804,26 @@ func TestInvokeUnreadableResultKillsInstance(t *testing.T) {
 	// result region must have been passed to plugin_free.
 	if got := readProbe(t, inst); got.FreeCalls != 1 {
 		t.Errorf("guest reports free_calls = %d, want 1: the unreadable result allocation was not freed", got.FreeCalls)
+	}
+}
+
+// TestInvokeEmptyResultReturnsNilNil covers Invoke's outLen == 0 branch
+// (instance.go's "return nil, nil"): abi.PackResult(0, 0) is a
+// contract-legal "no return body" outcome, not an error, and a call
+// producing it must not disturb the Instance.
+func TestInvokeEmptyResultReturnsNilNil(t *testing.T) {
+	inst := newTestInstance(t, testMemoryPages)
+	ctx := context.Background()
+
+	out, err := inst.Invoke(ctx, opEmptyResult, nil)
+	if err != nil {
+		t.Fatalf("Invoke(opEmptyResult): %v", err)
+	}
+	if out != nil {
+		t.Errorf("Invoke(opEmptyResult) = %q, want nil", out)
+	}
+	if inst.Dead() {
+		t.Errorf("Instance.Dead() = true after an empty-result call, want false")
 	}
 }
 
