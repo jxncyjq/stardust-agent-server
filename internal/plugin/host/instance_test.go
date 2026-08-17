@@ -552,9 +552,10 @@ func TestNewInstanceRunsInitializeStartFunction(t *testing.T) {
 // cannot silently move the ground other tests stand on: _initialize must be
 // exported (fatal detail #3), _start must not be, the three ABI functions
 // must be exported, a linear memory must be exported (NewInstance requires
-// one), and nothing may be imported from the host module — Task 2's runtime
-// registers no host functions, so a guest importing them could not
-// instantiate at all.
+// one), and nothing may be imported from the host module — the lifecycle tests
+// instantiate this fixture against a runtime with no host module, so a guest
+// importing host functions could not instantiate at all (that is what
+// testdata/hostcall.wasm is for).
 func TestFixtureExportsAndImportsArePinned(t *testing.T) {
 	_, compiled := newTestFixture(t, testMemoryPages)
 
@@ -582,8 +583,8 @@ func TestFixtureExportsAndImportsArePinned(t *testing.T) {
 	for _, def := range compiled.ImportedFunctions() {
 		module, name, _ := def.Import()
 		if module != "wasi_snapshot_preview1" {
-			t.Errorf("fixture imports %s.%s; Task 2's runtime provides only wasi_snapshot_preview1 "+
-				"(host functions start at Task 3)", module, name)
+			t.Errorf("fixture imports %s.%s; this fixture must instantiate against a runtime with no "+
+				"host module at all — host function imports belong in testdata/hostcall.wasm", module, name)
 		}
 	}
 }

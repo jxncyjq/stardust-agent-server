@@ -1,18 +1,33 @@
-# testdata: plugin.wasm test fixture
+# testdata: WASM test fixtures
 
-`plugin.wasm` is a prebuilt WASM guest used by `internal/plugin/host`'s tests.
-It is committed so CI does not need a Rust toolchain. Source is in
-`guest-rust/`.
+Two prebuilt WASM guests are used by `internal/plugin/host`'s tests. Both are
+committed so CI does not need a Rust toolchain.
 
-## Build command
+| fixture | source | imports from the `legion` host module |
+|---|---|---|
+| `plugin.wasm` | `guest-rust/` | none (WASI only) |
+| `hostcall.wasm` | `guest-hostcall-rust/` | all seven host functions |
+
+They are separate binaries on purpose: `plugin.wasm` must instantiate against a
+runtime with no host module at all, while `hostcall.wasm` must fail to
+instantiate unless every capability is granted. One fixture cannot do both.
+
+## Build commands
 
 ```
 cd guest-rust
 cargo build --release --target wasm32-wasip1
 cp target/wasm32-wasip1/release/guest_rust.wasm ../plugin.wasm
+
+cd ../guest-hostcall-rust
+cargo build --release --target wasm32-wasip1
+cp target/wasm32-wasip1/release/guest_hostcall_rust.wasm ../hostcall.wasm
 ```
 
-Requires `rustup target add wasm32-wasip1`.
+Requires `rustup target add wasm32-wasip1`. `guest-hostcall-rust` has no
+dependencies, so `--offline` works for it.
+
+# plugin.wasm
 
 ## Exports
 
@@ -24,12 +39,12 @@ than silently getting an uninitialized guest.
 Exported functions are exactly `_initialize`, `plugin_alloc`, `plugin_free`,
 `plugin_invoke`, plus the linear memory export `memory`
 (`NewInstance` requires a memory). Imports are WASI only
-(`wasi_snapshot_preview1.*`) — `internal/plugin/host`'s `NewRuntime` (Task 2)
-registers no host functions, so this guest must instantiate against WASI
-alone; host function calls are exercised starting Task 3. This export/import
-set is pinned by `TestFixtureExportsAndImportsArePinned`, so a rebuild that
-changes it fails the suite instead of quietly moving the ground the other
-tests stand on.
+(`wasi_snapshot_preview1.*`): this fixture must instantiate against a runtime
+that registers no host functions at all, which is what the lifecycle tests
+use it for. Host function calls are exercised by `hostcall.wasm` instead. This
+export/import set is pinned by `TestFixtureExportsAndImportsArePinned`, so a
+rebuild that changes it fails the suite instead of quietly moving the ground
+the other tests stand on.
 
 ## Op table (plugin_invoke's `op` argument)
 
@@ -74,3 +89,44 @@ iteration count against a first, uncancelled call and passes it in
 widen the window between a successful `plugin_invoke` and `Invoke`'s deferred
 input free deterministically, instead of racing context cancellation against
 many fast calls.
+
+# hostcall.wasm
+
+## Exports and imports
+
+Same ABI exports as `plugin.wasm` (`_initialize`, `plugin_alloc`,
+`plugin_free`, `plugin_invoke`, plus the `memory` export). It additionally
+imports **every** host function of the `legion` module — `log`, `config_get`,
+`kv_get`, `kv_put`, `http_request`, `read_file`, `call_tool` — so that:
+
+- a grant missing any capability makes this module fail to **instantiate**
+  (the capability whitelist is a link-time absence, not a runtime `DENIED`),
+  and
+- with the capability granted, each op below calls the matching host function
+  so the host-side argument checks (`allowed_hosts` / `allowed_paths`) can be
+  observed from the guest side.
+
+The export/import set is pinned by `TestHostcallFixtureContractIsPinned`.
+
+## Op table (all test-only, constants live in `hostfunc_test.go`)
+
+Every op that has a host return value returns the host's packed `(ptr, len)`
+result **verbatim** as its own `plugin_invoke` result. The host wrote that
+region through this guest's own `plugin_alloc`, so `Instance.Invoke` reads and
+`plugin_free`s it exactly as it would a guest-produced body.
+
+| op | name | behavior |
+|----|------|----------|
+| 70 | call log | calls `log(1 /* info */, body)`; returns `PackResult(0, 0)` (log has no host return value) |
+| 71 | call config_get | calls `config_get()` |
+| 72 | call kv_get | calls `kv_get(body)`: the whole request body is the key |
+| 73 | call kv_put | request body is framed `"<key>\n<value>"`; calls `kv_put(key, value)`. No newline returns `{"error":"missing newline separator"}` |
+| 74 | call http_request | calls `http_request(body)` |
+| 75 | call read_file | calls `read_file(body)` |
+| 76 | call call_tool | calls `call_tool(body)` |
+| 77 | arm alloc failure | makes the **next** `plugin_alloc` return 0 and disarms itself, so the host's "cannot hand the result back" path can be observed. Returns `PackResult(0, 0)` directly, because allocating its own response would consume the arming |
+| *  | (any other value) | never traps; returns `{"error":"unsupported op"}` |
+
+Op 77 must be invoked with a **nil** request body: a non-empty body makes
+`Instance.Invoke` allocate for the input first, which would consume the
+arming.
