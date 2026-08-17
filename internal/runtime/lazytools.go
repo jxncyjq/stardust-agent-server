@@ -69,29 +69,6 @@ func metaInferenceTools() []port.InferenceTool {
 	}
 }
 
-// guardedToolName returns the tool name the runaway guards must count for
-// call: the tool the model actually reached, not the protocol wrapper it
-// reached it through.
-//
-// Under the lazy protocol every real tool arrives as call_tool with the real
-// name in arguments.tool_name. Counting call.Name there collapses every
-// distinct tool onto one counter, so the per-tool cap degrades into a global
-// one that cuts healthy runs short, and the cap/failure messages blame a
-// wrapper the model cannot stop using.
-//
-// A call_tool with no tool_name falls back to the wrapper name: dispatch
-// rejects it anyway, and attributing it to the empty string would merge every
-// malformed call into one nameless counter.
-func guardedToolName(call domain.ToolCall) string {
-	if call.Name != metaToolCallTool {
-		return call.Name
-	}
-	if wrapped := strings.TrimSpace(call.Arguments["tool_name"]); wrapped != "" {
-		return wrapped
-	}
-	return call.Name
-}
-
 // isMetaTool reports whether name is one of the lazy-protocol meta tools.
 func isMetaTool(name string) bool {
 	return name == metaToolCallTool || name == metaToolLoadCapabilities

@@ -528,10 +528,10 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// this counts by tool NAME only. Recorded before executing this round so
 		// the count reflects every call the model has made, including now.
 		// Count the tool the model actually reached, not the call_tool wrapper
-		// the lazy protocol reaches it through: see guardedToolName.
+		// the lazy protocol reaches it through: see domain.GuardedToolName.
 		capHit := ""
 		for _, c := range calls {
-			guarded := guardedToolName(c)
+			guarded := domain.GuardedToolName(c)
 			if st.toolNameGuard.record(guarded) >= toolLoopCap {
 				capHit = guarded
 			}
@@ -548,7 +548,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// Warn only — the loop cap is the hard stop.
 		nameByID := make(map[string]string, len(calls))
 		for _, c := range calls {
-			nameByID[c.ID] = guardedToolName(c)
+			nameByID[c.ID] = domain.GuardedToolName(c)
 		}
 		for _, res := range results {
 			if res.Success {
