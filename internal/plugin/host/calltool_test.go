@@ -4,13 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/plugin/abi"
 	"github.com/stardust/legion-agent/internal/plugin/perm"
+	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
@@ -68,7 +71,15 @@ func callToolBody(t *testing.T, req callToolRequest) []byte {
 // A chain of nested call_tool calls needs one instance per level: an Instance is
 // documented as unsafe for concurrent use and is not re-entered here while one of
 // its own calls is still on the stack.
-func newHostcallStack(t *testing.T, g perm.Grant, deps Deps) func() *Instance {
+//
+// The returned factory reports its failure as an error rather than calling
+// t.Fatalf: TestCallToolDeniesAChainDeeperThanTheDepthCap invokes it from inside
+// the guest's own call stack (a tool handler running underneath a wazero host
+// frame), and t.Fatalf's runtime.Goexit can unwind through those frames the same
+// way it would have on the overrun path this test was rewritten to avoid — see
+// that test's own comment. Returning the error lets the caller propagate it the
+// way an ordinary tool failure is propagated instead.
+func newHostcallStack(t *testing.T, g perm.Grant, deps Deps) func() (*Instance, error) {
 	t.Helper()
 
 	ctx := context.Background()
@@ -86,13 +97,13 @@ func newHostcallStack(t *testing.T, g perm.Grant, deps Deps) func() *Instance {
 	if err != nil {
 		t.Fatalf("Compile(hostcall fixture): %v", err)
 	}
-	return func() *Instance {
+	return func() (*Instance, error) {
 		inst, err := NewInstance(ctx, rt, compiled)
 		if err != nil {
-			t.Fatalf("NewInstance(hostcall fixture): %v", err)
+			return nil, fmt.Errorf("NewInstance(hostcall fixture): %w", err)
 		}
 		t.Cleanup(func() { _ = inst.Close(context.Background()) })
-		return inst
+		return inst, nil
 	}
 }
 
@@ -249,7 +260,7 @@ func TestCallToolDeniesAChainDeeperThanTheDepthCap(t *testing.T) {
 	// handler is registered: the stack is built FROM the registry the handler
 	// lives in. Nothing calls it until the first Invoke below, by which time it
 	// is set.
-	var spawn func() *Instance
+	var spawn func() (*Instance, error)
 	env.deps.Tools.Register("recurse_tool", tool.HandlerFunc(
 		func(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
 			mu.Lock()
@@ -265,7 +276,21 @@ func TestCallToolDeniesAChainDeeperThanTheDepthCap(t *testing.T) {
 			}
 			mu.Unlock()
 
-			out, err := spawn().Invoke(ctx, opCallCallTool, callToolBody(t, callToolRequest{Tool: "recurse_tool"}))
+			// Marshalled directly rather than through callToolBody: this handler runs
+			// underneath a wazero host frame (see newHostcallStack's comment), so a
+			// t.Fatalf on marshal failure here would carry the same runtime.Goexit
+			// risk the factory itself was rewritten to avoid. The request is a fixed,
+			// always-marshalable struct, so the error path is unreachable in
+			// practice; it is still reported as an error rather than assumed away.
+			reqBody, err := json.Marshal(callToolRequest{Tool: "recurse_tool"})
+			if err != nil {
+				return domain.ToolResult{}, fmt.Errorf("marshal recurse_tool call_tool request: %w", err)
+			}
+			inst, err := spawn()
+			if err != nil {
+				return domain.ToolResult{}, err
+			}
+			out, err := inst.Invoke(ctx, opCallCallTool, reqBody)
 			if err != nil {
 				return domain.ToolResult{}, err
 			}
@@ -279,7 +304,11 @@ func TestCallToolDeniesAChainDeeperThanTheDepthCap(t *testing.T) {
 	spawn = newInstance
 	budget := newFakeBudget(100) // high enough that only the depth cap can bite
 
-	if _, err := newInstance().Invoke(budgetedCtx(budget), opCallCallTool,
+	firstInst, err := newInstance()
+	if err != nil {
+		t.Fatalf("newInstance(): %v", err)
+	}
+	if _, err := firstInst.Invoke(budgetedCtx(budget), opCallCallTool,
 		callToolBody(t, callToolRequest{Tool: "recurse_tool"})); err != nil {
 		t.Fatalf("Invoke(call_tool): %v", err)
 	}
@@ -407,5 +436,132 @@ func TestCallToolIsAuditedWithThePluginOrigin(t *testing.T) {
 	}
 	if got := origins["model-call"]; got != tool.OriginAgent {
 		t.Errorf("model-initiated call audited with origin %q, want %q", got, tool.OriginAgent)
+	}
+}
+
+// task-7-review-2 Minor 1: a path-guard refusal is an authorization-class
+// refusal exactly like a policy refusal — PathGuardrails.Before wraps
+// port.ErrPathOutsideWorkspace for the same reason the tool policy returns
+// tool.ErrPermissionDenied, and read_file's own workspace-guard check is already
+// a denial for it (hostcall.go's readFile) — so call_tool must classify it as a
+// denial too, not a host error.
+func TestCallToolSurfacesAPathGuardRefusalAsADenial(t *testing.T) {
+	env := newTestEnv(t)
+	reached := false
+	registry := tool.NewRegistry(
+		tool.NewStaticPolicy(tool.DecisionAllow), nil,
+		tool.NewPathGuardrails(port.NewWorkspacePathGuard(env.root), "path"),
+	)
+	registry.Register("read_path_tool", tool.HandlerFunc(func(context.Context, domain.ToolCall) (domain.ToolResult, error) {
+		reached = true
+		return domain.ToolResult{Success: true}, nil
+	}))
+	env.deps.Tools = registry
+	inst := newHostcallInstance(t, fullGrant(), env.deps)
+
+	outside := filepath.Join(filepath.Dir(env.root), "outside-the-workspace.txt")
+	out, err := inst.Invoke(budgetedCtx(newFakeBudget(30)), opCallCallTool,
+		callToolBody(t, callToolRequest{Tool: "read_path_tool", Arguments: map[string]string{"path": outside}}))
+	if err != nil {
+		t.Fatalf("Invoke(call_tool): %v", err)
+	}
+	got := decodeHostError(t, out)
+	if got.Code != CodeDenied {
+		t.Errorf("a path-guard refusal returned code %q, want %q (body %s)", got.Code, CodeDenied, out)
+	}
+	if !strings.Contains(got.Message, "read_path_tool") {
+		t.Errorf("refusal message %q does not name the tool", got.Message)
+	}
+	if denied := deniedEvents(t, env); len(denied) != 1 {
+		t.Errorf("published %d denial events, want exactly 1: %v", len(denied), denied)
+	}
+	if reached {
+		t.Error("the tool handler ran despite the path-guard refusal: call_tool is not a back door around it")
+	}
+}
+
+// The lower-stakes sibling named in the same review item: a validateInputSchema
+// failure is authorized but malformed, not an authorization refusal, so it must
+// be CodeInvalidRequest — the same code call_tool's own decode/field checks
+// use — and never a denial.
+func TestCallToolSurfacesASchemaFailureAsInvalidRequestNotADenial(t *testing.T) {
+	env := newTestEnv(t)
+	reached := false
+	registry := tool.NewRegistry(tool.NewStaticPolicy(tool.DecisionAllow), nil, nil)
+	registry.RegisterDescriptor(tool.Descriptor{
+		Name:        "schema_tool",
+		InputSchema: map[string]any{"required": []string{"text"}},
+	}, tool.HandlerFunc(func(context.Context, domain.ToolCall) (domain.ToolResult, error) {
+		reached = true
+		return domain.ToolResult{Success: true}, nil
+	}))
+	env.deps.Tools = registry
+	inst := newHostcallInstance(t, fullGrant(), env.deps)
+
+	// No "text" argument: fails the required-argument check before the policy,
+	// enforcer or guardrails ever run.
+	out, err := inst.Invoke(budgetedCtx(newFakeBudget(30)), opCallCallTool,
+		callToolBody(t, callToolRequest{Tool: "schema_tool"}))
+	if err != nil {
+		t.Fatalf("Invoke(call_tool): %v", err)
+	}
+	got := decodeHostError(t, out)
+	if got.Code != CodeInvalidRequest {
+		t.Errorf("a schema-invalid call returned code %q, want %q (body %s)", got.Code, CodeInvalidRequest, out)
+	}
+	if denied := deniedEvents(t, env); len(denied) != 0 {
+		t.Errorf("a schema failure published %d denial events, want 0: it is not an authorization refusal", len(denied))
+	}
+	if reached {
+		t.Error("the tool handler ran despite the invalid input")
+	}
+}
+
+// task-7-review-2 Minor 2: a guest that calls call_tool while answering
+// abi.OpManifest runs under the activation ctx readManifest hands it — which
+// carries neither a call_tool depth marker nor a shared per-task tool budget,
+// because it is not a dispatched tool call. This pins that call_tool denies it,
+// naming the missing budget, exactly as any other unbudgeted entry does (see
+// TestCallToolIsDeniedWhenNoSharedBudgetIsOnTheContext) — tool calls are
+// task-time only.
+func TestCallToolFromInsideOpManifestIsDeniedForNoBudget(t *testing.T) {
+	env := newTestEnv(t)
+	hostInst := newHostcallInstance(t, fullGrant(), env.deps)
+
+	manifestReached := false
+	assertionsRan := false
+	guest := guestCallerFunc(func(ctx context.Context, op int32, in []byte) ([]byte, error) {
+		if op != abi.OpManifest {
+			t.Fatalf("readManifest called op %d, want abi.OpManifest (%d)", op, abi.OpManifest)
+		}
+		manifestReached = true
+		// Simulate a guest that, while answering its self-description, also
+		// calls call_tool — through the SAME ctx readManifest handed this guest.
+		out, err := hostInst.Invoke(ctx, opCallCallTool, callToolBody(t, callToolRequest{Tool: "echo_tool"}))
+		if err != nil {
+			return nil, fmt.Errorf("invoke call_tool from inside OpManifest: %w", err)
+		}
+		got := decodeHostError(t, out)
+		if got.Code != CodeDenied {
+			t.Errorf("call_tool from inside OpManifest returned code %q, want %q (body %s)", got.Code, CodeDenied, out)
+		}
+		if !strings.Contains(got.Message, "budget") {
+			t.Errorf("refusal message %q does not name the missing budget", got.Message)
+		}
+		assertionsRan = true
+		return []byte(`{"name":"n","version":"v","provides":[]}`), nil
+	})
+
+	if _, err := readManifest(context.Background(), guest); err != nil {
+		t.Fatalf("readManifest: %v", err)
+	}
+	if !manifestReached {
+		t.Fatal("readManifest never called the guest at abi.OpManifest")
+	}
+	if !assertionsRan {
+		t.Fatal("the guest's call_tool attempt never ran its assertions")
+	}
+	if denied := deniedEvents(t, env); len(denied) != 1 {
+		t.Errorf("published %d denial events, want exactly 1: %v", len(denied), denied)
 	}
 }

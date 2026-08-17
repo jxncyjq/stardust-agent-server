@@ -527,14 +527,23 @@ type callToolRequest struct {
 // which is broken wiring rather than "unlimited" — is a denial: CodeDenied plus
 // the plugin/call_failed{category=denied} event.
 //
+// The budget only exists while a tool call is being dispatched (installed by
+// internal/runtime's dispatchToolCall), so call_tool is task-time only: a guest
+// that calls it from anywhere else — for example while answering abi.OpManifest
+// during activation — will always be denied for lack of a budget.
+//
 // Past the counters the call goes through tool.Registry.Execute like any other, so
 // permissions, policy, guardrails, timeouts, sanitizing and audit all stay on the
 // one path; the only thing added is the "plugin:<name>" call origin, which is what
-// makes a plugin's calls distinguishable in the audit trail. A refusal by the tool
-// policy comes back as a denial too — the plugin overstepped — while everything
-// else (an unresolvable tool name, a failing handler) is a host error. The
-// successful response is a JSON domain.ToolResult, including a result the tool
-// itself marked as failed — that is the tool's answer, not a host failure.
+// makes a plugin's calls distinguishable in the audit trail. Any authorization-class
+// refusal comes back as a denial too — the plugin overstepped — whether it is the
+// tool policy (tool.ErrPermissionDenied) or a path guardrail rejecting an argument
+// outside the workspace (port.ErrPathOutsideWorkspace); an input that fails the
+// tool's own schema (tool.ErrInvalidInput) is CodeInvalidRequest, matching this
+// function's own decode/field checks; everything else (an unresolvable tool name, a
+// failing handler) is a host error. The successful response is a JSON
+// domain.ToolResult, including a result the tool itself marked as failed — that is
+// the tool's answer, not a host failure.
 func (h hostCalls) callTool(ctx context.Context, m api.Module, ptr, length uint32) uint64 {
 	raw, err := readGuestBytes(m, ptr, length)
 	if err != nil {
@@ -567,7 +576,16 @@ func (h hostCalls) callTool(ctx context.Context, m api.Module, ptr, length uint3
 	if !found {
 		// Not "this task has no limit": nothing installed the task's shared budget
 		// on the way here, and running the call uncounted is precisely the bypass
-		// the shared counter exists to prevent.
+		// the shared counter exists to prevent. The controller's mandated response
+		// to this state is still DENIED plus the denial event (kept below, same as
+		// every other refusal in this function) — but unlike those, this one is not
+		// the plugin overstepping: it is a dispatch path that starts tool calls
+		// without installing tool.WithLoopBudget. Logged at Error, separately from
+		// deny()'s own Warn, so it stays diagnosable as broken host wiring rather
+		// than reading like ordinary plugin misbehaviour.
+		h.deps.Logger.Error("plugin call_tool: no shared per-task tool budget on the context; "+
+			"this is broken host wiring, not the plugin misbehaving",
+			"plugin", h.deps.PluginName, "tool", guarded)
 		return h.deny(ctx, m, funcCallTool, fmt.Sprintf(
 			"tool %q cannot be called: this call carries no shared per-task tool budget, "+
 				"so it could not be counted against the task's allowance", guarded))
@@ -584,16 +602,29 @@ func (h hostCalls) callTool(ctx context.Context, m api.Module, ptr, length uint3
 	callCtx = withCallToolDepth(callCtx, depth+1)
 	result, err := h.deps.Tools.Execute(callCtx, h.deps.Agent, call)
 	if err != nil {
-		// A policy/permission refusal is the plugin overstepping, and it must not
-		// read like an upstream fault: without this the one thing an operator counts
-		// (denials) would miss every plugin the tool policy turned away. Everything
-		// else — an unknown tool name, a broken handler, a cancelled call — stays a
-		// host error, so the denial count is not inflated by faults either.
-		if errors.Is(err, tool.ErrPermissionDenied) {
+		switch {
+		case errors.Is(err, tool.ErrInvalidInput):
+			// Authorized but malformed: the same class call_tool's own decode/field
+			// checks above already report as CodeInvalidRequest, so a schema failure
+			// inside Registry.Execute must land the same way — not as a host fault,
+			// and not as a denial (nothing was refused on authorization grounds).
+			return h.writeError(ctx, m, CodeInvalidRequest, fmt.Sprintf("call_tool %q: %v", guarded, err))
+		case errors.Is(err, tool.ErrPermissionDenied), errors.Is(err, port.ErrPathOutsideWorkspace):
+			// Both are the plugin overstepping, and neither must read like an
+			// upstream fault: a policy refusal (tool.ErrPermissionDenied) and a
+			// PathGuardrails refusal (port.ErrPathOutsideWorkspace, wrapped by
+			// PathGuardrails.Before) are the same authorization-class refusal
+			// read_file's own workspace-guard check already treats as a denial
+			// (see readFile above) — without this an operator counting
+			// plugin/call_failed{denied} would miss every plugin a path guardrail
+			// turned away. Everything else — an unknown tool name, a broken
+			// handler, a cancelled call — stays a host error, so the denial count
+			// is not inflated by faults either.
 			return h.deny(ctx, m, funcCallTool,
-				fmt.Sprintf("tool %q was refused by the tool policy: %v", req.Tool, err))
+				fmt.Sprintf("tool %q was refused: %v", guarded, err))
+		default:
+			return h.writeError(ctx, m, CodeHostError, fmt.Sprintf("call_tool %q: %v", req.Tool, err))
 		}
-		return h.writeError(ctx, m, CodeHostError, fmt.Sprintf("call_tool %q: %v", req.Tool, err))
 	}
 	return h.writeJSON(ctx, m, result)
 }

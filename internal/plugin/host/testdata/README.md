@@ -3,6 +3,14 @@
 Two prebuilt WASM guests are used by `internal/plugin/host`'s tests. Both are
 committed so CI does not need a Rust toolchain.
 
+`hostcall.wasm` is also read by `internal/runtime`'s tests
+(`internal/runtime/plugin_budget_test.go`'s `hostcallFixture`, by the relative
+path `../plugin/host/testdata/hostcall.wasm`), so that package's tests prove
+the shared per-task tool budget through a real guest calling the real
+`call_tool` host function. There is no compile-time link between the two
+packages: relocating or renaming this file breaks a test in
+`internal/runtime` too.
+
 | fixture | source | imports from the `legion` host module |
 |---|---|---|
 | `plugin.wasm` | `guest-rust/` | none (WASI only) |

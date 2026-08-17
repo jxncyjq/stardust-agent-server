@@ -15,6 +15,11 @@ import (
 var (
 	ErrPermissionDenied = errors.New("permission denied")
 	ErrToolNotFound     = errors.New("tool not found")
+	// ErrInvalidInput reports that a call's arguments failed the tool's own
+	// declared input schema. It is distinct from ErrPermissionDenied: the caller
+	// was authorized to reach the tool, but what it sent could not be understood
+	// against the schema (a required argument missing, a malformed schema).
+	ErrInvalidInput = errors.New("invalid tool input")
 )
 
 type Decision string
@@ -278,7 +283,7 @@ func (r *Registry) Execute(ctx context.Context, agent domain.Agent, call domain.
 		call.RiskLevel = descriptor.RiskLevel
 	}
 	if err := validateInputSchema(descriptor.InputSchema, call.Arguments); err != nil {
-		return domain.ToolResult{}, err
+		return domain.ToolResult{}, fmt.Errorf("%w: %w", ErrInvalidInput, err)
 	}
 	if r.enforcer != nil {
 		if err := r.enforcer.Check(agent, call); err != nil {
