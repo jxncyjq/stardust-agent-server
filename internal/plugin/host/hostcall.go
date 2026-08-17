@@ -114,6 +114,48 @@ const readFileByteLimit = 1 << 20
 // re-authorize.
 const httpMaxRedirects = 10
 
+// callToolDepthCap bounds how deep ONE chain of plugin-initiated tool calls may
+// go: a plugin calls call_tool, the tool it reaches is another plugin's tool, that
+// guest calls call_tool again. The depth accumulates across the chain (it travels
+// on the context, see withCallToolDepth), so a chain cannot reset it by taking one
+// more hop.
+//
+// It is a hard ceiling with no config toggle, for the same reason the agent's own
+// tool loop cap is one: a recursion a plugin drives has no round budget of its own
+// to run out of.
+const callToolDepthCap = 3
+
+// callToolDepthKey is the context key carrying how many call_tool frames are
+// already on the stack beneath the current one.
+//
+// It is unexported and travels on the context rather than in Deps because it is
+// per-CALL, not per-plugin: one host module serves every call the plugin makes,
+// and a chain that hops through another plugin's tool has to keep counting across
+// the hop. A field on hostCalls would be shared by unrelated concurrent calls.
+type callToolDepthKey struct{}
+
+// withCallToolDepth marks ctx as being depth levels deep in a call_tool chain.
+func withCallToolDepth(ctx context.Context, depth int) context.Context {
+	return context.WithValue(ctx, callToolDepthKey{}, depth)
+}
+
+// callToolDepthFrom reports how many call_tool frames the current call is nested
+// under.
+//
+// An unmarked context is depth 0, and that is a contract-legal absence rather
+// than a fallback: nothing has entered call_tool yet, so there is no frame to
+// count. Every nested call is reached through withCallToolDepth, so a chain can
+// only be undercounted if a hop drops the context entirely — which would also
+// drop the shared budget and the call origin, and callTool refuses a call whose
+// budget is missing.
+func callToolDepthFrom(ctx context.Context) int {
+	depth, ok := ctx.Value(callToolDepthKey{}).(int)
+	if !ok {
+		return 0
+	}
+	return depth
+}
+
 // errRedirectDenied is the sentinel a grant-aware CheckRedirect returns when a
 // redirect would leave Grant.AllowedHosts. net/http wraps it in a *url.Error,
 // whose Unwrap makes it reachable with errors.Is, which is how httpRequest tells
@@ -141,7 +183,11 @@ func redirectGuardedClient(g perm.Grant, client *http.Client) *http.Client {
 	inherited := client.CheckRedirect
 	guarded.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		if len(via) >= httpMaxRedirects {
-			return fmt.Errorf("stopped after %d redirects", httpMaxRedirects)
+			// Wrapped in errRedirectDenied like the two refusals below it: stopping
+			// at the cap is this host's REFUSAL of the plugin's request, and an
+			// unwrapped error would reach the guest as HOST_ERROR with no denial
+			// event, indistinguishable from an unreachable upstream.
+			return fmt.Errorf("%w: stopped after %d redirects", errRedirectDenied, httpMaxRedirects)
 		}
 		if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
 			return fmt.Errorf("%w: scheme %q is not reachable through the http capability",
@@ -336,12 +382,14 @@ func (h hostCalls) httpRequest(ctx context.Context, m api.Module, ptr, length ui
 	resp, err := h.deps.HTTP.Do(httpReq)
 	if err != nil {
 		// A refused redirect is a denial, not an upstream fault: the plugin asked
-		// for a host it is not authorized to reach, it just asked via a Location
-		// header. net/http returns the 3xx response alongside the error and has
-		// already closed its body, so there is nothing to close here.
+		// for something it is not authorized to have — a host outside its
+		// allowed_hosts, a non-http scheme, or more hops than the cap allows — it
+		// just asked via a Location header. The wrapped error says which of the
+		// three it was. net/http returns the 3xx response alongside the error and
+		// has already closed its body, so there is nothing to close here.
 		if errors.Is(err, errRedirectDenied) {
 			return h.deny(ctx, m, funcHTTPRequest,
-				fmt.Sprintf("%s %s was redirected outside this plugin's allowed_hosts: %v",
+				fmt.Sprintf("%s %s was refused while following redirects: %v",
 					req.Method, req.URL, err))
 		}
 		return h.writeError(ctx, m, CodeHostError, fmt.Sprintf("http_request %s %s: %v", req.Method, req.URL, err))
@@ -464,12 +512,29 @@ type callToolRequest struct {
 // callTool implements "call_tool(ptr i32, len i32) -> i64": the plugin asks the
 // host to run one of the host's own registered tools.
 //
-// The call goes through tool.Registry.Execute like any other, so permissions,
-// policy, guardrails, timeouts, sanitizing and audit all stay on the one path;
-// the only thing added is the "plugin:<name>" call origin, which is what makes
-// a plugin's calls distinguishable in the audit trail. The successful response
-// is a JSON domain.ToolResult, including a result the tool itself marked as
-// failed — that is the tool's answer, not a host failure.
+// The call must clear BOTH counters a plugin-initiated call is subject to, in
+// this order:
+//
+//   - the per-chain recursion depth (callToolDepthCap), which travels on the
+//     context and therefore accumulates across hops;
+//   - the per-task tool budget SHARED with the model (tool.LoopBudget), keyed by
+//     domain.GuardedToolName so both writers count the same string for the same
+//     tool. A counter of the plugin's own would be a channel around the task's
+//     total allowance.
+//
+// Depth is checked first so a chain past the cap is refused without spending
+// allowance on a call that will never run. Either refusal — and an absent budget,
+// which is broken wiring rather than "unlimited" — is a denial: CodeDenied plus
+// the plugin/call_failed{category=denied} event.
+//
+// Past the counters the call goes through tool.Registry.Execute like any other, so
+// permissions, policy, guardrails, timeouts, sanitizing and audit all stay on the
+// one path; the only thing added is the "plugin:<name>" call origin, which is what
+// makes a plugin's calls distinguishable in the audit trail. A refusal by the tool
+// policy comes back as a denial too — the plugin overstepped — while everything
+// else (an unresolvable tool name, a failing handler) is a host error. The
+// successful response is a JSON domain.ToolResult, including a result the tool
+// itself marked as failed — that is the tool's answer, not a host failure.
 func (h hostCalls) callTool(ctx context.Context, m api.Module, ptr, length uint32) uint64 {
 	raw, err := readGuestBytes(m, ptr, length)
 	if err != nil {
@@ -482,14 +547,52 @@ func (h hostCalls) callTool(ctx context.Context, m api.Module, ptr, length uint3
 	if req.Tool == "" {
 		return h.writeError(ctx, m, CodeInvalidRequest, "call_tool: tool must not be empty")
 	}
-
-	callCtx := tool.WithCallOrigin(ctx, pluginCallOrigin(h.deps.PluginName))
-	result, err := h.deps.Tools.Execute(callCtx, h.deps.Agent, domain.ToolCall{
+	call := domain.ToolCall{
 		ID:        req.CallID,
 		Name:      req.Tool,
 		Arguments: req.Arguments,
-	})
+	}
+	// The name the counters use is the tool actually reached, not the wrapper it
+	// may have been reached through: domain.GuardedToolName is the one function
+	// both writers of the shared budget call, which is what makes it shared.
+	guarded := domain.GuardedToolName(call)
+
+	depth := callToolDepthFrom(ctx)
+	if depth >= callToolDepthCap {
+		return h.deny(ctx, m, funcCallTool, fmt.Sprintf(
+			"tool %q would be level %d of one call chain, past the depth cap of %d",
+			guarded, depth+1, callToolDepthCap))
+	}
+	budget, found := tool.LoopBudgetFrom(ctx)
+	if !found {
+		// Not "this task has no limit": nothing installed the task's shared budget
+		// on the way here, and running the call uncounted is precisely the bypass
+		// the shared counter exists to prevent.
+		return h.deny(ctx, m, funcCallTool, fmt.Sprintf(
+			"tool %q cannot be called: this call carries no shared per-task tool budget, "+
+				"so it could not be counted against the task's allowance", guarded))
+	}
+	if count, limit := budget.Record(guarded); count > limit {
+		return h.deny(ctx, m, funcCallTool, fmt.Sprintf(
+			"tool %q has been called %d times in this task, past the shared per-task cap of %d",
+			guarded, count, limit))
+	}
+
+	callCtx := tool.WithCallOrigin(ctx, pluginCallOrigin(h.deps.PluginName))
+	// The chain the tool reached from here belongs to: a tool that enters another
+	// guest which calls call_tool again continues this count instead of restarting.
+	callCtx = withCallToolDepth(callCtx, depth+1)
+	result, err := h.deps.Tools.Execute(callCtx, h.deps.Agent, call)
 	if err != nil {
+		// A policy/permission refusal is the plugin overstepping, and it must not
+		// read like an upstream fault: without this the one thing an operator counts
+		// (denials) would miss every plugin the tool policy turned away. Everything
+		// else — an unknown tool name, a broken handler, a cancelled call — stays a
+		// host error, so the denial count is not inflated by faults either.
+		if errors.Is(err, tool.ErrPermissionDenied) {
+			return h.deny(ctx, m, funcCallTool,
+				fmt.Sprintf("tool %q was refused by the tool policy: %v", req.Tool, err))
+		}
 		return h.writeError(ctx, m, CodeHostError, fmt.Sprintf("call_tool %q: %v", req.Tool, err))
 	}
 	return h.writeJSON(ctx, m, result)

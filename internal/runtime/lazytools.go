@@ -133,6 +133,18 @@ func stringifyArgument(value any) string {
 // drawn from one scoped source: a Plan-mode run dispatches and loads against its
 // read-only subset, never a broader set than it offered.
 func (r *Runtime) dispatchToolCall(ctx context.Context, agent domain.Agent, task domain.Task, call domain.ToolCall, st *loopState) (domain.ToolResult, error) {
+	// The task's shared per-tool-name budget goes on the ctx of every dispatched
+	// call, so anything reached beneath this call that starts tool calls of its own
+	// — a plugin's call_tool host function — spends the same allowance this loop
+	// spends instead of an uncounted one of its own. A nil budget is a wiring bug in
+	// this package, not a task that has no limit: call_tool refuses a call it cannot
+	// count, so silently dispatching without one would turn a whole class of plugin
+	// calls into denials that look like the plugin's fault.
+	if st.toolNameGuard == nil {
+		return domain.ToolResult{}, fmt.Errorf(
+			"dispatch call %s for task %s: the run has no shared tool budget to charge", call.ID, task.ID)
+	}
+	ctx = tool.WithLoopBudget(ctx, st.toolNameGuard)
 	ctx = tool.WithUserTask(ctx, task.Input)
 	ctx = tool.WithChatSession(ctx, task.SessionID)
 	// A delegated sub-run's calls land in the same audit trail as its parent's.

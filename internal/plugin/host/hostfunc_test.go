@@ -850,6 +850,55 @@ func TestHTTPRequestFollowsARedirectWithinTheAllowlist(t *testing.T) {
 	}
 }
 
+// TestHTTPRequestDeniesARedirectChainPastTheCap pins the third refusal the
+// per-hop policy can make: the chain is longer than httpMaxRedirects. Every hop
+// stays inside allowed_hosts, so only the cap can stop it — and stopping at the
+// cap is a REFUSAL of the plugin's request, classified like the other two
+// (CodeDenied plus a plugin/call_failed{denied} event) rather than as an upstream
+// fault the plugin cannot tell apart from a broken host.
+func TestHTTPRequestDeniesARedirectChainPastTheCap(t *testing.T) {
+	var hops atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hops.Add(1)
+		// An endless chain on one host: nothing here leaves the allowlist.
+		http.Redirect(w, r, "/next", http.StatusFound)
+	}))
+	defer server.Close()
+
+	parsed, err := url.Parse(server.URL)
+	if err != nil {
+		t.Fatalf("parse test server URL: %v", err)
+	}
+
+	env := newTestEnv(t)
+	grant := fullGrant()
+	grant.AllowedHosts = []string{parsed.Hostname()}
+	inst := newHostcallInstance(t, grant, env.deps)
+
+	req, err := json.Marshal(map[string]any{"method": "GET", "url": server.URL + "/start"})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	out, err := inst.Invoke(context.Background(), opCallHTTPRequest, req)
+	if err != nil {
+		t.Fatalf("Invoke(http_request): %v", err)
+	}
+	if got := decodeHostError(t, out); got.Code != CodeDenied {
+		t.Errorf("a redirect chain past the cap returned code %q, want %q (body %s)", got.Code, CodeDenied, out)
+	}
+	if got := hops.Load(); got > httpMaxRedirects+1 {
+		t.Errorf("the client made %d requests, want at most %d: the cap must stop the chain",
+			got, httpMaxRedirects+1)
+	}
+	denied := deniedEvents(t, env)
+	if len(denied) != 1 {
+		t.Fatalf("published %d plugin/call_failed{denied} events, want exactly 1 (all: %v)", len(denied), denied)
+	}
+	if !strings.Contains(denied[0].Message, "http_request") || !strings.Contains(denied[0].Message, testPluginName) {
+		t.Errorf("denial event message %q must name the host function and the plugin", denied[0].Message)
+	}
+}
+
 func TestReadFileReadsAnAllowedPath(t *testing.T) {
 	env := newTestEnv(t)
 	allowedDir := filepath.Join(env.root, "allowed")
@@ -1269,7 +1318,10 @@ func TestCallToolGoesThroughTheRegistryWithAPluginOrigin(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal request: %v", err)
 	}
-	out, err := inst.Invoke(context.Background(), opCallCallTool, req)
+	// A plugin-initiated call is only counted if the task's shared budget is on the
+	// ctx, and call_tool refuses one that carries none: this is the ctx the runtime
+	// dispatches under (see calltool_test.go).
+	out, err := inst.Invoke(budgetedCtx(newFakeBudget(30)), opCallCallTool, req)
 	if err != nil {
 		t.Fatalf("Invoke(call_tool): %v", err)
 	}
@@ -1294,7 +1346,7 @@ func TestCallToolReportsARegistryFailure(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal request: %v", err)
 	}
-	out, err := inst.Invoke(context.Background(), opCallCallTool, req)
+	out, err := inst.Invoke(budgetedCtx(newFakeBudget(30)), opCallCallTool, req)
 	if err != nil {
 		t.Fatalf("Invoke(call_tool): %v", err)
 	}
@@ -1369,7 +1421,7 @@ func TestCallToolIgnoresAGuestSuppliedRiskLevel(t *testing.T) {
 	if err != nil {
 		t.Fatalf("marshal request: %v", err)
 	}
-	if _, err := inst.Invoke(context.Background(), opCallCallTool, req); err != nil {
+	if _, err := inst.Invoke(budgetedCtx(newFakeBudget(30)), opCallCallTool, req); err != nil {
 		t.Fatalf("Invoke(call_tool): %v", err)
 	}
 	if len(seen) != 1 || seen[0] != "high" {
