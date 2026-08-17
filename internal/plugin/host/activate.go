@@ -98,13 +98,14 @@ type Plugin struct {
 }
 
 // closeInstance performs the wazero close behind the instance's ledger
-// disposer. It is a package-level function value rather than a direct call
-// to *Instance.Close only so activate_test.go can substitute a failing
-// implementation and prove that a disposer failure during rollback is joined
-// onto the activation error instead of dropped
-// (TestActivateReportsAFailureWhileRollingBack) — forcing wazero's own Close
-// to fail from outside this package is not practically reachable. Production
-// code never overrides it.
+// disposer, and behind the pool's discard and drain closes. It is a
+// package-level function value rather than a direct call to *Instance.Close
+// only so tests can substitute a failing implementation and prove that a
+// close failure is reported instead of dropped
+// (TestActivateReportsAFailureWhileRollingBack,
+// TestPoolDrainReportsACloseFailure) — forcing wazero's own Close to fail from
+// outside this package is not practically reachable. Production code never
+// overrides it.
 var closeInstance = func(ctx context.Context, inst *Instance) error { return inst.Close(ctx) }
 
 // Activate brings one plugin up as a sequence of steps, each of which files
