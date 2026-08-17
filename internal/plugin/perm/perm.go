@@ -10,10 +10,7 @@
 // invite.
 package perm
 
-import (
-	"path/filepath"
-	"strings"
-)
+import "strings"
 
 // Grant is one plugin's authorization: the set of host capabilities it may
 // use, plus the argument allowlists for the two that need them.
@@ -44,9 +41,13 @@ type Grant struct {
 	// nothing, not a plugin with unrestricted network access.
 	AllowedHosts []string
 
-	// AllowedPaths lists the directories (or exact files) read_file may open,
-	// matched lexically by PathAllowed. Empty denies every path, for the same
-	// reason AllowedHosts does.
+	// AllowedPaths lists the directories (or exact files) read_file may open.
+	// Empty denies every path, for the same reason AllowedHosts does.
+	//
+	// Containment is not decided here: the host checks it with
+	// port.WorkspacePathGuard rooted at each entry, so that the allowlist holds
+	// under symlinks instead of being a lexical prefix test a link inside an
+	// allowed directory could walk out of.
 	AllowedPaths []string
 }
 
@@ -62,42 +63,6 @@ func (g Grant) HostAllowed(host string) bool {
 	}
 	for _, allowed := range g.AllowedHosts {
 		if strings.EqualFold(allowed, host) {
-			return true
-		}
-	}
-	return false
-}
-
-// PathAllowed reports whether path falls inside one of AllowedPaths, treating
-// each entry as a prefix directory and also allowing an exact match.
-//
-// The comparison is lexical (filepath.Clean plus filepath.Rel) and both sides
-// are used as spelled: this function neither resolves symlinks nor makes
-// relative paths absolute against the process working directory. It is
-// therefore only half of the fs check — the caller must FIRST put the path
-// through port.WorkspacePathGuard.Check, which is what closes symlink escapes
-// and the Windows device-name / alternate-data-stream spellings. A path that
-// is spelled differently from every allowlist entry (a relative path against
-// absolute entries, say) is denied rather than guessed at.
-func (g Grant) PathAllowed(path string) bool {
-	if path == "" {
-		return false
-	}
-	clean := filepath.Clean(path)
-	for _, allowed := range g.AllowedPaths {
-		if allowed == "" {
-			continue
-		}
-		rel, err := filepath.Rel(filepath.Clean(allowed), clean)
-		if err != nil {
-			// No expressible relation (different volumes, an extended-length
-			// prefix Clean leaves alone). "Cannot prove inside" is outside.
-			continue
-		}
-		if rel == "." {
-			return true
-		}
-		if !strings.HasPrefix(rel, "..") && !filepath.IsAbs(rel) {
 			return true
 		}
 	}

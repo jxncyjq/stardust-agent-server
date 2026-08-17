@@ -1,9 +1,6 @@
 package perm
 
-import (
-	"path/filepath"
-	"testing"
-)
+import "testing"
 
 // TestZeroGrantAuthorizesNothing pins the fail-closed default: a Grant nobody
 // populated must not hand out a capability or an allowlist entry.
@@ -16,8 +13,8 @@ func TestZeroGrantAuthorizesNothing(t *testing.T) {
 	if g.HostAllowed("example.com") {
 		t.Error("zero Grant HostAllowed(example.com) = true, want false")
 	}
-	if g.PathAllowed(filepath.Join("workspace", "file.txt")) {
-		t.Error("zero Grant PathAllowed(workspace/file.txt) = true, want false")
+	if len(g.AllowedPaths) != 0 {
+		t.Errorf("zero Grant AllowedPaths = %v, want empty", g.AllowedPaths)
 	}
 }
 
@@ -47,42 +44,16 @@ func TestHostAllowedMatchesExactlyAndCaseInsensitively(t *testing.T) {
 	}
 }
 
-func TestPathAllowedContainsOnlyListedTrees(t *testing.T) {
-	root := filepath.Join(string(filepath.Separator)+"workspace", "plugins")
-	allowed := filepath.Join(root, "data")
-	exactFile := filepath.Join(root, "single", "one.txt")
-	g := Grant{FS: true, AllowedPaths: []string{allowed, exactFile}}
+// TestHostAllowedDeniesEveryHostWithAnEmptyAllowlist covers the other
+// fail-closed default: granting the http capability without naming a host is a
+// plugin that may call http_request and reach nothing, not one with
+// unrestricted network access.
+func TestHostAllowedDeniesEveryHostWithAnEmptyAllowlist(t *testing.T) {
+	g := Grant{HTTP: true}
 
-	cases := []struct {
-		name string
-		path string
-		want bool
-	}{
-		{name: "the allowed directory itself", path: allowed, want: true},
-		{name: "a file inside it", path: filepath.Join(allowed, "a.txt"), want: true},
-		{name: "a nested file inside it", path: filepath.Join(allowed, "deep", "b.txt"), want: true},
-		{name: "the exact allowed file", path: exactFile, want: true},
-		{name: "a sibling of the exact allowed file", path: filepath.Join(root, "single", "two.txt"), want: false},
-		{name: "a sibling directory", path: filepath.Join(root, "other", "c.txt"), want: false},
-		{name: "the parent", path: root, want: false},
-		{name: "a traversal spelling that cleans back out", path: filepath.Join(allowed, "..", "escape.txt"), want: false},
-		{name: "an empty path", path: "", want: false},
-	}
-	for _, tc := range cases {
-		if got := g.PathAllowed(tc.path); got != tc.want {
-			t.Errorf("%s: PathAllowed(%q) = %t, want %t", tc.name, tc.path, got, tc.want)
+	for _, host := range []string{"example.com", "localhost", "127.0.0.1"} {
+		if g.HostAllowed(host) {
+			t.Errorf("HostAllowed(%q) with an empty allowlist = true, want false", host)
 		}
-	}
-}
-
-// TestPathAllowedIgnoresEmptyAllowlistEntries covers the fail-closed handling
-// of a malformed allowlist: an empty entry must not turn into "the process
-// working directory" (filepath.Clean("") == "."), which would silently widen
-// the grant to wherever the agent happens to be running.
-func TestPathAllowedIgnoresEmptyAllowlistEntries(t *testing.T) {
-	g := Grant{FS: true, AllowedPaths: []string{""}}
-
-	if g.PathAllowed(filepath.Join("some", "file.txt")) {
-		t.Error("PathAllowed with an empty allowlist entry = true, want false")
 	}
 }

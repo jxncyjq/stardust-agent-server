@@ -14,6 +14,7 @@ import (
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/plugin/abi"
 	"github.com/stardust/legion-agent/internal/plugin/perm"
+	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/tool"
 	"github.com/tetratelabs/wazero/api"
 )
@@ -290,9 +291,8 @@ func (h hostCalls) readFile(ctx context.Context, m api.Module, ptr, length uint3
 		return h.deny(ctx, m, funcReadFile,
 			fmt.Sprintf("path %q rejected by the workspace guard: %v", req.Path, err))
 	}
-	if !h.grant.PathAllowed(checked) {
-		return h.deny(ctx, m, funcReadFile,
-			fmt.Sprintf("path %q is not in this plugin's allowed_paths", req.Path))
+	if err := checkAllowedPath(ctx, h.grant, checked); err != nil {
+		return h.deny(ctx, m, funcReadFile, err.Error())
 	}
 
 	content, err := os.ReadFile(checked)
@@ -349,6 +349,36 @@ func (h hostCalls) callTool(ctx context.Context, m api.Module, ptr, length uint3
 		return h.writeError(ctx, m, CodeHostError, fmt.Sprintf("call_tool %q: %v", req.Tool, err))
 	}
 	return h.writeJSON(ctx, m, result)
+}
+
+// checkAllowedPath reports whether path is inside one of the grant's
+// allowed_paths, returning an error describing the refusal when it is not.
+//
+// Containment is decided by port.WorkspacePathGuard — the same check that
+// guards the workspace boundary, rooted at each allowed path in turn — rather
+// than by a lexical prefix test. That is what makes allowed_paths hold under
+// symlinks: a link inside an allowed directory pointing at a file elsewhere in
+// the workspace is spelled entirely inside the allowlist, so a lexical test
+// would let the plugin read a file the allowlist excludes. Rooting the guard at
+// the allowed path resolves both sides and refuses it.
+//
+// An empty allowlist denies everything (an fs grant with no allowed_paths is a
+// plugin that may call read_file and reach nothing), and so does a malformed
+// empty entry — filepath.Clean("") is ".", which would silently widen the grant
+// to the process working directory.
+func checkAllowedPath(ctx context.Context, g perm.Grant, path string) error {
+	if len(g.AllowedPaths) == 0 {
+		return fmt.Errorf("path %q is refused: this plugin has no allowed_paths", path)
+	}
+	for _, allowed := range g.AllowedPaths {
+		if allowed == "" {
+			continue
+		}
+		if _, err := port.NewWorkspacePathGuard(allowed).Check(ctx, path); err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("path %q is not inside any of this plugin's allowed_paths %v", path, g.AllowedPaths)
 }
 
 // namespacedKey qualifies a guest-supplied kv key with the plugin's own

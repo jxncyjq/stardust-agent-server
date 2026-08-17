@@ -816,6 +816,110 @@ func TestReadFileDeniesASymlinkEscape(t *testing.T) {
 	}
 }
 
+// TestReadFileDeniesASymlinkIntoTheWorkspaceOutsideTheAllowlist covers the
+// escape a lexical allowlist test would miss: a link INSIDE allowed_paths whose
+// target is a workspace file OUTSIDE them. The workspace guard is happy (the
+// target is in the workspace) and the spelling is inside the allowlist, so only
+// resolving the allowlist containment itself refuses it.
+func TestReadFileDeniesASymlinkIntoTheWorkspaceOutsideTheAllowlist(t *testing.T) {
+	env := newTestEnv(t)
+	allowedDir := filepath.Join(env.root, "allowed")
+	if err := os.MkdirAll(allowedDir, 0o755); err != nil {
+		t.Fatalf("create allowed dir: %v", err)
+	}
+	secret := filepath.Join(env.root, "secret.txt")
+	if err := os.WriteFile(secret, []byte("workspace secret"), 0o644); err != nil {
+		t.Fatalf("write workspace secret: %v", err)
+	}
+	link := filepath.Join(allowedDir, "shortcut.txt")
+	if err := os.Symlink(secret, link); err != nil {
+		t.Skipf("symlinks unavailable in this environment: %v", err)
+	}
+
+	grant := fullGrant()
+	grant.AllowedPaths = []string{allowedDir}
+	inst := newHostcallInstance(t, grant, env.deps)
+
+	req, err := json.Marshal(map[string]string{"path": link})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	out, err := inst.Invoke(context.Background(), opCallReadFile, req)
+	if err != nil {
+		t.Fatalf("Invoke(read_file): %v", err)
+	}
+	if strings.Contains(string(out), "workspace secret") {
+		t.Fatalf("read_file followed a symlink out of allowed_paths and returned the target's content: %s", out)
+	}
+	if got := decodeHostError(t, out); got.Code != CodeDenied {
+		t.Errorf("read_file(symlink inside allowed_paths -> outside) returned code %q, want %q (body %s)",
+			got.Code, CodeDenied, out)
+	}
+}
+
+// TestCheckAllowedPathIsFailClosed covers the allowlist containment rules
+// directly, including the two malformed-allowlist cases that must not widen a
+// grant: no entries at all, and an empty entry (filepath.Clean("") == ".").
+func TestCheckAllowedPathIsFailClosed(t *testing.T) {
+	root := t.TempDir()
+	allowedDir := filepath.Join(root, "allowed")
+	if err := os.MkdirAll(filepath.Join(allowedDir, "nested"), 0o755); err != nil {
+		t.Fatalf("create allowed dir: %v", err)
+	}
+	inside := filepath.Join(allowedDir, "nested", "file.txt")
+	if err := os.WriteFile(inside, []byte("x"), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+	outside := filepath.Join(root, "elsewhere.txt")
+
+	cases := []struct {
+		name    string
+		grant   perm.Grant
+		path    string
+		wantErr bool
+	}{
+		{
+			name:  "a file inside an allowed directory",
+			grant: perm.Grant{FS: true, AllowedPaths: []string{allowedDir}},
+			path:  inside,
+		},
+		{
+			name:  "the allowed directory itself",
+			grant: perm.Grant{FS: true, AllowedPaths: []string{allowedDir}},
+			path:  allowedDir,
+		},
+		{
+			name:    "a file outside every allowed directory",
+			grant:   perm.Grant{FS: true, AllowedPaths: []string{allowedDir}},
+			path:    outside,
+			wantErr: true,
+		},
+		{
+			name:    "an empty allowlist",
+			grant:   perm.Grant{FS: true},
+			path:    inside,
+			wantErr: true,
+		},
+		{
+			name:    "an empty allowlist entry",
+			grant:   perm.Grant{FS: true, AllowedPaths: []string{""}},
+			path:    inside,
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkAllowedPath(context.Background(), tc.grant, tc.path)
+			if tc.wantErr && err == nil {
+				t.Fatalf("checkAllowedPath(%s) = nil, want an error", tc.path)
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("checkAllowedPath(%s) = %v, want nil", tc.path, err)
+			}
+		})
+	}
+}
+
 func TestCallToolGoesThroughTheRegistryWithAPluginOrigin(t *testing.T) {
 	env := newTestEnv(t)
 	inst := newHostcallInstance(t, fullGrant(), env.deps)
