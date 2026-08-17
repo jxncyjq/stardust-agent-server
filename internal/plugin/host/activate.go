@@ -223,10 +223,10 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 	// every entry THIS CALL files, in filing order. Only these are rolled back
 	// on failure — see the owner-exclusivity paragraph above.
 	var revokers []func() error
-	// keep records one handle. It is passed to contributeTools, whose failure
-	// mode is a panic part-way through a list of tools: collecting each handle as
-	// it is filed is what lets the rollback below revoke the tools that were
-	// registered before the failing one.
+	// keep records one handle, and every step below files through it. It is also
+	// what contributeTools is handed, because that step's failure mode is a panic
+	// part-way through a list of tools: collecting each handle as it is filed is
+	// what lets the rollback revoke the tools registered before the failing one.
 	keep := func(revoke func() error) { revokers = append(revokers, revoke) }
 
 	committed := false
@@ -247,7 +247,7 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 	// fail. Closing the runtime also closes the host module and any instance
 	// created from it, which is why it is filed FIRST and therefore disposed
 	// LAST.
-	revokers = append(revokers, ledger.Add(owner, ledgerLabelRuntime, func() error {
+	keep(ledger.Add(owner, ledgerLabelRuntime, func() error {
 		if cerr := rt.Close(disposeCtx); cerr != nil {
 			return fmt.Errorf("close wasm runtime of plugin %q: %w", spec.Name, cerr)
 		}
@@ -271,7 +271,7 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 	if err != nil {
 		return nil, fmt.Errorf("activate plugin %q: %w", spec.Name, err)
 	}
-	revokers = append(revokers, ledger.Add(owner, ledgerLabelInstance, func() error {
+	keep(ledger.Add(owner, ledgerLabelInstance, func() error {
 		if cerr := closeInstance(disposeCtx, inst); cerr != nil {
 			return fmt.Errorf("close instance of plugin %q: %w", spec.Name, cerr)
 		}
@@ -296,6 +296,8 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 	// close the fresh module immediately (see NewRuntime's
 	// WithCloseOnContextDone), so every tool call would fail for a reason that
 	// has nothing to do with the call.
+	// This is the same cancellation scrubbing disposeCtx does, for a different
+	// reason, so it gets its own name rather than borrowing that one.
 	instantiateCtx := context.WithoutCancel(ctx)
 	instances := newPool(spec.MaxInstances, func() (*Instance, error) {
 		return NewInstance(instantiateCtx, rt, compiled)
@@ -307,7 +309,7 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 	// context (a tool descriptor's Timeout, or whatever the caller passed), not
 	// by a deadline invented here, so disposeCtx carries no cancellation of its
 	// own.
-	revokers = append(revokers, ledger.Add(owner, ledgerLabelPool, func() error {
+	keep(ledger.Add(owner, ledgerLabelPool, func() error {
 		if derr := instances.drain(disposeCtx); derr != nil {
 			return fmt.Errorf("drain instance pool of plugin %q: %w", spec.Name, derr)
 		}
