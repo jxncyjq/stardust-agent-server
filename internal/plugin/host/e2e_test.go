@@ -3,9 +3,12 @@ package host
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -446,5 +449,191 @@ func TestPluginToolCallCarriesTheDispatchContextThroughTheGuest(t *testing.T) {
 	}
 	if want := pluginCallOrigin(e2eManifestName); origins[e2eGuestCallID] != want {
 		t.Errorf("the plugin's own call was audited with origin %q, want %q", origins[e2eGuestCallID], want)
+	}
+}
+
+// The bounds the two resource-limit tests below run under.
+const (
+	// runawayDeadline is the short deadline the pure-compute loop is given. It
+	// is the bound under test, so it is paired with runawayCeiling.
+	runawayDeadline = 300 * time.Millisecond
+
+	// runawayCeiling is the independent bound: if the deadline does not
+	// interrupt the guest, the test must FAIL at this point rather than hang
+	// until the whole package's -timeout kills it with no diagnostic. It is
+	// generous enough that a loaded machine cannot trip it.
+	runawayCeiling = 20 * time.Second
+
+	// memoryBombCeiling is deliberately generous, for the opposite reason: the
+	// memory page cap is what must stop the allocation loop, and a deadline
+	// firing first would look identical to a cap that worked. The test reports
+	// that case as inconclusive (see the mctx.Err() check), the way
+	// TestInvokeMemoryCapTrapsInstance does.
+	memoryBombCeiling = 30 * time.Second
+
+	// resourceLimitToolTimeout replaces the fixture descriptor's generous
+	// timeout in these two tests. Nothing here calls the tool through
+	// Registry.Execute, so it is not the bound on the call; it is what
+	// drainDeadline is computed from, and shrinking it keeps a failing test's
+	// teardown short instead of waiting the fixture's 30s.
+	resourceLimitToolTimeout = 2 * time.Second
+)
+
+// activateForResourceLimits activates the fixture plugin under testOwner with a
+// registry of its own and a short tool timeout (see resourceLimitToolTimeout),
+// and asserts that nothing has been closed yet — so the close counts its caller
+// asserts afterwards can only come from the call that caller makes.
+//
+// memoryPages is passed rather than defaulted because it is the bound that
+// keeps a memory bomb from taking the machine with it: it must be visible at
+// the call site.
+func activateForResourceLimits(t *testing.T, memoryPages uint32) (*Plugin, *lifecycle.Ledger, *atomic.Int64) {
+	t.Helper()
+
+	instanceCloses := countInstanceCloses(t)
+
+	spec := fixtureSpec(t)
+	spec.MemoryPages = memoryPages
+	descriptor := fixtureDescriptor()
+	descriptor.Timeout = resourceLimitToolTimeout
+	spec.Tools = []tool.Descriptor{descriptor}
+
+	ledger := lifecycle.NewLedger()
+	plugin, err := Activate(context.Background(), ledger, testOwner, spec)
+	if err != nil {
+		t.Fatalf("Activate: %v", err)
+	}
+	t.Cleanup(func() { _ = ledger.DisposeOwner(testOwner) })
+
+	// The manifest read already borrowed and returned the pool's instance, so a
+	// healthy activation has closed nothing. Without this the "exactly one
+	// close" assertions below could be satisfied by a close that happened before
+	// the call under test.
+	if got := instanceCloses.Load(); got != 0 {
+		t.Fatalf("closeInstance ran %d times during activation, want 0", got)
+	}
+	return plugin, ledger, instanceCloses
+}
+
+// assertSlotCameBackEmpty asserts the pool's single slot was returned WITHOUT
+// its instance — which is what "the dead instance was not pooled" looks like
+// from the pool's side. It puts the slot straight back, because a slot dropped
+// here would make the drain that follows panic on its own accounting.
+//
+// It may only be called when no call is in flight, which is the case at both
+// call sites below (the call under test has already returned).
+func assertSlotCameBackEmpty(t *testing.T, p *pool) {
+	t.Helper()
+
+	select {
+	case slot := <-p.free:
+		defer func() { p.free <- slot }()
+		if slot != nil {
+			t.Errorf("the pool's slot came back holding instance %p: a dead instance must be discarded, "+
+				"not handed to the next caller", slot)
+		}
+	default:
+		t.Fatal("the pool's slot never came back after the call returned: its release did not run, " +
+			"so the slot is lost for the pool's whole lifetime")
+	}
+}
+
+// TestARunawayGuestCallIsInterruptedAndItsInstanceIsDiscarded is the deadline
+// half of the resource-limit acceptance: a guest that never yields (op 99 is a
+// pure-compute infinite loop) must be cut off by its context, and the instance
+// it wrecked must be discarded and closed rather than going back into the pool
+// for the next caller to draw.
+//
+// The deadline is the bound under test, so it is NOT this test's only brake:
+// the call runs on its own goroutine and the test fails at runawayCeiling if
+// the interrupt never happens, instead of hanging with no diagnostic. The guest
+// is stopped either way — teardown closes the plugin's runtime, which is what
+// interrupts a loop the deadline did not.
+func TestARunawayGuestCallIsInterruptedAndItsInstanceIsDiscarded(t *testing.T) {
+	plugin, ledger, instanceCloses := activateForResourceLimits(t, testMemoryPages)
+
+	callCtx, cancel := context.WithTimeout(context.Background(), runawayDeadline)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, cerr := plugin.pool.call(callCtx, opBusyLoop, nil)
+		done <- cerr
+	}()
+
+	var callErr error
+	select {
+	case callErr = <-done:
+	case <-time.After(runawayCeiling):
+		t.Fatalf("the busy-looping guest call had still not returned %s after it started (its context "+
+			"expires after %s): nothing interrupted it", runawayCeiling, runawayDeadline)
+	}
+
+	if callErr == nil {
+		t.Fatal("the busy-looping guest call returned no error, so it was never interrupted")
+	}
+	if callCtx.Err() == nil {
+		t.Fatalf("the call failed with %v while its context is still live: something other than the "+
+			"deadline stopped it, so this run proves nothing about the deadline", callErr)
+	}
+	if want := fmt.Sprintf("op %d", opBusyLoop); !strings.Contains(callErr.Error(), want) {
+		t.Errorf("the interrupted call reported %q, want it to name the guest operation (%q)", callErr, want)
+	}
+
+	// The wreckage is discarded at release time, not left for the drain: an
+	// instance wazero closed under an expired context would fail every
+	// subsequent caller that drew its slot.
+	if got := instanceCloses.Load(); got != 1 {
+		t.Errorf("closeInstance ran %d times after the interrupted call, want exactly 1: the dead instance "+
+			"must be closed when it is released, not merely dropped", got)
+	}
+	assertSlotCameBackEmpty(t, plugin.pool)
+
+	if err := ledger.DisposeOwner(testOwner); err != nil {
+		t.Fatalf("DisposeOwner: %v", err)
+	}
+	if got := instanceCloses.Load(); got != 1 {
+		t.Errorf("closeInstance ran %d times in total, want 1: the drain found an instance to close, "+
+			"which means the dead one had gone back into the pool", got)
+	}
+}
+
+// TestAMemoryBombIsTrappedByThePageCapAndItsInstanceIsDiscarded is the other
+// half: a guest that keeps allocating (op 98 allocates 1MiB chunks in a loop)
+// must be stopped by the runtime's memory page cap, and its instance discarded
+// like any other corpse.
+//
+// The cap is what bounds this test — testMemoryPages is 64 pages, 4MiB — and
+// the timeout around it is deliberately generous, because a deadline firing
+// first would look exactly like a cap that worked. That case is reported as
+// inconclusive rather than as a pass (see the mctx.Err() check, and
+// TestInvokeMemoryCapTrapsInstance, which set the precedent).
+func TestAMemoryBombIsTrappedByThePageCapAndItsInstanceIsDiscarded(t *testing.T) {
+	plugin, ledger, instanceCloses := activateForResourceLimits(t, testMemoryPages)
+
+	mctx, cancel := context.WithTimeout(context.Background(), memoryBombCeiling)
+	defer cancel()
+
+	out, err := plugin.pool.call(mctx, opMemBomb, nil)
+	if err == nil {
+		t.Fatalf("the memory bomb completed with no error: %s", out)
+	}
+	if mctx.Err() != nil {
+		t.Fatalf("the memory bomb hit the %s test deadline instead of the %d-page memory cap, so this run "+
+			"says nothing about the cap: %v", memoryBombCeiling, testMemoryPages, err)
+	}
+
+	if got := instanceCloses.Load(); got != 1 {
+		t.Errorf("closeInstance ran %d times after the trapped call, want exactly 1: a trapped guest leaves "+
+			"its module open, so the corpse must be closed when it is released", got)
+	}
+	assertSlotCameBackEmpty(t, plugin.pool)
+
+	if err := ledger.DisposeOwner(testOwner); err != nil {
+		t.Fatalf("DisposeOwner: %v", err)
+	}
+	if got := instanceCloses.Load(); got != 1 {
+		t.Errorf("closeInstance ran %d times in total, want 1: the drain found an instance to close, "+
+			"which means the trapped one had gone back into the pool", got)
 	}
 }
