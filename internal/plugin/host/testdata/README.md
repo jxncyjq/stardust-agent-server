@@ -1,6 +1,6 @@
 # testdata: WASM test fixtures
 
-Two prebuilt WASM guests are used by `internal/plugin/host`'s tests. Both are
+Three prebuilt WASM guests are used by `internal/plugin/host`'s tests. All are
 committed so CI does not need a Rust toolchain.
 
 `hostcall.wasm` is also read by `internal/runtime`'s tests
@@ -15,10 +15,19 @@ packages: relocating or renaming this file breaks a test in
 |---|---|---|
 | `plugin.wasm` | `guest-rust/` | none (WASI only) |
 | `hostcall.wasm` | `guest-hostcall-rust/` | all seven host functions |
+| `e2e.wasm` | `guest-e2e-rust/` | `call_tool` only |
 
 They are separate binaries on purpose: `plugin.wasm` must instantiate against a
 runtime with no host module at all, while `hostcall.wasm` must fail to
 instantiate unless every capability is granted. One fixture cannot do both.
+
+`e2e.wasm` exists for the same reason, from the third direction: the
+acceptance test (`e2e_test.go`) needs one guest that can be **activated** —
+which means answering `abi.OpManifest` with a real self-description — and that
+then **calls the host back** while serving a contributed tool. `plugin.wasm`
+can be activated but imports nothing, and `hostcall.wasm` calls everything but
+answers op 0 with an unsupported-op envelope on purpose (an activation test
+asserts the cross-check refuses it), so neither can play that part.
 
 ## Build commands
 
@@ -30,10 +39,14 @@ cp target/wasm32-wasip1/release/guest_rust.wasm ../plugin.wasm
 cd ../guest-hostcall-rust
 cargo build --release --target wasm32-wasip1
 cp target/wasm32-wasip1/release/guest_hostcall_rust.wasm ../hostcall.wasm
+
+cd ../guest-e2e-rust
+cargo build --release --target wasm32-wasip1
+cp target/wasm32-wasip1/release/guest_e2e_rust.wasm ../e2e.wasm
 ```
 
-Requires `rustup target add wasm32-wasip1`. `guest-hostcall-rust` has no
-dependencies, so `--offline` works for it.
+Requires `rustup target add wasm32-wasip1`. `guest-hostcall-rust` and
+`guest-e2e-rust` have no dependencies, so `--offline` works for both.
 
 # plugin.wasm
 
@@ -158,3 +171,39 @@ region through this guest's own `plugin_alloc`, so `Instance.Invoke` reads and
 Op 77 must be invoked with a **nil** request body: a non-empty body makes
 `Instance.Invoke` allocate for the input first, which would consume the
 arming.
+
+# e2e.wasm
+
+## Exports and imports
+
+Same ABI exports as the other two (`_initialize`, `plugin_alloc`,
+`plugin_free`, `plugin_invoke`, plus the `memory` export). It imports exactly
+one host function — `legion.call_tool` — so it activates under
+`perm.Grant{Tool: true}` and under nothing narrower: a grant without the tool
+capability fails `CheckImports` before instantiation.
+
+## Op table
+
+| op | name | behavior |
+|----|------|----------|
+| 0 | `abi.OpManifest` | input ignored; returns `{"name":"legion-e2e-plugin","version":"0.1.0","provides":["e2e_proxy_tool"]}` |
+| 1 | `abi.OpCallTool` | input **ignored** (this fixture has no JSON parser); calls `call_tool` with the constant request `{"call_id":"guest-inner-call","tool":"e2e_inner_tool","arguments":{"probe":"from-guest"}}` and returns the host's packed result verbatim. Before `_initialize` has run it returns `{"success":false,"error":"guest was never initialized"}` instead |
+| * | (any other value) | never traps; returns `{"error":"unsupported op"}` |
+
+On success the host's answer to op 1 is a JSON `domain.ToolResult`, which is
+exactly what a contributed tool's handler decodes, so the inner tool's result
+travels back out to the model unchanged.
+
+## Why the inner call names a constant tool
+
+`e2e_inner_tool` is hard-coded and is deliberately **not** the tool this plugin
+contributes (`e2e_proxy_tool`). Forwarding the host's own request back instead
+would make the guest call itself through the registry, and the only thing
+stopping that chain would be the `call_tool` depth cap — the feature under
+test. A fixture whose only brake is the thing being tested has no brake, and
+this repository has already paid for that lesson once (see
+`hardChainLevelBudget` in `calltool_test.go`).
+
+The call id and the argument are hard-coded for a second reason: the
+acceptance test asserts on them, so the innermost tool's arguments prove the
+request really came from inside the guest rather than from the test.
