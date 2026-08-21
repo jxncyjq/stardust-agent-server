@@ -120,11 +120,12 @@ type Filesystem struct {
 // reason — and TimeoutMs is the only bound ever placed on a call into the
 // guest, so a non-positive value would let a call run forever.
 //
-// host.validateSpec checks these same two fields again, later, against the
-// host.Spec assembled from this declaration (Task 2). The check is
-// deliberately duplicated: failing here, at manifest parse time, names the
-// plugin.json field the author got wrong, which is far more actionable than
-// a validateSpec error naming a Spec.Tools index the author never wrote.
+// host.validateSpec checks these same three fields again, later — Name,
+// Group and Timeout — against the host.Spec assembled from this declaration
+// (Task 2). The check is deliberately duplicated: failing here, at manifest
+// parse time, names the plugin.json field the author got wrong, which is far
+// more actionable than a validateSpec error naming a Spec.Tools index the
+// author never wrote.
 type ToolDecl struct {
 	Name        string         `json:"name"`
 	Description string         `json:"description"`
@@ -208,7 +209,9 @@ type ToolAccept struct {
 //   - Limits.MaxMemoryPages == 0 or Limits.MaxInstances < 1;
 //   - an empty Tools list (a plugin that contributes no tools has no
 //     reason to be loaded — the same requirement host.Spec.Tools carries);
-//   - any tool missing its Group, or with TimeoutMs <= 0.
+//   - any tool missing its Group, or with TimeoutMs <= 0;
+//   - two tools sharing the same Name (host.validateSpec would reject this
+//     too, later and less actionably, against the assembled host.Spec).
 //
 // Every error names the offending field (and, for a per-tool violation, the
 // tool's own name) rather than only reporting that parsing failed.
@@ -253,6 +256,7 @@ func validatePlugin(pm PluginManifest) error {
 		return fmt.Errorf("parse plugin manifest %q: tools is empty; a plugin exists to contribute tools",
 			pm.Name)
 	}
+	seenTools := make(map[string]struct{}, len(pm.Tools))
 	for i, tool := range pm.Tools {
 		if tool.Name == "" {
 			return fmt.Errorf("parse plugin manifest %q: tools[%d] has no name", pm.Name, i)
@@ -265,6 +269,12 @@ func validatePlugin(pm PluginManifest) error {
 			return fmt.Errorf("parse plugin manifest %q: tool %q has timeout_ms %d, want > 0; it is the only "+
 				"bound ever placed on a call into the guest", pm.Name, tool.Name, tool.TimeoutMs)
 		}
+		if _, dup := seenTools[tool.Name]; dup {
+			return fmt.Errorf("parse plugin manifest %q: tool %q claimed twice; one name is one tool, and the "+
+				"second registration would only be caught later, less actionably, by host.validateSpec",
+				pm.Name, tool.Name)
+		}
+		seenTools[tool.Name] = struct{}{}
 	}
 	return nil
 }

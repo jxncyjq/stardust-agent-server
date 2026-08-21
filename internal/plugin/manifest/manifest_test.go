@@ -211,6 +211,20 @@ func TestParsePlugin_ToolTimeoutNegative(t *testing.T) {
 	requireErrorContains(t, err, "timeout_ms")
 }
 
+func TestParsePlugin_DuplicateToolName(t *testing.T) {
+	data := []byte(`{
+		"name": "p", "version": "1.0.0", "abi": 1, "sha256": "` + validSHA256 + `",
+		"limits": {"max_memory_pages": 1, "max_instances": 1},
+		"tools": [
+			{"name": "jira_search", "group": "g", "timeout_ms": 1000},
+			{"name": "jira_search", "group": "g", "timeout_ms": 1000}
+		]
+	}`)
+	_, err := ParsePlugin(data)
+	requireErrorContains(t, err, "jira_search")
+	requireErrorContains(t, err, "twice")
+}
+
 func TestParsePlugin_UnknownCapability(t *testing.T) {
 	data := []byte(`{
 		"name": "p", "version": "1.0.0", "abi": 1, "sha256": "` + validSHA256 + `",
@@ -344,9 +358,9 @@ func TestParseDeployment_MissingName(t *testing.T) {
 }
 
 func TestParseDeployment_MissingSource(t *testing.T) {
-	data := []byte(`{"plugins": [{"name": "p"}]}`)
+	data := []byte(`{"plugins": [{"name": "my-plugin"}]}`)
 	_, err := ParseDeployment(data)
-	requireErrorContains(t, err, "p")
+	requireErrorContains(t, err, "my-plugin")
 	requireErrorContains(t, err, "source")
 }
 
