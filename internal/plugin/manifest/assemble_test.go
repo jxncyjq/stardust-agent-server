@@ -1,6 +1,7 @@
 package manifest
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"testing"
@@ -263,6 +264,44 @@ func TestAssembleSpec_ZeroDeployLimitTreatedAsUnset(t *testing.T) {
 	}
 }
 
+// TestAssembleSpec_ZeroPluginLimitTreatedAsUnset is the mirror of
+// TestAssembleSpec_ZeroDeployLimitTreatedAsUnset: the plugin side declares
+// nothing for MaxInstances/TimeoutMs, so the deployment's own value must be
+// used unchanged, not collapsed to zero.
+func TestAssembleSpec_ZeroPluginLimitTreatedAsUnset(t *testing.T) {
+	pm := basePluginManifest()
+	pm.Limits.MaxInstances = 0
+	pm.Limits.TimeoutMs = 0
+	entry := baseEntry()
+	deployLimits := baseDeployLimits() // TimeoutMs=4000, MaxInstances=2
+
+	spec, err := AssembleSpec(pm, entry, deployLimits)
+	if err != nil {
+		t.Fatalf("AssembleSpec: unexpected error: %v", err)
+	}
+	if spec.MaxInstances != 2 {
+		t.Errorf("MaxInstances = %d, want 2 (deployment's own value, plugin side unset)", spec.MaxInstances)
+	}
+	// timeoutCeilingMs = minIntZeroUnset(0, 4000) = 4000 (deployment's value,
+	// since the plugin side is unset). jira_create_issue's declared 5000ms is
+	// capped down to that ceiling; jira_search's declared 3000ms is already
+	// under it and stays unchanged.
+	for _, td := range spec.Tools {
+		var want time.Duration
+		switch td.Name {
+		case "jira_search":
+			want = 3000 * time.Millisecond
+		case "jira_create_issue":
+			want = 4000 * time.Millisecond
+		default:
+			t.Fatalf("unexpected tool %q", td.Name)
+		}
+		if td.Timeout != want {
+			t.Errorf("Tools[%q].Timeout = %v, want %v", td.Name, td.Timeout, want)
+		}
+	}
+}
+
 func TestAssembleSpec_MaxMemoryPagesZeroOnBothSides_Fails(t *testing.T) {
 	// ParsePlugin itself refuses a manifest with MaxMemoryPages == 0, so this
 	// constructs the PluginManifest by hand — bypassing ParsePlugin is what a
@@ -278,6 +317,26 @@ func TestAssembleSpec_MaxMemoryPagesZeroOnBothSides_Fails(t *testing.T) {
 	requireErrorContains(t, err, "max_memory_pages")
 }
 
+func TestAssembleSpec_NegativeDeployTimeoutMs_Fails(t *testing.T) {
+	pm := basePluginManifest()
+	entry := baseEntry()
+	deployLimits := baseDeployLimits()
+	deployLimits.TimeoutMs = -1
+
+	_, err := AssembleSpec(pm, entry, deployLimits)
+	requireErrorContains(t, err, "timeout_ms")
+}
+
+func TestAssembleSpec_NegativeDeployMaxInstances_Fails(t *testing.T) {
+	pm := basePluginManifest()
+	entry := baseEntry()
+	deployLimits := baseDeployLimits()
+	deployLimits.MaxInstances = -1
+
+	_, err := AssembleSpec(pm, entry, deployLimits)
+	requireErrorContains(t, err, "max_instances")
+}
+
 // --- Rule 3: tools must be explicitly accepted ------------------------------
 
 func TestAssembleSpec_AcceptedToolNotDeclared_Fails(t *testing.T) {
@@ -287,6 +346,16 @@ func TestAssembleSpec_AcceptedToolNotDeclared_Fails(t *testing.T) {
 
 	_, err := AssembleSpec(pm, entry, baseDeployLimits())
 	requireErrorContains(t, err, "jira_delete_issue")
+}
+
+func TestAssembleSpec_DuplicateAcceptedTool_Fails(t *testing.T) {
+	pm := basePluginManifest()
+	entry := baseEntry()
+	entry.Tools = []ToolAccept{{Name: "jira_search"}, {Name: "jira_search"}}
+
+	_, err := AssembleSpec(pm, entry, baseDeployLimits())
+	requireErrorContains(t, err, "jira_search")
+	requireErrorContains(t, err, "twice")
 }
 
 func TestAssembleSpec_UnacceptedToolIsNotRegistered(t *testing.T) {
@@ -361,6 +430,35 @@ func TestAssembleSpec_SensitiveOverrideLoosens_Fails(t *testing.T) {
 	_, err := AssembleSpec(pm, entry, baseDeployLimits())
 	requireErrorContains(t, err, "jira_create_issue")
 	requireErrorContains(t, err, "loosens")
+}
+
+func TestAssembleSpec_UnknownOverrideRiskLevel_Fails(t *testing.T) {
+	pm := basePluginManifest()
+	entry := baseEntry()
+	entry.Tools = []ToolAccept{{Name: "jira_search", RiskLevel: "extreme"}}
+
+	_, err := AssembleSpec(pm, entry, baseDeployLimits())
+	requireErrorContains(t, err, "jira_search")
+	requireErrorContains(t, err, "extreme")
+}
+
+// TestAssembleSpec_TimeoutMsOverflowsDuration_Fails exercises the
+// maxTimeoutMs guard: a tool's effective timeout_ms so large that
+// time.Duration(ms) * time.Millisecond would overflow int64 must be
+// refused, naming the tool and the value, rather than silently producing a
+// nonsensical (possibly negative) Duration.
+func TestAssembleSpec_TimeoutMsOverflowsDuration_Fails(t *testing.T) {
+	pm := basePluginManifest()
+	pm.Tools[0].TimeoutMs = math.MaxInt64 // jira_search
+	pm.Limits.TimeoutMs = 0               // don't let the ceiling cap it down first
+	entry := baseEntry()
+	entry.Tools = []ToolAccept{{Name: "jira_search"}}
+	deployLimits := baseDeployLimits()
+	deployLimits.TimeoutMs = 0 // ceiling stays unset on both sides
+
+	_, err := AssembleSpec(pm, entry, deployLimits)
+	requireErrorContains(t, err, "jira_search")
+	requireErrorContains(t, err, "9223372036854775807")
 }
 
 // --- LoadPackage -------------------------------------------------------------

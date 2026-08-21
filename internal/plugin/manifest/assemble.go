@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,6 +14,14 @@ import (
 	"github.com/stardust/legion-agent/internal/plugin/perm"
 	"github.com/stardust/legion-agent/internal/tool"
 )
+
+// maxTimeoutMs is the largest millisecond count that can be converted to a
+// time.Duration (an int64 count of nanoseconds) via
+// time.Duration(ms) * time.Millisecond without overflowing. A TimeoutMs
+// above this, however unlikely through normal configuration, must be
+// refused rather than silently wrapping into a nonsensical (possibly
+// negative) Duration.
+const maxTimeoutMs = int(math.MaxInt64 / int64(time.Millisecond))
 
 // riskLevelRank orders the risk levels a ToolDecl or ToolAccept may name, so
 // AssembleSpec can tell a deployment override that TIGHTENS a plugin's own
@@ -103,19 +112,41 @@ func LoadPackage(dir string) (PluginManifest, []byte, error) {
 //     that ceiling. MaxMemoryPages follows the same "zero means unset" rule
 //     with one exception: zero on BOTH sides is refused outright, because
 //     host.NewRuntime panics on a zero page count and "unset on both sides"
-//     must never silently become "zero".
+//     must never silently become "zero". deployLimits.TimeoutMs and
+//     deployLimits.MaxInstances must not be negative — minIntZeroUnset would
+//     otherwise happily pick a negative value as "the smaller one", producing
+//     a negative Timeout or MaxInstances that host.Activate would only catch
+//     later, less actionably; a negative deployLimits value is refused
+//     outright, naming the field. A tool's final effective TimeoutMs is also
+//     bounds-checked against maxTimeoutMs before conversion to time.Duration,
+//     since a sufficiently large millisecond count would overflow that
+//     conversion.
 //
 //  3. Tools: only tools entry.Tools explicitly accepts are registered, in
 //     entry.Tools' own order — a pm tool entry.Tools never mentions is
 //     simply left out of Spec.Tools (most plugins offer more than one
 //     deployment wants). An entry.Tools name that pm never declared is
 //     refused (a typo in plugins.json is far more likely to be a mistake
-//     than an unused acceptance). A ToolAccept's RiskLevel/Sensitive may
-//     only TIGHTEN the plugin's own declaration (e.g. "low" to "high",
-//     false to true), never loosen it; loosening is refused. An empty
-//     RiskLevel or a nil Sensitive means "no override, use the plugin's own
-//     declared value".
+//     than an unused acceptance). entry.Tools naming the same tool twice is
+//     refused here too, for the same reason ParsePlugin's ToolDecl duplicate
+//     check exists: failing at this specific, earlier layer names the
+//     mistake more actionably than host.validateSpec's later, less specific
+//     error. A ToolAccept's RiskLevel/Sensitive may only TIGHTEN the
+//     plugin's own declaration (e.g. "low" to "high", false to true), never
+//     loosen it; loosening is refused. An empty RiskLevel or a nil Sensitive
+//     means "no override, use the plugin's own declared value".
 func AssembleSpec(pm PluginManifest, entry Entry, deployLimits Limits) (host.Spec, error) {
+	if deployLimits.TimeoutMs < 0 {
+		return host.Spec{}, fmt.Errorf(
+			"plugin %q: deployment limit timeout_ms is %d, want >= 0", pm.Name, deployLimits.TimeoutMs,
+		)
+	}
+	if deployLimits.MaxInstances < 0 {
+		return host.Spec{}, fmt.Errorf(
+			"plugin %q: deployment limit max_instances is %d, want >= 0", pm.Name, deployLimits.MaxInstances,
+		)
+	}
+
 	grant, err := reconcileCapabilities(pm.Name, pm.Capabilities, entry.Grant.Capabilities)
 	if err != nil {
 		return host.Spec{}, err
@@ -139,8 +170,18 @@ func AssembleSpec(pm PluginManifest, entry Entry, deployLimits Limits) (host.Spe
 		declByName[td.Name] = td
 	}
 
+	seenAccepted := make(map[string]struct{}, len(entry.Tools))
 	specTools := make([]tool.Descriptor, 0, len(entry.Tools))
 	for _, accept := range entry.Tools {
+		if _, dup := seenAccepted[accept.Name]; dup {
+			return host.Spec{}, fmt.Errorf(
+				"plugin %q: deployment accepts tool %q twice; one name is one tool, and the second "+
+					"acceptance would only be caught later, less actionably, by host.validateSpec",
+				pm.Name, accept.Name,
+			)
+		}
+		seenAccepted[accept.Name] = struct{}{}
+
 		td, ok := declByName[accept.Name]
 		if !ok {
 			return host.Spec{}, fmt.Errorf(
@@ -170,6 +211,13 @@ func AssembleSpec(pm PluginManifest, entry Entry, deployLimits Limits) (host.Spe
 		}
 
 		toolTimeoutMs := minIntZeroUnset(td.TimeoutMs, timeoutCeilingMs)
+		if toolTimeoutMs > maxTimeoutMs {
+			return host.Spec{}, fmt.Errorf(
+				"plugin %q: tool %q effective timeout_ms %d exceeds the maximum %d representable as a "+
+					"time.Duration; time.Duration(timeoutMs) * time.Millisecond would overflow",
+				pm.Name, td.Name, toolTimeoutMs, maxTimeoutMs,
+			)
+		}
 		specTools = append(specTools, tool.Descriptor{
 			Name:        td.Name,
 			Description: td.Description,
