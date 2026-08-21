@@ -11,6 +11,13 @@ the shared per-task tool budget through a real guest calling the real
 packages: relocating or renaming this file breaks a test in
 `internal/runtime` too.
 
+`plugin.wasm` and `e2e.wasm` are read the same way by
+`internal/plugin/loader`'s tests (`fixtureWasm`, by the relative path
+`../host/testdata/<file>`): the loader's convergence tests mount real plugins,
+and they need two DIFFERENT guests because two plugins can never contribute the
+same tool name. The same warning applies — relocating or renaming either file
+breaks a test in `internal/plugin/loader`, with no compile-time link to say so.
+
 | fixture | source | imports from the `legion` host module |
 |---|---|---|
 | `plugin.wasm` | `guest-rust/` | none (WASI only) |
