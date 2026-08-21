@@ -5,6 +5,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -102,6 +104,12 @@ type pkg struct {
 	version      string
 	capabilities []string
 	tools        []string
+
+	// allowedPaths is the plugin's own filesystem.allowed_paths declaration. A
+	// deployment grant is intersected against it (manifest.AssembleSpec), so it
+	// is what lets a test change the ASSEMBLED grant without changing the module
+	// or the capability set.
+	allowedPaths []string
 }
 
 // writePackage writes a plugin package (plugin.json + plugin.wasm) into dir,
@@ -132,6 +140,7 @@ func writePackage(t *testing.T, dir string, p pkg) {
 		SHA256:       hex.EncodeToString(sum[:]),
 		Capabilities: p.capabilities,
 		Limits:       manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
+		Filesystem:   manifest.Filesystem{AllowedPaths: p.allowedPaths},
 		Tools:        decls,
 	}
 	data, err := json.Marshal(pm)
@@ -302,6 +311,24 @@ func (h *harness) eventsOfType(eventType string) []domain.RuntimeEvent {
 		}
 	}
 	return matched
+}
+
+// eventTypes returns the types of every published runtime event, in the order
+// they were published. It is how a test pins event ORDER, which counting alone
+// cannot: "loaded then activation_failed" and "activation_failed then loaded"
+// carry the same counts and opposite meanings to whoever is reading the stream.
+func (h *harness) eventTypes() []string {
+	h.t.Helper()
+
+	all, err := h.events.Events()
+	if err != nil {
+		h.t.Fatalf("read published events: %v", err)
+	}
+	types := make([]string, 0, len(all))
+	for _, event := range all {
+		types = append(types, event.Type)
+	}
+	return types
 }
 
 // apply runs one convergence and fails the test if it reports anything.
@@ -655,8 +682,27 @@ func TestApplyRestoresThePreviousInstanceWhenAReplacementFails(t *testing.T) {
 	// The restore is a real activation, so it publishes its own plugin/loaded:
 	// one for the original mount, one for the restore, and none for the
 	// replacement that never came up.
-	if loaded := h.eventsOfType(RuntimeEventLoaded); len(loaded) != 2 {
+	loaded := h.eventsOfType(RuntimeEventLoaded)
+	if len(loaded) != 2 {
 		t.Fatalf("want the original activation and the restore, got %v", loaded)
+	}
+
+	// ORDER, not just counts: the restore's plugin/loaded must come AFTER the
+	// plugin/activation_failed that forced it. Published the other way round the
+	// stream reads unloaded -> loaded -> activation_failed, and an operator
+	// tailing it blames the load that had just succeeded.
+	wantStrings(t, "published event order", h.eventTypes(), []string{
+		RuntimeEventLoaded,
+		RuntimeEventUnloaded,
+		RuntimeEventActivationFailed,
+		RuntimeEventLoaded,
+	})
+	if !strings.Contains(loaded[1].Message, "reason="+loadReasonRestored) {
+		t.Fatalf("the restore's %s must say it is a restoration, not a fresh mount, got %q",
+			RuntimeEventLoaded, loaded[1].Message)
+	}
+	if !strings.Contains(loaded[0].Message, "reason="+loadReasonMounted) {
+		t.Fatalf("a fresh mount's %s must say so, got %q", RuntimeEventLoaded, loaded[0].Message)
 	}
 }
 
@@ -888,5 +934,367 @@ func TestApplyRefusesAnEntryWhoseToolNameIsTaken(t *testing.T) {
 	failed := h.eventsOfType(RuntimeEventActivationFailed)
 	if len(failed) != 1 || !strings.Contains(failed[0].Message, "step="+stepToolNames) {
 		t.Fatalf("want one %s event naming step %q, got %v", RuntimeEventActivationFailed, stepToolNames, failed)
+	}
+}
+
+// TestApplyRefusesADeploymentThatNamesOnePluginTwice pins the one documented
+// exception to "a failure never aborts the rest": an ambiguous target state is
+// not a target state, so Apply refuses it BEFORE converging anything rather
+// than letting map iteration order decide which of the two entries wins.
+func TestApplyRefusesADeploymentThatNamesOnePluginTwice(t *testing.T) {
+	h := newHarness(t)
+	echo := h.writeEcho("1.0.0")
+	proxy := h.writeProxy("1.0.0")
+
+	err := h.loader.Apply(
+		context.Background(),
+		manifest.Deployment{Plugins: []manifest.Entry{echo, proxy, echo}},
+		h.root,
+	)
+	if err == nil {
+		t.Fatal("Apply must refuse a deployment that names one plugin twice")
+	}
+	if !strings.Contains(err.Error(), echoPluginName) {
+		t.Fatalf("the error must name the duplicated plugin, got %q", err)
+	}
+	// The healthy entry between the two duplicates proves the abort really is an
+	// abort: nothing converged, not even the entry that was perfectly fine.
+	if got := h.owners(); len(got) != 0 {
+		t.Fatalf("an ambiguous target state must converge nothing at all, ledger holds %v", got)
+	}
+	if got := h.toolNames(); len(got) != 0 {
+		t.Fatalf("an ambiguous target state must register nothing, got %v", got)
+	}
+	if got := h.loader.Status(); len(got) != 0 {
+		t.Fatalf("an ambiguous target state must leave no instance behind, got %v", got)
+	}
+	if got := h.eventTypes(); len(got) != 0 {
+		t.Fatalf("an Apply that refused before touching anything must publish nothing, got %v", got)
+	}
+}
+
+// TestApplyRefusesAnAbsoluteSource: root is what bounds where plugin code is
+// read from, so an entry that ignores it is refused rather than obeyed. The
+// package at the absolute path is a perfectly valid one — the ONLY reason this
+// Apply fails is the confinement check.
+func TestApplyRefusesAnAbsoluteSource(t *testing.T) {
+	h := newHarness(t)
+	outside := t.TempDir()
+	source := filepath.Join(outside, "echo")
+	writePackage(t, source, pkg{
+		wasm:    fixtureWasm(t, echoWasmFile),
+		name:    echoPluginName,
+		version: "1.0.0",
+		tools:   []string{echoToolName},
+	})
+	entry := entryFor(echoPluginName, source, nil, echoToolName)
+
+	err := h.loader.Apply(context.Background(), manifest.Deployment{Plugins: []manifest.Entry{entry}}, h.root)
+	if err == nil {
+		t.Fatal("Apply must refuse an absolute source: it would read plugin code from outside the root")
+	}
+	// %q-quoted, as the error writes it: on Windows a path's separators are
+	// escaped, so the raw string is not a substring of the message.
+	if !strings.Contains(err.Error(), fmt.Sprintf("%q", source)) {
+		t.Fatalf("the error must name the offending source, got %q", err)
+	}
+	if !strings.Contains(err.Error(), echoPluginName) {
+		t.Fatalf("the error must name the entry, got %q", err)
+	}
+	if got := h.owners(); len(got) != 0 {
+		t.Fatalf("nothing may be mounted from outside the root, got %v", got)
+	}
+	failed := h.eventsOfType(RuntimeEventActivationFailed)
+	if len(failed) != 1 || !strings.Contains(failed[0].Message, "step="+stepSource) {
+		t.Fatalf("want one %s event naming step %q, got %v", RuntimeEventActivationFailed, stepSource, failed)
+	}
+}
+
+// TestApplyRefusesASourceThatEscapesTheRoot is the same bound from the other
+// side: filepath.Join CLEANS a path, it does not confine it, so ".." walks out
+// of the root unless the escape is refused explicitly.
+func TestApplyRefusesASourceThatEscapesTheRoot(t *testing.T) {
+	h := newHarness(t)
+	outside := t.TempDir()
+	dir := filepath.Join(outside, "echo")
+	writePackage(t, dir, pkg{
+		wasm:    fixtureWasm(t, echoWasmFile),
+		name:    echoPluginName,
+		version: "1.0.0",
+		tools:   []string{echoToolName},
+	})
+	source, err := filepath.Rel(h.root, dir)
+	if err != nil {
+		t.Fatalf("build a relative source pointing outside the root: %v", err)
+	}
+	if !strings.HasPrefix(source, "..") {
+		t.Fatalf("this test needs a source that escapes the root, got %q", source)
+	}
+	entry := entryFor(echoPluginName, source, nil, echoToolName)
+
+	applyErr := h.loader.Apply(context.Background(), manifest.Deployment{Plugins: []manifest.Entry{entry}}, h.root)
+	if applyErr == nil {
+		t.Fatal("Apply must refuse a relative source that escapes the deployment root")
+	}
+	if !strings.Contains(applyErr.Error(), fmt.Sprintf("%q", source)) {
+		t.Fatalf("the error must name the offending source, got %q", applyErr)
+	}
+	if !strings.Contains(applyErr.Error(), echoPluginName) {
+		t.Fatalf("the error must name the entry, got %q", applyErr)
+	}
+	if got := h.owners(); len(got) != 0 {
+		t.Fatalf("nothing may be mounted from outside the root, got %v", got)
+	}
+	failed := h.eventsOfType(RuntimeEventActivationFailed)
+	if len(failed) != 1 || !strings.Contains(failed[0].Message, "step="+stepSource) {
+		t.Fatalf("want one %s event naming step %q, got %v", RuntimeEventActivationFailed, stepSource, failed)
+	}
+}
+
+// TestApplyReplacesAnEntryWhoseGrantChanged: the grant is one of the four
+// change-detection inputs, and it is the security-relevant one. The module, its
+// version and its config are byte-identical across the two applies; only the
+// deployment's authorization narrowed. An implementation that left Grant out of
+// the fingerprint would keep the plugin running with access the operator has
+// already revoked.
+func TestApplyReplacesAnEntryWhoseGrantChanged(t *testing.T) {
+	h := newHarness(t)
+	writePackage(t, filepath.Join(h.root, "echo"), pkg{
+		wasm:         fixtureWasm(t, echoWasmFile),
+		name:         echoPluginName,
+		version:      "1.0.0",
+		tools:        []string{echoToolName},
+		allowedPaths: []string{"/srv/plugins/a", "/srv/plugins/b"},
+	})
+	wide := entryFor(echoPluginName, "echo", nil, echoToolName)
+	wide.Grant.AllowedPaths = []string{"/srv/plugins/a", "/srv/plugins/b"}
+	h.apply(wide)
+
+	narrowed := wide
+	narrowed.Grant.AllowedPaths = []string{"/srv/plugins/a"}
+	h.apply(narrowed)
+
+	unloaded := h.eventsOfType(RuntimeEventUnloaded)
+	if len(unloaded) != 1 || !strings.Contains(unloaded[0].Message, reasonReplaced) {
+		t.Fatalf("a narrowed grant must replace the running instance with reason %q, got %v",
+			reasonReplaced, unloaded)
+	}
+	if loaded := h.eventsOfType(RuntimeEventLoaded); len(loaded) != 2 {
+		t.Fatalf("want one %s event per activation, got %v", RuntimeEventLoaded, loaded)
+	}
+	status := h.loader.Status()
+	if len(status) != 1 || status[0].State != StateLoaded {
+		t.Fatalf("the narrowed instance must be the one running, got %v", status)
+	}
+}
+
+// TestApplyReplacesAnEntryWhoseAcceptedToolsChanged is the fourth
+// change-detection input: the deployment tightened a tool's risk level, which
+// changes nothing on disk and everything about how the tool is gated.
+func TestApplyReplacesAnEntryWhoseAcceptedToolsChanged(t *testing.T) {
+	h := newHarness(t)
+	echo := h.writeEcho("1.0.0")
+	h.apply(echo)
+
+	tightened := echo
+	tightened.Tools = []manifest.ToolAccept{{Name: echoToolName, RiskLevel: "high"}}
+	h.apply(tightened)
+
+	unloaded := h.eventsOfType(RuntimeEventUnloaded)
+	if len(unloaded) != 1 || !strings.Contains(unloaded[0].Message, reasonReplaced) {
+		t.Fatalf("a changed tool override must replace the running instance with reason %q, got %v",
+			reasonReplaced, unloaded)
+	}
+	if loaded := h.eventsOfType(RuntimeEventLoaded); len(loaded) != 2 {
+		t.Fatalf("want one %s event per activation, got %v", RuntimeEventLoaded, loaded)
+	}
+	for _, descriptor := range h.registry.Descriptors() {
+		if descriptor.Name == echoToolName && descriptor.RiskLevel != "high" {
+			t.Fatalf("the rebuilt instance must carry the tightened risk level, got %q", descriptor.RiskLevel)
+		}
+	}
+}
+
+// TestApplyMigratesAToolNameBetweenPluginsInOneRound is the convergence
+// requirement Apply's doc comment makes: every tool name this Apply frees is
+// free before any activation claims one, so a name moving from one plugin to
+// another settles in ONE round. "Run reload twice" is not acceptable behaviour
+// for a convergence function.
+//
+// The releasing plugin is one that STAYS in the target state and merely
+// changes, which is the case an unload pass covering only departing entries
+// misses. The name is held by a foreign contributor whose revocation is filed
+// under that plugin's ledger owner, so it is released exactly when that
+// instance is unloaded — the committed guests cannot express the migration
+// directly, because host.Activate's cross-check binds every tool name to the
+// guest that declares it and each fixture guest declares exactly one, tied to
+// its own plugin name.
+//
+// The claimant is listed FIRST in the deployment, ahead of the entry releasing
+// the name: converged in deployment order without an unload pass that runs
+// ahead of every activation, it hits the tool-name conflict and fails.
+func TestApplyMigratesAToolNameBetweenPluginsInOneRound(t *testing.T) {
+	h := newHarness(t)
+	h.apply(h.writeEcho("1.0.0"))
+
+	revoke := h.registry.Register(proxyToolName, tool.HandlerFunc(
+		func(context.Context, domain.ToolCall) (domain.ToolResult, error) {
+			return domain.ToolResult{}, nil
+		}))
+	h.ledger.Add(ownerFor(echoPluginName, "1.0.0"), "test-foreign-tool", func() error {
+		revoke()
+		return nil
+	})
+
+	proxy := h.writeProxy("1.0.0")
+	changedEcho := h.writeEcho("2.0.0")
+
+	// Exactly one Apply. Not a loop: the requirement IS that one round is enough.
+	h.apply(proxy, changedEcho)
+
+	wantStrings(t, "ledger owners", h.owners(), []string{
+		"plugin:" + proxyPluginName + "@1.0.0",
+		"plugin:" + echoPluginName + "@2.0.0",
+	})
+	wantStrings(t, "registered tools", h.toolNames(), []string{proxyToolName, echoToolName})
+	if failed := h.eventsOfType(RuntimeEventActivationFailed); len(failed) != 0 {
+		t.Fatalf("one Apply must converge both entries, got %v", failed)
+	}
+	unloaded := h.eventsOfType(RuntimeEventUnloaded)
+	if len(unloaded) != 1 || !strings.Contains(unloaded[0].Message, reasonReplaced) {
+		t.Fatalf("the changed entry's old instance must be unloaded once, got %v", unloaded)
+	}
+	// The unload of the entry that is merely CHANGING happens in the same pass
+	// as any departing entry's would, before every activation.
+	wantStrings(t, "published event order", h.eventTypes(), []string{
+		RuntimeEventLoaded,
+		RuntimeEventUnloaded,
+		RuntimeEventLoaded,
+		RuntimeEventLoaded,
+	})
+}
+
+// TestApplyReportsAFailedDisposalWhenAnEntryLeaves: DisposeOwner clears the
+// owner even when a disposer fails, so the plugin IS unmounted — but what
+// failed is a wasm runtime close or a pool drain, i.e. a leak. It must reach
+// both the returned error and the event, never be logged and dropped.
+func TestApplyReportsAFailedDisposalWhenAnEntryLeaves(t *testing.T) {
+	h := newHarness(t)
+	h.apply(h.writeEcho("1.0.0"))
+	h.ledger.Add(ownerFor(echoPluginName, "1.0.0"), "test-failing-disposer", func() error {
+		return errors.New("boom")
+	})
+
+	err := h.loader.Apply(context.Background(), manifest.Deployment{}, h.root)
+	if err == nil {
+		t.Fatal("Apply must report an unload whose disposal failed")
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("the error must carry the disposal's own failure, got %q", err)
+	}
+	if !strings.Contains(err.Error(), echoPluginName) {
+		t.Fatalf("the error must name the plugin whose disposal failed, got %q", err)
+	}
+
+	if got := h.owners(); len(got) != 0 {
+		t.Fatalf("the owner is cleared even by a failed disposal, ledger holds %v", got)
+	}
+	if got := h.loader.Status(); len(got) != 0 {
+		t.Fatalf("a removed entry must not be reported as an instance, got %v", got)
+	}
+	unloaded := h.eventsOfType(RuntimeEventUnloaded)
+	if len(unloaded) != 1 {
+		t.Fatalf("want one %s event, got %v", RuntimeEventUnloaded, unloaded)
+	}
+	if !strings.Contains(unloaded[0].Message, "error=") || !strings.Contains(unloaded[0].Message, "boom") {
+		t.Fatalf("%s must carry the disposal failure, got %q", RuntimeEventUnloaded, unloaded[0].Message)
+	}
+}
+
+// TestApplyReportsAFailedDisposalOfAReplacedInstance is the same failure on the
+// replace path, where it is worse: the replacement comes up, so Status says
+// state=loaded — and it has to say WHY there is a leaked runtime behind it,
+// otherwise the only trace is a log line.
+func TestApplyReportsAFailedDisposalOfAReplacedInstance(t *testing.T) {
+	h := newHarness(t)
+	h.apply(h.writeEcho("1.0.0"))
+	h.ledger.Add(ownerFor(echoPluginName, "1.0.0"), "test-failing-disposer", func() error {
+		return errors.New("boom")
+	})
+
+	replacement := h.writeEcho("2.0.0")
+	err := h.loader.Apply(
+		context.Background(),
+		manifest.Deployment{Plugins: []manifest.Entry{replacement}},
+		h.root,
+	)
+	if err == nil {
+		t.Fatal("Apply must report a previous instance that would not go down cleanly")
+	}
+	if !strings.Contains(err.Error(), "boom") {
+		t.Fatalf("the error must carry the disposal's own failure, got %q", err)
+	}
+
+	// The replacement still came up: a failed disposal is a leak, not a reason
+	// to leave the entry unmounted.
+	wantStrings(t, "ledger owners", h.owners(), []string{"plugin:" + echoPluginName + "@2.0.0"})
+	wantStrings(t, "registered tools", h.toolNames(), []string{echoToolName})
+	if failed := h.eventsOfType(RuntimeEventActivationFailed); len(failed) != 0 {
+		t.Fatalf("the replacement activated, so nothing may report an activation failure, got %v", failed)
+	}
+
+	status := h.loader.Status()
+	if len(status) != 1 {
+		t.Fatalf("want one status row, got %v", status)
+	}
+	if status[0].State != StateLoaded || status[0].Version != "2.0.0" {
+		t.Fatalf("the replacement must be reported as running, got %+v", status[0])
+	}
+	if !strings.Contains(status[0].LastError, "boom") {
+		t.Fatalf("a leaked runtime must stay visible on the status row, got %+v", status[0])
+	}
+	unloaded := h.eventsOfType(RuntimeEventUnloaded)
+	if len(unloaded) != 1 || !strings.Contains(unloaded[0].Message, "boom") {
+		t.Fatalf("%s must carry the disposal failure, got %v", RuntimeEventUnloaded, unloaded)
+	}
+}
+
+// TestApplyReportsAFailedDisposalAlongsideAFailedReplacement: when the unload
+// fails AND the replacement then fails too, both reasons have to travel
+// together — in the returned error, on the status row, and in the
+// plugin/activation_failed payload an operator actually reads.
+func TestApplyReportsAFailedDisposalAlongsideAFailedReplacement(t *testing.T) {
+	h := newHarness(t)
+	h.apply(h.writeEcho("1.0.0"))
+	h.ledger.Add(ownerFor(echoPluginName, "1.0.0"), "test-failing-disposer", func() error {
+		return errors.New("boom")
+	})
+
+	broken := h.writeEcho("2.0.0", echoToolName, ghostToolName)
+	err := h.loader.Apply(context.Background(), manifest.Deployment{Plugins: []manifest.Entry{broken}}, h.root)
+	if err == nil {
+		t.Fatal("Apply must report both the failed disposal and the failed replacement")
+	}
+	if !strings.Contains(err.Error(), "boom") || !strings.Contains(err.Error(), ghostToolName) {
+		t.Fatalf("both failures must be identifiable in the returned error, got %q", err)
+	}
+
+	failed := h.eventsOfType(RuntimeEventActivationFailed)
+	if len(failed) != 1 {
+		t.Fatalf("want one %s event, got %v", RuntimeEventActivationFailed, failed)
+	}
+	if !strings.Contains(failed[0].Message, "boom") || !strings.Contains(failed[0].Message, ghostToolName) {
+		t.Fatalf("%s must carry both failures, got %q", RuntimeEventActivationFailed, failed[0].Message)
+	}
+	if !strings.Contains(failed[0].Message, "restored="+restoredYes) {
+		t.Fatalf("the previous instance must still be restored, got %q", failed[0].Message)
+	}
+
+	status := h.loader.Status()
+	if len(status) != 1 || status[0].Version != "1.0.0" || status[0].State != StateLoaded {
+		t.Fatalf("the restored instance must be the one running, got %v", status)
+	}
+	if !strings.Contains(status[0].LastError, "boom") || !strings.Contains(status[0].LastError, ghostToolName) {
+		t.Fatalf("the status row must carry both failures, got %+v", status[0])
 	}
 }

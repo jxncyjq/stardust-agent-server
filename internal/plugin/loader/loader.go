@@ -71,12 +71,14 @@ import (
 // would fork the event schema.
 const (
 	// RuntimeEventLoaded reports one plugin activated: name, version, sha256,
-	// the capabilities actually granted, the tools it contributed, and the
-	// ledger owner everything it filed lives under.
+	// the capabilities actually granted, the tools it contributed, the ledger
+	// owner everything it filed lives under, and whether this was a fresh mount
+	// or the restoration of a previous instance (reason=).
 	RuntimeEventLoaded = "plugin/loaded"
 
 	// RuntimeEventUnloaded reports one plugin unmounted, with the reason it
-	// went away and how many ledger entries were revoked with it.
+	// went away, how many ledger entries were revoked with it, and the
+	// disposal's own failure if it had one (error=).
 	RuntimeEventUnloaded = "plugin/unloaded"
 
 	// RuntimeEventActivationFailed reports one plugin that did not come up:
@@ -98,12 +100,26 @@ const (
 	reasonReplaced        = "replaced"
 )
 
+// The reasons a plugin is mounted, as they appear in a RuntimeEventLoaded
+// message.
+//
+// A restoration is called out because it reads backwards otherwise: it is
+// published next to the plugin/activation_failed that FORCED it, and an
+// operator tailing the stream has to be able to tell "the replacement came up"
+// from "the replacement did not come up and the old instance is back".
+const (
+	loadReasonMounted  = "mounted"
+	loadReasonRestored = "restored"
+)
+
 // The convergence steps a single entry passes through, as they appear in a
 // RuntimeEventActivationFailed message. Naming the step is what lets an
-// operator tell "the package on disk is wrong" (load-package) from "the
-// deployment's authorization is wrong" (assemble-spec) from "the plugin itself
-// would not come up" (activate).
+// operator tell "the entry points outside the deployment root" (source) from
+// "the package on disk is wrong" (load-package) from "the deployment's
+// authorization is wrong" (assemble-spec) from "the plugin itself would not
+// come up" (activate).
 const (
+	stepSource       = "source"
 	stepLoadPackage  = "load-package"
 	stepIdentity     = "identity"
 	stepAssembleSpec = "assemble-spec"
@@ -126,9 +142,12 @@ const (
 // The states an InstanceStatus reports.
 const (
 	// StateLoaded means the plugin is mounted right now. Its LastError may
-	// still be non-empty: a replacement that failed and was rolled back leaves
-	// the previous instance running AND the failure that forced the rollback
-	// visible.
+	// still be non-empty, in two cases: a replacement that failed and was
+	// rolled back leaves the previous instance running AND the failure that
+	// forced the rollback visible; and a replacement that came up after its
+	// predecessor's disposal FAILED carries that disposal failure, because a
+	// wasm runtime that would not close is a leak an operator has to be able to
+	// see from the status.
 	StateLoaded = "loaded"
 
 	// StateFailed means the entry is in the target state but nothing is
@@ -294,13 +313,25 @@ func New(cfg Config) (*Loader, error) {
 // grant, accepted tools and config — see fingerprintOf for why each is in
 // there.
 //
-// Unloads run first, before any activation, so a tool name that moves from one
-// plugin to another in the same convergence is free by the time its new owner
-// claims it.
+// It runs in three passes, and the split is the load-bearing part:
 //
-// Order within a step is the deployment's own entry order, so a convergence is
-// reproducible and its event stream reads in the order the operator wrote the
-// manifest.
+//  1. Every desired entry's package is read, checked, assembled and fingerprinted.
+//     Nothing running is touched, so an entry whose package is broken fails on
+//     its own and leaves its running instance alone.
+//  2. EVERY unload this convergence performs runs — both the entries that left
+//     the target state and the old instances of entries whose content changed.
+//  3. Every entry that needs one is activated.
+//
+// Pass 2 is why a tool name moving from one plugin to another converges in a
+// SINGLE Apply: every name this convergence frees is free before any activation
+// claims one, whether the name is being released by an entry that is going away
+// or by an entry that is merely being replaced. "Run it twice and it settles"
+// is not what a convergence function may ask of an operator.
+//
+// Order within a pass is the deployment's own entry order (unloads go in sorted
+// name order, since a mounted instance has no deployment position of its own),
+// so a convergence is reproducible and its event stream reads in the order the
+// operator wrote the manifest.
 //
 // Every failure is reported and none aborts the rest: each entry is converged
 // independently and Apply returns errors.Join of everything that went wrong,
@@ -338,25 +369,6 @@ func (l *Loader) Apply(ctx context.Context, dep manifest.Deployment, root string
 
 	var errs []error
 
-	mounted := make([]string, 0, len(l.instances))
-	for name := range l.instances {
-		mounted = append(mounted, name)
-	}
-	sort.Strings(mounted)
-	for _, name := range mounted {
-		if desired[name] {
-			continue
-		}
-		reason := reasonManifestRemoved
-		if declared[name] {
-			reason = reasonDisabled
-		}
-		inst := l.instances[name]
-		delete(l.instances, name)
-		if _, err := l.unload(ctx, inst, reason); err != nil {
-			errs = append(errs, err)
-		}
-	}
 	// A recorded failure outlives the Apply that produced it so that "this
 	// plugin is not running, and here is why" stays answerable — but only while
 	// the entry is still in the target state. An entry the operator removed or
@@ -367,9 +379,69 @@ func (l *Loader) Apply(ctx context.Context, dep manifest.Deployment, root string
 		}
 	}
 
+	// Pass 1: work out what each desired entry needs, touching nothing.
+	plans := make([]*convergePlan, 0, len(wanted))
+	planFor := make(map[string]*convergePlan, len(wanted))
 	for _, entry := range wanted {
-		if err := l.converge(ctx, entry, root); err != nil {
+		plan, err := l.prepare(ctx, entry, root)
+		if err != nil {
 			errs = append(errs, fmt.Errorf("converge plugin %q: %w", entry.Name, err))
+			continue
+		}
+		if plan == nil {
+			// Unchanged: leave the running instance exactly as it is. Rebuilding
+			// it would discard whatever the guest holds in memory and pay a fresh
+			// instantiation for no change at all.
+			continue
+		}
+		plans = append(plans, plan)
+		planFor[entry.Name] = plan
+	}
+
+	// Pass 2: free everything this convergence frees — the entries that left the
+	// target state AND the previous instances of the entries that changed —
+	// before pass 3 activates anything. A replaced instance's own unload belongs
+	// here and not next to its activation, so that a tool name it releases is
+	// available to whichever entry claims it next, in this same Apply.
+	mounted := make([]string, 0, len(l.instances))
+	for name := range l.instances {
+		mounted = append(mounted, name)
+	}
+	sort.Strings(mounted)
+	for _, name := range mounted {
+		plan := planFor[name]
+		var reason string
+		switch {
+		case plan != nil && plan.prev != nil:
+			reason = reasonReplaced
+		case desired[name]:
+			continue
+		case declared[name]:
+			reason = reasonDisabled
+		default:
+			reason = reasonManifestRemoved
+		}
+		inst := l.instances[name]
+		delete(l.instances, name)
+		revoked, err := l.unload(ctx, inst, reason)
+		if plan != nil {
+			// The replacement carries its predecessor's disposal failure: it is
+			// how many entries a rollback would have to put back, and — if the
+			// disposal failed — a leak that has to stay visible on whatever ends
+			// up mounted under this name.
+			plan.revoked = revoked
+			plan.unloadErr = err
+			continue
+		}
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+
+	// Pass 3: activate, now that every name this Apply frees is free.
+	for _, plan := range plans {
+		if err := l.activate(ctx, plan); err != nil {
+			errs = append(errs, fmt.Errorf("converge plugin %q: %w", plan.entry.Name, err))
 		}
 	}
 	return errors.Join(errs...)
@@ -404,19 +476,47 @@ func (l *Loader) Status() []InstanceStatus {
 	return out
 }
 
-// converge brings one entry to its target state. It is called with l.mu held.
+// convergePlan is one desired entry that needs an activation, with everything
+// pass 1 worked out about it. It exists so that "what has to happen" is decided
+// before pass 2 tears anything down: a plan is the only thing that carries an
+// entry's state between Apply's three passes.
+type convergePlan struct {
+	entry  manifest.Entry
+	dir    string
+	pm     manifest.PluginManifest
+	spec   host.Spec
+	digest string
+
+	// prev is the instance this plan replaces, or nil for an entry that is not
+	// mounted yet. A non-nil prev is what tells pass 2 to unload this name and
+	// what a failed activation is rolled back to.
+	prev *instance
+
+	// revoked and unloadErr are pass 2's answer about prev: how many ledger
+	// entries went with it, and whether its disposal reported a failure. Both
+	// are zero-valued for a plan with no prev.
+	unloadErr error
+	revoked   int
+}
+
+// prepare works out what one entry needs, without touching anything that is
+// running. It returns nil, nil when the entry did not change. It is called with
+// l.mu held.
 //
 // The package is read, checked and assembled BEFORE anything running is torn
 // down, which is what makes a broken new package safe: a plugin.wasm whose
 // digest no longer matches its plugin.json leaves the current instance running
 // and reports the failure, instead of unmounting a working plugin for a
 // replacement that never existed.
-func (l *Loader) converge(ctx context.Context, entry manifest.Entry, root string) error {
-	dir := packageDir(root, entry.Source)
+func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string) (*convergePlan, error) {
+	dir, err := packageDir(entry.Name, root, entry.Source)
+	if err != nil {
+		return nil, l.fail(ctx, entry.Name, "", stepSource, err, nil)
+	}
 
 	pm, wasm, err := manifest.LoadPackage(dir)
 	if err != nil {
-		return l.fail(ctx, entry.Name, "", stepLoadPackage, err, nil, 0)
+		return nil, l.fail(ctx, entry.Name, "", stepLoadPackage, err, nil)
 	}
 	if pm.Name != entry.Name {
 		// The deployment entry's name and the plugin's own name are two
@@ -426,12 +526,12 @@ func (l *Loader) converge(ctx context.Context, entry manifest.Entry, root string
 		// panic in the registry rather than an error anyone can report.
 		mismatch := fmt.Errorf("deployment entry %q loads plugin %q from %s; an entry must be named after "+
 			"the plugin it installs", entry.Name, pm.Name, dir)
-		return l.fail(ctx, entry.Name, pm.Version, stepIdentity, mismatch, nil, 0)
+		return nil, l.fail(ctx, entry.Name, pm.Version, stepIdentity, mismatch, nil)
 	}
 
 	spec, err := manifest.AssembleSpec(pm, entry, l.deployLimits)
 	if err != nil {
-		return l.fail(ctx, entry.Name, pm.Version, stepAssembleSpec, err, nil, 0)
+		return nil, l.fail(ctx, entry.Name, pm.Version, stepAssembleSpec, err, nil)
 	}
 	spec.Wasm = wasm
 
@@ -445,105 +545,116 @@ func (l *Loader) converge(ctx context.Context, entry manifest.Entry, root string
 		missing := fmt.Errorf("plugin %q: Config.Deps returned host.Deps with a nil Tools registry; "+
 			"it is where the plugin's tools are registered, so activating it would mount a plugin "+
 			"nothing can call", entry.Name)
-		return l.fail(ctx, entry.Name, pm.Version, stepDependencies, missing, nil, 0)
+		return nil, l.fail(ctx, entry.Name, pm.Version, stepDependencies, missing, nil)
 	}
 	spec.Deps = deps
 	spec.Registry = deps.Tools
 
 	digest, err := fingerprintOf(entry, pm, spec)
 	if err != nil {
-		return l.fail(ctx, entry.Name, pm.Version, stepFingerprint, err, nil, 0)
+		return nil, l.fail(ctx, entry.Name, pm.Version, stepFingerprint, err, nil)
 	}
 
 	prev := l.instances[entry.Name]
 	if prev != nil && prev.fingerprint == digest {
-		// Unchanged: leave the running instance exactly as it is. Rebuilding it
-		// would discard whatever the guest holds in memory and pay a fresh
-		// instantiation for no change at all.
-		return nil
+		return nil, nil
 	}
+	return &convergePlan{entry: entry, dir: dir, pm: pm, spec: spec, digest: digest, prev: prev}, nil
+}
 
-	var errs []error
-	revoked := 0
-	if prev != nil {
-		// The old instance goes first, and not only for tidiness: its owner
-		// carries the version, so a same-version replacement would reuse it,
-		// and host.Activate refuses an owner that already holds anything.
-		delete(l.instances, entry.Name)
-		n, err := l.unload(ctx, prev, reasonReplaced)
-		revoked = n
-		if err != nil {
-			// The tools and the gateable entries are revoked even by a
-			// DisposeOwner that reports a failure (only the pool drain and the
-			// runtime close can fail), so the new instance can still be
-			// activated. Report the failure and carry on converging.
-			errs = append(errs, err)
-		}
-	}
+// activate mounts one prepared plan. Its predecessor, if it had one, is already
+// gone: Apply's pass 2 unloaded it, which is both what frees its owner (a
+// same-version replacement reuses it, and host.Activate refuses an owner that
+// already holds anything) and what frees its tool names for whoever claims them
+// next. It is called with l.mu held.
+func (l *Loader) activate(ctx context.Context, plan *convergePlan) error {
+	entry := plan.entry
 
-	// Checked here, after the previous instance is gone (its own names are free
-	// again) and before host.Activate: a tool name another contributor already
-	// owns is fail-loud by PANIC in both the registry and the gateable catalog,
-	// and a panic would abort the whole convergence instead of reporting one
-	// entry. Two plugins claiming one model-facing name is ordinary operator
-	// data, so it has to come back as an error naming both the entry and the
-	// names.
-	if conflicts := toolNameConflicts(spec); len(conflicts) > 0 {
+	// Checked here, after pass 2 (so an entry never conflicts with its own
+	// predecessor, and a name another entry is releasing in this same Apply is
+	// already free) and before host.Activate: a tool name another contributor
+	// already owns is fail-loud by PANIC in both the registry and the gateable
+	// catalog, and a panic would abort the whole convergence instead of
+	// reporting one entry. Two plugins claiming one model-facing name is
+	// ordinary operator data, so it has to come back as an error naming both
+	// the entry and the names.
+	if conflicts := toolNameConflicts(plan.spec); len(conflicts) > 0 {
 		clash := fmt.Errorf("plugin %q contributes tool name(s) %v that another contributor already owns; "+
 			"one name is one tool", entry.Name, conflicts)
-		errs = append(errs, l.fail(ctx, entry.Name, pm.Version, stepToolNames, clash, prev, revoked))
-		return errors.Join(errs...)
+		return l.fail(ctx, entry.Name, plan.pm.Version, stepToolNames, clash, plan)
 	}
 
-	owner := ownerFor(pm.Name, pm.Version)
-	if _, err := host.Activate(ctx, l.ledger, owner, spec); err != nil {
-		activation := fmt.Errorf("activate plugin %q from %s: %w", entry.Name, dir, err)
-		errs = append(errs, l.fail(ctx, entry.Name, pm.Version, stepActivate, activation, prev, revoked))
-		return errors.Join(errs...)
+	owner := ownerFor(plan.pm.Name, plan.pm.Version)
+	if _, err := host.Activate(ctx, l.ledger, owner, plan.spec); err != nil {
+		activation := fmt.Errorf("activate plugin %q from %s: %w", entry.Name, plan.dir, err)
+		return l.fail(ctx, entry.Name, plan.pm.Version, stepActivate, activation, plan)
 	}
 
 	inst := &instance{
 		name:        entry.Name,
-		version:     pm.Version,
+		version:     plan.pm.Version,
 		owner:       owner,
-		spec:        spec,
-		fingerprint: digest,
-		sha256:      pm.SHA256,
-		tools:       toolNames(spec.Tools),
+		spec:        plan.spec,
+		fingerprint: plan.digest,
+		sha256:      plan.pm.SHA256,
+		tools:       toolNames(plan.spec.Tools),
+	}
+	if plan.unloadErr != nil {
+		// The replacement came up, but its predecessor did not go down cleanly:
+		// only the pool drain and the runtime close can fail a DisposeOwner, so
+		// what is left behind is a leaked wasm runtime. It travels out in Apply's
+		// error, and it stays on the status row too — an operator looking at
+		// "state=loaded" has to be able to see it.
+		inst.lastError = plan.unloadErr.Error()
 	}
 	l.instances[entry.Name] = inst
 	delete(l.failures, entry.Name)
 	l.logger.Info("plugin loaded",
 		"plugin", inst.name, "version", inst.version, "owner", string(inst.owner), "tools", inst.tools)
-	l.publish(ctx, RuntimeEventLoaded, formatLoadedMessage(inst))
-	return errors.Join(errs...)
+	l.publish(ctx, RuntimeEventLoaded, formatLoadedMessage(inst, loadReasonMounted))
+	return plan.unloadErr
 }
 
 // fail records one entry's failure, restores the previous instance if the
 // failure took one down, publishes plugin/activation_failed and returns
 // everything that went wrong. It is called with l.mu held.
 //
-// prev is the instance this failure unmounted and must therefore bring back, or
-// nil when the failure happened before anything was touched. revoked is how
-// many ledger entries were revoked when prev was unmounted — i.e. how many this
-// failure has to put back. (The activation's OWN rollback is not counted here:
-// host.Activate rolls back everything it filed and reports no count, and
-// inventing one would be a number nobody measured.)
+// plan is the entry's convergence plan, or nil when the failure happened in
+// pass 1 — before anything was touched, so there is nothing to restore and no
+// earlier failure to carry. From a non-nil plan the failure inherits the
+// instance it must bring back (plan.prev), how many ledger entries were revoked
+// when that instance was unmounted — i.e. how many this failure has to put back
+// — and the unload's own failure if it had one, which is joined in ahead of the
+// cause because it happened first. (The activation's OWN rollback is not
+// counted: host.Activate rolls back everything it filed and reports no count,
+// and inventing one would be a number nobody measured.)
 func (l *Loader) fail(
 	ctx context.Context,
 	name, version, step string,
 	cause error,
-	prev *instance,
-	revoked int,
+	plan *convergePlan,
 ) error {
-	errs := []error{cause}
+	var errs []error
+	var prev *instance
+	revoked := 0
+	if plan != nil {
+		if plan.unloadErr != nil {
+			errs = append(errs, plan.unloadErr)
+		}
+		prev = plan.prev
+		revoked = plan.revoked
+	}
+	errs = append(errs, cause)
+
 	restored := restoredNone
+	var restoredInstance *instance
 	if prev != nil {
 		if err := l.restore(ctx, prev); err != nil {
 			errs = append(errs, err)
 			restored = restoredNo
 		} else {
 			restored = restoredYes
+			restoredInstance = prev
 		}
 	}
 	joined := errors.Join(errs...)
@@ -562,19 +673,34 @@ func (l *Loader) fail(
 		"rolled_back", revoked, "restored", restored, "error", joined)
 	l.publish(ctx, RuntimeEventActivationFailed,
 		formatActivationFailedMessage(name, version, step, revoked, restored, joined))
+
+	// The restore's own plugin/loaded goes out AFTER the failure that forced it,
+	// so the stream reads unloaded(replaced) -> activation_failed -> loaded, and
+	// carries reason=restored. Published the other way round an operator sees a
+	// load immediately followed by a failure and blames the load that succeeded.
+	if restoredInstance != nil {
+		l.publish(ctx, RuntimeEventLoaded, formatLoadedMessage(restoredInstance, loadReasonRestored))
+	}
 	return joined
 }
 
 // restore re-activates a previous instance from the Spec it was mounted from,
 // under its own owner (which the unload freed). It is called with l.mu held.
+//
+// It does not publish: its plugin/loaded is fail's to send, after the
+// plugin/activation_failed that explains why a restore was needed at all.
 func (l *Loader) restore(ctx context.Context, prev *instance) error {
 	if _, err := host.Activate(ctx, l.ledger, prev.owner, prev.spec); err != nil {
 		return fmt.Errorf("restore previous instance of plugin %q (owner %s): %w", prev.name, prev.owner, err)
 	}
 	l.instances[prev.name] = prev
+	// Defensive: a name cannot be in failures and instances at once today
+	// (fail only writes a failure record when nothing is mounted, and this
+	// insertion happens first), but the invariant is implicit, and a duplicate
+	// Status row for one entry would be a diagnosis that contradicts itself.
+	delete(l.failures, prev.name)
 	l.logger.Info("previous plugin instance restored",
 		"plugin", prev.name, "version", prev.version, "owner", string(prev.owner))
-	l.publish(ctx, RuntimeEventLoaded, formatLoadedMessage(prev))
 	return nil
 }
 
@@ -584,7 +710,9 @@ func (l *Loader) restore(ctx context.Context, prev *instance) error {
 // The event is published whether or not the disposal reported a failure: the
 // plugin IS unmounted either way (lifecycle.Ledger.DisposeOwner clears the
 // owner even when a disposer fails), and a failure that reached nobody would be
-// the worst of both.
+// the worst of both. The event carries the failure in its error= field, so an
+// operator reading the event stream sees the same thing the returned error
+// says.
 func (l *Loader) unload(ctx context.Context, inst *instance, reason string) (int, error) {
 	revoked := len(l.ledger.Snapshot()[inst.owner])
 	disposeErr := l.ledger.DisposeOwner(inst.owner)
@@ -598,7 +726,7 @@ func (l *Loader) unload(ctx context.Context, inst *instance, reason string) (int
 			"plugin", inst.name, "version", inst.version, "owner", string(inst.owner),
 			"reason", reason, "revoked", revoked)
 	}
-	l.publish(ctx, RuntimeEventUnloaded, formatUnloadedMessage(inst, reason, revoked))
+	l.publish(ctx, RuntimeEventUnloaded, formatUnloadedMessage(inst, reason, revoked, disposeErr))
 
 	if disposeErr != nil {
 		return revoked, fmt.Errorf("unload plugin %q (owner %s, reason %s): %w",
@@ -630,14 +758,32 @@ func ownerFor(name, version string) lifecycle.Owner {
 	return lifecycle.Owner("plugin:" + name + "@" + version)
 }
 
-// packageDir resolves one entry's Source. A relative source is resolved against
-// the deployment root; an absolute one is taken as it stands, since joining it
-// onto the root would silently produce a path the operator never wrote.
-func packageDir(root, source string) string {
+// packageDir resolves one entry's Source against the deployment root, refusing
+// anything that would read plugin code from outside it.
+//
+// root is what bounds where plugin code comes from, and a bound that only holds
+// when the operator happens to write well-behaved paths is not a bound: an
+// absolute source ignores root entirely, and a relative one containing ".."
+// walks out of it (filepath.Join cleans a path, it does not confine it). Both
+// are refused by name, naming the entry and the source, rather than silently
+// loading a module from wherever the string pointed — a plugin's wasm is code
+// that runs, so where it is read from is a trust decision.
+func packageDir(name, root, source string) (string, error) {
 	if filepath.IsAbs(source) {
-		return filepath.Clean(source)
+		return "", fmt.Errorf("plugin %q: source %q is absolute; a plugin source must be relative to the "+
+			"deployment root %s, which is what bounds where plugin code is read from", name, source, root)
 	}
-	return filepath.Join(root, source)
+	dir := filepath.Join(root, source)
+	rel, err := filepath.Rel(root, dir)
+	if err != nil {
+		return "", fmt.Errorf("plugin %q: source %q cannot be resolved against the deployment root %s: %w",
+			name, source, root, err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("plugin %q: source %q escapes the deployment root %s (it resolves to %s); "+
+			"plugin code is only read from inside the root", name, source, root, dir)
+	}
+	return dir, nil
 }
 
 // fingerprintInput is everything "did this entry change?" is decided on. It is
@@ -741,17 +887,25 @@ func grantedCapabilities(g perm.Grant) []string {
 	return names
 }
 
-// formatLoadedMessage renders a RuntimeEventLoaded payload.
-func formatLoadedMessage(inst *instance) string {
-	return fmt.Sprintf("plugin=%s version=%s sha256=%s owner=%s capabilities=[%s] tools=[%s]",
-		inst.name, inst.version, inst.sha256, inst.owner,
+// formatLoadedMessage renders a RuntimeEventLoaded payload. reason is
+// loadReasonMounted or loadReasonRestored.
+func formatLoadedMessage(inst *instance, reason string) string {
+	return fmt.Sprintf("plugin=%s version=%s sha256=%s owner=%s reason=%s capabilities=[%s] tools=[%s]",
+		inst.name, inst.version, inst.sha256, inst.owner, reason,
 		strings.Join(grantedCapabilities(inst.spec.Grant), " "), strings.Join(inst.tools, " "))
 }
 
-// formatUnloadedMessage renders a RuntimeEventUnloaded payload.
-func formatUnloadedMessage(inst *instance, reason string, revoked int) string {
-	return fmt.Sprintf("plugin=%s version=%s reason=%s revoked=%d",
-		inst.name, inst.version, reason, revoked)
+// formatUnloadedMessage renders a RuntimeEventUnloaded payload. disposeErr is
+// the disposal's own failure, or nil; the field is present either way (empty
+// when the unload was clean) so the payload has one shape a consumer can parse,
+// the same way plugin/activation_failed's error= always is.
+func formatUnloadedMessage(inst *instance, reason string, revoked int, disposeErr error) string {
+	text := ""
+	if disposeErr != nil {
+		text = strings.ReplaceAll(disposeErr.Error(), "\n", "; ")
+	}
+	return fmt.Sprintf("plugin=%s version=%s reason=%s revoked=%d error=%s",
+		inst.name, inst.version, reason, revoked, text)
 }
 
 // formatActivationFailedMessage renders a RuntimeEventActivationFailed
