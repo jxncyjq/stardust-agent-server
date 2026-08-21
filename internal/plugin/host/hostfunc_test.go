@@ -469,6 +469,15 @@ func TestBuildHostModuleFailsWhenGrantedCapabilityLacksDependency(t *testing.T) 
 			wantMessage: "Deps.Agent",
 		},
 		{
+			// call_tool denies (depth cap, no/exhausted shared budget, policy /
+			// path-guardrail refusal) all publish through Deps.Events exactly like
+			// http and fs do, so tool needs the same event-bus requirement.
+			name:        "tool without an event bus",
+			grant:       perm.Grant{Tool: true},
+			mutate:      func(d *Deps) { d.Events = nil },
+			wantMessage: "Deps.Events",
+		},
+		{
 			name:        "any capability without a plugin name",
 			grant:       perm.Grant{Log: true},
 			mutate:      func(d *Deps) { d.PluginName = "" },

@@ -120,8 +120,10 @@ type Deps struct {
 
 	// Events receives a plugin/call_failed runtime event for every host-side
 	// denial, so a refused plugin is visible in the event stream and not only
-	// in the guest's own error handling. Required by the http and fs
-	// capabilities, which are the ones that can deny.
+	// in the guest's own error handling. Required by the http, fs and tool
+	// capabilities, which are the ones that can deny: tool joined the other
+	// two because call_tool's depth-cap, budget and policy/path-guardrail
+	// refusals are denials that publish events exactly like http and fs do.
 	Events port.EventBus
 
 	// Tools executes call_tool's calls. Plugin tool calls go through
@@ -346,9 +348,9 @@ func validateDeps(g perm.Grant, deps Deps) error {
 			}
 		}
 	}
-	if (g.HTTP || g.FS) && deps.Events == nil {
-		return fmt.Errorf("build host module: capabilities %q/%q can deny a call and must report it, "+
-			"but Deps.Events is nil", capHTTP, capFS)
+	if (g.HTTP || g.FS || g.Tool) && deps.Events == nil {
+		return fmt.Errorf("build host module: capabilities %q/%q/%q can deny a call and must report it, "+
+			"but Deps.Events is nil", capHTTP, capFS, capTool)
 	}
 	if g.Tool {
 		if deps.Tools == nil {
