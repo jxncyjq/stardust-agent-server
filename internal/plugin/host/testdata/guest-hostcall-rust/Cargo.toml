@@ -1,0 +1,16 @@
+[package]
+name = "guest-hostcall-rust"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+# Deliberately dependency-free: this fixture must be rebuildable offline, so
+# its request framing is hand-rolled instead of going through serde_json.
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"

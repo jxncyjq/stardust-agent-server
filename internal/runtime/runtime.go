@@ -211,7 +211,12 @@ type loopState struct {
 	// task, backing the toolLoopCap runaway guard that the name+arguments
 	// repeatGuard cannot see. toolFailGuard counts per-name FAILURES for the
 	// same-tool-failure warning. Both one per RunTask, like repeatGuard.
-	toolNameGuard    *repeatGuard
+	//
+	// toolNameGuard is a sharedToolBudget rather than a bare repeatGuard because
+	// the model is not its only writer: dispatchToolCall installs it on every
+	// dispatched call's context as a tool.LoopBudget, so a plugin's call_tool
+	// spends this same allowance instead of a counter of its own.
+	toolNameGuard    *sharedToolBudget
 	toolFailGuard    *repeatGuard
 	loaded           []loadedEntry
 	resp             port.InferenceResponse
@@ -437,7 +442,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 				images:           cp.Images,
 				tools:            effTools,
 				repeatGuard:      newRepeatGuard(),
-				toolNameGuard:    newRepeatGuard(),
+				toolNameGuard:    newSharedToolBudget(),
 				toolFailGuard:    newRepeatGuard(),
 				// The resumed prompt's catalog is already baked into cp.BasePrompt
 				// from the first run; this rebuilds the dispatch-side catalog so a
@@ -483,7 +488,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		images:           task.Images,
 		tools:            effTools,
 		repeatGuard:      newRepeatGuard(),
-		toolNameGuard:    newRepeatGuard(),
+		toolNameGuard:    newSharedToolBudget(),
 		toolFailGuard:    newRepeatGuard(),
 		catalog:          catalog,
 	}
@@ -528,11 +533,14 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// this counts by tool NAME only. Recorded before executing this round so
 		// the count reflects every call the model has made, including now.
 		// Count the tool the model actually reached, not the call_tool wrapper
-		// the lazy protocol reaches it through: see guardedToolName.
+		// the lazy protocol reaches it through: see domain.GuardedToolName.
+		// The count comes back from the SHARED budget (sharedToolBudget), so calls a
+		// plugin made through call_tool during earlier rounds are already in it: the
+		// model's remaining allowance is reduced by whatever a contributor spent.
 		capHit := ""
 		for _, c := range calls {
-			guarded := guardedToolName(c)
-			if st.toolNameGuard.record(guarded) >= toolLoopCap {
+			guarded := domain.GuardedToolName(c)
+			if count, limit := st.toolNameGuard.Record(guarded); count >= limit {
 				capHit = guarded
 			}
 		}
@@ -548,7 +556,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// Warn only — the loop cap is the hard stop.
 		nameByID := make(map[string]string, len(calls))
 		for _, c := range calls {
-			nameByID[c.ID] = guardedToolName(c)
+			nameByID[c.ID] = domain.GuardedToolName(c)
 		}
 		for _, res := range results {
 			if res.Success {

@@ -6,9 +6,11 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/tool"
 )
 
 // conversation accumulates the multi-turn exchange of one tool loop.
@@ -198,6 +200,46 @@ func (g *repeatGuard) record(signature string) int {
 	g.seen[signature]++
 	return g.seen[signature]
 }
+
+// sharedToolBudget is the task's per-tool-name counter seen through
+// tool.LoopBudget: the seam that lets something the tool loop dispatched into —
+// a plugin's call_tool host function — spend the SAME allowance the loop spends.
+//
+// There is exactly one per RunTask (loopState.toolNameGuard), and the loop's own
+// per-name accounting goes through it too, so the map behind it has one writer
+// path rather than two. A counter of its own for the plugin would be a channel
+// around the task's total budget: toolLoopCap would see a quiet task while a
+// contributor drove one tool without limit.
+//
+// The mutex is not decoration and not a leftover. repeatGuard is a plain map with
+// no synchronization of its own, and this budget is handed to every dispatched
+// tool call on its context: a handler is free to charge it from a goroutine of its
+// own while the loop records the next round, and an unsynchronized map racing that
+// way is a fatal "concurrent map writes", not a wrong number.
+type sharedToolBudget struct {
+	mu    sync.Mutex
+	guard *repeatGuard
+}
+
+// newSharedToolBudget returns an empty per-task tool budget.
+func newSharedToolBudget() *sharedToolBudget {
+	return &sharedToolBudget{guard: newRepeatGuard()}
+}
+
+// Record counts one call of the tool named name and returns the task's running
+// total for that name together with toolLoopCap, the ceiling in force. It
+// implements tool.LoopBudget; see that interface for why counting and reporting
+// are one call rather than a peek plus an increment.
+func (b *sharedToolBudget) Record(name string) (count, limit int) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.guard.record(name), toolLoopCap
+}
+
+// The budget is installed on every dispatched call's context as a
+// tool.LoopBudget, so a signature drift must fail here rather than at the
+// installation site.
+var _ tool.LoopBudget = (*sharedToolBudget)(nil)
 
 // repeatedCallStreak reports how many consecutive rounds requested exactly the
 // same tool calls, counting the pending calls as the newest round. It returns 1

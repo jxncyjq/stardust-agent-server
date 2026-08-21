@@ -177,7 +177,7 @@ func TestRuntimeCallToolFailLoudOnBadInput(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			call := domain.ToolCall{ID: "meta-call", Name: metaToolCallTool, Arguments: tc.args}
-			st := &loopState{tools: runner.tools}
+			st := &loopState{tools: runner.tools, toolNameGuard: newSharedToolBudget()}
 			result, err := runner.dispatchToolCall(context.Background(), agent, task, call, st)
 			if err != nil {
 				t.Fatalf("dispatchToolCall(%s) returned Go error = %v, want fail-loud ToolResult", tc.name, err)

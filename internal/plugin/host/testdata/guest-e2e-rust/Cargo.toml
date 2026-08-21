@@ -1,0 +1,17 @@
+[package]
+name = "guest-e2e-rust"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+# Deliberately dependency-free, like the other two fixtures: it must be
+# rebuildable offline, so every body it returns is a hand-written literal
+# instead of something serde_json produced.
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"

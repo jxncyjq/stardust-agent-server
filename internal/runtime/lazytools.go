@@ -69,29 +69,6 @@ func metaInferenceTools() []port.InferenceTool {
 	}
 }
 
-// guardedToolName returns the tool name the runaway guards must count for
-// call: the tool the model actually reached, not the protocol wrapper it
-// reached it through.
-//
-// Under the lazy protocol every real tool arrives as call_tool with the real
-// name in arguments.tool_name. Counting call.Name there collapses every
-// distinct tool onto one counter, so the per-tool cap degrades into a global
-// one that cuts healthy runs short, and the cap/failure messages blame a
-// wrapper the model cannot stop using.
-//
-// A call_tool with no tool_name falls back to the wrapper name: dispatch
-// rejects it anyway, and attributing it to the empty string would merge every
-// malformed call into one nameless counter.
-func guardedToolName(call domain.ToolCall) string {
-	if call.Name != metaToolCallTool {
-		return call.Name
-	}
-	if wrapped := strings.TrimSpace(call.Arguments["tool_name"]); wrapped != "" {
-		return wrapped
-	}
-	return call.Name
-}
-
 // isMetaTool reports whether name is one of the lazy-protocol meta tools.
 func isMetaTool(name string) bool {
 	return name == metaToolCallTool || name == metaToolLoadCapabilities
@@ -156,6 +133,18 @@ func stringifyArgument(value any) string {
 // drawn from one scoped source: a Plan-mode run dispatches and loads against its
 // read-only subset, never a broader set than it offered.
 func (r *Runtime) dispatchToolCall(ctx context.Context, agent domain.Agent, task domain.Task, call domain.ToolCall, st *loopState) (domain.ToolResult, error) {
+	// The task's shared per-tool-name budget goes on the ctx of every dispatched
+	// call, so anything reached beneath this call that starts tool calls of its own
+	// — a plugin's call_tool host function — spends the same allowance this loop
+	// spends instead of an uncounted one of its own. A nil budget is a wiring bug in
+	// this package, not a task that has no limit: call_tool refuses a call it cannot
+	// count, so silently dispatching without one would turn a whole class of plugin
+	// calls into denials that look like the plugin's fault.
+	if st.toolNameGuard == nil {
+		return domain.ToolResult{}, fmt.Errorf(
+			"dispatch call %s for task %s: the run has no shared tool budget to charge", call.ID, task.ID)
+	}
+	ctx = tool.WithLoopBudget(ctx, st.toolNameGuard)
 	ctx = tool.WithUserTask(ctx, task.Input)
 	ctx = tool.WithChatSession(ctx, task.SessionID)
 	// A delegated sub-run's calls land in the same audit trail as its parent's.

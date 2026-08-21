@@ -106,6 +106,30 @@ type ToolCall struct {
 	RiskLevel string            `json:"risk_level"`
 }
 
+// GuardedToolName returns the tool name the runaway guards must count for
+// call: the tool the model actually reached, not the protocol wrapper it
+// reached it through.
+//
+// Under the lazy protocol every real tool arrives as call_tool with the real
+// name in arguments.tool_name. Counting call.Name there collapses every
+// distinct tool onto one counter, so the per-tool cap degrades into a global
+// one that cuts healthy runs short, and the cap/failure messages blame a
+// wrapper the model cannot stop using.
+//
+// A call_tool with no tool_name falls back to the wrapper name: dispatch
+// rejects it anyway, and attributing it to the empty string would merge every
+// malformed call into one nameless counter.
+func GuardedToolName(call ToolCall) string {
+	const metaToolCallTool = "call_tool"
+	if call.Name != metaToolCallTool {
+		return call.Name
+	}
+	if wrapped := strings.TrimSpace(call.Arguments["tool_name"]); wrapped != "" {
+		return wrapped
+	}
+	return call.Name
+}
+
 type ToolResult struct {
 	CallID  string `json:"call_id"`
 	Success bool   `json:"success"`
