@@ -394,10 +394,16 @@ func TestNewRequiresEveryDependency(t *testing.T) {
 		corrupt func(*Config)
 		field   string
 	}{
+		// This table is the whole list of New's required fields, and it has to
+		// stay that way: boundary_test.go covers Gate and ApplyWait a second
+		// time with their own reasoning, but somebody adding a required field
+		// will read this table and nothing else.
 		{name: "no ledger", corrupt: func(c *Config) { c.Ledger = nil }, field: "Ledger"},
 		{name: "no deps", corrupt: func(c *Config) { c.Deps = nil }, field: "Deps"},
 		{name: "no events", corrupt: func(c *Config) { c.Events = nil }, field: "Events"},
 		{name: "no logger", corrupt: func(c *Config) { c.Logger = nil }, field: "Logger"},
+		{name: "no gate", corrupt: func(c *Config) { c.Gate = nil }, field: "Gate"},
+		{name: "no apply wait", corrupt: func(c *Config) { c.ApplyWait = 0 }, field: "ApplyWait"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

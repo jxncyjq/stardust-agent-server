@@ -45,8 +45,10 @@ var errApplyInProgress = errors.New("another plugin change is already being appl
 // # How it behaves
 //
 // Begin registers an in-flight task and returns the end func that retires it.
-// ApplyAtBoundary marks a change pending, waits (bounded) for the in-flight
-// count to reach zero, runs fn there, and clears the flag.
+// BeginChild registers a continuation of a task that is already in flight (a
+// delegated sub-task) and never refuses. ApplyAtBoundary marks a change
+// pending, waits (bounded) for the in-flight count to reach zero, runs fn
+// there, and clears the flag.
 //
 // Two choices are deliberate and should not be softened:
 //
@@ -60,6 +62,23 @@ var errApplyInProgress = errors.New("another plugin change is already being appl
 //     precisely the mid-task change this gate forbids, and a timeout is the
 //     case where it would hurt most (a long task is the one with the most
 //     cache to lose).
+//
+// # What it does NOT guarantee: one catalog per CONTINUOUS execution
+//
+// The unit this gate protects is a stretch of continuous execution, not a task
+// id. A task that suspends for human approval (manual mode: RunTask returns
+// ErrSuspended, its end func runs, the gate reopens) and is later resumed
+// through a fresh RunTask may therefore observe a DIFFERENT plugin catalog
+// across that suspend/resume boundary — including in the conversation it
+// restored from its checkpoint, whose prompt prefix is invalidated by the
+// change exactly as a mid-task apply would have invalidated it.
+//
+// This is an accepted narrowing, not an oversight. A suspended task is waiting
+// on a human and can sit for hours or days; counting it as in flight would let
+// one unanswered approval wedge every plugin reload for as long as it went
+// unanswered, and an operator with no way to load a plugin is a worse failure
+// than one prompt-cache miss on the resumed leg. What the gate still guarantees
+// absolutely is that no apply lands while a task is actually executing.
 //
 // A TaskGate is safe for concurrent use by any number of goroutines, and its
 // zero value is not usable — construct one with NewTaskGate.
@@ -122,6 +141,51 @@ func (g *TaskGate) Begin() (end func(), err error) {
 	}, nil
 }
 
+// BeginChild registers one in-flight task that continues a task already in
+// flight — a delegated sub-task — and returns the end func that retires it.
+//
+// Unlike Begin it never consults the pending flag and therefore never refuses.
+// The contract this gate enforces protects work that has ALREADY started, and a
+// child of an in-flight task is part of that work rather than a new arrival.
+// Refusing it would break the very task the apply is holding: the parent
+// started before the apply was requested, is entitled to finish against the
+// catalog it started with, and would instead see its delegation fail for a
+// reason it can neither retry nor understand. The apply loses nothing by
+// admitting the child — it is already waiting for the parent, and the child
+// finishes inside the parent's own in-flight window (for the one path where it
+// can outlive the parent, RunSubTaskAsync holds a token of its own from spawn
+// time until the background work is over, so that window is covered too).
+//
+// Because there is no refusal there is no error to report, so BeginChild
+// returns only end. end carries exactly Begin's contract: call it once, when
+// the child is over (defer it); a second call panics rather than retiring a
+// task twice.
+//
+// The caller must be certain the task really is a continuation of one already
+// in flight — a top-level task admitted this way would walk straight through a
+// pending apply into a catalog that is being replaced. Calling it while an
+// apply has already reached its boundary (nothing in flight) is that mistake by
+// definition, and panics.
+func (g *TaskGate) BeginChild() (end func()) {
+	g.mu.Lock()
+	if g.pending && g.running == 0 {
+		g.mu.Unlock()
+		panic("runtime: TaskGate.BeginChild: no task is in flight while an apply holds the gate; " +
+			"a child task cannot continue a parent that is not running")
+	}
+	g.running++
+	g.mu.Unlock()
+
+	var ended atomic.Bool
+	return func() {
+		if !ended.CompareAndSwap(false, true) {
+			panic("runtime: TaskGate: end func called more than once; " +
+				"each BeginChild must be retired exactly once")
+		}
+		g.finish()
+	}
+}
+
 // finish retires one in-flight task and, if that was the last one an apply is
 // waiting for, releases the apply.
 func (g *TaskGate) finish() {
@@ -135,8 +199,9 @@ func (g *TaskGate) finish() {
 	g.running--
 	if g.pending && g.running == 0 {
 		// Closes exactly once per apply: idle is made open only when running
-		// was already above zero, running never rises while pending is set
-		// (Begin refuses), so this is the single transition to zero.
+		// was already above zero, and while pending is set running can only
+		// rise from a non-zero count (Begin refuses; BeginChild panics rather
+		// than raise it from zero), so this is the single transition to zero.
 		close(g.idle)
 	}
 }

@@ -413,9 +413,22 @@ func (r *Runtime) Interrupt() {
 // It holds the runtime's task-boundary gate for the entire run, so a plugin
 // change waits for this task to finish instead of changing the capability
 // catalog underneath it. When a plugin change is already waiting for a boundary
-// the task does not start at all and the returned error wraps ErrApplyPending —
-// a caller that matches it with errors.Is can retry shortly, which is a
-// different response from the one a task that genuinely failed deserves.
+// a TOP-LEVEL task does not start at all and the returned error wraps
+// ErrApplyPending — a caller that matches it with errors.Is can retry shortly,
+// which is a different response from the one a task that genuinely failed
+// deserves. A delegated sub-task (Depth above 0) is never refused this way: it
+// continues a task that is already in flight, which the pending apply is
+// already waiting for, so refusing it would break the very task the gate is
+// holding the apply for.
+//
+// The guarantee is one catalog per CONTINUOUS execution, not per task id. A
+// manual-mode task that suspends returns ErrSuspended, which retires the gate
+// like any other ending, so an apply may land while it waits for its human and
+// the resumed leg (a fresh RunTask over the checkpointed conversation) may see
+// a changed catalog. That is accepted deliberately: a suspended task can sit
+// for hours, and counting it as in flight would let one unanswered approval
+// block every plugin reload indefinitely — a worse failure than one
+// prompt-cache miss on resume. See TaskGate's doc for the full reasoning.
 func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.Task) (domain.TaskRun, error) {
 	// The task is registered with the task-boundary gate before anything else
 	// happens, and retired when it is over however it ends. That is both halves
@@ -423,14 +436,27 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	// for it instead of landing underneath it, and a task that would start into
 	// a plugin set that is mid-change does not start at all.
 	//
+	// Depth is what tells the two apart. A runtime at depth 0 is where a task
+	// ARRIVES, so it is the one that can be turned away; every deeper runtime is
+	// built by newSubRuntime for a child of a task whose Begin is still held, so
+	// it registers with BeginChild and is admitted unconditionally. (Depth above
+	// 0 is only ever reached through that delegation path — no production
+	// construction site sets Config.Depth.)
+	//
 	// The refusal is wrapped, not flattened: it carries ErrApplyPending, so a
 	// caller can tell "the plugin set is switching, retry in a moment" from
 	// "this task failed". Returning here costs nothing to unwind — no event has
 	// been published, no inference issued — and it is deliberately NOT recorded
 	// as a learning failure: the task did not fail, it did not run.
-	end, err := r.gate.Begin()
-	if err != nil {
-		return domain.TaskRun{}, fmt.Errorf("run task %s: %w", task.ID, err)
+	var end func()
+	if r.depth > 0 {
+		end = r.gate.BeginChild()
+	} else {
+		gateEnd, err := r.gate.Begin()
+		if err != nil {
+			return domain.TaskRun{}, fmt.Errorf("run task %s: %w", task.ID, err)
+		}
+		end = gateEnd
 	}
 	defer end()
 

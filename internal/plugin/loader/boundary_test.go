@@ -94,6 +94,15 @@ func TestNewRejectsNonPositiveApplyWait(t *testing.T) {
 // registry, or Apply returning at all — are both checked while the task is in
 // flight, so a Loader that converged directly fails here rather than passing on
 // a timing accident.
+//
+// It proves ONLY the loader half of the chain: the in-flight task here is
+// simulated with a bare gate.Begin(), so nothing about it says that a real
+// RunTask registers with the gate at all. That the runtime holds the gate for
+// the whole of a task, and releases it afterwards, is the other half and is
+// proved by TestRunTaskHoldsGateWhileRunning in
+// internal/runtime/taskgate_wiring_test.go. Neither test implies the other:
+// delete either one and the survivor still passes with the chain broken, so
+// they must be maintained as a pair.
 func TestApplyLandsOnlyAtTaskBoundary(t *testing.T) {
 	h := newHarnessWithApplyWait(t, boundaryApplyBound)
 	entry := h.writeEcho("1.0.0")
@@ -130,7 +139,7 @@ func TestApplyLandsOnlyAtTaskBoundary(t *testing.T) {
 		}
 	})
 
-	h.awaitApplyPending(t, done)
+	h.awaitApplyPending(t, done, &applyReturned)
 
 	// The in-flight task's world is unchanged: no tool, no ledger owner, and
 	// nothing the Loader reports as loaded.
@@ -282,7 +291,12 @@ func TestApplyRejectsEmptyRootBeforeReachingTheGate(t *testing.T) {
 // reports ErrApplyPending, the Apply is demonstrably underway AND demonstrably
 // has not converged, so "nothing changed" is a statement about a real window
 // rather than about a race the test happened to win.
-func (h *harness) awaitApplyPending(t *testing.T, done <-chan error) {
+//
+// applyReturned is the caller's own flag, and this helper owns it on the one
+// path where it takes the value out of done: the cleanup would otherwise wait
+// the full boundaryApplyBound on a channel that can never deliver again,
+// padding a failure that should be instant with 30s of silence.
+func (h *harness) awaitApplyPending(t *testing.T, done <-chan error, applyReturned *bool) {
 	t.Helper()
 
 	deadline := time.Now().Add(boundaryPendingBound)
@@ -293,6 +307,7 @@ func (h *harness) awaitApplyPending(t *testing.T, done <-chan error) {
 		}
 		select {
 		case err := <-done:
+			*applyReturned = true
 			t.Fatalf("Apply() returned (%v) while a task was still in flight; "+
 				"the convergence did not wait for a task boundary", err)
 		default:

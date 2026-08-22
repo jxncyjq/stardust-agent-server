@@ -2642,7 +2642,8 @@ func TestDefaultTaskRunnerSandboxesToolsToTaskWorkingDir(t *testing.T) {
 
 	newRunner := func() *defaultTaskRunner {
 		return &defaultTaskRunner{
-			runtimeCfg: agentruntime.Config{Gate: agentruntime.NewTaskGate(),
+			runtimeCfg: agentruntime.Config{
+				Gate:   agentruntime.NewTaskGate(),
 				Events: adapter.NewMemoryEventBus(),
 			},
 			contextRoot: contextRoot,
@@ -2747,7 +2748,8 @@ func TestDefaultTaskRunnerInjectsSessionHistory(t *testing.T) {
 		// A real Core is what renders the "Recent conversation" block, so this
 		// asserts the whole turns -> context -> prompt path, not just field
 		// assignment.
-		runtimeCfg: agentruntime.Config{Gate: agentruntime.NewTaskGate(),
+		runtimeCfg: agentruntime.Config{
+			Gate:           agentruntime.NewTaskGate(),
 			Maas:           maas,
 			Events:         adapter.NewMemoryEventBus(),
 			ContextBuilder: cognitive.NewCore(cognitive.NoopCompressor{}),
