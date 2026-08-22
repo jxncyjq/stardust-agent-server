@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/app"
@@ -239,13 +241,12 @@ func (f *pluginFixture) assembleWithLogger(logger *slog.Logger) error {
 	if err != nil {
 		f.t.Fatalf("load config %s: %v", f.configPath, err)
 	}
-	_, err = assemblePlugins(context.Background(), f.application, cfg, pluginHostDeps{
+	return assemblePlugins(context.Background(), f.application, cfg, pluginHostDeps{
 		Audit:  adapter.NewMemoryAuditLog(),
 		Events: adapter.NewMemoryEventBus(),
 		Logger: logger,
 		Gate:   f.gate,
 	})
-	return err
 }
 
 // run executes one `agent plugins ...` invocation against the fixture's App and
@@ -551,11 +552,17 @@ func TestPluginsReloadFailsWhenNoTaskBoundaryIsReached(t *testing.T) {
 	}
 }
 
-// TestDrainPluginsUnmountsEverythingOnShutdown pins serve's shutdown step. It
-// is not tidiness: a plugin's tool name lives in the process-global gateable
-// catalog, so an embedded host that restarts serve in one process would hit a
-// duplicate-name panic if shutdown left the first run's plugins mounted.
-func TestDrainPluginsUnmountsEverythingOnShutdown(t *testing.T) {
+// TestDrainPluginsUnmountsEverythingAndReleasesTheLoaderSlot covers the drain
+// function itself: everything the loader mounted goes away, AND the App's
+// loader slot is released so the same process can assemble again. The second
+// half is not tidiness either -- App.SetPlugins refuses a second attachment, so
+// a drain that did not detach would make an in-process serve restart fail at
+// assembly even though nothing is mounted any more.
+//
+// Whether serve's own shutdown path actually calls this is a separate question,
+// pinned through the real ServeResult.Close by
+// TestServeResultCloseDrainsPluginsAndAllowsAnInProcessRestart.
+func TestDrainPluginsUnmountsEverythingAndReleasesTheLoaderSlot(t *testing.T) {
 	f := newPluginFixture(t, 30_000)
 	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
 	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
@@ -566,13 +573,132 @@ func TestDrainPluginsUnmountsEverythingOnShutdown(t *testing.T) {
 		t.Fatalf("IsGateable(%q) = false after startup apply, want true", testEchoTool)
 	}
 
-	drainPlugins(f.application.Plugins(), f.root, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	drainPlugins(f.application, f.root, slog.New(slog.NewTextHandler(io.Discard, nil)))
 
 	if toolauth.IsGateable(testEchoTool) {
 		t.Errorf("IsGateable(%q) = true after the shutdown drain, want false", testEchoTool)
 	}
 	if left := f.application.PluginResources(); len(left) != 0 {
 		t.Errorf("PluginResources() = %v after the shutdown drain, want empty", left)
+	}
+	if got := f.application.Plugins(); got != nil {
+		t.Errorf("App.Plugins() = %v after the drain, want nil: the slot must be released", got)
+	}
+	// The slot really is reusable: a second assembly in the same process mounts
+	// the deployment again instead of being refused by SetPlugins.
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() after a drain: error = %v, want nil (a drained slot must be reusable)", err)
+	}
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = false after the second assembly, want true", testEchoTool)
+	}
+}
+
+// TestServeResultCloseDrainsPluginsAndAllowsAnInProcessRestart is the wiring
+// guard the drain function's own test cannot give: it goes through the REAL
+// serve assembly and the ServeResult.Close a host actually calls, so dropping
+// the one-line drainPlugins call from Close is caught here.
+//
+// The restart half is the reason the drain exists. An embedded host (the Wails
+// GUI) stops and restarts serve inside one process; a plugin's tool name lives
+// in the process-global toolauth catalog, so a Close that left the first run's
+// plugins mounted would make the second assembly panic on the duplicate name.
+func TestServeResultCloseDrainsPluginsAndAllowsAnInProcessRestart(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	result, err := BuildServeService(ctx, ServeOptions{
+		ConfigPath: f.configPath,
+		Addr:       "127.0.0.1:0",
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		App:        f.application,
+	})
+	if err != nil {
+		t.Fatalf("BuildServeService() error = %v, want nil", err)
+	}
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Fatalf("IsGateable(%q) = false after serve assembly, want true", testEchoTool)
+	}
+
+	result.Close()
+
+	if toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = true after ServeResult.Close, want false: Close must drain the plugins", testEchoTool)
+	}
+	if left := f.application.PluginResources(); len(left) != 0 {
+		t.Errorf("PluginResources() = %v after ServeResult.Close, want empty", left)
+	}
+
+	restarted, err := BuildServeService(ctx, ServeOptions{
+		ConfigPath: f.configPath,
+		Addr:       "127.0.0.1:0",
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		App:        f.application,
+	})
+	if err != nil {
+		t.Fatalf("BuildServeService() after Close: error = %v, want nil (a drained App must accept the next serve)", err)
+	}
+	defer restarted.Close()
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = false after the in-process restart, want true", testEchoTool)
+	}
+}
+
+// TestBuildServeServiceUnmountsPluginsWhenAssemblyFailsAfterTheMount is the
+// leak guard: the plugins are mounted early in serve assembly, and a dozen
+// failure returns come after that point. The most ordinary one there is -- the
+// address is already taken -- must leave the process as it found it: nothing in
+// the process-global gateable catalog, no live ledger entry, and the App's
+// loader slot free for the retry.
+//
+// Without that, an embedded host retrying after "address already in use" hits
+// toolauth.Contribute's duplicate-name panic on the second attempt.
+func TestBuildServeServiceUnmountsPluginsWhenAssemblyFailsAfterTheMount(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+
+	// Hold the address serve is about to be pointed at, so its net.Listen --
+	// well past the plugin mount -- fails.
+	taken, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("take a port for the test: %v", err)
+	}
+	defer func() {
+		if cerr := taken.Close(); cerr != nil {
+			t.Errorf("close the held listener: %v", cerr)
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	result, err := BuildServeService(ctx, ServeOptions{
+		ConfigPath: f.configPath,
+		Addr:       taken.Addr().String(),
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		App:        f.application,
+	})
+	if err == nil {
+		result.Close()
+		t.Fatal("BuildServeService() error = nil, want an error: the address is already in use")
+	}
+	// Pinned so the test cannot silently start failing BEFORE the plugin mount,
+	// which would make every assertion below vacuous.
+	if !strings.Contains(err.Error(), "listen on") {
+		t.Fatalf("BuildServeService() error = %v, want the listen failure", err)
+	}
+
+	if toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = true after a failed assembly, want false: the mounted plugins must be drained", testEchoTool)
+	}
+	if left := f.application.PluginResources(); len(left) != 0 {
+		t.Errorf("PluginResources() = %v after a failed assembly, want empty", left)
+	}
+	if got := f.application.Plugins(); got != nil {
+		t.Errorf("App.Plugins() = %v after a failed assembly, want nil: the retry needs the slot", got)
 	}
 }
 
@@ -674,5 +800,237 @@ func TestConfigRejectsAnIncompletePluginSection(t *testing.T) {
 				t.Errorf("config.Load() error = %v, want it to name %s", err, tc.want)
 			}
 		})
+	}
+}
+
+// TestPluginsStatusStillReportsMountedPluginsWhenTheManifestIsUnreadable is the
+// diagnostic's own contract. Failing serve assembly on an unreadable manifest
+// is right; blinding `plugins status` is not -- an operator whose plugins.json
+// was deleted or corrupted under a running serve is exactly the operator who
+// needs to know what is still mounted. So the command reports the read failure,
+// still prints the loader's view, and only then exits non-zero.
+func TestPluginsStatusStillReportsMountedPluginsWhenTheManifestIsUnreadable(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	// The manifest goes away under the running deployment; the plugin stays
+	// mounted.
+	if err := os.Remove(f.manifestPath); err != nil {
+		t.Fatalf("remove manifest %s: %v", f.manifestPath, err)
+	}
+
+	out, err := f.run("status")
+	if err == nil {
+		t.Fatal("plugins status error = nil, want an error: the configured manifest cannot be read")
+	}
+	if !strings.Contains(err.Error(), f.manifestPath) {
+		t.Errorf("plugins status error = %v, want it to name the manifest %s", err, f.manifestPath)
+	}
+	if !strings.Contains(out, testEchoPlugin) {
+		t.Fatalf("plugins status output = %q, want the mounted plugin %q still reported", out, testEchoPlugin)
+	}
+	if !strings.Contains(out, testEchoTool) {
+		t.Errorf("plugins status output = %q, want the mounted plugin's tool %q reported", out, testEchoTool)
+	}
+	if !strings.Contains(out, "no longer in the manifest") {
+		t.Errorf("plugins status output = %q, want the row to say the manifest no longer declares it", out)
+	}
+}
+
+// TestPluginsStatusLabelsAFailedEntryTheManifestNoLongerDeclares covers the one
+// row nothing else reaches: the loader still remembers a FAILED entry that the
+// manifest on disk has since dropped. Its failure must keep its own "error="
+// label instead of being folded into the row's "reason=" -- a failure under the
+// wrong label, mid-sentence, is a failure nobody greps for.
+func TestPluginsStatusLabelsAFailedEntryTheManifestNoLongerDeclares(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	// The proxy guest does not provide testGhostTool, so this entry fails at
+	// host.Activate's manifest cross-check.
+	f.writePackage("proxy", testProxyWasm, testProxyPlugin, "3.4.0", []string{"tool"}, []string{testProxyTool, testGhostTool})
+	f.writeManifest(manifestEntry{
+		name: testProxyPlugin, source: "proxy", enabled: true,
+		capabilities: []string{"tool"}, tools: []string{testProxyTool, testGhostTool},
+	})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil (a failed entry must not stop startup)", err)
+	}
+
+	// The entry leaves the manifest, but nobody has reloaded: the loader still
+	// holds its failure.
+	f.writeManifest()
+
+	out, err := f.run("status")
+	if err != nil {
+		t.Fatalf("plugins status error = %v, want nil", err)
+	}
+	line := ""
+	for _, candidate := range strings.Split(out, "\n") {
+		if strings.Contains(candidate, testProxyPlugin) {
+			line = candidate
+			break
+		}
+	}
+	if line == "" {
+		t.Fatalf("plugins status output = %q, want a row for %q", out, testProxyPlugin)
+	}
+	if !strings.Contains(line, "no longer in the manifest") {
+		t.Errorf("plugins status row = %q, want the reason that it left the manifest", line)
+	}
+	at := strings.Index(line, "error=")
+	if at < 0 {
+		t.Fatalf("plugins status row = %q, want the failure labelled error=", line)
+	}
+	if !strings.Contains(line[at:], testGhostTool) {
+		t.Errorf("plugins status row = %q, want the failure text to follow the error= label", line)
+	}
+}
+
+// TestAssemblePluginsFailsWhenTheManifestIsUnparseable is the other half of
+// "configured means meant it": a manifest that exists but is not valid JSON is
+// as much a startup failure as one that is missing, and the error names the
+// file so the operator knows which one to fix.
+func TestAssemblePluginsFailsWhenTheManifestIsUnparseable(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	if err := os.WriteFile(f.manifestPath, []byte("{"), 0o644); err != nil {
+		t.Fatalf("write truncated manifest %s: %v", f.manifestPath, err)
+	}
+
+	err := f.assemble()
+	if err == nil {
+		t.Fatal("assemblePlugins() error = nil, want an error: the manifest is not parseable")
+	}
+	// %q-quoted, which is how the wrapper renders it -- on Windows that means
+	// escaped separators, so the raw path is not a substring of the message.
+	if !strings.Contains(err.Error(), fmt.Sprintf("%q", f.manifestPath)) {
+		t.Errorf("assemblePlugins() error = %v, want it to name the manifest path %s", err, f.manifestPath)
+	}
+	if !strings.Contains(err.Error(), "parse") {
+		t.Errorf("assemblePlugins() error = %v, want it to say the manifest could not be parsed", err)
+	}
+	if got := f.application.Plugins(); got != nil {
+		t.Errorf("App.Plugins() = %v after a refused assembly, want nil", got)
+	}
+}
+
+// TestPluginsStatusWithoutALoaderFails is status's half of the "no loader in
+// this process" answer (reload's half is TestPluginsReloadWithoutALoaderFails).
+// A manifest IS configured, so reporting an empty plugin list would be a lie
+// about a deployment that may well be running in the serve process next door.
+func TestPluginsStatusWithoutALoaderFails(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writeManifest()
+	// Deliberately no assemble(): the App has no loader.
+	_, err := f.run("status")
+	if err == nil {
+		t.Fatal("plugins status error = nil, want an error: there is no loader in this process")
+	}
+	if !strings.Contains(err.Error(), "agent serve") {
+		t.Errorf("plugins status error = %v, want it to say a loader belongs to `agent serve`", err)
+	}
+}
+
+// TestPluginsReloadWithoutAConfiguredManifestFails pins a DELIBERATE asymmetry
+// with status: with no plugins.manifest configured, status answers "plugins are
+// off" and exits 0, while reload fails. They are different questions -- "what is
+// the state?" has an answer here, "converge toward the target state" has no
+// target to converge toward, and reporting success would claim a reload that
+// never happened.
+func TestPluginsReloadWithoutAConfiguredManifestFails(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{"storage": {"driver": "memory"}}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	out := &bytes.Buffer{}
+	err := Execute(app.New(), out, []string{"plugins", "reload", "--config", configPath})
+	if err == nil {
+		t.Fatal("plugins reload error = nil, want an error: there is no deployment to reload")
+	}
+	if !strings.Contains(err.Error(), "plugins.manifest") {
+		t.Errorf("plugins reload error = %v, want it to name the missing plugins.manifest setting", err)
+	}
+
+	// The same config, the same process: status still succeeds.
+	statusOut := &bytes.Buffer{}
+	if err := Execute(app.New(), statusOut, []string{"plugins", "status", "--config", configPath}); err != nil {
+		t.Fatalf("plugins status error = %v, want nil: the asymmetry with reload is deliberate", err)
+	}
+}
+
+// TestPluginsResolveRelativePathsAgainstTheProcessWorkingDirectory pins where a
+// relative plugins.manifest / plugins.root actually resolves: the PROCESS
+// working directory, not the directory --config was read from. The config below
+// lives in a subdirectory that contains neither the manifest nor the packages,
+// so the two rules give different answers and only one of them can pass.
+func TestPluginsResolveRelativePathsAgainstTheProcessWorkingDirectory(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+
+	confDir := filepath.Join(f.dir, "conf")
+	if err := os.MkdirAll(confDir, 0o755); err != nil {
+		t.Fatalf("create config dir %s: %v", confDir, err)
+	}
+	f.configPath = filepath.Join(confDir, "agent.json")
+	f.writeConfig(fmt.Sprintf(`{
+		"storage": {"driver": "memory"},
+		"context_files": {"root": %s},
+		"plugins": {
+			"manifest": "plugins.json",
+			"root": "plugins",
+			"limits": {"timeout_ms": 5000, "max_memory_pages": 64, "max_instances": 1},
+			"apply_wait_ms": 30000
+		}
+	}`, jsonString(f.dir)))
+
+	// Started from anywhere else, those same relative paths resolve to nothing:
+	// the config file's own directory is NOT what they are relative to.
+	t.Chdir(t.TempDir())
+	if err := f.assemble(); err == nil {
+		t.Fatal("assemblePlugins() error = nil from an unrelated working directory, want an error")
+	}
+
+	// Started from the deployment's directory, the same config works.
+	t.Chdir(f.dir)
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil: relative paths resolve against the process working directory", err)
+	}
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = false, want true: the relative deployment must have mounted", testEchoTool)
+	}
+}
+
+// TestWritePluginStatusAlignsNonASCIINames pins that the status table's columns
+// are measured in runes. fmt's width verb pads to a BYTE count, so a plugin
+// whose name is not ASCII would otherwise push its whole row out of the
+// columns -- and the table is read by a human looking down one column.
+func TestWritePluginStatusAlignsNonASCIINames(t *testing.T) {
+	out := &bytes.Buffer{}
+	rows := []pluginStatusRow{
+		{Name: "\u63d2\u4ef6", Version: "1.0.0", State: "loaded"},
+		{Name: "ascii-name", Version: "1.0.0", State: "failed"},
+	}
+	if err := writePluginStatus(out, "plugins.json", "plugins", rows); err != nil {
+		t.Fatalf("writePluginStatus() error = %v, want nil", err)
+	}
+	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("writePluginStatus() wrote %d lines (%q), want a header and two rows", len(lines), out.String())
+	}
+	column := func(line string) int {
+		at := strings.Index(line, "version=")
+		if at < 0 {
+			t.Fatalf("status row = %q, want a version= column", line)
+		}
+		return utf8.RuneCountInString(line[:at])
+	}
+	if first, second := column(lines[1]), column(lines[2]); first != second {
+		t.Errorf("version= column starts at rune %d on %q but %d on %q; the columns must line up for a reader",
+			first, lines[1], second, lines[2])
 	}
 }

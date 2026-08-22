@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/spf13/cobra"
 
@@ -89,43 +90,44 @@ type pluginHostDeps struct {
 // is attached BEFORE the convergence runs, so a failed entry keeps its failure
 // visible in `agent plugins status` for as long as it stays in the manifest.
 //
-// It returns the loader it built, or nil when plugins are not enabled — serve
-// keeps it so it can drain the plugins on shutdown (see drainPlugins).
+// The loader it builds is reachable through application.Plugins(), which is
+// also how serve drains the plugins again (see drainPlugins); nothing is
+// attached at all when plugins are not enabled.
 //
 // ctx bounds the startup convergence's wait for a task boundary, so a caller
 // that cancels on shutdown releases it. In practice the wait is not spent:
 // this runs before the service starts, with no task in flight, so there is no
 // path here that parks a goroutine on a gate nobody will release.
-func assemblePlugins(ctx context.Context, application *app.App, cfg config.Config, deps pluginHostDeps) (*loader.Loader, error) {
+func assemblePlugins(ctx context.Context, application *app.App, cfg config.Config, deps pluginHostDeps) error {
 	if application == nil {
-		return nil, errors.New("assemble plugins: application is nil; there is no lifecycle ledger to file activations under")
+		return errors.New("assemble plugins: application is nil; there is no lifecycle ledger to file activations under")
 	}
 	if strings.TrimSpace(cfg.Plugins.Manifest) == "" {
-		return nil, nil
+		return nil
 	}
 	switch {
 	case deps.Audit == nil:
-		return nil, errors.New("assemble plugins: Audit is nil; a plugin's tool calls would be recorded nowhere")
+		return errors.New("assemble plugins: Audit is nil; a plugin's tool calls would be recorded nowhere")
 	case deps.Events == nil:
-		return nil, errors.New("assemble plugins: Events is nil; a convergence that published nothing would be invisible")
+		return errors.New("assemble plugins: Events is nil; a convergence that published nothing would be invisible")
 	case deps.Logger == nil:
-		return nil, errors.New("assemble plugins: Logger is nil; a convergence that logged nothing would be unexplainable")
+		return errors.New("assemble plugins: Logger is nil; a convergence that logged nothing would be unexplainable")
 	case deps.Gate == nil:
-		return nil, errors.New("assemble plugins: Gate is nil; a convergence with no task-boundary gate would land in the middle of a running task")
+		return errors.New("assemble plugins: Gate is nil; a convergence with no task-boundary gate would land in the middle of a running task")
 	}
 
 	deployment, err := readPluginDeployment(cfg.Plugins.Manifest)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	pluginLoader, err := newPluginLoader(application, cfg, deps)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	// Attached before the convergence, not after: an Apply that fails outright
 	// must still leave a loader whose Status answers "why is nothing mounted?".
 	if err := application.SetPlugins(pluginLoader); err != nil {
-		return nil, err
+		return err
 	}
 	if err := pluginLoader.Apply(ctx, deployment, cfg.Plugins.Root); err != nil {
 		// Loud, and startup continues. The alternative — refusing to serve at
@@ -139,26 +141,42 @@ func assemblePlugins(ctx context.Context, application *app.App, cfg config.Confi
 			"consequence", "the failed entries stay visible in `agent plugins status`",
 			"error", err)
 	}
-	return pluginLoader, nil
+	return nil
 }
 
-// drainPlugins unmounts every plugin the loader has mounted, by converging it
-// toward an EMPTY target state. It is serve's shutdown step, and it is not
+// drainPlugins unmounts every plugin the loader attached to application has
+// mounted, by converging it toward an EMPTY target state, and then detaches the
+// loader (app.App.ClearPlugins) so the same process can assemble serve again.
+//
+// It is serve's shutdown step, and also the cleanup every FAILING serve
+// assembly runs once the plugins are mounted (see BuildServeService). It is not
 // housekeeping for its own sake: a plugin's tool name lives in the
 // PROCESS-GLOBAL gateable catalog (toolauth), so an embedded host that stops
-// and restarts serve in one process would otherwise hit a duplicate-name panic
-// the second time round — and every mounted wasm runtime would stay resident
-// in between.
+// and restarts serve in one process — or simply retries an assembly that failed
+// on "address already in use" — would otherwise hit a duplicate-name panic the
+// second time round, and every mounted wasm runtime would stay resident in
+// between.
 //
 // It must be called after in-flight tasks have drained, so the convergence
 // finds the task gate idle and does not have to wait for a boundary that a
-// stopping service will never reach. A failure is logged at Warn and no
-// further: the process is going away, and there is nothing left to retry
-// against — but a wasm runtime that would not close is a leak the operator has
-// to be able to see.
+// stopping service will never reach. Its wait is bounded only by
+// loader.Config.ApplyWait (config plugins.apply_wait_ms, 60s by default), so a
+// gate still held by something outside the caller's reach delays shutdown by up
+// to that long before the Warn below — bounded, but not short.
 //
-// pluginLoader is nil when plugins are not enabled, which is a no-op.
-func drainPlugins(pluginLoader *loader.Loader, root string, logger *slog.Logger) {
+// A failure is logged at Warn and no further: the process is usually going
+// away, and there is nothing left to retry against — but a wasm runtime that
+// would not close is a leak the operator has to be able to see. A failed drain
+// deliberately does NOT detach: the plugins really are still mounted, and the
+// next SetPlugins must still refuse.
+//
+// application is nil, or holds no loader, when plugins are not enabled — both
+// are a no-op.
+func drainPlugins(application *app.App, root string, logger *slog.Logger) {
+	if application == nil {
+		return
+	}
+	pluginLoader := application.Plugins()
 	if pluginLoader == nil {
 		return
 	}
@@ -166,9 +184,11 @@ func drainPlugins(pluginLoader *loader.Loader, root string, logger *slog.Logger)
 		logger.Warn("unmount plugins on shutdown",
 			"component", "cli",
 			"root", root,
-			"consequence", "wasm runtimes and gateable tool names may stay resident",
+			"consequence", "wasm runtimes and gateable tool names stay resident, and this process cannot assemble serve again",
 			"error", err)
+		return
 	}
+	application.ClearPlugins()
 }
 
 // newPluginLoader builds the Loader for cfg.Plugins, wiring every dependency a
@@ -306,6 +326,20 @@ func newPluginsStatusCommand(application *app.App, out io.Writer) *cobra.Command
 			}
 			deployment, err := readPluginDeployment(cfg.Plugins.Manifest)
 			if err != nil {
+				// The manifest being unreadable is exactly when an operator
+				// needs this command most, so it reports the read failure and
+				// then still prints what the loader actually has mounted —
+				// every entry shows up under the "no longer in the manifest"
+				// row. Failing serve assembly on an unreadable manifest is
+				// right; blinding the diagnostic is not. The command still
+				// exits non-zero, but AFTER printing.
+				if _, werr := fmt.Fprintf(out, "plugins: manifest unreadable, reporting what is mounted: %v\n", err); werr != nil {
+					return fmt.Errorf("write plugin status manifest failure: %w", werr)
+				}
+				if werr := writePluginStatus(out, cfg.Plugins.Manifest, cfg.Plugins.Root,
+					mergePluginStatus(manifest.Deployment{}, pluginLoader.Status())); werr != nil {
+					return werr
+				}
 				return err
 			}
 			return writePluginStatus(out, cfg.Plugins.Manifest, cfg.Plugins.Root,
@@ -378,9 +412,11 @@ type pluginStatusRow struct {
 	State   string
 	Tools   []string
 
-	// Detail is the row's already-labelled explanation ("error=..." for a
-	// failure, "reason=..." for everything else), or empty when a loaded entry
-	// has nothing to explain.
+	// Detail is the row's already-labelled explanation: "error=..." for a
+	// failure, "reason=..." for a state the operator's own manifest explains,
+	// or both (a row that is out of the manifest AND failed carries the reason
+	// followed by its own error=). Empty when a loaded entry has nothing to
+	// explain.
 	Detail string
 }
 
@@ -429,7 +465,13 @@ func mergePluginStatus(deployment manifest.Deployment, statuses []loader.Instanc
 			continue
 		}
 		row := pluginStatusRow{Name: st.Name, Version: st.Version, State: st.State, Tools: st.Tools}
-		row.Detail = detailFor("reason", `no longer in the manifest; run "agent plugins reload" to unmount it. `+st.LastError)
+		row.Detail = detailFor("reason", `no longer in the manifest; run "agent plugins reload" to unmount it`)
+		// The entry's own failure keeps its own "error=" label instead of being
+		// folded into the reason: a failure buried mid-sentence under the wrong
+		// label is a failure nobody greps for.
+		if failure := detailFor("error", st.LastError); failure != "" {
+			row.Detail += "  " + failure
+		}
 		rows = append(rows, row)
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
@@ -456,6 +498,15 @@ func detailFor(label, text string) string {
 	return label + "=" + strings.Join(strings.Fields(trimmed), " ")
 }
 
+// padRunes left-aligns s in a column width runes wide. It exists because the
+// column widths are counted in runes while fmt's width verb counts bytes.
+func padRunes(s string, width int) string {
+	if pad := width - utf8.RuneCountInString(s); pad > 0 {
+		return s + strings.Repeat(" ", pad)
+	}
+	return s
+}
+
 // writePluginStatus prints the header and one aligned line per entry. The
 // header names the manifest and root the rows were read against, because "the
 // plugin is not there" is very often "the manifest is not the one you think".
@@ -470,21 +521,19 @@ func writePluginStatus(w io.Writer, manifestPath, root string, rows []pluginStat
 		return nil
 	}
 
+	// Widths are counted in RUNES, not bytes: fmt's %-*s pads to a byte count,
+	// so a plugin whose name is not ASCII would otherwise push its whole row
+	// out of the columns.
 	nameWidth, stateWidth, versionWidth := 0, 0, 0
 	for _, row := range rows {
-		if len(row.Name) > nameWidth {
-			nameWidth = len(row.Name)
-		}
-		if len(row.State) > stateWidth {
-			stateWidth = len(row.State)
-		}
-		if len(pluginRowVersion(row)) > versionWidth {
-			versionWidth = len(pluginRowVersion(row))
-		}
+		nameWidth = max(nameWidth, utf8.RuneCountInString(row.Name))
+		stateWidth = max(stateWidth, utf8.RuneCountInString(row.State))
+		versionWidth = max(versionWidth, utf8.RuneCountInString(pluginRowVersion(row)))
 	}
 	for _, row := range rows {
-		line := fmt.Sprintf("  %-*s  %-*s  version=%-*s  tools=[%s]",
-			nameWidth, row.Name, stateWidth, row.State, versionWidth, pluginRowVersion(row), strings.Join(row.Tools, " "))
+		line := fmt.Sprintf("  %s  %s  version=%s  tools=[%s]",
+			padRunes(row.Name, nameWidth), padRunes(row.State, stateWidth),
+			padRunes(pluginRowVersion(row), versionWidth), strings.Join(row.Tools, " "))
 		if row.Detail != "" {
 			line += "  " + row.Detail
 		}

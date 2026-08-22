@@ -159,6 +159,12 @@ func (a *App) Plugins() *loader.Loader {
 // either: a nil would be indistinguishable from "plugins are not configured",
 // and a replacement would leave the plugins mounted by the first loader
 // running with nothing tracking them.
+//
+// The refusal is not permanent. A serve that shuts down drains its plugins and
+// then calls ClearPlugins, which releases the slot, so the same process can
+// build serve again and attach the new assembly's loader. The refusal therefore
+// means "something is still mounted under another loader", not "this process
+// has used up its one attachment".
 func (a *App) SetPlugins(pluginLoader *loader.Loader) error {
 	if pluginLoader == nil {
 		return errors.New("set plugin loader: loader is nil; " +
@@ -174,6 +180,23 @@ func (a *App) SetPlugins(pluginLoader *loader.Loader) error {
 	}
 	a.plugins = pluginLoader
 	return nil
+}
+
+// ClearPlugins detaches the loader SetPlugins attached, releasing the slot so a
+// later assembly in the same process can attach its own. Clearing when nothing
+// is attached is a no-op.
+//
+// It is the counterpart of serve's shutdown drain (cli.drainPlugins) and MUST
+// be called only once that drain has actually unmounted everything: detaching a
+// loader whose plugins are still mounted would leave them running with nothing
+// tracking them — exactly the state SetPlugins' refusal of a second attachment
+// exists to prevent. A drain that failed therefore does not clear, so the next
+// SetPlugins still refuses and says why.
+func (a *App) ClearPlugins() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.plugins = nil
 }
 
 func (a *App) RunDemo(ctx context.Context) (DemoResult, error) {

@@ -1898,6 +1898,13 @@ type ServeOptions struct {
 	// the assembly then builds one for itself, and the plugins are loaded and
 	// converged exactly the same way — they are simply not reachable through a
 	// cobra root nobody built.
+	//
+	// The same App may be handed to a later BuildServeService in the same
+	// process: ServeResult.Close (and every failing assembly past the plugin
+	// mount) drains the plugins and releases the App's loader slot, so stopping
+	// and restarting serve in-process works. What it may NOT be is shared by two
+	// serves running at once — the second attachment is refused by name, because
+	// the first serve's plugins are still mounted under a loader it still owns.
 	App *app.App
 }
 
@@ -2320,15 +2327,26 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	if pluginApp == nil {
 		pluginApp = app.New()
 	}
-	pluginLoader, err := assemblePlugins(ctx, pluginApp, cfg, pluginHostDeps{
+	if err := assemblePlugins(ctx, pluginApp, cfg, pluginHostDeps{
 		Audit:  auditLog,
 		Events: workflowEvents,
 		Logger: logger,
 		Gate:   taskGate,
-	})
-	if err != nil {
+	}); err != nil {
+		// Nothing is mounted on this path: assemblePlugins only returns an error
+		// before it converges anything, so there is no plugin state to unwind.
 		closeStore()
 		return ServeResult{}, err
+	}
+	// From here on the plugins ARE mounted, so every failure return below must
+	// unmount them before giving up — not only the shutdown path. A plugin's
+	// tool name lives in the process-global toolauth catalog, so an embedded
+	// host that retries the assembly after, say, "address already in use" would
+	// otherwise hit toolauth.Contribute's duplicate-name panic on the second
+	// attempt, with the first attempt's wasm runtimes still resident.
+	cleanup := func() {
+		drainPlugins(pluginApp, cfg.Plugins.Root, logger)
+		closeStore()
 	}
 	liveTasks := task.NewSchedulerWithSink(taskSink)
 	httpTasks := server.TaskStore(liveTasks)
@@ -2344,12 +2362,12 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	})
 	registry, err := loadServeAgentRegistry(ctx, cfg, opts.ConfigPath)
 	if err != nil {
-		closeStore()
+		cleanup()
 		return ServeResult{}, err
 	}
 	taskLedger, err := newCommandTaskLedger(cfg)
 	if err != nil {
-		closeStore()
+		cleanup()
 		return ServeResult{}, err
 	}
 	// Manual-mode approval gate wiring (M2b). A single ToolGateStore persists
@@ -2377,7 +2395,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// AgentRuntimeResolverConfig.EpisodeRecorder.
 	defaultMaas, err := adapter.NewMaasClientFromProfile(cfg.Maas, "")
 	if err != nil {
-		closeStore()
+		cleanup()
 		return ServeResult{}, err
 	}
 	if defaultMaas == nil {
@@ -2417,7 +2435,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		}
 		brt, err := browser.NewRuntime(runtimeCfg)
 		if err != nil {
-			closeStore()
+			cleanup()
 			return ServeResult{}, fmt.Errorf("init browser runtime: %w", err)
 		}
 		sharedBrowser = brt
@@ -2452,7 +2470,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	defaultDisplay := tuiDisplayConfig(cfg.Maas, "", "")
 	defaultContext, err := buildRunContextPrefix(ctx, cfg, false, defaultDisplay.ModelName)
 	if err != nil {
-		closeStore()
+		cleanup()
 		return ServeResult{}, err
 	}
 	// Cognitive evolution wiring (L4 memory / L5 learning). The capability
@@ -2586,7 +2604,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	metrics := observability.NewMetricsRecorder(nil)
 	listener, err := net.Listen("tcp", addr)
 	if err != nil {
-		closeStore()
+		cleanup()
 		return ServeResult{}, fmt.Errorf("listen on %q: %w", addr, err)
 	}
 
@@ -2600,7 +2618,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	recoveryBases, err := distinctSessionBases(ctx, sessionStore, workspaceRoot)
 	if err != nil {
 		_ = listener.Close()
-		closeStore()
+		cleanup()
 		return ServeResult{}, fmt.Errorf("enumerate session bases for restart recovery: %w", err)
 	}
 	var suspendedCheckpoints []sessionstate.Checkpoint
@@ -2608,7 +2626,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		cps, err := checkpointStore.ListSuspendedIn(base)
 		if err != nil {
 			_ = listener.Close()
-			closeStore()
+			cleanup()
 			return ServeResult{}, fmt.Errorf("list suspended checkpoints in base %q: %w", base, err)
 		}
 		suspendedCheckpoints = append(suspendedCheckpoints, cps...)
@@ -2616,7 +2634,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	recovered, err := coordinator.RecoverSuspended(ctx, suspendedCheckpoints)
 	if err != nil {
 		_ = listener.Close()
-		closeStore()
+		cleanup()
 		return ServeResult{}, fmt.Errorf("recover suspended tasks: %w", err)
 	}
 	if recovered > 0 {
@@ -2631,7 +2649,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	suspendCandidates, err := liveTasks.List(ctx)
 	if err != nil {
 		_ = listener.Close()
-		closeStore()
+		cleanup()
 		return ServeResult{}, fmt.Errorf("list tasks for approval reconcile: %w", err)
 	}
 	for _, st := range suspendCandidates {
@@ -2640,7 +2658,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		}
 		if err := approvalCoordinator.ReconcileResume(ctx, st.ID); err != nil {
 			_ = listener.Close()
-			closeStore()
+			cleanup()
 			return ServeResult{}, fmt.Errorf("reconcile approval resume for task %s: %w", st.ID, err)
 		}
 	}
@@ -2770,7 +2788,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	})
 	if err != nil {
 		_ = listener.Close()
-		closeStore()
+		cleanup()
 		return ServeResult{}, err
 	}
 	return ServeResult{
@@ -2792,7 +2810,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 			// After the in-flight tasks have drained, so the convergence finds
 			// the task gate idle rather than waiting for a boundary a stopping
 			// service will never reach.
-			drainPlugins(pluginLoader, cfg.Plugins.Root, logger)
+			drainPlugins(pluginApp, cfg.Plugins.Root, logger)
 			// Tear down the one shared Chromium process after in-flight tasks
 			// have drained (coordinator.Wait above), so no task can still be
 			// driving the browser when it closes.

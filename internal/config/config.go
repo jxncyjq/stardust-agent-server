@@ -55,11 +55,21 @@ type PluginsConfig struct {
 	// enabled: no loader is built, nothing is mounted, and `agent plugins
 	// status` says so. A non-empty path that cannot be read or parsed fails
 	// serve assembly.
+	//
+	// A relative path resolves against the PROCESS working directory, not the
+	// directory the config file lives in: `agent serve --config /etc/agent.json`
+	// started from /srv reads /srv/plugins.json, not /etc/plugins.json. Use an
+	// absolute path whenever the config is not read from the working directory.
 	Manifest string `json:"manifest"`
 
 	// Root is the directory every manifest entry's "source" resolves against,
 	// and the boundary plugin code may be read from — a source that escapes it
 	// is refused. It must be non-empty whenever Manifest is set.
+	//
+	// Like Manifest, a relative Root (the default "plugins" is one) resolves
+	// against the PROCESS working directory rather than the config file's
+	// directory, so where serve was started from decides which packages it
+	// loads.
 	Root string `json:"root"`
 
 	// Limits is the deployment's own resource ceiling, applied on top of each
