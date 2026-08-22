@@ -115,7 +115,7 @@ func TestCoordinatorRunsPendingTaskToDone(t *testing.T) {
 		},
 		Scheduler: scheduler,
 		Locks:     task.NewLockStore(),
-		Runtime: NewRuntime(Config{
+		Runtime: NewRuntime(Config{Gate: NewTaskGate(),
 			Maas:   adapter.NewRecordingMaas("safe result"),
 			Audit:  audit,
 			Events: events,
@@ -174,7 +174,7 @@ func TestCoordinatorSuspendsHardLoopAndCreatesApproval(t *testing.T) {
 		},
 		Scheduler: scheduler,
 		Locks:     task.NewLockStore(),
-		Runtime: NewRuntime(Config{
+		Runtime: NewRuntime(Config{Gate: NewTaskGate(),
 			Maas:   adapter.NewRecordingMaas("same"),
 			Audit:  audit,
 			Events: events,

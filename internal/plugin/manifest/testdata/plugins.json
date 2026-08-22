@@ -1,0 +1,28 @@
+{
+  "plugins": [
+    {
+      "name": "legion-jira",
+      "source": "./plugins/legion-jira",
+      "enabled": true,
+      "grant": {
+        "capabilities": ["log", "http"],
+        "allowed_hosts": ["jira.example.com"],
+        "allowed_paths": []
+      },
+      "tools": [
+        {"name": "jira_search", "risk_level": "low", "sensitive": false}
+      ],
+      "config": {"project": "LEGION"}
+    },
+    {
+      "name": "legion-notify",
+      "source": "./plugins/legion-notify",
+      "grant": {
+        "capabilities": ["log"]
+      },
+      "tools": [
+        {"name": "notify_send"}
+      ]
+    }
+  ]
+}

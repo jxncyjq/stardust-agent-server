@@ -1,0 +1,38 @@
+{
+  "name": "legion-jira",
+  "version": "1.2.0",
+  "abi": 1,
+  "sha256": "a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4",
+  "capabilities": ["log", "http", "kv"],
+  "limits": {
+    "timeout_ms": 5000,
+    "max_memory_pages": 64,
+    "max_instances": 4
+  },
+  "network": {
+    "allowed_hosts": ["jira.example.com"]
+  },
+  "filesystem": {
+    "allowed_paths": ["/data/jira"]
+  },
+  "tools": [
+    {
+      "name": "jira_search",
+      "description": "Search Jira issues",
+      "group": "issue-tracking",
+      "risk_level": "low",
+      "input_schema": {"type": "object"},
+      "timeout_ms": 3000,
+      "sensitive": false
+    },
+    {
+      "name": "jira_create_issue",
+      "description": "Create a Jira issue",
+      "group": "issue-tracking",
+      "risk_level": "medium",
+      "input_schema": {"type": "object"},
+      "timeout_ms": 5000,
+      "sensitive": true
+    }
+  ]
+}

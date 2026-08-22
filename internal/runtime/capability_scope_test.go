@@ -29,7 +29,7 @@ func TestPlanModeCatalogExcludesSensitiveTools(t *testing.T) {
 		Name: "write_file", Group: "files", Description: "Write.", Sensitive: true, InputSchema: map[string]any{"type": "object"},
 	}, noop)
 
-	rt := NewRuntime(Config{Tools: registry})
+	rt := NewRuntime(Config{Gate: NewTaskGate(), Tools: registry})
 	// This is the same effective-registry scoping RunTask applies at Plan-mode
 	// entry (buildCatalog(r.effectiveTools(task))); building the catalog
 	// directly from it here, rather than from the raw registry, is the
@@ -97,7 +97,7 @@ func TestSubRuntimeStartsWithEmptyLoadedSet(t *testing.T) {
 		return domain.ToolResult{Success: true, Output: "ok"}, nil
 	}))
 
-	parent := NewRuntime(Config{Maas: &childCapturingMaas{}, Tools: registry, LazyTools: true})
+	parent := NewRuntime(Config{Gate: NewTaskGate(), Maas: &childCapturingMaas{}, Tools: registry, LazyTools: true})
 
 	// Simulate the parent's in-flight loop state carrying a loaded capability,
 	// the way dispatchLoadCapabilities does mid-run. This is exactly the state

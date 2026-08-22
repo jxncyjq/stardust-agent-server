@@ -51,7 +51,7 @@ func planRegistry(t *testing.T) *tool.Registry {
 
 func TestPlanModeOffersOnlySafeTools(t *testing.T) {
 	maas := &planProbeMaas{}
-	runner := NewRuntime(Config{
+	runner := NewRuntime(Config{Gate: NewTaskGate(),
 		Maas: maas, Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
 		Tools: planRegistry(t), LazyTools: false,
 	})
@@ -121,7 +121,7 @@ func TestPlanModeLazyCallToolCannotReachSensitiveTool(t *testing.T) {
 	}))
 
 	maas := &planLazyCallToolMaas{}
-	runner := NewRuntime(Config{
+	runner := NewRuntime(Config{Gate: NewTaskGate(),
 		Maas: maas, Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
 		Tools: reg, LazyTools: true,
 	})
@@ -141,7 +141,7 @@ func TestPlanModeLazyCallToolCannotReachSensitiveTool(t *testing.T) {
 
 func TestAutoModeOffersAllTools(t *testing.T) {
 	maas := &planProbeMaas{}
-	runner := NewRuntime(Config{
+	runner := NewRuntime(Config{Gate: NewTaskGate(),
 		Maas: maas, Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
 		Tools: planRegistry(t), LazyTools: false,
 	})
@@ -163,7 +163,7 @@ func TestPlanModeWritesOKFPlanFile(t *testing.T) {
 	dir := t.TempDir()
 	store := sessionstate.NewStore(dir)
 	maas := &planProbeMaas{}
-	runner := NewRuntime(Config{
+	runner := NewRuntime(Config{Gate: NewTaskGate(),
 		Maas: maas, Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
 		Tools: planRegistry(t), LazyTools: false, Checkpoints: store,
 	})
@@ -194,7 +194,7 @@ func TestPlanModeWritesOKFPlanFile(t *testing.T) {
 func TestAutoModeWritesNoPlanFile(t *testing.T) {
 	dir := t.TempDir()
 	store := sessionstate.NewStore(dir)
-	runner := NewRuntime(Config{
+	runner := NewRuntime(Config{Gate: NewTaskGate(),
 		Maas: &planProbeMaas{}, Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
 		Tools: planRegistry(t), LazyTools: false, Checkpoints: store,
 	})

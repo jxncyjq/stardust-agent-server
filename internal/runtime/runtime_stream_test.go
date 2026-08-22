@@ -45,7 +45,7 @@ func (b *recordingBus) Events() ([]domain.RuntimeEvent, error) { return nil, nil
 func TestRuntimeStreamsTokenEventsWhenClientSupportsStreaming(t *testing.T) {
 	bus := &recordingBus{}
 	maas := &streamingMaas{deltas: []string{"He", "llo"}, resp: port.InferenceResponse{Text: "Hello"}}
-	rt := NewRuntime(Config{Maas: maas, Events: bus, Tools: unchangingReadRegistry(t)})
+	rt := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas, Events: bus, Tools: unchangingReadRegistry(t)})
 
 	if _, err := rt.RunTask(context.Background(), domain.Agent{ID: "a"}, domain.Task{ID: "t1", Input: "hi"}); err != nil {
 		t.Fatalf("RunTask error = %v, want nil", err)
@@ -70,7 +70,7 @@ func TestRuntimeStreamsTokenEventsWhenClientSupportsStreaming(t *testing.T) {
 func TestRuntimeEmitsNoTokenEventsForNonStreamingClient(t *testing.T) {
 	bus := &recordingBus{}
 	maas := &recordingRoundsMaas{responses: []port.InferenceResponse{{Text: "done"}}}
-	rt := NewRuntime(Config{Maas: maas, Events: bus, Tools: unchangingReadRegistry(t)})
+	rt := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas, Events: bus, Tools: unchangingReadRegistry(t)})
 	if _, err := rt.RunTask(context.Background(), domain.Agent{ID: "a"}, domain.Task{ID: "t1", Input: "hi"}); err != nil {
 		t.Fatalf("RunTask error = %v, want nil", err)
 	}

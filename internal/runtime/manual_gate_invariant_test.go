@@ -33,7 +33,7 @@ func TestRunTaskManualWithoutGateFailsLoud(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			r := NewRuntime(Config{
+			r := NewRuntime(Config{Gate: NewTaskGate(),
 				Maas:        &captureMaas{response: "should never run"},
 				Audit:       adapter.NewMemoryAuditLog(),
 				Events:      adapter.NewMemoryEventBus(),
@@ -53,7 +53,7 @@ func TestRunTaskManualWithoutGateFailsLoud(t *testing.T) {
 // an Auto task without a gate is legitimate (Auto never suspends) and must not
 // trip ErrManualGateMissing.
 func TestRunTaskAutoWithoutGateOK(t *testing.T) {
-	r := NewRuntime(Config{
+	r := NewRuntime(Config{Gate: NewTaskGate(),
 		Maas:   &captureMaas{response: "done"},
 		Audit:  adapter.NewMemoryAuditLog(),
 		Events: adapter.NewMemoryEventBus(),

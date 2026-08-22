@@ -23,7 +23,7 @@ func TestSuspendRestartResumeEndToEnd(t *testing.T) {
 
 	// --- process 1: run until it suspends ---
 	store1 := sessionstate.NewStore(dir)
-	runner1 := NewRuntime(Config{
+	runner1 := NewRuntime(Config{Gate: NewTaskGate(),
 		Maas:        &scriptedMaas{},
 		Audit:       adapter.NewMemoryAuditLog(),
 		Events:      adapter.NewMemoryEventBus(),
@@ -47,7 +47,7 @@ func TestSuspendRestartResumeEndToEnd(t *testing.T) {
 
 	// Fresh runtime; its gate never suspends (decision has "arrived"), so the
 	// resumed loop runs the pending echo call and completes.
-	runner2 := NewRuntime(Config{
+	runner2 := NewRuntime(Config{Gate: NewTaskGate(),
 		Maas:        &scriptedMaas{},
 		Audit:       adapter.NewMemoryAuditLog(),
 		Events:      adapter.NewMemoryEventBus(),

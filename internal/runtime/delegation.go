@@ -119,6 +119,12 @@ func (r *Runtime) newSubRuntime(role string, toolsets []string) (*Runtime, error
 		// the parent even if it wanted to -- a parent's in-flight loaded block
 		// simply has no path into a spawned child's loopState.
 		capabilitySkills: r.capabilitySkills,
+		// The child runs its own RunTask, so it needs a gate — and it must be
+		// the PARENT'S gate, not one of its own. A sub-task runs inside its
+		// parent's task, which already holds that gate open; a private gate
+		// would make the child invisible to the apply that is waiting for the
+		// parent's boundary, which is the one thing the gate exists to prevent.
+		gate: r.gate,
 	}
 	return child, nil
 }
@@ -205,6 +211,11 @@ func (r *Runtime) RunSubTasks(ctx context.Context, specs []SubTaskSpec) ([]SubTa
 // immediately. Completion (or failure) is published as a "subtask_completed"
 // runtime event. The work runs on a detached context so it survives the tool call
 // that launched it, but it is process-local: a parent exit loses it.
+//
+// Because it survives the tool call, it can also outlive the parent TASK. It
+// therefore takes a task-boundary token of its own before it starts, so a
+// plugin change waits for the background work as well and never lands on top of
+// it — see the comment on that token below.
 func (r *Runtime) RunSubTaskAsync(ctx context.Context, spec SubTaskSpec) (SubTaskHandle, error) {
 	if err := ctx.Err(); err != nil {
 		return SubTaskHandle{}, err
@@ -220,7 +231,28 @@ func (r *Runtime) RunSubTaskAsync(ctx context.Context, spec SubTaskSpec) (SubTas
 		return SubTaskHandle{}, err
 	}
 	subTaskID := r.nextSubTaskID(spec.ParentTaskID)
+
+	// The background sub-task keeps running after the tool call that started it
+	// returns, and so possibly after the parent task itself has ended and
+	// retired its Begin. Depth alone would not cover that: the child's own
+	// BeginChild inside RunTask lasts only as long as its RunTask, and between
+	// the parent retiring and the goroutine reaching that call — and again
+	// between that call returning and this goroutine publishing its outcome —
+	// nothing would be counted, so an apply could land on top of live work.
+	//
+	// So take a token HERE, on the caller's goroutine, while the parent is
+	// demonstrably still in flight: RunSubTaskAsync is reached from a tool call
+	// inside the parent's RunTask, which holds the gate. ApplyAtBoundary then
+	// waits for the background sub-task too.
+	//
+	// Ownership passes to the goroutine and to nothing else: endBackground is
+	// captured by exactly one closure and retired by its first deferred call, so
+	// every way out — the child failing, the publish failing, a panic unwinding
+	// — releases it exactly once. Nothing between this line and the go statement
+	// can return or fail, so there is no path that takes the token and drops it.
+	endBackground := r.gate.BeginChild()
 	go func() {
+		defer endBackground()
 		bg := context.WithoutCancel(ctx)
 		res, err := r.runChild(bg, child, subTaskID, spec)
 		event := domain.RuntimeEvent{

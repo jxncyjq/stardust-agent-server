@@ -38,7 +38,7 @@ func TestLoopCapStopsSameToolDifferentArgs(t *testing.T) {
 			return domain.ToolResult{CallID: call.ID, Success: true, Output: "ok"}, nil
 		}),
 	)
-	rt := NewRuntime(Config{Maas: maas, Tools: reg, MaxToolRounds: 1000})
+	rt := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas, Tools: reg, MaxToolRounds: 1000})
 	_, err := rt.RunTask(context.Background(), domain.Agent{ID: "a", Role: "developer"},
 		domain.Task{ID: "t1", Status: domain.TaskRunning, Input: "go"})
 	if err != nil {
@@ -92,7 +92,7 @@ func TestSameToolFailureWarnsModel(t *testing.T) {
 			return domain.ToolResult{CallID: call.ID, Success: false, Error: "boom"}, nil
 		}),
 	)
-	rt := NewRuntime(Config{Maas: maas, Tools: reg, MaxToolRounds: 1000})
+	rt := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas, Tools: reg, MaxToolRounds: 1000})
 	if _, err := rt.RunTask(context.Background(), domain.Agent{ID: "a", Role: "developer"},
 		domain.Task{ID: "t1", Status: domain.TaskRunning, Input: "go"}); err != nil {
 		t.Fatalf("RunTask err = %v", err)

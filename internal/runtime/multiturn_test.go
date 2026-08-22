@@ -101,7 +101,7 @@ func TestSecondRoundCarriesPriorAssistantCallAndToolResult(t *testing.T) {
 		{ToolCalls: []domain.ToolCall{{ID: "c1", Name: "read_file", Arguments: map[string]string{"path": "hello.txt"}}}},
 		{Text: "done"},
 	}}
-	rt := NewRuntime(Config{Maas: maas, Tools: unchangingReadRegistry(t)})
+	rt := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas, Tools: unchangingReadRegistry(t)})
 
 	if _, err := rt.RunTask(context.Background(), domain.Agent{ID: "a"}, domain.Task{ID: "t1", Input: "read hello.txt"}); err != nil {
 		t.Fatalf("RunTask() error = %v, want nil", err)
@@ -133,7 +133,7 @@ func TestSecondRoundCarriesPriorAssistantCallAndToolResult(t *testing.T) {
 func TestRuntimeBreaksRepeatedIdenticalToolCallLoop(t *testing.T) {
 	t.Parallel()
 	maas := &loopingMaas{call: domain.ToolCall{Name: "read_file", Arguments: map[string]string{"path": "hello.txt"}}}
-	rt := NewRuntime(Config{Maas: maas, Tools: unchangingReadRegistry(t), MaxToolRounds: 0})
+	rt := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas, Tools: unchangingReadRegistry(t), MaxToolRounds: 0})
 
 	run, err := rt.RunTask(context.Background(), domain.Agent{ID: "a"}, domain.Task{ID: "t1", Input: "read it"})
 	if err != nil {
@@ -168,7 +168,7 @@ func TestRuntimeDoesNotBreakLoopOnDistinctCalls(t *testing.T) {
 	}
 	responses = append(responses, port.InferenceResponse{Text: "done"})
 	maas := &recordingRoundsMaas{responses: responses}
-	rt := NewRuntime(Config{Maas: maas, Tools: unchangingReadRegistry(t), MaxToolRounds: len(responses) + 2})
+	rt := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas, Tools: unchangingReadRegistry(t), MaxToolRounds: len(responses) + 2})
 
 	run, err := rt.RunTask(context.Background(), domain.Agent{ID: "a"}, domain.Task{ID: "t1", Input: "read many files"})
 	if err != nil {

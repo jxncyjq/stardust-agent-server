@@ -62,7 +62,7 @@ func productionToolRegistryForTest(t *testing.T) *tool.Registry {
 	// then let it add delegate_task on top. A default-constructed runtime
 	// (Depth 0) resolves to role "orchestrator" (see NewRuntime), so
 	// canDelegate() is true and delegate_task actually registers.
-	rt := NewRuntime(Config{Tools: tools})
+	rt := NewRuntime(Config{Gate: NewTaskGate(), Tools: tools})
 	rt.RegisterDelegateTaskTool(tools)
 
 	return tools
