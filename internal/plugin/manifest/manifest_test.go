@@ -280,6 +280,69 @@ func TestParsePlugin_UnknownFieldRejected(t *testing.T) {
 	requireErrorContains(t, err, "nmae")
 }
 
+func TestParsePlugin_RequiresAbsentDefaultsEmpty(t *testing.T) {
+	data := mustReadFixture(t, "plugin.json")
+	pm, err := ParsePlugin(data)
+	if err != nil {
+		t.Fatalf("ParsePlugin: unexpected error: %v", err)
+	}
+	if len(pm.Requires) != 0 {
+		t.Errorf("Requires = %v, want empty (fixture has no requires key)", pm.Requires)
+	}
+}
+
+func TestParsePlugin_RequiresValid(t *testing.T) {
+	data := []byte(`{
+		"name": "p", "version": "1.0.0", "abi": 1, "sha256": "` + validSHA256 + `",
+		"limits": {"max_memory_pages": 1, "max_instances": 1},
+		"tools": [{"name": "my_tool", "group": "g", "timeout_ms": 1000}],
+		"requires": ["other_plugin_tool", "yet_another_tool"]
+	}`)
+	pm, err := ParsePlugin(data)
+	if err != nil {
+		t.Fatalf("ParsePlugin: unexpected error: %v", err)
+	}
+	want := []string{"other_plugin_tool", "yet_another_tool"}
+	if !equalStrings(pm.Requires, want) {
+		t.Errorf("Requires = %v, want %v", pm.Requires, want)
+	}
+}
+
+func TestParsePlugin_RequiresEmptyString(t *testing.T) {
+	data := []byte(`{
+		"name": "p", "version": "1.0.0", "abi": 1, "sha256": "` + validSHA256 + `",
+		"limits": {"max_memory_pages": 1, "max_instances": 1},
+		"tools": [{"name": "my_tool", "group": "g", "timeout_ms": 1000}],
+		"requires": ["other_tool", ""]
+	}`)
+	_, err := ParsePlugin(data)
+	requireErrorContains(t, err, "requires")
+}
+
+func TestParsePlugin_RequiresDuplicate(t *testing.T) {
+	data := []byte(`{
+		"name": "p", "version": "1.0.0", "abi": 1, "sha256": "` + validSHA256 + `",
+		"limits": {"max_memory_pages": 1, "max_instances": 1},
+		"tools": [{"name": "my_tool", "group": "g", "timeout_ms": 1000}],
+		"requires": ["other_tool", "other_tool"]
+	}`)
+	_, err := ParsePlugin(data)
+	requireErrorContains(t, err, "other_tool")
+	requireErrorContains(t, err, "twice")
+}
+
+func TestParsePlugin_RequiresSelfDependency(t *testing.T) {
+	data := []byte(`{
+		"name": "p", "version": "1.0.0", "abi": 1, "sha256": "` + validSHA256 + `",
+		"limits": {"max_memory_pages": 1, "max_instances": 1},
+		"tools": [{"name": "my_tool", "group": "g", "timeout_ms": 1000}],
+		"requires": ["my_tool"]
+	}`)
+	_, err := ParsePlugin(data)
+	requireErrorContains(t, err, "my_tool")
+	requireErrorContains(t, err, "itself")
+}
+
 // --- ParseDeployment ------------------------------------------------------
 
 func TestParseDeployment_ValidFixture(t *testing.T) {

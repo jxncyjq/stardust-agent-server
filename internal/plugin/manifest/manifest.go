@@ -68,7 +68,8 @@ var knownCapabilities = map[string]bool{
 // (SHA256) of the .wasm module it travels with, which host capabilities it
 // needs (Capabilities), what resources it wants (Limits), the network hosts
 // and filesystem paths it needs those capabilities to reach (Network,
-// Filesystem), and the tools it contributes (Tools).
+// Filesystem), the tools it contributes (Tools), and the tools of other
+// plugins it calls into (Requires).
 //
 // ParsePlugin is the only way to obtain a validated PluginManifest; every
 // field below has already passed its shape check by the time a caller sees
@@ -83,6 +84,30 @@ type PluginManifest struct {
 	Network      Network    `json:"network"`
 	Filesystem   Filesystem `json:"filesystem"`
 	Tools        []ToolDecl `json:"tools"`
+
+	// Requires lists the names of tools this plugin calls through
+	// call_tool: external dependencies on tools other plugins contribute.
+	// It is NOT a second capability list — that role belongs to
+	// Capabilities, which is checked at load time and refuses the load
+	// outright when ungranted. Requires is different in kind: it names
+	// runtime call targets, and an unsatisfied entry (the tool's
+	// contributor is absent or gone) is a suspendable, temporary state —
+	// this plugin still loads, but the calls it makes into that name fail
+	// or suspend until something contributes it. Resolving Requires
+	// against the running plugin set is a later phase's job (dependency
+	// graph, suspension); this package only validates the declaration's
+	// own shape.
+	//
+	// Requires is a contract-declared optional: an absent "requires" key
+	// decodes to a nil/empty slice and means no external dependencies,
+	// not an unset field waiting to be filled in. ParsePlugin rejects an
+	// empty-string entry, a name repeated more than once, and a name this
+	// same manifest already contributes in Tools — a plugin cannot
+	// require its own tool. That last case would always trivially
+	// "satisfy" (a plugin resolves its own contributed name) while adding
+	// a self-loop to the dependency graph that pollutes the cycle
+	// detection a later phase performs on it.
+	Requires []string `json:"requires"`
 }
 
 // Limits is the resource envelope a plugin asks for. MaxMemoryPages and
@@ -211,7 +236,9 @@ type ToolAccept struct {
 //     reason to be loaded — the same requirement host.Spec.Tools carries);
 //   - any tool missing its Group, or with TimeoutMs <= 0;
 //   - two tools sharing the same Name (host.validateSpec would reject this
-//     too, later and less actionably, against the assembled host.Spec).
+//     too, later and less actionably, against the assembled host.Spec);
+//   - a Requires entry that is empty, repeated, or names a tool this same
+//     manifest already contributes in Tools (see PluginManifest.Requires).
 //
 // Every error names the offending field (and, for a per-tool violation, the
 // tool's own name) rather than only reporting that parsing failed.
@@ -275,6 +302,35 @@ func validatePlugin(pm PluginManifest) error {
 				pm.Name, tool.Name)
 		}
 		seenTools[tool.Name] = struct{}{}
+	}
+	if err := validateRequires(pm.Name, pm.Requires, seenTools); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateRequires rejects a PluginManifest.Requires that is not fit to
+// feed a later dependency graph: an empty entry (index named, since an
+// empty string carries no name of its own to point at), a name repeated
+// more than once, or a name contributedTools already holds — the plugin's
+// own Tools, which requiring would create a self-loop (see
+// PluginManifest.Requires's doc comment for why that is rejected here
+// rather than left for the graph builder to discover).
+func validateRequires(name string, requires []string, contributedTools map[string]struct{}) error {
+	seen := make(map[string]struct{}, len(requires))
+	for i, r := range requires {
+		if r == "" {
+			return fmt.Errorf("parse plugin manifest %q: requires[%d] is empty", name, i)
+		}
+		if _, dup := seen[r]; dup {
+			return fmt.Errorf("parse plugin manifest %q: requires %q claimed twice", name, r)
+		}
+		seen[r] = struct{}{}
+		if _, self := contributedTools[r]; self {
+			return fmt.Errorf("parse plugin manifest %q: requires %q, which this plugin already contributes "+
+				"itself in tools; a plugin cannot require its own tool (it would always trivially resolve while "+
+				"adding a self-loop that pollutes cycle detection)", name, r)
+		}
 	}
 	return nil
 }
