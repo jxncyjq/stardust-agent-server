@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -342,6 +343,16 @@ func (p *Plugin) Resume(_ context.Context) error {
 	if !p.suspended {
 		return fmt.Errorf("resume plugin %q: it is active, not suspended; its contributions are already "+
 			"filed and filing them again would be a duplicate registration", p.Name)
+	}
+	// A disposed plugin is not a suspended one, and the ledger is where the
+	// difference shows: disposing the instance owner took the
+	// ledgerLabelContributions entry with it, so contributions filed now would
+	// have nothing left to revoke them — they would outlive the plugin in the
+	// registry and, process-globally, in the gateable catalog. That is the leak
+	// the ledger exists to prevent, so it is refused rather than filed.
+	if !slices.Contains(p.ledger.Snapshot()[p.owner], ledgerLabelContributions) {
+		return fmt.Errorf("resume plugin %q: owner %s no longer holds its %q entry, so the plugin has been "+
+			"disposed; contributions filed now could never be revoked", p.Name, p.owner, ledgerLabelContributions)
 	}
 	if taken := p.takenToolNames(); len(taken) > 0 {
 		return fmt.Errorf("resume plugin %q: another contributor now holds its tool names %v; "+

@@ -354,6 +354,45 @@ func TestDisposeOwnerAfterResumeRemovesTheRestoredTool(t *testing.T) {
 	}
 }
 
+// TestResumeAfterDisposalIsRefused closes the gap between "suspended" and
+// "gone": both leave the contribution owner empty, but a disposed plugin has
+// lost the entry that would revoke anything filed now — so a Resume that went
+// ahead would put a tool the drained pool can never serve into the registry,
+// and a name into the PROCESS-GLOBAL gateable catalog, with nothing left that
+// could ever take either out again.
+func TestResumeAfterDisposalIsRefused(t *testing.T) {
+	c := newContribution(t)
+
+	if err := c.plugin.Suspend(context.Background()); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	if err := c.ledger.DisposeOwner(testOwner); err != nil {
+		t.Fatalf("DisposeOwner: %v", err)
+	}
+
+	err := c.plugin.Resume(context.Background())
+	if err == nil {
+		t.Fatal("Resume on a disposed plugin succeeded, want an error: its contributions could never be revoked")
+	}
+	for _, want := range []string{fixtureManifestName, "disposed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	for _, descriptor := range c.registry.Descriptors() {
+		if descriptor.Name == fixtureProvidedTool {
+			t.Errorf("a refused Resume registered %q anyway", fixtureProvidedTool)
+		}
+	}
+	if toolauth.IsGateable(fixtureProvidedTool) {
+		t.Errorf("a refused Resume left %q in the gateable catalog, which nothing could take out again",
+			fixtureProvidedTool)
+	}
+	if snapshot := c.ledger.Snapshot(); len(snapshot) != 0 {
+		t.Errorf("ledger.Snapshot() = %v after a refused Resume, want empty", snapshot)
+	}
+}
+
 // TestSuspendResumeCyclesKeepOneInstance walks the state machine a fixed,
 // small number of times — the count is a literal, and the instance ceiling is
 // asserted every round — so a leak that only shows up on repetition is caught
