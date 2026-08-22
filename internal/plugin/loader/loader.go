@@ -802,7 +802,9 @@ func (l *Loader) restore(ctx context.Context, prev *instance) error {
 }
 
 // unload disposes everything one instance filed and reports how many ledger
-// entries went with it. It is called with l.mu held.
+// entries went with it — across BOTH owners the activation files under (see
+// host.ToolsOwner), because "revoked" is read as how much this unload took
+// down. It is called with l.mu held.
 //
 // The event is published whether or not the disposal reported a failure: the
 // plugin IS unmounted either way (lifecycle.Ledger.DisposeOwner clears the
@@ -811,7 +813,15 @@ func (l *Loader) restore(ctx context.Context, prev *instance) error {
 // operator reading the event stream sees the same thing the returned error
 // says.
 func (l *Loader) unload(ctx context.Context, inst *instance, reason string) (int, error) {
-	revoked := len(l.ledger.Snapshot()[inst.owner])
+	// Both owners, counted from ONE snapshot: an activation files its wasm
+	// resources and the link to its contributions under inst.owner, and one
+	// entry per tool per half (registry, gateable catalog) under
+	// host.ToolsOwner(inst.owner). Counting only the instance owner would report
+	// the same 3 for every plugin no matter how many tools went away with it —
+	// a number that no longer means what the field says it means, in an event
+	// operators read to see what an unload actually took down.
+	snapshot := l.ledger.Snapshot()
+	revoked := len(snapshot[inst.owner]) + len(snapshot[host.ToolsOwner(inst.owner)])
 	disposeErr := l.ledger.DisposeOwner(inst.owner)
 
 	if disposeErr != nil {

@@ -127,6 +127,19 @@ func countInstanceCloses(t *testing.T) *atomic.Int64 {
 	return &closes
 }
 
+// assertOrderedLabels fails unless owner holds exactly want, in that order.
+// The order is asserted, not just the set: the ledger disposes in reverse
+// filing order, so it is the order that decides whether tools are withdrawn
+// before the pool is drained.
+func assertOrderedLabels(t *testing.T, ledger *lifecycle.Ledger, owner lifecycle.Owner, want ...string) {
+	t.Helper()
+
+	got := ledger.Snapshot()[owner]
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("ledger.Snapshot()[%s] = %v, want %v", owner, got, want)
+	}
+}
+
 // assertOwnerRolledBack asserts that nothing remains filed under owner. That
 // the disposers really RAN (rather than being dropped) is asserted separately,
 // with watchGuestClose, wherever a guest module existed to close.

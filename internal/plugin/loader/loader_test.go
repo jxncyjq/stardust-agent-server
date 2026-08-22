@@ -616,6 +616,47 @@ func TestApplyUnloadsADisabledEntry(t *testing.T) {
 	}
 }
 
+// TestUnloadReportsEveryRevokedEntry pins the revoked= field of the
+// plugin/unloaded event — an operator-visible number in the runtime event
+// stream, and unload's own return value — against what an activation really
+// files, which since the owner split lives under TWO owners: three entries
+// under the instance owner (the wasm runtime, the instance pool, and the link
+// to the contribution side) plus two per contributed tool under
+// host.ToolsOwner (its registry entry and its gateable-catalog entry).
+//
+// Counting only the instance owner reports the same 3 for every plugin no
+// matter how much went away with it, which is why the count is pinned here
+// against a plugin whose tool count is known rather than left to drift.
+func TestUnloadReportsEveryRevokedEntry(t *testing.T) {
+	h := newHarness(t)
+	echo := h.writeEcho("1.0.0")
+	h.apply(echo)
+
+	// The premise of the arithmetic below: this plugin contributes exactly one
+	// tool. If the fixture ever grows a second, this assertion must be updated
+	// rather than silently keep passing.
+	wantStrings(t, "registered tools", h.toolNames(), []string{echoToolName})
+
+	disabled := echo
+	disabled.Enabled = false
+	h.apply(disabled)
+
+	const instanceEntries = 3 // wasm-runtime, wasm-instance-pool, tool-contributions
+	const perToolEntries = 2  // the registry entry and the gateable-catalog entry
+	want := fmt.Sprintf("revoked=%d", instanceEntries+perToolEntries*1)
+
+	unloaded := h.eventsOfType(RuntimeEventUnloaded)
+	if len(unloaded) != 1 {
+		t.Fatalf("want one %s event, got %v", RuntimeEventUnloaded, unloaded)
+	}
+	if !strings.Contains(unloaded[0].Message, want) {
+		t.Errorf("%s carries %q, want %q: the unload revoked %d entries under the instance owner and %d "+
+			"for its one tool under %s, and a count that skips the contribution side reports a number that "+
+			"no longer means what the field says", RuntimeEventUnloaded, unloaded[0].Message, want,
+			instanceEntries, perToolEntries, host.ToolsOwner("plugin:"+echoPluginName+"@1.0.0"))
+	}
+}
+
 // TestApplyUnloadsARemovedEntry pins that a vanished entry and a disabled one
 // behave identically apart from the reason they report.
 func TestApplyUnloadsARemovedEntry(t *testing.T) {

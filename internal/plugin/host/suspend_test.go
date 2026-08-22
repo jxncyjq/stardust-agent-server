@@ -5,7 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/lifecycle"
@@ -34,19 +37,6 @@ func readPoolProbe(t *testing.T, p *pool) probeReport {
 		t.Fatalf("decode probe report %s: %v", out, err)
 	}
 	return got
-}
-
-// assertOrderedLabels fails unless owner holds exactly want, in that order.
-// The order is asserted, not just the set: the ledger disposes in reverse
-// filing order, so it is the order that decides whether tools are withdrawn
-// before the pool is drained.
-func assertOrderedLabels(t *testing.T, ledger *lifecycle.Ledger, owner lifecycle.Owner, want ...string) {
-	t.Helper()
-
-	got := ledger.Snapshot()[owner]
-	if strings.Join(got, ",") != strings.Join(want, ",") {
-		t.Errorf("ledger.Snapshot()[%s] = %v, want %v", owner, got, want)
-	}
 }
 
 // TestToolsOwnerDerivesTheContributionSideOwner pins the spelling both halves
@@ -454,5 +444,214 @@ func TestActivateRefusesAnOccupiedToolsOwner(t *testing.T) {
 	}
 	if labels := ledger.Snapshot()[testOwner]; len(labels) != 0 {
 		t.Errorf("the refused activation filed %v under %s, want nothing", labels, testOwner)
+	}
+}
+
+// TestSuspendAfterDisposalIsRefused is the third state on the OTHER transition.
+// lifecycle.Ledger.DisposeOwner answers an unknown owner with nil, so a Suspend
+// that only asked the ledger would report a withdrawal it never performed and
+// leave Suspended() describing a plugin that no longer exists as merely
+// resting.
+func TestSuspendAfterDisposalIsRefused(t *testing.T) {
+	c := newContribution(t)
+
+	// Disposed while ACTIVE, so "already suspended" cannot be what refuses it.
+	if err := c.ledger.DisposeOwner(testOwner); err != nil {
+		t.Fatalf("DisposeOwner: %v", err)
+	}
+
+	err := c.plugin.Suspend(context.Background())
+	if err == nil {
+		t.Fatal("Suspend on a disposed plugin succeeded, want an error naming the state: there was nothing " +
+			"left to withdraw, so reporting success describes a withdrawal that never happened")
+	}
+	for _, want := range []string{fixtureManifestName, "disposed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	if c.plugin.Suspended() {
+		t.Error("Plugin.Suspended() = true after a refused Suspend, want false: a disposed plugin is gone, " +
+			"not suspended, and a caller reading true would wait for a Resume that can never come")
+	}
+}
+
+// TestResumeRefusesItsOwnLeftoverContributions covers the residue a
+// contribution that died part-way through leaves: entries of the plugin's OWN
+// under its own contribution owner. Reporting those as names another
+// contributor holds is misleading and unactionable, and contributing over them
+// would panic on the duplicate — so they are named for what they are.
+func TestResumeRefusesItsOwnLeftoverContributions(t *testing.T) {
+	c := newContribution(t)
+
+	if err := c.plugin.Suspend(context.Background()); err != nil {
+		t.Fatalf("Suspend: %v", err)
+	}
+	// Stands in for a contributeTools that panicked between its two halves: the
+	// entry is filed and the plugin is still suspended. The ledger is the only
+	// place that records it, which is why Resume has to look there.
+	c.ledger.Add(ToolsOwner(testOwner), "tool:"+fixtureProvidedTool, func() error { return nil })
+
+	err := c.plugin.Resume(context.Background())
+	if err == nil {
+		t.Fatal("Resume succeeded with its own half-filed contributions still under its contribution owner, " +
+			"want an error: contributing over them panics on the duplicate registration")
+	}
+	for _, want := range []string{fixtureManifestName, string(ToolsOwner(testOwner)), "tool:" + fixtureProvidedTool} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err, want)
+		}
+	}
+	if strings.Contains(err.Error(), "another contributor") {
+		t.Errorf("error %q blames another contributor for the plugin's own leftovers", err)
+	}
+	if !c.plugin.Suspended() {
+		t.Error("Plugin.Suspended() = false after a refused Resume, want the plugin to stay suspended")
+	}
+}
+
+// disposalOvertakeWindow is how long TestResumeAndDisposalCannotInterleave
+// holds a resume inside its critical section while a DisposeOwner runs against
+// it. It is the one deliberately NEGATIVE wait in this package: the property
+// under test is that the disposal cannot get past Plugin.markDisposed while the
+// resume holds the lock, so this bound is expected to expire. Disposing a
+// suspended plugin (an empty contribution owner, one pooled instance, one
+// runtime) takes single-digit milliseconds when nothing holds it off, so a
+// second is ample slack for a loaded machine and still bounds the test.
+const disposalOvertakeWindow = time.Second
+
+// TestResumeAndDisposalCannotInterleave is the concurrency half of the state
+// machine. Both halves guard ONE outcome: contributions that no entry can
+// revoke. They would sit in the tool registry and in the PROCESS-GLOBAL
+// gateable catalog for the life of the process, served by a pool that has been
+// drained — the exact leak the cross-owner entry exists to prevent, reached by
+// two goroutines instead of by one caller mistake.
+func TestResumeAndDisposalCannotInterleave(t *testing.T) {
+	t.Run("a disposal already under way refuses the resume", func(t *testing.T) {
+		// closeInstance is the seam that stops a disposal midway: the pool
+		// drain runs AFTER the cross-owner entry's disposer (reverse filing
+		// order), so a disposal paused here has already taken the contribution
+		// side down and has not returned.
+		draining, release := make(chan struct{}), make(chan struct{})
+		var opened sync.Once
+		var blockedTooLong atomic.Bool
+		original := closeInstance
+		closeInstance = func(ctx context.Context, inst *Instance) error {
+			opened.Do(func() { close(draining) })
+			select {
+			case <-release:
+			case <-time.After(30 * time.Second):
+				blockedTooLong.Store(true)
+			}
+			return original(ctx, inst)
+		}
+		t.Cleanup(func() { closeInstance = original })
+
+		c := newContribution(t)
+		// A safety net, not part of the assertion: if the refusal below ever
+		// stops working, this keeps a leaked gateable name from panicking every
+		// later test in the package instead of just failing this one.
+		t.Cleanup(func() { _ = c.ledger.DisposeOwner(ToolsOwner(testOwner)) })
+		if err := c.plugin.Suspend(context.Background()); err != nil {
+			t.Fatalf("Suspend: %v", err)
+		}
+
+		disposed := make(chan error, 1)
+		go func() { disposed <- c.ledger.DisposeOwner(testOwner) }()
+		select {
+		case <-draining:
+		case <-time.After(30 * time.Second):
+			t.Fatal("the disposal never reached the pool drain within 30s")
+		}
+
+		err := c.plugin.Resume(context.Background())
+		if err == nil {
+			t.Error("Resume succeeded against a disposal already under way, want an error: the entry that " +
+				"would revoke these contributions has already been disposed")
+		} else {
+			for _, want := range []string{fixtureManifestName, "disposed"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not mention %q", err, want)
+				}
+			}
+		}
+
+		close(release)
+		select {
+		case derr := <-disposed:
+			if derr != nil {
+				t.Fatalf("DisposeOwner: %v", derr)
+			}
+		case <-time.After(60 * time.Second):
+			t.Fatal("DisposeOwner did not return within 60s of being released")
+		}
+		if blockedTooLong.Load() {
+			t.Fatal("the paused drain hit its own 30s bound instead of being released")
+		}
+		assertNothingSurvivedTheDisposal(t, c)
+	})
+
+	t.Run("a disposal arriving mid-resume waits for it", func(t *testing.T) {
+		c := newContribution(t)
+		t.Cleanup(func() { _ = c.ledger.DisposeOwner(ToolsOwner(testOwner)) })
+		if err := c.plugin.Suspend(context.Background()); err != nil {
+			t.Fatalf("Suspend: %v", err)
+		}
+
+		var disposeErr error
+		finished := make(chan struct{})
+		var overtaken atomic.Bool
+		original := resumeContributionBarrier
+		resumeContributionBarrier = func() {
+			go func() {
+				disposeErr = c.ledger.DisposeOwner(testOwner)
+				close(finished)
+			}()
+			select {
+			case <-finished:
+				overtaken.Store(true)
+			case <-time.After(disposalOvertakeWindow):
+			}
+		}
+		t.Cleanup(func() { resumeContributionBarrier = original })
+
+		if err := c.plugin.Resume(context.Background()); err != nil {
+			t.Fatalf("Resume: %v; it holds the lock, so the disposal has to wait for it rather than refuse it", err)
+		}
+		if overtaken.Load() {
+			t.Error("the disposal ran to completion while the resume sat between its checks and its " +
+				"contribution: everything the resume then filed is unrevocable")
+		}
+		select {
+		case <-finished:
+		case <-time.After(60 * time.Second):
+			t.Fatal("DisposeOwner did not return within 60s of the resume releasing the plugin")
+		}
+		if disposeErr != nil {
+			t.Fatalf("DisposeOwner: %v", disposeErr)
+		}
+		assertNothingSurvivedTheDisposal(t, c)
+	})
+}
+
+// assertNothingSurvivedTheDisposal is the outcome both halves of
+// TestResumeAndDisposalCannotInterleave exist for, whichever of the two won the
+// lock: nothing filed, nothing callable, and — the one that cannot be undone —
+// nothing left in the process-global gateable catalog.
+func assertNothingSurvivedTheDisposal(t *testing.T, c *contribution) {
+	t.Helper()
+
+	if snapshot := c.ledger.Snapshot(); len(snapshot) != 0 {
+		t.Errorf("ledger.Snapshot() = %v after the disposal, want empty", snapshot)
+	}
+	if toolauth.IsGateable(fixtureProvidedTool) {
+		t.Errorf("toolauth.IsGateable(%q) = true after the disposal: the name is in the PROCESS-GLOBAL "+
+			"catalog with nothing left that could ever take it out", fixtureProvidedTool)
+	}
+	for _, descriptor := range c.registry.Descriptors() {
+		if descriptor.Name == fixtureProvidedTool {
+			t.Errorf("Registry.Descriptors() still lists %q after the disposal: it is served by a drained "+
+				"pool, so every call to it must fail", fixtureProvidedTool)
+		}
 	}
 }

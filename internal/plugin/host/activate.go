@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -251,14 +250,68 @@ type Plugin struct {
 	// the same plugin name. Re-deriving them from the manifest would lose
 	// everything the deployment declared (schema, risk level, group) and let a
 	// resumed plugin come back as a different tool than it went down as.
+	//
+	// It is the WHOLE Spec, Wasm bytes included, so a plugin retains its module
+	// bytes for its entire lifetime. On the Loader's path that costs nothing —
+	// it keeps the same Spec per instance anyway, and the slice shares one
+	// backing array — but a caller driving host.Activate directly should know
+	// the bytes are held rather than released once the module is compiled.
 	spec Spec
 
-	// mu guards suspended and serializes the transitions themselves, so two
-	// callers cannot both find the plugin active and both withdraw its
-	// contributions — the second withdrawal would report success having revoked
-	// nothing.
-	mu        sync.Mutex
+	// mu guards suspended and disposed and serializes the transitions
+	// themselves, so two callers cannot both find the plugin active and both
+	// withdraw its contributions — the second withdrawal would report success
+	// having revoked nothing.
+	//
+	// It is also taken by the disposer of the ledgerLabelContributions entry
+	// (see markDisposed), which is what keeps a teardown from disposing the
+	// contribution side in the middle of a Resume. Nothing held under this lock
+	// reaches a guest, so holding it can never wait on wasm.
+	mu sync.Mutex
+
+	// suspended is the sole authority on whether the contributions are
+	// currently withdrawn; the ledger is never consulted for it, because a
+	// state read from the ledger cannot be kept consistent with the transition
+	// that is changing it. That makes one thing a caller's responsibility:
+	// ToolsOwner(owner) must only ever be revoked through Suspend, or as part of
+	// disposing the instance owner. A direct
+	// ledger.DisposeOwner(ToolsOwner(owner)) would empty the contribution side
+	// while Suspended() kept answering false, and the next Resume would then
+	// panic on a duplicate registration instead of reporting anything.
 	suspended bool
+
+	// disposed records that the ledgerLabelContributions entry has been revoked
+	// — that the activation is being, or has been, torn down. It is the third
+	// state Suspended() cannot express, and BOTH transitions refuse it: entries
+	// filed once that one is gone have nothing left that could revoke them, so
+	// they would outlive the plugin in the registry and in the PROCESS-GLOBAL
+	// gateable catalog.
+	disposed bool
+}
+
+// markDisposed records that the plugin's ledgerLabelContributions entry has
+// been revoked. It is called by that entry's own disposer, before the
+// contribution side is disposed.
+//
+// Taking p.mu is the whole point of it. Resume holds p.mu from its checks
+// through its contribution, so a lifecycle.Ledger.DisposeOwner(owner) racing a
+// Resume can only arrive on one side of that critical section: before it, where
+// the flag makes Resume refuse, or after it, where the disposal that follows
+// this call takes the freshly filed contributions down with everything else.
+// The interleaving in between — teardown disposing an empty contribution owner,
+// then a resume filing into it with nothing left to revoke — is the one leak
+// that reaches the process-global gateable catalog and can never be undone.
+//
+// The lock it takes is also a constraint on this file: nothing running while
+// p.mu is held may dispose the INSTANCE owner, because this disposer waits for
+// that lock. Suspend disposes ToolsOwner(owner) and only that — which is what
+// it must do anyway — so the constraint costs nothing today; but a Suspend that
+// disposed its own instance owner would hang instead of failing, and that is a
+// far worse way to be wrong.
+func (p *Plugin) markDisposed() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.disposed = true
 }
 
 // Suspended reports whether the plugin's contributions are currently
@@ -283,7 +336,12 @@ func (p *Plugin) Suspended() bool {
 // Suspending an already-suspended plugin is an error naming the current state,
 // not a silent no-op: a caller that suspends twice is reasoning from a stale
 // view of the plugin set, and a second call that revoked nothing while
-// reporting success is what would keep it there.
+// reporting success is what would keep it there. Suspending a DISPOSED plugin
+// is refused for the same reason and is the sharper case of it: the
+// contributions went with the activation, so lifecycle.Ledger.DisposeOwner
+// would find an unknown owner and answer nil, and a Suspend that reported
+// success would leave Suspended() claiming a plugin that no longer exists is
+// merely resting.
 //
 // The context is accepted for symmetry with Resume and with the other calls a
 // caller makes at a task boundary, and is deliberately not consulted:
@@ -294,6 +352,11 @@ func (p *Plugin) Suspend(_ context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	if p.disposed {
+		return fmt.Errorf("suspend plugin %q: it has been disposed; its contributions went with the rest of "+
+			"the activation, so there is nothing left to withdraw and nothing a later Resume could bring back",
+			p.Name)
+	}
 	if p.suspended {
 		return fmt.Errorf("suspend plugin %q: it is already suspended; an earlier call withdrew its "+
 			"contributions and there is nothing left to withdraw", p.Name)
@@ -317,7 +380,18 @@ func (p *Plugin) Suspend(_ context.Context) error {
 // Resuming a plugin that is not suspended is an error naming the current
 // state. It cannot be a no-op: contributing a second time is a duplicate
 // registration, which is fail-loud in the registry and in the gateable catalog
-// alike.
+// alike. Resuming a DISPOSED one is refused too, and for a different reason:
+// the entry that would revoke the contributions is gone, so anything filed now
+// would outlive the plugin (see markDisposed, which is also what makes that
+// refusal hold against a teardown running concurrently).
+//
+// A resume that PANICKED part-way through its contribution — the race below —
+// leaves the plugin suspended with some of its own entries filed under
+// ToolsOwner(owner). Resume refuses that state too, naming the entries, rather
+// than treating the plugin's own leftovers as somebody else's tool names or
+// contributing over them (which would panic on the duplicate). Nothing here can
+// clear it: the way out is disposing the owner, which is the caller's decision
+// to make.
 //
 // A tool name is only the plugin's while it holds it. While it was suspended
 // its names were free, so another contributor may legitimately have taken one —
@@ -340,25 +414,40 @@ func (p *Plugin) Resume(_ context.Context) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
+	// A disposed plugin is not a suspended one, even though both leave the
+	// contribution owner empty: disposal took the ledgerLabelContributions entry
+	// with it, so contributions filed now would have nothing left to revoke them
+	// — they would outlive the plugin in the registry and, process-globally, in
+	// the gateable catalog. That is the leak the ledger exists to prevent, so it
+	// is refused rather than filed. The flag is read here rather than the
+	// ledger, because only the flag is written under the same lock this call
+	// holds: a snapshot could go stale between the check and the contribution,
+	// which is precisely the window that produces the unrevocable entries.
+	if p.disposed {
+		return fmt.Errorf("resume plugin %q: it has been disposed, so owner %s no longer holds its %q entry; "+
+			"contributions filed now could never be revoked", p.Name, p.owner, ledgerLabelContributions)
+	}
 	if !p.suspended {
 		return fmt.Errorf("resume plugin %q: it is active, not suspended; its contributions are already "+
 			"filed and filing them again would be a duplicate registration", p.Name)
 	}
-	// A disposed plugin is not a suspended one, and the ledger is where the
-	// difference shows: disposing the instance owner took the
-	// ledgerLabelContributions entry with it, so contributions filed now would
-	// have nothing left to revoke them — they would outlive the plugin in the
-	// registry and, process-globally, in the gateable catalog. That is the leak
-	// the ledger exists to prevent, so it is refused rather than filed.
-	if !slices.Contains(p.ledger.Snapshot()[p.owner], ledgerLabelContributions) {
-		return fmt.Errorf("resume plugin %q: owner %s no longer holds its %q entry, so the plugin has been "+
-			"disposed; contributions filed now could never be revoked", p.Name, p.owner, ledgerLabelContributions)
+	// The plugin's own leftovers, not somebody else's names: a contribution that
+	// panicked half-way through leaves entries under ToolsOwner(owner) while the
+	// plugin stays suspended. Reporting them as "taken" would name the plugin's
+	// own tools as another contributor's, and contributing over them would panic
+	// on the duplicate — so the residue is named for what it is.
+	if residue := p.ledger.Snapshot()[ToolsOwner(p.owner)]; len(residue) != 0 {
+		return fmt.Errorf("resume plugin %q: its contribution owner %s still holds %v, which an earlier "+
+			"resume left behind when it failed part-way through; those entries have to be disposed before "+
+			"the plugin can come back", p.Name, ToolsOwner(p.owner), residue)
 	}
 	if taken := p.takenToolNames(); len(taken) > 0 {
 		return fmt.Errorf("resume plugin %q: another contributor now holds its tool names %v; "+
 			"a suspended plugin's names are free, so they have to be released before it can come back",
 			p.Name, taken)
 	}
+
+	resumeContributionBarrier()
 
 	// keep is a no-op collector rather than a rollback: with the names checked,
 	// what is left is the race above, and everything contributeTools files goes
@@ -369,6 +458,20 @@ func (p *Plugin) Resume(_ context.Context) error {
 	p.suspended = false
 	return nil
 }
+
+// resumeContributionBarrier runs inside Plugin.Resume, between its checks and
+// its contribution, with p.mu held. It does nothing in production.
+//
+// It is a package-level function value for the same reason closeInstance and
+// drainGrace are: what it makes testable cannot be reached from outside. The
+// guarantee Resume rests on — that a teardown racing it can never dispose the
+// contribution side in the window between the checks and the contribution — is
+// a property of that critical section, and a test cannot hold a resume inside
+// it without a seam to hold it at (TestResumeHoldsOffAConcurrentDisposal is the
+// one test that substitutes it). It carries the same condition as the other
+// two: substituting it is only safe while no test in this package calls
+// t.Parallel().
+var resumeContributionBarrier = func() {}
 
 // takenToolNames returns the plugin's tool names something else holds right
 // now, sorted, so the error Resume returns names all of them at once instead of
@@ -394,7 +497,7 @@ func (p *Plugin) takenToolNames() []string {
 			taken = append(taken, descriptor.Name)
 		}
 	}
-	sort.Strings(taken)
+	slices.Sort(taken)
 	return taken
 }
 
@@ -653,7 +756,27 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 	// nothing pointing at them — a panicking contribution (a duplicate tool
 	// name) would otherwise be reachable only by a caller that already knew to
 	// look there.
+	//
+	// The Plugin itself is built first, before that entry, because the entry's
+	// disposer has to reach it: disposal marks the plugin disposed under its own
+	// lock (see Plugin.markDisposed), which is what serialises a teardown
+	// against a Suspend or Resume running at the same time. Everything the
+	// Plugin needs is already known here — the manifest was read and
+	// cross-checked above — and nothing outside this function can observe it
+	// until Activate returns it, so this only reorders construction, not the
+	// filing sequence the rollback depends on. On the rollback path the entry's
+	// disposer therefore marks a plugin that is never returned, which is exactly
+	// right: it did not survive the activation either.
+	plugin := &Plugin{
+		Name:     spec.Name,
+		Manifest: manifest,
+		pool:     instances,
+		ledger:   ledger,
+		owner:    owner,
+		spec:     spec,
+	}
 	keep(ledger.Add(owner, ledgerLabelContributions, func() error {
+		plugin.markDisposed()
 		if derr := ledger.DisposeOwner(toolsOwner); derr != nil {
 			return fmt.Errorf("withdraw contributions of plugin %q: %w", spec.Name, derr)
 		}
@@ -667,14 +790,7 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 	contributeTools(ledger, toolsOwner, spec, instances, keep)
 
 	committed = true
-	return &Plugin{
-		Name:     spec.Name,
-		Manifest: manifest,
-		pool:     instances,
-		ledger:   ledger,
-		owner:    owner,
-		spec:     spec,
-	}, nil
+	return plugin, nil
 }
 
 // validateSpec rejects a Spec that cannot describe a real activation. These
@@ -827,7 +943,7 @@ func crossCheck(spec Spec, manifest Manifest) error {
 		}
 	}
 	if len(missing) > 0 {
-		sort.Strings(missing)
+		slices.Sort(missing)
 		return fmt.Errorf("cross-check manifest: host claims plugin %q provides %v, "+
 			"guest declares %v; not declared by the guest: %v",
 			spec.Name, claimed, manifest.Provides, missing)
