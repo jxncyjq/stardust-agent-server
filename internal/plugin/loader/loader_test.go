@@ -113,6 +113,12 @@ type pkg struct {
 	// is what lets a test change the ASSEMBLED grant without changing the module
 	// or the capability set.
 	allowedPaths []string
+
+	// requires is the plugin's own "requires" declaration: the tool names it
+	// calls into through call_tool. It is what the Loader's dependency
+	// convergence reads (see suspend_test.go); an empty one is the ordinary
+	// case of a plugin that depends on nothing.
+	requires []string
 }
 
 // writePackage writes a plugin package (plugin.json + plugin.wasm) into dir,
@@ -145,6 +151,7 @@ func writePackage(t *testing.T, dir string, p pkg) {
 		Limits:       manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
 		Filesystem:   manifest.Filesystem{AllowedPaths: p.allowedPaths},
 		Tools:        decls,
+		Requires:     p.requires,
 	}
 	data, err := json.Marshal(pm)
 	if err != nil {
