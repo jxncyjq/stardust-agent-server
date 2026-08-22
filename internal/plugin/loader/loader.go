@@ -771,7 +771,22 @@ func (l *Loader) fail(
 //
 // It does not publish: its plugin/loaded is fail's to send, after the
 // plugin/activation_failed that explains why a restore was needed at all.
+//
+// A restore is not guaranteed to be possible. One Apply frees every name it
+// frees before it claims any (converge's pass 2 before pass 3), so between the
+// unload that took prev down and the failure that asks for it back, another
+// entry in the same convergence may legitimately have taken a tool name prev
+// held. Re-activating over that name is fail-loud by PANIC in the registry and
+// in the gateable catalog, and a panic on the ROLLBACK path would kill the
+// process mid-teardown — in a state that is neither the old deployment nor the
+// new one. So restore runs activate's own pre-flight and reports a taken name
+// as an error: fail joins it and publishes restored=no, which is the honest
+// account of what happened.
 func (l *Loader) restore(ctx context.Context, prev *instance) error {
+	if conflicts := toolNameConflicts(prev.spec); len(conflicts) > 0 {
+		return fmt.Errorf("restore previous instance of plugin %q (owner %s): tool name(s) %v are now "+
+			"owned by another contributor", prev.name, prev.owner, conflicts)
+	}
 	if _, err := host.Activate(ctx, l.ledger, prev.owner, prev.spec); err != nil {
 		return fmt.Errorf("restore previous instance of plugin %q (owner %s): %w", prev.name, prev.owner, err)
 	}

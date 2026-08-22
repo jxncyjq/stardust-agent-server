@@ -187,7 +187,36 @@ type harness struct {
 	// shut. A test that wants to converge with a task in flight begins one on
 	// this gate (see boundary_test.go).
 	gate *runtime.TaskGate
+
+	// onPublish, when non-nil, runs on every runtime event the Loader
+	// publishes. It is a scheduling point rather than an observer: publishing
+	// happens synchronously inside converge, on Apply's own goroutine and with
+	// the Loader's lock held, so a test can use it to change the world BETWEEN
+	// two of a convergence's steps — see
+	// TestApplyRefusesARestoreWhoseToolNamesWereTaken, which uses the proxy's
+	// plugin/loaded to take a tool name the next entry's rollback needs.
+	// Set it before Apply; a nil hook changes nothing.
+	onPublish func(domain.RuntimeEvent)
 }
+
+// harnessBus is the port.EventBus the harness's Loader publishes through: it
+// records into the harness's MemoryEventBus, which every assertion reads, and
+// then runs h.onPublish.
+type harnessBus struct{ h *harness }
+
+// Publish records the event and then runs the harness's hook.
+func (b *harnessBus) Publish(ctx context.Context, event domain.RuntimeEvent) error {
+	if err := b.h.events.Publish(ctx, event); err != nil {
+		return err
+	}
+	if b.h.onPublish != nil {
+		b.h.onPublish(event)
+	}
+	return nil
+}
+
+// Events returns everything recorded, straight from the underlying bus.
+func (b *harnessBus) Events() ([]domain.RuntimeEvent, error) { return b.h.events.Events() }
 
 // newHarness builds that world and — this is not optional — disposes every
 // owner still in the ledger when the test ends. toolauth's gateable catalog is
@@ -223,7 +252,7 @@ func newHarnessWithApplyWait(t *testing.T, applyWait time.Duration) *harness {
 	loader, err := New(Config{
 		Ledger:       h.ledger,
 		Deps:         h.deps,
-		Events:       h.events,
+		Events:       &harnessBus{h: h},
 		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 		DeployLimits: manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
 		Gate:         h.gate,
@@ -801,6 +830,133 @@ func TestApplyReportsBothFailuresWhenTheRestoreAlsoFails(t *testing.T) {
 	if held := h.ledger.Snapshot()[owner]; len(held) != 1 || held[0] != "test-squatter" {
 		t.Fatalf("the test's blocking ledger entry was never filed (owner holds %v); "+
 			"the restore did not fail for the intended reason", held)
+	}
+}
+
+// TestApplyRefusesARestoreWhoseToolNamesWereTaken pins the rollback path's own
+// fail-loud line: when the names the previous instance contributed are no
+// longer free, the restore comes back as an ERROR. It must not reach
+// host.Activate, whose contribution step is fail-loud by PANIC in both the tool
+// registry and the gateable catalog — and a panic there would kill the process
+// on the exact path that exists to make a failed convergence survivable, at the
+// one moment the deployment is neither the old state nor the new one (the
+// predecessor unloaded, its replacement refused).
+//
+// The reachable shape is a tool name MIGRATING between two entries of one Apply
+// while the entry that held it also changes:
+//
+//  1. echo is mounted and owns echoToolName.
+//  2. The new deployment lists the proxy entry FIRST and a CHANGED echo second.
+//  3. Pass 2 unloads echo, freeing echoToolName.
+//  4. Pass 3 activates the proxy, which takes echoToolName.
+//  5. Pass 3 reaches echo's replacement, whose pre-flight refuses the name, and
+//     the failure asks for the predecessor back — but the predecessor's own
+//     retained Spec still claims echoToolName.
+//
+// Step 4 is where the committed fixtures run out: what a plugin provides is
+// answered by the compiled guest (host.crossCheck holds a Spec against that
+// self-description), and the two guests provide exactly one tool name each,
+// and different ones. So the half of the proxy's contribution that claims
+// echoToolName is made here, through the same two authorities
+// host.contributeTools uses — tool.Registry and toolauth.Contribute — and at
+// the same point in the convergence, while the proxy's activation publishes its
+// plugin/loaded from inside converge. No seam in production code is involved.
+func TestApplyRefusesARestoreWhoseToolNamesWereTaken(t *testing.T) {
+	h := newHarness(t)
+	proxy := h.writeProxy("1.0.0")
+	h.apply(h.writeEcho("1.0.0"))
+
+	// The proxy's contribution, in the one respect its guest cannot declare.
+	// Registered under the test's own revocation so the PROCESS-GLOBAL gateable
+	// catalog is clean again for the next test in this package.
+	claimed := false
+	h.onPublish = func(event domain.RuntimeEvent) {
+		if claimed || event.Type != RuntimeEventLoaded ||
+			!strings.HasPrefix(event.Message, "plugin="+proxyPluginName+" ") {
+			return
+		}
+		claimed = true
+		revokeTool := h.registry.Register(echoToolName, tool.HandlerFunc(
+			func(context.Context, domain.ToolCall) (domain.ToolResult, error) {
+				return domain.ToolResult{}, errors.New("the squatting tool is never called")
+			}))
+		revokeGateable := toolauth.Contribute(toolauth.GateableTool{
+			Name:        echoToolName,
+			Description: "taken by another contributor while the echo plugin was down",
+		})
+		t.Cleanup(func() {
+			revokeGateable()
+			revokeTool()
+		})
+	}
+
+	// recover() here is an assertion, not a rescue: it turns "the process would
+	// have died" into a reported test failure and stops this test. Without it a
+	// regression takes the whole package's test binary down and the reason has
+	// to be read out of a stack trace.
+	var (
+		err      error
+		panicked any
+	)
+	func() {
+		defer func() { panicked = recover() }()
+		err = h.loader.Apply(context.Background(), manifest.Deployment{
+			Plugins: []manifest.Entry{proxy, h.writeEcho("2.0.0")},
+		}, h.root)
+	}()
+	if panicked != nil {
+		t.Fatalf("Apply must REPORT a restore whose tool names were taken, not panic: %v", panicked)
+	}
+	if err == nil {
+		t.Fatal("Apply must report the replacement whose tool name another contributor now owns")
+	}
+	if !claimed {
+		t.Fatal("the proxy's plugin/loaded never fired, so the tool name was never taken; " +
+			"this test did not exercise the restore it is about")
+	}
+
+	// Both halves, each identifiable: the replacement's own refusal, and the
+	// restore that could not undo it. The entry that legitimately took the name
+	// is NOT named — it converged, and blaming it would send an operator to the
+	// wrong plugin.
+	for _, want := range []string{echoPluginName, echoToolName, "restore", "another contributor"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("the error must name %q, got %q", want, err)
+		}
+	}
+	if strings.Contains(err.Error(), proxyPluginName) {
+		t.Fatalf("the error must not blame the entry that converged, got %q", err)
+	}
+
+	failed := h.eventsOfType(RuntimeEventActivationFailed)
+	if len(failed) != 1 {
+		t.Fatalf("want one %s event, got %v", RuntimeEventActivationFailed, failed)
+	}
+	if !strings.Contains(failed[0].Message, "restored="+restoredNo) {
+		t.Fatalf("%s must state that the previous instance was NOT restored, got %q",
+			RuntimeEventActivationFailed, failed[0].Message)
+	}
+	if !strings.Contains(failed[0].Message, "step="+stepToolNames) {
+		t.Fatalf("%s must name the failing step, got %q", RuntimeEventActivationFailed, failed[0].Message)
+	}
+
+	// The convergence carried on: the entry that legitimately took the name is
+	// mounted, and only it. echo is a failure row, not a second instance.
+	wantStrings(t, "ledger owners", h.owners(), []string{"plugin:" + proxyPluginName + "@1.0.0"})
+	wantStrings(t, "registered tools", h.toolNames(), []string{proxyToolName, echoToolName})
+
+	status := h.loader.Status()
+	if len(status) != 2 {
+		t.Fatalf("want one row per entry, got %v", status)
+	}
+	if status[0].Name != proxyPluginName || status[0].State != StateLoaded {
+		t.Fatalf("the entry that converged must be reported as loaded, got %+v", status[0])
+	}
+	if status[1].Name != echoPluginName || status[1].State != StateFailed {
+		t.Fatalf("the entry that came back up nowhere must be reported as failed, got %+v", status[1])
+	}
+	if status[1].LastError == "" {
+		t.Fatalf("a failed entry must carry its reason, got %+v", status[1])
 	}
 }
 
