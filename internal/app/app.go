@@ -2,11 +2,13 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/stardust/legion-agent/internal/adapter"
@@ -17,6 +19,7 @@ import (
 	"github.com/stardust/legion-agent/internal/lifecycle"
 	"github.com/stardust/legion-agent/internal/memory"
 	"github.com/stardust/legion-agent/internal/observability"
+	"github.com/stardust/legion-agent/internal/plugin/loader"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/quality"
 	"github.com/stardust/legion-agent/internal/runtime"
@@ -39,6 +42,14 @@ type App struct {
 	// ledger records which owner must revoke which runtime resource. Static
 	// assembly registers under the "app" owner; plugin instances get their own.
 	ledger *lifecycle.Ledger
+
+	// mu guards plugins. The loader is attached during serve assembly and read
+	// by the `agent plugins` commands, which in an embedded host (the Wails
+	// GUI) run on a different goroutine than the assembly did.
+	mu sync.RWMutex
+	// plugins is the loader serve assembly built, or nil when this process has
+	// no plugin deployment configured. See Plugins.
+	plugins *loader.Loader
 }
 
 type RunTaskOptions struct {
@@ -115,6 +126,54 @@ func New() *App {
 // "the plugin loaded but nothing happened" without reading code.
 func (a *App) PluginResources() map[lifecycle.Owner][]string {
 	return a.ledger.Snapshot()
+}
+
+// PluginLedger returns the lifecycle ledger every plugin activation files its
+// revocation handles under — the same one PluginResources reports. Serve
+// assembly needs it to build the plugin loader (loader.Config.Ledger); nothing
+// else should file under it.
+func (a *App) PluginLedger() *lifecycle.Ledger {
+	return a.ledger
+}
+
+// Plugins returns the plugin loader this process assembled, or nil when no
+// plugin deployment is configured (config's plugins.manifest is absent).
+//
+// A nil return is the documented "plugins are not enabled here" state, not a
+// failure: callers must distinguish it rather than dereference it. It is also
+// nil in a process that never ran serve assembly — the loader belongs to a
+// running service, and there is no cross-process view of another serve's
+// plugins.
+func (a *App) Plugins() *loader.Loader {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+
+	return a.plugins
+}
+
+// SetPlugins attaches the plugin loader serve assembly built, so that
+// Plugins — and the `agent plugins` commands reading it — report THIS
+// process's plugins.
+//
+// It refuses a nil loader and a second attachment rather than accepting
+// either: a nil would be indistinguishable from "plugins are not configured",
+// and a replacement would leave the plugins mounted by the first loader
+// running with nothing tracking them.
+func (a *App) SetPlugins(pluginLoader *loader.Loader) error {
+	if pluginLoader == nil {
+		return errors.New("set plugin loader: loader is nil; " +
+			"a process with no plugin deployment must simply not call this")
+	}
+
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.plugins != nil {
+		return errors.New("set plugin loader: a loader is already attached; " +
+			"the plugins the first one mounted would be left running with nothing tracking them")
+	}
+	a.plugins = pluginLoader
+	return nil
 }
 
 func (a *App) RunDemo(ctx context.Context) (DemoResult, error) {

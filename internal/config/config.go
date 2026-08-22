@@ -35,6 +35,62 @@ type Config struct {
 	Web          WebToolConfig      `json:"web"`
 	Browser      BrowserConfig      `json:"browser"`
 	Evolution    EvolutionConfig    `json:"evolution"`
+	Plugins      PluginsConfig      `json:"plugins"`
+}
+
+// PluginsConfig is the WASM plugin deployment this process runs: which
+// deployment manifest declares the target state, where the plugin packages
+// live, the resource ceiling every plugin is held to, and how long a
+// convergence may wait for a task boundary.
+//
+// Manifest is what turns the whole section on, and its absence is a
+// CONTRACT-DECLARED OPTIONAL rather than a fallback: a config with no
+// "plugins.manifest" key runs no plugins at all, which is the supported
+// deployment for every installation that does not use them. Configuring a path
+// is the opposite statement — serve then fails to start if the file cannot be
+// read or parsed, because an operator who named a manifest meant to run it.
+type PluginsConfig struct {
+	// Manifest is the path to the deployment manifest (plugins.json, see
+	// internal/plugin/manifest.ParseDeployment). Empty means plugins are not
+	// enabled: no loader is built, nothing is mounted, and `agent plugins
+	// status` says so. A non-empty path that cannot be read or parsed fails
+	// serve assembly.
+	Manifest string `json:"manifest"`
+
+	// Root is the directory every manifest entry's "source" resolves against,
+	// and the boundary plugin code may be read from — a source that escapes it
+	// is refused. It must be non-empty whenever Manifest is set.
+	Root string `json:"root"`
+
+	// Limits is the deployment's own resource ceiling, applied on top of each
+	// plugin's own request (each limit becomes min(plugin's request, this)).
+	Limits PluginLimitsConfig `json:"limits"`
+
+	// ApplyWaitMs is how long a convergence waits for the tasks already running
+	// to finish before giving up, in milliseconds. It must be positive whenever
+	// Manifest is set: a convergence that waited forever would hold the task
+	// gate shut against every new task with no way for anyone to recover.
+	ApplyWaitMs int `json:"apply_wait_ms"`
+}
+
+// PluginLimitsConfig is the deployment-wide resource ceiling every plugin is
+// held to. MaxMemoryPages and MaxInstances are "not declared" at zero, which
+// leaves each plugin's own declared limit standing; TimeoutMs is not, because
+// it is also the timeout of the HTTP client handed to a plugin granted the
+// http capability, and a zero there would be an unbounded outbound request.
+type PluginLimitsConfig struct {
+	// TimeoutMs bounds one call into a plugin, and the outbound HTTP requests
+	// a plugin granted "http" makes. It must be positive whenever
+	// PluginsConfig.Manifest is set.
+	TimeoutMs int `json:"timeout_ms"`
+
+	// MaxMemoryPages caps a plugin instance's linear memory, in 64 KiB WASM
+	// pages. Zero means the deployment declares no ceiling of its own.
+	MaxMemoryPages uint32 `json:"max_memory_pages"`
+
+	// MaxInstances caps how many instances of one plugin may exist at once.
+	// Zero means the deployment declares no ceiling of its own.
+	MaxInstances int `json:"max_instances"`
 }
 
 // EvolutionConfig tunes the periodic degradation-detection job
@@ -301,7 +357,36 @@ func Load(ctx context.Context, opts Options) (Config, error) {
 		cfg.Server.FileBaseURL = trimmed
 	}
 
+	if err := validatePlugins(cfg.Plugins); err != nil {
+		return Config{}, err
+	}
+
 	return cfg, nil
+}
+
+// validatePlugins checks the plugin section's internal consistency. An absent
+// plugins.manifest is the documented "plugins are off" state and needs no
+// other field; a present one makes Root, Limits.TimeoutMs and ApplyWaitMs
+// load-bearing, and each is rejected by name rather than left to fail later as
+// an unbounded HTTP request, an unconfined plugin source, or a convergence
+// that waits forever.
+func validatePlugins(cfg PluginsConfig) error {
+	if strings.TrimSpace(cfg.Manifest) == "" {
+		return nil
+	}
+	if strings.TrimSpace(cfg.Root) == "" {
+		return fmt.Errorf("plugins.root is empty while plugins.manifest is %q; "+
+			"every entry's source resolves against the root, and it is what bounds where plugin code is read from", cfg.Manifest)
+	}
+	if cfg.ApplyWaitMs <= 0 {
+		return fmt.Errorf("plugins.apply_wait_ms is %d; it must be positive, "+
+			"since a convergence that waits forever for a task boundary holds the gate shut against every new task", cfg.ApplyWaitMs)
+	}
+	if cfg.Limits.TimeoutMs <= 0 {
+		return fmt.Errorf("plugins.limits.timeout_ms is %d; it must be positive, "+
+			"since it also bounds the outbound HTTP requests of a plugin granted the http capability", cfg.Limits.TimeoutMs)
+	}
+	return nil
 }
 
 func defaultConfig() Config {
@@ -401,6 +486,14 @@ func defaultConfig() Config {
 			DegradationThreshold:   0.2,
 			DegradationWindowDays:  14,
 			DegradationScanMinutes: 60,
+		},
+		// Manifest stays empty on purpose: plugins are off until an operator
+		// names a deployment manifest. Everything else is defaulted so that
+		// naming one is the only edit a working plugin deployment needs.
+		Plugins: PluginsConfig{
+			Root:        "plugins",
+			Limits:      PluginLimitsConfig{TimeoutMs: 10000, MaxMemoryPages: 256, MaxInstances: 4},
+			ApplyWaitMs: 60000,
 		},
 	}
 }

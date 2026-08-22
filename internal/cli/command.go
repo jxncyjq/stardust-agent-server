@@ -65,7 +65,8 @@ func NewRoot(application *app.App, out io.Writer) *cobra.Command {
 	}
 	cmd.AddCommand(newRunCommand(application, out))
 	cmd.AddCommand(newTUICommand(application, out))
-	cmd.AddCommand(newServeCommand(out))
+	cmd.AddCommand(newServeCommand(application, out))
+	cmd.AddCommand(newPluginsCommand(application, out))
 	cmd.AddCommand(newBackupCommand(out))
 	cmd.AddCommand(newRestoreCommand(out))
 	cmd.AddCommand(newDataCommand(out))
@@ -1362,7 +1363,7 @@ func parseTUIColorProfile(s string) termenv.Profile {
 	}
 }
 
-func newServeCommand(out io.Writer) *cobra.Command {
+func newServeCommand(application *app.App, out io.Writer) *cobra.Command {
 	var configPath string
 	var addr string
 	cmd := &cobra.Command{
@@ -1376,6 +1377,7 @@ func newServeCommand(out io.Writer) *cobra.Command {
 			result, err := BuildServeService(cmd.Context(), ServeOptions{
 				ConfigPath: configPath,
 				Addr:       addr,
+				App:        application,
 			})
 			if err != nil {
 				return err
@@ -1391,6 +1393,20 @@ func newServeCommand(out io.Writer) *cobra.Command {
 	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file")
 	cmd.Flags().StringVar(&addr, "addr", "", "HTTP listen address")
 	return cmd
+}
+
+// serveDefaultAgent is the identity a serve runs default-agent work as: the
+// coordinator dispatches tasks with no per-agent runner under it, and a
+// plugin's call_tool calls are evaluated against it too (host.Deps.Agent).
+// Both must be the SAME identity — a plugin whose tool calls were evaluated as
+// some other role would be authorized differently from the agent that hosts it.
+func serveDefaultAgent() domain.Agent {
+	return domain.Agent{
+		ID:        "default-agent",
+		CompanyID: "default-company",
+		Role:      "developer",
+		Status:    domain.AgentActive,
+	}
 }
 
 // defaultLogger opens the process-wide file logger. It never falls back to a
@@ -1874,6 +1890,15 @@ type ServeOptions struct {
 	ConfigPath string
 	Addr       string
 	Logger     *slog.Logger
+	// App owns the process-wide lifecycle ledger plugin activations file under,
+	// and holds the plugin loader this assembly builds so that `agent plugins
+	// status|reload` in the same process report THIS serve's plugins.
+	//
+	// Nil is the embedded caller that has no App of its own (the Wails GUI):
+	// the assembly then builds one for itself, and the plugins are loaded and
+	// converged exactly the same way — they are simply not reachable through a
+	// cobra root nobody built.
+	App *app.App
 }
 
 // ServeResult holds the running service and a cleanup function.
@@ -2280,6 +2305,31 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		closeStore()
 		return ServeResult{}, fmt.Errorf("storage driver %q provides no task sink: task state changes would never be persisted", cfg.Storage.Driver)
 	}
+	// One gate per serve, shared by every runtime this assembly builds: the
+	// default-agent runner below and every per-agent runtime the resolver
+	// builds. A plugin change lands only when none of them has a task in
+	// flight, which is only decidable if they all count into the same gate.
+	// It is built here, ahead of everything that uses it, because the plugin
+	// assembly right below needs it too.
+	taskGate := agentruntime.NewTaskGate()
+	// Plugin deployment. A configured-but-unreadable manifest aborts startup;
+	// an absent one means plugins are off; a plugin that will not activate is
+	// logged loudly and left visible in `agent plugins status` without stopping
+	// serve. See assemblePlugins.
+	pluginApp := opts.App
+	if pluginApp == nil {
+		pluginApp = app.New()
+	}
+	pluginLoader, err := assemblePlugins(ctx, pluginApp, cfg, pluginHostDeps{
+		Audit:  auditLog,
+		Events: workflowEvents,
+		Logger: logger,
+		Gate:   taskGate,
+	})
+	if err != nil {
+		closeStore()
+		return ServeResult{}, err
+	}
 	liveTasks := task.NewSchedulerWithSink(taskSink)
 	httpTasks := server.TaskStore(liveTasks)
 	if taskStore != nil {
@@ -2382,11 +2432,6 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	if bs, ok := sharedBrowser.(server.BrowserStreamer); ok {
 		browserStream = bs
 	}
-	// One gate per serve, shared by every runtime this assembly builds: the
-	// default-agent runner below and every per-agent runtime the resolver
-	// builds. A plugin change lands only when none of them has a task in
-	// flight, which is only decidable if they all count into the same gate.
-	taskGate := agentruntime.NewTaskGate()
 	resolver := agentruntime.NewAgentRuntimeResolver(agentruntime.AgentRuntimeResolverConfig{
 		Registry:          registry,
 		Gate:              taskGate,
@@ -2485,12 +2530,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		sessionCfg:        cfg.Session,
 	}
 	coordinator := agentruntime.NewCoordinator(agentruntime.CoordinatorConfig{
-		Agent: domain.Agent{
-			ID:        "default-agent",
-			CompanyID: "default-company",
-			Role:      "developer",
-			Status:    domain.AgentActive,
-		},
+		Agent:              serveDefaultAgent(),
 		Scheduler:          liveTasks,
 		Locks:              task.NewLockStore(),
 		Runtime:            defaultRunner,
@@ -2749,6 +2789,10 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		// task goroutine can never write to an already-closed store.
 		Close: func() {
 			coordinator.Wait()
+			// After the in-flight tasks have drained, so the convergence finds
+			// the task gate idle rather than waiting for a boundary a stopping
+			// service will never reach.
+			drainPlugins(pluginLoader, cfg.Plugins.Root, logger)
 			// Tear down the one shared Chromium process after in-flight tasks
 			// have drained (coordinator.Wait above), so no task can still be
 			// driving the browser when it closes.
