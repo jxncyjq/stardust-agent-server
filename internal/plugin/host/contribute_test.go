@@ -132,16 +132,19 @@ func TestContributedToolIsCallableAndGateable(t *testing.T) {
 			result.CallID, "call-1")
 	}
 
-	labels := c.ledger.Snapshot()[testOwner]
-	want := []string{
+	// Both entries of the contribution live under the contribution owner, and
+	// the instance owner holds the entry that reaches them (see ToolsOwner):
+	// the tool and its gateable catalogue entry are revoked together, and by
+	// something that cannot touch the runtime or the pool.
+	assertOrderedLabels(t, c.ledger, ToolsOwner(testOwner),
+		"tool:"+fixtureProvidedTool,
+		gateableLabel(fixtureProvidedTool),
+	)
+	assertOrderedLabels(t, c.ledger, testOwner,
 		ledgerLabelRuntime,
 		ledgerLabelPool,
-		"tool:" + fixtureProvidedTool,
-		gateableLabel(fixtureProvidedTool),
-	}
-	if strings.Join(labels, ",") != strings.Join(want, ",") {
-		t.Errorf("ledger.Snapshot()[%s] = %v, want %v", testOwner, labels, want)
-	}
+		ledgerLabelContributions,
+	)
 }
 
 // TestDisposeOwnerRemovesTheContributedTool is the revocation half: one
@@ -288,6 +291,10 @@ func TestASecondContributionOfTheSameToolNamePanics(t *testing.T) {
 			if labels := second.Snapshot()[secondOwner]; len(labels) != 0 {
 				t.Errorf("the panicking activation left %v filed under %s, want nothing", labels, secondOwner)
 			}
+			if labels := second.Snapshot()[ToolsOwner(secondOwner)]; len(labels) != 0 {
+				t.Errorf("the panicking activation left %v filed under %s, want nothing: the rollback must "+
+					"reach the contribution side too", labels, ToolsOwner(secondOwner))
+			}
 		}()
 
 		_, _ = Activate(context.Background(), second, secondOwner, spec)
@@ -321,6 +328,11 @@ func TestASecondContributionOfTheSameToolNamePanics(t *testing.T) {
 			// the rollback runs even when the contribution panics.
 			if labels := ledger.Snapshot()[testOwner]; len(labels) != 0 {
 				t.Errorf("the panicking activation left %v filed under %s, want nothing", labels, testOwner)
+			}
+			if labels := ledger.Snapshot()[ToolsOwner(testOwner)]; len(labels) != 0 {
+				t.Errorf("the panicking activation left %v filed under %s, want nothing: the tool WAS "+
+					"registered before toolauth refused, so its entry must have been rolled back",
+					labels, ToolsOwner(testOwner))
 			}
 			if _, err := spec.Registry.Execute(context.Background(), contributionAgent(), domain.ToolCall{
 				ID:   "call-1",

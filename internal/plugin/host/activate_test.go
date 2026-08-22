@@ -137,6 +137,13 @@ func assertOwnerRolledBack(t *testing.T, ledger *lifecycle.Ledger, owner lifecyc
 		t.Fatalf("after a failed activation ledger still holds %v for owner %s, want nothing: "+
 			"the rollback did not run", labels, owner)
 	}
+	// The contribution side is filed under a second owner, so a rollback that
+	// only cleared this one would leave a plugin's tools registered with no
+	// plugin behind them.
+	if labels := ledger.Snapshot()[ToolsOwner(owner)]; len(labels) != 0 {
+		t.Fatalf("after a failed activation ledger still holds %v for owner %s, want nothing: "+
+			"the rollback did not reach the contribution side", labels, ToolsOwner(owner))
+	}
 }
 
 // TestActivateFilesRuntimeAndPool covers the happy path: the manifest the
@@ -184,21 +191,20 @@ func TestActivateFilesRuntimeAndPool(t *testing.T) {
 		t.Errorf("call(opEcho) = %s, want it to contain \"doubled\":42", out)
 	}
 
-	labels := ledger.Snapshot()[testOwner]
-	want := []string{
+	// Every entry activation filed, across BOTH owners. The instance side holds
+	// the wasm resources plus the one entry that reaches the contribution side,
+	// and it is last so that reverse disposal withdraws the tools before the
+	// pool is drained and the runtime closed; the contribution side holds the
+	// two entries per tool.
+	assertOrderedLabels(t, ledger, testOwner,
 		ledgerLabelRuntime,
 		ledgerLabelPool,
-		"tool:" + fixtureProvidedTool,
+		ledgerLabelContributions,
+	)
+	assertOrderedLabels(t, ledger, ToolsOwner(testOwner),
+		"tool:"+fixtureProvidedTool,
 		gateableLabel(fixtureProvidedTool),
-	}
-	if len(labels) != len(want) {
-		t.Fatalf("ledger.Snapshot()[%s] = %v, want %v", testOwner, labels, want)
-	}
-	for i, label := range want {
-		if labels[i] != label {
-			t.Errorf("ledger.Snapshot()[%s][%d] = %q, want %q", testOwner, i, labels[i], label)
-		}
-	}
+	)
 
 	if err := ledger.DisposeOwner(testOwner); err != nil {
 		t.Fatalf("DisposeOwner: %v", err)

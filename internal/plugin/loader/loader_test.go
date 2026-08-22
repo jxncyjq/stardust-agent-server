@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -320,14 +321,39 @@ func (h *harness) writeProxy(version string) manifest.Entry {
 	return entryFor(proxyPluginName, "proxy", []string{"tool"}, proxyToolName)
 }
 
-// owners returns the ledger's live owners, sorted.
+// owners returns the ledger's live INSTANCE owners, sorted — one per mounted
+// plugin, which is what every count assertion in these tests means by "owner".
+//
+// An activation files under two owners: the instance owner and the
+// contribution owner host.ToolsOwner derives from it. The second is filtered
+// out here rather than counted, because a plugin that contributes tools is
+// still one plugin — but it is not ignored: every contribution owner must
+// belong to an instance owner that is also live, so a contribution left behind
+// by a plugin that is gone (or filed under a name nothing owns) fails here
+// instead of quietly disappearing from the count.
 func (h *harness) owners() []string {
 	h.t.Helper()
 
 	snapshot := h.ledger.Snapshot()
 	names := make([]string, 0, len(snapshot))
+	contributions := make([]lifecycle.Owner, 0, len(snapshot))
 	for owner := range snapshot {
+		if strings.HasSuffix(string(owner), "/tools") {
+			contributions = append(contributions, owner)
+			continue
+		}
 		names = append(names, string(owner))
+	}
+	for _, contribution := range contributions {
+		instance := strings.TrimSuffix(string(contribution), "/tools")
+		if host.ToolsOwner(lifecycle.Owner(instance)) != contribution {
+			h.t.Fatalf("ledger owner %s looks like a contribution owner but is not one host.ToolsOwner "+
+				"produces", contribution)
+		}
+		if !slices.Contains(names, instance) {
+			h.t.Fatalf("ledger holds contributions under %s (%v) but nothing under its instance owner %s: "+
+				"a plugin's tools outlived the plugin", contribution, snapshot[contribution], instance)
+		}
 	}
 	sort.Strings(names)
 	return names

@@ -7,21 +7,53 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/stardust/legion-agent/internal/lifecycle"
 	"github.com/stardust/legion-agent/internal/plugin/abi"
 	"github.com/stardust/legion-agent/internal/plugin/perm"
 	"github.com/stardust/legion-agent/internal/tool"
+	"github.com/stardust/legion-agent/internal/toolauth"
 )
 
 // The ledger labels Activate files its resources under. They name the thing
 // being revoked, so a "plugin loaded but nothing happened" report can be
 // answered from lifecycle.Ledger.Snapshot alone.
+//
+// ledgerLabelContributions is the odd one out: it names no resource of its own
+// but the whole contribution side of the activation, which lives under a
+// SECOND owner (see ToolsOwner). Its disposer is what keeps
+// lifecycle.Ledger.DisposeOwner(instance owner) sufficient after the split.
 const (
-	ledgerLabelRuntime = "wasm-runtime"
-	ledgerLabelPool    = "wasm-instance-pool"
+	ledgerLabelRuntime       = "wasm-runtime"
+	ledgerLabelPool          = "wasm-instance-pool"
+	ledgerLabelContributions = "tool-contributions"
 )
+
+// ToolsOwner derives the ledger owner a plugin's CONTRIBUTIONS are filed
+// under — "<owner>/tools" — from the owner its wasm resources are filed under.
+//
+// The two sides are separate owners because they have different lifetimes: a
+// plugin whose dependency went away must stop offering tools the model cannot
+// use, without losing the guest instance and the state inside it. Withdrawing
+// the contributions is then lifecycle.Ledger.DisposeOwner(ToolsOwner(owner)),
+// which cannot touch the runtime or the pool because they are not filed there
+// (see Plugin.Suspend).
+//
+// It is a derivation rather than a field so that a caller holding only the
+// instance owner can reach the contribution side without consulting a
+// directory of who is mounted — the same reason lifecycle.Ledger keeps no such
+// directory itself.
+//
+// An empty owner is a programming error, not a caller mistake to be defaulted:
+// "/tools" would be a namespace shared by every plugin that forgot its owner.
+func ToolsOwner(owner lifecycle.Owner) lifecycle.Owner {
+	if owner == "" {
+		panic("host: ToolsOwner: owner is empty; the contribution side of an activation cannot be namespaced by nothing")
+	}
+	return owner + "/tools"
+}
 
 // drainGrace is how much longer than the longest in-flight call teardown waits
 // for a plugin's instance pool to converge (see drainDeadline).
@@ -181,11 +213,17 @@ type Spec struct {
 // served from.
 //
 // A Plugin owns no teardown of its own. Every resource activation created is
-// filed in the lifecycle.Ledger under the owner it was activated for, so once
-// Activate has returned successfully, revoking the plugin is
-// ledger.DisposeOwner(owner) and nothing else — Activate's owner-exclusivity
-// precondition (see its doc comment) guarantees nothing else is filed under
-// that owner alongside it.
+// filed in the lifecycle.Ledger, so once Activate has returned successfully,
+// revoking the plugin is ledger.DisposeOwner(owner) and nothing else —
+// Activate's owner-exclusivity precondition (see its doc comment) guarantees
+// nothing else is filed under that owner alongside it, and the entry labelled
+// ledgerLabelContributions carries that disposal across to the contribution
+// side.
+//
+// What a Plugin does own is one state transition: Suspend withdraws its
+// contributions without touching the guest, and Resume files them again. A
+// suspended plugin is still activated — same runtime, same pool, same guest
+// state — it is only invisible to the model.
 type Plugin struct {
 	// Name is Spec.Name, which activation has proven equals Manifest.Name.
 	Name string
@@ -199,6 +237,154 @@ type Plugin struct {
 	// contributeTools), and the handlers it registered hold this pool — so
 	// nothing outside this package needs to invoke a guest directly.
 	pool *pool
+
+	// ledger and owner are what Suspend and Resume act on: the contributions
+	// live under ToolsOwner(owner) in ledger, which is the only place either
+	// method reaches. owner itself is never disposed by them — disposing it
+	// means something else entirely, and it is the caller's decision.
+	ledger *lifecycle.Ledger
+	owner  lifecycle.Owner
+
+	// spec is the activation's own Spec, kept because Resume must file exactly
+	// what activation filed: the same descriptors, into the same registry, under
+	// the same plugin name. Re-deriving them from the manifest would lose
+	// everything the deployment declared (schema, risk level, group) and let a
+	// resumed plugin come back as a different tool than it went down as.
+	spec Spec
+
+	// mu guards suspended and serializes the transitions themselves, so two
+	// callers cannot both find the plugin active and both withdraw its
+	// contributions — the second withdrawal would report success having revoked
+	// nothing.
+	mu        sync.Mutex
+	suspended bool
+}
+
+// Suspended reports whether the plugin's contributions are currently
+// withdrawn. A suspended plugin still holds its wasm runtime and its instance
+// pool; it is only absent from the tool registry and the gateable catalog.
+func (p *Plugin) Suspended() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.suspended
+}
+
+// Suspend withdraws the plugin's contributions — every tool it registered and
+// every gateable entry it filed — while leaving the guest exactly as it is.
+//
+// It exists for the plugin that cannot work rather than the plugin that is
+// going away: when something a plugin depends on is gone, leaving its tools in
+// the registry means the model is offered tools whose every call must fail.
+// Withdrawing them is the honest answer, and doing it WITHOUT tearing down the
+// instance pool is what makes it reversible — the guest keeps whatever state it
+// built up, so a Resume costs one ledger pass instead of a re-instantiation.
+//
+// Suspending an already-suspended plugin is an error naming the current state,
+// not a silent no-op: a caller that suspends twice is reasoning from a stale
+// view of the plugin set, and a second call that revoked nothing while
+// reporting success is what would keep it there.
+//
+// The context is accepted for symmetry with Resume and with the other calls a
+// caller makes at a task boundary, and is deliberately not consulted:
+// withdrawing a contribution is a revocation, and a revocation that skipped
+// itself because the caller's context had expired would leave the model looking
+// at tools that cannot work — the exact state this method exists to prevent.
+func (p *Plugin) Suspend(_ context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.suspended {
+		return fmt.Errorf("suspend plugin %q: it is already suspended; an earlier call withdrew its "+
+			"contributions and there is nothing left to withdraw", p.Name)
+	}
+	// lifecycle.Ledger.DisposeOwner runs every disposer even when one fails, so
+	// the contributions are gone whatever it returns. The state flips before the
+	// error is reported for that reason: a Suspend that stayed "active" after
+	// withdrawing everything would refuse the Resume that is the only way back.
+	err := p.ledger.DisposeOwner(ToolsOwner(p.owner))
+	p.suspended = true
+	if err != nil {
+		return fmt.Errorf("suspend plugin %q: %w", p.Name, err)
+	}
+	return nil
+}
+
+// Resume files the plugin's contributions again, on the pool it never lost, so
+// its tools come back served by the same guest instance and the state inside
+// it.
+//
+// Resuming a plugin that is not suspended is an error naming the current
+// state. It cannot be a no-op: contributing a second time is a duplicate
+// registration, which is fail-loud in the registry and in the gateable catalog
+// alike.
+//
+// A tool name is only the plugin's while it holds it. While it was suspended
+// its names were free, so another contributor may legitimately have taken one —
+// operator-authored data that collides, which is an error, not a violated
+// invariant. Resume therefore checks BEFORE it contributes and reports the
+// conflicting names, because both tool.Registry.RegisterDescriptor and
+// toolauth.Contribute answer a duplicate with a panic, and a resume that
+// panicked would take the caller down over a state its operator can fix.
+//
+// The check and the contribution are not one atomic step against the world:
+// nothing stops a third party from taking one of these names in between, and
+// that remains fail-loud. Closing that window would mean holding a lock the
+// registry does not offer; what the check buys is that the reachable,
+// operator-caused version — the name was taken and stayed taken — is an error,
+// leaving only a genuine race to panic.
+//
+// The context is accepted and not consulted for the same reason Suspend's is:
+// re-filing ledger entries reaches no guest and cannot block.
+func (p *Plugin) Resume(_ context.Context) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !p.suspended {
+		return fmt.Errorf("resume plugin %q: it is active, not suspended; its contributions are already "+
+			"filed and filing them again would be a duplicate registration", p.Name)
+	}
+	if taken := p.takenToolNames(); len(taken) > 0 {
+		return fmt.Errorf("resume plugin %q: another contributor now holds its tool names %v; "+
+			"a suspended plugin's names are free, so they have to be released before it can come back",
+			p.Name, taken)
+	}
+
+	// keep is a no-op collector rather than a rollback: with the names checked,
+	// what is left is the race above, and everything contributeTools files goes
+	// under the contribution owner — which the instance owner's
+	// ledgerLabelContributions entry still reaches, so even a panicking resume
+	// leaves nothing DisposeOwner cannot take down.
+	contributeTools(p.ledger, ToolsOwner(p.owner), p.spec, p.pool, func(func() error) {})
+	p.suspended = false
+	return nil
+}
+
+// takenToolNames returns the plugin's tool names something else holds right
+// now, sorted, so the error Resume returns names all of them at once instead of
+// one per attempt.
+//
+// A name counts as taken if the registry exposes it OR the gateable catalog has
+// it, because contributing does both and either half panics on its own. The
+// registry side is read through Descriptors, which is a superset of what
+// RegisterDescriptor would refuse: a derived registry view also reports the
+// names it inherits, and registering one of those would shadow rather than
+// panic. Refusing to resume into a name something else already answers is the
+// safer half of that inaccuracy — the model would otherwise see one name with
+// two implementations behind it.
+func (p *Plugin) takenToolNames() []string {
+	exposed := make(map[string]struct{})
+	for _, descriptor := range p.spec.Registry.Descriptors() {
+		exposed[descriptor.Name] = struct{}{}
+	}
+
+	var taken []string
+	for _, descriptor := range p.spec.Tools {
+		if _, inRegistry := exposed[descriptor.Name]; inRegistry || toolauth.IsGateable(descriptor.Name) {
+			taken = append(taken, descriptor.Name)
+		}
+	}
+	sort.Strings(taken)
+	return taken
 }
 
 // closeInstance performs the wazero close behind every place an Instance is
@@ -231,8 +417,20 @@ var closeInstance = func(ctx context.Context, inst *Instance) error { return ins
 //  6. read the guest's self-description via abi.OpManifest — on an instance from
 //     that pool, so no guest instance ever exists outside it;
 //  7. cross-check that self-description against spec;
-//  8. contribute the plugin's tools (see contributeTools), which files one
+//  8. file the entry that reaches the contribution side (see below), and
+//     contribute the plugin's tools (see contributeTools), which files one
 //     registry entry and one gateable-catalog entry per tool.
+//
+// The resulting entries are split across TWO owners. owner holds the wasm
+// resources — runtime, instance pool — plus one entry, labelled
+// ledgerLabelContributions, whose disposer disposes ToolsOwner(owner); that
+// second owner holds the per-tool entries. The split is what lets the
+// contributions be withdrawn on their own while the guest keeps running
+// (Plugin.Suspend), and the entry that bridges them is what keeps
+// ledger.DisposeOwner(owner) sufficient for callers that know only that one
+// owner. It is filed after both wasm entries precisely so reverse-order
+// disposal runs it first: tools withdrawn, then the pool drained, then the
+// runtime closed.
 //
 // The self-description is read and cross-checked deliberately AFTER the pool is
 // filed and before the contribution: a plugin whose host manifest disagrees with
@@ -252,7 +450,9 @@ var closeInstance = func(ctx context.Context, inst *Instance) error { return ins
 // entries already filed under it, rather than silently tearing them down. A
 // caller reloading a plugin under a stable owner (a hot-reload keeping
 // "plugin:foo" across activations, for instance) MUST dispose the previous
-// activation before calling Activate again with the same owner.
+// activation before calling Activate again with the same owner. The same holds
+// for ToolsOwner(owner), which this activation disposes wholesale and which is
+// therefore checked too.
 //
 // On any failure Activate rolls back only the entries THIS CALL filed, in
 // reverse order, using the one-shot revoke handle lifecycle.Ledger.Add
@@ -281,7 +481,7 @@ var closeInstance = func(ctx context.Context, inst *Instance) error { return ins
 // spec.Registry, they are gateable, and every call to one of them is served by
 // the instance pool through the handler contributeTools registered. Revoking all
 // of that — tools, gateable entries, pool (drained), runtime, in that order — is
-// ledger.DisposeOwner(owner) and nothing else.
+// ledger.DisposeOwner(owner) and nothing else, the second owner included.
 func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Owner, spec Spec) (_ *Plugin, err error) {
 	if ledger == nil {
 		return nil, fmt.Errorf("activate plugin %q: ledger is nil; activation has nowhere to file its rollback", spec.Name)
@@ -293,6 +493,16 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 		return nil, fmt.Errorf("activate plugin %q: owner %s already holds %v; owner must be exclusive to a single "+
 			"activation — dispose the previous activation before activating a new one under the same owner",
 			spec.Name, owner, held)
+	}
+	// The contribution side is part of the same exclusivity: this activation's
+	// teardown disposes that owner wholesale (see ledgerLabelContributions), so
+	// entries already sitting there would be revoked by a plugin that never
+	// filed them, and until then the snapshot would attribute them to it.
+	toolsOwner := ToolsOwner(owner)
+	if held := ledger.Snapshot()[toolsOwner]; len(held) != 0 {
+		return nil, fmt.Errorf("activate plugin %q: contribution owner %s already holds %v; it is derived from "+
+			"owner %s and must be exclusive to this activation, which disposes it wholesale",
+			spec.Name, toolsOwner, held, owner)
 	}
 	if err := validateSpec(spec); err != nil {
 		return nil, err
@@ -420,13 +630,40 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 		return nil, fmt.Errorf("activate plugin %q: %w", spec.Name, err)
 	}
 
+	// The link to the contribution side, filed under the instance owner AFTER
+	// both wasm entries so that reverse disposal withdraws the tools first, then
+	// drains the pool, then closes the runtime. It is what keeps
+	// DisposeOwner(owner) sufficient once the contributions live under a second
+	// owner: the Loader, the CLI drain and ServeResult.Close all know only this
+	// one.
+	//
+	// It is filed BEFORE anything is contributed, not after, so there is never
+	// an instant at which entries exist under the contribution owner with
+	// nothing pointing at them — a panicking contribution (a duplicate tool
+	// name) would otherwise be reachable only by a caller that already knew to
+	// look there.
+	keep(ledger.Add(owner, ledgerLabelContributions, func() error {
+		if derr := ledger.DisposeOwner(toolsOwner); derr != nil {
+			return fmt.Errorf("withdraw contributions of plugin %q: %w", spec.Name, derr)
+		}
+		return nil
+	}))
+
 	// Contribution is the last step, so a tool name another contributor already
 	// owns rolls back everything above it — including the tools registered
-	// before the failing one.
-	contributeTools(ledger, owner, spec, instances, keep)
+	// before the failing one. It files under the contribution owner, which is
+	// what lets Plugin.Suspend withdraw exactly this much and nothing else.
+	contributeTools(ledger, toolsOwner, spec, instances, keep)
 
 	committed = true
-	return &Plugin{Name: spec.Name, Manifest: manifest, pool: instances}, nil
+	return &Plugin{
+		Name:     spec.Name,
+		Manifest: manifest,
+		pool:     instances,
+		ledger:   ledger,
+		owner:    owner,
+		spec:     spec,
+	}, nil
 }
 
 // validateSpec rejects a Spec that cannot describe a real activation. These
