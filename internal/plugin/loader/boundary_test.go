@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -103,15 +104,31 @@ func TestApplyLandsOnlyAtTaskBoundary(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Begin() error = %v, want nil", err)
 	}
-	ended := false
-	defer func() {
-		if !ended {
-			end()
-		}
-	}()
 
 	done := make(chan error, 1)
 	go func() { done <- h.loader.Apply(context.Background(), dep, h.root) }()
+
+	// Retiring the task and waiting the backgrounded Apply out are cleanup, not
+	// a deferred block, so they run on the failure paths below too — and so they
+	// run BEFORE the harness disposes the ledger (t.Cleanup is
+	// last-registered-first, and the harness registered its own first). A failing
+	// run would otherwise dispose owners while a convergence was still filing
+	// them, burying the real failure under the wreckage.
+	var (
+		endOnce       sync.Once
+		applyReturned bool
+	)
+	t.Cleanup(func() {
+		endOnce.Do(end)
+		if applyReturned {
+			return
+		}
+		select {
+		case <-done:
+		case <-time.After(boundaryApplyBound):
+			t.Errorf("Apply() did not return within %s of the task ending", boundaryApplyBound)
+		}
+	})
 
 	h.awaitApplyPending(t, done)
 
@@ -128,11 +145,11 @@ func TestApplyLandsOnlyAtTaskBoundary(t *testing.T) {
 	}
 
 	// The boundary: the task ends and the apply may land.
-	ended = true
-	end()
+	endOnce.Do(end)
 
 	select {
 	case err := <-done:
+		applyReturned = true
 		if err != nil {
 			t.Fatalf("Apply() error = %v, want nil", err)
 		}
