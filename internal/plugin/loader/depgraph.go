@@ -119,22 +119,63 @@ type depNode struct {
 // a caller bug, not operator data — and resolveStates panics naming it
 // rather than silently treating the requirement as satisfied or folding it
 // into the cycle-detection error meant for genuine multi-plugin cycles.
+// This check is deliberately node-local: it tests n's own Provides directly
+// against n's own Requires, never routed through the providerOf map below,
+// because self-dependency is a property of a single entry and must not
+// depend on what any other entry happens to declare (see the duplicate
+// Provides section next for why routing it through providerOf would be
+// wrong). It is also checked before duplicate Provides below, so an entry
+// that is simultaneously self-dependent and part of a duplicate-Provides
+// pair still panics rather than being reported as a duplicate-provider
+// error — the programming-invariant violation takes priority over the
+// operator-data error.
+//
+// # Duplicate Provides across plugins is refused, not resolved by order
+//
+// Two entries in the same call must never declare the same tool name in
+// Provides. This is operator data, exactly like a cycle: two plugins
+// contributing the same tool cannot both be mounted anyway — the host's
+// tool registry and the gateable catalog both panic on a duplicate
+// registration, and the Loader already pre-checks tool-name conflicts
+// before activating a plugin — so a depgraph containing two Provides for
+// the same tool describes a manifest-level mistake, not a graph
+// resolveStates can meaningfully decide. Silently letting the later entry
+// in the slice win (as an ordinary map insert would) is precisely the
+// silent, input-order-dependent default the fail-loud rule forbids
+// elsewhere in this function, and it has a real consequence: a single
+// providerOf entry is all requirementsSatisfied consults, so if the
+// winning provider is suspended while the losing (equally real) provider
+// is still active, the cascade would suspend a requirement that a correct
+// "any active provider satisfies" semantics would not touch. resolveStates
+// therefore returns an error naming the tool and both plugins as soon as a
+// second Provides for the same name is seen, before any cascade or cycle
+// check runs on the resulting (ambiguous) providerOf map.
 func resolveStates(entries []depNode, resolvable func(toolName string) bool) (map[string]depState, error) {
-	providerOf := make(map[string]string, len(entries))
-	for _, n := range entries {
-		for _, tool := range n.Provides {
-			providerOf[tool] = n.Name
-		}
+	if resolvable == nil {
+		panic("depgraph: resolveStates called with a nil resolvable; callers must always supply a callback (one that always returns false is fine), never nil")
 	}
 
 	for _, n := range entries {
 		for _, r := range n.Requires {
-			if providerOf[r] == n.Name {
+			if containsName(n.Provides, r) {
 				panic(fmt.Sprintf(
 					"depgraph: plugin %q requires %q, which it provides itself; "+
 						"internal/plugin/manifest.ParsePlugin should have rejected this at parse time",
 					n.Name, r))
 			}
+		}
+	}
+
+	providerOf := make(map[string]string, len(entries))
+	for _, n := range entries {
+		for _, tool := range n.Provides {
+			if existing, dup := providerOf[tool]; dup {
+				return nil, fmt.Errorf(
+					"depgraph: tool %q is provided by both plugin %q and plugin %q; "+
+						"two plugins cannot both provide the same tool name",
+					tool, existing, n.Name)
+			}
+			providerOf[tool] = n.Name
 		}
 	}
 
@@ -183,11 +224,29 @@ func resolveStates(entries []depNode, resolvable func(toolName string) bool) (ma
 	panic("depgraph: resolveStates fell through its bounded loop, which should be unreachable")
 }
 
+// containsName reports whether name is present in names. resolveStates uses
+// it for the self-dependency check, which must stay a purely node-local
+// property (does this entry's own Provides contain a name from its own
+// Requires) rather than being routed through the providerOf map, which can
+// only ever name one winning provider per tool.
+func containsName(names []string, name string) bool {
+	for _, n := range names {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
 // requirementsSatisfied reports whether every name in n.Requires resolves —
 // either via resolvable, or via another entry that both provides it and is
 // depActive in the snapshot states holds at the moment of the call. states
 // is read only, never written, so the same snapshot can be reused to decide
 // every entry's transition within one round before any of them are applied.
+// providerOf is guaranteed by resolveStates to hold at most one provider
+// name per tool — duplicate Provides across entries is refused as an error
+// before requirementsSatisfied is ever called — so the single lookup below
+// is never resolving an ambiguity by picking one of several real providers.
 func requirementsSatisfied(n depNode, states map[string]depState, providerOf map[string]string, resolvable func(string) bool) bool {
 	for _, r := range n.Requires {
 		if resolvable(r) {
@@ -210,11 +269,13 @@ func requirementsSatisfied(n depNode, states map[string]depState, providerOf map
 // declared dependency shape alone, independent of whether the round loop in
 // resolveStates would ever actually suspend either plugin.
 //
-// The traversal is a standard three-colour DFS (white/gray/black) bounded
-// by len(entries) nodes and len(entries) edges (each entry contributes at
-// most one outgoing edge per Requires name that resolves to another entry's
-// Provides); it visits each node at most once thanks to the colour marks,
-// so it terminates without needing any loop-count cap of its own.
+// The traversal is a standard three-colour DFS (white/gray/black) over
+// len(entries) nodes, with one outgoing edge per Requires name that
+// resolves to another entry's Provides — so a node with several Requires
+// contributes several edges, not just one; termination does not depend on
+// counting edges at all. It visits each node at most once thanks to the
+// colour marks (white -> gray -> black, never revisited once black), so it
+// terminates without needing any loop-count cap of its own.
 func detectCycle(entries []depNode, providerOf map[string]string) []string {
 	const (
 		white = 0

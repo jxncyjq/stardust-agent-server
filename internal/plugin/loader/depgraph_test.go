@@ -119,8 +119,93 @@ func TestResolveStates_Cycle_ReturnsErrorNamingBothPlugins(t *testing.T) {
 	if err == nil {
 		t.Fatal("resolveStates: want error for dependency cycle, got nil")
 	}
-	if !strings.Contains(err.Error(), "a") || !strings.Contains(err.Error(), "b") {
-		t.Errorf("cycle error %q must name both plugins \"a\" and \"b\"", err.Error())
+	// Assert the actual rendered cycle, not a loose substring check: with
+	// single-letter plugin names, strings.Contains(err.Error(), "b") would
+	// stay true even if the real cycle-naming logic broke and "b" only
+	// appeared incidentally elsewhere in a reworded message.
+	const wantCycle = "a -> b -> a"
+	if !strings.Contains(err.Error(), wantCycle) {
+		t.Errorf("cycle error %q must contain the rendered cycle %q", err.Error(), wantCycle)
+	}
+}
+
+func TestResolveStates_NilEntries_ReturnsEmptyMapNoError(t *testing.T) {
+	states, err := resolveStates(nil, alwaysFalse)
+	if err != nil {
+		t.Fatalf("resolveStates: unexpected error: %v", err)
+	}
+	if len(states) != 0 {
+		t.Errorf("states = %v, want empty map", states)
+	}
+}
+
+func TestResolveStates_EmptyEntries_ReturnsEmptyMapNoError(t *testing.T) {
+	states, err := resolveStates([]depNode{}, alwaysFalse)
+	if err != nil {
+		t.Fatalf("resolveStates: unexpected error: %v", err)
+	}
+	if len(states) != 0 {
+		t.Errorf("states = %v, want empty map", states)
+	}
+}
+
+// TestResolveStates_DuplicateProvides_ReturnsErrorNamingToolAndBothPlugins
+// covers the shape the review flagged: two plugins that are otherwise
+// unrelated to any self-dependency both declare Provides for the same tool
+// name. Letting the later entry win by slice order would be exactly the
+// silent, order-dependent default the fail-loud rule forbids, so this must
+// be a fail-loud error naming the tool and both plugins.
+func TestResolveStates_DuplicateProvides_ReturnsErrorNamingToolAndBothPlugins(t *testing.T) {
+	entries := []depNode{
+		{Name: "x", Provides: []string{"tool_t"}},
+		{Name: "y", Provides: []string{"tool_t"}},
+	}
+	_, err := resolveStates(entries, alwaysFalse)
+	if err == nil {
+		t.Fatal("resolveStates: want error for duplicate Provides, got nil")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "tool_t") {
+		t.Errorf("duplicate-provides error %q must name the tool \"tool_t\"", msg)
+	}
+	if !strings.Contains(msg, "\"x\"") || !strings.Contains(msg, "\"y\"") {
+		t.Errorf("duplicate-provides error %q must name both plugins \"x\" and \"y\"", msg)
+	}
+}
+
+// TestResolveStates_SelfDependencyWithDuplicateProvides_PanicsBeforeDuplicateError
+// pins the overlap the review identified: x requires and provides "T"
+// itself (a genuine self-dependency), while an unrelated plugin y also
+// provides "T" (making the graph a duplicate-Provides graph too). Both
+// checks are real for this input; resolveStates must run the node-local
+// self-dependency check first and panic, never reaching (or masking the
+// panic behind) the duplicate-Provides error — because the self-dependency
+// panic is a programming-invariant violation, which takes priority over an
+// operator-data error.
+func TestResolveStates_SelfDependencyWithDuplicateProvides_PanicsBeforeDuplicateError(t *testing.T) {
+	entries := []depNode{
+		{Name: "x", Provides: []string{"tool_t"}, Requires: []string{"tool_t"}},
+		{Name: "y", Provides: []string{"tool_t"}},
+	}
+
+	var (
+		err      error
+		panicked any
+	)
+	func() {
+		defer func() { panicked = recover() }()
+		_, err = resolveStates(entries, alwaysFalse)
+	}()
+
+	if panicked == nil {
+		t.Fatalf("resolveStates: want panic for x's self-dependency (must fire before the duplicate-Provides error), got err=%v", err)
+	}
+	msg, ok := panicked.(string)
+	if !ok {
+		t.Fatalf("resolveStates: panic value = %#v, want string naming plugin \"x\"", panicked)
+	}
+	if !strings.Contains(msg, "\"x\"") {
+		t.Errorf("panic message %q must name plugin \"x\" (the self-dependent entry), not resolve to the duplicate-Provides error", msg)
 	}
 }
 
