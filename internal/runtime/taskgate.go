@@ -156,6 +156,9 @@ func (g *TaskGate) finish() {
 //     and names how many tasks are still running. Nothing is changed: applying
 //     anyway is the mid-task change this gate exists to prevent, and giving up
 //     loudly lets the caller retry at a calmer moment;
+//   - ctx is already done even though the gate turns out to be idle right
+//     now — a cancelled ctx means "don't do this", and that holds whether or
+//     not any waiting was ever needed to reach the boundary;
 //   - another apply is already pending — that convergence belongs to its own
 //     caller, and reporting success here would claim an apply that never ran.
 //
@@ -222,16 +225,21 @@ func (g *TaskGate) endApply() {
 }
 
 // awaitIdle waits for idle, giving up after wait or when ctx ends, whichever
-// comes first. Giving up is an error naming the tasks that are still running:
-// the caller has to be able to tell "nothing was applied, and here is what was
-// in the way" from a successful apply.
+// comes first. Before reporting success it also checks the parent ctx (not
+// the derived waitCtx) one last time, so a ctx that was already cancelled
+// when the gate happened to be idle right now still stops fn from running —
+// see the "ctx is already done" case documented on ApplyAtBoundary.
+//
+// Giving up is an error naming the tasks that are still running and how long
+// the wait actually ran: the caller has to be able to tell "nothing was
+// applied, and here is what was in the way" from a successful apply.
 func (g *TaskGate) awaitIdle(ctx context.Context, wait time.Duration, idle <-chan struct{}) error {
+	start := time.Now()
 	waitCtx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
 
 	select {
 	case <-idle:
-		return nil
 	case <-waitCtx.Done():
 	}
 
@@ -240,11 +248,20 @@ func (g *TaskGate) awaitIdle(ctx context.Context, wait time.Duration, idle <-cha
 	// apply that in fact reached its boundary.
 	select {
 	case <-idle:
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("apply plugin change at task boundary: ctx was already done "+
+				"once the boundary was reached, nothing was applied: %w", err)
+		}
 		return nil
 	default:
 	}
+
+	// Captured right where the recheck just failed, not after any further
+	// work, so a last end() landing after this point cannot make the count
+	// in the error contradict the "still running" it is reporting.
+	running := g.runningCount()
 	return fmt.Errorf("apply plugin change at task boundary: waited %s for the running tasks to finish, "+
-		"%d task(s) still running, nothing was applied: %w", wait, g.runningCount(), waitCtx.Err())
+		"%d task(s) still running, nothing was applied: %w", time.Since(start), running, waitCtx.Err())
 }
 
 // runningCount reports how many tasks are in flight right now. It is a snapshot
