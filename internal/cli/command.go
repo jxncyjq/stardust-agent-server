@@ -1913,6 +1913,7 @@ func buildDefaultRunnerConfig(
 	capabilitySkills capability.Provider,
 	skillUsage agentruntime.SkillUsageRecorder,
 	episodeRecorder agentruntime.EpisodeRecorder,
+	gate *agentruntime.TaskGate,
 ) agentruntime.Config {
 	return agentruntime.Config{
 		Maas:             maas,
@@ -1933,6 +1934,11 @@ func buildDefaultRunnerConfig(
 		// config serves default-agent tasks, so wiring it only on the resolver
 		// left a configured threshold doing nothing for the GUI.
 		CompactTokenThreshold: runtimeSettings.CompactTokenThreshold,
+		// The task-boundary gate this serve's default-agent tasks register on.
+		// It is the same gate the per-agent resolver gets, because both kinds of
+		// task run against one process-wide tool registry: an apply may only
+		// land when NEITHER has a task in flight.
+		Gate: gate,
 	}
 }
 
@@ -2376,8 +2382,14 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	if bs, ok := sharedBrowser.(server.BrowserStreamer); ok {
 		browserStream = bs
 	}
+	// One gate per serve, shared by every runtime this assembly builds: the
+	// default-agent runner below and every per-agent runtime the resolver
+	// builds. A plugin change lands only when none of them has a task in
+	// flight, which is only decidable if they all count into the same gate.
+	taskGate := agentruntime.NewTaskGate()
 	resolver := agentruntime.NewAgentRuntimeResolver(agentruntime.AgentRuntimeResolverConfig{
 		Registry:          registry,
+		Gate:              taskGate,
 		RootConfig:        cfg,
 		Audit:             auditLog,
 		Events:            workflowEvents,
@@ -2452,6 +2464,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 			cfg.Runtime, checkpointStore, manualGate, logger, capabilitySkills,
 			skillUsage,
 			episodeRecorder,
+			taskGate,
 		),
 		contextRoot:     cfg.ContextFiles.Root,
 		audit:           auditLog,

@@ -67,7 +67,7 @@ func TestRuntimeRoutesLoadCapabilities(t *testing.T) {
 	maas := &loadCapabilitiesMaas{}
 	audit := adapter.NewMemoryAuditLog()
 	events := adapter.NewMemoryEventBus()
-	runner := NewRuntime(Config{
+	runner := NewRuntime(Config{Gate: NewTaskGate(),
 		Maas:      maas,
 		Audit:     audit,
 		Events:    events,

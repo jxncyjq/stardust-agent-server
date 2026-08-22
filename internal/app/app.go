@@ -127,6 +127,12 @@ func (a *App) RunDemo(ctx context.Context) (DemoResult, error) {
 		Events:   events,
 		Tools:    tool.NewWorkspaceRegistry(".", audit),
 		ToolRoot: ".",
+		// This path runs one task and returns; it mounts no plugins and shares
+		// no registry with a plugin loader, so the gate it registers that task
+		// on is its own. It is still required, not optional: the field is what
+		// makes "which boundary does this runtime's task belong to?" an answered
+		// question at every construction site.
+		Gate: runtime.NewTaskGate(),
 	})
 	task := domain.Task{
 		ID:        "demo-task",
@@ -295,6 +301,8 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 		Checkpoints:       opts.Checkpoints,
 		Logger:            taskLogger,
 		DisabledTools:     opts.DisabledTools,
+		// One-shot task, its own gate — see RunDemo above.
+		Gate: runtime.NewTaskGate(),
 	})
 	task := domain.Task{
 		ID:         opts.TaskID,

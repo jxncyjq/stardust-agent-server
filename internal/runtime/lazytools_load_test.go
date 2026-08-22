@@ -40,7 +40,7 @@ func loadCall(names ...string) domain.ToolCall {
 
 func TestLoadCapabilitiesPutsDetailInLoadedBlock(t *testing.T) {
 	t.Parallel()
-	rt := NewRuntime(Config{})
+	rt := NewRuntime(Config{Gate: NewTaskGate()})
 	catalog := capability.NewCatalog(stubProvider{details: map[string]string{"read_file": "SCHEMA-MARKER"}})
 	st := &loopState{}
 
@@ -61,7 +61,7 @@ func TestLoadCapabilitiesPutsDetailInLoadedBlock(t *testing.T) {
 
 func TestLoadCapabilitiesRejectsUnknownName(t *testing.T) {
 	t.Parallel()
-	rt := NewRuntime(Config{})
+	rt := NewRuntime(Config{Gate: NewTaskGate()})
 	catalog := capability.NewCatalog(stubProvider{details: map[string]string{"read_file": "S"}})
 	st := &loopState{}
 
@@ -84,7 +84,7 @@ func TestLoadCapabilitiesRejectsUnknownName(t *testing.T) {
 
 func TestLoadCapabilitiesRejectsEmptyAndOversizedBatch(t *testing.T) {
 	t.Parallel()
-	rt := NewRuntime(Config{})
+	rt := NewRuntime(Config{Gate: NewTaskGate()})
 	details := map[string]string{}
 	names := make([]string, 0, maxLoadBatch+1)
 	for i := 0; i <= maxLoadBatch; i++ {
@@ -118,7 +118,7 @@ func (u *recordingUsage) Touch(id string, _ time.Time) { u.touched = append(u.to
 func TestLoadCapabilitiesTouchesSkillUsage(t *testing.T) {
 	t.Parallel()
 	usage := &recordingUsage{}
-	rt := NewRuntime(Config{SkillUsage: usage})
+	rt := NewRuntime(Config{Gate: NewTaskGate(), SkillUsage: usage})
 	catalog := capability.NewCatalog(stubProvider{details: map[string]string{"go-testing": "BODY"}})
 
 	if _, err := rt.dispatchLoadCapabilities(context.Background(), &loopState{}, loadCall("go-testing"), catalog); err != nil {

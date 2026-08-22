@@ -14,12 +14,14 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/lifecycle"
 	"github.com/stardust/legion-agent/internal/plugin/host"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
+	"github.com/stardust/legion-agent/internal/runtime"
 	"github.com/stardust/legion-agent/internal/tool"
 	"github.com/stardust/legion-agent/internal/toolauth"
 )
@@ -179,6 +181,12 @@ type harness struct {
 	registry *tool.Registry
 	events   *adapter.MemoryEventBus
 	loader   *Loader
+
+	// gate is the task-boundary gate this harness's Loader applies through. It
+	// is per-harness, so one test's in-flight task cannot hold another's apply
+	// shut. A test that wants to converge with a task in flight begins one on
+	// this gate (see boundary_test.go).
+	gate *runtime.TaskGate
 }
 
 // newHarness builds that world and — this is not optional — disposes every
@@ -190,12 +198,27 @@ type harness struct {
 func newHarness(t *testing.T) *harness {
 	t.Helper()
 
+	return newHarnessWithApplyWait(t, defaultTestApplyWait)
+}
+
+// defaultTestApplyWait is how long a harness Loader waits for a task boundary.
+// No test that uses newHarness holds a task in flight, so the wait is never
+// spent — it is a bound against a wedged gate hanging the suite, not a delay.
+const defaultTestApplyWait = 30 * time.Second
+
+// newHarnessWithApplyWait is newHarness with a caller-chosen ApplyWait, for the
+// tests that DO converge with a task in flight and need to pin what happens
+// when the wait runs out.
+func newHarnessWithApplyWait(t *testing.T, applyWait time.Duration) *harness {
+	t.Helper()
+
 	h := &harness{
 		t:        t,
 		root:     t.TempDir(),
 		ledger:   lifecycle.NewLedger(),
 		registry: tool.NewRegistry(nil, nil, nil),
 		events:   adapter.NewMemoryEventBus(),
+		gate:     runtime.NewTaskGate(),
 	}
 	loader, err := New(Config{
 		Ledger:       h.ledger,
@@ -203,6 +226,8 @@ func newHarness(t *testing.T) *harness {
 		Events:       h.events,
 		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 		DeployLimits: manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
+		Gate:         h.gate,
+		ApplyWait:    applyWait,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -356,10 +381,12 @@ func wantStrings(t *testing.T, what string, got, want []string) {
 func TestNewRequiresEveryDependency(t *testing.T) {
 	full := func() Config {
 		return Config{
-			Ledger: lifecycle.NewLedger(),
-			Deps:   func(string, json.RawMessage) host.Deps { return host.Deps{} },
-			Events: adapter.NewMemoryEventBus(),
-			Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+			Ledger:    lifecycle.NewLedger(),
+			Deps:      func(string, json.RawMessage) host.Deps { return host.Deps{} },
+			Events:    adapter.NewMemoryEventBus(),
+			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+			Gate:      runtime.NewTaskGate(),
+			ApplyWait: defaultTestApplyWait,
 		}
 	}
 	cases := []struct {
@@ -883,6 +910,8 @@ func TestApplyReportsADepsFactoryWithNoRegistry(t *testing.T) {
 		Events:       events,
 		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 		DeployLimits: manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
+		Gate:         runtime.NewTaskGate(),
+		ApplyWait:    defaultTestApplyWait,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

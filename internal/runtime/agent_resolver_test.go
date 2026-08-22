@@ -29,7 +29,7 @@ func TestResolverInjectsCheckpointsAndGate(t *testing.T) {
 
 	cfgStore := sessionstate.NewStore(t.TempDir())
 	gate := manualgate.New(approval.NewToolGateStore(t.TempDir()))
-	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{Gate: NewTaskGate(),
 		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
 			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep"},
 		}),
@@ -82,7 +82,7 @@ func TestResolverInjectsSkillUsage(t *testing.T) {
 	t.Parallel()
 
 	usage := &recordingUsage{}
-	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{Gate: NewTaskGate(),
 		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
 			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep"},
 		}),
@@ -127,7 +127,7 @@ func TestResolverInjectsEpisodeRecorder(t *testing.T) {
 	t.Parallel()
 
 	recorder := &fakeEpisodeRecorder{}
-	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{Gate: NewTaskGate(),
 		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
 			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep"},
 		}),
@@ -208,7 +208,7 @@ func TestAgentRuntimeResolverUsesRegisteredAgentMaasProfileAndContextFiles(t *te
 
 	maas := &resolverCaptureMaas{response: "researched"}
 	var gotProfile string
-	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{Gate: NewTaskGate(),
 		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
 			"researcher": {
 				ID:          "agent-researcher",
@@ -306,7 +306,7 @@ func TestResolveTaskRunnerLoadsProjectRootAgents(t *testing.T) {
 	writeResolverContextFile(t, projectDir, "agents.md", "PROJECT-RULE-XYZ")
 
 	maas := &resolverCaptureMaas{response: "ok"}
-	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{Gate: NewTaskGate(),
 		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
 			"researcher": {
 				ID:          "agent-researcher",
@@ -379,7 +379,7 @@ Write concise cache documentation.
 `)
 
 	maas := &resolverCaptureMaas{response: "researched"}
-	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{Gate: NewTaskGate(),
 		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
 			"researcher": {
 				ID:           "researcher",
@@ -473,7 +473,7 @@ func TestAgentRuntimeResolverToleratesMissingSkillsRoot(t *testing.T) {
 	missingSkills := filepath.Join(root, "skills", "researcher")
 
 	maas := &resolverCaptureMaas{response: "researched"}
-	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{Gate: NewTaskGate(),
 		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
 			"researcher": {
 				ID:           "researcher",
@@ -522,7 +522,7 @@ summary: Shared cache skill.
 Shared cache skill.
 `)
 	maas := &resolverCaptureMaas{response: "ok"}
-	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{Gate: NewTaskGate(),
 		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
 			"writer": {
 				ID:           "writer",
@@ -565,7 +565,7 @@ Shared cache skill.
 func TestAgentRuntimeResolverRegistryMissReturnsFalse(t *testing.T) {
 	t.Parallel()
 
-	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{Gate: NewTaskGate(),
 		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{}),
 		MaasFactory: func(string) (MaasRunnerFactoryResult, error) {
 			return MaasRunnerFactoryResult{Client: &resolverCaptureMaas{}}, nil
@@ -593,7 +593,7 @@ func TestAgentRuntimeResolverFactoryErrorReturnsError(t *testing.T) {
 	t.Parallel()
 
 	wantErr := errors.New("factory failed")
-	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{Gate: NewTaskGate(),
 		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
 			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep"},
 		}),
@@ -624,7 +624,7 @@ func TestAgentRuntimeResolverFactoryErrorReturnsError(t *testing.T) {
 func TestResolverOmitsOrchestratorOnlyTools(t *testing.T) {
 	t.Parallel()
 
-	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{Gate: NewTaskGate(),
 		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
 			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep"},
 		}),
@@ -681,7 +681,7 @@ func TestResolverOmitsOrchestratorOnlyTools(t *testing.T) {
 func TestResolverGivesWorkerWriteFile(t *testing.T) {
 	t.Parallel()
 
-	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{Gate: NewTaskGate(),
 		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
 			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep"},
 		}),
@@ -725,7 +725,7 @@ func TestResolverGivesWorkerWriteFile(t *testing.T) {
 func TestResolverRejectsUnknownDisabledTool(t *testing.T) {
 	t.Parallel()
 
-	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{Gate: NewTaskGate(),
 		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
 			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep", DisabledTools: []string{"writ_file"}},
 		}),
@@ -759,7 +759,7 @@ func TestResolverAppliesDisabledTools(t *testing.T) {
 	t.Parallel()
 
 	maas := &recordingRoundsMaas{responses: []port.InferenceResponse{{Text: "done"}}}
-	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{Gate: NewTaskGate(),
 		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
 			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep", DisabledTools: []string{"write_file"}},
 		}),
@@ -809,7 +809,7 @@ func TestResolveTaskRunnerInjectsSessionHistory(t *testing.T) {
 	lister := &fakeTurnLister{turns: []domain.ConversationTurn{
 		{ID: "t1:user", TaskID: "task-1", Role: domain.ConversationRoleUser, Content: "HISTORY-MARKER"},
 	}}
-	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{Gate: NewTaskGate(),
 		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
 			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep"},
 		}),

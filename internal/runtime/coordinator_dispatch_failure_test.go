@@ -64,7 +64,7 @@ func TestCoordinatorReturnsTaskToPendingWhenMarkRunningFails(t *testing.T) {
 		},
 		Scheduler: scheduler,
 		Locks:     locks,
-		Runtime: NewRuntime(Config{
+		Runtime: NewRuntime(Config{Gate: NewTaskGate(),
 			Maas:   adapter.NewRecordingMaas("safe result"),
 			Audit:  audit,
 			Events: events,
@@ -212,7 +212,7 @@ func TestCoordinatorCompletesTaskAfterTransientDispatchFailure(t *testing.T) {
 		Agent:     domain.Agent{ID: "agent-1", CompanyID: "company-1", Role: "developer", Status: domain.AgentActive},
 		Scheduler: scheduler,
 		Locks:     task.NewLockStore(),
-		Runtime: NewRuntime(Config{
+		Runtime: NewRuntime(Config{Gate: NewTaskGate(),
 			Maas:   adapter.NewRecordingMaas("safe result"),
 			Audit:  audit,
 			Events: events,

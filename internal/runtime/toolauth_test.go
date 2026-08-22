@@ -13,7 +13,7 @@ import (
 // single effectiveTools choke point covers offer, catalog and dispatch at once.
 func TestEffectiveToolsRemovesDisabledTool(t *testing.T) {
 	maas := &recordingRoundsMaas{responses: []port.InferenceResponse{{Text: "done"}}}
-	rt := NewRuntime(Config{
+	rt := NewRuntime(Config{Gate: NewTaskGate(),
 		Maas:          maas,
 		Tools:         unchangingReadRegistry(t), // has read_file
 		DisabledTools: []string{"read_file"},
@@ -36,7 +36,7 @@ func TestDispatchRejectsDisabledTool(t *testing.T) {
 		{ToolCalls: []domain.ToolCall{{ID: "c1", Name: "read_file", Arguments: map[string]string{"path": "x"}}}},
 		{Text: "done"},
 	}}
-	rt := NewRuntime(Config{
+	rt := NewRuntime(Config{Gate: NewTaskGate(),
 		Maas:          maas,
 		Tools:         unchangingReadRegistry(t),
 		DisabledTools: []string{"read_file"},
@@ -62,7 +62,7 @@ func TestDispatchRejectsDisabledTool(t *testing.T) {
 
 func TestEffectiveToolsUnaffectedWhenNoDisabled(t *testing.T) {
 	maas := &recordingRoundsMaas{responses: []port.InferenceResponse{{Text: "done"}}}
-	rt := NewRuntime(Config{Maas: maas, Tools: unchangingReadRegistry(t)})
+	rt := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas, Tools: unchangingReadRegistry(t)})
 	if _, err := rt.RunTask(context.Background(), domain.Agent{ID: "a"}, domain.Task{ID: "t1", Input: "go"}); err != nil {
 		t.Fatalf("RunTask error = %v, want nil", err)
 	}

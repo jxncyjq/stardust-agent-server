@@ -1989,7 +1989,7 @@ func TestServeCommandSandboxesTaskToolsToSessionWorkingDir(t *testing.T) {
 
 	newRunner := func() *defaultTaskRunner {
 		return &defaultTaskRunner{
-			runtimeCfg: agentruntime.Config{Events: adapter.NewMemoryEventBus()},
+			runtimeCfg: agentruntime.Config{Gate: agentruntime.NewTaskGate(), Events: adapter.NewMemoryEventBus()},
 			// contextRoot is never consulted here: both tasks above carry a
 			// non-empty WorkingDir (inherited from the session), and
 			// defaultTaskRunner.RunTask prioritizes task.WorkingDir over it.
@@ -2603,7 +2603,7 @@ func TestDefaultTaskRunnerCanWriteFile(t *testing.T) {
 	workingDir := t.TempDir()
 	maas := &writeProbingMaas{path: "created.txt", content: "hello serve"}
 	runner := &defaultTaskRunner{
-		runtimeCfg:  agentruntime.Config{Events: adapter.NewMemoryEventBus(), Maas: maas},
+		runtimeCfg:  agentruntime.Config{Gate: agentruntime.NewTaskGate(), Events: adapter.NewMemoryEventBus(), Maas: maas},
 		contextRoot: workingDir,
 		audit:       adapter.NewMemoryAuditLog(),
 		webOptions:  tool.WebToolOptions{},
@@ -2642,7 +2642,7 @@ func TestDefaultTaskRunnerSandboxesToolsToTaskWorkingDir(t *testing.T) {
 
 	newRunner := func() *defaultTaskRunner {
 		return &defaultTaskRunner{
-			runtimeCfg: agentruntime.Config{
+			runtimeCfg: agentruntime.Config{Gate: agentruntime.NewTaskGate(),
 				Events: adapter.NewMemoryEventBus(),
 			},
 			contextRoot: contextRoot,
@@ -2747,7 +2747,7 @@ func TestDefaultTaskRunnerInjectsSessionHistory(t *testing.T) {
 		// A real Core is what renders the "Recent conversation" block, so this
 		// asserts the whole turns -> context -> prompt path, not just field
 		// assignment.
-		runtimeCfg: agentruntime.Config{
+		runtimeCfg: agentruntime.Config{Gate: agentruntime.NewTaskGate(),
 			Maas:           maas,
 			Events:         adapter.NewMemoryEventBus(),
 			ContextBuilder: cognitive.NewCore(cognitive.NoopCompressor{}),
@@ -2783,6 +2783,7 @@ func TestBuildDefaultRunnerConfigCarriesCompactThreshold(t *testing.T) {
 		nil, adapter.NewMemoryAuditLog(), adapter.NewMemoryEventBus(), nil,
 		config.RuntimeConfig{CompactTokenThreshold: 4321}, nil, nil, nil, nil, nil,
 		nil,
+		agentruntime.NewTaskGate(),
 	)
 	if cfg.CompactTokenThreshold != 4321 {
 		t.Fatalf("CompactTokenThreshold = %d, want 4321", cfg.CompactTokenThreshold)

@@ -119,6 +119,12 @@ func (r *Runtime) newSubRuntime(role string, toolsets []string) (*Runtime, error
 		// the parent even if it wanted to -- a parent's in-flight loaded block
 		// simply has no path into a spawned child's loopState.
 		capabilitySkills: r.capabilitySkills,
+		// The child runs its own RunTask, so it needs a gate — and it must be
+		// the PARENT'S gate, not one of its own. A sub-task runs inside its
+		// parent's task, which already holds that gate open; a private gate
+		// would make the child invisible to the apply that is waiting for the
+		// parent's boundary, which is the one thing the gate exists to prevent.
+		gate: r.gate,
 	}
 	return child, nil
 }

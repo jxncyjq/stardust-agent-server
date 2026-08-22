@@ -79,7 +79,7 @@ func echoRegistry(t *testing.T) *tool.Registry {
 
 func TestRunTaskSuspendsAndWritesCheckpoint(t *testing.T) {
 	store := sessionstate.NewStore(t.TempDir())
-	runner := NewRuntime(Config{
+	runner := NewRuntime(Config{Gate: NewTaskGate(),
 		Maas:        &scriptedMaas{},
 		Audit:       adapter.NewMemoryAuditLog(),
 		Events:      adapter.NewMemoryEventBus(),
@@ -110,6 +110,7 @@ func TestRunTaskResumesFromCheckpointToCompletion(t *testing.T) {
 	maas := &scriptedMaas{}
 	gate := &gateOnce{}
 	cfg := Config{
+		Gate:        NewTaskGate(),
 		Maas:        maas,
 		Audit:       adapter.NewMemoryAuditLog(),
 		Events:      adapter.NewMemoryEventBus(),
@@ -222,7 +223,7 @@ func TestLoadedCapabilitiesPersistAcrossSuspendResume(t *testing.T) {
 
 	// --- process 1: load a capability, then suspend before the pending real call ---
 	store1 := sessionstate.NewStore(dir)
-	runner1 := NewRuntime(Config{
+	runner1 := NewRuntime(Config{Gate: NewTaskGate(),
 		Maas:        &scriptedLoadThenToolMaas{},
 		Audit:       adapter.NewMemoryAuditLog(),
 		Events:      adapter.NewMemoryEventBus(),
@@ -252,7 +253,7 @@ func TestLoadedCapabilitiesPersistAcrossSuspendResume(t *testing.T) {
 	// --- simulate restart: brand-new store + runtime over the same dir ---
 	store2 := sessionstate.NewStore(dir)
 	resumeMaas := &recordingSubMaas{summary: "final answer"}
-	runner2 := NewRuntime(Config{
+	runner2 := NewRuntime(Config{Gate: NewTaskGate(),
 		Maas:        resumeMaas,
 		Audit:       adapter.NewMemoryAuditLog(),
 		Events:      adapter.NewMemoryEventBus(),

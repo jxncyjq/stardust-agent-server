@@ -188,7 +188,7 @@ func TestPluginCallToolSpendsTheModelsSharedToolBudget(t *testing.T) {
 	)
 
 	maas := &pluginThenDirectMaas{pluginRounds: pluginRounds}
-	runner := NewRuntime(Config{
+	runner := NewRuntime(Config{Gate: NewTaskGate(),
 		Maas: maas, Tools: registry, Events: events, MaxToolRounds: 1000,
 		// Discarded rather than left nil: the cap-break WARN this test intentionally
 		// triggers would otherwise go to stderr, cluttering `go test -v` and hiding a
@@ -288,7 +288,7 @@ func TestRuntimeInstallsTheSharedToolBudgetOnEveryDispatch(t *testing.T) {
 		}),
 	)
 	maas := &pluginThenDirectMaas{pluginRounds: 0}
-	runner := NewRuntime(Config{Maas: maas, Tools: registry, MaxToolRounds: 3})
+	runner := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas, Tools: registry, MaxToolRounds: 3})
 	if _, err := runner.RunTask(context.Background(),
 		domain.Agent{ID: "a", Role: "developer", Status: domain.AgentActive},
 		domain.Task{ID: "t1", Status: domain.TaskRunning, Input: "go"},

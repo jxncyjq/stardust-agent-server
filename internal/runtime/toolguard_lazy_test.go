@@ -59,7 +59,7 @@ func TestLoopCapCountsWrappedToolNotCallTool(t *testing.T) {
 	maas := &rotatingCallToolMaas{distinct: distinct}
 	events := adapter.NewMemoryEventBus()
 
-	rt := NewRuntime(Config{
+	rt := NewRuntime(Config{Gate: NewTaskGate(),
 		Maas:          maas,
 		Tools:         lazyGuardRegistry(distinct),
 		Events:        events,
@@ -110,7 +110,7 @@ func TestLoopCapStopsWrappedRunawayAndNamesTheRealTool(t *testing.T) {
 	maas := &sameWrappedToolMaas{}
 	events := adapter.NewMemoryEventBus()
 
-	rt := NewRuntime(Config{
+	rt := NewRuntime(Config{Gate: NewTaskGate(),
 		Maas:          maas,
 		Tools:         lazyGuardRegistry(1),
 		Events:        events,
@@ -182,7 +182,7 @@ func TestSameToolFailureWarningNamesWrappedTool(t *testing.T) {
 		}),
 	)
 	maas := &failingWrappedToolMaas{}
-	rt := NewRuntime(Config{Maas: maas, Tools: registry, LazyTools: true, MaxToolRounds: 50})
+	rt := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas, Tools: registry, LazyTools: true, MaxToolRounds: 50})
 	if _, err := rt.RunTask(context.Background(), domain.Agent{ID: "a", Role: "developer"},
 		domain.Task{ID: "t1", Status: domain.TaskRunning, Input: "go"}); err != nil {
 		t.Fatalf("RunTask err = %v", err)

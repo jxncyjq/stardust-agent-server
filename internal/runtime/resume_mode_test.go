@@ -58,7 +58,7 @@ func TestCheckSuspendPersistsMode(t *testing.T) {
 	store := sessionstate.NewStore(dir)
 	reg := planRegistry(t) // reuses helper from plan_mode_test.go (read_x safe, write_x sensitive)
 	maas := &oneToolThenTextMaas{toolName: "read_x"}
-	runner := NewRuntime(Config{
+	runner := NewRuntime(Config{Gate: NewTaskGate(),
 		Maas: maas, Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
 		Tools: reg, Checkpoints: store, ToolGate: &alwaysSuspendGate{},
 	})

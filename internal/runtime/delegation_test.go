@@ -39,7 +39,7 @@ func TestRunSubTaskReturnsSummaryOnly(t *testing.T) {
 	t.Parallel()
 
 	maas := &recordingSubMaas{summary: "子任务摘要：完成"}
-	parent := NewRuntime(Config{Maas: maas})
+	parent := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas})
 
 	res, err := parent.RunSubTask(context.Background(), SubTaskSpec{
 		ParentTaskID: "parent-1",
@@ -71,7 +71,7 @@ func TestRunSubTaskLeafCannotDelegate(t *testing.T) {
 
 	maas := &recordingSubMaas{summary: "ok"}
 	// A leaf runtime at depth 1 must refuse to spawn.
-	leaf := NewRuntime(Config{Maas: maas, Role: roleLeaf, Depth: 1})
+	leaf := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas, Role: roleLeaf, Depth: 1})
 	if _, err := leaf.RunSubTask(context.Background(), SubTaskSpec{Goal: "nope"}); err == nil {
 		t.Fatalf("RunSubTask(leaf) error = nil, want delegation-not-permitted")
 	}
@@ -82,7 +82,7 @@ func TestRunSubTaskDepthLimitFailsLoud(t *testing.T) {
 
 	maas := &recordingSubMaas{summary: "ok"}
 	// Orchestrator already at the spawn depth limit cannot go deeper.
-	deep := NewRuntime(Config{Maas: maas, Role: roleOrchestrator, Depth: 2, MaxSpawnDepth: 2})
+	deep := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas, Role: roleOrchestrator, Depth: 2, MaxSpawnDepth: 2})
 	if _, err := deep.RunSubTask(context.Background(), SubTaskSpec{Goal: "too deep"}); err == nil {
 		t.Fatalf("RunSubTask(at depth limit) error = nil, want depth-exceeded")
 	}
@@ -92,7 +92,7 @@ func TestRunSubTasksBatchStableOrderAndReportsFailure(t *testing.T) {
 	t.Parallel()
 
 	maas := &recordingSubMaas{summary: "batch summary"}
-	parent := NewRuntime(Config{Maas: maas})
+	parent := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas})
 
 	specs := []SubTaskSpec{
 		{ParentTaskID: "p", Goal: "a"},
@@ -119,7 +119,7 @@ func TestRunSubTaskAsyncPublishesCompletion(t *testing.T) {
 
 	maas := &recordingSubMaas{summary: "async done"}
 	events := newCollectingEventBus()
-	parent := NewRuntime(Config{Maas: maas, Events: events})
+	parent := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas, Events: events})
 
 	handle, err := parent.RunSubTaskAsync(context.Background(), SubTaskSpec{ParentTaskID: "p", Goal: "bg work"})
 	if err != nil {
@@ -152,7 +152,7 @@ func TestParentTaskIDForSubTask(t *testing.T) {
 // in newSubRuntime (not via NewRuntime), so it must carry the parent's
 // deny-list or a delegating agent silently regains the tool it was denied.
 func TestSubRuntimeInheritsDisabledTools(t *testing.T) {
-	parent := NewRuntime(Config{
+	parent := NewRuntime(Config{Gate: NewTaskGate(),
 		Maas:          &recordingRoundsMaas{responses: []port.InferenceResponse{{Text: "done"}}},
 		Tools:         unchangingReadRegistry(t), // has read_file
 		MaxSpawnDepth: 2,

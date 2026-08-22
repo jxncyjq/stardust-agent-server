@@ -146,6 +146,18 @@ type Config struct {
 	// summary for episodic memory. Nil disables it; the runtime never depends on
 	// its outcome.
 	EpisodeRecorder EpisodeRecorder
+	// Gate is the task-boundary gate this runtime registers every RunTask on, so
+	// a plugin change lands only between tasks and never underneath one. It is
+	// REQUIRED: NewRuntime panics on a nil Gate rather than running ungated.
+	//
+	// The reason it is not optional is the shape of the mistake it would allow.
+	// The gate is the whole of that guarantee, so a "nil means no gating"
+	// default would make the guarantee vanish silently whenever a new
+	// construction site forgot the field — the protection would be off and
+	// nothing would say so. Every runtime that can carry a task in a process
+	// where plugins are applied must share ONE gate with the loader; a gate of
+	// its own would let its tasks run straight through another gate's boundary.
+	Gate *TaskGate
 }
 
 // SkillUsageRecorder is the usage sidecar skill.UsageStore satisfies.
@@ -190,6 +202,9 @@ type Runtime struct {
 	debug                 bool
 	compactTokenThreshold int
 	episodeRecorder       EpisodeRecorder
+	// gate is never nil: NewRuntime refuses a nil Config.Gate and newSubRuntime
+	// carries the parent's over, so RunTask can register on it unconditionally.
+	gate *TaskGate
 }
 
 // loopState is the mutable state threaded through the tool-execution loop.
@@ -299,6 +314,13 @@ func (r *Runtime) buildCatalog(tools *tool.Registry) *capability.Catalog {
 const planInstruction = "\n\n[系统] 当前为 Plan 模式：只做调研与分析，产出一份结构化的执行计划（步骤、涉及文件、验证方式），不要执行任何有副作用的操作。只可使用只读工具。"
 
 func NewRuntime(cfg Config) *Runtime {
+	// A nil gate is a wiring error, not a request to run ungated — see
+	// Config.Gate. NewRuntime has no error return and every caller is assembly
+	// code, so the loud failure is a panic naming the field.
+	if cfg.Gate == nil {
+		panic("runtime: NewRuntime: Config.Gate is nil; a runtime without a task-boundary gate " +
+			"would let a plugin change land in the middle of a running task")
+	}
 	audit := cfg.Audit
 	if audit == nil {
 		audit = noopAuditLog{}
@@ -345,6 +367,7 @@ func NewRuntime(cfg Config) *Runtime {
 		disabledTools:         cfg.DisabledTools,
 		compactTokenThreshold: cfg.CompactTokenThreshold,
 		episodeRecorder:       cfg.EpisodeRecorder,
+		gate:                  cfg.Gate,
 	}
 }
 
@@ -384,7 +407,33 @@ func (r *Runtime) Interrupt() {
 	r.interrupted.Store(true)
 }
 
+// RunTask runs one task from prompt to result, including the whole tool loop,
+// and returns what it produced.
+//
+// It holds the runtime's task-boundary gate for the entire run, so a plugin
+// change waits for this task to finish instead of changing the capability
+// catalog underneath it. When a plugin change is already waiting for a boundary
+// the task does not start at all and the returned error wraps ErrApplyPending —
+// a caller that matches it with errors.Is can retry shortly, which is a
+// different response from the one a task that genuinely failed deserves.
 func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.Task) (domain.TaskRun, error) {
+	// The task is registered with the task-boundary gate before anything else
+	// happens, and retired when it is over however it ends. That is both halves
+	// of the contract in one place: while this task runs a plugin change waits
+	// for it instead of landing underneath it, and a task that would start into
+	// a plugin set that is mid-change does not start at all.
+	//
+	// The refusal is wrapped, not flattened: it carries ErrApplyPending, so a
+	// caller can tell "the plugin set is switching, retry in a moment" from
+	// "this task failed". Returning here costs nothing to unwind — no event has
+	// been published, no inference issued — and it is deliberately NOT recorded
+	// as a learning failure: the task did not fail, it did not run.
+	end, err := r.gate.Begin()
+	if err != nil {
+		return domain.TaskRun{}, fmt.Errorf("run task %s: %w", task.ID, err)
+	}
+	defer end()
+
 	started := time.Now()
 	requestID := task.ID + ":run"
 	if err := r.events.Publish(ctx, domain.RuntimeEvent{

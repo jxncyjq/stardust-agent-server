@@ -73,6 +73,13 @@ type AgentRuntimeResolverConfig struct {
 	// into the episodic store, mirroring Config.EpisodeRecorder on the default
 	// runtime. Nil disables episodic recording for those runtimes.
 	EpisodeRecorder EpisodeRecorder
+	// Gate is the task-boundary gate every runtime this resolver builds
+	// registers its tasks on. It is REQUIRED and must be the SAME gate the
+	// plugin loader applies through: per-agent runtimes run tasks through the
+	// same RunTask as the default one, so a resolver without the shared gate
+	// would be a hole in the task-boundary contract exactly where per-agent
+	// tasks run. NewAgentRuntimeResolver panics on a nil Gate.
+	Gate *TaskGate
 	// BrowserRuntime is the ONE shared browser runtime (one Chromium process)
 	// injected at serve assembly when RootConfig.Browser.Enabled. Per-agent
 	// runtimes register browser_* against this shared instance rather than
@@ -96,9 +103,17 @@ type AgentRuntimeResolver struct {
 	conversationTurns ConversationTurnLister
 	episodeRecorder   EpisodeRecorder
 	browserRuntime    browser.RuntimeAPI
+	gate              *TaskGate
 }
 
 func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolver {
+	// Same fail-loud as NewRuntime, for the same reason: every runtime this
+	// resolver builds runs tasks, and a missing gate would silently drop them
+	// out of the task-boundary contract instead of failing.
+	if cfg.Gate == nil {
+		panic("runtime: NewAgentRuntimeResolver: Config.Gate is nil; per-agent runtimes without a " +
+			"task-boundary gate would let a plugin change land in the middle of a running task")
+	}
 	return &AgentRuntimeResolver{
 		registry:          cfg.Registry,
 		rootConfig:        cfg.RootConfig,
@@ -114,6 +129,7 @@ func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolv
 		conversationTurns: cfg.ConversationTurns,
 		episodeRecorder:   cfg.EpisodeRecorder,
 		browserRuntime:    cfg.BrowserRuntime,
+		gate:              cfg.Gate,
 	}
 }
 
@@ -278,6 +294,7 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		DisabledTools:         agentCfg.DisabledTools,
 		ConversationTurns:     recentTurns,
 		EpisodeRecorder:       r.episodeRecorder,
+		Gate:                  r.gate,
 	})
 	return agent, runner, true, nil
 }

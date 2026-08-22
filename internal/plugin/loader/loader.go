@@ -29,11 +29,16 @@
 //     both failures travel out together and the plugin/activation_failed event
 //     says the old instance was NOT restored.
 //
+// WHEN a convergence lands is not this package's own judgement either: Apply
+// hands the whole convergence to the task-boundary gate (internal/runtime's
+// TaskGate), which runs it only with no task in flight. A task therefore keeps
+// the capability catalog it started with, and a new target state reaches only
+// the tasks that start after it.
+//
 // What this package does NOT do: it does not read plugins.json (that is
-// manifest.ParseDeployment), does not decide WHEN a convergence may land (that
-// is the task-boundary gate, wired in a later task), and does not format status
-// for a human (that is the CLI's). Apply is a synchronous, serialized
-// operation; Status is a snapshot of what it left behind.
+// manifest.ParseDeployment) and does not format status for a human (that is the
+// CLI's). Apply is a synchronous, serialized operation; Status is a snapshot of
+// what it left behind.
 package loader
 
 import (
@@ -56,6 +61,7 @@ import (
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
 	"github.com/stardust/legion-agent/internal/plugin/perm"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/runtime"
 	"github.com/stardust/legion-agent/internal/tool"
 	"github.com/stardust/legion-agent/internal/toolauth"
 )
@@ -187,6 +193,33 @@ type Config struct {
 	// convergence that half-happened unexplainable from the logs alone.
 	Logger *slog.Logger
 
+	// Gate is the task-boundary gate every convergence lands through: Apply
+	// waits on it until no task is running, so a task that has started keeps the
+	// capability catalog it started with. It is REQUIRED.
+	//
+	// A nil Gate is a wiring error, not "converge immediately". The mid-task
+	// change it would allow is not a stray tool error: the tool registry
+	// resolves handlers at call time, so a tool this Loader deregisters stops
+	// working inside a task whose prompt still advertises it, and the changed
+	// capability list invalidates the model's prompt prefix — a measured reload
+	// zeroed one provider's cache hits and cut another's from 1792 to 768. A
+	// default that silently skipped the gate would make that damage a
+	// forgotten-field away. It must be the same gate the runtimes running those
+	// tasks were built with; a gate of its own would wait for a boundary nobody
+	// is standing at.
+	Gate *runtime.TaskGate
+
+	// ApplyWait is how long Apply waits for the tasks already running to finish
+	// before giving up. It is REQUIRED and must be positive.
+	//
+	// A non-positive value is a configuration error rather than "wait forever":
+	// forever is not a policy a caller can recover from — an apply that never
+	// returns is indistinguishable from a wedged one, and it would hold the gate
+	// shut against every new task for as long as it lasted. When the wait
+	// expires, NOTHING is applied and the failure says how many tasks were in
+	// the way.
+	ApplyWait time.Duration
+
 	// DeployLimits is the deployment's resource ceiling, applied to every
 	// plugin by manifest.AssembleSpec (each limit is min(plugin's request,
 	// this), with zero on either side meaning "not declared"). Its zero value
@@ -264,6 +297,8 @@ type Loader struct {
 	events       port.EventBus
 	logger       *slog.Logger
 	deployLimits manifest.Limits
+	gate         *runtime.TaskGate
+	applyWait    time.Duration
 
 	mu        sync.Mutex
 	instances map[string]*instance
@@ -285,6 +320,11 @@ func New(cfg Config) (*Loader, error) {
 		return nil, errors.New("new plugin loader: Config.Events is nil; a convergence that published nothing would be invisible")
 	case cfg.Logger == nil:
 		return nil, errors.New("new plugin loader: Config.Logger is nil; a convergence that logged nothing would be unexplainable")
+	case cfg.Gate == nil:
+		return nil, errors.New("new plugin loader: Config.Gate is nil; a convergence with no task-boundary gate would land in the middle of a running task")
+	case cfg.ApplyWait <= 0:
+		return nil, fmt.Errorf("new plugin loader: Config.ApplyWait is %s; it must be positive, "+
+			"since an apply that waits forever for a task boundary holds the gate shut against every new task", cfg.ApplyWait)
 	}
 	return &Loader{
 		ledger:       cfg.Ledger,
@@ -292,6 +332,8 @@ func New(cfg Config) (*Loader, error) {
 		events:       cfg.Events,
 		logger:       cfg.Logger,
 		deployLimits: cfg.DeployLimits,
+		gate:         cfg.Gate,
+		applyWait:    cfg.ApplyWait,
 		instances:    make(map[string]*instance),
 		failures:     make(map[string]failure),
 	}, nil
@@ -342,7 +384,28 @@ func New(cfg Config) (*Loader, error) {
 // The one failure that stops Apply before it touches anything is a target state
 // that is not a target state: an empty root (every relative Source resolves
 // against it) or two entries claiming the same name (which of the two is
-// supposed to be running would be decided by iteration order).
+// supposed to be running would be decided by iteration order). Both are
+// rejected before the gate is involved at all — a manifest that cannot be
+// applied is no reason to make anybody's tasks wait for a boundary.
+//
+// Everything after those checks happens at a task boundary, with no task in
+// flight, as ONE gated step (Config.Gate, Config.ApplyWait). Two consequences
+// are worth stating:
+//
+//   - Apply BLOCKS until the tasks already running finish, up to ApplyWait. If
+//     that wait expires, or ctx ends first, Apply reports an error naming how
+//     many tasks were in the way and NOTHING is applied — not the entries it
+//     could have converged, not a partial pass. The target state is unchanged
+//     and the call can be retried at a calmer moment.
+//   - While Apply waits and converges, a task that tries to START is refused
+//     with runtime.ErrApplyPending rather than joining a plugin set that is
+//     mid-change.
+//
+// Two Apply calls do not queue behind each other either: while one holds the
+// gate a second is refused with an error rather than waiting for its turn. The
+// convergence belongs to whoever asked for it first, and a caller that was told
+// nothing about the target state it asked for is better served by an error than
+// by a wait of unknown length.
 func (l *Loader) Apply(ctx context.Context, dep manifest.Deployment, root string) error {
 	if root == "" {
 		return errors.New("apply plugin deployment: root is empty; every entry's source resolves against it")
@@ -364,6 +427,25 @@ func (l *Loader) Apply(ctx context.Context, dep manifest.Deployment, root string
 		wanted = append(wanted, entry)
 	}
 
+	// The WHOLE convergence goes inside one gate acquisition, not one per entry.
+	// A single Apply may unload A and then install B; between those two steps
+	// the plugin set is neither the old one nor the new one, and no task may
+	// ever observe that. Per-entry gating would publish exactly that
+	// intermediate state to any task that started between two entries.
+	return l.gate.ApplyAtBoundary(ctx, l.applyWait, func() error {
+		return l.converge(ctx, wanted, declared, desired, root)
+	})
+}
+
+// converge is Apply's three passes, run at a task boundary with no task in
+// flight. It is separate from Apply so that the target state is validated
+// before anybody's tasks are paused for it, and so that the gate wraps every
+// pass together rather than each one on its own.
+//
+// declared names every entry in the target state (enabled or not), desired only
+// the enabled ones, and wanted is the enabled entries in the manifest's own
+// order. All three are derived from the same deployment by Apply.
+func (l *Loader) converge(ctx context.Context, wanted []manifest.Entry, declared, desired map[string]bool, root string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
