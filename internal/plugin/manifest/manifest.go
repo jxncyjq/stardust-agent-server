@@ -33,6 +33,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 )
 
 // pluginABIVersion is the only ABI version ParsePlugin currently accepts.
@@ -285,7 +286,7 @@ func validatePlugin(pm PluginManifest) error {
 	}
 	seenTools := make(map[string]struct{}, len(pm.Tools))
 	for i, tool := range pm.Tools {
-		if tool.Name == "" {
+		if strings.TrimSpace(tool.Name) == "" {
 			return fmt.Errorf("parse plugin manifest %q: tools[%d] has no name", pm.Name, i)
 		}
 		if tool.Group == "" {
@@ -319,7 +320,7 @@ func validatePlugin(pm PluginManifest) error {
 func validateRequires(name string, requires []string, contributedTools map[string]struct{}) error {
 	seen := make(map[string]struct{}, len(requires))
 	for i, r := range requires {
-		if r == "" {
+		if strings.TrimSpace(r) == "" {
 			return fmt.Errorf("parse plugin manifest %q: requires[%d] is empty", name, i)
 		}
 		if _, dup := seen[r]; dup {
