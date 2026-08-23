@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -21,7 +22,7 @@ import (
 	"github.com/stardust/legion-agent/internal/lifecycle"
 	"github.com/stardust/legion-agent/internal/plugin/host"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
-	"github.com/stardust/legion-agent/internal/runtime"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
 	"github.com/stardust/legion-agent/internal/toolauth"
 )
@@ -112,6 +113,12 @@ type pkg struct {
 	// is what lets a test change the ASSEMBLED grant without changing the module
 	// or the capability set.
 	allowedPaths []string
+
+	// requires is the plugin's own "requires" declaration: the tool names it
+	// calls into through call_tool. It is what the Loader's dependency
+	// convergence reads (see suspend_test.go); an empty one is the ordinary
+	// case of a plugin that depends on nothing.
+	requires []string
 }
 
 // writePackage writes a plugin package (plugin.json + plugin.wasm) into dir,
@@ -144,6 +151,7 @@ func writePackage(t *testing.T, dir string, p pkg) {
 		Limits:       manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
 		Filesystem:   manifest.Filesystem{AllowedPaths: p.allowedPaths},
 		Tools:        decls,
+		Requires:     p.requires,
 	}
 	data, err := json.Marshal(pm)
 	if err != nil {
@@ -186,7 +194,7 @@ type harness struct {
 	// is per-harness, so one test's in-flight task cannot hold another's apply
 	// shut. A test that wants to converge with a task in flight begins one on
 	// this gate (see boundary_test.go).
-	gate *runtime.TaskGate
+	gate *taskgate.TaskGate
 
 	// onPublish, when non-nil, runs on every runtime event the Loader
 	// publishes. It is a scheduling point rather than an observer: publishing
@@ -247,7 +255,7 @@ func newHarnessWithApplyWait(t *testing.T, applyWait time.Duration) *harness {
 		ledger:   lifecycle.NewLedger(),
 		registry: tool.NewRegistry(nil, nil, nil),
 		events:   adapter.NewMemoryEventBus(),
-		gate:     runtime.NewTaskGate(),
+		gate:     taskgate.NewTaskGate(),
 	}
 	loader, err := New(Config{
 		Ledger:       h.ledger,
@@ -320,14 +328,39 @@ func (h *harness) writeProxy(version string) manifest.Entry {
 	return entryFor(proxyPluginName, "proxy", []string{"tool"}, proxyToolName)
 }
 
-// owners returns the ledger's live owners, sorted.
+// owners returns the ledger's live INSTANCE owners, sorted — one per mounted
+// plugin, which is what every count assertion in these tests means by "owner".
+//
+// An activation files under two owners: the instance owner and the
+// contribution owner host.ToolsOwner derives from it. The second is filtered
+// out here rather than counted, because a plugin that contributes tools is
+// still one plugin — but it is not ignored: every contribution owner must
+// belong to an instance owner that is also live, so a contribution left behind
+// by a plugin that is gone (or filed under a name nothing owns) fails here
+// instead of quietly disappearing from the count.
 func (h *harness) owners() []string {
 	h.t.Helper()
 
 	snapshot := h.ledger.Snapshot()
 	names := make([]string, 0, len(snapshot))
+	contributions := make([]lifecycle.Owner, 0, len(snapshot))
 	for owner := range snapshot {
+		if strings.HasSuffix(string(owner), "/tools") {
+			contributions = append(contributions, owner)
+			continue
+		}
 		names = append(names, string(owner))
+	}
+	for _, contribution := range contributions {
+		instance := strings.TrimSuffix(string(contribution), "/tools")
+		if host.ToolsOwner(lifecycle.Owner(instance)) != contribution {
+			h.t.Fatalf("ledger owner %s looks like a contribution owner but is not one host.ToolsOwner "+
+				"produces", contribution)
+		}
+		if !slices.Contains(names, instance) {
+			h.t.Fatalf("ledger holds contributions under %s (%v) but nothing under its instance owner %s: "+
+				"a plugin's tools outlived the plugin", contribution, snapshot[contribution], instance)
+		}
 	}
 	sort.Strings(names)
 	return names
@@ -414,7 +447,7 @@ func TestNewRequiresEveryDependency(t *testing.T) {
 			Deps:      func(string, json.RawMessage) host.Deps { return host.Deps{} },
 			Events:    adapter.NewMemoryEventBus(),
 			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-			Gate:      runtime.NewTaskGate(),
+			Gate:      taskgate.NewTaskGate(),
 			ApplyWait: defaultTestApplyWait,
 		}
 	}
@@ -587,6 +620,47 @@ func TestApplyUnloadsADisabledEntry(t *testing.T) {
 	}
 	if !strings.Contains(unloaded[0].Message, reasonDisabled) {
 		t.Fatalf("%s must carry reason %q, got %q", RuntimeEventUnloaded, reasonDisabled, unloaded[0].Message)
+	}
+}
+
+// TestUnloadReportsEveryRevokedEntry pins the revoked= field of the
+// plugin/unloaded event — an operator-visible number in the runtime event
+// stream, and unload's own return value — against what an activation really
+// files, which since the owner split lives under TWO owners: three entries
+// under the instance owner (the wasm runtime, the instance pool, and the link
+// to the contribution side) plus two per contributed tool under
+// host.ToolsOwner (its registry entry and its gateable-catalog entry).
+//
+// Counting only the instance owner reports the same 3 for every plugin no
+// matter how much went away with it, which is why the count is pinned here
+// against a plugin whose tool count is known rather than left to drift.
+func TestUnloadReportsEveryRevokedEntry(t *testing.T) {
+	h := newHarness(t)
+	echo := h.writeEcho("1.0.0")
+	h.apply(echo)
+
+	// The premise of the arithmetic below: this plugin contributes exactly one
+	// tool. If the fixture ever grows a second, this assertion must be updated
+	// rather than silently keep passing.
+	wantStrings(t, "registered tools", h.toolNames(), []string{echoToolName})
+
+	disabled := echo
+	disabled.Enabled = false
+	h.apply(disabled)
+
+	const instanceEntries = 3 // wasm-runtime, wasm-instance-pool, tool-contributions
+	const perToolEntries = 2  // the registry entry and the gateable-catalog entry
+	want := fmt.Sprintf("revoked=%d", instanceEntries+perToolEntries*1)
+
+	unloaded := h.eventsOfType(RuntimeEventUnloaded)
+	if len(unloaded) != 1 {
+		t.Fatalf("want one %s event, got %v", RuntimeEventUnloaded, unloaded)
+	}
+	if !strings.Contains(unloaded[0].Message, want) {
+		t.Errorf("%s carries %q, want %q: the unload revoked %d entries under the instance owner and %d "+
+			"for its one tool under %s, and a count that skips the contribution side reports a number that "+
+			"no longer means what the field says", RuntimeEventUnloaded, unloaded[0].Message, want,
+			instanceEntries, perToolEntries, host.ToolsOwner("plugin:"+echoPluginName+"@1.0.0"))
 	}
 }
 
@@ -1072,7 +1146,7 @@ func TestApplyReportsADepsFactoryWithNoRegistry(t *testing.T) {
 		Events:       events,
 		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 		DeployLimits: manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
-		Gate:         runtime.NewTaskGate(),
+		Gate:         taskgate.NewTaskGate(),
 		ApplyWait:    defaultTestApplyWait,
 	})
 	if err != nil {

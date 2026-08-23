@@ -45,6 +45,7 @@ import (
 	"github.com/stardust/legion-agent/internal/skill"
 	"github.com/stardust/legion-agent/internal/storage"
 	"github.com/stardust/legion-agent/internal/task"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/taskledger"
 	"github.com/stardust/legion-agent/internal/tool"
 	"github.com/stardust/legion-agent/internal/tui"
@@ -1945,7 +1946,7 @@ func buildDefaultRunnerConfig(
 	capabilitySkills capability.Provider,
 	skillUsage agentruntime.SkillUsageRecorder,
 	episodeRecorder agentruntime.EpisodeRecorder,
-	gate *agentruntime.TaskGate,
+	gate *taskgate.TaskGate,
 ) agentruntime.Config {
 	return agentruntime.Config{
 		Maas:             maas,
@@ -2318,7 +2319,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// flight, which is only decidable if they all count into the same gate.
 	// It is built here, ahead of everything that uses it, because the plugin
 	// assembly right below needs it too.
-	taskGate := agentruntime.NewTaskGate()
+	taskGate := taskgate.NewTaskGate()
 	// Plugin deployment. A configured-but-unreadable manifest aborts startup;
 	// an absent one means plugins are off; a plugin that will not activate is
 	// logged loudly and left visible in `agent plugins status` without stopping

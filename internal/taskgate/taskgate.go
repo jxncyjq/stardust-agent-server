@@ -1,4 +1,4 @@
-package runtime
+package taskgate
 
 import (
 	"context"
@@ -134,7 +134,7 @@ func (g *TaskGate) Begin() (end func(), err error) {
 	var ended atomic.Bool
 	return func() {
 		if !ended.CompareAndSwap(false, true) {
-			panic("runtime: TaskGate: end func called more than once; " +
+			panic("taskgate: TaskGate: end func called more than once; " +
 				"each Begin must be retired exactly once")
 		}
 		g.finish()
@@ -170,7 +170,7 @@ func (g *TaskGate) BeginChild() (end func()) {
 	g.mu.Lock()
 	if g.pending && g.running == 0 {
 		g.mu.Unlock()
-		panic("runtime: TaskGate.BeginChild: no task is in flight while an apply holds the gate; " +
+		panic("taskgate: TaskGate.BeginChild: no task is in flight while an apply holds the gate; " +
 			"a child task cannot continue a parent that is not running")
 	}
 	g.running++
@@ -179,7 +179,7 @@ func (g *TaskGate) BeginChild() (end func()) {
 	var ended atomic.Bool
 	return func() {
 		if !ended.CompareAndSwap(false, true) {
-			panic("runtime: TaskGate: end func called more than once; " +
+			panic("taskgate: TaskGate: end func called more than once; " +
 				"each BeginChild must be retired exactly once")
 		}
 		g.finish()
@@ -193,7 +193,7 @@ func (g *TaskGate) finish() {
 	defer g.mu.Unlock()
 
 	if g.running <= 0 {
-		panic(fmt.Sprintf("runtime: TaskGate: end func retired a task while %d were running; "+
+		panic(fmt.Sprintf("taskgate: TaskGate: end func retired a task while %d were running; "+
 			"in-flight accounting is corrupt", g.running))
 	}
 	g.running--
@@ -239,7 +239,7 @@ func (g *TaskGate) finish() {
 // the call site, not a state to tolerate, so ApplyAtBoundary panics.
 func (g *TaskGate) ApplyAtBoundary(ctx context.Context, wait time.Duration, fn func() error) error {
 	if fn == nil {
-		panic("runtime: TaskGate.ApplyAtBoundary: fn is nil; there is nothing to apply at the boundary")
+		panic("taskgate: TaskGate.ApplyAtBoundary: fn is nil; there is nothing to apply at the boundary")
 	}
 
 	idle, err := g.beginApply()
@@ -282,7 +282,7 @@ func (g *TaskGate) endApply() {
 	defer g.mu.Unlock()
 
 	if !g.pending {
-		panic("runtime: TaskGate: an apply ended while none was pending; " +
+		panic("taskgate: TaskGate: an apply ended while none was pending; " +
 			"pending accounting is corrupt")
 	}
 	g.pending = false

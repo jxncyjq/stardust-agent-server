@@ -24,6 +24,7 @@ import (
 	"github.com/stardust/legion-agent/internal/quality"
 	"github.com/stardust/legion-agent/internal/runtime"
 	"github.com/stardust/legion-agent/internal/sessionstate"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/taskledger"
 	"github.com/stardust/legion-agent/internal/tool"
 	"github.com/stardust/legion-agent/internal/toolauth"
@@ -214,7 +215,7 @@ func (a *App) RunDemo(ctx context.Context) (DemoResult, error) {
 		// on is its own. It is still required, not optional: the field is what
 		// makes "which boundary does this runtime's task belong to?" an answered
 		// question at every construction site.
-		Gate: runtime.NewTaskGate(),
+		Gate: taskgate.NewTaskGate(),
 	})
 	task := domain.Task{
 		ID:        "demo-task",
@@ -384,7 +385,7 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 		Logger:            taskLogger,
 		DisabledTools:     opts.DisabledTools,
 		// One-shot task, its own gate — see RunDemo above.
-		Gate: runtime.NewTaskGate(),
+		Gate: taskgate.NewTaskGate(),
 	})
 	task := domain.Task{
 		ID:         opts.TaskID,

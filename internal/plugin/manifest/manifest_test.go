@@ -189,6 +189,20 @@ func TestParsePlugin_ToolMissingGroup(t *testing.T) {
 	requireErrorContains(t, err, "group")
 }
 
+// TestParsePlugin_ToolNameWhitespaceOnly asserts a whitespace-only tool name
+// is rejected the same as an outright empty string: strings.TrimSpace(tool.Name)
+// == "" catches it, and the error still names the offending index.
+func TestParsePlugin_ToolNameWhitespaceOnly(t *testing.T) {
+	data := []byte(`{
+		"name": "p", "version": "1.0.0", "abi": 1, "sha256": "` + validSHA256 + `",
+		"limits": {"max_memory_pages": 1, "max_instances": 1},
+		"tools": [{"name": "   ", "group": "g", "timeout_ms": 1000}]
+	}`)
+	_, err := ParsePlugin(data)
+	requireErrorContains(t, err, "tools[0]")
+	requireErrorContains(t, err, "no name")
+}
+
 func TestParsePlugin_ToolTimeoutZero(t *testing.T) {
 	data := []byte(`{
 		"name": "p", "version": "1.0.0", "abi": 1, "sha256": "` + validSHA256 + `",
@@ -278,6 +292,83 @@ func TestParsePlugin_UnknownFieldRejected(t *testing.T) {
 	}`)
 	_, err := ParsePlugin(data)
 	requireErrorContains(t, err, "nmae")
+}
+
+func TestParsePlugin_RequiresAbsentDefaultsEmpty(t *testing.T) {
+	data := mustReadFixture(t, "plugin.json")
+	pm, err := ParsePlugin(data)
+	if err != nil {
+		t.Fatalf("ParsePlugin: unexpected error: %v", err)
+	}
+	if len(pm.Requires) != 0 {
+		t.Errorf("Requires = %v, want empty (fixture has no requires key)", pm.Requires)
+	}
+}
+
+func TestParsePlugin_RequiresValid(t *testing.T) {
+	data := []byte(`{
+		"name": "p", "version": "1.0.0", "abi": 1, "sha256": "` + validSHA256 + `",
+		"limits": {"max_memory_pages": 1, "max_instances": 1},
+		"tools": [{"name": "my_tool", "group": "g", "timeout_ms": 1000}],
+		"requires": ["other_plugin_tool", "yet_another_tool"]
+	}`)
+	pm, err := ParsePlugin(data)
+	if err != nil {
+		t.Fatalf("ParsePlugin: unexpected error: %v", err)
+	}
+	want := []string{"other_plugin_tool", "yet_another_tool"}
+	if !equalStrings(pm.Requires, want) {
+		t.Errorf("Requires = %v, want %v", pm.Requires, want)
+	}
+}
+
+func TestParsePlugin_RequiresEmptyString(t *testing.T) {
+	data := []byte(`{
+		"name": "p", "version": "1.0.0", "abi": 1, "sha256": "` + validSHA256 + `",
+		"limits": {"max_memory_pages": 1, "max_instances": 1},
+		"tools": [{"name": "my_tool", "group": "g", "timeout_ms": 1000}],
+		"requires": ["other_tool", ""]
+	}`)
+	_, err := ParsePlugin(data)
+	requireErrorContains(t, err, "requires[1]")
+}
+
+// TestParsePlugin_RequiresWhitespaceOnly asserts a whitespace-only entry is
+// rejected the same as an outright empty string: strings.TrimSpace(r) == ""
+// catches it, and the error still names the offending index.
+func TestParsePlugin_RequiresWhitespaceOnly(t *testing.T) {
+	data := []byte(`{
+		"name": "p", "version": "1.0.0", "abi": 1, "sha256": "` + validSHA256 + `",
+		"limits": {"max_memory_pages": 1, "max_instances": 1},
+		"tools": [{"name": "my_tool", "group": "g", "timeout_ms": 1000}],
+		"requires": ["other_tool", "   "]
+	}`)
+	_, err := ParsePlugin(data)
+	requireErrorContains(t, err, "requires[1]")
+}
+
+func TestParsePlugin_RequiresDuplicate(t *testing.T) {
+	data := []byte(`{
+		"name": "p", "version": "1.0.0", "abi": 1, "sha256": "` + validSHA256 + `",
+		"limits": {"max_memory_pages": 1, "max_instances": 1},
+		"tools": [{"name": "my_tool", "group": "g", "timeout_ms": 1000}],
+		"requires": ["other_tool", "other_tool"]
+	}`)
+	_, err := ParsePlugin(data)
+	requireErrorContains(t, err, "other_tool")
+	requireErrorContains(t, err, "twice")
+}
+
+func TestParsePlugin_RequiresSelfDependency(t *testing.T) {
+	data := []byte(`{
+		"name": "p", "version": "1.0.0", "abi": 1, "sha256": "` + validSHA256 + `",
+		"limits": {"max_memory_pages": 1, "max_instances": 1},
+		"tools": [{"name": "my_tool", "group": "g", "timeout_ms": 1000}],
+		"requires": ["my_tool"]
+	}`)
+	_, err := ParsePlugin(data)
+	requireErrorContains(t, err, "my_tool")
+	requireErrorContains(t, err, "itself")
 }
 
 // --- ParseDeployment ------------------------------------------------------

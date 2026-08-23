@@ -54,8 +54,12 @@ type guestToolCall struct {
 	Arguments map[string]string `json:"arguments,omitempty"`
 }
 
-// contributeTools registers every tool spec.Tools claims. Each one is three
-// things, filed under the one owner:
+// contributeTools registers every tool spec.Tools claims, filing everything it
+// files under the ONE owner it is handed — which in an activation is the
+// contribution-side owner (ToolsOwner), never the instance owner: that is what
+// makes withdrawing a plugin's contributions a single DisposeOwner that cannot
+// reach its runtime or its pool (see Plugin.Suspend). Each tool is three
+// things:
 //
 //  1. the tool enters spec.Registry, so the model can call it
 //     (tool.RegisterOwned);

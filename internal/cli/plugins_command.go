@@ -23,7 +23,7 @@ import (
 	"github.com/stardust/legion-agent/internal/plugin/loader"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
 	"github.com/stardust/legion-agent/internal/port"
-	agentruntime "github.com/stardust/legion-agent/internal/runtime"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
@@ -72,7 +72,7 @@ type pluginHostDeps struct {
 	// Gate is the task-boundary gate every convergence lands through. It MUST
 	// be the same gate the runtimes running this serve's tasks were built with;
 	// a gate of its own would wait for a boundary nobody is standing at.
-	Gate *agentruntime.TaskGate
+	Gate *taskgate.TaskGate
 }
 
 // assemblePlugins builds this process's plugin loader from cfg.Plugins,
@@ -435,6 +435,7 @@ func mergePluginStatus(deployment manifest.Deployment, statuses []loader.Instanc
 	for _, st := range statuses {
 		byName[st.Name] = st
 	}
+	providerOf := pluginToolProviders(statuses)
 
 	rows := make([]pluginStatusRow, 0, len(deployment.Plugins)+len(statuses))
 	declared := make(map[string]bool, len(deployment.Plugins))
@@ -445,6 +446,15 @@ func mergePluginStatus(deployment manifest.Deployment, statuses []loader.Instanc
 		switch {
 		case known && st.State == loader.StateFailed:
 			row.Detail = detailFor("error", st.LastError)
+		case known && st.State == loader.StateSuspended:
+			// Checked before the disabled-but-known case below, the same way
+			// StateFailed already is: "status" re-reads the manifest from disk on
+			// every call, independently of the loader's live state, so a plugin
+			// that is mounted-and-suspended with a stale (not yet reloaded)
+			// "enabled": false in the manifest is fully reachable. Its waiting_on=
+			// explanation must not be replaced by the disabled reason below —
+			// that is the entire reason SuspendedBy exists.
+			row.Detail = suspendedRowDetail(st, providerOf, byName)
 		case known && !entry.Enabled:
 			// Mounted, but the file says it should not be. The manifest changed
 			// under a running deployment and nobody has reloaded yet.
@@ -468,7 +478,11 @@ func mergePluginStatus(deployment manifest.Deployment, statuses []loader.Instanc
 		row.Detail = detailFor("reason", `no longer in the manifest; run "agent plugins reload" to unmount it`)
 		// The entry's own failure keeps its own "error=" label instead of being
 		// folded into the reason: a failure buried mid-sentence under the wrong
-		// label is a failure nobody greps for.
+		// label is a failure nobody greps for. A suspension's waiting_on= gets
+		// the same treatment, for the same reason.
+		if waiting := suspendedWaitingOn(st.SuspendedBy, providerOf, byName); waiting != "" {
+			row.Detail += "  " + waiting
+		}
 		if failure := detailFor("error", st.LastError); failure != "" {
 			row.Detail += "  " + failure
 		}
@@ -476,6 +490,74 @@ func mergePluginStatus(deployment manifest.Deployment, statuses []loader.Instanc
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
 	return rows
+}
+
+// pluginToolProviders maps every tool name to the plugin that contributes it,
+// read from every entry the loader has ever mounted — a currently suspended
+// entry included, since InstanceStatus.Tools always names what an instance
+// contributes when it can work (see its doc comment), not just what it is
+// contributing right now. It is what lets a suspended row tell "nobody
+// provides this tool" apart from "the plugin that provides it is suspended
+// too": the deployment manifest refuses two entries claiming the same tool
+// name (manifest.AssembleSpec), so this mapping is never ambiguous.
+func pluginToolProviders(statuses []loader.InstanceStatus) map[string]string {
+	providerOf := make(map[string]string, len(statuses))
+	for _, st := range statuses {
+		for _, toolName := range st.Tools {
+			providerOf[toolName] = st.Name
+		}
+	}
+	return providerOf
+}
+
+// suspendedRowDetail is a StateSuspended row's Detail: what it is waiting on,
+// followed by its own error= if the suspension itself carries one (see
+// TestApplyReportsAResumeWhoseToolNameWasTaken in internal/plugin/loader for
+// the case where SuspendedBy is empty and the error is the whole story).
+func suspendedRowDetail(st loader.InstanceStatus, providerOf map[string]string, byName map[string]loader.InstanceStatus) string {
+	detail := suspendedWaitingOn(st.SuspendedBy, providerOf, byName)
+	if errDetail := detailFor("error", st.LastError); errDetail != "" {
+		if detail != "" {
+			detail += "  "
+		}
+		detail += errDetail
+	}
+	return detail
+}
+
+// suspendedWaitingOn renders a StateSuspended row's SuspendedBy as the row's
+// own explanation of what it is blocked on, naming each tool and telling
+// apart the two reasons a tool can be unresolved (brief decision #2):
+//
+//   - nobody in this loader's view has ever contributed the tool at all —
+//     the operator's fix is to install a plugin that provides it;
+//   - a plugin DOES provide it, but that plugin is not active either — the
+//     operator's fix is one hop further up the chain, at the named plugin.
+//     Its state is read from byName rather than hardcoded to "suspended":
+//     it always IS suspended today (a loaded plugin's requirement would not
+//     be unresolved, and a failed one contributes no Tools and so is never a
+//     provider at all — see pluginToolProviders), but reading the true value
+//     costs nothing and never asserts a state this package did not itself
+//     observe.
+//
+// Empty when suspendedBy is empty, which is a real state: a suspended entry
+// whose blocker was not a missing dependency (its tool name was taken by
+// another contributor while it was down) carries nothing here and leans on
+// the row's own error= instead.
+func suspendedWaitingOn(suspendedBy []string, providerOf map[string]string, byName map[string]loader.InstanceStatus) string {
+	if len(suspendedBy) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(suspendedBy))
+	for _, toolName := range suspendedBy {
+		provider, provided := providerOf[toolName]
+		if !provided {
+			parts = append(parts, fmt.Sprintf("%s(no plugin provides it)", toolName))
+			continue
+		}
+		parts = append(parts, fmt.Sprintf("%s(cascade: %s is %s)", toolName, provider, byName[provider].State))
+	}
+	return "waiting_on=" + strings.Join(parts, " ")
 }
 
 // pluginRowVersion is the version column's text: an entry that failed before
@@ -531,9 +613,19 @@ func writePluginStatus(w io.Writer, manifestPath, root string, rows []pluginStat
 		versionWidth = max(versionWidth, utf8.RuneCountInString(pluginRowVersion(row)))
 	}
 	for _, row := range rows {
-		line := fmt.Sprintf("  %s  %s  version=%s  tools=[%s]",
+		// A suspended row's Tools names what the instance WOULD contribute once
+		// unblocked (loader.InstanceStatus.Tools's own doc comment), not what it
+		// is serving right now — nothing is, the tools are withdrawn for as long
+		// as the plugin stays suspended. Marking that inline keeps a reader who
+		// scans only the tools= column from mistaking a suspended plugin for an
+		// active provider of the names it lists.
+		toolsSuffix := ""
+		if row.State == loader.StateSuspended && len(row.Tools) > 0 {
+			toolsSuffix = "(withdrawn)"
+		}
+		line := fmt.Sprintf("  %s  %s  version=%s  tools=[%s]%s",
 			padRunes(row.Name, nameWidth), padRunes(row.State, stateWidth),
-			padRunes(pluginRowVersion(row), versionWidth), strings.Join(row.Tools, " "))
+			padRunes(pluginRowVersion(row), versionWidth), strings.Join(row.Tools, " "), toolsSuffix)
 		if row.Detail != "" {
 			line += "  " + row.Detail
 		}

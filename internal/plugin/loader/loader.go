@@ -30,7 +30,7 @@
 //     says the old instance was NOT restored.
 //
 // WHEN a convergence lands is not this package's own judgement either: Apply
-// hands the whole convergence to the task-boundary gate (internal/runtime's
+// hands the whole convergence to the task-boundary gate (internal/taskgate's
 // TaskGate), which runs it only with no task in flight. A task therefore keeps
 // the capability catalog it started with, and a new target state reaches only
 // the tasks that start after it.
@@ -61,7 +61,7 @@ import (
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
 	"github.com/stardust/legion-agent/internal/plugin/perm"
 	"github.com/stardust/legion-agent/internal/port"
-	"github.com/stardust/legion-agent/internal/runtime"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
 	"github.com/stardust/legion-agent/internal/toolauth"
 )
@@ -156,6 +156,14 @@ const (
 	// see from the status.
 	StateLoaded = "loaded"
 
+	// StateSuspended means the plugin IS mounted — same wasm runtime, same
+	// instance pool, same guest state — but its contributions are withdrawn
+	// because a tool it requires cannot be resolved. SuspendedBy names those
+	// tools. It is a state of its own rather than a flavour of StateFailed
+	// because nothing failed: the plugin is waiting for a dependency, and it
+	// comes back on its own the moment one arrives.
+	StateSuspended = "suspended"
+
 	// StateFailed means the entry is in the target state but nothing is
 	// mounted for it, and LastError says why.
 	StateFailed = "failed"
@@ -207,7 +215,7 @@ type Config struct {
 	// forgotten-field away. It must be the same gate the runtimes running those
 	// tasks were built with; a gate of its own would wait for a boundary nobody
 	// is standing at.
-	Gate *runtime.TaskGate
+	Gate *taskgate.TaskGate
 
 	// ApplyWait is how long Apply waits for the tasks already running to finish
 	// before giving up. It is REQUIRED and must be positive.
@@ -243,12 +251,19 @@ type InstanceStatus struct {
 	// that goes into the ledger owner.
 	Version string
 
-	// State is StateLoaded or StateFailed.
+	// State is StateLoaded, StateSuspended or StateFailed.
 	State string
 
 	// Tools are the tool names this instance contributed, empty for a failed
-	// entry.
+	// entry. A StateSuspended entry still reports them: they are the tools it
+	// contributes when it can work, and the ones that come back when its
+	// dependency does — the State field is what says they are withdrawn right
+	// now.
 	Tools []string
+
+	// SuspendedBy names the tools this plugin requires that nothing resolves,
+	// which is WHY it is suspended. It is empty for every other state.
+	SuspendedBy []string
 
 	// LastError is the most recent failure involving this entry, empty if
 	// there has not been one. It is populated for a StateLoaded entry too: see
@@ -276,6 +291,24 @@ type instance struct {
 	sha256    string
 	tools     []string
 	lastError string
+
+	// plugin is the activation's own handle, kept because suspending and
+	// resuming are its methods: the Loader decides WHICH plugins may work, and
+	// host.Plugin is what actually withdraws and re-files their contributions.
+	// Every path that puts an instance into l.instances sets it.
+	plugin *host.Plugin
+
+	// requires is the plugin's declared dependency on other plugins' tools
+	// (manifest.PluginManifest.Requires), which is what the dependency graph is
+	// built from. It is part of the fingerprint, so an operator who edits it
+	// gets a remount rather than an instance still running the old declaration.
+	requires []string
+
+	// suspendedBy names the required tools that are currently unresolved. It is
+	// non-empty only while the plugin is suspended, and it is refreshed on every
+	// convergence: which dependency is missing can change while the answer
+	// "suspended" does not.
+	suspendedBy []string
 }
 
 // failure is one entry that is in the target state with nothing mounted for it.
@@ -297,7 +330,7 @@ type Loader struct {
 	events       port.EventBus
 	logger       *slog.Logger
 	deployLimits manifest.Limits
-	gate         *runtime.TaskGate
+	gate         *taskgate.TaskGate
 	applyWait    time.Duration
 
 	mu        sync.Mutex
@@ -398,7 +431,7 @@ func New(cfg Config) (*Loader, error) {
 //     could have converged, not a partial pass. The target state is unchanged
 //     and the call can be retried at a calmer moment.
 //   - While Apply waits and converges, a task that tries to START is refused
-//     with runtime.ErrApplyPending rather than joining a plugin set that is
+//     with taskgate.ErrApplyPending rather than joining a plugin set that is
 //     mid-change.
 //
 // Two Apply calls do not queue behind each other either: while one holds the
@@ -526,6 +559,16 @@ func (l *Loader) converge(ctx context.Context, wanted []manifest.Entry, declared
 			errs = append(errs, fmt.Errorf("converge plugin %q: %w", plan.entry.Name, err))
 		}
 	}
+
+	// Pass 4: with the mounted set settled, decide which of those plugins can
+	// actually work and suspend or resume each one accordingly (see
+	// convergeDependencies). It runs last because it reads the mounted set the
+	// three passes above produced, and it runs inside the same gate for the
+	// reason the rest does: a plugin mounted by pass 3 and suspended here was
+	// never advertised to a task in between.
+	if err := l.convergeDependencies(ctx); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
 }
 
@@ -537,13 +580,29 @@ func (l *Loader) Status() []InstanceStatus {
 	defer l.mu.Unlock()
 
 	out := make([]InstanceStatus, 0, len(l.instances)+len(l.failures))
-	for _, inst := range l.instances {
+	for name := range l.instances {
+		// Read through mounted so an instance with no host.Plugin behind it
+		// trips the same invariant here as it does in the convergence, instead
+		// of being reported as a healthy "loaded": a status that answers
+		// "everything is fine" for a half-built instance is worse than no
+		// status at all, and the two call sites must not disagree about what a
+		// mounted plugin is.
+		inst := l.mounted(name)
+		// The plugin itself is the authority on whether its contributions are
+		// currently withdrawn; the Loader's own note only says why.
+		state := StateLoaded
+		var suspendedBy []string
+		if inst.plugin.Suspended() {
+			state = StateSuspended
+			suspendedBy = append([]string(nil), inst.suspendedBy...)
+		}
 		out = append(out, InstanceStatus{
-			Name:      inst.name,
-			Version:   inst.version,
-			State:     StateLoaded,
-			Tools:     append([]string(nil), inst.tools...),
-			LastError: inst.lastError,
+			Name:        inst.name,
+			Version:     inst.version,
+			State:       state,
+			Tools:       append([]string(nil), inst.tools...),
+			SuspendedBy: suspendedBy,
+			LastError:   inst.lastError,
 		})
 	}
 	for name, f := range l.failures {
@@ -667,7 +726,8 @@ func (l *Loader) activate(ctx context.Context, plan *convergePlan) error {
 	}
 
 	owner := ownerFor(plan.pm.Name, plan.pm.Version)
-	if _, err := host.Activate(ctx, l.ledger, owner, plan.spec); err != nil {
+	plugin, err := host.Activate(ctx, l.ledger, owner, plan.spec)
+	if err != nil {
 		activation := fmt.Errorf("activate plugin %q from %s: %w", entry.Name, plan.dir, err)
 		return l.fail(ctx, entry.Name, plan.pm.Version, stepActivate, activation, plan)
 	}
@@ -680,6 +740,8 @@ func (l *Loader) activate(ctx context.Context, plan *convergePlan) error {
 		fingerprint: plan.digest,
 		sha256:      plan.pm.SHA256,
 		tools:       toolNames(plan.spec.Tools),
+		plugin:      plugin,
+		requires:    append([]string(nil), plan.pm.Requires...),
 	}
 	if plan.unloadErr != nil {
 		// The replacement came up, but its predecessor did not go down cleanly:
@@ -787,9 +849,17 @@ func (l *Loader) restore(ctx context.Context, prev *instance) error {
 		return fmt.Errorf("restore previous instance of plugin %q (owner %s): tool name(s) %v are now "+
 			"owned by another contributor", prev.name, prev.owner, conflicts)
 	}
-	if _, err := host.Activate(ctx, l.ledger, prev.owner, prev.spec); err != nil {
+	plugin, err := host.Activate(ctx, l.ledger, prev.owner, prev.spec)
+	if err != nil {
 		return fmt.Errorf("restore previous instance of plugin %q (owner %s): %w", prev.name, prev.owner, err)
 	}
+	// The restoration is a NEW activation, so it comes with a new host.Plugin:
+	// the handle the instance carried before was marked disposed by the unload
+	// that took it down, and suspending or resuming through it would be refused
+	// for a plugin that is running again. A restore also re-files the
+	// contributions, so what comes back is never suspended.
+	prev.plugin = plugin
+	prev.suspendedBy = nil
 	l.instances[prev.name] = prev
 	// Defensive: a name cannot be in failures and instances at once today
 	// (fail only writes a failure record when nothing is mounted, and this
@@ -802,7 +872,9 @@ func (l *Loader) restore(ctx context.Context, prev *instance) error {
 }
 
 // unload disposes everything one instance filed and reports how many ledger
-// entries went with it. It is called with l.mu held.
+// entries went with it — across BOTH owners the activation files under (see
+// host.ToolsOwner), because "revoked" is read as how much this unload took
+// down. It is called with l.mu held.
 //
 // The event is published whether or not the disposal reported a failure: the
 // plugin IS unmounted either way (lifecycle.Ledger.DisposeOwner clears the
@@ -811,7 +883,15 @@ func (l *Loader) restore(ctx context.Context, prev *instance) error {
 // operator reading the event stream sees the same thing the returned error
 // says.
 func (l *Loader) unload(ctx context.Context, inst *instance, reason string) (int, error) {
-	revoked := len(l.ledger.Snapshot()[inst.owner])
+	// Both owners, counted from ONE snapshot: an activation files its wasm
+	// resources and the link to its contributions under inst.owner, and one
+	// entry per tool per half (registry, gateable catalog) under
+	// host.ToolsOwner(inst.owner). Counting only the instance owner would report
+	// the same 3 for every plugin no matter how many tools went away with it —
+	// a number that no longer means what the field says it means, in an event
+	// operators read to see what an unload actually took down.
+	snapshot := l.ledger.Snapshot()
+	revoked := len(snapshot[inst.owner]) + len(snapshot[host.ToolsOwner(inst.owner)])
 	disposeErr := l.ledger.DisposeOwner(inst.owner)
 
 	if disposeErr != nil {
@@ -904,6 +984,13 @@ type fingerprintInput struct {
 	MaxInstances int
 	MemoryPages  uint32
 
+	// Requires is the plugin's declared dependency on other plugins' tools. It
+	// changes nothing about the module, so without it here an operator who
+	// edited "requires" in plugin.json would get no remount at all and the
+	// dependency graph would keep resolving the declaration the running
+	// instance was mounted with.
+	Requires []string
+
 	// Config is the entry's configuration JSON, verbatim. It is not part of
 	// the Spec (it reaches the plugin through Deps) and a plugin reads it once,
 	// at activation, so a changed config must remount. Comparison is by bytes:
@@ -926,6 +1013,7 @@ func fingerprintOf(entry manifest.Entry, pm manifest.PluginManifest, spec host.S
 		Tools:        spec.Tools,
 		MaxInstances: spec.MaxInstances,
 		MemoryPages:  spec.MemoryPages,
+		Requires:     pm.Requires,
 		Config:       string(entry.Config),
 	})
 	if err != nil {

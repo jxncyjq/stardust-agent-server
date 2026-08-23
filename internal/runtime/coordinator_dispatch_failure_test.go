@@ -17,6 +17,7 @@ import (
 	"github.com/stardust/legion-agent/internal/quality"
 	"github.com/stardust/legion-agent/internal/storage"
 	"github.com/stardust/legion-agent/internal/task"
+	"github.com/stardust/legion-agent/internal/taskgate"
 )
 
 // flakyStatusSink fails the durable write for one target status and lets every
@@ -64,7 +65,7 @@ func TestCoordinatorReturnsTaskToPendingWhenMarkRunningFails(t *testing.T) {
 		},
 		Scheduler: scheduler,
 		Locks:     locks,
-		Runtime: NewRuntime(Config{Gate: NewTaskGate(),
+		Runtime: NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 			Maas:   adapter.NewRecordingMaas("safe result"),
 			Audit:  audit,
 			Events: events,
@@ -212,7 +213,7 @@ func TestCoordinatorCompletesTaskAfterTransientDispatchFailure(t *testing.T) {
 		Agent:     domain.Agent{ID: "agent-1", CompanyID: "company-1", Role: "developer", Status: domain.AgentActive},
 		Scheduler: scheduler,
 		Locks:     task.NewLockStore(),
-		Runtime: NewRuntime(Config{Gate: NewTaskGate(),
+		Runtime: NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 			Maas:   adapter.NewRecordingMaas("safe result"),
 			Audit:  audit,
 			Events: events,

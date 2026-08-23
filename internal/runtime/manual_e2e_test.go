@@ -9,6 +9,7 @@ import (
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/manualgate"
 	"github.com/stardust/legion-agent/internal/sessionstate"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
@@ -28,7 +29,7 @@ func TestManualGateDenyThenResume(t *testing.T) {
 		return domain.ToolResult{Success: true, Output: "wrote"}, nil
 	}))
 	maas := &oneToolThenTextMaas{toolName: "write_file", toolArgs: map[string]string{"path": "out/a.txt"}}
-	r := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas, Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
+	r := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Maas: maas, Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
 		Tools: reg, Checkpoints: cpStore, ToolGate: gate})
 	task := domain.Task{ID: "t1", SessionID: "s1", AgentID: "a1", Status: domain.TaskRunning, Mode: domain.ModeManual, Input: "go"}
 	if _, err := r.RunTask(context.Background(), domain.Agent{ID: "a1"}, task); err != ErrSuspended {
@@ -64,7 +65,7 @@ func TestManualGateApproveThenResume(t *testing.T) {
 		return domain.ToolResult{Success: true, Output: "wrote"}, nil
 	}))
 	maas := &oneToolThenTextMaas{toolName: "write_file", toolArgs: map[string]string{"path": "out/a.txt"}}
-	r := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas, Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
+	r := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Maas: maas, Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
 		Tools: reg, Checkpoints: cpStore, ToolGate: gate})
 	task := domain.Task{ID: "t1", SessionID: "s1", AgentID: "a1", Status: domain.TaskRunning, Mode: domain.ModeManual, Input: "go"}
 	if _, err := r.RunTask(context.Background(), domain.Agent{ID: "a1"}, task); err != ErrSuspended {

@@ -7,6 +7,7 @@ import (
 	"github.com/stardust/legion-agent/internal/domain"
 	agentruntime "github.com/stardust/legion-agent/internal/runtime"
 	"github.com/stardust/legion-agent/internal/skill"
+	"github.com/stardust/legion-agent/internal/taskgate"
 )
 
 // TestBuildDefaultRunnerConfigWiresSkillUsage guards the default-runner half of
@@ -32,7 +33,7 @@ func TestBuildDefaultRunnerConfigWiresSkillUsage(t *testing.T) {
 		nil, nil, nil, nil,
 		usage,
 		nil,
-		agentruntime.NewTaskGate(),
+		taskgate.NewTaskGate(),
 	)
 
 	if cfg.SkillUsage == nil {
@@ -76,7 +77,7 @@ func TestBuildDefaultRunnerConfigWiresEpisodeRecorder(t *testing.T) {
 		nil, nil, nil, nil,
 		nil,
 		rec,
-		agentruntime.NewTaskGate(),
+		taskgate.NewTaskGate(),
 	)
 
 	if cfg.EpisodeRecorder == nil {

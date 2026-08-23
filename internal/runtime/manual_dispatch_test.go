@@ -8,6 +8,7 @@ import (
 	"github.com/stardust/legion-agent/internal/approval"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/manualgate"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
@@ -23,7 +24,7 @@ func TestDispatchDeniedSensitiveReturnsRejectResult(t *testing.T) {
 		writeCalled = true
 		return domain.ToolResult{Success: true}, nil
 	}))
-	r := NewRuntime(Config{Gate: NewTaskGate(), Maas: &oneToolThenTextMaas{}, Tools: reg, Checkpoints: nil, ToolGate: gate})
+	r := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Maas: &oneToolThenTextMaas{}, Tools: reg, Checkpoints: nil, ToolGate: gate})
 	task := domain.Task{ID: "t1", SessionID: "s1", Mode: domain.ModeManual}
 	call := domain.ToolCall{ID: "c1", Name: "write_file", Arguments: map[string]string{}}
 	// open + deny the ticket first
@@ -63,7 +64,7 @@ func TestDispatchDeniedLazyCallToolReturnsRejectResult(t *testing.T) {
 		writeCalled = true
 		return domain.ToolResult{Success: true}, nil
 	}))
-	r := NewRuntime(Config{Gate: NewTaskGate(), Maas: &oneToolThenTextMaas{}, Tools: reg, Checkpoints: nil, ToolGate: gate, LazyTools: true})
+	r := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Maas: &oneToolThenTextMaas{}, Tools: reg, Checkpoints: nil, ToolGate: gate, LazyTools: true})
 	task := domain.Task{ID: "t1", SessionID: "s1", Mode: domain.ModeManual}
 	call := domain.ToolCall{ID: "c1", Name: "call_tool", Arguments: map[string]string{"tool_name": "write_file", "arguments_json": "{}"}}
 	// open + deny the ticket, keyed on the outer call_tool call ID

@@ -17,6 +17,7 @@ import (
 	"github.com/stardust/legion-agent/internal/evolution"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/sessionstate"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
@@ -157,7 +158,7 @@ type Config struct {
 	// nothing would say so. Every runtime that can carry a task in a process
 	// where plugins are applied must share ONE gate with the loader; a gate of
 	// its own would let its tasks run straight through another gate's boundary.
-	Gate *TaskGate
+	Gate *taskgate.TaskGate
 }
 
 // SkillUsageRecorder is the usage sidecar skill.UsageStore satisfies.
@@ -204,7 +205,7 @@ type Runtime struct {
 	episodeRecorder       EpisodeRecorder
 	// gate is never nil: NewRuntime refuses a nil Config.Gate and newSubRuntime
 	// carries the parent's over, so RunTask can register on it unconditionally.
-	gate *TaskGate
+	gate *taskgate.TaskGate
 }
 
 // loopState is the mutable state threaded through the tool-execution loop.

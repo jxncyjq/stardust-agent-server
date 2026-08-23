@@ -20,8 +20,9 @@ import (
 	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/app"
 	"github.com/stardust/legion-agent/internal/config"
+	"github.com/stardust/legion-agent/internal/plugin/loader"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
-	agentruntime "github.com/stardust/legion-agent/internal/runtime"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/toolauth"
 )
 
@@ -49,6 +50,13 @@ const (
 // the manifest cross-check. No test seam in production code is involved.
 const testGhostTool = "ghost_tool"
 
+// testMissingRequiredTool is a tool name no fixture in this file ever
+// contributes. A plugin whose plugin.json requires it can never resolve the
+// requirement, so it is how these tests put a plugin into StateSuspended for
+// a reason that is NOT a cascade: nobody, known to the loader or not, is ever
+// going to provide this name.
+const testMissingRequiredTool = "totally_missing_tool"
+
 // pluginFixture is one test's whole plugin world: a deployment manifest and
 // package tree on disk, an agent.json pointing at them, and an App carrying the
 // loader that serve assembly would have built from exactly that config.
@@ -59,7 +67,7 @@ type pluginFixture struct {
 	manifestPath string
 	configPath   string
 	application  *app.App
-	gate         *agentruntime.TaskGate
+	gate         *taskgate.TaskGate
 }
 
 // newPluginFixture writes a config with a plugins section pointing at a
@@ -82,7 +90,7 @@ func newPluginFixture(t *testing.T, applyWaitMs int) *pluginFixture {
 		manifestPath: filepath.Join(dir, "plugins.json"),
 		configPath:   filepath.Join(dir, "agent.json"),
 		application:  app.New(),
-		gate:         agentruntime.NewTaskGate(),
+		gate:         taskgate.NewTaskGate(),
 	}
 	f.writeConfig(fmt.Sprintf(`{
 		"storage": {"driver": "memory"},
@@ -130,6 +138,20 @@ func (f *pluginFixture) writeConfig(body string) {
 func (f *pluginFixture) writePackage(source, wasmFile, name, version string, capabilities, tools []string) {
 	f.t.Helper()
 
+	f.writePackageWithRequires(source, wasmFile, name, version, capabilities, tools, nil)
+}
+
+// writePackageWithRequires is writePackage plus a plugin.json "requires"
+// declaration, for a fixture that wants ITS OWN plugin suspended (or another
+// plugin cascading off it) rather than merely mounted. Requires is the
+// package-manifest field the dependency convergence reads — it names tools
+// this plugin calls into, not tools it contributes — so it has no bearing on
+// host.Activate's cross-check against the guest's own self-description
+// (name and provides); a fixture may declare any requires here without
+// touching the two committed guest binaries' fixed identities.
+func (f *pluginFixture) writePackageWithRequires(source, wasmFile, name, version string, capabilities, tools, requires []string) {
+	f.t.Helper()
+
 	dir := filepath.Join(f.root, source)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		f.t.Fatalf("create package dir %s: %v", dir, err)
@@ -154,6 +176,7 @@ func (f *pluginFixture) writePackage(source, wasmFile, name, version string, cap
 		Capabilities: capabilities,
 		Limits:       manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
 		Tools:        decls,
+		Requires:     requires,
 	})
 	if err != nil {
 		f.t.Fatalf("encode plugin.json for %s: %v", name, err)
@@ -1032,5 +1055,343 @@ func TestWritePluginStatusAlignsNonASCIINames(t *testing.T) {
 	if first, second := column(lines[1]), column(lines[2]); first != second {
 		t.Errorf("version= column starts at rune %d on %q but %d on %q; the columns must line up for a reader",
 			first, lines[1], second, lines[2])
+	}
+}
+
+// rowFor returns the single line of out whose OWN plugin name (the first
+// column, after the table's leading indent) is name, failing the test when
+// there is none or more than one. Matching on containment instead would give
+// a false match here on purpose: a cascade's waiting_on= names another row's
+// plugin inline (see TestPluginsStatusDistinguishesCascadedSuspensionFromDirect),
+// so a line can legitimately CONTAIN a name that is not its own.
+func rowFor(t *testing.T, out, name string) string {
+	t.Helper()
+
+	found := ""
+	for _, line := range strings.Split(out, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != name {
+			continue
+		}
+		if found != "" {
+			t.Fatalf("plugins status output has more than one row for %q:\n%s\n%s", name, found, line)
+		}
+		found = line
+	}
+	if found == "" {
+		t.Fatalf("plugins status output = %q, want a row for %q", out, name)
+	}
+	return found
+}
+
+// TestPluginsStatusNamesTheToolADirectSuspensionIsWaitingOn is decision #1 of
+// the a4b-task-5 brief: a suspended row must name the unresolved tool, not
+// just say "suspended" and send the operator to read code. The plugin here
+// requires a tool NOTHING in this deployment (or anywhere else) contributes,
+// so the row's explanation must say so plainly rather than point at some
+// other plugin -- there is no cascade to point at.
+//
+// This is also the mandated mutation's target: dropping SuspendedBy from the
+// row must make the testMissingRequiredTool assertion below fail.
+func TestPluginsStatusNamesTheToolADirectSuspensionIsWaitingOn(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackageWithRequires("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil,
+		[]string{testEchoTool}, []string{testMissingRequiredTool})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil (an unresolved requirement suspends, it does not fail startup)", err)
+	}
+
+	out, err := f.run("status")
+	if err != nil {
+		t.Fatalf("plugins status error = %v, want nil", err)
+	}
+	row := rowFor(t, out, testEchoPlugin)
+	if !strings.Contains(row, "suspended") {
+		t.Fatalf("plugins status row = %q, want the suspended state", row)
+	}
+	if !strings.Contains(row, testMissingRequiredTool) {
+		t.Fatalf("plugins status row = %q, want it to name the unresolved tool %q", row, testMissingRequiredTool)
+	}
+	// The withdrawal is real: the tool this plugin WOULD contribute is not
+	// currently gateable.
+	if toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = true, want false: a suspended entry's tools are withdrawn", testEchoTool)
+	}
+	// Nobody provides testMissingRequiredTool, known or not -- this must not
+	// be reported as a cascade onto some other plugin.
+	if strings.Contains(row, "cascade") {
+		t.Errorf("plugins status row = %q, want no cascade label: nothing in this deployment provides %q",
+			row, testMissingRequiredTool)
+	}
+}
+
+// TestPluginsStatusDistinguishesCascadedSuspensionFromDirect is decision #2:
+// a plugin suspended because the tool it needs is missing entirely, and a
+// plugin suspended because the PLUGIN that provides that tool is itself
+// suspended, are different operator problems, and the row has to say which
+// one this is.
+//
+// Two plugins are enough to build a cascade here without a third guest
+// fixture: echo requires a tool nobody provides (so it suspends directly),
+// and proxy requires echo's own tool -- which is provided by a plugin that is
+// mounted but not active, so proxy's suspension cascades off echo's.
+func TestPluginsStatusDistinguishesCascadedSuspensionFromDirect(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackageWithRequires("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil,
+		[]string{testEchoTool}, []string{testMissingRequiredTool})
+	f.writePackageWithRequires("proxy", testProxyWasm, testProxyPlugin, "3.4.0", []string{"tool"},
+		[]string{testProxyTool}, []string{testEchoTool})
+	f.writeManifest(
+		manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}},
+		manifestEntry{name: testProxyPlugin, source: "proxy", enabled: true, capabilities: []string{"tool"}, tools: []string{testProxyTool}},
+	)
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	out, err := f.run("status")
+	if err != nil {
+		t.Fatalf("plugins status error = %v, want nil", err)
+	}
+
+	echoRow := rowFor(t, out, testEchoPlugin)
+	if !strings.Contains(echoRow, "suspended") || !strings.Contains(echoRow, testMissingRequiredTool) {
+		t.Fatalf("echo row = %q, want suspended naming %q", echoRow, testMissingRequiredTool)
+	}
+	if strings.Contains(echoRow, "cascade") {
+		t.Errorf("echo row = %q, want no cascade label: %q has no provider at all", echoRow, testMissingRequiredTool)
+	}
+
+	proxyRow := rowFor(t, out, testProxyPlugin)
+	if !strings.Contains(proxyRow, "suspended") {
+		t.Fatalf("proxy row = %q, want the suspended state", proxyRow)
+	}
+	if !strings.Contains(proxyRow, testEchoTool) {
+		t.Fatalf("proxy row = %q, want it to name the unresolved tool %q", proxyRow, testEchoTool)
+	}
+	if !strings.Contains(proxyRow, "cascade") {
+		t.Errorf("proxy row = %q, want it labelled a cascade: %q is provided by %q, which is itself suspended",
+			proxyRow, testEchoTool, testEchoPlugin)
+	}
+	if !strings.Contains(proxyRow, testEchoPlugin) {
+		t.Errorf("proxy row = %q, want it to name %q as the plugin its cascade traces back to", proxyRow, testEchoPlugin)
+	}
+}
+
+// TestPluginsStatusShowsAllFourStatesTogetherWithoutSwallowing is decision #3:
+// disabled, failed, suspended and pending must each keep their own row when
+// all four are on screen at once, and no row's explanation must bleed into
+// another's.
+func TestPluginsStatusShowsAllFourStatesTogetherWithoutSwallowing(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackageWithRequires("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil,
+		[]string{testEchoTool}, []string{testMissingRequiredTool})
+	// The proxy guest does not provide testGhostTool, so this entry fails at
+	// host.Activate's manifest cross-check.
+	f.writePackage("proxy", testProxyWasm, testProxyPlugin, "3.4.0", []string{"tool"}, []string{testProxyTool, testGhostTool})
+	f.writeManifest(
+		manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}},
+		manifestEntry{name: testProxyPlugin, source: "proxy", enabled: true, capabilities: []string{"tool"}, tools: []string{testProxyTool, testGhostTool}},
+		// Reuses the echo package on disk; a disabled entry is never read
+		// (Loader.Apply skips it before the package is ever opened), so the
+		// mismatched identity is harmless.
+		manifestEntry{name: "disabled-plugin", source: "echo", enabled: false, tools: []string{testEchoTool}},
+	)
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil (no bad entry may stop startup)", err)
+	}
+
+	// A fourth entry, added to the manifest on disk WITHOUT a reload: enabled,
+	// but nothing has converged it yet.
+	f.writeManifest(
+		manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}},
+		manifestEntry{name: testProxyPlugin, source: "proxy", enabled: true, capabilities: []string{"tool"}, tools: []string{testProxyTool, testGhostTool}},
+		manifestEntry{name: "disabled-plugin", source: "echo", enabled: false, tools: []string{testEchoTool}},
+		manifestEntry{name: "pending-plugin", source: "echo", enabled: true, tools: []string{testEchoTool}},
+	)
+
+	out, err := f.run("status")
+	if err != nil {
+		t.Fatalf("plugins status error = %v, want nil", err)
+	}
+
+	suspendedRow := rowFor(t, out, testEchoPlugin)
+	failedRow := rowFor(t, out, testProxyPlugin)
+	disabledRow := rowFor(t, out, "disabled-plugin")
+	pendingRow := rowFor(t, out, "pending-plugin")
+
+	if !strings.Contains(suspendedRow, "suspended") || !strings.Contains(suspendedRow, testMissingRequiredTool) {
+		t.Errorf("suspended row = %q, want suspended naming %q", suspendedRow, testMissingRequiredTool)
+	}
+	if !strings.Contains(failedRow, "failed") || !strings.Contains(failedRow, testGhostTool) {
+		t.Errorf("failed row = %q, want failed naming %q", failedRow, testGhostTool)
+	}
+	if !strings.Contains(disabledRow, "disabled") {
+		t.Errorf("disabled row = %q, want the disabled state", disabledRow)
+	}
+	if !strings.Contains(pendingRow, "pending") {
+		t.Errorf("pending row = %q, want the pending state", pendingRow)
+	}
+
+	// No swallowing: the suspended entry's missing tool must not leak into the
+	// failed row's ghost-tool complaint, or vice versa, and neither the
+	// disabled nor the pending row (which explain nothing about a tool) may
+	// carry either one.
+	for _, row := range []struct {
+		label string
+		text  string
+	}{
+		{"failed", failedRow}, {"disabled", disabledRow}, {"pending", pendingRow},
+	} {
+		if strings.Contains(row.text, testMissingRequiredTool) {
+			t.Errorf("%s row = %q, must not carry the suspended row's unresolved tool %q", row.label, row.text, testMissingRequiredTool)
+		}
+	}
+	for _, row := range []struct {
+		label string
+		text  string
+	}{
+		{"suspended", suspendedRow}, {"disabled", disabledRow}, {"pending", pendingRow},
+	} {
+		if strings.Contains(row.text, testGhostTool) {
+			t.Errorf("%s row = %q, must not carry the failed row's ghost tool %q", row.label, row.text, testGhostTool)
+		}
+	}
+}
+
+// TestPluginsStatusKeepsWaitingOnForASuspendedEntryTheManifestHasSinceDisabled
+// is the a4b-task-5 review's Important #1: "status" re-reads the manifest from
+// disk on every call, independently of the loader's live state, so a plugin
+// that is currently mounted-and-suspended can pick up a stale "enabled": false
+// in the manifest before anyone reloads. The row must still be suspended and
+// still name what it is waiting on -- it must not fall into the
+// disabled-but-known branch and lose the waiting_on= explanation, which is the
+// entire reason SuspendedBy exists.
+func TestPluginsStatusKeepsWaitingOnForASuspendedEntryTheManifestHasSinceDisabled(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackageWithRequires("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil,
+		[]string{testEchoTool}, []string{testMissingRequiredTool})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil (an unresolved requirement suspends, it does not fail startup)", err)
+	}
+
+	// Edited on disk WITHOUT a reload: the loader's live state is still
+	// mounted-and-suspended, but the manifest now says the entry should be off.
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}})
+
+	out, err := f.run("status")
+	if err != nil {
+		t.Fatalf("plugins status error = %v, want nil", err)
+	}
+	row := rowFor(t, out, testEchoPlugin)
+	if !strings.Contains(row, "suspended") {
+		t.Fatalf("plugins status row = %q, want the suspended state: the loader has not been reloaded yet", row)
+	}
+	if !strings.Contains(row, testMissingRequiredTool) {
+		t.Fatalf("plugins status row = %q, want it to still name the unresolved tool %q, "+
+			"not have waiting_on= swallowed by the disabled-but-known branch", row, testMissingRequiredTool)
+	}
+}
+
+// TestPluginsStatusMarksASuspendedRowsToolsAsWithdrawn is the a4b-task-5
+// review's Important #2: tools= must not read identically for a row that is
+// actually serving a tool and a row that merely WOULD serve it once
+// unblocked. A loaded row's tools= is unmarked; a suspended row's is
+// annotated "(withdrawn)" so a reader scanning only that column cannot
+// mistake a suspended plugin for an active provider.
+func TestPluginsStatusMarksASuspendedRowsToolsAsWithdrawn(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writePackageWithRequires("proxy", testProxyWasm, testProxyPlugin, "3.4.0", []string{"tool"},
+		[]string{testProxyTool}, []string{testMissingRequiredTool})
+	f.writeManifest(
+		manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}},
+		manifestEntry{name: testProxyPlugin, source: "proxy", enabled: true, capabilities: []string{"tool"}, tools: []string{testProxyTool}},
+	)
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil (an unresolved requirement suspends, it does not fail startup)", err)
+	}
+
+	out, err := f.run("status")
+	if err != nil {
+		t.Fatalf("plugins status error = %v, want nil", err)
+	}
+
+	loadedRow := rowFor(t, out, testEchoPlugin)
+	if !strings.Contains(loadedRow, "tools=["+testEchoTool+"]") {
+		t.Fatalf("loaded row = %q, want an unmarked tools= column: %q is actually being served", loadedRow, testEchoTool)
+	}
+	if strings.Contains(loadedRow, "withdrawn") {
+		t.Errorf("loaded row = %q, must not read withdrawn: it is serving %q right now", loadedRow, testEchoTool)
+	}
+
+	suspendedRow := rowFor(t, out, testProxyPlugin)
+	if !strings.Contains(suspendedRow, "tools=["+testProxyTool+"](withdrawn)") {
+		t.Errorf("suspended row = %q, want tools=[%s](withdrawn): the tool it would contribute is not served right now",
+			suspendedRow, testProxyTool)
+	}
+}
+
+// TestSuspendedRowDetailCombinesWaitingOnAndError is Minor #1 of the
+// a4b-task-5 review: the combined-Detail path at plugins_command.go:101-110 is
+// reachable whenever a suspend's OWN teardown fails -- SuspendedBy is recorded
+// before Suspend is called (suspend.go:117), so a failing Suspend call
+// (suspend.go:237-252) leaves both a non-empty SuspendedBy and a non-empty
+// LastError on the same instance. Neither may swallow the other.
+func TestSuspendedRowDetailCombinesWaitingOnAndError(t *testing.T) {
+	st := loader.InstanceStatus{
+		Name:        testEchoPlugin,
+		State:       loader.StateSuspended,
+		SuspendedBy: []string{testMissingRequiredTool},
+		LastError:   "suspend plugin: disposer failed",
+	}
+	detail := suspendedRowDetail(st, map[string]string{}, map[string]loader.InstanceStatus{})
+	if !strings.Contains(detail, "waiting_on="+testMissingRequiredTool) {
+		t.Errorf("suspendedRowDetail() = %q, want it to still name the unresolved tool %q", detail, testMissingRequiredTool)
+	}
+	if !strings.Contains(detail, "error=suspend plugin: disposer failed") {
+		t.Errorf("suspendedRowDetail() = %q, want the suspend failure to appear alongside waiting_on=", detail)
+	}
+}
+
+// TestSuspendedRowDetailFallsBackToErrorAloneWhenSuspendedByIsEmpty is Minor #1's
+// other half: internal/plugin/loader's TestApplyReportsAResumeWhoseToolNameWasTaken
+// is the scenario where a plugin's own dependency resolves (SuspendedBy comes
+// back empty) but its RESUME then fails because its own tool name was taken
+// while it was down (suspend.go:140-151) -- LastError is the whole story then,
+// and the row must still say something rather than reading bare "suspended".
+func TestSuspendedRowDetailFallsBackToErrorAloneWhenSuspendedByIsEmpty(t *testing.T) {
+	st := loader.InstanceStatus{
+		Name:      testEchoPlugin,
+		State:     loader.StateSuspended,
+		LastError: `register tool "echo_aux": name already taken`,
+	}
+	detail := suspendedRowDetail(st, map[string]string{}, map[string]loader.InstanceStatus{})
+	if strings.Contains(detail, "waiting_on=") {
+		t.Errorf("suspendedRowDetail() = %q, want no waiting_on=: SuspendedBy is empty", detail)
+	}
+	want := `error=register tool "echo_aux": name already taken`
+	if detail != want {
+		t.Errorf("suspendedRowDetail() = %q, want %q (the error alone)", detail, want)
+	}
+}
+
+// TestSuspendedWaitingOnNamesEveryUnresolvedTool is Minor #2 of the a4b-task-5
+// review: suspendedWaitingOn's loop is correct by inspection for
+// len(suspendedBy) > 1, but no test built that case. Two unresolved tools are
+// named here, one direct and one cascaded, and the join must keep both without
+// either overwriting the other.
+func TestSuspendedWaitingOnNamesEveryUnresolvedTool(t *testing.T) {
+	providerOf := map[string]string{testProxyTool: testProxyPlugin}
+	byName := map[string]loader.InstanceStatus{
+		testProxyPlugin: {Name: testProxyPlugin, State: loader.StateSuspended},
+	}
+	got := suspendedWaitingOn([]string{testMissingRequiredTool, testProxyTool}, providerOf, byName)
+	want := fmt.Sprintf("waiting_on=%s(no plugin provides it) %s(cascade: %s is %s)",
+		testMissingRequiredTool, testProxyTool, testProxyPlugin, loader.StateSuspended)
+	if got != want {
+		t.Errorf("suspendedWaitingOn() = %q, want %q", got, want)
 	}
 }
