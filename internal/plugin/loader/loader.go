@@ -655,7 +655,12 @@ func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string)
 		return nil, l.fail(ctx, entry.Name, "", stepSource, err, nil)
 	}
 
-	pm, wasm, err := manifest.LoadPackage(dir)
+	// nil keyring: signature verification is off until the deployment policy
+	// that decides otherwise exists (it is A5a Task 3, which gives Config a
+	// Keyring and passes it here). nil means "this deployment does not require
+	// signatures" — it does NOT disable LoadPackage's sha256 check, which runs
+	// either way.
+	pm, wasm, err := manifest.LoadPackage(dir, nil)
 	if err != nil {
 		return nil, l.fail(ctx, entry.Name, "", stepLoadPackage, err, nil)
 	}
