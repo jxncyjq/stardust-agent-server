@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -195,11 +196,7 @@ func (f *pluginFixture) signPackage(source string, priv ed25519.PrivateKey) {
 	if err != nil {
 		f.t.Fatalf("sign plugin.json in %s: %v", dir, err)
 	}
-	doc, err := json.Marshal(map[string]string{
-		"key_id":    string(sig.KeyID),
-		"algorithm": sig.Algorithm,
-		"signature": base64.StdEncoding.EncodeToString(sig.Value),
-	})
+	doc, err := sign.MarshalSignature(sig)
 	if err != nil {
 		f.t.Fatalf("encode plugin.sig for %s: %v", dir, err)
 	}
@@ -2047,13 +2044,65 @@ func TestPluginsKeygenWritesThePrivateKeyReadableOnlyByItsOwner(t *testing.T) {
 	}
 }
 
+// assertNeverPrintsPrivateKey fails t if text contains priv or its seed, in
+// every encoding a leak might plausibly take. When fileData is non-nil, the
+// whole private key file's contents are searched for too. It is shared
+// between the success-path and forced-failure cases of the keygen leak test
+// below, so both search with the SAME technique.
+func assertNeverPrintsPrivateKey(t *testing.T, label string, text string, priv ed25519.PrivateKey, fileData []byte) {
+	t.Helper()
+	seed := priv.Seed()
+	forbidden := map[string]string{
+		"the private key, raw":      string(priv),
+		"the private key, base64":   base64.StdEncoding.EncodeToString(priv),
+		"the private key, hex":      hex.EncodeToString(priv),
+		"the private key, url-safe": base64.URLEncoding.EncodeToString(priv),
+		"the seed, raw":             string(seed),
+		"the seed, base64":          base64.StdEncoding.EncodeToString(seed),
+		"the seed, hex":             hex.EncodeToString(seed),
+	}
+	if fileData != nil {
+		forbidden["the whole private key file"] = string(fileData)
+	}
+	for what, needle := range forbidden {
+		if strings.Contains(text, needle) {
+			t.Errorf("%s contains %s", label, what)
+		}
+	}
+}
+
+// fixedReader is an io.Reader over a fixed byte slice. crypto/rand.Reader is
+// swapped for one of these, and restored immediately after, to make
+// sign.GenerateKey's output predictable for exactly the duration of one
+// call: without that, there would be no way to know what key a
+// forced-failure keygen call held, and therefore nothing to search its error
+// message for.
+type fixedReader struct{ data []byte }
+
+func (r *fixedReader) Read(p []byte) (int, error) {
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	if n < len(p) {
+		return n, io.ErrUnexpectedEOF
+	}
+	return n, nil
+}
+
 // TestPluginsKeygenNeverPrintsThePrivateKey searches EVERYTHING the command
 // wrote for the key it just produced, in every encoding it could plausibly
 // have been rendered in, and for the seed alone (the first 32 bytes) — half a
 // private key is a whole private key.
 //
-// The public key is asserted to BE present, so this test cannot pass by the
-// search being broken.
+// The public key is asserted to BE present on the success path, so this test
+// cannot pass by the search being broken.
+//
+// It also forces a write failure — --private-key pointing into a directory
+// that does not exist, which fails at the os.OpenFile call rather than at
+// O_EXCL — and searches the returned error the same way. keygen's error
+// paths hold priv and keyDoc in scope right up until they return (see
+// plugins_command.go, the OpenFile/Write/Close/Sync branches), so an error
+// string is exactly as capable of leaking the key as stdout is; the success
+// path alone left those branches checked only by inspection.
 func TestPluginsKeygenNeverPrintsThePrivateKey(t *testing.T) {
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "ops-2026.key")
@@ -2070,22 +2119,7 @@ func TestPluginsKeygenNeverPrintsThePrivateKey(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the private key keygen wrote does not parse: %v", err)
 	}
-	seed := priv.Seed()
-	forbidden := map[string]string{
-		"the private key, raw":       string(priv),
-		"the private key, base64":    base64.StdEncoding.EncodeToString(priv),
-		"the private key, hex":       hex.EncodeToString(priv),
-		"the private key, url-safe":  base64.URLEncoding.EncodeToString(priv),
-		"the seed, raw":              string(seed),
-		"the seed, base64":           base64.StdEncoding.EncodeToString(seed),
-		"the seed, hex":              hex.EncodeToString(seed),
-		"the whole private key file": string(data),
-	}
-	for what, needle := range forbidden {
-		if strings.Contains(out, needle) {
-			t.Errorf("keygen output contains %s", what)
-		}
-	}
+	assertNeverPrintsPrivateKey(t, "keygen output", out, priv, data)
 
 	// The counter-assertion: the search above is only meaningful if this
 	// technique can find a key that IS printed.
@@ -2093,6 +2127,21 @@ func TestPluginsKeygenNeverPrintsThePrivateKey(t *testing.T) {
 	if !strings.Contains(out, base64.StdEncoding.EncodeToString(pub)) {
 		t.Error("keygen output does not contain the PUBLIC key, so the searches above prove nothing")
 	}
+
+	// The forced-failure case: the key generated for THIS call is made
+	// predictable by swapping crypto/rand.Reader for a fixed 32-byte stream,
+	// restored immediately after the call returns.
+	seed := bytes.Repeat([]byte{0x42}, ed25519.SeedSize)
+	wantPriv := ed25519.NewKeyFromSeed(seed)
+	original := rand.Reader
+	rand.Reader = &fixedReader{data: append([]byte(nil), seed...)}
+	badPath := filepath.Join(dir, "no-such-directory", "ops-2026.key")
+	_, failErr := runAgent(t, "plugins", "keygen", "--key-id", "ops-2026", "--private-key", badPath)
+	rand.Reader = original
+	if failErr == nil {
+		t.Fatal("plugins keygen into a non-existent directory error = nil, want an error")
+	}
+	assertNeverPrintsPrivateKey(t, "keygen error", failErr.Error(), wantPriv, nil)
 }
 
 func TestPluginsKeygenRefusesAnEmptyKeyID(t *testing.T) {
@@ -2104,6 +2153,50 @@ func TestPluginsKeygenRefusesAnEmptyKeyID(t *testing.T) {
 	}
 	if _, statErr := os.Stat(keyPath); !os.IsNotExist(statErr) {
 		t.Errorf("a key file was created for a refused key id: stat error = %v, want not-exist", statErr)
+	}
+}
+
+// failAfterWriter fails every Write call after the first n succeed, letting
+// a test force an output failure at a specific point in a command without
+// breaking every line that comes before it.
+type failAfterWriter struct {
+	n     int
+	calls int
+}
+
+func (w *failAfterWriter) Write(p []byte) (int, error) {
+	w.calls++
+	if w.calls > w.n {
+		return 0, errors.New("simulated output failure")
+	}
+	return len(p), nil
+}
+
+// TestPluginsKeygenCleansUpWhenItCannotPrintTheKeyringEntry pins the fix for
+// the strand M-3 describes: a private key that reaches disk successfully but
+// whose keyring entry the operator never gets to see (because the output
+// stream itself failed, e.g. a broken pipe) must not be left behind. Left in
+// place, it would exist with no public entry ever shown for it, and the next
+// keygen attempt at the same path would be refused by O_EXCL — an operator
+// stuck with a key they cannot use and cannot regenerate. Both Fprintf calls
+// in runPluginsKeygen are exercised: the first (mode/path line) and the
+// second (the keyring entry itself).
+func TestPluginsKeygenCleansUpWhenItCannotPrintTheKeyringEntry(t *testing.T) {
+	for _, n := range []int{0, 1} {
+		t.Run(fmt.Sprintf("failAfter=%d", n), func(t *testing.T) {
+			dir := t.TempDir()
+			keyPath := filepath.Join(dir, "ops-2026.key")
+			w := &failAfterWriter{n: n}
+
+			err := runPluginsKeygen(w, "ops-2026", keyPath)
+			if err == nil {
+				t.Fatal("runPluginsKeygen error = nil, want an error: printing the keyring entry failed")
+			}
+			if _, statErr := os.Stat(keyPath); !os.IsNotExist(statErr) {
+				t.Errorf("the private key survived a failed keyring-entry print: stat error = %v, want not-exist",
+					statErr)
+			}
+		})
 	}
 }
 

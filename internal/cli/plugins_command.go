@@ -873,10 +873,33 @@ func newPluginsKeygenCommand(out io.Writer) *cobra.Command {
 // input fails before anything is created on disk. The file is then created
 // with O_EXCL, which is both the refusal to overwrite an existing key and the
 // only form of that refusal that cannot lose a race with another process
-// between the check and the write.
+// between the check and the write. The write is followed by Sync before
+// Close: without it, a crash between "wrote the private key" being printed
+// and the data actually reaching the platter can lose the only copy of a key
+// whose entry the operator has already pasted into a keyring, and the O_EXCL
+// refusal above would then make recreating it under the same name harder,
+// not easier. A failure to print the keyring entry after the key is safely
+// on disk is treated the same as a failure to write it: the file is removed
+// and the whole call reports an error, rather than leaving a valid key on
+// disk whose public entry the operator never saw and which O_EXCL would then
+// block them from regenerating at the same path.
 //
-// No error, and no line of output, ever carries the private key or any part of
-// it. The only place it goes is the file.
+// --key-id and --private-key are both trimmed of leading and trailing
+// whitespace before use; the trimmed value is what goes into the key file
+// AND the printed entry, so the two can never disagree, but a value entered
+// with stray whitespace is silently normalized rather than rejected.
+//
+// No error, and no line of output, ever carries the private key or any part
+// of it. The only place it goes is the file. Beyond the clear() calls below,
+// nothing in this function attempts to zero the key material it holds: this
+// is a seconds-long CLI invocation whose process exits (or fails) shortly
+// after this function returns, Go's garbage collector is free to relocate or
+// copy the underlying memory before or after clear() runs, and ed25519's
+// GenerateKey/Sign and encoding/json's Marshal are handed the key and keep
+// their own internal copies outside this function's control. clear() is
+// still worth doing as defense in depth against a slow leak in a long-lived
+// process, but its presence here is not a guarantee that no copy of the key
+// ever lingers in this process's memory.
 func runPluginsKeygen(out io.Writer, keyID string, privateKeyPath string) error {
 	id := sign.KeyID(strings.TrimSpace(keyID))
 	if id == "" {
@@ -893,10 +916,12 @@ func runPluginsKeygen(out io.Writer, keyID string, privateKeyPath string) error 
 	if err != nil {
 		return fmt.Errorf("plugins keygen: %w", err)
 	}
+	defer clear(priv)
 	keyDoc, err := sign.MarshalPrivateKey(id, priv)
 	if err != nil {
 		return fmt.Errorf("plugins keygen: %w", err)
 	}
+	defer clear(keyDoc)
 	entry, err := sign.MarshalKeyEntry(id, pub)
 	if err != nil {
 		return fmt.Errorf("plugins keygen: %w", err)
@@ -918,6 +943,13 @@ func runPluginsKeygen(out io.Writer, keyID string, privateKeyPath string) error 
 		}
 		return errors.Join(failure, removeIncompletePrivateKey(path))
 	}
+	if err := file.Sync(); err != nil {
+		failure := fmt.Errorf("sync private key file %q: %w", path, err)
+		if cerr := file.Close(); cerr != nil {
+			failure = errors.Join(failure, fmt.Errorf("close private key file %q: %w", path, cerr))
+		}
+		return errors.Join(failure, removeIncompletePrivateKey(path))
+	}
 	if err := file.Close(); err != nil {
 		return errors.Join(fmt.Errorf("close private key file %q: %w", path, err),
 			removeIncompletePrivateKey(path))
@@ -925,11 +957,11 @@ func runPluginsKeygen(out io.Writer, keyID string, privateKeyPath string) error 
 
 	if _, err := fmt.Fprintf(out, "wrote the private key for %q to %s (mode %#o%s).\n",
 		id, path, privateKeyFileMode, privateKeyModeCaveat()); err != nil {
-		return fmt.Errorf("write plugins keygen output: %w", err)
+		return errors.Join(fmt.Errorf("write plugins keygen output: %w", err), removeIncompletePrivateKey(path))
 	}
 	if _, err := fmt.Fprintf(out, "it is not printed here, and nothing in this tool ever prints it.\n\n"+
 		"paste this entry into the \"keys\" array of the keyring named by plugins.keyring:\n%s", entry); err != nil {
-		return fmt.Errorf("write plugins keygen output: %w", err)
+		return errors.Join(fmt.Errorf("write plugins keygen output: %w", err), removeIncompletePrivateKey(path))
 	}
 	return nil
 }
@@ -1003,7 +1035,19 @@ func newPluginsSignCommand(out io.Writer) *cobra.Command {
 // format it has no stake in.
 //
 // The signature is verified before it is written (see verifyOwnSignature).
-// Nothing is written if that check fails.
+// Nothing is written if that check fails, and plugin.sig is written through
+// writeFileAtomically so a failed write can never leave a truncated,
+// unparseable document in place of a good signature that used to be there.
+//
+// The package directory and --private-key path are both trimmed of leading
+// and trailing whitespace before use; a value entered with stray whitespace
+// is silently normalized rather than rejected.
+//
+// Beyond the clear() calls below, nothing in this function attempts to zero
+// the key material it reads: this is a seconds-long CLI invocation, Go's
+// garbage collector is free to relocate the underlying memory around
+// clear(), and ed25519.Sign is handed the key and may keep its own copy.
+// clear() is still worth doing as defense in depth, not as a guarantee.
 func runPluginsSign(out io.Writer, packageDir string, privateKeyPath string) error {
 	dir := strings.TrimSpace(packageDir)
 	if dir == "" {
@@ -1019,10 +1063,12 @@ func runPluginsSign(out io.Writer, packageDir string, privateKeyPath string) err
 	if err != nil {
 		return fmt.Errorf("read private key file %q: %w", keyPath, err)
 	}
+	defer clear(keyData)
 	id, priv, err := sign.ParsePrivateKey(keyData)
 	if err != nil {
 		return fmt.Errorf("parse private key file %s: %w", keyPath, err)
 	}
+	defer clear(priv)
 
 	manifestPath := filepath.Join(dir, "plugin.json")
 	manifestData, err := os.ReadFile(manifestPath)
@@ -1052,7 +1098,7 @@ func runPluginsSign(out io.Writer, packageDir string, privateKeyPath string) err
 	default:
 		return fmt.Errorf("inspect the existing signature at %s: %w", sigPath, err)
 	}
-	if err := os.WriteFile(sigPath, doc, signatureFileMode); err != nil {
+	if err := writeFileAtomically(sigPath, doc, signatureFileMode); err != nil {
 		return fmt.Errorf("write the signature to %s: %w", sigPath, err)
 	}
 
@@ -1070,6 +1116,62 @@ func runPluginsSign(out io.Writer, packageDir string, privateKeyPath string) err
 	}
 	if _, err := fmt.Fprintf(out, "wrote %s%s.\n", sigPath, note); err != nil {
 		return fmt.Errorf("write plugins sign output: %w", err)
+	}
+	return nil
+}
+
+// writeFileAtomically writes data to a temp file created beside path and
+// renames it into place, so that a process that dies mid-write can never
+// leave path holding a truncated, unparseable document in place of a good
+// one that used to be there. It is used for plugin.sig, which sign allows to
+// be replaced (an operator re-signing a package is normal): the risk it
+// guards against is availability, not secrecy — a signature is public by
+// construction — but a half-written plugin.sig destroys a working signature
+// for no better reason than an interrupted write, and the fix costs one
+// extra file plus a rename.
+//
+// The temp file is created in the SAME directory as path (not the OS temp
+// directory), so the final os.Rename is a same-filesystem move: on every
+// platform this package runs on, that makes the rename atomic with respect
+// to a concurrent reader, which would not be guaranteed across filesystems.
+func writeFileAtomically(path string, data []byte, mode fs.FileMode) (err error) {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, filepath.Base(path)+".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create a temp file beside %q: %w", path, err)
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		if err == nil {
+			return
+		}
+		if rmErr := os.Remove(tmpPath); rmErr != nil && !errors.Is(rmErr, fs.ErrNotExist) {
+			err = errors.Join(err, fmt.Errorf("remove temp file %q: %w", tmpPath, rmErr))
+		}
+	}()
+
+	if _, werr := tmp.Write(data); werr != nil {
+		failure := fmt.Errorf("write temp file %q: %w", tmpPath, werr)
+		if cerr := tmp.Close(); cerr != nil {
+			failure = errors.Join(failure, fmt.Errorf("close temp file %q: %w", tmpPath, cerr))
+		}
+		return failure
+	}
+	if serr := tmp.Sync(); serr != nil {
+		failure := fmt.Errorf("sync temp file %q: %w", tmpPath, serr)
+		if cerr := tmp.Close(); cerr != nil {
+			failure = errors.Join(failure, fmt.Errorf("close temp file %q: %w", tmpPath, cerr))
+		}
+		return failure
+	}
+	if cerr := tmp.Close(); cerr != nil {
+		return fmt.Errorf("close temp file %q: %w", tmpPath, cerr)
+	}
+	if cherr := os.Chmod(tmpPath, mode); cherr != nil {
+		return fmt.Errorf("set mode on temp file %q: %w", tmpPath, cherr)
+	}
+	if rerr := os.Rename(tmpPath, path); rerr != nil {
+		return fmt.Errorf("rename %q into place at %q: %w", tmpPath, path, rerr)
 	}
 	return nil
 }

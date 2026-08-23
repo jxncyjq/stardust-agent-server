@@ -69,11 +69,7 @@ func signPackage(t *testing.T, dir string, priv ed25519.PrivateKey) {
 	if err != nil {
 		t.Fatalf("sign plugin.json in %s: %v", dir, err)
 	}
-	doc, err := json.Marshal(map[string]string{
-		"key_id":    string(sig.KeyID),
-		"algorithm": sig.Algorithm,
-		"signature": base64.StdEncoding.EncodeToString(sig.Value),
-	})
+	doc, err := sign.MarshalSignature(sig)
 	if err != nil {
 		t.Fatalf("encode plugin.sig for %s: %v", dir, err)
 	}

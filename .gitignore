@@ -29,3 +29,8 @@ agent.db-wal
 # Agent 工具结果缓存与真机测试产物：本地运行副产物，不入库
 .stardust/
 demo/
+/tasks
+
+# agent plugins keygen 产出的私钥文件：任何层级都不入库
+*.key
+*.pem
