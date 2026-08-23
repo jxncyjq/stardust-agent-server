@@ -13,6 +13,7 @@ import (
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/evolution"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/testsupport"
 	"github.com/stardust/legion-agent/internal/tool"
 )
@@ -23,7 +24,7 @@ func TestRuntimeRunTaskCompletesThroughMaasPort(t *testing.T) {
 	maas := adapter.NewRecordingMaas("done")
 	audit := adapter.NewMemoryAuditLog()
 	events := adapter.NewMemoryEventBus()
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:   maas,
 		Audit:  audit,
 		Events: events,
@@ -64,7 +65,7 @@ func TestRuntimeRunTaskPublishesLightweightFailureLearningEvent(t *testing.T) {
 	t.Parallel()
 
 	events := adapter.NewMemoryEventBus()
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:   failingMaas{},
 		Audit:  adapter.NewMemoryAuditLog(),
 		Events: events,
@@ -105,7 +106,7 @@ func TestRuntimeRecordsSuccessEpisode(t *testing.T) {
 	t.Parallel()
 
 	rec := &fakeEpisodeRecorder{}
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:            adapter.NewRecordingMaas("done"),
 		Audit:           adapter.NewMemoryAuditLog(),
 		Events:          adapter.NewMemoryEventBus(),
@@ -141,7 +142,7 @@ func TestRuntimeRecordsFailureEpisode(t *testing.T) {
 	t.Parallel()
 
 	rec := &fakeEpisodeRecorder{}
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:            failingMaas{},
 		Audit:           adapter.NewMemoryAuditLog(),
 		Events:          adapter.NewMemoryEventBus(),
@@ -177,7 +178,7 @@ func TestRuntimeUsesNoopPortsWhenAuditAndEventsMissing(t *testing.T) {
 	t.Parallel()
 
 	maas := &captureMaas{response: "done without optional ports", reasoning: "reasoned through noop ports"}
-	runner := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas})
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Maas: maas})
 	run, err := runner.RunTask(context.Background(), domain.Agent{ID: "agent-1"}, domain.Task{
 		ID:    "task-noop-ports",
 		Input: "run without optional ports",
@@ -207,7 +208,7 @@ func TestRuntimeRecordsTokenUsageOnModelInferenceCompletedAudit(t *testing.T) {
 		totalTokens:      33,
 	}
 	audit := adapter.NewMemoryAuditLog()
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:   maas,
 		Audit:  audit,
 		Events: adapter.NewMemoryEventBus(),
@@ -235,7 +236,7 @@ func TestRuntimeRecordsTokenUsageOnModelInferenceCompletedAudit(t *testing.T) {
 func TestRuntimeMissingMaasReturnsErrMaasUnavailable(t *testing.T) {
 	t.Parallel()
 
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Audit:  adapter.NewMemoryAuditLog(),
 		Events: adapter.NewMemoryEventBus(),
 	})
@@ -252,7 +253,7 @@ func TestRuntimeRunTaskIncludesContextPrefixInPrompt(t *testing.T) {
 	t.Parallel()
 
 	maas := &captureMaas{response: "done"}
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:          maas,
 		Audit:         adapter.NewMemoryAuditLog(),
 		Events:        adapter.NewMemoryEventBus(),
@@ -278,7 +279,7 @@ func TestRuntimeRunTaskBuildsPromptWithCognitiveCore(t *testing.T) {
 
 	maas := &captureMaas{response: "done"}
 	core := cognitive.NewCore(cognitive.NoopCompressor{}).WithContextFiles("Agent identity:\nLegion Soul")
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:           maas,
 		Audit:          adapter.NewMemoryAuditLog(),
 		Events:         adapter.NewMemoryEventBus(),
@@ -303,7 +304,7 @@ func TestRuntimeRunTaskPassesConversationTurnsToCognitiveCore(t *testing.T) {
 
 	maas := &captureMaas{response: "done"}
 	core := cognitive.NewCore(cognitive.NoopCompressor{})
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:              maas,
 		Audit:             adapter.NewMemoryAuditLog(),
 		Events:            adapter.NewMemoryEventBus(),
@@ -347,7 +348,7 @@ func TestRuntimeExecutesModelToolCallsAndContinuesInference(t *testing.T) {
 	}, tool.HandlerFunc(func(_ context.Context, call domain.ToolCall) (domain.ToolResult, error) {
 		return domain.ToolResult{CallID: call.ID, Success: true, Output: "cache is implemented by map"}, nil
 	}))
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:   maas,
 		Audit:  audit,
 		Events: events,
@@ -409,7 +410,7 @@ func TestRuntimeSupportsMultipleToolRounds(t *testing.T) {
 		}
 		return domain.ToolResult{CallID: call.ID, Success: true, Output: outputs[call.Arguments["query"]]}, nil
 	}))
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:  maas,
 		Audit: audit,
 		Tools: registry,
@@ -459,7 +460,7 @@ func TestRuntimeFeedsToolExecuteErrorBackToModel(t *testing.T) {
 	}, tool.HandlerFunc(func(_ context.Context, _ domain.ToolCall) (domain.ToolResult, error) {
 		return domain.ToolResult{}, errors.New("task \"task-tool-error\" not found")
 	}))
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:   maas,
 		Audit:  audit,
 		Events: events,
@@ -493,7 +494,7 @@ func TestRuntimeInterruptStopsBeforeInference(t *testing.T) {
 
 	maas := &captureMaas{response: "should not run"}
 	events := adapter.NewMemoryEventBus()
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:   maas,
 		Audit:  adapter.NewMemoryAuditLog(),
 		Events: events,
@@ -550,7 +551,7 @@ func TestRuntimeRunTaskPropagatesContextCanceled(t *testing.T) {
 	t.Parallel()
 
 	maas := &cancelSignalMaas{started: make(chan struct{})}
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:   maas,
 		Audit:  adapter.NewMemoryAuditLog(),
 		Events: adapter.NewMemoryEventBus(),
@@ -695,7 +696,7 @@ func newCompactionTestRuntime(t *testing.T, maas *compactingToolMaas, compactTok
 	}, tool.HandlerFunc(func(_ context.Context, call domain.ToolCall) (domain.ToolResult, error) {
 		return domain.ToolResult{CallID: call.ID, Success: true, Output: "ok " + call.Arguments["query"]}, nil
 	}))
-	return NewRuntime(Config{Gate: NewTaskGate(),
+	return NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:                  maas,
 		Audit:                 audit,
 		Tools:                 registry,
@@ -856,7 +857,7 @@ func TestRuntimeGracefullyAnswersWhenToolBudgetExhausted(t *testing.T) {
 	}, tool.HandlerFunc(func(_ context.Context, call domain.ToolCall) (domain.ToolResult, error) {
 		return domain.ToolResult{CallID: call.ID, Success: true, Output: "partial data"}, nil
 	}))
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:          maas,
 		Audit:         audit,
 		Events:        events,
@@ -892,7 +893,7 @@ func TestRuntimeGracefullyAnswersWhenToolBudgetExhausted(t *testing.T) {
 func TestLazyToolHintPointsToLoadCapabilitiesNotListTools(t *testing.T) {
 	t.Parallel()
 
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:      adapter.NewRecordingMaas("done"),
 		LazyTools: true,
 	})
@@ -965,7 +966,7 @@ func TestRunToolLoopAbortsOnNonConsecutiveRepeat(t *testing.T) {
 	registerLookupLikeTool("lookup")
 	registerLookupLikeTool("other")
 
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:          maas,
 		Audit:         audit,
 		Events:        events,
@@ -1131,7 +1132,7 @@ func TestRuntimeCapturesGeneratedFilesFromWriteFile(t *testing.T) {
 		return domain.ToolResult{CallID: call.ID, Success: true, Output: "data"}, nil
 	}))
 
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:          maas,
 		Audit:         audit,
 		Events:        events,

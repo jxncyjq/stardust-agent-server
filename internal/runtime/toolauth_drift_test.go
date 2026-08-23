@@ -7,6 +7,7 @@ import (
 
 	"github.com/stardust/legion-agent/internal/browser"
 	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/taskledger"
 	"github.com/stardust/legion-agent/internal/tool"
 	"github.com/stardust/legion-agent/internal/toolauth"
@@ -62,7 +63,7 @@ func productionToolRegistryForTest(t *testing.T) *tool.Registry {
 	// then let it add delegate_task on top. A default-constructed runtime
 	// (Depth 0) resolves to role "orchestrator" (see NewRuntime), so
 	// canDelegate() is true and delegate_task actually registers.
-	rt := NewRuntime(Config{Gate: NewTaskGate(), Tools: tools})
+	rt := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Tools: tools})
 	rt.RegisterDelegateTaskTool(tools)
 
 	return tools

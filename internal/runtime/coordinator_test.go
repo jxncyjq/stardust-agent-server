@@ -15,6 +15,7 @@ import (
 	"github.com/stardust/legion-agent/internal/quality"
 	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/task"
+	"github.com/stardust/legion-agent/internal/taskgate"
 )
 
 // newTestCoordinator builds a Coordinator wired with the same stubs the other
@@ -115,7 +116,7 @@ func TestCoordinatorRunsPendingTaskToDone(t *testing.T) {
 		},
 		Scheduler: scheduler,
 		Locks:     task.NewLockStore(),
-		Runtime: NewRuntime(Config{Gate: NewTaskGate(),
+		Runtime: NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 			Maas:   adapter.NewRecordingMaas("safe result"),
 			Audit:  audit,
 			Events: events,
@@ -174,7 +175,7 @@ func TestCoordinatorSuspendsHardLoopAndCreatesApproval(t *testing.T) {
 		},
 		Scheduler: scheduler,
 		Locks:     task.NewLockStore(),
-		Runtime: NewRuntime(Config{Gate: NewTaskGate(),
+		Runtime: NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 			Maas:   adapter.NewRecordingMaas("same"),
 			Audit:  audit,
 			Events: events,

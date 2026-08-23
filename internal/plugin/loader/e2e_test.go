@@ -14,7 +14,7 @@ import (
 
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
-	"github.com/stardust/legion-agent/internal/runtime"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
 	"github.com/stardust/legion-agent/internal/toolauth"
 )
@@ -746,7 +746,7 @@ func TestE2EReloadLandsOnlyAfterTheInFlightTaskAndOnlyNewTasksSeeIt(t *testing.T
 	if probe, err := h.gate.Begin(); err == nil {
 		probe()
 		t.Fatalf("Begin() started a new task while a reload was pending, error = nil, want ErrApplyPending")
-	} else if !errors.Is(err, runtime.ErrApplyPending) {
+	} else if !errors.Is(err, taskgate.ErrApplyPending) {
 		t.Fatalf("Begin() while a reload was pending error = %v, want one matching ErrApplyPending", err)
 	}
 
@@ -820,7 +820,7 @@ func (h *harness) awaitReloadPending(t *testing.T, done <-chan error, applyRetur
 
 		probe, err := h.gate.Begin()
 		if err != nil {
-			if !errors.Is(err, runtime.ErrApplyPending) {
+			if !errors.Is(err, taskgate.ErrApplyPending) {
 				t.Fatalf("Begin() error = %v, want one matching ErrApplyPending", err)
 			}
 			return

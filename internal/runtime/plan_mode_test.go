@@ -12,6 +12,7 @@ import (
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/sessionstate"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
@@ -51,7 +52,7 @@ func planRegistry(t *testing.T) *tool.Registry {
 
 func TestPlanModeOffersOnlySafeTools(t *testing.T) {
 	maas := &planProbeMaas{}
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas: maas, Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
 		Tools: planRegistry(t), LazyTools: false,
 	})
@@ -121,7 +122,7 @@ func TestPlanModeLazyCallToolCannotReachSensitiveTool(t *testing.T) {
 	}))
 
 	maas := &planLazyCallToolMaas{}
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas: maas, Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
 		Tools: reg, LazyTools: true,
 	})
@@ -141,7 +142,7 @@ func TestPlanModeLazyCallToolCannotReachSensitiveTool(t *testing.T) {
 
 func TestAutoModeOffersAllTools(t *testing.T) {
 	maas := &planProbeMaas{}
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas: maas, Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
 		Tools: planRegistry(t), LazyTools: false,
 	})
@@ -163,7 +164,7 @@ func TestPlanModeWritesOKFPlanFile(t *testing.T) {
 	dir := t.TempDir()
 	store := sessionstate.NewStore(dir)
 	maas := &planProbeMaas{}
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas: maas, Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
 		Tools: planRegistry(t), LazyTools: false, Checkpoints: store,
 	})
@@ -194,7 +195,7 @@ func TestPlanModeWritesOKFPlanFile(t *testing.T) {
 func TestAutoModeWritesNoPlanFile(t *testing.T) {
 	dir := t.TempDir()
 	store := sessionstate.NewStore(dir)
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas: &planProbeMaas{}, Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
 		Tools: planRegistry(t), LazyTools: false, Checkpoints: store,
 	})

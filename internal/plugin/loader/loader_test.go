@@ -22,7 +22,7 @@ import (
 	"github.com/stardust/legion-agent/internal/lifecycle"
 	"github.com/stardust/legion-agent/internal/plugin/host"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
-	"github.com/stardust/legion-agent/internal/runtime"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
 	"github.com/stardust/legion-agent/internal/toolauth"
 )
@@ -194,7 +194,7 @@ type harness struct {
 	// is per-harness, so one test's in-flight task cannot hold another's apply
 	// shut. A test that wants to converge with a task in flight begins one on
 	// this gate (see boundary_test.go).
-	gate *runtime.TaskGate
+	gate *taskgate.TaskGate
 
 	// onPublish, when non-nil, runs on every runtime event the Loader
 	// publishes. It is a scheduling point rather than an observer: publishing
@@ -255,7 +255,7 @@ func newHarnessWithApplyWait(t *testing.T, applyWait time.Duration) *harness {
 		ledger:   lifecycle.NewLedger(),
 		registry: tool.NewRegistry(nil, nil, nil),
 		events:   adapter.NewMemoryEventBus(),
-		gate:     runtime.NewTaskGate(),
+		gate:     taskgate.NewTaskGate(),
 	}
 	loader, err := New(Config{
 		Ledger:       h.ledger,
@@ -447,7 +447,7 @@ func TestNewRequiresEveryDependency(t *testing.T) {
 			Deps:      func(string, json.RawMessage) host.Deps { return host.Deps{} },
 			Events:    adapter.NewMemoryEventBus(),
 			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-			Gate:      runtime.NewTaskGate(),
+			Gate:      taskgate.NewTaskGate(),
 			ApplyWait: defaultTestApplyWait,
 		}
 	}
@@ -1146,7 +1146,7 @@ func TestApplyReportsADepsFactoryWithNoRegistry(t *testing.T) {
 		Events:       events,
 		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 		DeployLimits: manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
-		Gate:         runtime.NewTaskGate(),
+		Gate:         taskgate.NewTaskGate(),
 		ApplyWait:    defaultTestApplyWait,
 	})
 	if err != nil {

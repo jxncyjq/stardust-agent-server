@@ -19,6 +19,7 @@ import (
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/skill"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/taskledger"
 	"github.com/stardust/legion-agent/internal/tool"
 	"github.com/stardust/legion-agent/internal/toolauth"
@@ -79,7 +80,7 @@ type AgentRuntimeResolverConfig struct {
 	// same RunTask as the default one, so a resolver without the shared gate
 	// would be a hole in the task-boundary contract exactly where per-agent
 	// tasks run. NewAgentRuntimeResolver panics on a nil Gate.
-	Gate *TaskGate
+	Gate *taskgate.TaskGate
 	// BrowserRuntime is the ONE shared browser runtime (one Chromium process)
 	// injected at serve assembly when RootConfig.Browser.Enabled. Per-agent
 	// runtimes register browser_* against this shared instance rather than
@@ -103,7 +104,7 @@ type AgentRuntimeResolver struct {
 	conversationTurns ConversationTurnLister
 	episodeRecorder   EpisodeRecorder
 	browserRuntime    browser.RuntimeAPI
-	gate              *TaskGate
+	gate              *taskgate.TaskGate
 }
 
 func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolver {

@@ -16,6 +16,7 @@ import (
 	"github.com/stardust/legion-agent/internal/evolution"
 	"github.com/stardust/legion-agent/internal/quality"
 	"github.com/stardust/legion-agent/internal/task"
+	"github.com/stardust/legion-agent/internal/taskgate"
 )
 
 // learningFailingEventBus accepts every event except the learning signal, which
@@ -64,7 +65,7 @@ func TestRuntimeLogsLearningPublishFailure(t *testing.T) {
 	events := &learningFailingEventBus{err: errors.New("event bus rejected learning signal")}
 	// Maas nil takes the shortest path to a failure-learning publish: RunTask
 	// reports ErrMaasUnavailable and, on the way out, tries to record the signal.
-	rt := NewRuntime(Config{Gate: NewTaskGate(),
+	rt := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Events: events,
 		Logger: slog.New(slog.NewTextHandler(&logs, nil)),
 	})
@@ -158,7 +159,7 @@ func TestSubRuntimeInheritsLogger(t *testing.T) {
 	t.Parallel()
 
 	logger := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
-	parent := NewRuntime(Config{Gate: NewTaskGate(), Logger: logger, MaxSpawnDepth: 3})
+	parent := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Logger: logger, MaxSpawnDepth: 3})
 
 	child, err := parent.newSubRuntime("leaf", nil)
 	if err != nil {

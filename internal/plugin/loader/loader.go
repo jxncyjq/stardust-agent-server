@@ -30,7 +30,7 @@
 //     says the old instance was NOT restored.
 //
 // WHEN a convergence lands is not this package's own judgement either: Apply
-// hands the whole convergence to the task-boundary gate (internal/runtime's
+// hands the whole convergence to the task-boundary gate (internal/taskgate's
 // TaskGate), which runs it only with no task in flight. A task therefore keeps
 // the capability catalog it started with, and a new target state reaches only
 // the tasks that start after it.
@@ -61,7 +61,7 @@ import (
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
 	"github.com/stardust/legion-agent/internal/plugin/perm"
 	"github.com/stardust/legion-agent/internal/port"
-	"github.com/stardust/legion-agent/internal/runtime"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
 	"github.com/stardust/legion-agent/internal/toolauth"
 )
@@ -215,7 +215,7 @@ type Config struct {
 	// forgotten-field away. It must be the same gate the runtimes running those
 	// tasks were built with; a gate of its own would wait for a boundary nobody
 	// is standing at.
-	Gate *runtime.TaskGate
+	Gate *taskgate.TaskGate
 
 	// ApplyWait is how long Apply waits for the tasks already running to finish
 	// before giving up. It is REQUIRED and must be positive.
@@ -330,7 +330,7 @@ type Loader struct {
 	events       port.EventBus
 	logger       *slog.Logger
 	deployLimits manifest.Limits
-	gate         *runtime.TaskGate
+	gate         *taskgate.TaskGate
 	applyWait    time.Duration
 
 	mu        sync.Mutex
@@ -431,7 +431,7 @@ func New(cfg Config) (*Loader, error) {
 //     could have converged, not a partial pass. The target state is unchanged
 //     and the call can be retried at a calmer moment.
 //   - While Apply waits and converges, a task that tries to START is refused
-//     with runtime.ErrApplyPending rather than joining a plugin set that is
+//     with taskgate.ErrApplyPending rather than joining a plugin set that is
 //     mid-change.
 //
 // Two Apply calls do not queue behind each other either: while one holds the

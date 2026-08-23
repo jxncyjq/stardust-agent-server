@@ -23,7 +23,7 @@ import (
 	"github.com/stardust/legion-agent/internal/plugin/loader"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
 	"github.com/stardust/legion-agent/internal/port"
-	agentruntime "github.com/stardust/legion-agent/internal/runtime"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
@@ -72,7 +72,7 @@ type pluginHostDeps struct {
 	// Gate is the task-boundary gate every convergence lands through. It MUST
 	// be the same gate the runtimes running this serve's tasks were built with;
 	// a gate of its own would wait for a boundary nobody is standing at.
-	Gate *agentruntime.TaskGate
+	Gate *taskgate.TaskGate
 }
 
 // assemblePlugins builds this process's plugin loader from cfg.Plugins,

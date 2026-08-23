@@ -16,7 +16,7 @@ import (
 	"github.com/stardust/legion-agent/internal/lifecycle"
 	"github.com/stardust/legion-agent/internal/plugin/host"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
-	"github.com/stardust/legion-agent/internal/runtime"
+	"github.com/stardust/legion-agent/internal/taskgate"
 )
 
 // boundaryDeps is a Deps func for the constructor tests, which only need one
@@ -73,7 +73,7 @@ func TestNewRejectsNonPositiveApplyWait(t *testing.T) {
 			Deps:      boundaryDeps,
 			Events:    adapter.NewMemoryEventBus(),
 			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-			Gate:      runtime.NewTaskGate(),
+			Gate:      taskgate.NewTaskGate(),
 			ApplyWait: wait,
 		})
 		if err == nil {
@@ -315,7 +315,7 @@ func (h *harness) awaitApplyPending(t *testing.T, done <-chan error, applyReturn
 
 		probe, err := h.gate.Begin()
 		if err != nil {
-			if !errors.Is(err, runtime.ErrApplyPending) {
+			if !errors.Is(err, taskgate.ErrApplyPending) {
 				t.Fatalf("Begin() error = %v, want one matching ErrApplyPending", err)
 			}
 			return

@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
@@ -23,7 +24,7 @@ func TestRegisterDelegateTaskToolOnlyForOrchestrators(t *testing.T) {
 
 	maas := &recordingSubMaas{summary: "ok"}
 
-	orchestrator := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas})
+	orchestrator := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Maas: maas})
 	orchRegistry := tool.NewRegistry(nil, nil, nil)
 	orchestrator.RegisterDelegateTaskTool(orchRegistry)
 	if !hasDescriptor(orchRegistry, "delegate_task") {
@@ -31,7 +32,7 @@ func TestRegisterDelegateTaskToolOnlyForOrchestrators(t *testing.T) {
 	}
 
 	// A leaf child never gets the tool, so it cannot recurse.
-	leaf := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas, Role: roleLeaf, Depth: 1})
+	leaf := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Maas: maas, Role: roleLeaf, Depth: 1})
 	leafRegistry := tool.NewRegistry(nil, nil, nil)
 	leaf.RegisterDelegateTaskTool(leafRegistry)
 	if hasDescriptor(leafRegistry, "delegate_task") {
@@ -43,7 +44,7 @@ func TestHandleDelegateTaskSingleMode(t *testing.T) {
 	t.Parallel()
 
 	maas := &recordingSubMaas{summary: "single summary"}
-	parent := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas})
+	parent := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Maas: maas})
 	result, err := parent.handleDelegateTask(context.Background(), domain.ToolCall{
 		ID: "call-1", Arguments: map[string]string{"goal": "do a thing"},
 	})
@@ -60,7 +61,7 @@ func TestHandleDelegateTaskBatchMode(t *testing.T) {
 	t.Parallel()
 
 	maas := &recordingSubMaas{summary: "batch item"}
-	parent := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas})
+	parent := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Maas: maas})
 	result, err := parent.handleDelegateTask(context.Background(), domain.ToolCall{
 		ID: "call-1", Arguments: map[string]string{"tasks": `[{"goal":"a"},{"goal":"b"}]`},
 	})
@@ -81,7 +82,7 @@ func TestHandleDelegateTaskInvalidBatchJSONFailsSoft(t *testing.T) {
 	t.Parallel()
 
 	maas := &recordingSubMaas{summary: "x"}
-	parent := NewRuntime(Config{Gate: NewTaskGate(), Maas: maas})
+	parent := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Maas: maas})
 	result, err := parent.handleDelegateTask(context.Background(), domain.ToolCall{
 		ID: "call-1", Arguments: map[string]string{"tasks": "{not json"},
 	})
@@ -103,7 +104,7 @@ func TestNewSubRuntimeToolsetsNarrowsChildRegistry(t *testing.T) {
 	registry.RegisterDescriptor(tool.Descriptor{Name: "read_file"}, noop)
 	registry.RegisterDescriptor(tool.Descriptor{Name: "write_file"}, noop)
 
-	parent := NewRuntime(Config{Gate: NewTaskGate(), Maas: &recordingSubMaas{summary: "ok"}, Tools: registry})
+	parent := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Maas: &recordingSubMaas{summary: "ok"}, Tools: registry})
 
 	// No toolsets inherits the full parent registry.
 	full, err := parent.newSubRuntime(roleLeaf, nil)

@@ -22,7 +22,7 @@ import (
 	"github.com/stardust/legion-agent/internal/config"
 	"github.com/stardust/legion-agent/internal/plugin/loader"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
-	agentruntime "github.com/stardust/legion-agent/internal/runtime"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/toolauth"
 )
 
@@ -67,7 +67,7 @@ type pluginFixture struct {
 	manifestPath string
 	configPath   string
 	application  *app.App
-	gate         *agentruntime.TaskGate
+	gate         *taskgate.TaskGate
 }
 
 // newPluginFixture writes a config with a plugins section pointing at a
@@ -90,7 +90,7 @@ func newPluginFixture(t *testing.T, applyWaitMs int) *pluginFixture {
 		manifestPath: filepath.Join(dir, "plugins.json"),
 		configPath:   filepath.Join(dir, "agent.json"),
 		application:  app.New(),
-		gate:         agentruntime.NewTaskGate(),
+		gate:         taskgate.NewTaskGate(),
 	}
 	f.writeConfig(fmt.Sprintf(`{
 		"storage": {"driver": "memory"},

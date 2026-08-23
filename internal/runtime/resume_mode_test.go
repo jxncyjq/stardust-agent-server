@@ -8,6 +8,7 @@ import (
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/sessionstate"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
@@ -58,7 +59,7 @@ func TestCheckSuspendPersistsMode(t *testing.T) {
 	store := sessionstate.NewStore(dir)
 	reg := planRegistry(t) // reuses helper from plan_mode_test.go (read_x safe, write_x sensitive)
 	maas := &oneToolThenTextMaas{toolName: "read_x"}
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas: maas, Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
 		Tools: reg, Checkpoints: store, ToolGate: &alwaysSuspendGate{},
 	})

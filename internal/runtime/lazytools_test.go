@@ -8,6 +8,7 @@ import (
 	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/testsupport"
 	"github.com/stardust/legion-agent/internal/tool"
 )
@@ -37,7 +38,7 @@ func newLazyTestRegistry(audit port.AuditLog) *tool.Registry {
 func TestInferenceToolsLazyOffersOnlyMetaTools(t *testing.T) {
 	t.Parallel()
 
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:      &captureMaas{response: "done"},
 		Tools:     newLazyTestRegistry(adapter.NewMemoryAuditLog()),
 		LazyTools: true,
@@ -60,7 +61,7 @@ func TestInferenceToolsLazyOffersOnlyMetaTools(t *testing.T) {
 func TestInferenceToolsEagerOffersFullSchema(t *testing.T) {
 	t.Parallel()
 
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:      &captureMaas{response: "done"},
 		Tools:     newLazyTestRegistry(adapter.NewMemoryAuditLog()),
 		LazyTools: false,
@@ -103,7 +104,7 @@ func TestRuntimeLazyCallToolDispatch(t *testing.T) {
 	maas := &lazyToolCallingMaas{}
 	audit := adapter.NewMemoryAuditLog()
 	events := adapter.NewMemoryEventBus()
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:      maas,
 		Audit:     audit,
 		Events:    events,
@@ -143,7 +144,7 @@ func TestRuntimeLazyCallToolDispatch(t *testing.T) {
 func TestRuntimeCallToolFailLoudOnBadInput(t *testing.T) {
 	t.Parallel()
 
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:      &captureMaas{response: "done"},
 		Audit:     adapter.NewMemoryAuditLog(),
 		Events:    adapter.NewMemoryEventBus(),

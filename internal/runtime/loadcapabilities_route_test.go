@@ -8,6 +8,7 @@ import (
 	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/testsupport"
 	"github.com/stardust/legion-agent/internal/tool"
 )
@@ -67,7 +68,7 @@ func TestRuntimeRoutesLoadCapabilities(t *testing.T) {
 	maas := &loadCapabilitiesMaas{}
 	audit := adapter.NewMemoryAuditLog()
 	events := adapter.NewMemoryEventBus()
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:      maas,
 		Audit:     audit,
 		Events:    events,

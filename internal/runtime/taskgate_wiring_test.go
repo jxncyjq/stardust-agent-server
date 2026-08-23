@@ -13,6 +13,7 @@ import (
 	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/taskgate"
 )
 
 // hookMaas answers every request with "done" after running hook, so a test can
@@ -30,7 +31,7 @@ func (m hookMaas) Generate(context.Context, port.InferenceRequest) (port.Inferen
 }
 
 // gatedRuntime builds a Runtime on gate with a maas that runs hook mid-task.
-func gatedRuntime(gate *TaskGate, maas port.MaasInferenceClient, events port.EventBus) *Runtime {
+func gatedRuntime(gate *taskgate.TaskGate, maas port.MaasInferenceClient, events port.EventBus) *Runtime {
 	return NewRuntime(Config{
 		Maas:   maas,
 		Audit:  adapter.NewMemoryAuditLog(),
@@ -109,7 +110,7 @@ func TestNewAgentRuntimeResolverRejectsNilGate(t *testing.T) {
 
 // TestRunTaskRefusesWhileApplyPending covers the second half of contract 4: a
 // task that would start into a half-changed plugin set must not start at all,
-// and must say so in a way the caller can act on (errors.Is ErrApplyPending).
+// and must say so in a way the caller can act on (errors.Is taskgate.ErrApplyPending).
 //
 // The check runs INSIDE ApplyAtBoundary's fn, which is exactly the window the
 // gate protects and needs no synchronisation of its own: while fn runs, the
@@ -117,7 +118,7 @@ func TestNewAgentRuntimeResolverRejectsNilGate(t *testing.T) {
 func TestRunTaskRefusesWhileApplyPending(t *testing.T) {
 	t.Parallel()
 
-	gate := NewTaskGate()
+	gate := taskgate.NewTaskGate()
 	maas := adapter.NewRecordingMaas("done")
 	events := adapter.NewMemoryEventBus()
 	runner := gatedRuntime(gate, maas, events)
@@ -130,8 +131,8 @@ func TestRunTaskRefusesWhileApplyPending(t *testing.T) {
 	if applyErr != nil {
 		t.Fatalf("ApplyAtBoundary() error = %v, want nil (no task was in flight)", applyErr)
 	}
-	if !errors.Is(runErr, ErrApplyPending) {
-		t.Fatalf("RunTask() error = %v, want one matching ErrApplyPending", runErr)
+	if !errors.Is(runErr, taskgate.ErrApplyPending) {
+		t.Fatalf("RunTask() error = %v, want one matching taskgate.ErrApplyPending", runErr)
 	}
 	if !strings.Contains(runErr.Error(), "task-refused") {
 		t.Errorf("RunTask() error = %q, want it to name the task it refused", runErr)
@@ -164,7 +165,7 @@ func TestRunTaskRefusesWhileApplyPending(t *testing.T) {
 func TestRunTaskHoldsGateWhileRunning(t *testing.T) {
 	t.Parallel()
 
-	gate := NewTaskGate()
+	gate := taskgate.NewTaskGate()
 	var (
 		midTaskErr     error
 		midTaskApplied bool
@@ -208,7 +209,7 @@ func TestRunTaskHoldsGateWhileRunning(t *testing.T) {
 func TestRunTaskReleasesGateWhenItFails(t *testing.T) {
 	t.Parallel()
 
-	gate := NewTaskGate()
+	gate := taskgate.NewTaskGate()
 	runner := gatedRuntime(gate, failingMaas{}, adapter.NewMemoryEventBus())
 
 	if _, err := runner.RunTask(context.Background(), gateTestAgent(), gateTestTask("task-fails")); err == nil {
@@ -235,7 +236,7 @@ func TestRunTaskReleasesGateWhenItFails(t *testing.T) {
 func TestSubRuntimeInheritsGate(t *testing.T) {
 	t.Parallel()
 
-	gate := NewTaskGate()
+	gate := taskgate.NewTaskGate()
 	parent := gatedRuntime(gate, adapter.NewRecordingMaas("done"), adapter.NewMemoryEventBus())
 	child, err := parent.newSubRuntime(roleLeaf, nil)
 	if err != nil {
@@ -283,15 +284,15 @@ const (
 // started.
 //
 // It must be called from the test's own goroutine (it calls t.Fatalf).
-func awaitApplyPending(t *testing.T, gate *TaskGate) {
+func awaitApplyPending(t *testing.T, gate *taskgate.TaskGate) {
 	t.Helper()
 
 	deadline := time.Now().Add(gatePendingBound)
 	for {
 		end, err := gate.Begin()
 		if err != nil {
-			if !errors.Is(err, ErrApplyPending) {
-				t.Fatalf("Begin() error = %v, want one matching ErrApplyPending", err)
+			if !errors.Is(err, taskgate.ErrApplyPending) {
+				t.Fatalf("Begin() error = %v, want one matching taskgate.ErrApplyPending", err)
 			}
 			return
 		}
@@ -307,7 +308,7 @@ func awaitApplyPending(t *testing.T, gate *TaskGate) {
 // that has not happened within gateApplyBound. The fn it probes with is a
 // no-op — no plugin instance is created by this loop, whatever number of rounds
 // it takes.
-func awaitGateIdle(t *testing.T, gate *TaskGate) {
+func awaitGateIdle(t *testing.T, gate *taskgate.TaskGate) {
 	t.Helper()
 
 	deadline := time.Now().Add(gateApplyBound)
@@ -346,7 +347,7 @@ func awaitGateIdle(t *testing.T, gate *TaskGate) {
 func TestDelegatedSubTaskRunsWhileApplyPending(t *testing.T) {
 	t.Parallel()
 
-	gate := NewTaskGate()
+	gate := taskgate.NewTaskGate()
 	applyDone := make(chan error, 1)
 
 	var (
@@ -448,7 +449,7 @@ func (b *blockingEventBus) Events() ([]domain.RuntimeEvent, error) { return b.in
 func TestBackgroundSubTaskHoldsGateAfterItsParentReturns(t *testing.T) {
 	t.Parallel()
 
-	gate := NewTaskGate()
+	gate := taskgate.NewTaskGate()
 	bus := &blockingEventBus{
 		inner:   adapter.NewMemoryEventBus(),
 		entered: make(chan struct{}, 1),

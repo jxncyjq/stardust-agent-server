@@ -11,6 +11,7 @@ import (
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/sessionstate"
+	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
@@ -79,7 +80,7 @@ func echoRegistry(t *testing.T) *tool.Registry {
 
 func TestRunTaskSuspendsAndWritesCheckpoint(t *testing.T) {
 	store := sessionstate.NewStore(t.TempDir())
-	runner := NewRuntime(Config{Gate: NewTaskGate(),
+	runner := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:        &scriptedMaas{},
 		Audit:       adapter.NewMemoryAuditLog(),
 		Events:      adapter.NewMemoryEventBus(),
@@ -110,7 +111,7 @@ func TestRunTaskResumesFromCheckpointToCompletion(t *testing.T) {
 	maas := &scriptedMaas{}
 	gate := &gateOnce{}
 	cfg := Config{
-		Gate:        NewTaskGate(),
+		Gate:        taskgate.NewTaskGate(),
 		Maas:        maas,
 		Audit:       adapter.NewMemoryAuditLog(),
 		Events:      adapter.NewMemoryEventBus(),
@@ -223,7 +224,7 @@ func TestLoadedCapabilitiesPersistAcrossSuspendResume(t *testing.T) {
 
 	// --- process 1: load a capability, then suspend before the pending real call ---
 	store1 := sessionstate.NewStore(dir)
-	runner1 := NewRuntime(Config{Gate: NewTaskGate(),
+	runner1 := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:        &scriptedLoadThenToolMaas{},
 		Audit:       adapter.NewMemoryAuditLog(),
 		Events:      adapter.NewMemoryEventBus(),
@@ -253,7 +254,7 @@ func TestLoadedCapabilitiesPersistAcrossSuspendResume(t *testing.T) {
 	// --- simulate restart: brand-new store + runtime over the same dir ---
 	store2 := sessionstate.NewStore(dir)
 	resumeMaas := &recordingSubMaas{summary: "final answer"}
-	runner2 := NewRuntime(Config{Gate: NewTaskGate(),
+	runner2 := NewRuntime(Config{Gate: taskgate.NewTaskGate(),
 		Maas:        resumeMaas,
 		Audit:       adapter.NewMemoryAuditLog(),
 		Events:      adapter.NewMemoryEventBus(),
