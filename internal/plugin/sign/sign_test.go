@@ -1,6 +1,7 @@
 package sign
 
 import (
+	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
 	"strings"
@@ -87,6 +88,32 @@ func TestParseKeyring_RejectsMalformedJSON(t *testing.T) {
 	requireErrorContains(t, err, "parse keyring")
 }
 
+// TestParseKeyring_RejectsUnknownFieldNested pins the doc's "at any nesting
+// level" claim (sign.go:97): DisallowUnknownFields must reject a bogus
+// field inside a keys[] entry, not only at the document's top level.
+func TestParseKeyring_RejectsUnknownFieldNested(t *testing.T) {
+	pub, _ := mustGenerateKey(t)
+	entry := validKeyEntry("ops-2026", pub)
+	entry["bogus"] = "surprise"
+	data := keyringJSON(t, entry)
+
+	_, err := ParseKeyring(data)
+	requireErrorContains(t, err, "parse keyring")
+}
+
+// TestParseKeyring_RejectsTrailingContent pins the requirement that a
+// keyring document is exactly one JSON value: bytes after the closing brace
+// must be refused, not silently discarded (json.Decoder.Decode alone stops
+// after the first value and reports no error for what follows).
+func TestParseKeyring_RejectsTrailingContent(t *testing.T) {
+	pub, _ := mustGenerateKey(t)
+	valid := keyringJSON(t, validKeyEntry("ops-2026", pub))
+	data := append(append([]byte{}, valid...), []byte(` {"x":1}`)...)
+
+	_, err := ParseKeyring(data)
+	requireErrorContains(t, err, "parse keyring")
+}
+
 func TestParseKeyring_RejectsNonEd25519Algorithm(t *testing.T) {
 	pub, _ := mustGenerateKey(t)
 	entry := validKeyEntry("ops-2026", pub)
@@ -123,6 +150,20 @@ func TestParseKeyring_RejectsWrongPublicKeyLength(t *testing.T) {
 	requireErrorContains(t, err, "32")
 }
 
+// TestParseKeyring_RejectsOverlongPublicKey pins the length check to "!=
+// ed25519.PublicKeySize" rather than "< ed25519.PublicKeySize". A 33-byte
+// key is the one input that would reach ed25519.Verify unrejected under a
+// "<" mutation and panic there instead of being refused here — this test
+// must fail loudly (via error, not panic) on the correct implementation.
+func TestParseKeyring_RejectsOverlongPublicKey(t *testing.T) {
+	entry := map[string]any{"id": "ops-2026", "algorithm": "ed25519", "public_key": b64(make([]byte, 33))}
+	data := keyringJSON(t, entry)
+
+	_, err := ParseKeyring(data)
+	requireErrorContains(t, err, "33")
+	requireErrorContains(t, err, "32")
+}
+
 func TestParseKeyring_RejectsEmptyID(t *testing.T) {
 	pub, _ := mustGenerateKey(t)
 	entry := validKeyEntry("", pub)
@@ -144,6 +185,18 @@ func TestParseKeyring_RejectsDuplicateID(t *testing.T) {
 
 func TestParseKeyring_RejectsEmptyKeyList(t *testing.T) {
 	data := keyringJSON(t)
+
+	_, err := ParseKeyring(data)
+	requireErrorContains(t, err, "empty")
+}
+
+// TestParseKeyring_RejectsEmptyKeyListLiteral exercises the brief's literal
+// {"keys":[]} shape directly. keyringJSON(t) with zero entries marshals a
+// nil slice to {"keys":null}, not {"keys":[]} — both hit the same
+// len(raw.Keys)==0 branch in this implementation, but only this case
+// constructs the byte-exact document rule 5 describes.
+func TestParseKeyring_RejectsEmptyKeyListLiteral(t *testing.T) {
+	data := []byte(`{"keys":[]}`)
 
 	_, err := ParseKeyring(data)
 	requireErrorContains(t, err, "empty")
@@ -218,6 +271,29 @@ func TestParseSignature_RejectsWrongSignatureLength(t *testing.T) {
 
 	_, err := ParseSignature(data)
 	requireErrorContains(t, err, "64")
+}
+
+// TestParseSignature_RejectsOverlongSignatureLength is the signature-side
+// counterpart of TestParseKeyring_RejectsOverlongPublicKey: a 65-byte value
+// is the one input that would reach ed25519.Verify unrejected under a "<"
+// mutation of the length check.
+func TestParseSignature_RejectsOverlongSignatureLength(t *testing.T) {
+	fields := validSigFields("ops-2026", make([]byte, 65))
+	data := sigJSON(t, fields)
+
+	_, err := ParseSignature(data)
+	requireErrorContains(t, err, "65")
+	requireErrorContains(t, err, "64")
+}
+
+// TestParseSignature_RejectsTrailingContent is the plugin.sig counterpart
+// of TestParseKeyring_RejectsTrailingContent.
+func TestParseSignature_RejectsTrailingContent(t *testing.T) {
+	valid := sigJSON(t, validSigFields("ops-2026", make([]byte, 64)))
+	data := append(append([]byte{}, valid...), []byte(` {"x":1}`)...)
+
+	_, err := ParseSignature(data)
+	requireErrorContains(t, err, "parse signature")
 }
 
 func TestParseSignature_RejectsEmptyKeyID(t *testing.T) {
@@ -308,7 +384,13 @@ func TestVerify_RejectsTamperedMessage(t *testing.T) {
 	tampered := append([]byte(nil), message...)
 	tampered[0] ^= 0xFF
 
+	// Assert on "does not verify" — wording that only the ed25519-failure
+	// branch produces. Asserting on "ops-2026" alone would not distinguish
+	// this from the unknown-key-id branch, whose error also names
+	// "ops-2026" as a trusted id; this test must pin rule 7 (the
+	// ed25519.Verify outcome), not merely "some error mentioning that id".
 	err = kr.Verify(sig, tampered)
+	requireErrorContains(t, err, "does not verify")
 	requireErrorContains(t, err, "ops-2026")
 }
 
@@ -351,4 +433,87 @@ func TestVerify_RejectsUnknownKeyID(t *testing.T) {
 	err = kr.Verify(sig, message)
 	requireErrorContains(t, err, "unknown-key")
 	requireErrorContains(t, err, "ops-2026")
+}
+
+// TestVerify_RejectsAlgorithmMismatch constructs a Signature directly
+// (bypassing ParseSignature, which is the only place algorithm enforcement
+// was previously wired up) to prove Verify itself refuses a signature
+// naming an algorithm this package does not implement. ParseSignature
+// validates the algorithm on the way in, but Verify is the actual security
+// gate; any future caller that builds a Signature some other way — a
+// second file format, a test helper, a config-driven constructor — must
+// not be able to sneak a non-ed25519 algorithm past Verify just because it
+// skipped ParseSignature.
+func TestVerify_RejectsAlgorithmMismatch(t *testing.T) {
+	pub, priv := mustGenerateKey(t)
+	message := []byte("plugin package bytes")
+	data := keyringJSON(t, validKeyEntry("ops-2026", pub))
+	kr, err := ParseKeyring(data)
+	if err != nil {
+		t.Fatalf("ParseKeyring: unexpected error: %v", err)
+	}
+
+	// The raw ed25519 signature is genuine and would verify — only the
+	// claimed Algorithm is wrong. Verify must refuse based on the claim
+	// alone.
+	value := ed25519.Sign(priv, message)
+	sig := Signature{KeyID: "ops-2026", Algorithm: "rsa", Value: value}
+
+	err = kr.Verify(sig, message)
+	requireErrorContains(t, err, "rsa")
+}
+
+// TestVerify_RejectsEmptyAlgorithm is TestVerify_RejectsAlgorithmMismatch's
+// empty-string case: an omitted Algorithm on a directly-constructed
+// Signature must not be treated as "the default algorithm".
+func TestVerify_RejectsEmptyAlgorithm(t *testing.T) {
+	pub, priv := mustGenerateKey(t)
+	message := []byte("plugin package bytes")
+	data := keyringJSON(t, validKeyEntry("ops-2026", pub))
+	kr, err := ParseKeyring(data)
+	if err != nil {
+		t.Fatalf("ParseKeyring: unexpected error: %v", err)
+	}
+
+	value := ed25519.Sign(priv, message)
+	sig := Signature{KeyID: "ops-2026", Algorithm: "", Value: value}
+
+	err = kr.Verify(sig, message)
+	requireErrorContains(t, err, "algorithm")
+}
+
+// TestVerify_NilKeyringPanics pins M-5: a nil *Keyring must crash loudly
+// and self-explanatorily, not read as "no verification required" (that
+// policy decision belongs to a later task and must be made by not calling
+// Verify at all, never by Verify silently admitting on a nil receiver).
+func TestVerify_NilKeyringPanics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("want panic calling Verify on a nil *Keyring, got none")
+		}
+		msg, ok := r.(string)
+		if !ok || !strings.Contains(msg, "nil") {
+			t.Fatalf("panic value %v does not explain the nil keyring", r)
+		}
+	}()
+	var kr *Keyring
+	_ = kr.Verify(Signature{KeyID: "ops-2026", Algorithm: "ed25519", Value: make([]byte, 64)}, []byte("m"))
+}
+
+// TestIDs_NilKeyringPanics is IDs' counterpart to
+// TestVerify_NilKeyringPanics.
+func TestIDs_NilKeyringPanics(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("want panic calling IDs on a nil *Keyring, got none")
+		}
+		msg, ok := r.(string)
+		if !ok || !strings.Contains(msg, "nil") {
+			t.Fatalf("panic value %v does not explain the nil keyring", r)
+		}
+	}()
+	var kr *Keyring
+	_ = kr.IDs()
 }

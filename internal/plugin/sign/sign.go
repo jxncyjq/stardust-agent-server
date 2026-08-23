@@ -108,7 +108,11 @@ type rawKeyring struct {
 //     decode to exactly ed25519.PublicKeySize (32) bytes;
 //   - two entries sharing the same id — a trust set must name each key
 //     unambiguously, or "which key signed this" stops being a well-defined
-//     question.
+//     question;
+//   - any non-whitespace content in data after the single JSON document —
+//     a second, ignored document is the same kind of mistake
+//     DisallowUnknownFields exists to catch: something written wrong being
+//     silently dropped instead of refused.
 //
 // Every error names the offending key's id (or, when the id itself is the
 // problem, the entry's index) rather than only reporting that parsing
@@ -119,6 +123,9 @@ func ParseKeyring(data []byte) (*Keyring, error) {
 	var raw rawKeyring
 	if err := dec.Decode(&raw); err != nil {
 		return nil, fmt.Errorf("parse keyring: %w", err)
+	}
+	if dec.More() {
+		return nil, fmt.Errorf("parse keyring: unexpected content after the JSON document")
 	}
 	if len(raw.Keys) == 0 {
 		return nil, fmt.Errorf("parse keyring: keys is empty; an empty trust set combined with mandatory " +
@@ -154,7 +161,15 @@ func ParseKeyring(data []byte) (*Keyring, error) {
 // IDs returns the ids of every key in the keyring, sorted for a
 // deterministic, reproducible order — callers that render this list (Verify
 // does, in its unknown-key-id error) get the same text on every run.
+//
+// IDs panics if k is nil: a nil *Keyring is a programming error, not "no
+// keys" — a nil-safe zero value here would let callers read "no keyring
+// configured" as "trust set of size zero" instead of the fail-loud crash
+// that omission deserves.
 func (k *Keyring) IDs() []KeyID {
+	if k == nil {
+		panic("sign: IDs called on a nil *Keyring")
+	}
 	ids := make([]KeyID, 0, len(k.keys))
 	for id := range k.keys {
 		ids = append(ids, id)
@@ -175,12 +190,30 @@ func (k *Keyring) IDs() []KeyID {
 // key could happen to also fail against a trusted key for an unrelated
 // reason, masking which check actually failed.
 //
+// Verify also checks sig.Algorithm before touching the keyring: a Signature
+// naming any algorithm other than the one this package implements is
+// refused by name, exactly as ParseSignature would refuse it — a Signature
+// built directly (bypassing ParseSignature) must not be able to carry a
+// claimed algorithm of "rsa" or "" into an ed25519 check and have it
+// silently ignored.
+//
 // An unknown sig.KeyID is refused, naming both the unknown id and the ids
 // Verify does trust (via IDs), so the caller can tell "wrong key" from
 // "right key, bad signature" without guessing. A signature that fails
 // ed25519.Verify against the resolved public key is refused the same way,
 // naming the key it was checked against.
+//
+// Verify panics if k is nil, for the same reason IDs does: a nil *Keyring
+// must never read as "no verification required". Callers that want signing
+// to be optional must decide that before calling Verify, not by passing it
+// a nil receiver.
 func (k *Keyring) Verify(sig Signature, message []byte) error {
+	if k == nil {
+		panic("sign: Verify called on a nil *Keyring")
+	}
+	if sig.Algorithm != signatureAlgorithm {
+		return fmt.Errorf("verify signature: algorithm is %q, want %q", sig.Algorithm, signatureAlgorithm)
+	}
 	pub, ok := k.keys[sig.KeyID]
 	if !ok {
 		return fmt.Errorf("verify signature: key id %q is not in the keyring (trusted ids: %v)",
@@ -211,7 +244,9 @@ type rawSignature struct {
 //   - an algorithm that is not exactly "ed25519" (an empty string is not
 //     treated as a default, for the same reason ParseKeyring rejects one);
 //   - a signature that does not decode as base64, or does not decode to
-//     exactly ed25519.SignatureSize (64) bytes.
+//     exactly ed25519.SignatureSize (64) bytes;
+//   - any non-whitespace content in data after the single JSON document, for
+//     the same reason ParseKeyring refuses it.
 //
 // ParseSignature does not check the signature against any key — it only
 // validates the document's own shape. Checking it is Keyring.Verify's job.
@@ -221,6 +256,9 @@ func ParseSignature(data []byte) (Signature, error) {
 	var raw rawSignature
 	if err := dec.Decode(&raw); err != nil {
 		return Signature{}, fmt.Errorf("parse signature: %w", err)
+	}
+	if dec.More() {
+		return Signature{}, fmt.Errorf("parse signature: unexpected content after the JSON document")
 	}
 	if raw.KeyID == "" {
 		return Signature{}, fmt.Errorf("parse signature: key_id is empty")
