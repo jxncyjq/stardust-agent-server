@@ -104,6 +104,22 @@ func assemblePlugins(ctx context.Context, application *app.App, cfg config.Confi
 		return errors.New("assemble plugins: application is nil; there is no lifecycle ledger to file activations under")
 	}
 	if strings.TrimSpace(cfg.Plugins.Manifest) == "" {
+		if strings.TrimSpace(cfg.Plugins.Keyring) != "" {
+			// The one documented exception to "configured means you meant it":
+			// with no manifest nothing is ever loaded, so this keyring is
+			// never read, never parsed, and a broken one would go unnoticed
+			// until the day plugins are switched on. Nothing is verified here
+			// because nothing is mounted here, but the operator gets to hear
+			// that the file they configured is doing nothing.
+			if deps.Logger == nil {
+				return errors.New("assemble plugins: Logger is nil; a configured keyring that is not in use would go unreported")
+			}
+			deps.Logger.Warn("plugin trust keyring is configured but plugins are not enabled",
+				"component", "cli",
+				"keyring", cfg.Plugins.Keyring,
+				"consequence", `no "plugins.manifest" is configured, so nothing is loaded and this keyring is never read or validated`,
+				"remedy", `configure "plugins.manifest" to enable plugins, or remove "plugins.keyring"`)
+		}
 		return nil
 	}
 	switch {
@@ -242,14 +258,33 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 	httpClient := &http.Client{Timeout: time.Duration(cfg.Plugins.Limits.TimeoutMs) * time.Millisecond}
 	identity := serveDefaultAgent()
 	logger := deps.Logger
+	if logger == nil {
+		// Reached only through assemblePlugins, which already refuses a nil
+		// Logger -- but the signature policy is reported through this logger
+		// below, and a policy decision made with nowhere to report it is the
+		// silent degradation this whole path exists to prevent.
+		return nil, errors.New("new plugin loader: Logger is nil; the signature policy would be decided with no record of it")
+	}
 
 	// The trust set, or the deliberate nil that says this deployment does not
 	// require signatures. Anything else -- a keyring that would not read, a
 	// requirement with nothing to check against -- fails here rather than
 	// mounting plugins nobody verified.
-	keyring, err := resolvePluginKeyring(cfg.Plugins, logger)
+	keyring, unenforcedKeyring, err := resolvePluginKeyring(cfg.Plugins)
 	if err != nil {
 		return nil, err
+	}
+	if unenforcedKeyring != "" {
+		// Deliberately NOT a second "this deployment verifies nothing": that
+		// sentence is loader.New's to say, once, and two warnings meaning the
+		// same thing are how an operator learns to skip both. This one carries
+		// only what the assembly knows and the loader cannot -- that a trust
+		// set was configured, and which file it is.
+		logger.Warn("plugin trust keyring is configured but not enforced",
+			"component", "cli",
+			"keyring", unenforcedKeyring,
+			"consequence", `the keys in it are loaded and then dropped, because the config says "require_signature": false`,
+			"remedy", `remove "require_signature": false to enforce the trust set that is already configured`)
 	}
 
 	return loader.New(loader.Config{
@@ -306,26 +341,25 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 //     reachable from one deliberate statement and from nothing else: not from
 //     a file that would not open, not from a forgotten field, not from an
 //     error someone decided to tolerate. A keyring that loaded fine is still
-//     dropped here — the policy, not the presence of a file, is what decides —
-//     and that is logged at Warn, because a deployment holding a trust set it
-//     does not enforce is worth seeing in the log.
+//     dropped here — the policy, not the presence of a file, is what decides.
 //
-// logger is required; a policy decision this consequential may not be made
-// silently.
-func resolvePluginKeyring(cfg config.PluginsConfig, logger *slog.Logger) (*sign.Keyring, error) {
-	if logger == nil {
-		return nil, errors.New("resolve plugin keyring: logger is nil; the signature policy would be decided with no record of it")
-	}
+// The second return value is the path of a keyring that loaded successfully and
+// was then dropped by policy, or "" when there was none. It is returned rather
+// than logged here because this function has two callers with different jobs:
+// serve assembly reports it (a deployment holding a trust set it does not
+// enforce is worth a line in the log), while `plugins reload` only compares
+// policies and has nothing new to say about one that has not changed.
+func resolvePluginKeyring(cfg config.PluginsConfig) (*sign.Keyring, string, error) {
 	path := strings.TrimSpace(cfg.Keyring)
 	var keyring *sign.Keyring
 	if path != "" {
 		data, err := os.ReadFile(path)
 		if err != nil {
-			return nil, fmt.Errorf("read plugin trust keyring %q: %w", path, err)
+			return nil, "", fmt.Errorf("read plugin trust keyring %q: %w", path, err)
 		}
 		keyring, err = sign.ParseKeyring(data)
 		if err != nil {
-			return nil, fmt.Errorf("parse plugin trust keyring %q: %w", path, err)
+			return nil, "", fmt.Errorf("parse plugin trust keyring %q: %w", path, err)
 		}
 		if keyring == nil {
 			// sign.ParseKeyring's contract is a non-nil keyring on a nil
@@ -335,21 +369,37 @@ func resolvePluginKeyring(cfg config.PluginsConfig, logger *slog.Logger) (*sign.
 		}
 	}
 	if !cfg.SignatureRequired() {
+		unenforced := ""
 		if keyring != nil {
-			logger.Warn("plugin signature verification is off",
-				"component", "cli",
-				"keyring", path,
-				"consequence", "the configured trust set is loaded but nothing is verified against it",
-				"remedy", `remove "require_signature": false from the plugins config to enforce it`)
+			unenforced = path
 		}
-		return nil, nil
+		return nil, unenforced, nil
 	}
 	if keyring == nil {
-		return nil, fmt.Errorf("plugins.keyring is not configured while plugin signatures are required: "+
+		return nil, "", fmt.Errorf("plugins.keyring is not configured while plugin signatures are required: "+
 			"either configure a keyring of trusted public keys, or turn the requirement off explicitly with "+
 			`"require_signature": false in the plugins config (manifest %q)`, cfg.Manifest)
 	}
-	return keyring, nil
+	return keyring, "", nil
+}
+
+// pluginSignaturePolicy is the signature policy cfg asks for, in the comparable
+// form a running Loader reports through Loader.SignaturePolicy.
+//
+// It resolves the keyring through resolvePluginKeyring, so it applies exactly
+// the rules serve assembly applies: a keyring that will not read still fails
+// here, and "signatures required" with no keyring still fails here. A leniently
+// computed policy would be worse than none — it could report "unchanged" for a
+// config serve would refuse to start on.
+func pluginSignaturePolicy(cfg config.PluginsConfig) (loader.SignaturePolicy, error) {
+	// The "configured but not enforced" note belongs to whoever ASSEMBLES a
+	// loader; startup already logged it, and repeating it on every reload of an
+	// unchanged policy would say nothing new.
+	keyring, _, err := resolvePluginKeyring(cfg)
+	if err != nil {
+		return loader.SignaturePolicy{}, err
+	}
+	return loader.SignaturePolicyOf(keyring), nil
 }
 
 // readPluginDeployment reads and parses the deployment manifest at path. Both
@@ -447,6 +497,30 @@ func newPluginsReloadCommand(application *app.App, out io.Writer) *cobra.Command
 			pluginLoader, err := requirePluginLoader(application)
 			if err != nil {
 				return err
+			}
+			// The manifest and root below come from the config just read, but
+			// the trust set does NOT: it was frozen when serve assembled this
+			// Loader, and there is no way to swap it under a running one. So an
+			// operator who tightened the policy and reloaded would get their new
+			// manifest converged under their OLD trust set, with no warning
+			// replayed and every log line looking normal — the exact silent
+			// degradation signature verification exists to prevent. Refuse
+			// instead, and say what has to happen: a security control that is
+			// partly applied is worse than one that is not, because it looks
+			// applied.
+			//
+			// limits and apply_wait are frozen the same way and are NOT checked
+			// here. They are resource settings; a stale ceiling is a performance
+			// surprise, not an unverified plugin.
+			wanted, err := pluginSignaturePolicy(cfg.Plugins)
+			if err != nil {
+				return err
+			}
+			if running := pluginLoader.SignaturePolicy(); !running.Equal(wanted) {
+				return fmt.Errorf("reload plugin deployment %q: the config now says %s, but this process is enforcing %s; "+
+					"the trust set is fixed when serve starts, so restart serve to apply a signature-policy change "+
+					"(reloading now would converge the new manifest under the old policy)",
+					cfg.Plugins.Manifest, wanted, running)
 			}
 			// Re-read from disk rather than replaying what startup parsed: a
 			// reload that applied the manifest as it was at startup would be a

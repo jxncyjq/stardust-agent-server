@@ -1661,3 +1661,245 @@ func TestAssemblePluginsSkipsVerificationWhenSignaturesAreExplicitlyOff(t *testi
 		t.Errorf("IsGateable(%q) = false, want true: an unsigned package mounts where signatures are off", testEchoTool)
 	}
 }
+
+// TestPluginsReloadRefusesATightenedSignaturePolicy is the a5a-task-3 review's
+// Important #1. reload re-reads the config and converges toward the manifest it
+// finds there, but the trust set it would verify with was frozen when serve
+// assembled the Loader and cannot be swapped under a running one. An operator
+// who turns "require_signature" back on (or adds a keyring) and reloads must
+// therefore NOT get a convergence: their new manifest would be applied under
+// the old, unenforcing policy, with startup's warning long gone from the log
+// and nothing on screen saying the policy did not take.
+func TestPluginsReloadRefusesATightenedSignaturePolicy(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	// Started with signatures explicitly off, and an unsigned package mounted.
+	f.writeSignatureConfig(30_000, signaturePolicy{requireSignature: boolPtr(false)})
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Fatalf("IsGateable(%q) = false after startup apply, want true", testEchoTool)
+	}
+
+	// The operator tightens the policy: a keyring is configured and
+	// require_signature goes back to its (strict) default.
+	_, keyringPath := f.newKeyring("keyring.json")
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath})
+
+	_, err := f.run("reload")
+	if err == nil {
+		t.Fatal("plugins reload error = nil, want an error: the signature policy in the config is not the one this process enforces")
+	}
+	if !strings.Contains(err.Error(), "restart") {
+		t.Errorf("plugins reload error = %v, want it to say serve must be restarted for a signature-policy change", err)
+	}
+	if !strings.Contains(err.Error(), "signature") {
+		t.Errorf("plugins reload error = %v, want it to name the signature policy as what changed", err)
+	}
+	// Refusing is not tearing down: the deployment that IS running stays
+	// exactly as it was, so an operator who reloads by mistake loses nothing.
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = false, want true: a refused reload must leave the running deployment alone", testEchoTool)
+	}
+}
+
+// TestPluginsReloadConvergesWhenTheSignaturePolicyIsUnchanged is the other half
+// of that check, on the enforcing side: with the SAME keyring in the config as
+// the running Loader was built with, the policies compare equal and the reload
+// goes through. Without this, "refuse whenever signatures are enforced" would
+// pass the test above and break every reload of a signing deployment.
+func TestPluginsReloadConvergesWhenTheSignaturePolicyIsUnchanged(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	priv, keyringPath := f.newKeyring("keyring.json")
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath})
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.signPackage("echo", priv)
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Fatalf("IsGateable(%q) = false after startup apply, want true", testEchoTool)
+	}
+
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}})
+	if _, err := f.run("reload"); err != nil {
+		t.Fatalf("plugins reload error = %v, want nil: the signature policy did not change", err)
+	}
+	if toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = true after reload, want false: the disabled entry must be unmounted", testEchoTool)
+	}
+}
+
+// TestAssemblePluginsDropsALoadedKeyringWhenSignaturesAreExplicitlyOff is the
+// a5a-task-3 review's Minor #3: the branch where a keyring loads FINE and is
+// then discarded by policy had no test at all -- the three "off" tests either
+// configured no keyring or one that would not read. A valid keyring plus an
+// unsigned package is what tells the two apart: if the keyring were kept, this
+// package could not mount.
+//
+// It also pins Minor #4: exactly one line in a startup log says this deployment
+// verifies nothing. The cli's warning carries only what the cli knows (a trust
+// set is configured, and which file), because two warnings meaning the same
+// thing teach an operator to skip both.
+func TestAssemblePluginsDropsALoadedKeyringWhenSignaturesAreExplicitlyOff(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	_, keyringPath := f.newKeyring("keyring.json")
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(false)})
+	// Written and never signed: it mounts only if the keyring was truly dropped.
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+
+	logs := &bytes.Buffer{}
+	if err := f.assembleWithLogger(slog.New(slog.NewTextHandler(logs, nil))); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil: a valid keyring plus an explicit off is a legal deployment", err)
+	}
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Fatalf("IsGateable(%q) = false, want true: an unsigned package mounting is what proves the keyring was discarded",
+			testEchoTool)
+	}
+
+	log := logs.String()
+	if !strings.Contains(log, "plugin trust keyring is configured but not enforced") {
+		t.Errorf("startup log = %q, want the cli to report the trust set it loaded and dropped", log)
+	}
+	if !strings.Contains(log, "keyring.json") {
+		t.Errorf("startup log = %q, want it to name the keyring file that is not being enforced", log)
+	}
+	if got := strings.Count(log, "signature verification is"); got != 1 {
+		t.Errorf("startup log says %q %d times, want exactly 1 (the loader's): a second warning saying the same thing "+
+			"is how an operator learns to ignore both.\nlog = %q", "signature verification is", got, log)
+	}
+}
+
+// TestAssemblePluginsFailsWhenTheKeyringPathIsADirectory is the a5a-task-3
+// review's Minor #5(a): a keyring path that names a directory is a configured
+// trust set that cannot be read, and os.ReadFile failing on it must fail
+// assembly like any other unreadable one rather than leave a nil keyring
+// behind.
+func TestAssemblePluginsFailsWhenTheKeyringPathIsADirectory(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	keyringDir := filepath.Join(f.dir, "keyring-dir")
+	if err := os.MkdirAll(keyringDir, 0o755); err != nil {
+		t.Fatalf("create directory %s: %v", keyringDir, err)
+	}
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringDir})
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+
+	err := f.assemble()
+	if err == nil {
+		t.Fatal("assemblePlugins() error = nil, want an error: a directory is not a readable keyring")
+	}
+	if !strings.Contains(err.Error(), fmt.Sprintf("%q", keyringDir)) {
+		t.Errorf("assemblePlugins() error = %v, want it to name the keyring path %s", err, keyringDir)
+	}
+	if toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = true, want false: nothing may mount from a refused assembly", testEchoTool)
+	}
+}
+
+// TestPluginsResolveARelativeKeyringAgainstTheProcessWorkingDirectory is the
+// a5a-task-3 review's Minor #5(b): plugins.keyring follows the same rule as
+// plugins.manifest and plugins.root -- a relative path resolves against the
+// PROCESS working directory, not the directory --config was read from. The
+// config below lives in a subdirectory holding no keyring at all, so the two
+// rules give different answers and only one of them can pass. A later tidy-up
+// that "fixed" keyring resolution to be config-relative fails here.
+func TestPluginsResolveARelativeKeyringAgainstTheProcessWorkingDirectory(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	priv, _ := f.newKeyring("keyring.json")
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.signPackage("echo", priv)
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+
+	confDir := filepath.Join(f.dir, "conf")
+	if err := os.MkdirAll(confDir, 0o755); err != nil {
+		t.Fatalf("create config dir %s: %v", confDir, err)
+	}
+	f.configPath = filepath.Join(confDir, "agent.json")
+	// manifest and root stay absolute on purpose: the only relative path under
+	// test here is the keyring, so nothing else can explain the outcome.
+	f.writeConfig(fmt.Sprintf(`{
+		"storage": {"driver": "memory"},
+		"context_files": {"root": %s},
+		"plugins": {
+			"manifest": %s,
+			"root": %s,
+			"keyring": "keyring.json",
+			"limits": {"timeout_ms": 5000, "max_memory_pages": 64, "max_instances": 1},
+			"apply_wait_ms": 30000
+		}
+	}`, jsonString(f.dir), jsonString(f.manifestPath), jsonString(f.root)))
+
+	// Started anywhere else, "keyring.json" names nothing -- and the config
+	// file's own directory does not hold one either, so a config-relative rule
+	// would fail here too. What must NOT happen is a nil keyring: signatures
+	// are required in this config, so assembly refuses.
+	t.Chdir(t.TempDir())
+	err := f.assemble()
+	if err == nil {
+		t.Fatal("assemblePlugins() error = nil from an unrelated working directory, want an error: the relative keyring resolves to nothing there")
+	}
+	if !strings.Contains(err.Error(), "keyring.json") {
+		t.Errorf("assemblePlugins() error = %v, want it to name the keyring path that could not be read", err)
+	}
+	if toolauth.IsGateable(testEchoTool) {
+		t.Fatalf("IsGateable(%q) = true, want false: nothing may mount from a refused assembly", testEchoTool)
+	}
+
+	// Started from the deployment's directory, the same relative path finds the
+	// keyring and the signed package mounts.
+	t.Chdir(f.dir)
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil: a relative keyring resolves against the process working directory", err)
+	}
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = false, want true: the signed package must have mounted", testEchoTool)
+	}
+}
+
+// TestAssemblePluginsReportsAConfiguredKeyringWhilePluginsAreOff is the
+// a5a-task-3 review's Minor #6. With no plugins.manifest nothing is loaded, so
+// assembly returns before the keyring is ever read -- a broken one would sit
+// there unreported until the day plugins are switched on. There is no security
+// consequence (nothing mounts), but "configured means you meant it" holds
+// everywhere else on this path, so the exception is announced rather than
+// silent: the keyring below does not even exist, and startup still succeeds.
+func TestAssemblePluginsReportsAConfiguredKeyringWhilePluginsAreOff(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "agent.json")
+	keyringPath := filepath.Join(dir, "no-such-keyring.json")
+	body := fmt.Sprintf(`{
+		"storage": {"driver": "memory"},
+		"context_files": {"root": %s},
+		"plugins": {"keyring": %s}
+	}`, jsonString(dir), jsonString(keyringPath))
+	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
+		t.Fatalf("write config %s: %v", configPath, err)
+	}
+	cfg, err := config.Load(context.Background(), config.Options{Path: configPath})
+	if err != nil {
+		t.Fatalf("load config %s: %v", configPath, err)
+	}
+
+	logs := &bytes.Buffer{}
+	if err := assemblePlugins(context.Background(), app.New(), cfg, pluginHostDeps{
+		Audit:  adapter.NewMemoryAuditLog(),
+		Events: adapter.NewMemoryEventBus(),
+		Logger: slog.New(slog.NewTextHandler(logs, nil)),
+		Gate:   taskgate.NewTaskGate(),
+	}); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil: no manifest is the documented plugins-are-off state", err)
+	}
+
+	log := logs.String()
+	if !strings.Contains(log, "plugin trust keyring is configured but plugins are not enabled") {
+		t.Errorf("startup log = %q, want it to say the configured keyring is doing nothing", log)
+	}
+	if !strings.Contains(log, "no-such-keyring.json") {
+		t.Errorf("startup log = %q, want it to name the keyring that is not in use", log)
+	}
+}

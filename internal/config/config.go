@@ -81,6 +81,14 @@ type PluginsConfig struct {
 	// It must be non-empty whenever signatures are required (see
 	// SignatureRequired): "verify every package" with nothing to verify
 	// against is not a runnable deployment, and serve refuses to start in it.
+	//
+	// That rule is NOT enforced here, which is the difference between it and
+	// Root's identically-worded one above. validatePlugins rejects an empty
+	// Root because Root is decidable from the config text alone; deciding this
+	// one means reading and parsing the keyring file, and Load never does file
+	// I/O. It is enforced one layer out, at serve assembly, by
+	// cli.resolvePluginKeyring — so a plugins section that satisfied Load is
+	// not yet one serve will start on.
 	Keyring string `json:"keyring"`
 
 	// RequireSignature is the deployment's signature policy, as a POINTER so

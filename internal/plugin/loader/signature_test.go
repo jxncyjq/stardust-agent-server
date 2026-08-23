@@ -28,12 +28,20 @@ const testKeyID = sign.KeyID("test-key")
 func newTestKey(t *testing.T) (ed25519.PrivateKey, *sign.Keyring) {
 	t.Helper()
 
+	return newTestKeyWithID(t, testKeyID)
+}
+
+// newTestKeyWithID is newTestKey under a caller-chosen key id, for the tests
+// that need two DIFFERENT trust sets rather than two copies of one.
+func newTestKeyWithID(t *testing.T, id sign.KeyID) (ed25519.PrivateKey, *sign.Keyring) {
+	t.Helper()
+
 	pub, priv, err := sign.GenerateKey()
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
 	}
 	doc := map[string]any{"keys": []map[string]string{{
-		"id":         string(testKeyID),
+		"id":         string(id),
 		"algorithm":  "ed25519",
 		"public_key": base64.StdEncoding.EncodeToString(pub),
 	}}}
@@ -291,5 +299,56 @@ func TestNewSaysSoWhenItIsBuiltWithoutAKeyring(t *testing.T) {
 	}
 	if logs.Len() != 0 {
 		t.Errorf("New() with a keyring logged %q, want nothing at Warn or above", logs.String())
+	}
+}
+
+// TestSignaturePolicyDistinguishesADifferentTrustSet pins what a policy
+// comparison has to notice, and it is not just "on or off": `agent plugins
+// reload` refuses to converge when the config's policy differs from the running
+// Loader's, and a comparison that looked only at Enforced (or only at the
+// number of keys) would call a ROTATED trust set unchanged -- quietly
+// converging new plugins against keys the operator has already retired.
+func TestSignaturePolicyDistinguishesADifferentTrustSet(t *testing.T) {
+	_, keyring := newTestKey(t)
+	_, rotated := newTestKeyWithID(t, sign.KeyID("rotated-key"))
+
+	if off := SignaturePolicyOf(nil); off.Enforced || len(off.KeyIDs) != 0 {
+		t.Errorf("SignaturePolicyOf(nil) = %+v, want the unenforced policy with no keys", off)
+	}
+	on := SignaturePolicyOf(keyring)
+	if !on.Enforced || len(on.KeyIDs) != 1 || on.KeyIDs[0] != testKeyID {
+		t.Fatalf("SignaturePolicyOf(keyring) = %+v, want it enforced over exactly %q", on, testKeyID)
+	}
+	if !on.Equal(SignaturePolicyOf(keyring)) {
+		t.Errorf("SignaturePolicyOf(keyring).Equal(itself) = false, want true")
+	}
+	if on.Equal(SignaturePolicyOf(nil)) {
+		t.Errorf("an enforcing policy compares equal to the unenforced one; reload would apply a policy change silently")
+	}
+	if on.Equal(SignaturePolicyOf(rotated)) {
+		t.Errorf("two trust sets of the same size but different key ids compare equal; a key rotation would look like no change")
+	}
+	if got := SignaturePolicyOf(rotated).String(); !strings.Contains(got, "rotated-key") {
+		t.Errorf("SignaturePolicy.String() = %q, want it to name the trusted key so a changed trust set is visible", got)
+	}
+	if got := SignaturePolicyOf(nil).String(); !strings.Contains(got, "not required") {
+		t.Errorf("SignaturePolicy.String() = %q, want it to say signatures are not required", got)
+	}
+}
+
+// TestLoaderReportsThePolicyItWasBuiltWith is the other end of that wire: the
+// policy a caller compares against has to be the one this Loader actually
+// verifies with, not a value stored beside it.
+func TestLoaderReportsThePolicyItWasBuiltWith(t *testing.T) {
+	_, keyring := newTestKey(t)
+	verifying := newHarnessWith(t, defaultTestApplyWait, keyring)
+
+	if got := verifying.loader.SignaturePolicy(); !got.Equal(SignaturePolicyOf(keyring)) {
+		t.Errorf("Loader.SignaturePolicy() = %+v, want the policy of the keyring it was built with %+v",
+			got, SignaturePolicyOf(keyring))
+	}
+
+	if got := newHarness(t).loader.SignaturePolicy(); got.Enforced {
+		t.Errorf("Loader.SignaturePolicy() = %+v for a Loader built with no keyring, want the unenforced policy", got)
 	}
 }

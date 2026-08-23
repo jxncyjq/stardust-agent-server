@@ -414,6 +414,85 @@ func New(cfg Config) (*Loader, error) {
 	}, nil
 }
 
+// SignaturePolicy is a Loader's signature-verification policy in comparable
+// form: whether a trust set is in force at all, and exactly which keys are in
+// it.
+//
+// It exists for one caller: a command that re-reads the deployment config
+// while a Loader is already running (`agent plugins reload` does) has to be
+// able to tell whether the policy it just read is the policy the running
+// Loader was BUILT with. The keyring is frozen when serve assembles the
+// Loader, so converging a new manifest without that comparison would apply the
+// operator's new manifest under their old trust set — a signature policy that
+// looks applied and is not.
+type SignaturePolicy struct {
+	// Enforced is whether this Loader verifies signatures at all. False is the
+	// deployment's deliberate "signatures are not required" statement, which
+	// is the only way a nil keyring may arise (see Config.Keyring).
+	Enforced bool
+
+	// KeyIDs are the ids of the trusted keys, sorted (sign.Keyring.IDs). It is
+	// empty exactly when Enforced is false: sign.ParseKeyring refuses an empty
+	// trust set, so an enforcing policy always names at least one key.
+	KeyIDs []sign.KeyID
+}
+
+// SignaturePolicyOf describes the policy a Loader built with keyring enforces.
+// A nil keyring — the one legitimate "this deployment does not require
+// signatures" value — is the unenforced policy.
+//
+// It is exported so that a caller which has resolved a keyring from a config
+// but has not built a Loader from it (reload does exactly that) computes the
+// policy through the same function Loader.SignaturePolicy uses, rather than
+// growing a second, drifting idea of what a policy is.
+func SignaturePolicyOf(keyring *sign.Keyring) SignaturePolicy {
+	if keyring == nil {
+		return SignaturePolicy{}
+	}
+	return SignaturePolicy{Enforced: true, KeyIDs: keyring.IDs()}
+}
+
+// Equal reports whether p and other are the same policy: the same enforcement
+// state over the same set of key ids. Key order does not matter in principle,
+// but both sides come from sign.Keyring.IDs, which sorts — so this compares
+// element by element rather than paying for a set.
+func (p SignaturePolicy) Equal(other SignaturePolicy) bool {
+	if p.Enforced != other.Enforced || len(p.KeyIDs) != len(other.KeyIDs) {
+		return false
+	}
+	for i, id := range p.KeyIDs {
+		if id != other.KeyIDs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// String renders p for an operator reading an error message: the enforcement
+// state first, because that is the part that decides whether anything is
+// checked at all, then the trusted key ids so a changed trust set is visible
+// rather than merely asserted.
+func (p SignaturePolicy) String() string {
+	if !p.Enforced {
+		return "signatures not required"
+	}
+	ids := make([]string, 0, len(p.KeyIDs))
+	for _, id := range p.KeyIDs {
+		ids = append(ids, string(id))
+	}
+	return fmt.Sprintf("signatures required, trusted keys [%s]", strings.Join(ids, " "))
+}
+
+// SignaturePolicy returns the policy this Loader is enforcing right now.
+//
+// No lock is taken: keyring is written once in New and never again, so there
+// is nothing here for a concurrent Apply to race with. The returned KeyIDs
+// slice is freshly built by sign.Keyring.IDs on every call, so a caller cannot
+// reach into the Loader's trust set through it.
+func (l *Loader) SignaturePolicy() SignaturePolicy {
+	return SignaturePolicyOf(l.keyring)
+}
+
 // Apply converges the running plugin set toward dep, resolving each entry's
 // Source against root.
 //
