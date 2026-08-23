@@ -60,6 +60,7 @@ import (
 	"github.com/stardust/legion-agent/internal/plugin/host"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
 	"github.com/stardust/legion-agent/internal/plugin/perm"
+	"github.com/stardust/legion-agent/internal/plugin/sign"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
@@ -169,10 +170,16 @@ const (
 	StateFailed = "failed"
 )
 
-// Config is everything a Loader needs. Every field except DeployLimits is
-// required; New reports a missing one by name rather than defaulting it,
-// because each missing field would turn into a nil dereference or a silently
-// unrecorded convergence at the first Apply.
+// Config is everything a Loader needs. Every field except DeployLimits and
+// Keyring is required; New reports a missing one by name rather than defaulting
+// it, because each missing field would turn into a nil dereference or a
+// silently unrecorded convergence at the first Apply.
+//
+// The two exceptions are exceptions for opposite reasons: a zero DeployLimits
+// is simply "this deployment sets no ceiling of its own", while a nil Keyring
+// is a POLICY STATEMENT ("this deployment does not require signatures") that
+// New cannot tell apart from a forgotten field — which is why the field's own
+// doc puts the burden of never letting nil arise by accident on the caller.
 type Config struct {
 	// Ledger is where every activation files its revocation handles, and what
 	// an unload disposes. It is the single source of "what is actually
@@ -227,6 +234,25 @@ type Config struct {
 	// expires, NOTHING is applied and the failure says how many tasks were in
 	// the way.
 	ApplyWait time.Duration
+
+	// Keyring is the deployment's trust set: the public keys a plugin
+	// package's detached signature (plugin.sig) must verify against before
+	// anything is mounted from it. It is handed to manifest.LoadPackage on
+	// every convergence.
+	//
+	// A nil Keyring means THIS DEPLOYMENT DOES NOT REQUIRE SIGNATURES, and it
+	// is the one field here whose absence is a legitimate configuration rather
+	// than a wiring mistake — which is exactly why it is dangerous, and why
+	// the caller that builds this Config must let nil arise ONLY from an
+	// explicit "not required" statement. A nil that arrived because a keyring
+	// file could not be read, or because a field was forgotten, is a security
+	// control that switched itself off while the logs looked normal; the
+	// assembly is required to fail loudly in those cases instead of passing
+	// nil (see cli.resolvePluginKeyring, the only place that decides this).
+	//
+	// nil does NOT relax manifest.LoadPackage's sha256 check, which runs
+	// either way.
+	Keyring *sign.Keyring
 
 	// DeployLimits is the deployment's resource ceiling, applied to every
 	// plugin by manifest.AssembleSpec (each limit is min(plugin's request,
@@ -333,6 +359,11 @@ type Loader struct {
 	gate         *taskgate.TaskGate
 	applyWait    time.Duration
 
+	// keyring is Config.Keyring, verbatim: the deployment's trust set, or nil
+	// when it has explicitly stated that it does not require signatures. See
+	// Config.Keyring for why nil may only ever mean that.
+	keyring *sign.Keyring
+
 	mu        sync.Mutex
 	instances map[string]*instance
 	failures  map[string]failure
@@ -367,6 +398,7 @@ func New(cfg Config) (*Loader, error) {
 		deployLimits: cfg.DeployLimits,
 		gate:         cfg.Gate,
 		applyWait:    cfg.ApplyWait,
+		keyring:      cfg.Keyring,
 		instances:    make(map[string]*instance),
 		failures:     make(map[string]failure),
 	}, nil
@@ -655,12 +687,14 @@ func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string)
 		return nil, l.fail(ctx, entry.Name, "", stepSource, err, nil)
 	}
 
-	// nil keyring: signature verification is off until the deployment policy
-	// that decides otherwise exists (it is A5a Task 3, which gives Config a
-	// Keyring and passes it here). nil means "this deployment does not require
-	// signatures" — it does NOT disable LoadPackage's sha256 check, which runs
-	// either way.
-	pm, wasm, err := manifest.LoadPackage(dir, nil)
+	// l.keyring is the deployment's trust set, or nil when the deployment has
+	// EXPLICITLY stated that it does not require signatures (Config.Keyring).
+	// Either way LoadPackage's sha256 check runs; a non-nil keyring adds the
+	// signature check, whose failure is an ordinary activation failure — it
+	// goes through l.fail like every other one, so the entry lands in
+	// StateFailed with a LastError naming the signature, and the other entries
+	// keep converging.
+	pm, wasm, err := manifest.LoadPackage(dir, l.keyring)
 	if err != nil {
 		return nil, l.fail(ctx, entry.Name, "", stepLoadPackage, err, nil)
 	}

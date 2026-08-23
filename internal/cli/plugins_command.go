@@ -22,6 +22,7 @@ import (
 	"github.com/stardust/legion-agent/internal/plugin/host"
 	"github.com/stardust/legion-agent/internal/plugin/loader"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
+	"github.com/stardust/legion-agent/internal/plugin/sign"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
@@ -242,6 +243,15 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 	identity := serveDefaultAgent()
 	logger := deps.Logger
 
+	// The trust set, or the deliberate nil that says this deployment does not
+	// require signatures. Anything else -- a keyring that would not read, a
+	// requirement with nothing to check against -- fails here rather than
+	// mounting plugins nobody verified.
+	keyring, err := resolvePluginKeyring(cfg.Plugins, logger)
+	if err != nil {
+		return nil, err
+	}
+
 	return loader.New(loader.Config{
 		Ledger: application.PluginLedger(),
 		Deps: func(name string, pluginConfig json.RawMessage) host.Deps {
@@ -268,7 +278,78 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 		},
 		Gate:      deps.Gate,
 		ApplyWait: time.Duration(cfg.Plugins.ApplyWaitMs) * time.Millisecond,
+		Keyring:   keyring,
 	})
+}
+
+// resolvePluginKeyring turns the deployment's signature POLICY into the trust
+// set the Loader will verify with, and is the only place a nil keyring may be
+// produced. Every caller that builds a loader.Config must obtain its Keyring
+// from here.
+//
+// The rules, and why each one fails loudly rather than degrading:
+//
+//   - A configured keyring path is always read and parsed, whatever the policy
+//     says. An unreadable or unparseable one fails assembly with the path
+//     named — the same "configured means you meant it" rule the manifest path
+//     follows. This is deliberately checked even when signatures are turned
+//     off: an operator who wrote down both a keyring and
+//     "require_signature": false wrote two contradictory things, and quietly
+//     dropping the broken file is exactly the silent degradation this whole
+//     control exists to prevent.
+//   - Signatures required (the default, see config.PluginsConfig.
+//     SignatureRequired) with NO keyring configured fails assembly. "Verify
+//     every package" with nothing to verify against is not a deployment worth
+//     starting, and the error names both ways out of it.
+//   - Signatures explicitly NOT required returns nil, and only then. nil is
+//     what tells manifest.LoadPackage to skip verification, so it must be
+//     reachable from one deliberate statement and from nothing else: not from
+//     a file that would not open, not from a forgotten field, not from an
+//     error someone decided to tolerate. A keyring that loaded fine is still
+//     dropped here — the policy, not the presence of a file, is what decides —
+//     and that is logged at Warn, because a deployment holding a trust set it
+//     does not enforce is worth seeing in the log.
+//
+// logger is required; a policy decision this consequential may not be made
+// silently.
+func resolvePluginKeyring(cfg config.PluginsConfig, logger *slog.Logger) (*sign.Keyring, error) {
+	if logger == nil {
+		return nil, errors.New("resolve plugin keyring: logger is nil; the signature policy would be decided with no record of it")
+	}
+	path := strings.TrimSpace(cfg.Keyring)
+	var keyring *sign.Keyring
+	if path != "" {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, fmt.Errorf("read plugin trust keyring %q: %w", path, err)
+		}
+		keyring, err = sign.ParseKeyring(data)
+		if err != nil {
+			return nil, fmt.Errorf("parse plugin trust keyring %q: %w", path, err)
+		}
+		if keyring == nil {
+			// sign.ParseKeyring's contract is a non-nil keyring on a nil
+			// error. A nil here would travel on as "signatures not required",
+			// so it is an invariant violation rather than a case to handle.
+			panic("cli: sign.ParseKeyring returned a nil keyring and a nil error")
+		}
+	}
+	if !cfg.SignatureRequired() {
+		if keyring != nil {
+			logger.Warn("plugin signature verification is off",
+				"component", "cli",
+				"keyring", path,
+				"consequence", "the configured trust set is loaded but nothing is verified against it",
+				"remedy", `remove "require_signature": false from the plugins config to enforce it`)
+		}
+		return nil, nil
+	}
+	if keyring == nil {
+		return nil, fmt.Errorf("plugins.keyring is not configured while plugin signatures are required: "+
+			"either configure a keyring of trusted public keys, or turn the requirement off explicitly with "+
+			`"require_signature": false in the plugins config (manifest %q)`, cfg.Manifest)
+	}
+	return keyring, nil
 }
 
 // readPluginDeployment reads and parses the deployment manifest at path. Both

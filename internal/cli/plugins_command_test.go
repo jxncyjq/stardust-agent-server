@@ -3,7 +3,9 @@ package cli
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -22,6 +24,7 @@ import (
 	"github.com/stardust/legion-agent/internal/config"
 	"github.com/stardust/legion-agent/internal/plugin/loader"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
+	"github.com/stardust/legion-agent/internal/plugin/sign"
 	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/toolauth"
 )
@@ -92,16 +95,11 @@ func newPluginFixture(t *testing.T, applyWaitMs int) *pluginFixture {
 		application:  app.New(),
 		gate:         taskgate.NewTaskGate(),
 	}
-	f.writeConfig(fmt.Sprintf(`{
-		"storage": {"driver": "memory"},
-		"context_files": {"root": %s},
-		"plugins": {
-			"manifest": %s,
-			"root": %s,
-			"limits": {"timeout_ms": 5000, "max_memory_pages": 64, "max_instances": 1},
-			"apply_wait_ms": %d
-		}
-	}`, jsonString(dir), jsonString(f.manifestPath), jsonString(f.root), applyWaitMs))
+	// The signature policy is written EXPLICITLY off: every test in this file
+	// but the signature ones is about something else, and an absent
+	// require_signature means "required" (config.PluginsConfig), which would
+	// make each of them fail assembly on a keyring it never meant to configure.
+	f.writeSignatureConfig(applyWaitMs, signaturePolicy{requireSignature: boolPtr(false)})
 
 	t.Cleanup(func() {
 		ledger := f.application.PluginLedger()
@@ -112,6 +110,100 @@ func newPluginFixture(t *testing.T, applyWaitMs int) *pluginFixture {
 		}
 	})
 	return f
+}
+
+// signaturePolicy is the plugins-section signature policy a fixture writes into
+// its agent.json. A nil requireSignature omits the key entirely, which is how a
+// test exercises the DEFAULT rather than a value it wrote down; an empty
+// keyring omits that key the same way.
+type signaturePolicy struct {
+	keyring          string
+	requireSignature *bool
+}
+
+// boolPtr is the one-line spelling of an explicitly-written JSON boolean.
+func boolPtr(v bool) *bool { return &v }
+
+// writeSignatureConfig rewrites the fixture's agent.json with the given
+// signature policy, leaving every other plugin setting as newPluginFixture
+// wrote it.
+func (f *pluginFixture) writeSignatureConfig(applyWaitMs int, policy signaturePolicy) {
+	f.t.Helper()
+
+	settings := []string{
+		fmt.Sprintf("\"manifest\": %s", jsonString(f.manifestPath)),
+		fmt.Sprintf("\"root\": %s", jsonString(f.root)),
+		`"limits": {"timeout_ms": 5000, "max_memory_pages": 64, "max_instances": 1}`,
+		fmt.Sprintf(`"apply_wait_ms": %d`, applyWaitMs),
+	}
+	if policy.keyring != "" {
+		settings = append(settings, fmt.Sprintf("\"keyring\": %s", jsonString(policy.keyring)))
+	}
+	if policy.requireSignature != nil {
+		settings = append(settings, fmt.Sprintf(`"require_signature": %t`, *policy.requireSignature))
+	}
+	f.writeConfig(fmt.Sprintf(`{
+		"storage": {"driver": "memory"},
+		"context_files": {"root": %s},
+		"plugins": {%s}
+	}`, jsonString(f.dir), strings.Join(settings, ", ")))
+}
+
+// testPluginKeyID is the key id every signed fixture package in this file is
+// signed and trusted under.
+const testPluginKeyID = sign.KeyID("fixture-key")
+
+// newKeyring mints a key pair, writes a keyring document trusting its public
+// half into the fixture directory, and returns the private key and that file's
+// path. The private key is generated per test and never written to disk:
+// committing one -- even a test one -- trains the wrong habit.
+func (f *pluginFixture) newKeyring(name string) (ed25519.PrivateKey, string) {
+	f.t.Helper()
+
+	pub, priv, err := sign.GenerateKey()
+	if err != nil {
+		f.t.Fatalf("GenerateKey: %v", err)
+	}
+	data, err := json.Marshal(map[string]any{"keys": []map[string]string{{
+		"id":         string(testPluginKeyID),
+		"algorithm":  "ed25519",
+		"public_key": base64.StdEncoding.EncodeToString(pub),
+	}}})
+	if err != nil {
+		f.t.Fatalf("encode keyring: %v", err)
+	}
+	path := filepath.Join(f.dir, name)
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		f.t.Fatalf("write keyring %s: %v", path, err)
+	}
+	return priv, path
+}
+
+// signPackage signs the raw bytes of one package's plugin.json and writes
+// plugin.sig beside it, which is what the loader verifies.
+func (f *pluginFixture) signPackage(source string, priv ed25519.PrivateKey) {
+	f.t.Helper()
+
+	dir := filepath.Join(f.root, source)
+	manifestData, err := os.ReadFile(filepath.Join(dir, "plugin.json"))
+	if err != nil {
+		f.t.Fatalf("read plugin.json in %s: %v", dir, err)
+	}
+	sig, err := sign.Sign(priv, testPluginKeyID, manifestData)
+	if err != nil {
+		f.t.Fatalf("sign plugin.json in %s: %v", dir, err)
+	}
+	doc, err := json.Marshal(map[string]string{
+		"key_id":    string(sig.KeyID),
+		"algorithm": sig.Algorithm,
+		"signature": base64.StdEncoding.EncodeToString(sig.Value),
+	})
+	if err != nil {
+		f.t.Fatalf("encode plugin.sig for %s: %v", dir, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "plugin.sig"), doc, 0o644); err != nil {
+		f.t.Fatalf("write plugin.sig in %s: %v", dir, err)
+	}
 }
 
 // jsonString quotes s as a JSON string literal, so a Windows temp path's
@@ -1006,6 +1098,7 @@ func TestPluginsResolveRelativePathsAgainstTheProcessWorkingDirectory(t *testing
 		"plugins": {
 			"manifest": "plugins.json",
 			"root": "plugins",
+			"require_signature": false,
 			"limits": {"timeout_ms": 5000, "max_memory_pages": 64, "max_instances": 1},
 			"apply_wait_ms": 30000
 		}
@@ -1393,5 +1486,178 @@ func TestSuspendedWaitingOnNamesEveryUnresolvedTool(t *testing.T) {
 		testMissingRequiredTool, testProxyTool, testProxyPlugin, loader.StateSuspended)
 	if got != want {
 		t.Errorf("suspendedWaitingOn() = %q, want %q", got, want)
+	}
+}
+
+// TestAssemblePluginsRefusesRequiredSignaturesWithNoKeyring is the policy's
+// central rule. "Signatures are required" and "there is no trust set" is not a
+// runnable deployment: it would either refuse every plugin or, far worse,
+// quietly verify nothing. Serve does not start, and the error names both ways
+// out.
+func TestAssemblePluginsRefusesRequiredSignaturesWithNoKeyring(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	// No keyring, and no require_signature either: the absent setting is the
+	// strict one, so this config demands signatures it cannot check.
+	f.writeSignatureConfig(30_000, signaturePolicy{})
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+
+	err := f.assemble()
+	if err == nil {
+		t.Fatal("assemblePlugins() error = nil, want an error: signatures are required with no keyring configured")
+	}
+	if !strings.Contains(err.Error(), "plugins.keyring") {
+		t.Errorf("assemblePlugins() error = %v, want it to name plugins.keyring", err)
+	}
+	if !strings.Contains(err.Error(), "require_signature") {
+		t.Errorf("assemblePlugins() error = %v, want it to name the setting that turns the requirement off", err)
+	}
+	if toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = true, want false: nothing may mount from a refused assembly", testEchoTool)
+	}
+}
+
+// TestAssemblePluginsFailsWhenTheKeyringCannotBeRead is the anti-degradation
+// rule: a keyring that cannot be read must NOT become "no keyring", which the
+// loader would read as "this deployment does not require signatures". A
+// security control that switches itself off when its own configuration breaks
+// is worse than none, because the logs look normal.
+func TestAssemblePluginsFailsWhenTheKeyringCannotBeRead(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	missing := filepath.Join(f.dir, "no-such-keyring.json")
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: missing})
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+
+	err := f.assemble()
+	if err == nil {
+		t.Fatal("assemblePlugins() error = nil, want an error: the configured keyring does not exist")
+	}
+	if !strings.Contains(err.Error(), missing) {
+		t.Errorf("assemblePlugins() error = %v, want it to name the keyring path %s", err, missing)
+	}
+	if toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = true, want false: nothing may mount from a refused assembly", testEchoTool)
+	}
+}
+
+// TestAssemblePluginsFailsWhenTheKeyringIsUnparseable is the same rule one step
+// later: a keyring file that exists but is not a keyring is a broken trust set,
+// not an absent one.
+func TestAssemblePluginsFailsWhenTheKeyringIsUnparseable(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	broken := filepath.Join(f.dir, "keyring.json")
+	if err := os.WriteFile(broken, []byte("{not json"), 0o600); err != nil {
+		t.Fatalf("write keyring %s: %v", broken, err)
+	}
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: broken})
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+
+	err := f.assemble()
+	if err == nil {
+		t.Fatal("assemblePlugins() error = nil, want an error: the configured keyring does not parse")
+	}
+	// %q-quoted, which is how the wrapper renders it -- on Windows that means
+	// escaped separators, so the raw path is not a substring of the message.
+	if !strings.Contains(err.Error(), fmt.Sprintf("%q", broken)) {
+		t.Errorf("assemblePlugins() error = %v, want it to name the keyring path %s", err, broken)
+	}
+	if !strings.Contains(err.Error(), "parse") {
+		t.Errorf("assemblePlugins() error = %v, want it to say the keyring could not be parsed", err)
+	}
+	if toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = true, want false: nothing may mount from a refused assembly", testEchoTool)
+	}
+}
+
+// TestAssemblePluginsFailsOnAnUnreadableKeyringEvenWithSignaturesOff pins the
+// "configured means you meant it" rule the manifest path already follows. An
+// operator who both named a keyring and turned signatures off wrote down two
+// contradictory things; the broken file is reported rather than skipped,
+// because skipping it is exactly the silent degradation this task exists to
+// prevent.
+func TestAssemblePluginsFailsOnAnUnreadableKeyringEvenWithSignaturesOff(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	missing := filepath.Join(f.dir, "no-such-keyring.json")
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: missing, requireSignature: boolPtr(false)})
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+
+	err := f.assemble()
+	if err == nil {
+		t.Fatal("assemblePlugins() error = nil, want an error: a configured keyring that cannot be read is never silently dropped")
+	}
+	if !strings.Contains(err.Error(), missing) {
+		t.Errorf("assemblePlugins() error = %v, want it to name the keyring path %s", err, missing)
+	}
+}
+
+// TestAssemblePluginsMountsASignedPackageUnderTheDefaultPolicy is the
+// end-to-end positive: a config that says nothing about signatures verifies
+// them, and a properly signed package mounts through the real assembly.
+func TestAssemblePluginsMountsASignedPackageUnderTheDefaultPolicy(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	priv, keyringPath := f.newKeyring("keyring.json")
+	// requireSignature is left unwritten on purpose: the default is strict.
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath})
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.signPackage("echo", priv)
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = false, want true: a signed package must mount", testEchoTool)
+	}
+}
+
+// TestPluginsStatusReportsASignatureFailureWhereAnOperatorLooks pins rule 4 at
+// the surface an operator actually reads: a package that fails verification is
+// a FAILED entry -- no new state -- whose LastError says it was the signature,
+// and startup carries on.
+func TestPluginsStatusReportsASignatureFailureWhereAnOperatorLooks(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	_, keyringPath := f.newKeyring("keyring.json")
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath})
+	// Written but never signed.
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil (a failed entry must not stop startup)", err)
+	}
+
+	out, err := f.run("status")
+	if err != nil {
+		t.Fatalf("plugins status error = %v, want nil", err)
+	}
+	if !strings.Contains(out, "failed") {
+		t.Fatalf("plugins status output = %q, want the entry reported as failed", out)
+	}
+	if !strings.Contains(out, "plugin.sig") {
+		t.Errorf("plugins status output = %q, want the failure to say it was the signature", out)
+	}
+	if toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = true, want false: an unverified plugin contributes nothing", testEchoTool)
+	}
+}
+
+// TestAssemblePluginsSkipsVerificationWhenSignaturesAreExplicitlyOff is the
+// only door to a nil keyring, and it is guarded here: an unsigned package
+// mounts, but only because the config says in so many words that this
+// deployment does not require signatures.
+func TestAssemblePluginsSkipsVerificationWhenSignaturesAreExplicitlyOff(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writeSignatureConfig(30_000, signaturePolicy{requireSignature: boolPtr(false)})
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil: signatures are explicitly not required", err)
+	}
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = false, want true: an unsigned package mounts where signatures are off", testEchoTool)
 	}
 }

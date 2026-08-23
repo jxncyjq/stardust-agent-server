@@ -650,3 +650,81 @@ func TestBrowserSnapshotDefaults(t *testing.T) {
 		t.Fatalf("SnapshotTTLHours = %d, want 24", cfg.Browser.SnapshotTTLHours)
 	}
 }
+
+// TestLoadPluginsSignaturePolicyDefaultsToRequired pins the safe side of the
+// signature switch: a plugins section that says nothing about signatures
+// REQUIRES them. A security control whose absent setting meant "off" would be
+// off in every deployment that never heard of it.
+func TestLoadPluginsSignaturePolicyDefaultsToRequired(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(path, []byte(`{
+		"plugins": {
+			"manifest": "plugins.json",
+			"root": "plugins",
+			"keyring": "keyring.json",
+			"limits": {"timeout_ms": 1000},
+			"apply_wait_ms": 1000
+		}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", path, err)
+	}
+
+	cfg, err := Load(context.Background(), Options{Path: path})
+	if err != nil {
+		t.Fatalf("Load(%q) error = %v, want nil", path, err)
+	}
+	if !cfg.Plugins.SignatureRequired() {
+		t.Errorf("Load(%q).Plugins.SignatureRequired() = false, want true: an absent require_signature must mean strict", path)
+	}
+	if cfg.Plugins.RequireSignature == nil {
+		t.Fatalf("Load(%q).Plugins.RequireSignature = nil, want a normalized pointer: Load must state the policy explicitly", path)
+	}
+	if !*cfg.Plugins.RequireSignature {
+		t.Errorf("Load(%q).Plugins.RequireSignature = %t, want true", path, *cfg.Plugins.RequireSignature)
+	}
+	if cfg.Plugins.Keyring != "keyring.json" {
+		t.Errorf("Load(%q).Plugins.Keyring = %q, want keyring.json", path, cfg.Plugins.Keyring)
+	}
+}
+
+// TestLoadPluginsSignatureCanBeTurnedOffExplicitly is the other half of the
+// same rule: "off" is reachable, but only by writing it down.
+func TestLoadPluginsSignatureCanBeTurnedOffExplicitly(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(path, []byte(`{
+		"plugins": {
+			"manifest": "plugins.json",
+			"root": "plugins",
+			"require_signature": false,
+			"limits": {"timeout_ms": 1000},
+			"apply_wait_ms": 1000
+		}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", path, err)
+	}
+
+	cfg, err := Load(context.Background(), Options{Path: path})
+	if err != nil {
+		t.Fatalf("Load(%q) error = %v, want nil", path, err)
+	}
+	if cfg.Plugins.SignatureRequired() {
+		t.Errorf("Load(%q).Plugins.SignatureRequired() = true, want false: an explicit require_signature:false must be honored", path)
+	}
+	if cfg.Plugins.RequireSignature == nil || *cfg.Plugins.RequireSignature {
+		t.Errorf("Load(%q).Plugins.RequireSignature = %v, want a pointer to false", path, cfg.Plugins.RequireSignature)
+	}
+}
+
+// TestPluginsConfigZeroValueRequiresSignature covers the path Load does not
+// travel: a PluginsConfig built as a struct literal (an embedder's, a test's)
+// has a nil RequireSignature, and nil must read as strict there too. If the
+// zero value read as "off", every config assembled without Load would silently
+// stop verifying signatures.
+func TestPluginsConfigZeroValueRequiresSignature(t *testing.T) {
+	t.Parallel()
+	if !(PluginsConfig{}).SignatureRequired() {
+		t.Error("PluginsConfig{}.SignatureRequired() = false, want true: an unstated policy is the strict one")
+	}
+}
