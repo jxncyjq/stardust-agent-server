@@ -390,6 +390,16 @@ func New(cfg Config) (*Loader, error) {
 		return nil, fmt.Errorf("new plugin loader: Config.ApplyWait is %s; it must be positive, "+
 			"since an apply that waits forever for a task boundary holds the gate shut against every new task", cfg.ApplyWait)
 	}
+	if cfg.Keyring == nil {
+		// The one state this constructor cannot tell apart from a mistake, said
+		// out loud once per Loader. A deployment that verifies nothing is a
+		// legitimate choice; a deployment that verifies nothing because a field
+		// was forgotten looks exactly the same from in here, and the difference
+		// has to be visible somewhere an operator can find it.
+		cfg.Logger.Warn("plugin signature verification is disabled",
+			"component", "plugin-loader",
+			"consequence", "packages are accepted on their sha256 alone, which travels inside the very manifest it describes")
+	}
 	return &Loader{
 		ledger:       cfg.Ledger,
 		deps:         cfg.Deps,

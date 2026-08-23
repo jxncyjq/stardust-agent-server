@@ -1,12 +1,14 @@
 package loader
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -247,5 +249,47 @@ func TestApplyStillChecksTheDigestWithoutAKeyring(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "sha256") {
 		t.Errorf("Apply() error = %v, want it to name the sha256 mismatch", err)
+	}
+}
+
+// TestNewSaysSoWhenItIsBuiltWithoutAKeyring pins the one thing New cannot
+// check. A nil Keyring is a legitimate policy and a forgotten field at the same
+// time, and they are indistinguishable from inside the constructor -- so the
+// state that verifies nothing is announced once, at Warn, rather than being the
+// quiet default it would otherwise be.
+func TestNewSaysSoWhenItIsBuiltWithoutAKeyring(t *testing.T) {
+	h := newHarness(t)
+	logs := &bytes.Buffer{}
+	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	if _, err := New(Config{
+		Ledger:    h.ledger,
+		Deps:      h.deps,
+		Events:    h.events,
+		Logger:    logger,
+		Gate:      h.gate,
+		ApplyWait: defaultTestApplyWait,
+	}); err != nil {
+		t.Fatalf("New() error = %v, want nil: a nil Keyring is a policy, not a wiring error", err)
+	}
+	if !strings.Contains(logs.String(), "signature verification is disabled") {
+		t.Errorf("New() log = %q, want it to say signature verification is off", logs.String())
+	}
+
+	logs.Reset()
+	_, keyring := newTestKey(t)
+	if _, err := New(Config{
+		Ledger:    h.ledger,
+		Deps:      h.deps,
+		Events:    h.events,
+		Logger:    logger,
+		Gate:      h.gate,
+		ApplyWait: defaultTestApplyWait,
+		Keyring:   keyring,
+	}); err != nil {
+		t.Fatalf("New() error = %v, want nil", err)
+	}
+	if logs.Len() != 0 {
+		t.Errorf("New() with a keyring logged %q, want nothing at Warn or above", logs.String())
 	}
 }
