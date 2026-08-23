@@ -3,7 +3,9 @@ package manifest
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
@@ -120,16 +122,27 @@ func LoadPackage(dir string, keyring *sign.Keyring) (PluginManifest, []byte, err
 // verifyManifestSignature reads dir/plugin.sig and checks it against keyring
 // over manifestData — plugin.json's raw bytes, exactly as read from disk.
 //
-// A missing, malformed, untrusted or non-verifying plugin.sig is an error
-// naming which of those it was; none of them is ever answered with a zero
-// value or a skipped package, because "this package has no valid signature"
-// and "this deployment does not require signatures" must never be the same
-// outcome. The second is expressed only by LoadPackage's caller passing a
-// nil keyring, in which case this function is not called at all.
+// A missing, unreadable, malformed, untrusted or non-verifying plugin.sig is
+// an error naming which of those it was; none of them is ever answered with
+// a zero value or a skipped package, because "this package has no valid
+// signature" and "this deployment does not require signatures" must never be
+// the same outcome. The second is expressed only by LoadPackage's caller
+// passing a nil keyring, in which case this function is not called at all.
+//
+// The missing case (fs.ErrNotExist) is reported with its own wording,
+// distinct from an unreadable-but-present plugin.sig (a permission error, or
+// plugin.sig existing as something other than a regular file): the two are
+// deliberately kept apart so that a future caller can never key on
+// errors.Is(err, fs.ErrNotExist) — which is otherwise also true for a
+// missing plugin.json or plugin.wasm — and downgrade "no signature" into
+// "package not present, skip it".
 func verifyManifestSignature(dir string, manifestData []byte, keyring *sign.Keyring) error {
 	sigPath := filepath.Join(dir, "plugin.sig")
 	sigData, err := os.ReadFile(sigPath)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("plugin.sig is missing: this deployment requires a signed package: %w", err)
+		}
 		return fmt.Errorf("read plugin.sig: %w", err)
 	}
 	sig, err := sign.ParseSignature(sigData)

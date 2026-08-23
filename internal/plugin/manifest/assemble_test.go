@@ -8,6 +8,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -649,7 +650,37 @@ func TestLoadPackage_MissingSignatureWithKeyring(t *testing.T) {
 	if err == nil {
 		t.Fatal("LoadPackage: want an error for a package with no plugin.sig, got nil")
 	}
-	requireErrorContains(t, err, "plugin.sig")
+	// The missing case has its own wording, distinct from an
+	// unreadable-but-present plugin.sig (see
+	// TestLoadPackage_UnreadableSignatureFile) — a future caller must never
+	// be able to key on "not exist" and treat it as "package absent, skip".
+	requireErrorContains(t, err, "plugin.sig is missing")
+}
+
+// TestLoadPackage_UnreadableSignatureFile pins the missing/unreadable
+// distinction from the other side: a plugin.sig that exists but cannot be
+// read as a regular file (here, it exists as a directory) must be reported
+// with the generic "read plugin.sig" wording, never the "is missing" wording
+// that fs.ErrNotExist gets — the two failure modes must stay
+// distinguishable, and neither may claim the package has no signature.
+func TestLoadPackage_UnreadableSignatureFile(t *testing.T) {
+	dir, kr := signedPackage(t)
+	if err := os.Remove(filepath.Join(dir, "plugin.sig")); err != nil {
+		t.Fatalf("remove plugin.sig: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "plugin.sig"), 0o755); err != nil {
+		t.Fatalf("mkdir plugin.sig: %v", err)
+	}
+
+	_, _, err := LoadPackage(dir, kr)
+	if err == nil {
+		t.Fatal("LoadPackage: want an error for a plugin.sig that exists but cannot be read, got nil")
+	}
+	requireErrorContains(t, err, "read plugin.sig")
+	if strings.Contains(err.Error(), "is missing") {
+		t.Errorf("error %q says plugin.sig is missing, but plugin.sig exists (as a directory); "+
+			"the missing and unreadable cases must say different things", err)
+	}
 }
 
 func TestLoadPackage_SignatureAlteredByOneByte(t *testing.T) {
@@ -690,6 +721,35 @@ func TestLoadPackage_SignedByUntrustedKey(t *testing.T) {
 	}
 	requireErrorContains(t, err, "attacker-2027")
 	requireErrorContains(t, err, "not in the keyring")
+}
+
+// TestLoadPackage_ImpersonationWithTrustedKeyID covers the attack shape
+// TestLoadPackage_SignedByUntrustedKey does not: there, the key id itself is
+// untrusted, so refusal comes from sign.Keyring.Verify's unknown-id branch.
+// Here an attacker who holds no trusted key signs with their OWN key but
+// labels the signature with a key_id the keyring DOES trust ("ops-2026"),
+// hoping the id alone is enough. It is not: Verify resolves the named id to
+// its one trusted public key and checks strictly against that key, so this
+// must be refused by the cryptographic branch — the same one
+// TestLoadPackage_SignatureAlteredByOneByte exercises — giving Task 1's
+// "Verify never iterates keys hoping one works" guarantee a package-level
+// witness for the impersonation case specifically, not just bit-flip.
+func TestLoadPackage_ImpersonationWithTrustedKeyID(t *testing.T) {
+	dir, kr := signedPackage(t)
+	// A second, real key pair the keyring does not trust.
+	_, attackerPriv := newKeyring(t, "attacker-2027")
+	manifestData := mustReadFixture(t, "pkg/plugin.json")
+	// Sign with the attacker's own key, but claim the id "ops-2026" — the
+	// one key signedPackage's keyring actually trusts.
+	writeSignature(t, dir, attackerPriv, "ops-2026", manifestData)
+
+	_, _, err := LoadPackage(dir, kr)
+	if err == nil {
+		t.Fatal("LoadPackage: want an error for a signature made by an untrusted key but labeled " +
+			"with a trusted key id, got nil")
+	}
+	requireErrorContains(t, err, "does not verify")
+	requireErrorContains(t, err, "ops-2026")
 }
 
 // TestLoadPackage_ManifestAlteredByOneByte is the reason the whole mechanism
@@ -781,4 +841,26 @@ func TestLoadPackage_MalformedSignatureDocument(t *testing.T) {
 		t.Fatal("LoadPackage: want an error for a malformed plugin.sig, got nil")
 	}
 	requireErrorContains(t, err, "parse plugin.sig")
+}
+
+// TestLoadPackage_EmptySignatureFile pins that a zero-byte plugin.sig is
+// refused the same way any other malformed document is (sign.ParseSignature
+// sees io.EOF from json.Decoder), and — more importantly — that it is NOT
+// treated the same as a missing plugin.sig: the file is present, so this
+// must go through verifyManifestSignature's parse failure, never through the
+// fs.ErrNotExist branch os.ReadFile would take for a genuinely absent file.
+func TestLoadPackage_EmptySignatureFile(t *testing.T) {
+	dir, kr := signedPackage(t)
+	if err := os.WriteFile(filepath.Join(dir, "plugin.sig"), []byte{}, 0o644); err != nil {
+		t.Fatalf("truncate plugin.sig: %v", err)
+	}
+
+	_, _, err := LoadPackage(dir, kr)
+	if err == nil {
+		t.Fatal("LoadPackage: want an error for a zero-byte plugin.sig, got nil")
+	}
+	requireErrorContains(t, err, "parse plugin.sig")
+	if strings.Contains(err.Error(), "is missing") {
+		t.Errorf("error %q says plugin.sig is missing, but an empty file is not the same as no file", err)
+	}
 }
