@@ -446,12 +446,19 @@ func mergePluginStatus(deployment manifest.Deployment, statuses []loader.Instanc
 		switch {
 		case known && st.State == loader.StateFailed:
 			row.Detail = detailFor("error", st.LastError)
+		case known && st.State == loader.StateSuspended:
+			// Checked before the disabled-but-known case below, the same way
+			// StateFailed already is: "status" re-reads the manifest from disk on
+			// every call, independently of the loader's live state, so a plugin
+			// that is mounted-and-suspended with a stale (not yet reloaded)
+			// "enabled": false in the manifest is fully reachable. Its waiting_on=
+			// explanation must not be replaced by the disabled reason below —
+			// that is the entire reason SuspendedBy exists.
+			row.Detail = suspendedRowDetail(st, providerOf, byName)
 		case known && !entry.Enabled:
 			// Mounted, but the file says it should not be. The manifest changed
 			// under a running deployment and nobody has reloaded yet.
 			row.Detail = detailFor("reason", `the manifest now sets "enabled": false; run "agent plugins reload" to unmount it`)
-		case known && st.State == loader.StateSuspended:
-			row.Detail = suspendedRowDetail(st, providerOf, byName)
 		case known:
 			row.Detail = detailFor("error", st.LastError)
 		case !entry.Enabled:
@@ -606,9 +613,19 @@ func writePluginStatus(w io.Writer, manifestPath, root string, rows []pluginStat
 		versionWidth = max(versionWidth, utf8.RuneCountInString(pluginRowVersion(row)))
 	}
 	for _, row := range rows {
-		line := fmt.Sprintf("  %s  %s  version=%s  tools=[%s]",
+		// A suspended row's Tools names what the instance WOULD contribute once
+		// unblocked (loader.InstanceStatus.Tools's own doc comment), not what it
+		// is serving right now — nothing is, the tools are withdrawn for as long
+		// as the plugin stays suspended. Marking that inline keeps a reader who
+		// scans only the tools= column from mistaking a suspended plugin for an
+		// active provider of the names it lists.
+		toolsSuffix := ""
+		if row.State == loader.StateSuspended && len(row.Tools) > 0 {
+			toolsSuffix = "(withdrawn)"
+		}
+		line := fmt.Sprintf("  %s  %s  version=%s  tools=[%s]%s",
 			padRunes(row.Name, nameWidth), padRunes(row.State, stateWidth),
-			padRunes(pluginRowVersion(row), versionWidth), strings.Join(row.Tools, " "))
+			padRunes(pluginRowVersion(row), versionWidth), strings.Join(row.Tools, " "), toolsSuffix)
 		if row.Detail != "" {
 			line += "  " + row.Detail
 		}
