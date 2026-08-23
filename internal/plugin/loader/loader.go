@@ -580,12 +580,19 @@ func (l *Loader) Status() []InstanceStatus {
 	defer l.mu.Unlock()
 
 	out := make([]InstanceStatus, 0, len(l.instances)+len(l.failures))
-	for _, inst := range l.instances {
+	for name := range l.instances {
+		// Read through mounted so an instance with no host.Plugin behind it
+		// trips the same invariant here as it does in the convergence, instead
+		// of being reported as a healthy "loaded": a status that answers
+		// "everything is fine" for a half-built instance is worse than no
+		// status at all, and the two call sites must not disagree about what a
+		// mounted plugin is.
+		inst := l.mounted(name)
 		// The plugin itself is the authority on whether its contributions are
 		// currently withdrawn; the Loader's own note only says why.
 		state := StateLoaded
 		var suspendedBy []string
-		if inst.plugin != nil && inst.plugin.Suspended() {
+		if inst.plugin.Suspended() {
 			state = StateSuspended
 			suspendedBy = append([]string(nil), inst.suspendedBy...)
 		}

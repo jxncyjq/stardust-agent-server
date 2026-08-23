@@ -139,6 +139,16 @@ func (l *Loader) convergeDependencies(ctx context.Context) error {
 		}
 		if err := l.resume(ctx, inst); err != nil {
 			errs = append(errs, err)
+			// The graph just said every requirement resolves, so whatever the
+			// PREVIOUS convergence blamed this suspension on is no longer true
+			// — leaving it there would have Status name a dependency that is
+			// back. The honest answer is the live one: the requirements its own
+			// registry still does not hold, which is empty whenever the resume
+			// failed for a reason that is not a missing dependency at all (a
+			// tool name taken by somebody else, say). Empty is the right
+			// diagnosis then: nothing it requires is missing, and LastError —
+			// which resume has just written — is what says why it is still down.
+			inst.suspendedBy = inst.unregisteredRequires()
 			continue
 		}
 		inst.suspendedBy = nil
@@ -146,13 +156,14 @@ func (l *Loader) convergeDependencies(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
-// mounted returns the instance registered under name, which every caller in
-// this file has just read out of l.instances' own key set. A missing one is a
-// bookkeeping bug in this package, not a state a deployment can produce, and
-// so is an instance with no host.Plugin behind it: every path that puts an
-// instance into l.instances (activate, restore) has one. Either would otherwise
-// surface as a nil dereference several frames away from the mistake. It is
-// called with l.mu held.
+// mounted returns the instance registered under name, which every caller has
+// just read out of l.instances' own key set (the convergence here, and Status).
+// A missing one is a bookkeeping bug in this package, not a state a deployment
+// can produce, and so is an instance with no host.Plugin behind it: every path
+// that puts an instance into l.instances (activate, restore) has one. Either
+// would otherwise surface as a nil dereference several frames away from the
+// mistake — or, worse, as a status row calling a half-built instance healthy.
+// It is called with l.mu held.
 func (l *Loader) mounted(name string) *instance {
 	inst, ok := l.instances[name]
 	if !ok {

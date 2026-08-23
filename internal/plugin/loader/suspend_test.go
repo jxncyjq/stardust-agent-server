@@ -53,6 +53,41 @@ const (
 	depCToolName   = "dep_c_tool"
 )
 
+// hostBuiltinToolName is a tool registered straight on the harness registry,
+// belonging to no plugin at all. It stands in for what a "requires" entry names
+// in almost every real deployment: one of the HOST's own tools, which no
+// plugin's suspension can take away and which therefore has to resolve through
+// externalToolNames rather than through the dependency graph.
+const hostBuiltinToolName = "host_builtin_tool"
+
+// The plugin that requires nothing but hostBuiltinToolName. Its names are kept
+// short because patchIdentity has to fit them into a fixed-length literal.
+const (
+	builtinDepPluginName = "hostdep-plugin"
+	builtinDepToolName   = "hostdep_tool"
+)
+
+// The three plugins the mid-chain resume-failure test deploys. They are a
+// second, SHORTER-named chain rather than the dep-* one because its middle
+// plugin has to provide TWO tools — one that the chain depends on and one a
+// squatter can take — and patchIdentity's fixed-length budget cannot hold two
+// tool names next to a name as long as "dep-b-plugin".
+//
+//	mid-a  provides ma_tool, requires nothing
+//	mid-b  provides mb_tool and mb_aux, requires ma_tool
+//	mid-c  provides mc_tool, requires mb_tool
+const (
+	midAPluginName = "mid-a"
+	midAToolName   = "ma_tool"
+
+	midBPluginName = "mid-b"
+	midBToolName   = "mb_tool"
+	midBAuxName    = "mb_aux"
+
+	midCPluginName = "mid-c"
+	midCToolName   = "mc_tool"
+)
+
 // echoIdentity is the self-description plugin.wasm answers abi.OpManifest
 // with, byte for byte (see internal/plugin/host/testdata/README.md). It is
 // spelled here so a rebuilt fixture that changed one character fails
@@ -61,8 +96,8 @@ const (
 const echoIdentity = `{"name":"legion-test-plugin","version":"0.1.0","provides":["echo_tool"]}`
 
 // patchIdentity returns plugin.wasm with the identity it answers
-// abi.OpManifest with rewritten to name and toolName, so this package can
-// mount THREE distinct plugins from the two guest binaries the repository
+// abi.OpManifest with rewritten to name and toolNames, so this package can
+// mount SEVERAL distinct plugins from the two guest binaries the repository
 // commits.
 //
 // It is needed because host.Activate cross-checks a Spec against the guest's
@@ -84,8 +119,13 @@ const echoIdentity = `{"name":"legion-test-plugin","version":"0.1.0","provides":
 // This is the same kind of surgical fixture edit appendCustomSection performs;
 // like it, it never touches the committed file, only the bytes a test writes
 // into its own temp directory.
-func patchIdentity(t *testing.T, name, toolName string) []byte {
+func patchIdentity(t *testing.T, name string, toolNames ...string) []byte {
 	t.Helper()
+
+	if len(toolNames) == 0 {
+		t.Fatalf("patchIdentity: plugin %q was given no tool names; a guest that provides nothing "+
+			"cannot back any deployment entry this package writes", name)
+	}
 
 	wasm := fixtureWasm(t, echoWasmFile)
 	old := []byte(echoIdentity)
@@ -95,11 +135,15 @@ func patchIdentity(t *testing.T, name, toolName string) []byte {
 			echoWasmFile, echoIdentity, count)
 	}
 
-	body := fmt.Sprintf(`{"name":%q,"version":"0.1.0","provides":[%q]`, name, toolName)
+	quoted := make([]string, 0, len(toolNames))
+	for _, toolName := range toolNames {
+		quoted = append(quoted, fmt.Sprintf("%q", toolName))
+	}
+	body := fmt.Sprintf(`{"name":%q,"version":"0.1.0","provides":[%s]`, name, strings.Join(quoted, ","))
 	padding := len(old) - len(body) - len("}")
 	if padding < 0 {
-		t.Fatalf("patchIdentity: identity for plugin %q / tool %q is %d bytes too long for the %d-byte "+
-			"literal it replaces; pick shorter names", name, toolName, -padding, len(old))
+		t.Fatalf("patchIdentity: identity for plugin %q / tools %v is %d bytes too long for the %d-byte "+
+			"literal it replaces; pick shorter names", name, toolNames, -padding, len(old))
 	}
 	replacement := make([]byte, 0, len(old))
 	replacement = append(replacement, body...)
@@ -118,14 +162,36 @@ func patchIdentity(t *testing.T, name, toolName string) []byte {
 func (h *harness) writeDep(dir, name, toolName string, requires ...string) manifest.Entry {
 	h.t.Helper()
 
+	return h.writeDepTools(dir, name, []string{toolName}, requires...)
+}
+
+// writeDepTools is writeDep for a plugin that provides more than one tool: the
+// middle of a chain needs a second, unrequired name for a squatter to take, so
+// that its resume can be made to fail WITHOUT the tool its dependents need
+// ending up registered by somebody else.
+func (h *harness) writeDepTools(dir, name string, tools []string, requires ...string) manifest.Entry {
+	h.t.Helper()
+
 	writePackage(h.t, filepath.Join(h.root, dir), pkg{
-		wasm:     patchIdentity(h.t, name, toolName),
+		wasm:     patchIdentity(h.t, name, tools...),
 		name:     name,
 		version:  "0.1.0",
-		tools:    []string{toolName},
+		tools:    tools,
 		requires: requires,
 	})
-	return entryFor(name, dir, nil, toolName)
+	return entryFor(name, dir, nil, tools...)
+}
+
+// midChain writes the mid-a -> mid-b -> mid-c chain and returns the three
+// entries in that order. mid-b provides midBAuxName on top of midBToolName; see
+// the constants' comment.
+func (h *harness) midChain() (a, b, c manifest.Entry) {
+	h.t.Helper()
+
+	a = h.writeDep("mida", midAPluginName, midAToolName)
+	b = h.writeDepTools("midb", midBPluginName, []string{midBToolName, midBAuxName}, midAToolName)
+	c = h.writeDep("midc", midCPluginName, midCToolName, midBToolName)
+	return a, b, c
 }
 
 // depChain writes the whole dep-a -> dep-b -> dep-c chain and returns the three
@@ -209,6 +275,51 @@ func TestApplySuspendsAPluginWhoseRequirementIsAbsent(t *testing.T) {
 			t.Fatalf("plugin/suspended message %q does not contain %q", messages[0], want)
 		}
 	}
+}
+
+// TestApplyResolvesARequirementAgainstAHostBuiltinTool covers the other half of
+// resolvability, the one the dependency graph never answers: a "requires" entry
+// that names a tool NO mounted plugin provides is satisfied by the host's own
+// registry, and only externalToolNames can say so.
+//
+// Every other test in this file has each required tool provided by another
+// plugin under test, which makes externalToolNames' whole result empty — so an
+// implementation that returned an empty set unconditionally would pass all of
+// them while suspending, in production, every single plugin that calls into a
+// builtin. That is what this test is here to catch, from both directions: the
+// builtin is present and the plugin runs, then the builtin goes away and the
+// plugin is suspended naming it.
+func TestApplyResolvesARequirementAgainstAHostBuiltinTool(t *testing.T) {
+	h := newHarness(t)
+
+	// Registered straight on the registry, so it belongs to no plugin: this is
+	// a host tool, exactly what externalToolNames exists to recognise.
+	revokeBuiltin := h.registry.Register(hostBuiltinToolName, tool.HandlerFunc(
+		func(context.Context, domain.ToolCall) (domain.ToolResult, error) {
+			return domain.ToolResult{}, nil
+		}))
+	t.Cleanup(revokeBuiltin)
+
+	entry := h.writeDep("hostdep", builtinDepPluginName, builtinDepToolName, hostBuiltinToolName)
+
+	h.apply(entry)
+
+	h.wantState(builtinDepPluginName, StateLoaded)
+	wantStrings(t, "registry while the host builtin is present", h.toolNames(),
+		[]string{hostBuiltinToolName, builtinDepToolName})
+	if got := len(h.messagesOfType(RuntimeEventSuspended)); got != 0 {
+		t.Fatalf("plugin/suspended events while the required builtin is registered: got %d (%v), want 0",
+			got, h.messagesOfType(RuntimeEventSuspended))
+	}
+
+	// The host tool goes away — an ungated capability, a revoked builtin — and
+	// the plugin that calls into it must go down with it.
+	revokeBuiltin()
+
+	h.apply(entry)
+
+	h.wantState(builtinDepPluginName, StateSuspended, hostBuiltinToolName)
+	wantStrings(t, "registry after the host builtin was revoked", h.toolNames(), nil)
 }
 
 // TestApplyResumesAPluginWhenItsRequirementArrives asserts the state comes back
@@ -346,8 +457,9 @@ func TestApplyRefusesACyclicManifestWithoutTouchingMountedPlugins(t *testing.T) 
 	echo := h.writeEcho("1.0.0")
 
 	h.apply(echo)
-	ownersBefore := h.owners()
-	toolsBefore := h.toolNames()
+	wantStrings(t, "ledger instance owners before the cyclic manifest", h.owners(),
+		[]string{"plugin:" + echoPluginName + "@1.0.0"})
+	wantStrings(t, "registry before the cyclic manifest", h.toolNames(), []string{echoToolName})
 
 	// dep-a and dep-b require each other: an unresolvable activation order.
 	cycleA := h.writeDep("depa", depAPluginName, depAToolName, depBToolName)
@@ -362,17 +474,18 @@ func TestApplyRefusesACyclicManifestWithoutTouchingMountedPlugins(t *testing.T) 
 	}
 
 	// The plugin that was already running is untouched, in the ledger and in
-	// the registry alike.
-	for _, owner := range ownersBefore {
-		if !slices.Contains(h.owners(), owner) {
-			t.Fatalf("owner %s went away over a cyclic manifest; owners now %v", owner, h.owners())
-		}
-	}
-	for _, name := range toolsBefore {
-		if !slices.Contains(h.toolNames(), name) {
-			t.Fatalf("tool %q went away over a cyclic manifest; registry now %v", name, h.toolNames())
-		}
-	}
+	// the registry alike. Both are compared EXACTLY, not for containment:
+	// "changes nothing" is also violated by an Apply that adds something, and
+	// the two cyclic plugins are listed here because pass 3 does mount them —
+	// the cycle is only discovered afterwards, by a convergence that then
+	// declines to move anybody.
+	wantStrings(t, "ledger instance owners after the cyclic manifest", h.owners(), []string{
+		"plugin:" + depAPluginName + "@0.1.0",
+		"plugin:" + depBPluginName + "@0.1.0",
+		"plugin:" + echoPluginName + "@1.0.0",
+	})
+	wantStrings(t, "registry after the cyclic manifest", h.toolNames(),
+		[]string{depAToolName, depBToolName, echoToolName})
 	h.wantState(echoPluginName, StateLoaded)
 	// Nothing was suspended either: the graph never produced an answer to act
 	// on, so no state changed.
@@ -391,34 +504,67 @@ func TestApplyRefusesACyclicManifestWithoutTouchingMountedPlugins(t *testing.T) 
 // side: a suspended plugin's tool names are FREE, so another contributor may
 // legitimately take one while it is down. The plugin then cannot come back, and
 // that has to travel out as an error rather than as a silent half-resume.
+//
+// The chain is three levels deep because the interesting case is a failure in
+// the MIDDLE of one. The graph, resolved before anything moved, says all three
+// may be active; mid-b's resume then fails, so mb_tool never gets registered,
+// and mid-c — which the graph cleared to come back — has to notice that against
+// the LIVE registry and refuse rather than return to the model advertising a
+// tool whose implementation calls into nothing. Both failures travel out of the
+// same Apply.
+//
+// The squatter takes mb_aux, a name mid-b provides and nobody requires, rather
+// than mb_tool itself: taking mb_tool would leave the name registered (by the
+// squatter) and mid-c would then be entitled to come back, which tests the
+// opposite of the cascade this is about.
 func TestApplyReportsAResumeWhoseToolNameWasTaken(t *testing.T) {
 	h := newHarness(t)
-	a, b, _ := h.depChain()
+	a, b, c := h.midChain()
 
-	h.apply(b)
-	h.wantState(depBPluginName, StateSuspended, depAToolName)
+	h.apply(b, c)
+	h.wantState(midBPluginName, StateSuspended, midAToolName)
+	h.wantState(midCPluginName, StateSuspended, midBToolName)
 
-	// Somebody else claims dep_b_tool while dep-b is suspended.
-	revoke := h.registry.Register(depBToolName, tool.HandlerFunc(
+	// Somebody else claims one of mid-b's names while mid-b is suspended.
+	revoke := h.registry.Register(midBAuxName, tool.HandlerFunc(
 		func(context.Context, domain.ToolCall) (domain.ToolResult, error) {
 			return domain.ToolResult{}, nil
 		}))
 	t.Cleanup(revoke)
 
-	err := h.loader.Apply(context.Background(), manifest.Deployment{Plugins: []manifest.Entry{a, b}}, h.root)
+	err := h.loader.Apply(context.Background(), manifest.Deployment{Plugins: []manifest.Entry{a, b, c}}, h.root)
 	if err == nil {
 		t.Fatalf("Apply must report a resume whose tool name was taken, got nil")
 	}
-	if !strings.Contains(err.Error(), depBPluginName) || !strings.Contains(err.Error(), depBToolName) {
-		t.Fatalf("Apply error %v names neither the plugin nor the tool that blocked the resume", err)
+	// Both hops are named: the resume that failed on the taken name, and the one
+	// downstream of it that refused because of the first one's failure.
+	for _, want := range []string{midBPluginName, midBAuxName, midCPluginName, midBToolName} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("Apply error %v does not name %q; a mid-chain resume failure has to report both hops",
+				err, want)
+		}
 	}
-	// dep-a came up regardless — one entry's failure never aborts the others —
-	// and dep-b stayed suspended rather than half-resumed.
-	h.wantState(depAPluginName, StateLoaded)
-	h.wantState(depBPluginName, StateSuspended, depAToolName)
-	if row := h.statusOf(depBPluginName); row.LastError == "" {
-		t.Fatalf("plugin %q reports no LastError after a failed resume: %v", depBPluginName, row)
+
+	// mid-a came up regardless — one entry's failure never aborts the others —
+	// and neither of the two downstream plugins is half-resumed.
+	h.wantState(midAPluginName, StateLoaded)
+	// mid-b's blocker is NOT a missing dependency any more: ma_tool is back and
+	// registered. SuspendedBy has to say so — naming ma_tool here would send an
+	// operator after a dependency that is already satisfied — and LastError is
+	// what carries the taken name.
+	h.wantState(midBPluginName, StateSuspended)
+	// mid-c's blocker, by contrast, really is a missing dependency: mb_tool is
+	// unregistered because mid-b never came back.
+	h.wantState(midCPluginName, StateSuspended, midBToolName)
+	for _, name := range []string{midBPluginName, midCPluginName} {
+		if row := h.statusOf(name); row.LastError == "" {
+			t.Fatalf("plugin %q reports no LastError after a failed resume: %v", name, row)
+		}
 	}
+	// Nothing either of them provides reached the registry: mid-a's tool and the
+	// squatter's are all that is there.
+	wantStrings(t, "registry after the mid-chain resume failed", h.toolNames(),
+		[]string{midAToolName, midBAuxName})
 }
 
 // suspendApplyRounds is how many times TestApplyConvergesToTheSameDependencyState
@@ -428,11 +574,13 @@ func TestApplyReportsAResumeWhoseToolNameWasTaken(t *testing.T) {
 // condition was the thing being tested.
 const suspendApplyRounds = 5
 
-// suspendOwnerCeiling is the most ledger instance owners this package's
-// dependency tests may ever hold: one per mounted plugin of the three-plugin
-// chain. It is asserted in EVERY round, so a convergence that leaked an
-// instance per round fails on the first leaked one.
-const suspendOwnerCeiling = 3
+// suspendOwnerCeiling is the most ledger instance owners
+// TestApplyConvergesToTheSameDependencyStateEveryRound may ever hold: one per
+// plugin IT deploys, which is two — dep-b and dep-c; dep-a is written but never
+// applied, which is what keeps the chain suspended. It is asserted in EVERY
+// round, so a convergence that leaked an instance per round fails on the first
+// leaked one rather than after "enough" rounds.
+const suspendOwnerCeiling = 2
 
 // TestApplyConvergesToTheSameDependencyStateEveryRound pins idempotence: an
 // unchanged manifest reaches the same suspension state every time, without
