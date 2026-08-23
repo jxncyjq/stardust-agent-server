@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/lifecycle"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
 	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
@@ -1063,4 +1064,570 @@ func TestE2EAcceptedToolThePluginNeverDeclaredIsRefused(t *testing.T) {
 	requireGateable(t, typo, false, "after the refusal")
 	requireGateable(t, echoToolName, false, "after the refusal")
 	requireFailedRow(t, h.loader.Status(), echoPluginName, typo)
+}
+
+// ---------------------------------------------------------------------------
+// A4b acceptance: dependency convergence, driven from a plugins.json on disk.
+//
+// suspend_test.go already covers the convergence entry by entry, through
+// manifest.Entry values built in memory. What follows is the outside-in pass:
+// the same three-plugin chain written as a plugins.json FILE, read back and
+// parsed the way serve does, with every claim made through the surfaces an
+// operator and a model actually see — the real *tool.Registry, the
+// process-global gateable catalog, the lifecycle ledger, the published event
+// stream and the InstanceStatus rows `agent plugins status` renders.
+//
+// # Bounds (fork-bomb regime)
+//
+// None of these tests loops over Apply: each is a written-out sequence of at
+// most three applies, and every one of them is followed by
+// requireInstanceCeiling with that stage's own literal ceiling, so a
+// convergence that leaked an instance fails at the apply that leaked it. There
+// is no channel, no goroutine and no sleep anywhere below, so nothing here can
+// wait on the feature under test.
+//
+// # Why the status assertions stop at InstanceStatus
+//
+// `agent plugins status` renders in internal/cli, which imports this package,
+// so a test here cannot call the renderer without an import cycle. The rows
+// below are its INPUT, and the two helpers requireDirectSuspension and
+// requireCascadedSuspension assert exactly the facts internal/cli's
+// suspendedWaitingOn branches on: whether any plugin provides the unresolved
+// tool, and what state that provider is in. The rendering itself is covered
+// against a real deployment in internal/cli's
+// TestPluginsStatusNamesTheToolADirectSuspensionIsWaitingOn and
+// TestPluginsStatusDistinguishesCascadedSuspensionFromDirect.
+
+// The dependency chain these tests deploy from a manifest file:
+//
+//	e2e-a  provides ea_tool, requires nothing
+//	e2e-b  provides eb_tool (and, where a squatter is needed, eb_aux),
+//	       requires ea_tool
+//	e2e-c  provides ec_tool, requires eb_tool
+//
+// They carry their own names rather than reusing suspend_test.go's dep-* chain
+// so a failure names the pass it came from, and the names are short because
+// patchIdentity has to fit each plugin's name and tools into a fixed-length
+// literal.
+const (
+	e2eChainAPlugin = "e2e-a"
+	e2eChainATool   = "ea_tool"
+
+	e2eChainBPlugin = "e2e-b"
+	e2eChainBTool   = "eb_tool"
+	e2eChainBAux    = "eb_aux"
+
+	e2eChainCPlugin = "e2e-c"
+	e2eChainCTool   = "ec_tool"
+)
+
+// The ledger labels host.Activate files under a plugin's INSTANCE owner,
+// spelled here to match internal/plugin/host/activate.go's ledgerLabelRuntime,
+// ledgerLabelPool and ledgerLabelContributions. They are unexported there, so
+// this is a copy; a rename that made the two disagree fails
+// requireSuspendedInstanceIntact loudly rather than letting it assert nothing.
+const (
+	e2eLabelRuntime       = "wasm-runtime"
+	e2eLabelPool          = "wasm-instance-pool"
+	e2eLabelContributions = "tool-contributions"
+)
+
+// e2eChainEntryJSON renders one plugins.json entry for a chain plugin: literal
+// JSON, the text an operator edits, rather than a marshalled struct.
+func e2eChainEntryJSON(name, source string, tools ...string) string {
+	accepts := make([]string, 0, len(tools))
+	for _, toolName := range tools {
+		accepts = append(accepts, fmt.Sprintf(`{"name": %q}`, toolName))
+	}
+	return fmt.Sprintf(`    {
+      "name": %q,
+      "source": %q,
+      "enabled": true,
+      "tools": [%s]
+    }`, name, source, strings.Join(accepts, ", "))
+}
+
+// e2eChainManifestJSON assembles whole-file plugins.json text out of the
+// entries e2eChainEntryJSON produced.
+func e2eChainManifestJSON(entries ...string) string {
+	return "{\n  \"plugins\": [\n" + strings.Join(entries, ",\n") + "\n  ]\n}"
+}
+
+// chainOwnerOf is the ledger instance owner one chain plugin is filed under.
+// Every chain package is written at writeDep's version, 0.1.0.
+func chainOwnerOf(name string) string { return "plugin:" + name + "@0.1.0" }
+
+// requireLedgerLabels asserts the exact set of live ledger entries filed under
+// one owner.
+//
+// Exact rather than "contains": a suspension that had also torn down the
+// instance pool, and one that had left a second copy of it behind, are both
+// states this has to fail on, and neither shows up in a containment check.
+func (h *harness) requireLedgerLabels(when, owner string, want ...string) {
+	h.t.Helper()
+
+	got := append([]string(nil), h.ledger.Snapshot()[lifecycle.Owner(owner)]...)
+	slices.Sort(got)
+	sorted := append([]string(nil), want...)
+	slices.Sort(sorted)
+	wantStrings(h.t, fmt.Sprintf("%s: ledger entries under %s", when, owner), got, sorted)
+}
+
+// requireSuspendedInstanceIntact is the other half of "suspended is not
+// unloaded": the plugin's contributions are gone, and its INSTANCE — the wasm
+// runtime and the instance pool holding the guest's linear memory — is exactly
+// as it was.
+//
+// The contribution owner must be absent, which is what makes the claim mean
+// something: an implementation that unregistered the tools but left the
+// contribution entries filed would pass every registry assertion and fail here.
+func (h *harness) requireSuspendedInstanceIntact(when, name string) {
+	h.t.Helper()
+
+	owner := chainOwnerOf(name)
+	// tool-contributions stays: that entry is filed under the INSTANCE owner and
+	// is what a later teardown uses to withdraw whatever a Resume files. Only
+	// the contribution owner's own entries go away.
+	h.requireLedgerLabels(when+" ("+name+")", owner, e2eLabelRuntime, e2eLabelPool, e2eLabelContributions)
+	if labels, still := h.ledger.Snapshot()[lifecycle.Owner(owner+"/tools")]; still {
+		h.t.Fatalf("%s: plugin %q still holds contribution entries %v under %s; suspension must withdraw them",
+			when, name, labels, owner+"/tools")
+	}
+}
+
+// providersInStatus maps every tool name to the plugin whose Status row claims
+// it, exactly as internal/cli's pluginToolProviders does. It is what makes a
+// suspended row's blame legible: a tool with no provider here is one nobody
+// installed, and a tool whose provider is itself suspended is a cascade.
+func (h *harness) providersInStatus() map[string]string {
+	h.t.Helper()
+
+	providerOf := make(map[string]string)
+	for _, row := range h.loader.Status() {
+		for _, toolName := range row.Tools {
+			if previous, taken := providerOf[toolName]; taken {
+				h.t.Fatalf("Status reports two providers for tool %q (%s and %s); a suspended row's blame "+
+					"would be ambiguous", toolName, previous, row.Name)
+			}
+			providerOf[toolName] = row.Name
+		}
+	}
+	return providerOf
+}
+
+// requireDirectSuspension asserts that name is suspended waiting on toolName
+// and that NO Status row provides that tool — the input internal/cli renders as
+// "<tool>(no plugin provides it)".
+func (h *harness) requireDirectSuspension(when, name, toolName string) {
+	h.t.Helper()
+
+	h.wantState(name, StateSuspended, toolName)
+	if provider, provided := h.providersInStatus()[toolName]; provided {
+		h.t.Fatalf("%s: plugin %q is blamed on %q, which %q provides; that is a cascade, not a direct "+
+			"suspension", when, name, toolName, provider)
+	}
+}
+
+// requireCascadedSuspension asserts that name is suspended waiting on toolName,
+// that provider is the plugin whose Status row claims that tool, and that the
+// provider is itself not working — the input internal/cli renders as
+// "<tool>(cascade: <provider> is suspended)".
+//
+// The provider's Tools assertion is the load-bearing one: a suspended plugin
+// that stopped reporting what it contributes would leave the cascade
+// indistinguishable from a tool nobody ever installed, and would send an
+// operator looking for a plugin to install instead of at the plugin that is
+// actually down.
+func (h *harness) requireCascadedSuspension(when, name, toolName, provider string) {
+	h.t.Helper()
+
+	h.wantState(name, StateSuspended, toolName)
+	got, provided := h.providersInStatus()[toolName]
+	if !provided {
+		h.t.Fatalf("%s: plugin %q is blamed on %q, but no Status row reports providing it; the cascade back "+
+			"to %q is invisible to an operator", when, name, toolName, provider)
+	}
+	if got != provider {
+		h.t.Fatalf("%s: Status reports %q as the provider of %q, want %q", when, got, toolName, provider)
+	}
+	if state := h.statusOf(provider).State; state == StateLoaded {
+		h.t.Fatalf("%s: plugin %q is blamed on %q, whose provider %q reports %q; a cascade means the provider "+
+			"is not working either", when, name, toolName, provider, state)
+	}
+}
+
+// requireSuspendedEventCascade asserts that exactly one plugin/suspended event
+// was published for name and that it carries the cascade= label wanted.
+//
+// This is the Loader's OWN rendering of the same distinction, on the stream an
+// operator tails rather than in the table they poll, and it is asserted
+// separately because the two are produced by different code: unresolvedRequires
+// decides the event's cascade=, while a status row's is re-derived from the
+// provider set.
+func (h *harness) requireSuspendedEventCascade(name, cascade string) {
+	h.t.Helper()
+
+	var matched []string
+	for _, message := range h.messagesOfType(RuntimeEventSuspended) {
+		if strings.Contains(message, "plugin="+name+" ") {
+			matched = append(matched, message)
+		}
+	}
+	if len(matched) != 1 {
+		h.t.Fatalf("plugin/suspended events for %s: got %d (%v), want exactly 1", name, len(matched), matched)
+	}
+	if !strings.Contains(matched[0], "cascade="+cascade) {
+		h.t.Fatalf("plugin/suspended message for %s = %q, want cascade=%s", name, matched[0], cascade)
+	}
+}
+
+// requireLoadCount asserts how many plugin/loaded events one plugin has
+// published so far. One across a whole suspend-and-resume cycle is the proof
+// that the resume reused the mounted instance instead of rebuilding the guest.
+func (h *harness) requireLoadCount(when, name string, want int) {
+	h.t.Helper()
+
+	loads := 0
+	for _, message := range h.messagesOfType(RuntimeEventLoaded) {
+		if strings.Contains(message, "plugin="+name+" ") {
+			loads++
+		}
+	}
+	if loads != want {
+		h.t.Fatalf("%s: plugin/loaded events for %s = %d, want %d", when, name, loads, want)
+	}
+}
+
+// requireChainToolServes calls one chain plugin's tool the way a model does and
+// asserts the guest answered. The fixture echoes "<tool>:<arguments as compact
+// JSON>", so the answer proves the call reached the guest and came back — a
+// plugin whose tool is merely REGISTERED, against a pool that was disposed,
+// fails here while passing every catalog assertion.
+func (h *harness) requireChainToolServes(ctx context.Context, when, toolName string) {
+	h.t.Helper()
+
+	result, _, err := h.executeAsModel(ctx, domain.ToolCall{
+		ID:        "model-call-" + toolName + "-" + when,
+		Name:      toolName,
+		Arguments: map[string]string{"probe": when},
+	})
+	if err != nil {
+		h.t.Fatalf("%s: Execute(%q): %v", when, toolName, err)
+	}
+	want := fmt.Sprintf(`%s:{"probe":%q}`, toolName, when)
+	if !result.Success || result.Output != want {
+		h.t.Fatalf("%s: Execute(%q) = %+v, want a successful %q", when, toolName, result, want)
+	}
+}
+
+// TestE2EDependencyChainSuspendsAndResumesFromTheManifestFile is Step 1 of the
+// A4b acceptance, with Step 2's observability asserted at every stage of it.
+//
+//	a plugins.json declaring e2e-a -> e2e-b -> e2e-c -> Apply -> all three
+//	active, all three tools in the registry AND in the gateable catalog, and
+//	each one SERVES -> the operator deletes e2e-a from the file -> reload ->
+//	e2e-b and e2e-c are suspended, every tool of theirs is gone from the
+//	registry and the gateable catalog, e2e-a's ledger owner is gone, but
+//	e2e-b's and e2e-c's instances (wasm runtime + instance pool) are untouched
+//	-> the operator puts e2e-a back -> reload -> ONE convergence brings the
+//	whole chain back, on the instances it never rebuilt.
+//
+// Every "after" claim is paired with its "before": the three tools are proven
+// absent from the gateable catalog before the first apply and proven serving
+// before the manifest is edited, so nothing here is satisfied by a state that
+// was already true.
+//
+// There is no loop: three applies, written out, each followed by its own
+// instance ceiling.
+func TestE2EDependencyChainSuspendsAndResumesFromTheManifestFile(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	chainTools := []string{e2eChainATool, e2eChainBTool, e2eChainCTool}
+	// The gateable catalog is process-global: a leak from an earlier test would
+	// make this test's gateable assertions vacuous.
+	for _, name := range chainTools {
+		if toolauth.IsGateable(name) {
+			t.Fatalf("%q is already gateable before any apply: an earlier test leaked its contribution", name)
+		}
+	}
+	if names := h.toolNames(); len(names) != 0 {
+		t.Fatalf("registry already advertises %v before any apply", names)
+	}
+
+	h.writeDep("e2ea", e2eChainAPlugin, e2eChainATool)
+	h.writeDep("e2eb", e2eChainBPlugin, e2eChainBTool, e2eChainATool)
+	h.writeDep("e2ec", e2eChainCPlugin, e2eChainCTool, e2eChainBTool)
+
+	entryA := e2eChainEntryJSON(e2eChainAPlugin, "e2ea", e2eChainATool)
+	entryB := e2eChainEntryJSON(e2eChainBPlugin, "e2eb", e2eChainBTool)
+	entryC := e2eChainEntryJSON(e2eChainCPlugin, "e2ec", e2eChainCTool)
+	wholeChain := e2eChainManifestJSON(entryA, entryB, entryC)
+	withoutProvider := e2eChainManifestJSON(entryB, entryC)
+
+	// Stage 1: the whole chain, from the file.
+	h.writeManifest(wholeChain)
+	if err := h.applyManifest(ctx); err != nil {
+		t.Fatalf("startup Apply of the whole chain: %v", err)
+	}
+	h.requireInstanceCeiling("after the startup apply", 3)
+
+	wantStrings(t, "registry after the startup apply", h.toolNames(), chainTools)
+	for _, name := range chainTools {
+		requireGateable(t, name, true, "after the startup apply")
+	}
+	wantStrings(t, "ledger instance owners after the startup apply", h.owners(),
+		[]string{chainOwnerOf(e2eChainAPlugin), chainOwnerOf(e2eChainBPlugin), chainOwnerOf(e2eChainCPlugin)})
+	for _, name := range []string{e2eChainAPlugin, e2eChainBPlugin, e2eChainCPlugin} {
+		h.wantState(name, StateLoaded)
+	}
+	for _, name := range chainTools {
+		h.requireChainToolServes(ctx, "up", name)
+	}
+	if got := len(h.messagesOfType(RuntimeEventSuspended)); got != 0 {
+		t.Fatalf("plugin/suspended events while the whole chain is up: got %d, want 0", got)
+	}
+
+	// Stage 2: the operator deletes the root entry from plugins.json.
+	h.writeManifest(withoutProvider)
+	if err := h.applyManifest(ctx); err != nil {
+		t.Fatalf("reload after the provider was deleted from the manifest: %v", err)
+	}
+	h.requireInstanceCeiling("after the provider left", 2)
+
+	// Nothing the chain provides is reachable any more — not the tool whose
+	// provider left, and not the two whose providers are merely suspended.
+	wantStrings(t, "registry after the provider left", h.toolNames(), nil)
+	for _, name := range chainTools {
+		requireGateable(t, name, false, "after the provider left")
+	}
+	if _, _, err := h.executeAsModel(ctx, domain.ToolCall{ID: "call-suspended", Name: e2eChainBTool}); !errors.Is(err, tool.ErrToolNotFound) {
+		t.Errorf("Execute(%q) against a suspended plugin = %v, want ErrToolNotFound", e2eChainBTool, err)
+	}
+
+	// The deleted entry is really gone, and the two suspended ones really are
+	// still mounted: same owners, instances intact.
+	wantStrings(t, "ledger instance owners after the provider left", h.owners(),
+		[]string{chainOwnerOf(e2eChainBPlugin), chainOwnerOf(e2eChainCPlugin)})
+	if labels, still := h.ledger.Snapshot()[lifecycle.Owner(chainOwnerOf(e2eChainAPlugin))]; still {
+		t.Errorf("the deleted plugin %q still holds ledger entries %v; it was unloaded, not suspended",
+			e2eChainAPlugin, labels)
+	}
+	h.requireSuspendedInstanceIntact("after the provider left", e2eChainBPlugin)
+	h.requireSuspendedInstanceIntact("after the provider left", e2eChainCPlugin)
+
+	// Step 2: what an operator reads. The direct suspension and the cascade are
+	// told apart, in the status rows and in the event stream alike.
+	h.requireDirectSuspension("after the provider left", e2eChainBPlugin, e2eChainATool)
+	h.requireCascadedSuspension("after the provider left", e2eChainCPlugin, e2eChainBTool, e2eChainBPlugin)
+	h.requireSuspendedEventCascade(e2eChainBPlugin, cascadeNo)
+	h.requireSuspendedEventCascade(e2eChainCPlugin, cascadeYes)
+
+	// Stage 3: the operator puts the entry back. ONE convergence, whole chain.
+	h.writeManifest(wholeChain)
+	if err := h.applyManifest(ctx); err != nil {
+		t.Fatalf("reload after the provider was restored: %v", err)
+	}
+	h.requireInstanceCeiling("after the provider returned", 3)
+
+	for _, name := range []string{e2eChainAPlugin, e2eChainBPlugin, e2eChainCPlugin} {
+		h.wantState(name, StateLoaded)
+	}
+	wantStrings(t, "registry after the provider returned", h.toolNames(), chainTools)
+	for _, name := range chainTools {
+		requireGateable(t, name, true, "after the provider returned")
+		h.requireChainToolServes(ctx, "back", name)
+	}
+	// The two that came back were RESUMED, not rebuilt: one plugin/loaded each
+	// across the whole sequence, against the root's two — it really was unloaded
+	// and mounted again, which is what keeps "1" from being a number every
+	// plugin here happens to have.
+	h.requireLoadCount("after the provider returned", e2eChainBPlugin, 1)
+	h.requireLoadCount("after the provider returned", e2eChainCPlugin, 1)
+	h.requireLoadCount("after the provider returned", e2eChainAPlugin, 2)
+	if got := len(h.messagesOfType(RuntimeEventResumed)); got != 2 {
+		t.Errorf("plugin/resumed events: got %d (%v), want 2",
+			got, h.messagesOfType(RuntimeEventResumed))
+	}
+}
+
+// TestE2ECyclicManifestIsRefusedWithoutTouchingWhatIsRunning is the first of
+// Step 3's rejection paths, driven from the manifest file: a plugins.json whose
+// entries require each other in a loop.
+//
+// The refusal has to name the plugins on the cycle — an operator whose only
+// clue is "dependency cycle" has to go read every manifest themselves — and it
+// must not disturb the plugin that was already working. "Untouched" is asserted
+// on every surface separately: the ledger owner, the gateable catalog, the
+// status row, and one real tool call.
+func TestE2ECyclicManifestIsRefusedWithoutTouchingWhatIsRunning(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	h.writeEcho("1.0.0")
+	h.writeManifest(e2eEchoOnlyManifest())
+	if err := h.applyManifest(ctx); err != nil {
+		t.Fatalf("startup Apply: %v", err)
+	}
+	h.requireInstanceCeiling("after the startup apply", 1)
+	requireGateable(t, echoToolName, true, "after the startup apply")
+	beforeOwners := h.owners()
+	wantStrings(t, "ledger instance owners after the startup apply", beforeOwners,
+		[]string{"plugin:" + echoPluginName + "@1.0.0"})
+
+	// Two entries that require each other: an unresolvable order, and operator
+	// data rather than a programming error.
+	h.writeDep("e2ea", e2eChainAPlugin, e2eChainATool, e2eChainBTool)
+	h.writeDep("e2eb", e2eChainBPlugin, e2eChainBTool, e2eChainATool)
+	h.writeManifest(e2eChainManifestJSON(
+		e2eChainEntryJSON(echoPluginName, "echo", echoToolName),
+		e2eChainEntryJSON(e2eChainAPlugin, "e2ea", e2eChainATool),
+		e2eChainEntryJSON(e2eChainBPlugin, "e2eb", e2eChainBTool),
+	))
+
+	err := h.applyManifest(ctx)
+	if err == nil {
+		t.Fatalf("Apply() of a cyclic manifest error = nil, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "cycle") {
+		t.Errorf("Apply() error = %q, want it to name the cycle", err)
+	}
+	for _, name := range []string{e2eChainAPlugin, e2eChainBPlugin} {
+		if !strings.Contains(err.Error(), name) {
+			t.Errorf("Apply() error = %q, want it to name %q, a plugin on the cycle", err, name)
+		}
+	}
+	h.requireInstanceCeiling("after the cyclic manifest", 3)
+
+	// The plugin that was already running is exactly where it was. The owner set
+	// is compared EXACTLY, and against the owner recorded BEFORE the refusal:
+	// "changes nothing" is violated by a convergence that remounted it under a
+	// new owner just as much as by one that unmounted it. The two cyclic entries
+	// are listed because pass 3 does mount them — the cycle is only discovered
+	// afterwards, by a convergence that then declines to move anybody.
+	wantStrings(t, "ledger instance owners after the cyclic manifest", h.owners(), []string{
+		chainOwnerOf(e2eChainAPlugin),
+		chainOwnerOf(e2eChainBPlugin),
+		beforeOwners[0],
+	})
+	requireGateable(t, echoToolName, true, "after the cyclic manifest")
+	h.wantState(echoPluginName, StateLoaded)
+	result, _, execErr := h.executeAsModel(ctx, domain.ToolCall{
+		ID:        "model-call-after-cycle",
+		Name:      echoToolName,
+		Arguments: map[string]string{"text": "still here"},
+	})
+	if execErr != nil {
+		t.Fatalf("Execute(%q) after the cyclic manifest was refused: %v", echoToolName, execErr)
+	}
+	if want := echoToolName + `:{"text":"still here"}`; result.Output != want {
+		t.Errorf("Execute(%q) after the cyclic manifest result.Output = %q, want %q", echoToolName, result.Output, want)
+	}
+	// Nobody was suspended and nobody was unloaded: a graph that never produced
+	// an answer decides nothing.
+	if got := len(h.messagesOfType(RuntimeEventSuspended)); got != 0 {
+		t.Errorf("plugin/suspended events over a cyclic manifest: got %d (%v), want 0",
+			got, h.messagesOfType(RuntimeEventSuspended))
+	}
+	if got := len(h.eventsOfType(RuntimeEventUnloaded)); got != 0 {
+		t.Errorf("plugin/unloaded events over a cyclic manifest: got %d, want 0", got)
+	}
+}
+
+// TestE2EResumeRefusedByATakenToolNameStaysSuspendedWithItsReason is Step 3's
+// second rejection: while a plugin is suspended its tool names are free, so
+// somebody else may legitimately take one — and the plugin then cannot come
+// back.
+//
+// The requirement is that this is an ERROR, not a panic: both
+// tool.Registry.RegisterDescriptor and toolauth.Contribute answer a duplicate
+// name by panicking, so a resume that contributed without checking first would
+// take the whole process down over a state its operator can fix. The plugin has
+// to stay suspended with a reason a status row can show.
+//
+// The squatter takes eb_aux — a name e2e-b provides and nobody requires —
+// rather than eb_tool itself, because taking eb_tool would leave that name
+// registered by the squatter and entitle e2e-c to come back, which is the
+// opposite of the state under test.
+func TestE2EResumeRefusedByATakenToolNameStaysSuspendedWithItsReason(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	h.writeDep("e2ea", e2eChainAPlugin, e2eChainATool)
+	h.writeDepTools("e2eb", e2eChainBPlugin, []string{e2eChainBTool, e2eChainBAux}, e2eChainATool)
+	h.writeDep("e2ec", e2eChainCPlugin, e2eChainCTool, e2eChainBTool)
+
+	entryA := e2eChainEntryJSON(e2eChainAPlugin, "e2ea", e2eChainATool)
+	entryB := e2eChainEntryJSON(e2eChainBPlugin, "e2eb", e2eChainBTool, e2eChainBAux)
+	entryC := e2eChainEntryJSON(e2eChainCPlugin, "e2ec", e2eChainCTool)
+
+	// The chain without its root: both dependents mount and suspend.
+	h.writeManifest(e2eChainManifestJSON(entryB, entryC))
+	if err := h.applyManifest(ctx); err != nil {
+		t.Fatalf("startup Apply without the root entry: %v", err)
+	}
+	h.requireInstanceCeiling("after the startup apply", 2)
+	h.wantState(e2eChainBPlugin, StateSuspended, e2eChainATool)
+	h.wantState(e2eChainCPlugin, StateSuspended, e2eChainBTool)
+	// The name the squatter is about to take is free precisely BECAUSE e2e-b is
+	// suspended; asserting it here is what makes the registration below a
+	// legitimate one rather than a duplicate the registry would have refused.
+	if names := h.toolNames(); slices.Contains(names, e2eChainBAux) {
+		t.Fatalf("registry advertises %q while %q is suspended: %v", e2eChainBAux, e2eChainBPlugin, names)
+	}
+
+	revokeSquatter := h.registry.Register(e2eChainBAux, tool.HandlerFunc(
+		func(context.Context, domain.ToolCall) (domain.ToolResult, error) {
+			return domain.ToolResult{}, nil
+		}))
+	t.Cleanup(revokeSquatter)
+
+	// The operator restores the root entry. The resume of e2e-b now cannot
+	// happen, and e2e-c's cannot either.
+	h.writeManifest(e2eChainManifestJSON(entryA, entryB, entryC))
+	err := h.applyManifest(ctx)
+	if err == nil {
+		t.Fatalf("Apply() whose resume hits a taken tool name error = nil, want a refusal")
+	}
+	h.requireInstanceCeiling("after the refused resume", 3)
+	// Both hops are named: the resume that failed on the taken name, and the one
+	// downstream of it that stayed down because of it.
+	for _, want := range []string{e2eChainBPlugin, e2eChainBAux, e2eChainCPlugin, e2eChainBTool} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("Apply() error = %q, want it to name %q", err, want)
+		}
+	}
+
+	// The root came up regardless — one entry's failure never aborts the rest —
+	// and it serves.
+	h.wantState(e2eChainAPlugin, StateLoaded)
+	requireGateable(t, e2eChainATool, true, "after the refused resume")
+	h.requireChainToolServes(ctx, "root", e2eChainATool)
+
+	// e2e-b stayed suspended, and its reason is the taken name rather than a
+	// dependency: ea_tool is back and registered, so blaming that would send an
+	// operator after something which is already fixed.
+	h.wantState(e2eChainBPlugin, StateSuspended)
+	if row := h.statusOf(e2eChainBPlugin); !strings.Contains(row.LastError, e2eChainBAux) {
+		t.Errorf("Status row for %q LastError = %q, want it to name the taken tool %q",
+			e2eChainBPlugin, row.LastError, e2eChainBAux)
+	}
+	// e2e-c's reason IS a missing dependency: eb_tool never came back.
+	h.requireCascadedSuspension("after the refused resume", e2eChainCPlugin, e2eChainBTool, e2eChainBPlugin)
+	if row := h.statusOf(e2eChainCPlugin); row.LastError == "" {
+		t.Errorf("Status row for %q reports no LastError after a refused resume: %+v", e2eChainCPlugin, row)
+	}
+
+	// Neither of the two contributed anything: the registry holds the root's
+	// tool and the squatter's, and nothing either of them provides is gateable.
+	// The squatter's own name is not gateable either — it was registered
+	// directly on the registry, so a gateable eb_aux would mean the refused
+	// resume filed its catalog entries anyway.
+	wantStrings(t, "registry after the refused resume", h.toolNames(),
+		[]string{e2eChainATool, e2eChainBAux})
+	for _, name := range []string{e2eChainBTool, e2eChainBAux, e2eChainCTool} {
+		requireGateable(t, name, false, "after the refused resume")
+	}
+	h.requireSuspendedInstanceIntact("after the refused resume", e2eChainBPlugin)
+	h.requireSuspendedInstanceIntact("after the refused resume", e2eChainCPlugin)
 }
