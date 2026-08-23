@@ -574,16 +574,23 @@ func newKeyring(t *testing.T, id sign.KeyID) (*sign.Keyring, ed25519.PrivateKey)
 	return kr, priv
 }
 
-// writeSignatureDoc writes a plugin.sig document into dir carrying exactly the
-// given fields, without signing anything itself. Tests that need a
-// well-formed-but-wrong signature (one altered byte) use this so that the
-// refusal they observe comes from the cryptographic check and not from
-// sign.ParseSignature's shape checks.
-func writeSignatureDoc(t *testing.T, dir string, keyID sign.KeyID, algorithm string, value []byte) {
+// writeSignatureDoc writes sig into dir as a plugin.sig document, without
+// signing anything itself. Tests that need a well-formed-but-wrong signature
+// (one altered byte) use this so that the refusal they observe comes from the
+// cryptographic check and not from sign.ParseSignature's shape checks.
+//
+// It encodes through sign.MarshalSignature rather than formatting the JSON
+// here. That is the point of MarshalSignature existing: the plugin.sig format
+// has exactly one reader (sign.ParseSignature) and must have exactly one
+// writer, or a test and the signing command would encode the same file
+// independently and only one of them would learn about a new field.
+func writeSignatureDoc(t *testing.T, dir string, sig sign.Signature) {
 	t.Helper()
-	doc := fmt.Sprintf(`{"key_id":%q,"algorithm":%q,"signature":%q}`,
-		string(keyID), algorithm, base64.StdEncoding.EncodeToString(value))
-	if err := os.WriteFile(filepath.Join(dir, "plugin.sig"), []byte(doc), 0o644); err != nil {
+	doc, err := sign.MarshalSignature(sig)
+	if err != nil {
+		t.Fatalf("marshal plugin.sig: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "plugin.sig"), doc, 0o644); err != nil {
 		t.Fatalf("write plugin.sig: %v", err)
 	}
 }
@@ -596,7 +603,7 @@ func writeSignature(t *testing.T, dir string, priv ed25519.PrivateKey, id sign.K
 	if err != nil {
 		t.Fatalf("sign message: %v", err)
 	}
-	writeSignatureDoc(t, dir, sig.KeyID, sig.Algorithm, sig.Value)
+	writeSignatureDoc(t, dir, sig)
 }
 
 // signedPackage assembles a complete, correctly signed package — plugin.json
@@ -697,7 +704,7 @@ func TestLoadPackage_SignatureAlteredByOneByte(t *testing.T) {
 	// id, algorithm, signature length — untouched, so that the refusal can
 	// only come from the cryptographic check.
 	sig.Value[0] ^= 0x01
-	writeSignatureDoc(t, dir, sig.KeyID, sig.Algorithm, sig.Value)
+	writeSignatureDoc(t, dir, sig)
 
 	_, _, err = LoadPackage(dir, kr)
 	if err == nil {

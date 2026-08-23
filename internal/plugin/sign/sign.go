@@ -307,3 +307,214 @@ func GenerateKey() (ed25519.PublicKey, ed25519.PrivateKey, error) {
 	}
 	return pub, priv, nil
 }
+
+// --- encoding --------------------------------------------------------------
+//
+// Every file format this package can read, it also writes here, and nowhere
+// else. Before these functions existed the plugin.sig encoding lived only in
+// a test helper, which meant one decoder (ParseSignature) faced two
+// independent encoders that had to be kept in agreement by hand — the day the
+// document gains a field, only one of them learns about it. Each Marshal*
+// below validates what it is handed before encoding it, so none of them can
+// produce a document its matching Parse* would refuse.
+
+// marshalDocument encodes one of this package's raw document structs as
+// indented JSON with a trailing newline. Indented because every one of these
+// documents is a file an operator reads, diffs and pastes; the trailing
+// newline for the same reason. Both are safe for the readers: the Parse*
+// functions accept any amount of whitespace around the single document they
+// decode.
+func marshalDocument(doc any) ([]byte, error) {
+	data, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("encode document: %w", err)
+	}
+	return append(data, '\n'), nil
+}
+
+// MarshalSignature encodes sig as the bytes of a plugin.sig document, the
+// exact shape ParseSignature reads back:
+//
+//	{"key_id":"ops-2026","algorithm":"ed25519","signature":"<base64 64 字节>"}
+//
+// It validates before it encodes, so it cannot write a document its own
+// reader would refuse: an empty key id, an algorithm other than "ed25519"
+// (a Signature assembled literally, bypassing Sign, can carry one) and a
+// value that is not ed25519.SignatureSize bytes are errors rather than bytes
+// on disk. A signing tool that emitted signatures the verifier rejects would
+// teach operators that verification is broken, which is worse than not
+// signing at all.
+func MarshalSignature(sig Signature) ([]byte, error) {
+	if sig.KeyID == "" {
+		return nil, fmt.Errorf("marshal signature: key_id is empty")
+	}
+	if sig.Algorithm != signatureAlgorithm {
+		return nil, fmt.Errorf("marshal signature: algorithm is %q, want %q",
+			sig.Algorithm, signatureAlgorithm)
+	}
+	if len(sig.Value) != ed25519.SignatureSize {
+		return nil, fmt.Errorf("marshal signature: signature is %d bytes, want %d",
+			len(sig.Value), ed25519.SignatureSize)
+	}
+	data, err := marshalDocument(rawSignature{
+		KeyID:     sig.KeyID,
+		Algorithm: sig.Algorithm,
+		Signature: base64.StdEncoding.EncodeToString(sig.Value),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal signature %q: %w", sig.KeyID, err)
+	}
+	return data, nil
+}
+
+// newKeyEntry validates id and pub and returns the raw entry both
+// MarshalKeyEntry and MarshalKeyring encode, so the two can never disagree
+// about what a keyring entry looks like or about which entries are legal.
+func newKeyEntry(id KeyID, pub ed25519.PublicKey) (rawKeyEntry, error) {
+	if id == "" {
+		return rawKeyEntry{}, fmt.Errorf("key id is empty")
+	}
+	if len(pub) != ed25519.PublicKeySize {
+		return rawKeyEntry{}, fmt.Errorf("public key is %d bytes, want %d", len(pub), ed25519.PublicKeySize)
+	}
+	return rawKeyEntry{
+		ID:        id,
+		Algorithm: signatureAlgorithm,
+		PublicKey: base64.StdEncoding.EncodeToString(pub),
+	}, nil
+}
+
+// MarshalKeyEntry encodes one entry of a keyring document — the shape an
+// operator pastes into the "keys" array of a trust set they already have:
+//
+//	{"id":"ops-2026","algorithm":"ed25519","public_key":"<base64 32 字节>"}
+//
+// The result is not a keyring document on its own and ParseKeyring will not
+// accept it; MarshalKeyring produces the whole document for a trust set whose
+// only key is this one.
+func MarshalKeyEntry(id KeyID, pub ed25519.PublicKey) ([]byte, error) {
+	entry, err := newKeyEntry(id, pub)
+	if err != nil {
+		return nil, fmt.Errorf("marshal key entry: %w", err)
+	}
+	data, err := marshalDocument(entry)
+	if err != nil {
+		return nil, fmt.Errorf("marshal key entry %q: %w", id, err)
+	}
+	return data, nil
+}
+
+// MarshalKeyring encodes a complete keyring document whose trust set is the
+// single key id/pub, the shape ParseKeyring reads back:
+//
+//	{"keys":[{"id":"ops-2026","algorithm":"ed25519","public_key":"<base64 32 字节>"}]}
+//
+// Two callers want exactly this: a deployment that trusts one signing key,
+// and any tool that needs to check its own work against a key pair it holds
+// — marshalling and re-parsing costs nothing and routes the check through
+// the production reader (ParseKeyring, then Keyring.Verify) instead of a
+// second, privately assembled trust set that could drift from it.
+func MarshalKeyring(id KeyID, pub ed25519.PublicKey) ([]byte, error) {
+	entry, err := newKeyEntry(id, pub)
+	if err != nil {
+		return nil, fmt.Errorf("marshal keyring: %w", err)
+	}
+	data, err := marshalDocument(rawKeyring{Keys: []rawKeyEntry{entry}})
+	if err != nil {
+		return nil, fmt.Errorf("marshal keyring %q: %w", id, err)
+	}
+	return data, nil
+}
+
+// rawPrivateKey mirrors a private key document's JSON shape for encoding and
+// decoding:
+//
+//	{ "key_id": "ops-2026", "algorithm": "ed25519", "private_key": "<base64 64 字节>" }
+//
+// The key id travels WITH the key on purpose. A signature names the keyring
+// entry it was made with, and if that name lived only in a command-line flag
+// then a typo would produce a perfectly valid signature that no deployment
+// can resolve — a failure that surfaces only at mount time, on the far side
+// of a handoff. Binding the name to the key material once, when the pair is
+// minted, removes that class of mistake entirely.
+type rawPrivateKey struct {
+	KeyID      KeyID  `json:"key_id"`
+	Algorithm  string `json:"algorithm"`
+	PrivateKey string `json:"private_key"`
+}
+
+// MarshalPrivateKey encodes priv, named as key id, as the bytes of a private
+// key document (see rawPrivateKey for the shape). It is the counterpart of
+// ParsePrivateKey and, like the other Marshal* functions here, validates
+// first: an empty id or a key that is not ed25519.PrivateKeySize bytes is an
+// error rather than a file.
+//
+// THE RETURNED BYTES ARE SECRET. They are the whole private key. A caller
+// must write them where only it can read them (mode 0600) and must never
+// print them, log them, or place them in an error message. No error this
+// package returns ever contains key material — a wrong length is reported as
+// a length — and callers must hold the same line.
+func MarshalPrivateKey(id KeyID, priv ed25519.PrivateKey) ([]byte, error) {
+	if id == "" {
+		return nil, fmt.Errorf("marshal private key: key id is empty")
+	}
+	if len(priv) != ed25519.PrivateKeySize {
+		return nil, fmt.Errorf("marshal private key %q: private key is %d bytes, want %d",
+			id, len(priv), ed25519.PrivateKeySize)
+	}
+	data, err := marshalDocument(rawPrivateKey{
+		KeyID:      id,
+		Algorithm:  signatureAlgorithm,
+		PrivateKey: base64.StdEncoding.EncodeToString(priv),
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal private key %q: %w", id, err)
+	}
+	return data, nil
+}
+
+// ParsePrivateKey decodes and validates a private key document from bytes
+// already read from disk, returning the key id it names and the key itself.
+// It applies the same rules the other parsers here do — unknown fields at any
+// nesting level, trailing content after the document, an empty key_id, an
+// algorithm that is not exactly "ed25519", a private_key that is not base64
+// or not ed25519.PrivateKeySize bytes are all refused.
+//
+// No error it returns carries key material: the length case is reported as a
+// length, and the base64 case as the decoder's own offset-based complaint.
+// This matters more here than anywhere else in the package, because the
+// document being parsed IS a secret.
+//
+// ParsePrivateKey does NOT check that the key's two halves agree — an
+// Ed25519 private key is a seed followed by the public key it derives, and
+// nothing stops a hand-edited file from pairing a seed with someone else's
+// public half. Such a key signs happily and its signatures verify against
+// nothing; catching that is the job of whoever signs, by verifying its own
+// output before writing it.
+func ParsePrivateKey(data []byte) (KeyID, ed25519.PrivateKey, error) {
+	dec := json.NewDecoder(bytes.NewReader(data))
+	dec.DisallowUnknownFields()
+	var raw rawPrivateKey
+	if err := dec.Decode(&raw); err != nil {
+		return "", nil, fmt.Errorf("parse private key: %w", err)
+	}
+	if dec.More() {
+		return "", nil, fmt.Errorf("parse private key: unexpected content after the JSON document")
+	}
+	if raw.KeyID == "" {
+		return "", nil, fmt.Errorf("parse private key: key_id is empty")
+	}
+	if raw.Algorithm != signatureAlgorithm {
+		return "", nil, fmt.Errorf("parse private key %q: algorithm is %q, want %q",
+			raw.KeyID, raw.Algorithm, signatureAlgorithm)
+	}
+	priv, err := base64.StdEncoding.DecodeString(raw.PrivateKey)
+	if err != nil {
+		return "", nil, fmt.Errorf("parse private key %q: private_key is not valid base64: %w", raw.KeyID, err)
+	}
+	if len(priv) != ed25519.PrivateKeySize {
+		return "", nil, fmt.Errorf("parse private key %q: private_key is %d bytes, want %d",
+			raw.KeyID, len(priv), ed25519.PrivateKeySize)
+	}
+	return raw.KeyID, ed25519.PrivateKey(priv), nil
+}

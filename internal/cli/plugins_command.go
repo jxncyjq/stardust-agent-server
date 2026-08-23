@@ -2,14 +2,17 @@ package cli
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -417,20 +420,30 @@ func readPluginDeployment(path string) (manifest.Deployment, error) {
 	return deployment, nil
 }
 
-// newPluginsCommand builds `agent plugins`, the operator's view of the WASM
-// plugin deployment: what is mounted, what is not, and why.
+// newPluginsCommand builds `agent plugins`, the operator's handle on the WASM
+// plugin deployment. Its four subcommands fall into two groups that share
+// nothing but the noun:
 //
-// Both subcommands read the loader THIS process assembled (App.Plugins). There
-// is no cross-process view: a loader belongs to the serve that built it, so
-// running these against a process that never assembled one reports exactly
-// that instead of an empty answer that reads like "no plugins".
+//   - status and reload are a view of THIS PROCESS: both read the loader serve
+//     assembled (App.Plugins). There is no cross-process view — a loader
+//     belongs to the serve that built it, so running them against a process
+//     that never assembled one reports exactly that instead of an empty answer
+//     that reads like "no plugins".
+//   - keygen and sign touch no loader, no config and no running service. They
+//     are the tools that PRODUCE what verification consumes, and they ship
+//     alongside it deliberately: a deployment that can check signatures but
+//     has no way to make one has exactly one option left, turning the
+//     requirement off, which is the outcome signature verification exists to
+//     prevent.
 func newPluginsCommand(application *app.App, out io.Writer) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "plugins",
-		Short: "Inspect and reload the WASM plugin deployment",
+		Short: "Inspect and reload the WASM plugin deployment, and sign plugin packages",
 	}
 	cmd.AddCommand(newPluginsStatusCommand(application, out))
 	cmd.AddCommand(newPluginsReloadCommand(application, out))
+	cmd.AddCommand(newPluginsKeygenCommand(out))
+	cmd.AddCommand(newPluginsSignCommand(out))
 	return cmd
 }
 
@@ -787,6 +800,317 @@ func writePluginStatus(w io.Writer, manifestPath, root string, rows []pluginStat
 		if _, err := fmt.Fprintln(w, line); err != nil {
 			return fmt.Errorf("write plugin status row %q: %w", row.Name, err)
 		}
+	}
+	return nil
+}
+
+// --- keygen / sign ---------------------------------------------------------
+
+// privateKeyFileMode is the mode `agent plugins keygen` creates a private key
+// file with: readable and writable by its owner, invisible to everyone else.
+//
+// On Windows Go maps a mode onto the read-only attribute alone, so the bits
+// below do not become an ACL there. That is a real limitation of the platform
+// and is stated in the command's own output rather than papered over: an
+// operator on Windows has to protect the file themselves.
+const privateKeyFileMode = 0o600
+
+// signatureFileMode is the mode plugin.sig is written with. A signature is
+// public by construction — it is checked against public keys, and it travels
+// with the package — so it is deliberately NOT 0600: a signature nobody can
+// read is a package nobody can verify.
+const signatureFileMode = 0o644
+
+// mustMarkFlagRequired marks name required on cmd, panicking when there is no
+// such flag. That is a programming error in this file, not a runtime
+// condition, and a command whose "required" marking silently failed to apply
+// would go on to accept an empty value for a key id or a key path.
+func mustMarkFlagRequired(cmd *cobra.Command, name string) {
+	if err := cmd.MarkFlagRequired(name); err != nil {
+		panic(fmt.Sprintf("cli: mark flag %q required on command %q: %v", name, cmd.Name(), err))
+	}
+}
+
+// newPluginsKeygenCommand builds `agent plugins keygen`, which mints the
+// Ed25519 key pair a deployment signs its plugin packages with.
+//
+// The two halves go to two different places, and that split is the whole
+// design: the private key is written to a file only its owner can read and is
+// never rendered anywhere else, while the public half is printed as a keyring
+// entry, ready to paste into the "keys" array of the trust set the deployment
+// configures through plugins.keyring.
+func newPluginsKeygenCommand(out io.Writer) *cobra.Command {
+	var keyID string
+	var privateKeyPath string
+	cmd := &cobra.Command{
+		Use:   "keygen",
+		Short: "Mint an Ed25519 key pair for signing plugin packages",
+		Long: "Mint an Ed25519 key pair for signing plugin packages.\n\n" +
+			"The private key is written to --private-key and is never printed. The public half is\n" +
+			"printed as a keyring entry, to paste into the \"keys\" array of the keyring named by\n" +
+			"the plugins.keyring config setting.\n\n" +
+			"An existing --private-key file is never overwritten: overwriting a private key\n" +
+			"invalidates every signature ever made with it, and nothing can undo it.",
+		Args: cobra.NoArgs,
+		RunE: func(_ *cobra.Command, _ []string) error {
+			return runPluginsKeygen(out, keyID, privateKeyPath)
+		},
+	}
+	cmd.Flags().StringVar(&keyID, "key-id", "",
+		"name this key carries into the keyring and into every signature it makes")
+	cmd.Flags().StringVar(&privateKeyPath, "private-key", "",
+		"file to write the new private key to; it must not already exist")
+	mustMarkFlagRequired(cmd, "key-id")
+	mustMarkFlagRequired(cmd, "private-key")
+	return cmd
+}
+
+// runPluginsKeygen generates a key pair, writes the private half to path and
+// prints the public half as a keyring entry.
+//
+// The order of operations is deliberate. The key pair is minted and both
+// documents are encoded IN MEMORY first, so every way this can fail on bad
+// input fails before anything is created on disk. The file is then created
+// with O_EXCL, which is both the refusal to overwrite an existing key and the
+// only form of that refusal that cannot lose a race with another process
+// between the check and the write.
+//
+// No error, and no line of output, ever carries the private key or any part of
+// it. The only place it goes is the file.
+func runPluginsKeygen(out io.Writer, keyID string, privateKeyPath string) error {
+	id := sign.KeyID(strings.TrimSpace(keyID))
+	if id == "" {
+		return errors.New("plugins keygen: --key-id is empty; a signature names the keyring entry it was " +
+			"made with, so a key with no name can never be resolved by a verifier")
+	}
+	path := strings.TrimSpace(privateKeyPath)
+	if path == "" {
+		return errors.New("plugins keygen: --private-key is empty; there is nowhere to write the key, and " +
+			"a private key is not something this command will print instead")
+	}
+
+	pub, priv, err := sign.GenerateKey()
+	if err != nil {
+		return fmt.Errorf("plugins keygen: %w", err)
+	}
+	keyDoc, err := sign.MarshalPrivateKey(id, priv)
+	if err != nil {
+		return fmt.Errorf("plugins keygen: %w", err)
+	}
+	entry, err := sign.MarshalKeyEntry(id, pub)
+	if err != nil {
+		return fmt.Errorf("plugins keygen: %w", err)
+	}
+
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, privateKeyFileMode)
+	if err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return fmt.Errorf("plugins keygen: %s already exists and will not be overwritten: overwriting a "+
+				"private key invalidates every signature ever made with it and cannot be undone; write the new "+
+				"key elsewhere, or move the existing one aside yourself first", path)
+		}
+		return fmt.Errorf("create private key file %q: %w", path, err)
+	}
+	if _, err := file.Write(keyDoc); err != nil {
+		failure := fmt.Errorf("write private key file %q: %w", path, err)
+		if cerr := file.Close(); cerr != nil {
+			failure = errors.Join(failure, fmt.Errorf("close private key file %q: %w", path, cerr))
+		}
+		return errors.Join(failure, removeIncompletePrivateKey(path))
+	}
+	if err := file.Close(); err != nil {
+		return errors.Join(fmt.Errorf("close private key file %q: %w", path, err),
+			removeIncompletePrivateKey(path))
+	}
+
+	if _, err := fmt.Fprintf(out, "wrote the private key for %q to %s (mode %#o%s).\n",
+		id, path, privateKeyFileMode, privateKeyModeCaveat()); err != nil {
+		return fmt.Errorf("write plugins keygen output: %w", err)
+	}
+	if _, err := fmt.Fprintf(out, "it is not printed here, and nothing in this tool ever prints it.\n\n"+
+		"paste this entry into the \"keys\" array of the keyring named by plugins.keyring:\n%s", entry); err != nil {
+		return fmt.Errorf("write plugins keygen output: %w", err)
+	}
+	return nil
+}
+
+// privateKeyModeCaveat is the honest half of what keygen prints about the
+// file mode: on Windows the mode is not what it says it is, and an operator
+// reading "mode 0600" there would be reading a promise the platform did not
+// make. Go maps a file mode onto the read-only attribute only, so the file is
+// readable by every account on the machine.
+func privateKeyModeCaveat() string {
+	if runtime.GOOS != "windows" {
+		return ""
+	}
+	return "; on Windows this mode is not enforced — restrict the file yourself"
+}
+
+// removeIncompletePrivateKey deletes a private key file that was created but
+// never completely written.
+//
+// It exists because the refusal to overwrite is keyed on the file EXISTING: a
+// zero-length leftover from a failed run would block every retry while holding
+// no key at all, and the operator's only way out would be to delete a file
+// they have every reason to believe is a private key. A cleanup that itself
+// fails is returned, never swallowed — a half-written key file that could not
+// be removed is exactly the kind of thing that must not be discovered later.
+func removeIncompletePrivateKey(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove the incomplete private key file %q: %w", path, err)
+	}
+	return nil
+}
+
+// newPluginsSignCommand builds `agent plugins sign`, which signs a plugin
+// package's plugin.json with a private key and writes the detached signature
+// to plugin.sig beside it — the file manifest.LoadPackage verifies when the
+// deployment has a keyring.
+//
+// The key id is NOT a flag here: it travels inside the private key file, bound
+// to the key material when keygen minted the pair. A key id passed separately
+// would be a name that can be mistyped into a signature no keyring can
+// resolve, and the mistake would only surface at mount time.
+func newPluginsSignCommand(out io.Writer) *cobra.Command {
+	var privateKeyPath string
+	cmd := &cobra.Command{
+		Use:   "sign <package directory>",
+		Short: "Sign a plugin package's plugin.json, writing plugin.sig beside it",
+		Long: "Sign a plugin package's plugin.json, writing plugin.sig beside it.\n\n" +
+			"The signature covers plugin.json's raw bytes exactly as they are on disk, which is\n" +
+			"what a deployment's keyring verifies at load time. Re-signing a package is a normal\n" +
+			"operation and replaces an existing plugin.sig, which this command says out loud.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(_ *cobra.Command, args []string) error {
+			return runPluginsSign(out, args[0], privateKeyPath)
+		},
+	}
+	cmd.Flags().StringVar(&privateKeyPath, "private-key", "",
+		"private key file to sign with, as written by `agent plugins keygen`")
+	mustMarkFlagRequired(cmd, "private-key")
+	return cmd
+}
+
+// runPluginsSign signs packageDir/plugin.json with the key in privateKeyPath
+// and writes packageDir/plugin.sig.
+//
+// It signs the manifest's RAW BYTES, exactly as read, and does not parse them:
+// what a verifier checks is a byte string, so re-encoding anything here would
+// risk signing something other than the file that ships. By the same token
+// this command does not judge whether plugin.json is a valid manifest —
+// LoadPackage does that, after checking the signature, and duplicating the
+// schema here would mean a signer that has to be updated in lockstep with a
+// format it has no stake in.
+//
+// The signature is verified before it is written (see verifyOwnSignature).
+// Nothing is written if that check fails.
+func runPluginsSign(out io.Writer, packageDir string, privateKeyPath string) error {
+	dir := strings.TrimSpace(packageDir)
+	if dir == "" {
+		return errors.New("plugins sign: the package directory is empty; name the directory holding the " +
+			"plugin.json to sign")
+	}
+	keyPath := strings.TrimSpace(privateKeyPath)
+	if keyPath == "" {
+		return errors.New("plugins sign: --private-key is empty; there is no key to sign with")
+	}
+
+	keyData, err := os.ReadFile(keyPath)
+	if err != nil {
+		return fmt.Errorf("read private key file %q: %w", keyPath, err)
+	}
+	id, priv, err := sign.ParsePrivateKey(keyData)
+	if err != nil {
+		return fmt.Errorf("parse private key file %s: %w", keyPath, err)
+	}
+
+	manifestPath := filepath.Join(dir, "plugin.json")
+	manifestData, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return fmt.Errorf("read the plugin.json to sign at %s: %w", manifestPath, err)
+	}
+
+	signature, err := sign.Sign(priv, id, manifestData)
+	if err != nil {
+		return fmt.Errorf("sign %s: %w", manifestPath, err)
+	}
+	doc, err := sign.MarshalSignature(signature)
+	if err != nil {
+		return fmt.Errorf("encode the signature for %s: %w", manifestPath, err)
+	}
+	if err := verifyOwnSignature(doc, id, priv, manifestData); err != nil {
+		return fmt.Errorf("sign %s: %w", manifestPath, err)
+	}
+
+	sigPath := filepath.Join(dir, "plugin.sig")
+	replaced := false
+	switch _, err := os.Stat(sigPath); {
+	case err == nil:
+		replaced = true
+	case errors.Is(err, fs.ErrNotExist):
+		replaced = false
+	default:
+		return fmt.Errorf("inspect the existing signature at %s: %w", sigPath, err)
+	}
+	if err := os.WriteFile(sigPath, doc, signatureFileMode); err != nil {
+		return fmt.Errorf("write the signature to %s: %w", sigPath, err)
+	}
+
+	note := ""
+	if replaced {
+		// Announced rather than silent: re-signing with a DIFFERENT key is the
+		// quietest way to change which key a deployment's packages answer to,
+		// and an operator who did it by accident has to be able to see it in
+		// the output they already read.
+		note = " (replaced the signature that was already there)"
+	}
+	if _, err := fmt.Fprintf(out, "signed %s with key %q, and verified the result against that key.\n",
+		manifestPath, id); err != nil {
+		return fmt.Errorf("write plugins sign output: %w", err)
+	}
+	if _, err := fmt.Fprintf(out, "wrote %s%s.\n", sigPath, note); err != nil {
+		return fmt.Errorf("write plugins sign output: %w", err)
+	}
+	return nil
+}
+
+// verifyOwnSignature checks the plugin.sig document this command is about to
+// write the same way the loader will check it: the bytes are parsed back with
+// sign.ParseSignature, the trust set an operator would hold is rebuilt from
+// the signing key's own public half (through sign.MarshalKeyring and
+// sign.ParseKeyring, so the check runs through the production reader rather
+// than a privately assembled keyring that could drift from it), and
+// sign.Keyring.Verify runs over the same manifest bytes that were signed.
+//
+// This is not a formality, and it is not a test of the crypto library. An
+// Ed25519 private key is a seed followed by the public key that seed derives,
+// and nothing in the format binds the two together: a file that pairs one
+// pair's seed with another pair's public half is well-formed in every
+// checkable way, signs without complaint, and produces signatures that verify
+// against NOTHING — not the stated key, not any other. Without this check the
+// command would report success, write that signature out, and the failure
+// would surface at deployment as "signature verification is broken", which is
+// the one lesson a signing tool must never teach.
+func verifyOwnSignature(doc []byte, id sign.KeyID, priv ed25519.PrivateKey, message []byte) error {
+	pub, ok := priv.Public().(ed25519.PublicKey)
+	if !ok {
+		panic(fmt.Sprintf("cli: an ed25519 private key's Public() returned %T", priv.Public()))
+	}
+	keyringDoc, err := sign.MarshalKeyring(id, pub)
+	if err != nil {
+		return fmt.Errorf("build the trust set to check our own signature against: %w", err)
+	}
+	keyring, err := sign.ParseKeyring(keyringDoc)
+	if err != nil {
+		return fmt.Errorf("read back the trust set to check our own signature against: %w", err)
+	}
+	parsed, err := sign.ParseSignature(doc)
+	if err != nil {
+		return fmt.Errorf("read back the signature just produced: %w", err)
+	}
+	if err := keyring.Verify(parsed, message); err != nil {
+		return fmt.Errorf("the signature just produced does not verify against key %q's own public half, so a "+
+			"deployment would refuse this package; nothing was written: %w", id, err)
 	}
 	return nil
 }

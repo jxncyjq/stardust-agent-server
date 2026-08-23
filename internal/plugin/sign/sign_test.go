@@ -517,3 +517,258 @@ func TestIDs_NilKeyringPanics(t *testing.T) {
 	var kr *Keyring
 	_ = kr.IDs()
 }
+
+// --- marshalling -----------------------------------------------------------
+
+// privJSON marshals a private key document from raw fields, for the same
+// reason keyringJSON and sigJSON do: a test that wants exactly one field
+// wrong must be able to say so without depending on this package's internal
+// struct shapes.
+func privJSON(t *testing.T, fields map[string]any) []byte {
+	t.Helper()
+	data, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatalf("marshal private key fixture: %v", err)
+	}
+	return data
+}
+
+func validPrivFields(keyID string, priv []byte) map[string]any {
+	return map[string]any{"key_id": keyID, "algorithm": "ed25519", "private_key": b64(priv)}
+}
+
+func TestMarshalSignature_RoundTripsThroughParseSignature(t *testing.T) {
+	_, priv := mustGenerateKey(t)
+	sig, err := Sign(priv, "ops-2026", []byte("message"))
+	if err != nil {
+		t.Fatalf("Sign: unexpected error: %v", err)
+	}
+
+	data, err := MarshalSignature(sig)
+	if err != nil {
+		t.Fatalf("MarshalSignature: unexpected error: %v", err)
+	}
+	got, err := ParseSignature(data)
+	if err != nil {
+		t.Fatalf("ParseSignature of MarshalSignature output: unexpected error: %v", err)
+	}
+	if got.KeyID != sig.KeyID {
+		t.Errorf("KeyID = %q, want %q", got.KeyID, sig.KeyID)
+	}
+	if got.Algorithm != sig.Algorithm {
+		t.Errorf("Algorithm = %q, want %q", got.Algorithm, sig.Algorithm)
+	}
+	if b64(got.Value) != b64(sig.Value) {
+		t.Errorf("Value = %q, want %q", b64(got.Value), b64(sig.Value))
+	}
+}
+
+func TestMarshalSignature_RejectsEmptyKeyID(t *testing.T) {
+	_, priv := mustGenerateKey(t)
+	sig, err := Sign(priv, "ops-2026", []byte("message"))
+	if err != nil {
+		t.Fatalf("Sign: unexpected error: %v", err)
+	}
+	sig.KeyID = ""
+	_, err = MarshalSignature(sig)
+	requireErrorContains(t, err, "key_id is empty")
+}
+
+func TestMarshalSignature_RejectsNonEd25519Algorithm(t *testing.T) {
+	_, priv := mustGenerateKey(t)
+	sig, err := Sign(priv, "ops-2026", []byte("message"))
+	if err != nil {
+		t.Fatalf("Sign: unexpected error: %v", err)
+	}
+	sig.Algorithm = "rsa"
+	_, err = MarshalSignature(sig)
+	requireErrorContains(t, err, "rsa")
+}
+
+func TestMarshalSignature_RejectsWrongValueLength(t *testing.T) {
+	_, priv := mustGenerateKey(t)
+	sig, err := Sign(priv, "ops-2026", []byte("message"))
+	if err != nil {
+		t.Fatalf("Sign: unexpected error: %v", err)
+	}
+	sig.Value = sig.Value[:10]
+	_, err = MarshalSignature(sig)
+	requireErrorContains(t, err, "want 64")
+}
+
+func TestMarshalKeyEntry_ParsesInsideAKeyring(t *testing.T) {
+	pub, priv := mustGenerateKey(t)
+
+	entry, err := MarshalKeyEntry("ops-2026", pub)
+	if err != nil {
+		t.Fatalf("MarshalKeyEntry: unexpected error: %v", err)
+	}
+	kr, err := ParseKeyring([]byte(`{"keys":[` + string(entry) + `]}`))
+	if err != nil {
+		t.Fatalf("ParseKeyring of a document built from MarshalKeyEntry: unexpected error: %v", err)
+	}
+	sig, err := Sign(priv, "ops-2026", []byte("message"))
+	if err != nil {
+		t.Fatalf("Sign: unexpected error: %v", err)
+	}
+	if err := kr.Verify(sig, []byte("message")); err != nil {
+		t.Fatalf("Verify against the marshalled entry: unexpected error: %v", err)
+	}
+}
+
+func TestMarshalKeyEntry_RejectsEmptyID(t *testing.T) {
+	pub, _ := mustGenerateKey(t)
+	_, err := MarshalKeyEntry("", pub)
+	requireErrorContains(t, err, "key id is empty")
+}
+
+func TestMarshalKeyEntry_RejectsWrongPublicKeyLength(t *testing.T) {
+	pub, _ := mustGenerateKey(t)
+	_, err := MarshalKeyEntry("ops-2026", pub[:10])
+	requireErrorContains(t, err, "want 32")
+}
+
+func TestMarshalKeyring_RoundTripsThroughParseKeyring(t *testing.T) {
+	pub, priv := mustGenerateKey(t)
+
+	data, err := MarshalKeyring("ops-2026", pub)
+	if err != nil {
+		t.Fatalf("MarshalKeyring: unexpected error: %v", err)
+	}
+	kr, err := ParseKeyring(data)
+	if err != nil {
+		t.Fatalf("ParseKeyring of MarshalKeyring output: unexpected error: %v", err)
+	}
+	ids := kr.IDs()
+	if len(ids) != 1 || ids[0] != "ops-2026" {
+		t.Fatalf("IDs() = %v, want exactly [ops-2026]", ids)
+	}
+	sig, err := Sign(priv, "ops-2026", []byte("message"))
+	if err != nil {
+		t.Fatalf("Sign: unexpected error: %v", err)
+	}
+	if err := kr.Verify(sig, []byte("message")); err != nil {
+		t.Fatalf("Verify against the marshalled keyring: unexpected error: %v", err)
+	}
+}
+
+func TestMarshalKeyring_RejectsWrongPublicKeyLength(t *testing.T) {
+	pub, _ := mustGenerateKey(t)
+	_, err := MarshalKeyring("ops-2026", pub[:31])
+	requireErrorContains(t, err, "want 32")
+}
+
+func TestMarshalPrivateKey_RoundTripsThroughParsePrivateKey(t *testing.T) {
+	pub, priv := mustGenerateKey(t)
+
+	data, err := MarshalPrivateKey("ops-2026", priv)
+	if err != nil {
+		t.Fatalf("MarshalPrivateKey: unexpected error: %v", err)
+	}
+	id, got, err := ParsePrivateKey(data)
+	if err != nil {
+		t.Fatalf("ParsePrivateKey of MarshalPrivateKey output: unexpected error: %v", err)
+	}
+	if id != "ops-2026" {
+		t.Errorf("key id = %q, want %q", id, "ops-2026")
+	}
+	if b64(got) != b64(priv) {
+		t.Error("round-tripped private key differs from the one marshalled")
+	}
+	sig, err := Sign(got, id, []byte("message"))
+	if err != nil {
+		t.Fatalf("Sign with the round-tripped key: unexpected error: %v", err)
+	}
+	if !ed25519.Verify(pub, []byte("message"), sig.Value) {
+		t.Error("a signature made with the round-tripped private key does not verify against the original public key")
+	}
+}
+
+func TestMarshalPrivateKey_RejectsEmptyID(t *testing.T) {
+	_, priv := mustGenerateKey(t)
+	_, err := MarshalPrivateKey("", priv)
+	requireErrorContains(t, err, "key id is empty")
+}
+
+func TestMarshalPrivateKey_RejectsWrongLength(t *testing.T) {
+	_, priv := mustGenerateKey(t)
+	_, err := MarshalPrivateKey("ops-2026", priv[:32])
+	requireErrorContains(t, err, "want 64")
+}
+
+// TestMarshalPrivateKey_ErrorsNeverEchoTheKey pins the one property this
+// document's existence risks: private key material reaching an error message.
+// A key of the wrong LENGTH is exactly the case an implementation is most
+// tempted to report by dumping what it was handed.
+func TestMarshalPrivateKey_ErrorsNeverEchoTheKey(t *testing.T) {
+	_, priv := mustGenerateKey(t)
+	short := priv[:32]
+	_, err := MarshalPrivateKey("ops-2026", short)
+	if err == nil {
+		t.Fatal("MarshalPrivateKey: want an error for a 32-byte private key, got nil")
+	}
+	if strings.Contains(err.Error(), b64(short)) || strings.Contains(err.Error(), string(short)) {
+		t.Errorf("MarshalPrivateKey error %q echoes the private key material", err)
+	}
+}
+
+func TestParsePrivateKey_RejectsUnknownField(t *testing.T) {
+	_, priv := mustGenerateKey(t)
+	fields := validPrivFields("ops-2026", priv)
+	fields["comment"] = "generated on the ops laptop"
+	_, _, err := ParsePrivateKey(privJSON(t, fields))
+	requireErrorContains(t, err, "comment")
+}
+
+func TestParsePrivateKey_RejectsMalformedJSON(t *testing.T) {
+	_, _, err := ParsePrivateKey([]byte(`{"key_id":`))
+	requireErrorContains(t, err, "parse private key")
+}
+
+func TestParsePrivateKey_RejectsTrailingContent(t *testing.T) {
+	_, priv := mustGenerateKey(t)
+	data := append(privJSON(t, validPrivFields("ops-2026", priv)), []byte(`{"key_id":"other"}`)...)
+	_, _, err := ParsePrivateKey(data)
+	requireErrorContains(t, err, "unexpected content")
+}
+
+func TestParsePrivateKey_RejectsEmptyKeyID(t *testing.T) {
+	_, priv := mustGenerateKey(t)
+	_, _, err := ParsePrivateKey(privJSON(t, validPrivFields("", priv)))
+	requireErrorContains(t, err, "key_id is empty")
+}
+
+func TestParsePrivateKey_RejectsNonEd25519Algorithm(t *testing.T) {
+	_, priv := mustGenerateKey(t)
+	fields := validPrivFields("ops-2026", priv)
+	fields["algorithm"] = "rsa"
+	_, _, err := ParsePrivateKey(privJSON(t, fields))
+	requireErrorContains(t, err, "rsa")
+}
+
+func TestParsePrivateKey_RejectsInvalidBase64(t *testing.T) {
+	fields := map[string]any{"key_id": "ops-2026", "algorithm": "ed25519", "private_key": "not base64!!"}
+	_, _, err := ParsePrivateKey(privJSON(t, fields))
+	requireErrorContains(t, err, "base64")
+}
+
+func TestParsePrivateKey_RejectsWrongLength(t *testing.T) {
+	_, priv := mustGenerateKey(t)
+	_, _, err := ParsePrivateKey(privJSON(t, validPrivFields("ops-2026", priv[:32])))
+	requireErrorContains(t, err, "want 64")
+}
+
+// TestParsePrivateKey_ErrorsNeverEchoTheDocument is the reading half of
+// TestMarshalPrivateKey_ErrorsNeverEchoTheKey: a private_key that is valid
+// base64 but the wrong length must be reported by LENGTH, never by content.
+func TestParsePrivateKey_ErrorsNeverEchoTheDocument(t *testing.T) {
+	_, priv := mustGenerateKey(t)
+	short := priv[:48]
+	_, _, err := ParsePrivateKey(privJSON(t, validPrivFields("ops-2026", short)))
+	if err == nil {
+		t.Fatal("ParsePrivateKey: want an error for a 48-byte private key, got nil")
+	}
+	if strings.Contains(err.Error(), b64(short)) || strings.Contains(err.Error(), string(short)) {
+		t.Errorf("ParsePrivateKey error %q echoes the private key material", err)
+	}
+}

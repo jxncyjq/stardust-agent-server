@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -14,6 +15,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -1901,5 +1903,400 @@ func TestAssemblePluginsReportsAConfiguredKeyringWhilePluginsAreOff(t *testing.T
 	}
 	if !strings.Contains(log, "no-such-keyring.json") {
 		t.Errorf("startup log = %q, want it to name the keyring that is not in use", log)
+	}
+}
+
+// --- keygen / sign ---------------------------------------------------------
+
+// runAgent runs the root command with args and returns EVERYTHING the process
+// would have shown an operator: the writer the commands print to, cobra's own
+// stdout and its stderr are all pointed at one buffer. The private-key leak
+// test below depends on that: a key that reached any of the three would be a
+// key an operator (or a CI log) can read, and a test watching only one stream
+// would miss it.
+func runAgent(t *testing.T, args ...string) (string, error) {
+	t.Helper()
+	var out bytes.Buffer
+	root := NewRoot(app.New(), &out)
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs(args)
+	root.SetContext(context.Background())
+	err := root.Execute()
+	return out.String(), err
+}
+
+// keyEntryFrom extracts the keyring entry `agent plugins keygen` printed —
+// the substring from its first "{" to its last "}" — and parses it as a
+// one-key trust set. It is how these tests take the operator's own route:
+// paste what keygen printed into a keyring, and use that keyring to verify.
+func keyEntryFrom(t *testing.T, out string) *sign.Keyring {
+	t.Helper()
+	start := strings.Index(out, "{")
+	end := strings.LastIndex(out, "}")
+	if start < 0 || end < start {
+		t.Fatalf("keygen output %q contains no JSON object to paste into a keyring", out)
+	}
+	entry := out[start : end+1]
+	kr, err := sign.ParseKeyring([]byte(`{"keys":[` + entry + `]}`))
+	if err != nil {
+		t.Fatalf("the entry keygen printed (%s) does not parse inside a keyring: %v", entry, err)
+	}
+	return kr
+}
+
+// mustKeygen runs keygen into dir under id and returns the private key path
+// together with the keyring built from the entry it printed.
+func mustKeygen(t *testing.T, dir string, id string) (string, *sign.Keyring) {
+	t.Helper()
+	keyPath := filepath.Join(dir, id+".key")
+	out, err := runAgent(t, "plugins", "keygen", "--key-id", id, "--private-key", keyPath)
+	if err != nil {
+		t.Fatalf("plugins keygen error = %v, want nil (output: %s)", err, out)
+	}
+	return keyPath, keyEntryFrom(t, out)
+}
+
+// writeSignablePackage writes a plugin.json into a fresh directory and
+// returns the directory and the manifest's raw bytes — the exact bytes a
+// signature must be made over.
+func writeSignablePackage(t *testing.T) (string, []byte) {
+	t.Helper()
+	dir := t.TempDir()
+	body := []byte(`{"name":"legion-jira","version":"1.2.0","abi":1,"sha256":"` +
+		strings.Repeat("ab", 32) + `","tools":["jira_search"],"capabilities":["log"]}`)
+	if err := os.WriteFile(filepath.Join(dir, "plugin.json"), body, 0o600); err != nil {
+		t.Fatalf("write plugin.json: %v", err)
+	}
+	return dir, body
+}
+
+func TestPluginsKeygenWritesAPrivateKeyAndPrintsAPastableKeyringEntry(t *testing.T) {
+	dir := t.TempDir()
+	keyPath, kr := mustKeygen(t, dir, "ops-2026")
+
+	data, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatalf("read the generated private key: %v", err)
+	}
+	id, priv, err := sign.ParsePrivateKey(data)
+	if err != nil {
+		t.Fatalf("the private key keygen wrote does not parse: %v", err)
+	}
+	if id != "ops-2026" {
+		t.Errorf("private key names key id %q, want %q", id, "ops-2026")
+	}
+	// The round trip that matters: the key on disk and the entry on stdout
+	// must be halves of the same pair, or an operator who pastes the entry
+	// into their keyring gets a trust set that refuses everything this key
+	// signs.
+	sig, err := sign.Sign(priv, id, []byte("message"))
+	if err != nil {
+		t.Fatalf("sign with the generated private key: %v", err)
+	}
+	if err := kr.Verify(sig, []byte("message")); err != nil {
+		t.Fatalf("the printed entry does not verify what the written key signs: %v", err)
+	}
+}
+
+// TestPluginsKeygenRefusesToOverwriteAnExistingPrivateKey pins the one
+// irreversible thing this command could do. Overwriting a private key
+// destroys every signature ever made with it, with no way back, so the
+// refusal is checked together with the file being byte-for-byte untouched:
+// "it errored" is not enough if it errored after truncating.
+func TestPluginsKeygenRefusesToOverwriteAnExistingPrivateKey(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "ops-2026.key")
+	original := []byte("the production signing key, irreplaceable\n")
+	if err := os.WriteFile(keyPath, original, 0o600); err != nil {
+		t.Fatalf("write the pre-existing key: %v", err)
+	}
+
+	out, err := runAgent(t, "plugins", "keygen", "--key-id", "ops-2026", "--private-key", keyPath)
+	if err == nil {
+		t.Fatalf("plugins keygen error = nil, want an error: %s already exists (output: %s)", keyPath, out)
+	}
+	if !strings.Contains(err.Error(), keyPath) {
+		t.Errorf("plugins keygen error = %v, want it to name the file it refused to overwrite", err)
+	}
+
+	after, readErr := os.ReadFile(keyPath)
+	if readErr != nil {
+		t.Fatalf("read the pre-existing key after the refusal: %v", readErr)
+	}
+	if !bytes.Equal(after, original) {
+		t.Errorf("the pre-existing key changed: got %q, want %q", after, original)
+	}
+}
+
+func TestPluginsKeygenWritesThePrivateKeyReadableOnlyByItsOwner(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping the 0600 assertion: Go maps a file mode onto Windows' read-only " +
+			"attribute only, so os.Stat reports 0666/0444 whatever mode the file was created " +
+			"with. Asserting it here would pin the mapping, not the permission.")
+	}
+	dir := t.TempDir()
+	keyPath, _ := mustKeygen(t, dir, "ops-2026")
+
+	info, err := os.Stat(keyPath)
+	if err != nil {
+		t.Fatalf("stat the generated private key: %v", err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Errorf("private key mode = %#o, want %#o", perm, 0o600)
+	}
+}
+
+// TestPluginsKeygenNeverPrintsThePrivateKey searches EVERYTHING the command
+// wrote for the key it just produced, in every encoding it could plausibly
+// have been rendered in, and for the seed alone (the first 32 bytes) — half a
+// private key is a whole private key.
+//
+// The public key is asserted to BE present, so this test cannot pass by the
+// search being broken.
+func TestPluginsKeygenNeverPrintsThePrivateKey(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "ops-2026.key")
+	out, err := runAgent(t, "plugins", "keygen", "--key-id", "ops-2026", "--private-key", keyPath)
+	if err != nil {
+		t.Fatalf("plugins keygen error = %v, want nil", err)
+	}
+
+	data, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatalf("read the generated private key: %v", err)
+	}
+	_, priv, err := sign.ParsePrivateKey(data)
+	if err != nil {
+		t.Fatalf("the private key keygen wrote does not parse: %v", err)
+	}
+	seed := priv.Seed()
+	forbidden := map[string]string{
+		"the private key, raw":       string(priv),
+		"the private key, base64":    base64.StdEncoding.EncodeToString(priv),
+		"the private key, hex":       hex.EncodeToString(priv),
+		"the private key, url-safe":  base64.URLEncoding.EncodeToString(priv),
+		"the seed, raw":              string(seed),
+		"the seed, base64":           base64.StdEncoding.EncodeToString(seed),
+		"the seed, hex":              hex.EncodeToString(seed),
+		"the whole private key file": string(data),
+	}
+	for what, needle := range forbidden {
+		if strings.Contains(out, needle) {
+			t.Errorf("keygen output contains %s", what)
+		}
+	}
+
+	// The counter-assertion: the search above is only meaningful if this
+	// technique can find a key that IS printed.
+	pub := priv.Public().(ed25519.PublicKey)
+	if !strings.Contains(out, base64.StdEncoding.EncodeToString(pub)) {
+		t.Error("keygen output does not contain the PUBLIC key, so the searches above prove nothing")
+	}
+}
+
+func TestPluginsKeygenRefusesAnEmptyKeyID(t *testing.T) {
+	dir := t.TempDir()
+	keyPath := filepath.Join(dir, "blank.key")
+	_, err := runAgent(t, "plugins", "keygen", "--key-id", "", "--private-key", keyPath)
+	if err == nil {
+		t.Fatal("plugins keygen error = nil, want an error: an unnamed key can never be resolved in a keyring")
+	}
+	if _, statErr := os.Stat(keyPath); !os.IsNotExist(statErr) {
+		t.Errorf("a key file was created for a refused key id: stat error = %v, want not-exist", statErr)
+	}
+}
+
+func TestPluginsSignProducesASignatureTheVerifierAccepts(t *testing.T) {
+	keyDir := t.TempDir()
+	keyPath, kr := mustKeygen(t, keyDir, "ops-2026")
+	pkgDir, manifestData := writeSignablePackage(t)
+
+	out, err := runAgent(t, "plugins", "sign", pkgDir, "--private-key", keyPath)
+	if err != nil {
+		t.Fatalf("plugins sign error = %v, want nil (output: %s)", err, out)
+	}
+
+	sigData, err := os.ReadFile(filepath.Join(pkgDir, "plugin.sig"))
+	if err != nil {
+		t.Fatalf("read the plugin.sig sign wrote: %v", err)
+	}
+	sig, err := sign.ParseSignature(sigData)
+	if err != nil {
+		t.Fatalf("the plugin.sig sign wrote does not parse: %v", err)
+	}
+	if err := kr.Verify(sig, manifestData); err != nil {
+		t.Fatalf("the plugin.sig sign wrote does not verify against the keyring keygen printed: %v", err)
+	}
+	if sig.KeyID != "ops-2026" {
+		t.Errorf("plugin.sig names key %q, want %q", sig.KeyID, "ops-2026")
+	}
+}
+
+func TestPluginsSignFailsWhenThePackageHasNoManifest(t *testing.T) {
+	keyDir := t.TempDir()
+	keyPath, _ := mustKeygen(t, keyDir, "ops-2026")
+	pkgDir := t.TempDir()
+
+	_, err := runAgent(t, "plugins", "sign", pkgDir, "--private-key", keyPath)
+	if err == nil {
+		t.Fatal("plugins sign error = nil, want an error: there is no plugin.json to sign")
+	}
+	if !strings.Contains(err.Error(), "plugin.json") {
+		t.Errorf("plugins sign error = %v, want it to name the missing plugin.json", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(pkgDir, "plugin.sig")); !os.IsNotExist(statErr) {
+		t.Errorf("a plugin.sig was written for a package with no manifest: stat error = %v, want not-exist", statErr)
+	}
+}
+
+func TestPluginsSignFailsOnACorruptPrivateKeyFile(t *testing.T) {
+	keyDir := t.TempDir()
+	keyPath := filepath.Join(keyDir, "corrupt.key")
+	if err := os.WriteFile(keyPath, []byte("-----BEGIN NOT A KEY-----\n"), 0o600); err != nil {
+		t.Fatalf("write the corrupt key: %v", err)
+	}
+	pkgDir, _ := writeSignablePackage(t)
+
+	_, err := runAgent(t, "plugins", "sign", pkgDir, "--private-key", keyPath)
+	if err == nil {
+		t.Fatal("plugins sign error = nil, want an error: the private key file does not parse")
+	}
+	if !strings.Contains(err.Error(), keyPath) {
+		t.Errorf("plugins sign error = %v, want it to name the private key file", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(pkgDir, "plugin.sig")); !os.IsNotExist(statErr) {
+		t.Errorf("a plugin.sig was written from a corrupt key: stat error = %v, want not-exist", statErr)
+	}
+}
+
+func TestPluginsSignFailsWhenThePrivateKeyFileIsMissing(t *testing.T) {
+	pkgDir, _ := writeSignablePackage(t)
+	keyPath := filepath.Join(t.TempDir(), "absent.key")
+
+	_, err := runAgent(t, "plugins", "sign", pkgDir, "--private-key", keyPath)
+	if err == nil {
+		t.Fatal("plugins sign error = nil, want an error: the private key file does not exist")
+	}
+	if !strings.Contains(err.Error(), keyPath) {
+		t.Errorf("plugins sign error = %v, want it to name the private key file", err)
+	}
+}
+
+// TestPluginsSignRefusesToWriteASignatureItCannotVerifyItself is the test the
+// self-check exists for. The private key below is well-formed in every
+// checkable way — 64 bytes, base64, named — but its two halves come from
+// DIFFERENT key pairs, so ed25519.Sign happily produces a signature that
+// verifies against nothing at all. A signer without a self-check would write
+// that signature out and report success, and the operator would discover it
+// at deployment time as "verification is broken".
+func TestPluginsSignRefusesToWriteASignatureItCannotVerifyItself(t *testing.T) {
+	_, privA, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key A: %v", err)
+	}
+	pubB, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate key B: %v", err)
+	}
+	mixed := make([]byte, ed25519.PrivateKeySize)
+	copy(mixed, privA.Seed())
+	copy(mixed[ed25519.SeedSize:], pubB)
+	doc, err := sign.MarshalPrivateKey("ops-2026", ed25519.PrivateKey(mixed))
+	if err != nil {
+		t.Fatalf("marshal the mismatched private key: %v", err)
+	}
+	keyPath := filepath.Join(t.TempDir(), "mismatched.key")
+	if err := os.WriteFile(keyPath, doc, 0o600); err != nil {
+		t.Fatalf("write the mismatched key: %v", err)
+	}
+	pkgDir, _ := writeSignablePackage(t)
+
+	out, err := runAgent(t, "plugins", "sign", pkgDir, "--private-key", keyPath)
+	if err == nil {
+		t.Fatalf("plugins sign error = nil, want an error: the signature it produced verifies against nothing (output: %s)", out)
+	}
+	if !strings.Contains(err.Error(), "verif") {
+		t.Errorf("plugins sign error = %v, want it to say the self-check failed", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(pkgDir, "plugin.sig")); !os.IsNotExist(statErr) {
+		t.Errorf("plugin.sig was written despite the self-check failing: stat error = %v, want not-exist", statErr)
+	}
+}
+
+// TestPluginsSignSaysWhenItReplacedAnExistingSignature pins the deliberate
+// asymmetry with keygen: re-signing a package is routine and overwriting
+// plugin.sig is allowed, but it is announced — a re-sign that silently
+// replaced a signature made by a DIFFERENT key would be the quietest way to
+// swap out which key a deployment trusts.
+func TestPluginsSignSaysWhenItReplacedAnExistingSignature(t *testing.T) {
+	keyDir := t.TempDir()
+	keyPath, kr := mustKeygen(t, keyDir, "ops-2026")
+	pkgDir, manifestData := writeSignablePackage(t)
+	sigPath := filepath.Join(pkgDir, "plugin.sig")
+	if err := os.WriteFile(sigPath, []byte(`{"key_id":"stale","algorithm":"ed25519","signature":""}`), 0o600); err != nil {
+		t.Fatalf("write the stale plugin.sig: %v", err)
+	}
+
+	out, err := runAgent(t, "plugins", "sign", pkgDir, "--private-key", keyPath)
+	if err != nil {
+		t.Fatalf("plugins sign error = %v, want nil: re-signing is a normal operation", err)
+	}
+	if !strings.Contains(out, "replac") {
+		t.Errorf("plugins sign output = %q, want it to say it replaced the existing plugin.sig", out)
+	}
+
+	sigData, err := os.ReadFile(sigPath)
+	if err != nil {
+		t.Fatalf("read the replaced plugin.sig: %v", err)
+	}
+	sig, err := sign.ParseSignature(sigData)
+	if err != nil {
+		t.Fatalf("the replaced plugin.sig does not parse: %v", err)
+	}
+	if err := kr.Verify(sig, manifestData); err != nil {
+		t.Fatalf("the replaced plugin.sig does not verify: %v", err)
+	}
+}
+
+// TestPluginsSignNeverPrintsThePrivateKey is keygen's leak test applied to the
+// other command that holds key material: sign reads a whole private key off
+// disk, and neither its output nor its errors may carry any of it.
+func TestPluginsSignNeverPrintsThePrivateKey(t *testing.T) {
+	keyDir := t.TempDir()
+	keyPath, _ := mustKeygen(t, keyDir, "ops-2026")
+	data, err := os.ReadFile(keyPath)
+	if err != nil {
+		t.Fatalf("read the generated private key: %v", err)
+	}
+	_, priv, err := sign.ParsePrivateKey(data)
+	if err != nil {
+		t.Fatalf("the private key keygen wrote does not parse: %v", err)
+	}
+	pkgDir, _ := writeSignablePackage(t)
+
+	out, signErr := runAgent(t, "plugins", "sign", pkgDir, "--private-key", keyPath)
+	if signErr != nil {
+		t.Fatalf("plugins sign error = %v, want nil", signErr)
+	}
+	// The failing path holds the same key just as long, so it is searched too.
+	failOut, failErr := runAgent(t, "plugins", "sign", filepath.Join(pkgDir, "no-such-package"), "--private-key", keyPath)
+	if failErr == nil {
+		t.Fatal("plugins sign on a missing package error = nil, want an error")
+	}
+	everything := out + failOut + failErr.Error()
+
+	seed := priv.Seed()
+	for what, needle := range map[string]string{
+		"the private key, raw":    string(priv),
+		"the private key, base64": base64.StdEncoding.EncodeToString(priv),
+		"the private key, hex":    hex.EncodeToString(priv),
+		"the seed, base64":        base64.StdEncoding.EncodeToString(seed),
+		"the seed, hex":           hex.EncodeToString(seed),
+		"the private key file":    string(data),
+	} {
+		if strings.Contains(everything, needle) {
+			t.Errorf("sign output or error contains %s", what)
+		}
 	}
 }
