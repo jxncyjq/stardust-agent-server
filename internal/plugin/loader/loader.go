@@ -628,6 +628,25 @@ func (l *Loader) converge(ctx context.Context, wanted []manifest.Entry, declared
 			// Unchanged: leave the running instance exactly as it is. Rebuilding
 			// it would discard whatever the guest holds in memory and pay a fresh
 			// instantiation for no change at all.
+			//
+			// Its recorded explanation is NOT left as it is, though. prepare
+			// returns nil only for an entry whose package was read, verified,
+			// assembled and fingerprinted cleanly just now, which disproves
+			// whatever an earlier convergence recorded against it — a tampered
+			// plugin.wasm, a signature that did not verify, a manifest that
+			// would not assemble. Left in place that note would never come off:
+			// an unchanged entry is never activated again, and activate is the
+			// only other place that clears it, so an operator who fixed the
+			// package and reloaded successfully would go on reading the failure
+			// they had already fixed on every `agent plugins status`.
+			//
+			// A SUSPENDED instance is skipped. Its note explains a withdrawal
+			// that is still in force, and convergeDependencies deliberately does
+			// not rewrite it for a plugin that was already suspended before this
+			// convergence began.
+			if inst := l.mounted(entry.Name); !inst.plugin.Suspended() {
+				inst.lastError = ""
+			}
 			continue
 		}
 		plans = append(plans, plan)

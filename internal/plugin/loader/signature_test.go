@@ -61,21 +61,7 @@ func newTestKeyWithID(t *testing.T, id sign.KeyID) (ed25519.PrivateKey, *sign.Ke
 func signPackage(t *testing.T, dir string, priv ed25519.PrivateKey) {
 	t.Helper()
 
-	manifestData, err := os.ReadFile(filepath.Join(dir, "plugin.json"))
-	if err != nil {
-		t.Fatalf("read plugin.json in %s: %v", dir, err)
-	}
-	sig, err := sign.Sign(priv, testKeyID, manifestData)
-	if err != nil {
-		t.Fatalf("sign plugin.json in %s: %v", dir, err)
-	}
-	doc, err := sign.MarshalSignature(sig)
-	if err != nil {
-		t.Fatalf("encode plugin.sig for %s: %v", dir, err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "plugin.sig"), doc, 0o644); err != nil {
-		t.Fatalf("write plugin.sig in %s: %v", dir, err)
-	}
+	signPackageAs(t, dir, priv, testKeyID)
 }
 
 // retagVersion rewrites dir/plugin.json with a different version, leaving the
