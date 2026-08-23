@@ -525,10 +525,13 @@ func suspendedRowDetail(st loader.InstanceStatus, providerOf map[string]string, 
 //   - nobody in this loader's view has ever contributed the tool at all —
 //     the operator's fix is to install a plugin that provides it;
 //   - a plugin DOES provide it, but that plugin is not active either — the
-//     operator's fix is one hop further up the chain, at the named plugin,
-//     and its current state is reported so the row does not have to lie
-//     about what "cascade" means if that plugin has since failed outright
-//     rather than merely stayed suspended.
+//     operator's fix is one hop further up the chain, at the named plugin.
+//     Its state is read from byName rather than hardcoded to "suspended":
+//     it always IS suspended today (a loaded plugin's requirement would not
+//     be unresolved, and a failed one contributes no Tools and so is never a
+//     provider at all — see pluginToolProviders), but reading the true value
+//     costs nothing and never asserts a state this package did not itself
+//     observe.
 //
 // Empty when suspendedBy is empty, which is a real state: a suspended entry
 // whose blocker was not a missing dependency (its tool name was taken by
