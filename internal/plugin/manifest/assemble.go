@@ -134,7 +134,7 @@ func verifyManifestSignature(dir string, manifestData []byte, keyring *sign.Keyr
 	}
 	sig, err := sign.ParseSignature(sigData)
 	if err != nil {
-		return fmt.Errorf("read plugin.sig: %w", err)
+		return fmt.Errorf("parse plugin.sig: %w", err)
 	}
 	if err := keyring.Verify(sig, manifestData); err != nil {
 		return fmt.Errorf("verify plugin.json signature: %w", err)

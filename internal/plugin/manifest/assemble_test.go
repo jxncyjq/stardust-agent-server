@@ -765,3 +765,20 @@ func TestLoadPackage_NilKeyringSkipsVerificationNotDigest(t *testing.T) {
 	}
 	requireErrorContains(t, err, "sha256")
 }
+
+// TestLoadPackage_MalformedSignatureDocument covers the remaining refusal in
+// verifyManifestSignature: a plugin.sig that is present but is not a
+// signature document at all must be refused, not read as "no signature" and
+// certainly not as a valid one.
+func TestLoadPackage_MalformedSignatureDocument(t *testing.T) {
+	dir, kr := signedPackage(t)
+	if err := os.WriteFile(filepath.Join(dir, "plugin.sig"), []byte("not a signature document"), 0o644); err != nil {
+		t.Fatalf("write malformed plugin.sig: %v", err)
+	}
+
+	_, _, err := LoadPackage(dir, kr)
+	if err == nil {
+		t.Fatal("LoadPackage: want an error for a malformed plugin.sig, got nil")
+	}
+	requireErrorContains(t, err, "parse plugin.sig")
+}
