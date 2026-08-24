@@ -138,17 +138,46 @@ type Cache struct {
 // root must not be empty. It is resolved to an absolute path, so a later
 // change of working directory cannot move the cache.
 func NewCache(root string) (*Cache, error) {
-	if root == "" {
-		return nil, errors.New("cache root path is empty")
-	}
-	abs, err := filepath.Abs(root)
+	abs, err := CacheRoot(root)
 	if err != nil {
-		return nil, fmt.Errorf("resolve cache root %s: %w", root, err)
+		return nil, err
 	}
 	if err := os.MkdirAll(abs, 0o700); err != nil {
 		return nil, fmt.Errorf("create cache root %s: %w", abs, err)
 	}
 	return &Cache{root: abs, lockWait: digestLockTimeout, lockPoll: digestLockPollInterval}, nil
+}
+
+// CacheRoot returns the absolute directory a Cache rooted at root would use,
+// without creating anything or touching the filesystem's contents.
+//
+// It is the resolution NewCache performs, exported for the one caller that
+// must compare a cache location it has only read from a config against the
+// root of a Cache that is already running (`agent plugins reload` does, to
+// refuse a reload after "plugins.cache" moved). That comparison has to use
+// this function rather than its own idea of resolving a path: two spellings of
+// the resolution would eventually disagree, and a disagreement here reports
+// "unchanged" for a cache that moved — the silent half-applied change the
+// comparison exists to prevent.
+//
+// An empty root is an error, not the working directory: a cache location the
+// caller did not state is not a location.
+func CacheRoot(root string) (string, error) {
+	if root == "" {
+		return "", errors.New("cache root path is empty")
+	}
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve cache root %s: %w", root, err)
+	}
+	return abs, nil
+}
+
+// Root returns the absolute directory this Cache files packages under. It is
+// what a caller comparing a running Cache against a configured location reads;
+// the Cache's own contents are reached through Has, Dir and Put.
+func (c *Cache) Root() string {
+	return c.root
 }
 
 // Dir returns the directory the package named by digest occupies, whether or

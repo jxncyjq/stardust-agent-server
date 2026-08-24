@@ -603,6 +603,91 @@ func (l *Loader) SignaturePolicy() SignaturePolicy {
 	return SignaturePolicyOf(l.keyring)
 }
 
+// RemotePolicy is a Loader's remote-source policy in comparable form: where
+// fetched packages are filed, and whether a plaintext source may be fetched at
+// all.
+//
+// It exists for the same caller SignaturePolicy does, and for the same reason.
+// Config.Remote is frozen when serve assembles the Loader and cannot be swapped
+// under a running one, so a command that re-reads the config while a Loader
+// runs (`agent plugins reload`) has to be able to tell whether the policy it
+// just read is the one the Loader was BUILT with. Without that comparison an
+// operator who turns "allow_insecure_sources" back off and reloads is told the
+// reload succeeded while the process keeps fetching over plaintext, and an
+// operator who moves "plugins.cache" keeps writing to the old directory with
+// nothing on screen saying so — a control that looks applied and is not.
+//
+// Only the two settings that decide WHAT MAY BE FETCHED AND WHERE IT LANDS are
+// in it. The fetch and unpack limits are deliberately left out: like the
+// Loader's resource ceilings, a stale bound is a performance surprise rather
+// than an unverified package or a download written somewhere the operator did
+// not choose.
+type RemotePolicy struct {
+	// CacheRoot is the absolute directory fetched packages are filed under
+	// (fetch.Cache.Root). It is empty exactly when no cache is configured —
+	// the deployment that cannot fetch anything at all, where every remote
+	// entry fails naming what is missing.
+	CacheRoot string
+
+	// AllowInsecureSources is whether an "http://" source may be fetched.
+	// False is the safe side and the value a deployment that says nothing
+	// gets; it relaxes the URL scheme and nothing else (see RemoteConfig).
+	AllowInsecureSources bool
+}
+
+// RemotePolicyOf describes the policy a Loader built with remote enforces. The
+// zero RemoteConfig — the deployment with no remote entries — is the policy
+// with no cache root and plaintext refused.
+//
+// It is exported so that a caller which has resolved a remote configuration
+// from a config but has not built a Loader from it computes the policy through
+// the same function Loader.RemotePolicy uses, rather than growing a second,
+// drifting idea of what a policy is.
+func RemotePolicyOf(remote RemoteConfig) RemotePolicy {
+	policy := RemotePolicy{AllowInsecureSources: remote.AllowInsecureSources}
+	if remote.Cache != nil {
+		policy.CacheRoot = remote.Cache.Root()
+	}
+	return policy
+}
+
+// Equal reports whether p and other are the same policy: the same cache root
+// and the same answer on plaintext sources. Both roots are absolute (a Cache
+// resolves its root at construction, and a caller reading one from a config
+// resolves it through fetch.CacheRoot), so this compares them as written.
+func (p RemotePolicy) Equal(other RemotePolicy) bool {
+	return p == other
+}
+
+// String renders p for an operator reading an error message: the plaintext
+// answer first, because it is the security-relevant half, then the cache root
+// so a moved cache is visible rather than merely asserted.
+//
+// The path is rendered unquoted on purpose. %q would escape every separator of
+// a Windows path, and an operator comparing this against what they wrote in
+// "plugins.cache" should be reading the path they wrote.
+func (p RemotePolicy) String() string {
+	plaintext := "plaintext sources refused"
+	if p.AllowInsecureSources {
+		plaintext = "plaintext sources allowed"
+	}
+	if p.CacheRoot == "" {
+		return plaintext + ", no plugin cache configured"
+	}
+	return fmt.Sprintf("%s, plugin cache %s", plaintext, p.CacheRoot)
+}
+
+// RemotePolicy returns the remote-source policy this Loader is enforcing right
+// now.
+//
+// No lock is taken: remote is written once in New and never again, so there is
+// nothing here for a concurrent Apply to race with. The returned value holds
+// no reference to the Loader's Cache — only the path it is rooted at — so a
+// caller cannot reach into the cache through it.
+func (l *Loader) RemotePolicy() RemotePolicy {
+	return RemotePolicyOf(l.remote)
+}
+
 // Apply converges the running plugin set toward dep, resolving each entry's
 // Source against root.
 //
@@ -664,6 +749,15 @@ func (l *Loader) SignaturePolicy() SignaturePolicy {
 //   - While Apply waits and converges, a task that tries to START is refused
 //     with taskgate.ErrApplyPending rather than joining a plugin set that is
 //     mid-change.
+//
+// The convergence itself is no longer necessarily brief either: an entry whose
+// source is a URL is FETCHED inside it (see prepare), so a round that has to
+// download N uncached remote packages holds the gate and the Loader's lock for
+// as long as those downloads take — bounded by Config.Remote.FetchLimits.
+// Timeout times the number of uncached remote entries, on top of the wait for
+// a task boundary. For that whole stretch new tasks are refused with
+// taskgate.ErrApplyPending and Status blocks. A deployment whose remote entries
+// are already cached pays none of it: a cache hit reads the disk and returns.
 //
 // Two Apply calls do not queue behind each other either: while one holds the
 // gate a second is refused with an error rather than waiting for its turn. The
@@ -1240,7 +1334,9 @@ func (l *Loader) remoteDir(ctx context.Context, entry manifest.Entry) (string, e
 	}
 	if entry.IsInsecureSource() && !l.remote.AllowInsecureSources {
 		return "", fmt.Errorf("plugin %q: source %q is plaintext http, which this deployment does not permit; "+
-			"plaintext is a debugging aid and has to be turned on explicitly", entry.Name, entry.Source)
+			"plaintext is a debugging aid and has to be turned on explicitly with "+
+			`"allow_insecure_sources": true in the plugins config (and this Loader's policy is fixed when serve `+
+			"starts, so changing it takes a restart rather than a reload)", entry.Name, entry.Source)
 	}
 
 	hit, err := l.remote.Cache.Has(entry.Digest)

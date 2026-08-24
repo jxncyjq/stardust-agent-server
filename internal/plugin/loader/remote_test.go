@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -118,7 +119,7 @@ func newTestCache(t *testing.T) *fetch.Cache {
 // every GET and counts the requests it received. It exists for the tests that
 // are specifically about the insecure-source policy; every other test uses the
 // https variant, which is what a real deployment uses.
-func servePlaintext(t *testing.T, archive []byte) (*httptest.Server, *int) {
+func servePlaintext(t *testing.T, archive []byte) (*httptest.Server, *atomic.Int64) {
 	t.Helper()
 
 	return serveCounting(t, httptest.NewServer, archive)
@@ -127,7 +128,7 @@ func servePlaintext(t *testing.T, archive []byte) (*httptest.Server, *int) {
 // serveTLS is servePlaintext over https. Its client (srv.Client()) is the only
 // one that trusts the test certificate, so it must be the one the Loader is
 // given.
-func serveTLS(t *testing.T, archive []byte) (*httptest.Server, *int) {
+func serveTLS(t *testing.T, archive []byte) (*httptest.Server, *atomic.Int64) {
 	t.Helper()
 
 	return serveCounting(t, httptest.NewTLSServer, archive)
@@ -135,18 +136,23 @@ func serveTLS(t *testing.T, archive []byte) (*httptest.Server, *int) {
 
 // serveCounting is the body servePlaintext and serveTLS share, parameterized
 // by which httptest constructor starts the server.
-func serveCounting(t *testing.T, start func(http.Handler) *httptest.Server, archive []byte) (*httptest.Server, *int) {
+//
+// The counter is atomic because it is written by the server's handler
+// goroutine and read by the test's: a completed HTTP round trip is not a
+// happens-before edge the race detector knows about, so a plain int here would
+// be a data race that passes by luck rather than by construction.
+func serveCounting(t *testing.T, start func(http.Handler) *httptest.Server, archive []byte) (*httptest.Server, *atomic.Int64) {
 	t.Helper()
 
-	hits := 0
+	hits := &atomic.Int64{}
 	srv := start(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		hits++
+		hits.Add(1)
 		if _, err := w.Write(archive); err != nil {
 			t.Errorf("write archive to client: %v", err)
 		}
 	}))
 	t.Cleanup(srv.Close)
-	return srv, &hits
+	return srv, hits
 }
 
 // serveNothing starts a server that FAILS THE TEST if it is contacted at all.
@@ -220,8 +226,8 @@ func TestApplyMountsARemotePackageItFetchedAndVerified(t *testing.T) {
 	if row.Version != "1.0.0" {
 		t.Errorf("plugin %q: Version = %q, want 1.0.0", echoPluginName, row.Version)
 	}
-	if *hits != 1 {
-		t.Errorf("the source was requested %d times, want exactly 1", *hits)
+	if got := hits.Load(); got != 1 {
+		t.Errorf("the source was requested %d times, want exactly 1", got)
 	}
 	has, err := cache.Has(digest)
 	if err != nil {
@@ -304,11 +310,17 @@ func TestApplyRefusesAnInsecureRemoteSourceByDefault(t *testing.T) {
 	if !strings.Contains(err.Error(), echoPluginName) {
 		t.Errorf("Apply() error = %v, want it to name the entry %q", err, echoPluginName)
 	}
+	// The remedy, not just the refusal: this is the message an operator meets
+	// on the reload path, where the assembly-time error that names the setting
+	// is never reached.
+	if !strings.Contains(err.Error(), "allow_insecure_sources") {
+		t.Errorf("Apply() error = %v, want it to name the switch that turns plaintext on", err)
+	}
 	if row := h.statusOf(echoPluginName); row.State != StateFailed {
 		t.Errorf("plugin %q: State = %q, want %q", echoPluginName, row.State, StateFailed)
 	}
-	if *hits != 0 {
-		t.Errorf("the plaintext source was contacted %d times, want 0: a refused scheme must never be fetched", *hits)
+	if got := hits.Load(); got != 0 {
+		t.Errorf("the plaintext source was contacted %d times, want 0: a refused scheme must never be fetched", got)
 	}
 }
 
@@ -325,8 +337,8 @@ func TestApplyFetchesAnInsecureRemoteSourceWhenItIsAllowed(t *testing.T) {
 	if row := h.statusOf(echoPluginName); row.State != StateLoaded {
 		t.Fatalf("plugin %q: State = %q, want %q (LastError %q)", echoPluginName, row.State, StateLoaded, row.LastError)
 	}
-	if *hits != 1 {
-		t.Errorf("the source was requested %d times, want exactly 1", *hits)
+	if got := hits.Load(); got != 1 {
+		t.Errorf("the source was requested %d times, want exactly 1", got)
 	}
 }
 
@@ -402,8 +414,8 @@ func TestApplyFailsARemoteEntryWhenNoCacheIsConfigured(t *testing.T) {
 	if row := h.statusOf(echoPluginName); row.State != StateFailed {
 		t.Errorf("plugin %q: State = %q, want %q", echoPluginName, row.State, StateFailed)
 	}
-	if *hits != 0 {
-		t.Errorf("the source was contacted %d times, want 0: with nowhere to put the package, nothing may be downloaded", *hits)
+	if got := hits.Load(); got != 0 {
+		t.Errorf("the source was contacted %d times, want 0: with nowhere to put the package, nothing may be downloaded", got)
 	}
 }
 
@@ -425,6 +437,104 @@ func TestApplyLeavesALocalEntryUnchangedWhenRemoteSourcesAreConfigured(t *testin
 	}
 	if row.Version != "1.0.0" {
 		t.Errorf("plugin %q: Version = %q, want 1.0.0", echoPluginName, row.Version)
+	}
+}
+
+// TestApplyRefetchesAPartiallyDeletedCacheEntry pins WHICH question decides a
+// cache hit: fetch.Cache.Has ("all three package files are there"), not "the
+// digest directory exists". The two differ exactly in the state an unpack that
+// died mid-write leaves behind, and treating that as a hit would mount a
+// partial plugin and -- because the directory is already there -- never fetch
+// the rest.
+//
+// The half-written directory is built by deleting one file from a complete
+// entry, which is that state with none of the timing. This is the wiring
+// level: fetch's own tests cover Has, but nothing pinned that remoteDir asks
+// Has rather than the filesystem.
+func TestApplyRefetchesAPartiallyDeletedCacheEntry(t *testing.T) {
+	priv, keyring := newTestKey(t)
+	_, archive := signedEchoArchive(t, priv, "1.0.0")
+	digest := digestOf(archive)
+	cache := newTestCache(t)
+	dir, err := cache.Put(digest, archive, testUnpackLimits())
+	if err != nil {
+		t.Fatalf("cache.Put: %v", err)
+	}
+	// One file short of a package: the directory still stands, so an existence
+	// check would call this a hit.
+	if err := os.Remove(filepath.Join(dir, "plugin.sig")); err != nil {
+		t.Fatalf("remove plugin.sig from the cached package: %v", err)
+	}
+	srv, hits := serveTLS(t, archive)
+	h := newHarnessWithRemote(t, keyring, remoteFor(t, srv, cache, false))
+
+	h.apply(remoteEntry(srv.URL+"/echo.tgz", digest))
+
+	if got := hits.Load(); got != 1 {
+		t.Errorf("the source was requested %d times, want exactly 1: an incomplete cache entry must be refetched", got)
+	}
+	if row := h.statusOf(echoPluginName); row.State != StateLoaded {
+		t.Fatalf("plugin %q: State = %q, want %q (LastError %q)", echoPluginName, row.State, StateLoaded, row.LastError)
+	}
+	// The refetch repaired the entry rather than mounting around it.
+	has, err := cache.Has(digest)
+	if err != nil {
+		t.Fatalf("cache.Has(%s): %v", digest, err)
+	}
+	if !has {
+		t.Errorf("cache.Has(%s) = false, want true: the refetch must leave a whole entry behind", digest)
+	}
+}
+
+// TestRemotePolicyDistinguishesAMovedCacheAndARelaxedSwitch pins what a remote
+// policy comparison has to be able to tell apart, because `agent plugins
+// reload` refuses on exactly this difference: the plaintext switch flipping
+// either way, and the cache moving. A policy that compared equal across those
+// would report a successful reload for a process still fetching under the old
+// rules.
+func TestRemotePolicyDistinguishesAMovedCacheAndARelaxedSwitch(t *testing.T) {
+	cache := newTestCache(t)
+	strict := RemotePolicyOf(RemoteConfig{Cache: cache, AllowInsecureSources: false})
+	relaxed := RemotePolicyOf(RemoteConfig{Cache: cache, AllowInsecureSources: true})
+	moved := RemotePolicyOf(RemoteConfig{Cache: newTestCache(t), AllowInsecureSources: false})
+
+	if !strict.Equal(RemotePolicyOf(RemoteConfig{Cache: cache})) {
+		t.Errorf("RemotePolicy.Equal(itself) = false, want true")
+	}
+	if strict.Equal(relaxed) {
+		t.Errorf("%s compared equal to %s, want unequal: the plaintext switch is the policy", strict, relaxed)
+	}
+	if strict.Equal(moved) {
+		t.Errorf("%s compared equal to %s, want unequal: a moved cache is a changed policy", strict, moved)
+	}
+	if unconfigured := RemotePolicyOf(RemoteConfig{}); unconfigured.Equal(strict) {
+		t.Errorf("%s compared equal to %s, want unequal: no cache is a policy of its own", unconfigured, strict)
+	}
+	if got := strict.String(); !strings.Contains(got, cache.Root()) || !strings.Contains(got, "refused") {
+		t.Errorf("RemotePolicy.String() = %q, want it to name the cache root and say plaintext is refused", got)
+	}
+	if got := relaxed.String(); !strings.Contains(got, "allowed") {
+		t.Errorf("RemotePolicy.String() = %q, want it to say plaintext sources are allowed", got)
+	}
+	if got := (RemotePolicy{}).String(); !strings.Contains(got, "no plugin cache") {
+		t.Errorf("RemotePolicy.String() = %q, want it to say no cache is configured", got)
+	}
+}
+
+// TestLoaderReportsTheRemotePolicyItWasBuiltWith is the accessor's half: the
+// value reload compares against has to come from the Loader that is actually
+// running, not from the config that built it.
+func TestLoaderReportsTheRemotePolicyItWasBuiltWith(t *testing.T) {
+	srv, _ := serveTLS(t, nil)
+	remote := remoteFor(t, srv, newTestCache(t), true)
+	h := newHarnessWithRemote(t, nil, remote)
+
+	if got := h.loader.RemotePolicy(); !got.Equal(RemotePolicyOf(remote)) {
+		t.Errorf("Loader.RemotePolicy() = %s, want the policy of the RemoteConfig it was built with %s",
+			got, RemotePolicyOf(remote))
+	}
+	if got := newHarness(t).loader.RemotePolicy(); !got.Equal(RemotePolicy{}) {
+		t.Errorf("Loader.RemotePolicy() = %s for a Loader with no remote section, want the unconfigured policy", got)
 	}
 }
 

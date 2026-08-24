@@ -3048,3 +3048,177 @@ func TestAssemblePluginsMountsARemotePackageThroughTheConfiguredCache(t *testing
 		}
 	}
 }
+
+// TestPluginsReloadRefusesATightenedRemoteSourcePolicy is the a5b-task-5
+// review's Important #1, and the same shape the signature-policy check above
+// exists for. The remote policy — where downloads land, and whether plaintext
+// may be fetched at all — is frozen when serve assembles the Loader. An
+// operator who starts with "allow_insecure_sources": true, thinks better of it,
+// sets it back to false and reloads must therefore NOT be told the reload
+// succeeded: this process would keep fetching over plaintext, and the warning
+// that says so is written by assembly, which a reload never runs.
+func TestPluginsReloadRefusesATightenedRemoteSourcePolicy(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	priv, keyringPath := f.newKeyring("keyring.json")
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.signPackage("staging", priv)
+	archive := f.archivePackage("staging")
+	srv := serveArchive(t, archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	cacheSetting := fmt.Sprintf("\"cache\": %s", jsonString(cacheDir))
+	// Started with plaintext explicitly allowed, and a plaintext entry fetched
+	// and mounted under it.
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(true)},
+		cacheSetting, `"allow_insecure_sources": true`)
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: srv.URL + "/echo.tgz", enabled: true,
+		tools: []string{testEchoTool}, digest: digestOfArchive(archive),
+	})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Fatalf("IsGateable(%q) = false after startup apply, want true", testEchoTool)
+	}
+
+	// The operator tightens the policy: the switch goes back to its (safe)
+	// default by leaving it out entirely.
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(true)}, cacheSetting)
+
+	_, err := f.run("reload")
+	if err == nil {
+		t.Fatal("plugins reload error = nil, want an error: the remote policy in the config is not the one this process uses")
+	}
+	if !strings.Contains(err.Error(), "restart") {
+		t.Errorf("plugins reload error = %v, want it to say serve must be restarted for a remote-policy change", err)
+	}
+	if !strings.Contains(err.Error(), "allow_insecure_sources") {
+		t.Errorf("plugins reload error = %v, want it to name the setting that changed", err)
+	}
+	if !strings.Contains(err.Error(), "plaintext sources refused") ||
+		!strings.Contains(err.Error(), "plaintext sources allowed") {
+		t.Errorf("plugins reload error = %v, want it to say what the config asks for AND what this process is doing", err)
+	}
+	// Refusing is not tearing down: what IS running stays exactly as it was.
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = false, want true: a refused reload must leave the running deployment alone", testEchoTool)
+	}
+}
+
+// TestPluginsReloadRefusesAMovedPluginCache is the other half of the same
+// freeze, and the quieter one: a reload after "plugins.cache" moved would keep
+// filing downloads under the OLD directory, with the new one sitting empty and
+// nothing on screen saying which is in use.
+func TestPluginsReloadRefusesAMovedPluginCache(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	oldCache := filepath.Join(f.dir, "plugin-cache")
+	newCache := filepath.Join(f.dir, "plugin-cache-moved")
+	f.writeSignatureConfig(30_000, signaturePolicy{requireSignature: boolPtr(false)},
+		fmt.Sprintf("\"cache\": %s", jsonString(oldCache)))
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	f.writeSignatureConfig(30_000, signaturePolicy{requireSignature: boolPtr(false)},
+		fmt.Sprintf("\"cache\": %s", jsonString(newCache)))
+
+	_, err := f.run("reload")
+	if err == nil {
+		t.Fatal("plugins reload error = nil, want an error: this process is still filing downloads under the old cache")
+	}
+	if !strings.Contains(err.Error(), "restart") {
+		t.Errorf("plugins reload error = %v, want it to say serve must be restarted for a remote-policy change", err)
+	}
+	if !strings.Contains(err.Error(), "plugins.cache") {
+		t.Errorf("plugins reload error = %v, want it to name the setting that changed", err)
+	}
+	if !strings.Contains(err.Error(), oldCache) || !strings.Contains(err.Error(), newCache) {
+		t.Errorf("plugins reload error = %v, want it to name both the cache in use (%s) and the one configured (%s)",
+			err, oldCache, newCache)
+	}
+	// Nothing was converged: the entry the manifest still declares is mounted.
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = false, want true: a refused reload must leave the running deployment alone", testEchoTool)
+	}
+}
+
+// TestPluginsReloadConvergesWhenTheRemotePolicyIsUnchanged is the check's other
+// side: with the same cache and the same switch in the config as the running
+// Loader was built with, the policies compare equal and the reload goes
+// through. Without this, "refuse whenever a cache is configured" would pass
+// both tests above and break every reload of a deployment that fetches.
+func TestPluginsReloadConvergesWhenTheRemotePolicyIsUnchanged(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	remoteSettings := []string{
+		fmt.Sprintf("\"cache\": %s", jsonString(filepath.Join(f.dir, "plugin-cache"))),
+		`"allow_insecure_sources": true`,
+	}
+	f.writeSignatureConfig(30_000, signaturePolicy{requireSignature: boolPtr(false)}, remoteSettings...)
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Fatalf("IsGateable(%q) = false after startup apply, want true", testEchoTool)
+	}
+
+	// Only the manifest changes; the config's remote policy is rewritten
+	// identically, which is what an operator editing something else does.
+	f.writeSignatureConfig(30_000, signaturePolicy{requireSignature: boolPtr(false)}, remoteSettings...)
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}})
+
+	if _, err := f.run("reload"); err != nil {
+		t.Fatalf("plugins reload error = %v, want nil: the remote policy did not change", err)
+	}
+	if toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = true after reload, want false: the disabled entry must be unmounted", testEchoTool)
+	}
+}
+
+// TestAssemblePluginsFetchesUnderTheConfiguredByteCap pins the pass-through
+// from "plugins.fetch" to the loader's fetch bounds, which nothing else does:
+// the loader's own tests build their RemoteConfig by hand, and the assembly
+// tests above only check that a package mounted. A hard-coded 32 MiB here
+// would pass every one of them.
+//
+// One byte is a cap no real artifact fits under, so an entry that would
+// otherwise mount fails on the size limit -- and says so where an operator
+// looks. Startup itself still succeeds: one unfetchable entry does not stop
+// serve.
+func TestAssemblePluginsFetchesUnderTheConfiguredByteCap(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	priv, keyringPath := f.newKeyring("keyring.json")
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.signPackage("staging", priv)
+	archive := f.archivePackage("staging")
+	srv := serveArchive(t, archive)
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(true)},
+		fmt.Sprintf("\"cache\": %s", jsonString(filepath.Join(f.dir, "plugin-cache"))),
+		`"allow_insecure_sources": true`,
+		`"fetch": {"max_bytes": 1}`)
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: srv.URL + "/echo.tgz", enabled: true,
+		tools: []string{testEchoTool}, digest: digestOfArchive(archive),
+	})
+
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil: an unfetchable entry must not stop startup", err)
+	}
+
+	out, err := f.run("status")
+	if err != nil {
+		t.Fatalf("plugins status error = %v, want nil", err)
+	}
+	if !strings.Contains(out, "failed") {
+		t.Fatalf("plugins status output = %q, want the entry to have failed under a 1 byte download cap", out)
+	}
+	if !strings.Contains(out, "1 byte limit") {
+		t.Errorf("plugins status output = %q, want it to report the CONFIGURED byte cap as the reason", out)
+	}
+	if toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = true, want false: nothing may mount from a download that was refused", testEchoTool)
+	}
+}

@@ -546,6 +546,32 @@ func pluginSignaturePolicy(cfg config.PluginsConfig) (loader.SignaturePolicy, er
 	return loader.SignaturePolicyOf(keyring), nil
 }
 
+// pluginRemotePolicy is the remote-source policy cfg asks for, in the
+// comparable form a running Loader reports through Loader.RemotePolicy.
+//
+// It deliberately does NOT go through resolvePluginRemote: that one CREATES the
+// cache directory (fetch.NewCache), and a comparison that is only ever asked
+// "did this change?" must not leave a directory behind for a config it is about
+// to refuse. The path is resolved through fetch.CacheRoot instead, which is the
+// same resolution a Cache performs on itself, so an unchanged setting compares
+// equal however it was spelled.
+func pluginRemotePolicy(cfg config.PluginsConfig) (loader.RemotePolicy, error) {
+	policy := loader.RemotePolicy{AllowInsecureSources: cfg.InsecureSourcesAllowed()}
+	path := strings.TrimSpace(cfg.Cache)
+	if path == "" {
+		// No cache configured is a policy, not a missing one: it is the
+		// deployment that fetches nothing, and it must compare unequal to one
+		// that has a cache.
+		return policy, nil
+	}
+	root, err := fetch.CacheRoot(path)
+	if err != nil {
+		return loader.RemotePolicy{}, fmt.Errorf("resolve plugin cache %q: %w", path, err)
+	}
+	policy.CacheRoot = root
+	return policy, nil
+}
+
 // readPluginDeployment reads and parses the deployment manifest at path. Both
 // failures name the path: "configured but unreadable" is a startup failure, and
 // an operator has to be able to see which file was meant.
@@ -675,6 +701,30 @@ func newPluginsReloadCommand(application *app.App, out io.Writer) *cobra.Command
 					"the trust set is fixed when serve starts, so restart serve to apply a signature-policy change "+
 					"(reloading now would converge the new manifest under the old policy)",
 					cfg.Plugins.Manifest, wanted, running)
+			}
+			// The remote-source policy is frozen the same way and is refused
+			// for the same reason. An operator who turns
+			// "allow_insecure_sources" back OFF and reloads would otherwise be
+			// told the reload succeeded while this process kept fetching over
+			// plaintext -- and the assembly-time warning that says plaintext is
+			// in use is written by checkRemoteSources at startup only, so
+			// nothing would replay it either. A moved "plugins.cache" has the
+			// same shape: the reload would keep filing downloads under the old
+			// directory with nothing on screen saying so.
+			//
+			// The fetch bounds are NOT compared, deliberately: like limits and
+			// apply_wait above, a stale ceiling is a performance surprise
+			// rather than a package fetched from somewhere the operator no
+			// longer permits.
+			wantedRemote, err := pluginRemotePolicy(cfg.Plugins)
+			if err != nil {
+				return err
+			}
+			if running := pluginLoader.RemotePolicy(); !running.Equal(wantedRemote) {
+				return fmt.Errorf("reload plugin deployment %q: the config now says %s, but this process is using %s; "+
+					"the remote-source policy is fixed when serve starts, so restart serve to apply a change to "+
+					`"plugins.cache" or "allow_insecure_sources" (reloading now would fetch under the old policy)`,
+					cfg.Plugins.Manifest, wantedRemote, running)
 			}
 			// Re-read from disk rather than replaying what startup parsed: a
 			// reload that applied the manifest as it was at startup would be a
