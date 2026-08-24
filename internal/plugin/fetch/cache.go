@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 )
 
 // digestAlgorithmDirName is the directory level between the cache root and a
@@ -23,6 +24,26 @@ const digestAlgorithmDirName = "sha256"
 // digits and nothing else — so a temporary directory left behind by a killed
 // process is never read as a cached package.
 const tempUnpackDirPrefix = ".unpack-"
+
+// digestLockSuffix names the lock file guarding one digest directory:
+// "<64 hex digits>.lock", a sibling of the directory it guards. The suffix
+// makes the name longer than 64 characters, so — like tempUnpackDirPrefix —
+// it can never be mistaken for a digest directory.
+const digestLockSuffix = ".lock"
+
+// digestLockTimeout bounds how long a writer waits for another writer's lock
+// on the same digest before giving up with an error. The lock is held only
+// across a removal and a rename, so a wait anywhere near this long means the
+// holder died: the bound exists so that a leftover lock file fails loudly
+// instead of hanging a plugin install forever.
+const digestLockTimeout = 30 * time.Second
+
+// digestLockPollInterval is how often a waiting writer retries the exclusive
+// create. There is no cross-platform way to wait on a file's disappearance
+// with only the standard library, so this polls; the interval is short enough
+// that the common uncontended case is unaffected and the contended one costs a
+// few milliseconds.
+const digestLockPollInterval = 10 * time.Millisecond
 
 // Cache stores unpacked plugin packages under the digest that names them, so
 // that a package fetched once is not fetched again.
@@ -55,6 +76,12 @@ const tempUnpackDirPrefix = ".unpack-"
 // the next start — which matters more here than elsewhere, because a digest
 // directory that exists is a directory nothing will ever fetch again.
 //
+// Once an entry is whole it is never removed, by this process or another one
+// over the same root: the only removal here is of an *incomplete* entry, and
+// it happens under a lock file that serializes it against every other writer
+// that obeys these rules (see commit and lockDigestDir). A directory this
+// package handed a caller therefore does not disappear underneath it.
+//
 // # What Cache does not do
 //
 // It does not fetch (that is Fetch), does not verify that archive actually
@@ -80,9 +107,26 @@ type Cache struct {
 	// first installed, not on any hot path, and one lock is one thing to
 	// reason about instead of a map of them.
 	//
-	// It says nothing about a *second process* over the same root. That case
-	// is handled where it has to be, at the move into place: see commit.
+	// It says nothing about a *second process* over the same root — a mutex
+	// in this process cannot. That case is handled where it has to be, at
+	// the move into place: the rename itself is atomic on every platform
+	// this runs on, and the one step that is not a single operation —
+	// replacing an incomplete entry, which is a check followed by a removal
+	// followed by a rename — is serialized by a lock file, the only
+	// construct that serializes across processes. See commit and
+	// lockDigestDir.
 	mu sync.Mutex
+
+	// lockWait bounds how long commit waits for another writer's lock on the
+	// same digest, and lockPoll is how often it retries while waiting. They
+	// are fields rather than the constants read directly so that a caller
+	// building a Cache for a test can bound the wait tightly instead of
+	// standing in front of the production bound for half a minute. NewCache
+	// sets them once and nothing writes them afterwards, so they need no
+	// synchronization; a Cache that did not come from NewCache carries zeroes
+	// and is refused where they are used.
+	lockWait time.Duration
+	lockPoll time.Duration
 }
 
 // NewCache returns a Cache rooted at root, creating the directory (mode 0700,
@@ -104,7 +148,7 @@ func NewCache(root string) (*Cache, error) {
 	if err := os.MkdirAll(abs, 0o700); err != nil {
 		return nil, fmt.Errorf("create cache root %s: %w", abs, err)
 	}
-	return &Cache{root: abs}, nil
+	return &Cache{root: abs, lockWait: digestLockTimeout, lockPoll: digestLockPollInterval}, nil
 }
 
 // Dir returns the directory the package named by digest occupies, whether or
@@ -137,6 +181,12 @@ func (c *Cache) Dir(digest string) string {
 // the directory already exists — never fetch the rest. A miss is reported as
 // (false, nil); only a filesystem failure, a malformed digest, or something
 // other than a directory standing at the digest path is an error.
+//
+// "All three files present" is the whole test: a directory holding the three
+// files *plus* something else is still a hit. Put cannot produce such a
+// directory — it arrives whole by rename, and Unpack writes exactly those
+// three files — so the state only exists in a hand-edited cache, and refusing
+// it would turn a stray file into a package that can never be repaired.
 func (c *Cache) Has(digest string) (bool, error) {
 	hexDigits, err := parseDigest(digest)
 	if err != nil {
@@ -178,6 +228,12 @@ func (c *Cache) Has(digest string) (bool, error) {
 // An incomplete directory that is already at the digest path — left by a
 // process killed before this rule existed, or by a hand-edited cache — is
 // replaced whole rather than written into or left to wedge the digest forever.
+// That replacement is the one place this package deletes anything, and it runs
+// under a per-digest lock file ("<64 hex>.lock", beside the digest directory)
+// so that a second process cannot delete an entry a first one has already
+// published and handed to a caller: see commit. A process killed while holding
+// that lock leaves the file behind, and the next Put fails after a bounded
+// wait, naming it — an operator clears it by deleting exactly that file.
 // Something that is not a directory at all standing at that path is a
 // different matter: that is a cache nobody built by these rules, so Put
 // reports it and deletes nothing.
@@ -230,7 +286,7 @@ func (c *Cache) Put(digest string, archive []byte, limits UnpackLimits) (dir str
 	if err := Unpack(archive, tmp, limits); err != nil {
 		return "", fmt.Errorf("cache put %s: %w", digest, err)
 	}
-	if err := commit(tmp, final); err != nil {
+	if err := c.commit(tmp, final); err != nil {
 		return "", fmt.Errorf("cache put %s: %w", digest, err)
 	}
 	return final, nil
@@ -284,18 +340,61 @@ func isHexDigest(s string) bool {
 //   - An incomplete one. Nothing may read it (Has refuses it) and nothing else
 //     will ever replace it (its digest directory exists), so it is removed and
 //     the rename retried. This is the only place the cache deletes anything,
-//     and it deletes only something no reader was allowed to use. Between that
+//     and — because the check that calls it incomplete is made under the lock
+//     described below and nothing else may publish while that lock is held —
+//     it deletes only something no reader was ever allowed to use. Between the
 //     removal and the retry a concurrent Has reports a miss for a moment; the
 //     worst that costs is one redundant fetch, whereas the alternative —
 //     leaving the directory alone — wedges the digest permanently.
 //
-// Any other rename failure is reported, naming both attempts.
-func commit(tmp, final string) error {
+// # Why the whole of it runs under a lock file
+//
+// That second case is a check followed by a removal followed by a rename, and
+// between the check and the removal another writer can publish. Without a lock
+// two processes both see "incomplete", the first publishes and returns final
+// to its caller as usable, and the second — still acting on an observation
+// that is now stale — deletes the package the first one just handed out. The
+// bytes are the same either way, so nothing is corrupted, but a caller that
+// opens a file in that window finds it gone, and if the second rename then
+// fails the cache is left with no entry at a path a caller was told is usable.
+// A mutex cannot prevent that: the two writers are in different processes.
+//
+// A lock file can, so commit takes one — "<64 hex>.lock", beside the digest
+// directory — and holds it across the whole of the check, the removal and the
+// rename, never across the unpack. The completeness check therefore happens
+// *while the lock is held*, which is what turns check-then-act into
+// check-under-lock: a writer that waited for the lock re-reads the entry after
+// acquiring it, sees the package the previous holder published, and returns it
+// instead of deleting it. Under that rule the promise above is exact — a
+// complete entry is never removed by anything here.
+//
+// Any other rename failure is reported, naming both attempts. So is a lock
+// that cannot be taken: see lockDigestDir for the bounded wait and for what a
+// leftover lock file costs.
+func (c *Cache) commit(tmp, final string) (err error) {
+	unlock, lockErr := c.lockDigestDir(final)
+	if lockErr != nil {
+		return fmt.Errorf("move %s into place: %w", tmp, lockErr)
+	}
+	defer func() {
+		// The lock is released on every path, success or failure, and a
+		// release that itself fails is joined into the result rather than
+		// dropped: a lock file nothing can remove blocks every later
+		// writer of this digest, which is exactly the kind of condition
+		// that must not be discovered silently.
+		if unlockErr := unlock(); unlockErr != nil {
+			err = errors.Join(err, unlockErr)
+		}
+	}()
+
 	firstErr := os.Rename(tmp, final)
 	if firstErr == nil {
 		return nil
 	}
 
+	// Read the entry here, under the lock, not before taking it: whatever
+	// this sees cannot change until the lock is released, so the decision
+	// made from it is still true when it is acted on below.
 	complete, err := isCompletePackage(final)
 	if err != nil {
 		return fmt.Errorf("move %s into place: %w (after %v)", tmp, err, firstErr)
@@ -311,6 +410,63 @@ func commit(tmp, final string) error {
 		return fmt.Errorf("move %s to %s: %w (first attempt: %v)", tmp, final, err, firstErr)
 	}
 	return nil
+}
+
+// lockDigestDir takes the lock guarding one digest directory and returns the
+// function that releases it. The lock is a file named after the directory it
+// guards ("<64 hex>.lock", which is not 64 hex digits and so can never be read
+// as a digest directory) created with O_CREATE|O_EXCL: that combination is the
+// one filesystem operation both POSIX and Windows make atomic against other
+// processes, which is what makes this work where a mutex cannot.
+//
+// The wait is bounded by c.lockWait. A process killed while holding the lock
+// leaves the file behind, and rather than block forever on it, a writer that
+// has waited that long gives up and returns an error naming the file and
+// saying how to clear it: an operator deletes exactly that file, and the next
+// Put proceeds. Nothing here ages a lock out on its own, because "old" and
+// "abandoned" are not the same thing — a heuristic that broke a live holder's
+// lock would reintroduce the very race the lock exists to prevent. That is the
+// loud failure: nothing is guessed, nothing proceeds unserialized, and the
+// entry the lock guards stays readable throughout, because a stale lock blocks
+// only writers.
+func (c *Cache) lockDigestDir(dir string) (unlock func() error, err error) {
+	if c.lockWait <= 0 || c.lockPoll <= 0 {
+		panic(fmt.Sprintf("fetch: cache lock bounds not configured (wait %v, poll %v): Cache must come from NewCache", c.lockWait, c.lockPoll))
+	}
+	lockPath := dir + digestLockSuffix
+	release := func() error {
+		if err := os.Remove(lockPath); err != nil {
+			return fmt.Errorf("release cache lock %s: %w", lockPath, err)
+		}
+		return nil
+	}
+
+	deadline := time.Now().Add(c.lockWait)
+	for {
+		f, openErr := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if openErr == nil {
+			// The file's existence is the lock, not the open handle, so
+			// it is closed immediately; a close that fails still leaves
+			// the lock held, so it is reported together with the release
+			// rather than swallowed.
+			if closeErr := f.Close(); closeErr != nil {
+				return nil, errors.Join(
+					fmt.Errorf("acquire cache lock %s: close: %w", lockPath, closeErr),
+					release(),
+				)
+			}
+			return release, nil
+		}
+		if !errors.Is(openErr, fs.ErrExist) {
+			return nil, fmt.Errorf("acquire cache lock %s: %w", lockPath, openErr)
+		}
+		if time.Now().After(deadline) {
+			return nil, fmt.Errorf(
+				"acquire cache lock %s: another writer has held it for more than %s; if no other process is installing plugins, that file is a leftover from one that was killed and clearing it means deleting exactly that file",
+				lockPath, c.lockWait)
+		}
+		time.Sleep(c.lockPoll)
+	}
 }
 
 // isCompletePackage reports whether dir holds a whole package: it exists, it
