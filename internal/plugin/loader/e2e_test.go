@@ -1,20 +1,28 @@
 package loader
 
 import (
+	"archive/tar"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/ed25519"
 	"errors"
 	"fmt"
+	"io/fs"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/lifecycle"
+	"github.com/stardust/legion-agent/internal/plugin/fetch"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
 	"github.com/stardust/legion-agent/internal/plugin/sign"
 	"github.com/stardust/legion-agent/internal/taskgate"
@@ -51,6 +59,10 @@ import (
 //
 // No test in this file waits on an unbounded channel, and none uses the feature
 // under test as its termination condition.
+//
+// The remote-source scenarios appended at the end of this file carry their own
+// bounds note; every server they use is an httptest.Server serving one fixed,
+// pre-built archive, and none of them loops over Apply.
 
 // e2eInnerToolName is the tool the e2e guest calls back into through call_tool.
 // The name is hard-coded in the fixture (see
@@ -2022,4 +2034,619 @@ func TestE2EAnUnverifiableEntryContributesNothingWhileItsSignedSiblingServes(t *
 	if !strings.Contains(row.LastError, "plugin.sig") {
 		t.Errorf("Status row for %q LastError = %q, want it to say the signature was the problem", proxyPluginName, row.LastError)
 	}
+}
+
+// --- remote sources (a5b) --------------------------------------------------
+//
+// The acceptance for a plugins.json entry whose source is a URL. Everything
+// below drives the same seam the rest of this file does — a plugins.json on
+// disk, parsed and handed to Loader.Apply — with the real fetch, the real
+// content-addressed cache and the real signature verification behind it.
+//
+// # Where the packages come from
+//
+// A remote package is written, signed and packed into a gzipped tar in a
+// directory of its OWN, never under the deployment root. A mount in these
+// tests can therefore only have come from the fetched bytes: there is nothing
+// under the root to load instead.
+//
+// The signing is done with sign.GenerateKey and sign.Sign — the exact two
+// calls `agent plugins keygen` and `agent plugins sign` make (see
+// runPluginsKeygen and runPluginsSign in internal/cli). The commands
+// themselves cannot be invoked from here: internal/cli imports this package,
+// so a test in `package loader` that imported it back would not compile. What
+// the commands add on top of these calls — where the private key file lives,
+// what is printed, the refusal to overwrite a key — is covered by their own
+// tests in internal/cli, and none of it changes the bytes that reach a
+// verifier.
+//
+// # Bounds (fork-bomb regime)
+//
+//   - Every server here is an httptest.Server. No test in this file resolves a
+//     name or opens a socket to anything else.
+//   - Every handler writes ONE fixed archive, built once before the server
+//     starts. Nothing generates bytes on demand, so no response can grow.
+//   - No test below loops over Apply. Each one applies a written-out number of
+//     times (one, or two for the pair that proves a restart), and asserts the
+//     ledger's owner count against a declared ceiling after every one.
+//   - No test below waits on anything: no channel, no sleep, no polling. The
+//     only timeout in play is testFetchLimits().Timeout, which bounds a
+//     download against a server that is in this process.
+//
+// # What is NOT asserted here, and where it is
+//
+// The Warn every allowed plaintext source gets is written at serve ASSEMBLY,
+// by cli.checkRemoteSources — before any Loader exists. It is asserted in
+// internal/cli by TestAssemblePluginsWarnsOnEveryAllowedInsecureRemoteSource,
+// which counts one warning per plaintext entry. It cannot be asserted from
+// here for the import reason above, and the Loader deliberately does not warn
+// a second time: the policy is fixed when serve starts.
+
+// e2eSource is an httptest server handing out one plugin archive, which a test
+// can CUT OFF mid-run.
+//
+// Taking a source offline is how "a cache hit does not go online" is proved in
+// the strong form: not by counting requests that were never made, but by
+// making a request a test failure at the moment it arrives, at the SAME URL
+// the first apply used. A second server on a second port would prove only that
+// the second port was quiet.
+type e2eSource struct {
+	srv     *httptest.Server
+	hits    atomic.Int64
+	offline atomic.Bool
+}
+
+// newE2ESource starts a source serving archive over the transport start
+// builds. The counter and the offline flag are atomic because they are written
+// by the server's handler goroutine and read by the test's; a completed HTTP
+// round trip is not a happens-before edge the race detector knows about.
+//
+// t is the test that owns the server's whole lifetime — an outer test when
+// subtests share the source — so a request arriving from a subtest that has
+// already finished still reports against a live *testing.T.
+func newE2ESource(t *testing.T, start func(http.Handler) *httptest.Server, archive []byte) *e2eSource {
+	t.Helper()
+
+	src := &e2eSource{}
+	src.srv = start(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		src.hits.Add(1)
+		if src.offline.Load() {
+			t.Errorf("the remote source was contacted (%s %s) after it was taken offline; this apply had to be "+
+				"served entirely from the plugin cache, with no network access at all", r.Method, r.URL.Path)
+			http.Error(w, "this source is offline", http.StatusServiceUnavailable)
+			return
+		}
+		// One fixed archive, written once: this response cannot grow.
+		if _, err := w.Write(archive); err != nil {
+			t.Errorf("write archive to client: %v", err)
+		}
+	}))
+	t.Cleanup(src.srv.Close)
+	return src
+}
+
+// goOffline makes every later request to this source fail the test.
+func (s *e2eSource) goOffline() { s.offline.Store(true) }
+
+// url is the address a deployment entry names.
+func (s *e2eSource) url() string { return s.srv.URL + "/echo.tgz" }
+
+// requireHits fails the test unless the source has served exactly want
+// requests.
+func (s *e2eSource) requireHits(t *testing.T, when string, want int64) {
+	t.Helper()
+
+	if got := s.hits.Load(); got != want {
+		t.Errorf("%s: the remote source was requested %d times, want exactly %d", when, got, want)
+	}
+}
+
+// e2eRemoteEchoManifest is the plugins.json an operator writes for a remote
+// package: the same document as a local entry's, with a URL for a source and
+// the mandatory digest beside it. It is literal JSON — including the "digest"
+// field NAME, which only a manifest read off disk exercises — so a change to
+// plugins.json's shape breaks these tests instead of travelling silently
+// through the same struct tags on both sides.
+func e2eRemoteEchoManifest(source, digest string) string {
+	return fmt.Sprintf(`{
+  "plugins": [
+    {
+      "name": %q,
+      "source": %q,
+      "digest": %q,
+      "enabled": true,
+      "tools": [{"name": %q}]
+    }
+  ]
+}`, echoPluginName, source, digest, echoToolName)
+}
+
+// e2eCachedPackageDir is where the cache files the package named by digest,
+// spelled out from the documented layout rather than asked of the Cache. The
+// layout is what an operator inspects and what an offline deployment ships, so
+// a test that asked cache.Dir would be checking the code under test against
+// itself.
+func e2eCachedPackageDir(cache *fetch.Cache, digest string) string {
+	return filepath.Join(cache.Root(), "sha256", strings.TrimPrefix(digest, "sha256:"))
+}
+
+// requireCachedPackage fails unless the cache holds the package named by
+// digest as three non-empty regular files, and nothing else, in the documented
+// directory.
+func requireCachedPackage(t *testing.T, cache *fetch.Cache, digest, when string) {
+	t.Helper()
+
+	dir := e2eCachedPackageDir(cache, digest)
+	for _, name := range remotePackageFileNames {
+		info, err := os.Stat(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("%s: stat %s in %s: %v; a fetched package is filed under its digest as the three "+
+				"files a package consists of", when, name, dir, err)
+		}
+		if !info.Mode().IsRegular() {
+			t.Errorf("%s: %s in the cache has mode %s, want a regular file", when, name, info.Mode())
+		}
+		if info.Size() == 0 {
+			t.Errorf("%s: %s in the cache is empty", when, name)
+		}
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("%s: read the cached package directory %s: %v", when, dir, err)
+	}
+	if len(entries) != len(remotePackageFileNames) {
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		t.Errorf("%s: the cached package directory holds %v, want exactly %v",
+			when, names, remotePackageFileNames)
+	}
+}
+
+// requireNoFilesUnder fails the test if dir holds any file at all, at any
+// depth, naming everything it found.
+//
+// It is how the refusals below prove "nothing was written", and it is
+// deliberately a walk of the whole tree rather than a check of one expected
+// path: an unpack that escaped its destination would put its file somewhere no
+// single Stat would look, which is the entire point of escaping.
+func requireNoFilesUnder(t *testing.T, dir, when string) {
+	t.Helper()
+
+	var found []string
+	err := filepath.WalkDir(dir, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if !entry.IsDir() {
+			found = append(found, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("%s: walk %s: %v", when, dir, err)
+	}
+	if len(found) > 0 {
+		t.Fatalf("%s: %s holds %v, want no files at all: bytes a convergence refused must never reach disk",
+			when, dir, found)
+	}
+}
+
+// e2eTarGzWithTraversalEntry packs dir's three package files and then ONE more
+// regular-file entry whose name escapes the directory it would be unpacked
+// into.
+//
+// The escaping entry is written LAST on purpose: the three legitimate files
+// are read and held before the hostile one is even seen, so an unpack that
+// wrote as it went, or that skipped the bad entry and kept the rest, would
+// leave those three behind. Refusing the whole archive is the invariant, and
+// this ordering is what can tell the two apart.
+//
+// The archive is built here and never committed. Its four entries and its few
+// hundred bytes of payload are fixed by this function.
+func e2eTarGzWithTraversalEntry(t *testing.T, dir, escapingName string) []byte {
+	t.Helper()
+
+	buf := &bytes.Buffer{}
+	gz := gzip.NewWriter(buf)
+	tw := tar.NewWriter(gz)
+	write := func(name string, data []byte) {
+		if err := tw.WriteHeader(&tar.Header{
+			Name:     name,
+			Mode:     0o644,
+			Size:     int64(len(data)),
+			Typeflag: tar.TypeReg,
+		}); err != nil {
+			t.Fatalf("write tar header for %s: %v", name, err)
+		}
+		if _, err := tw.Write(data); err != nil {
+			t.Fatalf("write tar body for %s: %v", name, err)
+		}
+	}
+	for _, name := range remotePackageFileNames {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			t.Fatalf("read %s in %s: %v", name, dir, err)
+		}
+		write(name, data)
+	}
+	write(escapingName, []byte("this file must never be written\n"))
+	if err := tw.Close(); err != nil {
+		t.Fatalf("close tar writer: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("close gzip writer: %v", err)
+	}
+	return buf.Bytes()
+}
+
+// requireEchoNotDeployed is the shared "the refused entry reached nothing"
+// assertion: its tool is in neither the registry nor the PROCESS-GLOBAL
+// gateable catalog, and calling it reports ErrToolNotFound.
+//
+// All three are checked because none implies the others: a tool that is
+// callable but not gateable is an authorization bypass, and a tool that is
+// gateable but belongs to a plugin that never mounted is a ghost entry in
+// every agent's permission UI.
+func (h *harness) requireEchoNotDeployed(ctx context.Context, when string) {
+	h.t.Helper()
+
+	h.requireInstanceCeiling(when, 0)
+	wantStrings(h.t, "ledger owners "+when, h.owners(), nil)
+	wantStrings(h.t, "registry tools "+when, h.toolNames(), nil)
+	requireGateable(h.t, echoToolName, false, when)
+	_, _, err := h.executeAsModel(ctx, domain.ToolCall{ID: "model-call-echo-" + when, Name: echoToolName})
+	if err == nil {
+		h.t.Fatalf("%s: Execute(%q) error = nil, want an error: a refused plugin's tool must not be callable",
+			when, echoToolName)
+	}
+	if !errors.Is(err, tool.ErrToolNotFound) {
+		h.t.Errorf("%s: Execute(%q) error = %v, want %v", when, echoToolName, err, tool.ErrToolNotFound)
+	}
+}
+
+// requireRemoteEchoMounted is the shared "the remote package really mounted"
+// assertion: one owner at the expected version, the tool registered and
+// gateable, the status row loaded and clean, and — the load-bearing part — a
+// model-shaped call that reaches the wasm instance and comes back with what
+// the fixture echoes. A plugin that merely sat in the ledger cannot satisfy
+// the last one.
+func (h *harness) requireRemoteEchoMounted(ctx context.Context, when, version string) {
+	h.t.Helper()
+
+	h.requireInstanceCeiling(when, 1)
+	wantStrings(h.t, "ledger owners "+when, h.owners(), []string{"plugin:" + echoPluginName + "@" + version})
+	wantStrings(h.t, "registry tools "+when, h.toolNames(), []string{echoToolName})
+	requireGateable(h.t, echoToolName, true, when)
+	row := h.statusOf(echoPluginName)
+	if row.State != StateLoaded {
+		h.t.Fatalf("%s: plugin %q State = %q, want %q (LastError %q)", when, echoPluginName, row.State,
+			StateLoaded, row.LastError)
+	}
+	if row.Version != version {
+		h.t.Errorf("%s: plugin %q Version = %q, want %q", when, echoPluginName, row.Version, version)
+	}
+	if row.LastError != "" {
+		h.t.Errorf("%s: plugin %q LastError = %q, want empty", when, echoPluginName, row.LastError)
+	}
+	h.requireEchoStillServes(ctx, when)
+}
+
+// requireRemoteEchoFailed is the shared refusal assertion: Apply reported an
+// error naming the entry, the operator can read the reason off the status row,
+// and the entry reached none of the authorities a mounted plugin reaches.
+func requireRemoteEchoFailed(ctx context.Context, t *testing.T, h *harness, applyErr error, when string, want ...string) {
+	t.Helper()
+
+	if applyErr == nil {
+		t.Fatalf("%s: Apply() error = nil, want a refusal", when)
+	}
+	if !strings.Contains(applyErr.Error(), echoPluginName) {
+		t.Errorf("%s: Apply() error = %v, want it to name the entry %q", when, applyErr, echoPluginName)
+	}
+	row := h.statusOf(echoPluginName)
+	if row.State != StateFailed {
+		t.Fatalf("%s: plugin %q State = %q, want %q (LastError %q)", when, echoPluginName, row.State,
+			StateFailed, row.LastError)
+	}
+	if row.LastError == "" {
+		t.Fatalf("%s: plugin %q carries no LastError; the refusal reached no operator", when, echoPluginName)
+	}
+	for _, substring := range want {
+		if !strings.Contains(applyErr.Error(), substring) {
+			t.Errorf("%s: Apply() error = %v, want it to mention %q", when, applyErr, substring)
+		}
+		if !strings.Contains(row.LastError, substring) {
+			t.Errorf("%s: plugin %q LastError = %q, want it to mention %q", when, echoPluginName,
+				row.LastError, substring)
+		}
+	}
+	h.requireEchoNotDeployed(ctx, when)
+}
+
+// requireGateableIsClean fails the test if the echo fixture's tool is already
+// in the process-global gateable catalog. Every gateable assertion below would
+// be vacuous if an earlier test had leaked its contribution, so each test says
+// so before it starts.
+func requireGateableIsClean(t *testing.T) {
+	t.Helper()
+
+	if toolauth.IsGateable(echoToolName) {
+		t.Fatalf("%q is already gateable before any apply: an earlier test leaked its contribution and "+
+			"this test's gateable assertions would be vacuous", echoToolName)
+	}
+}
+
+// TestE2EARemotePackageIsFetchedVerifiedCachedAndThenMountedOffline is the
+// remote closed loop, from a key nobody has yet to a deployment that no longer
+// needs the network:
+//
+//	mint a key -> sign the package with it -> pack it as a tar.gz -> serve it
+//	-> write a plugins.json naming that https URL and the archive's sha256 ->
+//	Apply -> the plugin mounts, its tool answers a real call, and the cache
+//	holds the package under its digest -> take the source OFFLINE (a request
+//	is now a test failure) -> a FRESH loader, ledger and registry over the SAME
+//	cache -> Apply -> it mounts again, from disk, having contacted nothing
+//
+// The second half is a separate subtest so that the first one's cleanup — the
+// ledger disposal that unregisters the tool and its gateable entry — runs
+// before it begins. That makes it a restart rather than a re-apply: the second
+// Apply meets an empty ledger, an empty registry and a deployment root with no
+// package in it, so the only place the plugin can come from is the cache the
+// first half filled.
+//
+// Signatures are REQUIRED throughout: a fetched package goes through
+// manifest.LoadPackage exactly as a local one does.
+//
+// Bound: two Apply calls, written out, one per subtest, each followed by an
+// owner-count ceiling. No loop, no wait.
+func TestE2EARemotePackageIsFetchedVerifiedCachedAndThenMountedOffline(t *testing.T) {
+	requireGateableIsClean(t)
+	ctx := context.Background()
+
+	// `agent plugins keygen`, then `agent plugins sign`: the package is built,
+	// signed and packed OUTSIDE any deployment root.
+	priv, keyring := newTestKey(t)
+	_, archive := signedEchoArchive(t, priv, "1.4.0")
+	digest := digestOf(archive)
+	cache := newTestCache(t)
+	src := newE2ESource(t, httptest.NewTLSServer, archive)
+	// The one document both halves apply, built once so the second half cannot
+	// silently apply something else.
+	document := e2eRemoteEchoManifest(src.url(), digest)
+
+	requireNoFilesUnder(t, cache.Root(), "before the first apply")
+
+	t.Run("the first start fetches, verifies and caches", func(t *testing.T) {
+		h := newHarnessWithRemote(t, keyring, remoteFor(t, src.srv, cache, false))
+		h.writeManifest(document)
+
+		// Before: nothing of this plugin exists anywhere.
+		wantStrings(t, "registry tools before the first apply", h.toolNames(), nil)
+		requireGateable(t, echoToolName, false, "before the first apply")
+
+		if err := h.applyManifest(ctx); err != nil {
+			t.Fatalf("startup Apply: %v", err)
+		}
+
+		h.requireRemoteEchoMounted(ctx, "after the first apply", "1.4.0")
+		src.requireHits(t, "after the first apply", 1)
+		requireCachedPackage(t, cache, digest, "after the first apply")
+	})
+
+	t.Run("a restart mounts it again with the source unreachable", func(t *testing.T) {
+		src.goOffline()
+		h := newHarnessWithRemote(t, keyring, remoteFor(t, src.srv, cache, false))
+		h.writeManifest(document)
+
+		// This deployment root holds a plugins.json and nothing else: there is
+		// no package under it to load instead of the cached one.
+		if _, err := os.Stat(filepath.Join(h.root, "echo")); !errors.Is(err, fs.ErrNotExist) {
+			t.Fatalf("stat %s: %v, want it not to exist: a local package here would make the cache "+
+				"assertion below vacuous", filepath.Join(h.root, "echo"), err)
+		}
+		wantStrings(t, "registry tools before the restart apply", h.toolNames(), nil)
+		requireGateable(t, echoToolName, false, "before the restart apply")
+
+		if err := h.applyManifest(ctx); err != nil {
+			t.Fatalf("restart Apply: %v", err)
+		}
+
+		h.requireRemoteEchoMounted(ctx, "after the restart apply", "1.4.0")
+		// The handler fails the test the moment it is contacted; this is the
+		// second, cheaper witness to the same claim.
+		src.requireHits(t, "after the restart apply", 1)
+	})
+}
+
+// TestE2EARemoteDigestMismatchFailsTheEntryAndLeavesTheCacheEmpty is the first
+// refusal: the bytes the source served are not the bytes the deployment asked
+// for.
+//
+// What makes it more than "an error came back" is the pair of facts asserted
+// together: the source WAS contacted and did serve the whole archive (one
+// hit), and yet the cache holds no file at all. The bytes existed and were
+// streamed; they never reached disk. Either assertion alone would be satisfied
+// by a fetch that never happened.
+//
+// Bound: exactly one Apply. No loop, no wait.
+func TestE2EARemoteDigestMismatchFailsTheEntryAndLeavesTheCacheEmpty(t *testing.T) {
+	requireGateableIsClean(t)
+	ctx := context.Background()
+
+	priv, keyring := newTestKey(t)
+	_, archive := signedEchoArchive(t, priv, "1.4.0")
+	cache := newTestCache(t)
+	src := newE2ESource(t, httptest.NewTLSServer, archive)
+	h := newHarnessWithRemote(t, keyring, remoteFor(t, src.srv, cache, false))
+	// A well-formed digest of some other bytes: the entry parses, and only the
+	// comparison against what arrives can catch it.
+	wrongDigest := digestOf([]byte("not the archive this source serves"))
+	h.writeManifest(e2eRemoteEchoManifest(src.url(), wrongDigest))
+
+	err := h.applyManifest(ctx)
+
+	requireRemoteEchoFailed(ctx, t, h, err, "after the digest mismatch", "digest mismatch")
+	src.requireHits(t, "after the digest mismatch", 1)
+	requireNoFilesUnder(t, cache.Root(), "after the digest mismatch")
+}
+
+// TestE2EARemotePackageThatPassesItsDigestStillHasToPassItsSignature is the
+// two-gates claim, and it is the reason a digest does not make a signature
+// redundant.
+//
+// The package is signed and THEN re-tagged, leaving its own declared sha256
+// correct. The archive is packed after that, and the entry names the archive's
+// real digest — so the transport gate passes on every byte, and the only thing
+// left that can refuse the package is the signature over its plugin.json.
+//
+// The proof that the two gates are independent is not the error message: it is
+// that the package IS in the cache, filed whole under its digest, while the
+// entry is failed. Gate one said yes and wrote the bytes down; gate two said
+// no and nothing mounted.
+//
+// Bound: exactly one Apply. No loop, no wait.
+func TestE2EARemotePackageThatPassesItsDigestStillHasToPassItsSignature(t *testing.T) {
+	requireGateableIsClean(t)
+	ctx := context.Background()
+
+	priv, keyring := newTestKey(t)
+	dir, _ := signedEchoArchive(t, priv, "1.4.0")
+	retagVersion(t, dir, "1.4.1")
+	archive := tarGzPackage(t, dir)
+	digest := digestOf(archive)
+	cache := newTestCache(t)
+	src := newE2ESource(t, httptest.NewTLSServer, archive)
+	h := newHarnessWithRemote(t, keyring, remoteFor(t, src.srv, cache, false))
+	h.writeManifest(e2eRemoteEchoManifest(src.url(), digest))
+
+	err := h.applyManifest(ctx)
+
+	requireRemoteEchoFailed(ctx, t, h, err, "after the re-tagged package was refused", "signature")
+	src.requireHits(t, "after the re-tagged package was refused", 1)
+	// Gate one passed on exactly these bytes, and said so by filing them.
+	requireCachedPackage(t, cache, digest, "after the re-tagged package was refused")
+}
+
+// TestE2EARemoteArchiveThatEscapesItsDirectoryIsRefusedWhole is the unpack
+// refusal, at the level where it matters: an archive whose digest is perfectly
+// correct — the deployment asked for exactly these bytes — and which is still
+// not a package.
+//
+// The hostile entry is the LAST of four, after the three legitimate files, so
+// "refused whole" and "the bad entry was skipped" cannot both pass: a skip
+// would leave plugin.json, plugin.wasm and plugin.sig behind. The assertion is
+// a walk of the cache root's PARENT, which catches both the files that would
+// have been kept and the one that would have escaped — "../evil" unpacked
+// under the cache resolves to a path no single Stat would think to look at.
+//
+// Bound: exactly one Apply, over a four-entry archive built in this test. No
+// loop, no wait.
+func TestE2EARemoteArchiveThatEscapesItsDirectoryIsRefusedWhole(t *testing.T) {
+	requireGateableIsClean(t)
+	ctx := context.Background()
+
+	priv, keyring := newTestKey(t)
+	dir, _ := signedEchoArchive(t, priv, "1.4.0")
+	archive := e2eTarGzWithTraversalEntry(t, dir, "../evil")
+	digest := digestOf(archive)
+	cache := newTestCache(t)
+	src := newE2ESource(t, httptest.NewTLSServer, archive)
+	h := newHarnessWithRemote(t, keyring, remoteFor(t, src.srv, cache, false))
+	h.writeManifest(e2eRemoteEchoManifest(src.url(), digest))
+
+	err := h.applyManifest(ctx)
+
+	requireRemoteEchoFailed(ctx, t, h, err, "after the traversing archive was refused", "../evil", "path element")
+	src.requireHits(t, "after the traversing archive was refused", 1)
+	// Neither the escaping entry nor the three legitimate files beside it.
+	requireNoFilesUnder(t, filepath.Dir(cache.Root()), "after the traversing archive was refused")
+}
+
+// TestE2EThePlaintextSwitchIsTheOnlyDifferenceBetweenARefusalAndAMount is the
+// debugging channel, both halves, over ONE plugins.json document.
+//
+// The same bytes are written as the manifest twice and served from the same
+// http:// source; the only thing that differs between the two convergences is
+// plugins.allow_insecure_sources. With it unstated the entry is refused and
+// the source is never contacted at all — the refusal is decided before a
+// request is built. With it on, the identical document mounts.
+//
+// Building the document once is what makes that claim exact: neither half can
+// be quietly applying a different manifest from the other.
+//
+// The Warn that accompanies the second half is written at serve assembly, not
+// by the Loader; see this section's header for where it is asserted.
+//
+// Bound: two Apply calls, written out, over two harnesses. The first mounts
+// nothing, so the two cannot collide over the fixture's tool name. No loop, no
+// wait.
+func TestE2EThePlaintextSwitchIsTheOnlyDifferenceBetweenARefusalAndAMount(t *testing.T) {
+	requireGateableIsClean(t)
+	ctx := context.Background()
+
+	priv, keyring := newTestKey(t)
+	_, archive := signedEchoArchive(t, priv, "1.4.0")
+	digest := digestOf(archive)
+	cache := newTestCache(t)
+	src := newE2ESource(t, httptest.NewServer, archive)
+	document := e2eRemoteEchoManifest(src.url(), digest)
+
+	// Half one: the switch is not written down at all, which is the default
+	// and the safe side.
+	refusing := newHarnessWithRemote(t, keyring, remoteFor(t, src.srv, cache, false))
+	refusing.writeManifest(document)
+
+	err := refusing.applyManifest(ctx)
+
+	requireRemoteEchoFailed(ctx, t, refusing, err, "with plaintext refused",
+		src.url(), "allow_insecure_sources")
+	src.requireHits(t, "with plaintext refused", 0)
+	requireNoFilesUnder(t, cache.Root(), "with plaintext refused")
+
+	// Half two: the same document, the same source, the same cache — with the
+	// switch on.
+	allowing := newHarnessWithRemote(t, keyring, remoteFor(t, src.srv, cache, true))
+	allowing.writeManifest(document)
+
+	if err := allowing.applyManifest(ctx); err != nil {
+		t.Fatalf("Apply() error = %v, want nil: allow_insecure_sources is on, so this entry is fetchable", err)
+	}
+
+	allowing.requireRemoteEchoMounted(ctx, "with plaintext allowed", "1.4.0")
+	src.requireHits(t, "with plaintext allowed", 1)
+	requireCachedPackage(t, cache, digest, "with plaintext allowed")
+}
+
+// TestE2EAnAllowedPlaintextSourceIsStillHeldToItsDigest is the switch's blast
+// radius: it relaxes the URL SCHEME and nothing else.
+//
+// This is the half of the plaintext story an operator most needs to be able to
+// rely on. Plaintext costs confidentiality and availability — the download can
+// be watched and blocked — but not integrity, because the digest still checks
+// every byte. With the switch on and the digest wrong, the entry fails and the
+// cache stays empty, exactly as it does over https.
+//
+// The paired hit count is what keeps it honest: the source served the whole
+// archive over plaintext, and none of it was kept.
+//
+// Bound: exactly one Apply. No loop, no wait.
+func TestE2EAnAllowedPlaintextSourceIsStillHeldToItsDigest(t *testing.T) {
+	requireGateableIsClean(t)
+	ctx := context.Background()
+
+	priv, keyring := newTestKey(t)
+	_, archive := signedEchoArchive(t, priv, "1.4.0")
+	cache := newTestCache(t)
+	src := newE2ESource(t, httptest.NewServer, archive)
+	h := newHarnessWithRemote(t, keyring, remoteFor(t, src.srv, cache, true))
+	wrongDigest := digestOf([]byte("not the archive this plaintext source serves"))
+	h.writeManifest(e2eRemoteEchoManifest(src.url(), wrongDigest))
+
+	err := h.applyManifest(ctx)
+
+	requireRemoteEchoFailed(ctx, t, h, err, "with plaintext allowed and the digest wrong", "digest mismatch")
+	src.requireHits(t, "with plaintext allowed and the digest wrong", 1)
+	requireNoFilesUnder(t, cache.Root(), "with plaintext allowed and the digest wrong")
 }
