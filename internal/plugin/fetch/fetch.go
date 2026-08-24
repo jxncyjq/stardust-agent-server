@@ -5,16 +5,23 @@
 // repository that pulls bytes off a network, and the first that writes an
 // untrusted archive's contents to the filesystem.
 //
-// The package's two entry points sit on either side of that filesystem
-// boundary. Fetch retrieves and verifies bytes; it never touches the
-// filesystem — see Fetch's doc comment. Unpack is the package's only writer:
-// it decodes and validates an entire archive in memory first, and writes to
-// disk — creating the destination directory and the files inside it — only
-// after the whole archive has been judged acceptable; see Unpack's doc
+// The package's entry points sit on either side of that filesystem boundary.
+// Fetch retrieves and verifies bytes; it never touches the filesystem — see
+// Fetch's doc comment. Unpack is the package's only writer of package
+// contents: it decodes and validates an entire archive in memory first, and
+// writes to disk — creating the destination directory and the files inside it
+// — only after the whole archive has been judged acceptable; see Unpack's doc
 // comment for what "acceptable" means and what gets refused. Fetch does not
 // unpack, and Unpack does not fetch. Neither reads policy such as
 // plugins.allow_insecure_sources (the caller's job — see Fetch's doc
-// comment), caches anything, or reads back what it just wrote.
+// comment) or reads back what it just wrote.
+//
+// Cache decides where an unpacked package lives: it files packages under the
+// digest that names them, so that a package fetched once is not fetched
+// again, and it is the only type here that treats an unpack as something that
+// must appear whole or not at all — see Cache's doc comment. It does not
+// fetch and does not verify digests either; it takes bytes Fetch has already
+// verified and gives them a home.
 package fetch
 
 import (
