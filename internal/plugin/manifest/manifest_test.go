@@ -657,6 +657,20 @@ func TestParseDeployment_RemoteHTTPSUnparsableURL(t *testing.T) {
 	]}`)
 	_, err := ParseDeployment(data)
 	requireErrorContains(t, err, "p")
+	requireErrorContains(t, err, "valid URL")
+}
+
+// TestParseDeployment_RemoteHTTPUnparsableURL is the http:// counterpart of
+// TestParseDeployment_RemoteHTTPSUnparsableURL, added for rule-5 scheme
+// symmetry (the code path RemoteURL exercises is shared, but only https was
+// previously covered for the unparsable-URL sub-case).
+func TestParseDeployment_RemoteHTTPUnparsableURL(t *testing.T) {
+	data := []byte(`{"plugins": [
+		{"name": "p", "source": "http://[::1", "digest": "` + validDigest + `"}
+	]}`)
+	_, err := ParseDeployment(data)
+	requireErrorContains(t, err, "p")
+	requireErrorContains(t, err, "valid URL")
 }
 
 func TestParseDeployment_RemoteHTTPSUserinfoRejected(t *testing.T) {
@@ -707,6 +721,102 @@ func TestParseDeployment_ForeignScheme(t *testing.T) {
 			requireErrorContains(t, err, "p")
 		})
 	}
+}
+
+// Mixed-case scheme: rejectForeignScheme and IsRemote/IsInsecureSource must
+// agree on a source whose scheme is not lowercase. Before this fix,
+// rejectForeignScheme case-folded before comparing (so "HTTPS://..." passed
+// it as a legitimate http/https scheme) while IsRemote/IsInsecureSource
+// compared an exact lowercase prefix (so the same source then classified as
+// "local"), silently reclassifying a remote entry — see review Important-1.
+// Both entries below must be treated as remote: digest is required, and the
+// insecure flag must be correct for the http one.
+
+func TestParseDeployment_RemoteUppercaseHTTPSScheme(t *testing.T) {
+	data := []byte(`{"plugins": [
+		{"name": "p", "source": "HTTPS://pkgs.example.com/p.tar.gz", "digest": "` + validDigest + `"}
+	]}`)
+	dep, err := ParseDeployment(data)
+	if err != nil {
+		t.Fatalf("ParseDeployment: unexpected error: %v", err)
+	}
+	entry := dep.Plugins[0]
+	if !entry.IsRemote() {
+		t.Errorf("IsRemote() = false for %q, want true (scheme is case-insensitive)", entry.Source)
+	}
+	if entry.IsInsecureSource() {
+		t.Errorf("IsInsecureSource() = true for %q, want false", entry.Source)
+	}
+	u, err := entry.RemoteURL()
+	if err != nil {
+		t.Fatalf("RemoteURL(): unexpected error: %v", err)
+	}
+	if u.Host != "pkgs.example.com" {
+		t.Errorf("RemoteURL().Host = %q, want %q", u.Host, "pkgs.example.com")
+	}
+}
+
+func TestParseDeployment_RemoteUppercaseHTTPScheme(t *testing.T) {
+	data := []byte(`{"plugins": [
+		{"name": "p", "source": "HTTP://pkgs.example.com/p.tar.gz", "digest": "` + validDigest + `"}
+	]}`)
+	dep, err := ParseDeployment(data)
+	if err != nil {
+		t.Fatalf("ParseDeployment: unexpected error: %v", err)
+	}
+	entry := dep.Plugins[0]
+	if !entry.IsRemote() {
+		t.Errorf("IsRemote() = false for %q, want true (scheme is case-insensitive)", entry.Source)
+	}
+	if !entry.IsInsecureSource() {
+		t.Errorf("IsInsecureSource() = false for %q, want true", entry.Source)
+	}
+	u, err := entry.RemoteURL()
+	if err != nil {
+		t.Fatalf("RemoteURL(): unexpected error: %v", err)
+	}
+	if u.Host != "pkgs.example.com" {
+		t.Errorf("RemoteURL().Host = %q, want %q", u.Host, "pkgs.example.com")
+	}
+}
+
+// TestParseDeployment_RemoteUppercaseSchemeMissingDigest confirms the
+// mismatch's other symptom is also fixed: before the fix, an uppercase
+// remote scheme with no digest fell through to the local branch and
+// produced no error at all, instead of the correct "remote source has no
+// digest" refusal.
+func TestParseDeployment_RemoteUppercaseSchemeMissingDigest(t *testing.T) {
+	data := []byte(`{"plugins": [
+		{"name": "p", "source": "HTTPS://pkgs.example.com/p.tar.gz"}
+	]}`)
+	_, err := ParseDeployment(data)
+	requireErrorContains(t, err, "p")
+	requireErrorContains(t, err, "digest")
+}
+
+// M-2: RemoteURL rejects a URL with an empty host, rather than returning
+// a *url.URL a caller might assume names something fetchable.
+
+func TestParseDeployment_RemoteHTTPSEmptyHostRejected(t *testing.T) {
+	data := []byte(`{"plugins": [
+		{"name": "p", "source": "https:///path", "digest": "` + validDigest + `"}
+	]}`)
+	_, err := ParseDeployment(data)
+	requireErrorContains(t, err, "p")
+	requireErrorContains(t, err, "host")
+}
+
+// M-3: remote-source validation is not gated on Enabled — a disabled remote
+// entry with no digest must still be rejected, so a future reader cannot
+// wonder whether validation is skipped for disabled entries.
+
+func TestParseDeployment_RemoteValidationAppliesWhenDisabled(t *testing.T) {
+	data := []byte(`{"plugins": [
+		{"name": "p", "source": "https://pkgs.example.com/p.tar.gz", "enabled": false}
+	]}`)
+	_, err := ParseDeployment(data)
+	requireErrorContains(t, err, "p")
+	requireErrorContains(t, err, "digest")
 }
 
 // Rule 7: existing local-path rules (absolute, "..") must not be loosened

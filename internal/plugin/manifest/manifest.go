@@ -68,6 +68,26 @@ var digestPattern = regexp.MustCompile(`^sha256:[0-9a-fA-F]{64}$`)
 // this pattern exists to make the refusal explicit and name the scheme.
 var remoteSchemePattern = regexp.MustCompile(`^([a-zA-Z][a-zA-Z0-9+.-]*)://`)
 
+// remoteScheme extracts source's URI scheme (via remoteSchemePattern) and
+// lowercases it, reporting ok == false when source names no scheme at all
+// (an ordinary local path has no "://"). It is the single place that
+// decides what scheme a Source names: IsRemote, IsInsecureSource,
+// rejectForeignScheme and validateEntrySource (via IsRemote) all call this
+// instead of separately re-deriving the answer, so they cannot disagree
+// with each other about a mixed-case scheme such as "HTTPS://...". RFC 3986
+// treats a scheme as case-insensitive, and rejectForeignScheme already
+// case-folds before comparing; IsRemote/IsInsecureSource must fold the same
+// way or a source rejectForeignScheme accepts as "https" could still be
+// classified "local" by IsRemote, which is the exact silent slip
+// remoteSchemePattern's doc comment (and Source's) warns against.
+func remoteScheme(source string) (scheme string, ok bool) {
+	m := remoteSchemePattern.FindStringSubmatch(source)
+	if m == nil {
+		return "", false
+	}
+	return strings.ToLower(m[1]), true
+}
+
 // knownCapabilities is the complete set of host capability names a manifest
 // may name, on either side: PluginManifest.Capabilities (what a plugin
 // asks for) and GrantDecl.Capabilities (what a deployment grants). The six
@@ -202,12 +222,15 @@ type Entry struct {
 	Name string
 
 	// Source names where this entry's package comes from. It is one of
-	// two things, discriminated by prefix (see IsRemote):
+	// two things, discriminated by scheme, case-insensitively (see
+	// IsRemote):
 	//
-	//   - a Source beginning with "https://" or "http://" is a remote
-	//     source: the package is fetched from that URL (fetching itself is
-	//     a later task — this package only validates the shape). It must
-	//     be paired with Digest (see Digest's doc comment).
+	//   - a Source beginning with "https://" or "http://" (in any letter
+	//     case — "HTTPS://..." counts the same as "https://...", per RFC
+	//     3986's scheme case-insensitivity) is a remote source: the
+	//     package is fetched from that URL (fetching itself is a later
+	//     task — this package only validates the shape). It must be
+	//     paired with Digest (see Digest's doc comment).
 	//   - anything else is a package directory path relative to the
 	//     deployment root (existing semantics, unchanged). It must NOT be
 	//     paired with Digest.
@@ -256,20 +279,25 @@ type Entry struct {
 }
 
 // IsRemote reports whether e.Source names a remote package location rather
-// than a local one: a Source beginning with "https://" or "http://" is
-// remote; everything else — including a Source naming some other URL
-// scheme — is not (see Source's doc comment for why a foreign scheme is
-// refused by ParseDeployment rather than reported as remote here).
+// than a local one: a Source whose scheme is "https" or "http" — matched
+// case-insensitively via remoteScheme, so "HTTPS://..." counts the same as
+// "https://..." — is remote; everything else, including a Source naming
+// some other URL scheme, is not (see Source's doc comment for why a
+// foreign scheme is refused by ParseDeployment rather than reported as
+// remote here). IsRemote, IsInsecureSource and rejectForeignScheme all
+// derive their answer from the same remoteScheme helper so they cannot
+// disagree about what a given Source's scheme is.
 func (e Entry) IsRemote() bool {
-	return strings.HasPrefix(e.Source, "https://") || strings.HasPrefix(e.Source, "http://")
+	scheme, ok := remoteScheme(e.Source)
+	return ok && (scheme == "http" || scheme == "https")
 }
 
 // IsInsecureSource reports whether e is a plaintext remote source
-// (http://, as opposed to https://). It carries no policy of its own —
-// whether an insecure source is actually permitted is
-// plugins.allow_insecure_sources, read only at assembly time by a later
-// task — this method only states the fact so that layer has something to
-// decide on.
+// ("http", as opposed to "https", matched case-insensitively — see
+// IsRemote). It carries no policy of its own — whether an insecure source
+// is actually permitted is plugins.allow_insecure_sources, read only at
+// assembly time by a later task — this method only states the fact so
+// that layer has something to decide on.
 //
 // Digest still guards byte integrity end to end even over http://, so a
 // man-in-the-middle cannot substitute different bytes; what plaintext
@@ -277,15 +305,19 @@ func (e Entry) IsRemote() bool {
 // where, is observable on the wire) and availability (the connection can
 // be blocked, or fed a stale-but-legitimately-signed version indefinitely).
 func (e Entry) IsInsecureSource() bool {
-	return strings.HasPrefix(e.Source, "http://")
+	scheme, ok := remoteScheme(e.Source)
+	return ok && scheme == "http"
 }
 
 // RemoteURL parses e.Source as a URL. It returns an error if e is not a
-// remote entry (see IsRemote), if the URL fails to parse, or if the URL
+// remote entry (see IsRemote), if the URL fails to parse, if the URL
 // carries userinfo (as in "https://user:pass@host/...") — credentials
 // must not appear in a plugins.json manifest, which is expected to be
-// committed to a git repository; this check applies to http:// and
-// https:// alike.
+// committed to a git repository — or if the URL's host is empty (as in
+// "https:///path"): a remote source with no host names nothing to fetch
+// from, and this layer's job is to refuse a malformed source early with a
+// clear name rather than let it surface later as an unrelated dial
+// failure. All three checks apply to http:// and https:// alike.
 func (e Entry) RemoteURL() (*url.URL, error) {
 	if !e.IsRemote() {
 		return nil, fmt.Errorf("plugin %q: source %q is not a remote source", e.Name, e.Source)
@@ -297,6 +329,9 @@ func (e Entry) RemoteURL() (*url.URL, error) {
 	if u.User != nil {
 		return nil, fmt.Errorf("plugin %q: source %q carries userinfo; credentials must not appear in a "+
 			"deployment manifest", e.Name, e.Source)
+	}
+	if u.Host == "" {
+		return nil, fmt.Errorf("plugin %q: source %q has no host", e.Name, e.Source)
 	}
 	return u, nil
 }
@@ -545,16 +580,16 @@ func ParseDeployment(data []byte) (Deployment, error) {
 // rejectForeignScheme refuses a source naming a URL scheme other than
 // http/https (file://, ftp://, ssh://, ...), naming the offending scheme.
 // It must run before an Entry is classified by IsRemote: without this
-// check, a scheme-bearing source that is not "https://"/"http://" would
-// simply be IsRemote() == false and fall through as an ordinary local
-// path, which is the silent semantic slip Source's doc comment warns
-// against (see remoteSchemePattern).
+// check, a scheme-bearing source that is not http/https would simply be
+// IsRemote() == false and fall through as an ordinary local path, which is
+// the silent semantic slip Source's doc comment warns against. It shares
+// the remoteScheme helper with IsRemote/IsInsecureSource so this gate and
+// that classification can never disagree about what scheme a source names.
 func rejectForeignScheme(name, source string) error {
-	m := remoteSchemePattern.FindStringSubmatch(source)
-	if m == nil {
+	scheme, ok := remoteScheme(source)
+	if !ok {
 		return nil
 	}
-	scheme := strings.ToLower(m[1])
 	if scheme == "http" || scheme == "https" {
 		return nil
 	}
