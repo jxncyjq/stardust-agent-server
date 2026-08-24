@@ -171,7 +171,7 @@ git commit -m "feat(plugin): draft a deployment entry from a verified plugin man
 3. **`LoadPackage`（验签）** —— 没过这一关**绝不**写配置
 4. `DraftEntry` → `AddEntry` → `WriteDeployment`
 
-**七条规则，逐条要有测试：**
+**九条规则，逐条要有测试：**
 
 1. **验签失败 → 不写配置**，`plugins.json` 一个字节都不变。这是本 task 的核心不变量。
 2. 摘要不符 → 不写配置，缓存目录里不留东西。
@@ -180,6 +180,8 @@ git commit -m "feat(plugin): draft a deployment entry from a verified plugin man
 5. `--grant` 给了插件没声明的能力 → 报错点名该能力。授权一个插件没要的能力是配置错误，不是宽容。
 6. 同名插件已在 `plugins.json` → 报错（Task 2 规则 1 的传递），并提示用 `plugins grant` 或手工编辑。
 7. `plugins.manifest` 未配置 → 报错说明 install 需要一份目标态清单。
+8. 明文 `http://` 而 `allow_insecure_sources` 未开 → **取回之前就拒绝**。`remoteDir` 在 loader.go:1335 已有这条；install 不做就成了绕过它的洞——运维能经明文装进来，直到 serve 才发现部署根本不肯拉。
+9. `plugins.cache` 未配置 → 报错点名该设置。远程包总得写到某处，而写哪儿是部署决定（措辞与 loader.go:1330 保持一致）。
 
 **命令不重启也不 reload**：改的是磁盘上的目标态，生效要 `agent plugins reload`（且 A5b 已有「远程策略漂移就拒绝 reload」的保护）。输出里说清楚这一点。
 
