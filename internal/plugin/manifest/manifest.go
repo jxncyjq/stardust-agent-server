@@ -32,6 +32,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"regexp"
 	"strings"
 )
@@ -47,6 +48,25 @@ const pluginABIVersion = 1
 // file; that check needs the plugin's bytes and belongs to Task 2's
 // LoadPackage.
 var sha256HexPattern = regexp.MustCompile(`^[0-9a-fA-F]{64}$`)
+
+// digestPattern matches Entry.Digest's required shape: the literal prefix
+// "sha256:" followed by 64 lowercase or uppercase hex digits. Only sha256
+// is accepted (see Entry.Digest's doc comment for why a second algorithm
+// is deliberately not supported): a second algorithm would be a second way
+// for a remote source to be signed weakly.
+var digestPattern = regexp.MustCompile(`^sha256:[0-9a-fA-F]{64}$`)
+
+// remoteSchemePattern matches an RFC 3986 URI scheme prefix: a letter, then
+// letters/digits/"+"/"-"/".", then "://". ParseDeployment uses it to catch
+// a Source naming some scheme other than http/https (file://, ftp://,
+// ssh://, ...) before that Source can fall through to local-path handling.
+// Without this check, a Source like "file:///etc/passwd" would not match
+// the "https://"/"http://" prefixes IsRemote checks for, and so would look
+// exactly like a relative local path to everything downstream — including
+// internal/plugin/loader's packageDir, which would filepath.Join it onto
+// the deployment root. That is a silent semantic slip, not a refusal, so
+// this pattern exists to make the refusal explicit and name the scheme.
+var remoteSchemePattern = regexp.MustCompile(`^([a-zA-Z][a-zA-Z0-9+.-]*)://`)
 
 // knownCapabilities is the complete set of host capability names a manifest
 // may name, on either side: PluginManifest.Capabilities (what a plugin
@@ -179,8 +199,47 @@ type Deployment struct {
 // (Tools), and any operator-supplied configuration for it (Config, passed
 // through unparsed — this package does not know a plugin's config schema).
 type Entry struct {
-	Name   string
+	Name string
+
+	// Source names where this entry's package comes from. It is one of
+	// two things, discriminated by prefix (see IsRemote):
+	//
+	//   - a Source beginning with "https://" or "http://" is a remote
+	//     source: the package is fetched from that URL (fetching itself is
+	//     a later task — this package only validates the shape). It must
+	//     be paired with Digest (see Digest's doc comment).
+	//   - anything else is a package directory path relative to the
+	//     deployment root (existing semantics, unchanged). It must NOT be
+	//     paired with Digest.
+	//
+	// A Source naming any other URL scheme (file://, ftp://, ssh://, ...)
+	// is neither of the above: ParseDeployment refuses it by name, naming
+	// the scheme, rather than letting it silently fall through as a local
+	// path (see remoteSchemePattern's doc comment for why that matters —
+	// filepath.Join does not know a scheme prefix is not part of a
+	// relative path).
 	Source string
+
+	// Digest is the sha256 content digest a remote Source's fetched bytes
+	// must match, formatted as "sha256:" followed by 64 hex digits
+	// (digestPattern). It is the trust anchor for a remote package: it
+	// guards "should these bytes be accepted" before anything reaches
+	// disk, independently of the plugin's signature, which guards a
+	// separate question ("should this package load") at load time.
+	//
+	// Digest is required on a remote Entry (both http:// and https://
+	// alike — the weaker plaintext channel needs it no less than the
+	// encrypted one) and forbidden on a local Entry: a local package's
+	// trust comes from its signature and the operator's own control of
+	// the deployment root's disk, and a Digest field that is never
+	// checked would mislead a reader into thinking it is.
+	//
+	// Only sha256 is accepted. This package does not read
+	// plugins.allow_insecure_sources or any other policy — whether an
+	// entry's insecure http:// source is actually permitted is decided at
+	// assembly (a later task); this package only reports the fact via
+	// IsInsecureSource.
+	Digest string
 
 	// Enabled controls whether this entry's plugin should be running.
 	// ParseDeployment parses the JSON "enabled" field as an optional bool
@@ -194,6 +253,52 @@ type Entry struct {
 	Grant  GrantDecl
 	Tools  []ToolAccept
 	Config json.RawMessage
+}
+
+// IsRemote reports whether e.Source names a remote package location rather
+// than a local one: a Source beginning with "https://" or "http://" is
+// remote; everything else — including a Source naming some other URL
+// scheme — is not (see Source's doc comment for why a foreign scheme is
+// refused by ParseDeployment rather than reported as remote here).
+func (e Entry) IsRemote() bool {
+	return strings.HasPrefix(e.Source, "https://") || strings.HasPrefix(e.Source, "http://")
+}
+
+// IsInsecureSource reports whether e is a plaintext remote source
+// (http://, as opposed to https://). It carries no policy of its own —
+// whether an insecure source is actually permitted is
+// plugins.allow_insecure_sources, read only at assembly time by a later
+// task — this method only states the fact so that layer has something to
+// decide on.
+//
+// Digest still guards byte integrity end to end even over http://, so a
+// man-in-the-middle cannot substitute different bytes; what plaintext
+// loses is confidentiality (which plugin is being fetched, and from
+// where, is observable on the wire) and availability (the connection can
+// be blocked, or fed a stale-but-legitimately-signed version indefinitely).
+func (e Entry) IsInsecureSource() bool {
+	return strings.HasPrefix(e.Source, "http://")
+}
+
+// RemoteURL parses e.Source as a URL. It returns an error if e is not a
+// remote entry (see IsRemote), if the URL fails to parse, or if the URL
+// carries userinfo (as in "https://user:pass@host/...") — credentials
+// must not appear in a plugins.json manifest, which is expected to be
+// committed to a git repository; this check applies to http:// and
+// https:// alike.
+func (e Entry) RemoteURL() (*url.URL, error) {
+	if !e.IsRemote() {
+		return nil, fmt.Errorf("plugin %q: source %q is not a remote source", e.Name, e.Source)
+	}
+	u, err := url.Parse(e.Source)
+	if err != nil {
+		return nil, fmt.Errorf("plugin %q: source %q is not a valid URL: %w", e.Name, e.Source, err)
+	}
+	if u.User != nil {
+		return nil, fmt.Errorf("plugin %q: source %q carries userinfo; credentials must not appear in a "+
+			"deployment manifest", e.Name, e.Source)
+	}
+	return u, nil
 }
 
 // GrantDecl is the capability authorization a deployment gives one plugin:
@@ -344,6 +449,7 @@ func validateRequires(name string, requires []string, contributedTools map[strin
 type rawEntry struct {
 	Name    string          `json:"name"`
 	Source  string          `json:"source"`
+	Digest  string          `json:"digest"`
 	Enabled *bool           `json:"enabled"`
 	Grant   GrantDecl       `json:"grant"`
 	Tools   []ToolAccept    `json:"tools"`
@@ -365,11 +471,21 @@ type rawDeployment struct {
 //   - a Grant.Capabilities entry that is not one of the six known
 //     capability names, for the same reason ParsePlugin checks
 //     PluginManifest.Capabilities: both feed the same six perm.Grant bools.
+//   - a Source naming a URL scheme other than http/https (file://, ftp://,
+//     ssh://, ...), naming the offending scheme (see remoteSchemePattern);
+//   - a remote entry (Source beginning "https://" or "http://") with no
+//     Digest, or one whose Digest is not "sha256:" followed by 64 hex
+//     digits, or whose Source fails to parse as a URL, or whose URL
+//     carries userinfo (see Entry.Digest and Entry.RemoteURL);
+//   - a local entry (any other Source) that carries a Digest — a field
+//     that would never be checked, which would mislead a reader into
+//     thinking it is (see Entry.Digest).
 //
 // Reconciling an entry's Grant/Tools against the plugin's own
 // PluginManifest — checking that a granted capability was actually
-// requested, or that an accepted tool was actually declared — is Task 2;
-// this function only checks plugins.json's own shape.
+// requested, or that an accepted tool was actually declared — and actually
+// fetching a remote entry's bytes, are later tasks; this function only
+// checks plugins.json's own shape.
 func ParseDeployment(data []byte) (Deployment, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -399,20 +515,81 @@ func ParseDeployment(data []byte) (Deployment, error) {
 			return Deployment{}, err
 		}
 
+		if err := rejectForeignScheme(re.Name, re.Source); err != nil {
+			return Deployment{}, err
+		}
+
 		enabled := true
 		if re.Enabled != nil {
 			enabled = *re.Enabled
 		}
-		entries = append(entries, Entry{
+		entry := Entry{
 			Name:    re.Name,
 			Source:  re.Source,
+			Digest:  re.Digest,
 			Enabled: enabled,
 			Grant:   re.Grant,
 			Tools:   re.Tools,
 			Config:  re.Config,
-		})
+		}
+
+		if err := validateEntrySource(entry); err != nil {
+			return Deployment{}, err
+		}
+
+		entries = append(entries, entry)
 	}
 	return Deployment{Plugins: entries}, nil
+}
+
+// rejectForeignScheme refuses a source naming a URL scheme other than
+// http/https (file://, ftp://, ssh://, ...), naming the offending scheme.
+// It must run before an Entry is classified by IsRemote: without this
+// check, a scheme-bearing source that is not "https://"/"http://" would
+// simply be IsRemote() == false and fall through as an ordinary local
+// path, which is the silent semantic slip Source's doc comment warns
+// against (see remoteSchemePattern).
+func rejectForeignScheme(name, source string) error {
+	m := remoteSchemePattern.FindStringSubmatch(source)
+	if m == nil {
+		return nil
+	}
+	scheme := strings.ToLower(m[1])
+	if scheme == "http" || scheme == "https" {
+		return nil
+	}
+	return fmt.Errorf("parse deployment manifest: plugin %q source %q names scheme %q; only http and https "+
+		"are supported remote schemes (it is refused here rather than treated as a local path, which would "+
+		"let it be joined onto the deployment root as if it were a relative directory)", name, source, scheme)
+}
+
+// validateEntrySource enforces Entry.Digest's pairing rules against an
+// already-classified Entry (see IsRemote): a remote entry must carry a
+// Digest matching digestPattern and a URL that RemoteURL accepts (parses,
+// no userinfo); a local entry must carry no Digest at all.
+func validateEntrySource(e Entry) error {
+	if !e.IsRemote() {
+		if e.Digest != "" {
+			return fmt.Errorf("parse deployment manifest: plugin %q has digest %q but source %q is a local "+
+				"path; a local package's trust comes from its signature and the operator's own control of "+
+				"the deployment root, not a digest that would never be checked", e.Name, e.Digest, e.Source)
+		}
+		return nil
+	}
+
+	if e.Digest == "" {
+		return fmt.Errorf("parse deployment manifest: plugin %q source %q is remote and has no digest; a "+
+			"remote source must carry a sha256 digest that guards byte integrity end to end — this applies "+
+			"equally to http:// and https://, since the weaker plaintext channel needs it no less", e.Name, e.Source)
+	}
+	if !digestPattern.MatchString(e.Digest) {
+		return fmt.Errorf("parse deployment manifest: plugin %q digest %q is not \"sha256:\" followed by 64 "+
+			"hex digits", e.Name, e.Digest)
+	}
+	if _, err := e.RemoteURL(); err != nil {
+		return fmt.Errorf("parse deployment manifest: %w", err)
+	}
+	return nil
 }
 
 // validateCapabilities rejects any name in caps that is not one of the six

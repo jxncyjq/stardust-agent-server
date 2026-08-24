@@ -489,6 +489,271 @@ func TestParseDeployment_UnknownFieldInEntryToolsRejected(t *testing.T) {
 	requireErrorContains(t, err, "riks_level")
 }
 
+// --- Remote sources (Entry.Digest, IsRemote, IsInsecureSource, RemoteURL) --
+
+// validDigest is a syntactically valid "sha256:" + 64 lowercase hex digit
+// digest, used by every remote-source test that does not care about the
+// digest shape check itself.
+const validDigest = "sha256:" + validSHA256
+
+// TestParseDeployment_RemoteLocalMixed_Positive is the Step 1 positive case:
+// one https remote entry, one http remote entry, and one local entry in the
+// same deployment, each parsed correctly with IsRemote/IsInsecureSource
+// asserted field by field.
+func TestParseDeployment_RemoteLocalMixed_Positive(t *testing.T) {
+	data := []byte(`{"plugins": [
+		{"name": "remote-https", "source": "https://pkgs.example.com/legion-jira.tar.gz", "digest": "` + validDigest + `"},
+		{"name": "remote-http", "source": "http://localhost:8080/legion-notify.tar.gz", "digest": "` + validDigest + `"},
+		{"name": "local", "source": "./plugins/legion-echo"}
+	]}`)
+	dep, err := ParseDeployment(data)
+	if err != nil {
+		t.Fatalf("ParseDeployment: unexpected error: %v", err)
+	}
+	if len(dep.Plugins) != 3 {
+		t.Fatalf("len(Plugins) = %d, want 3", len(dep.Plugins))
+	}
+
+	https := dep.Plugins[0]
+	if https.Digest != validDigest {
+		t.Errorf("https.Digest = %q, want %q", https.Digest, validDigest)
+	}
+	if !https.IsRemote() {
+		t.Errorf("https.IsRemote() = false, want true")
+	}
+	if https.IsInsecureSource() {
+		t.Errorf("https.IsInsecureSource() = true, want false")
+	}
+	u, err := https.RemoteURL()
+	if err != nil {
+		t.Fatalf("https.RemoteURL(): unexpected error: %v", err)
+	}
+	if u.Scheme != "https" || u.Host != "pkgs.example.com" {
+		t.Errorf("https.RemoteURL() = %+v, want scheme https, host pkgs.example.com", u)
+	}
+
+	http_ := dep.Plugins[1]
+	if http_.Digest != validDigest {
+		t.Errorf("http.Digest = %q, want %q", http_.Digest, validDigest)
+	}
+	if !http_.IsRemote() {
+		t.Errorf("http.IsRemote() = false, want true")
+	}
+	if !http_.IsInsecureSource() {
+		t.Errorf("http.IsInsecureSource() = false, want true")
+	}
+	u2, err := http_.RemoteURL()
+	if err != nil {
+		t.Fatalf("http.RemoteURL(): unexpected error: %v", err)
+	}
+	if u2.Scheme != "http" || u2.Host != "localhost:8080" {
+		t.Errorf("http.RemoteURL() = %+v, want scheme http, host localhost:8080", u2)
+	}
+
+	local := dep.Plugins[2]
+	if local.Digest != "" {
+		t.Errorf("local.Digest = %q, want empty", local.Digest)
+	}
+	if local.IsRemote() {
+		t.Errorf("local.IsRemote() = true, want false")
+	}
+	if local.IsInsecureSource() {
+		t.Errorf("local.IsInsecureSource() = true, want false")
+	}
+	if _, err := local.RemoteURL(); err == nil {
+		t.Errorf("local.RemoteURL(): want error (not a remote entry), got nil")
+	}
+}
+
+// Rule 1: a remote entry must have a digest, for both https and http alike.
+
+func TestParseDeployment_RemoteHTTPSMissingDigest(t *testing.T) {
+	data := []byte(`{"plugins": [
+		{"name": "p", "source": "https://pkgs.example.com/p.tar.gz"}
+	]}`)
+	_, err := ParseDeployment(data)
+	requireErrorContains(t, err, "p")
+	requireErrorContains(t, err, "digest")
+}
+
+func TestParseDeployment_RemoteHTTPMissingDigest(t *testing.T) {
+	data := []byte(`{"plugins": [
+		{"name": "p", "source": "http://pkgs.example.com/p.tar.gz"}
+	]}`)
+	_, err := ParseDeployment(data)
+	requireErrorContains(t, err, "p")
+	requireErrorContains(t, err, "digest")
+}
+
+// Rule 2: a local entry must NOT have a digest.
+
+func TestParseDeployment_LocalEntryWithDigestRejected(t *testing.T) {
+	data := []byte(`{"plugins": [
+		{"name": "p", "source": "./plugins/p", "digest": "` + validDigest + `"}
+	]}`)
+	_, err := ParseDeployment(data)
+	requireErrorContains(t, err, "p")
+	requireErrorContains(t, err, "digest")
+}
+
+// Rule 3: digest must be "sha256:" + 64 hex digits, and only sha256.
+
+func TestParseDeployment_RemoteDigestMissingAlgoPrefix(t *testing.T) {
+	data := []byte(`{"plugins": [
+		{"name": "p", "source": "https://pkgs.example.com/p.tar.gz", "digest": "` + validSHA256 + `"}
+	]}`)
+	_, err := ParseDeployment(data)
+	requireErrorContains(t, err, validSHA256)
+}
+
+func TestParseDeployment_RemoteDigestWrongAlgo(t *testing.T) {
+	data := []byte(`{"plugins": [
+		{"name": "p", "source": "https://pkgs.example.com/p.tar.gz", "digest": "sha1:` + validSHA256 + `"}
+	]}`)
+	_, err := ParseDeployment(data)
+	requireErrorContains(t, err, "sha1:"+validSHA256)
+}
+
+func TestParseDeployment_RemoteDigestWrongLength(t *testing.T) {
+	data := []byte(`{"plugins": [
+		{"name": "p", "source": "https://pkgs.example.com/p.tar.gz", "digest": "sha256:a1b2c3"}
+	]}`)
+	_, err := ParseDeployment(data)
+	requireErrorContains(t, err, "sha256:a1b2c3")
+}
+
+func TestParseDeployment_RemoteDigestNotHex(t *testing.T) {
+	data := []byte(`{"plugins": [
+		{"name": "p", "source": "https://pkgs.example.com/p.tar.gz", "digest": "sha256:` + strings.Repeat("z", 64) + `"}
+	]}`)
+	_, err := ParseDeployment(data)
+	requireErrorContains(t, err, "sha256:"+strings.Repeat("z", 64))
+}
+
+// Rule 4: IsRemote is true for both https and http; IsInsecureSource only
+// for http. Covered field-by-field in TestParseDeployment_RemoteLocalMixed_Positive
+// above; this test isolates the boundary case of a local Source that merely
+// contains the substrings "http"/"https" without being a URL, to confirm
+// prefix matching (not substring matching) is what decides it.
+func TestParseDeployment_LocalSourceContainingHTTPSubstring(t *testing.T) {
+	data := []byte(`{"plugins": [
+		{"name": "p", "source": "./plugins/my-http-plugin"}
+	]}`)
+	dep, err := ParseDeployment(data)
+	if err != nil {
+		t.Fatalf("ParseDeployment: unexpected error: %v", err)
+	}
+	if dep.Plugins[0].IsRemote() {
+		t.Errorf("IsRemote() = true for %q, want false (only a URL prefix counts)", dep.Plugins[0].Source)
+	}
+}
+
+// Rule 5: URL parse failure, or userinfo in the URL, is an error — for both
+// schemes.
+
+func TestParseDeployment_RemoteHTTPSUnparsableURL(t *testing.T) {
+	data := []byte(`{"plugins": [
+		{"name": "p", "source": "https://[::1", "digest": "` + validDigest + `"}
+	]}`)
+	_, err := ParseDeployment(data)
+	requireErrorContains(t, err, "p")
+}
+
+func TestParseDeployment_RemoteHTTPSUserinfoRejected(t *testing.T) {
+	data := []byte(`{"plugins": [
+		{"name": "p", "source": "https://user:pass@pkgs.example.com/p.tar.gz", "digest": "` + validDigest + `"}
+	]}`)
+	_, err := ParseDeployment(data)
+	requireErrorContains(t, err, "p")
+	requireErrorContains(t, err, "userinfo")
+}
+
+func TestParseDeployment_RemoteHTTPUserinfoRejected(t *testing.T) {
+	data := []byte(`{"plugins": [
+		{"name": "p", "source": "http://user:pass@pkgs.example.com/p.tar.gz", "digest": "` + validDigest + `"}
+	]}`)
+	_, err := ParseDeployment(data)
+	requireErrorContains(t, err, "p")
+	requireErrorContains(t, err, "userinfo")
+}
+
+// Rule 6: a scheme other than http/https is refused by name, not silently
+// treated as a local path.
+
+func TestParseDeployment_ForeignScheme(t *testing.T) {
+	tests := []struct {
+		name   string
+		source string
+		scheme string
+	}{
+		{"file", "file:///etc/passwd", "file"},
+		{"ftp", "ftp://pkgs.example.com/p.tar.gz", "ftp"},
+		{"ssh", "ssh://git@example.com/p.git", "ssh"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			data := []byte(`{"plugins": [
+				{"name": "p", "source": "` + tc.source + `", "digest": "` + validDigest + `"}
+			]}`)
+			_, err := ParseDeployment(data)
+			requireErrorContains(t, err, tc.scheme)
+			requireErrorContains(t, err, "p")
+		})
+	}
+}
+
+// Rule 7: existing local-path rules (absolute, "..") must not be loosened
+// by the new remote-source classification — an absolute or "../"-escaping
+// Source must still be classified as local (IsRemote() false, no digest
+// required/allowed), so it is still caught downstream by
+// internal/plugin/loader's packageDir, which this task does not touch.
+
+func TestParseDeployment_LocalPathRulesUnaffected(t *testing.T) {
+	tests := []struct {
+		name   string
+		source string
+	}{
+		{"absolute", "/etc/passwd"},
+		{"parent-escape", "../../etc/passwd"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			data := []byte(`{"plugins": [{"name": "p", "source": "` + tc.source + `"}]}`)
+			dep, err := ParseDeployment(data)
+			if err != nil {
+				t.Fatalf("ParseDeployment: unexpected error: %v (manifest layer does not itself reject "+
+					"absolute/escaping local paths; that is loader.packageDir's job)", err)
+			}
+			if dep.Plugins[0].IsRemote() {
+				t.Errorf("IsRemote() = true for local path %q, want false", tc.source)
+			}
+		})
+	}
+}
+
+// TestParseDeployment_RemoteRequiresDigest_MutationTarget and
+// TestParseDeployment_ForeignSchemeRejected_MutationTarget are the two
+// tests Step 3's mutation verification targets directly (in addition to
+// the rule-1 and rule-6 tests above, which already cover the same ground):
+// making digest optional for remote entries must fail the former, and
+// treating a foreign scheme as a local path must fail the latter.
+func TestParseDeployment_RemoteRequiresDigest_MutationTarget(t *testing.T) {
+	data := []byte(`{"plugins": [
+		{"name": "mutation-target", "source": "https://pkgs.example.com/p.tar.gz"}
+	]}`)
+	_, err := ParseDeployment(data)
+	requireErrorContains(t, err, "mutation-target")
+	requireErrorContains(t, err, "digest")
+}
+
+func TestParseDeployment_ForeignSchemeRejected_MutationTarget(t *testing.T) {
+	data := []byte(`{"plugins": [
+		{"name": "mutation-target", "source": "file:///etc/passwd", "digest": "` + validDigest + `"}
+	]}`)
+	_, err := ParseDeployment(data)
+	requireErrorContains(t, err, "file")
+}
+
 func equalStrings(got, want []string) bool {
 	if len(got) != len(want) {
 		return false
