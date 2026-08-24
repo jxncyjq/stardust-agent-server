@@ -692,8 +692,15 @@ func TestParseDeployment_ForeignScheme(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
+			// Deliberately no "digest" field: this isolates rule 6 (scheme
+			// rejection) from rule 2 (local entry must not carry a
+			// digest). If both were present, a mutated implementation
+			// that stopped rejecting foreign schemes could still produce
+			// an error for the wrong reason (treated as local + has a
+			// digest) and this test would pass for a coincidental reason
+			// instead of actually exercising rule 6.
 			data := []byte(`{"plugins": [
-				{"name": "p", "source": "` + tc.source + `", "digest": "` + validDigest + `"}
+				{"name": "p", "source": "` + tc.source + `"}
 			]}`)
 			_, err := ParseDeployment(data)
 			requireErrorContains(t, err, tc.scheme)
@@ -747,8 +754,11 @@ func TestParseDeployment_RemoteRequiresDigest_MutationTarget(t *testing.T) {
 }
 
 func TestParseDeployment_ForeignSchemeRejected_MutationTarget(t *testing.T) {
+	// No "digest" field, for the same reason given in TestParseDeployment_ForeignScheme:
+	// this must fail because rule 6 stopped firing, not because a local
+	// entry happened to carry a digest.
 	data := []byte(`{"plugins": [
-		{"name": "mutation-target", "source": "file:///etc/passwd", "digest": "` + validDigest + `"}
+		{"name": "mutation-target", "source": "file:///etc/passwd"}
 	]}`)
 	_, err := ParseDeployment(data)
 	requireErrorContains(t, err, "file")
