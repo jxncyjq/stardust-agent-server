@@ -40,11 +40,16 @@ var digestPattern = regexp.MustCompile(`^sha256:([0-9a-fA-F]{64})$`)
 // Limits bounds a single Fetch call. Both fields are explicit and finite:
 // there is no "zero means unlimited" reading of either one. A zero MaxBytes
 // makes Fetch reject any response body at all (see the "+1" trick in
-// Fetch's doc comment), and a zero Timeout makes the request's context
-// already expired before it is even sent — both are degenerate but bounded
-// outcomes, never an unbounded one. Callers are expected to pass values that
-// actually make sense for the artifact being fetched; Limits only draws the
-// boundary, it does not pick a sensible default within it.
+// Fetch's doc comment). A negative MaxBytes, or a Timeout that is zero or
+// negative, is an invalid Limits value: Fetch returns an error naming the
+// offending field before ever building the request, rather than let the
+// mistake misdiagnose itself further in — a negative MaxBytes would
+// otherwise make io.LimitReader yield nothing at all, which then reads
+// exactly like a digest mismatch against the empty string, blaming the
+// upstream artifact for what was actually a caller bug. Callers are
+// expected to pass values that actually make sense for the artifact being
+// fetched; Limits only draws the boundary, it does not pick a sensible
+// default within it.
 type Limits struct {
 	// MaxBytes is the hard cap, in bytes, on the response body Fetch will
 	// read. A server that claims a small Content-Length but then streams
@@ -87,6 +92,11 @@ type Limits struct {
 //
 // # Limits are hard, not advisory
 //
+// A negative limits.MaxBytes or a non-positive limits.Timeout is rejected
+// immediately, before any request is built — see Limits' doc comment for
+// why a bad limit must be reported as a bad limit rather than left to
+// misdiagnose itself downstream.
+//
 // limits.MaxBytes bounds how much of the response body Fetch will ever
 // read, via io.LimitReader(body, limits.MaxBytes+1): reading exactly
 // MaxBytes+1 bytes is what lets Fetch tell "the body is exactly at the
@@ -106,17 +116,24 @@ type Limits struct {
 //
 // # Redirects
 //
-// Fetch follows up to 10 redirect hops (installed via a CheckRedirect on a
+// Fetch follows up to 9 redirect hops (installed via a CheckRedirect on a
 // shallow copy of client — client itself is never mutated, so it remains
-// safe to share across concurrent Fetch calls) and refuses an 11th. If u's
-// own scheme is "https", every redirect target must also be "https": a hop
-// that downgrades to "http://" is refused immediately, regardless of which
-// hop it occurs on, because the caller authorized one URL, not a chain that
-// can leave TLS behind on a later hop. If u's own scheme is "http", Fetch
-// places no such restriction on redirect targets — whether an http:// u is
+// safe to share across concurrent Fetch calls) and refuses the 10th: at
+// most 10 requests total may be issued (the original plus 9 followed
+// redirects), matching net/http's own default semantics and wording.
+//
+// If u's own scheme is "https", every redirect target must also be
+// "https", and this is checked independently on every hop, not just the
+// first: a hop that downgrades to "http://" is refused immediately no
+// matter where in the chain it occurs, so an https origin can never end up
+// redirected onto plaintext — the caller authorized one https URL, not a
+// chain that can leave TLS behind on a later hop. If u's own scheme is
+// "http", the caller has already accepted plaintext for u itself — there
+// is no TLS left to leave behind — so Fetch places no further scheme
+// restriction on that chain's redirect targets; whether an http:// u is
 // permitted at all is a policy decision this package does not make (see
-// below); once made, restricting redirects further would only re-litigate
-// a decision that was already accepted for u itself.
+// below), and once made, restricting that chain's redirects further would
+// only re-litigate a decision already accepted for u itself.
 //
 // # What Fetch does not decide
 //
@@ -135,6 +152,13 @@ func Fetch(ctx context.Context, client *http.Client, u *url.URL, digest string, 
 	wantHex, err := parseDigest(digest)
 	if err != nil {
 		return nil, fmt.Errorf("fetch %s: %w", u, err)
+	}
+
+	if limits.MaxBytes < 0 {
+		return nil, fmt.Errorf("fetch %s: invalid limits: MaxBytes must be >= 0, got %d", u, limits.MaxBytes)
+	}
+	if limits.Timeout <= 0 {
+		return nil, fmt.Errorf("fetch %s: invalid limits: Timeout must be > 0, got %s", u, limits.Timeout)
 	}
 
 	reqCtx, cancel := context.WithTimeout(ctx, limits.Timeout)
