@@ -3,7 +3,9 @@ package manifest
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/stardust/legion-agent/internal/plugin/host"
 	"github.com/stardust/legion-agent/internal/plugin/perm"
+	"github.com/stardust/legion-agent/internal/plugin/sign"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
@@ -35,9 +38,10 @@ var riskLevelRank = map[string]int{
 	"critical": 3,
 }
 
-// LoadPackage reads one plugin package directory — exactly plugin.json and
-// plugin.wasm, no other layout is recognized — and returns the plugin's
-// validated manifest together with its wasm bytes.
+// LoadPackage reads one plugin package directory — exactly plugin.json,
+// plugin.wasm and, when the deployment requires signatures, plugin.sig; no
+// other layout is recognized — and returns the plugin's validated manifest
+// together with its wasm bytes.
 //
 // It verifies that the wasm bytes' sha256 digest matches the one plugin.json
 // declares, refusing to return anything if they disagree: a plugin.wasm that
@@ -46,11 +50,51 @@ var riskLevelRank = map[string]int{
 // under an old authorization. A mismatch names both the digest plugin.json
 // declares and the digest the bytes actually hash to, so the caller can tell
 // a stale manifest from a tampered or corrupted module.
-func LoadPackage(dir string) (PluginManifest, []byte, error) {
+//
+// # What the signature covers, and why one signature is enough
+//
+// That digest check alone cannot tell a package this deployment trusts from
+// one it does not: the sha256 travels inside the very file being trusted, so
+// whoever can edit plugin.wasm can edit the digest that describes it. The
+// detached signature in dir/plugin.sig closes exactly that gap, and it
+// covers plugin.json's RAW BYTES.
+//
+// That is enough for both files. plugin.json carries plugin.wasm's sha256,
+// and LoadPackage already verifies that the binary really hashes to that
+// value — so altering the .wasm breaks the digest check, and altering the
+// declared digest breaks the signature. One signature covers both.
+//
+// Signing the raw bytes rather than a re-serialized struct is equally
+// deliberate: any "decode, then re-encode, then sign" scheme requires
+// byte-identical JSON encoding on the signing and the verifying side, which
+// is a classic exploitable ambiguity. LoadPackage therefore checks the
+// signature against the bytes it read from disk, and does so BEFORE parsing
+// them — authenticate first, interpret second.
+//
+// keyring decides whether that check happens at all, and is the one optional
+// this contract declares:
+//
+//   - a non-nil keyring is the deployment's trust set: dir/plugin.sig must
+//     exist, must parse, and must verify against a key in it, or LoadPackage
+//     refuses the package with an error naming the directory and what
+//     failed (an unknown key id names that id and the trusted ones; a bad
+//     signature names the key it was checked against);
+//   - a nil keyring means THIS DEPLOYMENT DOES NOT REQUIRE SIGNATURES:
+//     verification is skipped and plugin.sig is not read at all. The sha256
+//     check is NOT part of that concession — it still runs and still refuses
+//     a plugin.wasm that does not match its manifest. Deciding when a
+//     deployment may pass nil is the caller's policy call, deliberately not
+//     this function's.
+func LoadPackage(dir string, keyring *sign.Keyring) (PluginManifest, []byte, error) {
 	manifestPath := filepath.Join(dir, "plugin.json")
 	manifestData, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return PluginManifest{}, nil, fmt.Errorf("load plugin package %q: read plugin.json: %w", dir, err)
+	}
+	if keyring != nil {
+		if err := verifyManifestSignature(dir, manifestData, keyring); err != nil {
+			return PluginManifest{}, nil, fmt.Errorf("load plugin package %q: %w", dir, err)
+		}
 	}
 	pm, err := ParsePlugin(manifestData)
 	if err != nil {
@@ -73,6 +117,42 @@ func LoadPackage(dir string) (PluginManifest, []byte, error) {
 	}
 
 	return pm, wasm, nil
+}
+
+// verifyManifestSignature reads dir/plugin.sig and checks it against keyring
+// over manifestData — plugin.json's raw bytes, exactly as read from disk.
+//
+// A missing, unreadable, malformed, untrusted or non-verifying plugin.sig is
+// an error naming which of those it was; none of them is ever answered with
+// a zero value or a skipped package, because "this package has no valid
+// signature" and "this deployment does not require signatures" must never be
+// the same outcome. The second is expressed only by LoadPackage's caller
+// passing a nil keyring, in which case this function is not called at all.
+//
+// The missing case (fs.ErrNotExist) is reported with its own wording,
+// distinct from an unreadable-but-present plugin.sig (a permission error, or
+// plugin.sig existing as something other than a regular file): the two are
+// deliberately kept apart so that a future caller can never key on
+// errors.Is(err, fs.ErrNotExist) — which is otherwise also true for a
+// missing plugin.json or plugin.wasm — and downgrade "no signature" into
+// "package not present, skip it".
+func verifyManifestSignature(dir string, manifestData []byte, keyring *sign.Keyring) error {
+	sigPath := filepath.Join(dir, "plugin.sig")
+	sigData, err := os.ReadFile(sigPath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf("plugin.sig is missing: this deployment requires a signed package: %w", err)
+		}
+		return fmt.Errorf("read plugin.sig: %w", err)
+	}
+	sig, err := sign.ParseSignature(sigData)
+	if err != nil {
+		return fmt.Errorf("parse plugin.sig: %w", err)
+	}
+	if err := keyring.Verify(sig, manifestData); err != nil {
+		return fmt.Errorf("verify plugin.json signature: %w", err)
+	}
+	return nil
 }
 
 // AssembleSpec reconciles a plugin's own declaration (pm) against one

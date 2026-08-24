@@ -72,6 +72,40 @@ type PluginsConfig struct {
 	// loads.
 	Root string `json:"root"`
 
+	// Keyring is the path to the trust keyring (a document of public keys, see
+	// internal/plugin/sign.ParseKeyring) every plugin package's signature is
+	// checked against. Like Manifest, a relative path resolves against the
+	// PROCESS working directory, and a configured path that cannot be read or
+	// parsed fails serve assembly rather than degrading to "no trust set".
+	//
+	// It must be non-empty whenever signatures are required (see
+	// SignatureRequired): "verify every package" with nothing to verify
+	// against is not a runnable deployment, and serve refuses to start in it.
+	//
+	// That rule is NOT enforced here, which is the difference between it and
+	// Root's identically-worded one above. validatePlugins rejects an empty
+	// Root because Root is decidable from the config text alone; deciding this
+	// one means reading and parsing the keyring file, and Load never does file
+	// I/O. It is enforced one layer out, at serve assembly, by
+	// cli.resolvePluginKeyring — so a plugins section that satisfied Load is
+	// not yet one serve will start on.
+	Keyring string `json:"keyring"`
+
+	// RequireSignature is the deployment's signature policy, as a POINTER so
+	// that "the operator wrote false" and "the operator wrote nothing" stay
+	// distinguishable. Read it through SignatureRequired rather than
+	// dereferencing it: nil means REQUIRED.
+	//
+	// The pointer is the same technique manifest.Entry.Enabled uses, pointed
+	// the other way: an absent "enabled" installs the plugin, an absent
+	// "require_signature" demands a signature. A security switch's unstated
+	// value must be the safe one, or every deployment written before the
+	// switch existed runs without it.
+	//
+	// Load normalizes it to a non-nil pointer, so a config that came through
+	// Load states its policy explicitly.
+	RequireSignature *bool `json:"require_signature"`
+
 	// Limits is the deployment's own resource ceiling, applied on top of each
 	// plugin's own request (each limit becomes min(plugin's request, this)).
 	Limits PluginLimitsConfig `json:"limits"`
@@ -81,6 +115,22 @@ type PluginsConfig struct {
 	// Manifest is set: a convergence that waited forever would hold the task
 	// gate shut against every new task with no way for anyone to recover.
 	ApplyWaitMs int `json:"apply_wait_ms"`
+}
+
+// SignatureRequired reports whether this deployment requires every plugin
+// package to carry a signature made by a key in its keyring.
+//
+// An UNSTATED policy (RequireSignature nil) is required, not optional. That is
+// the one rule this method exists to hold: it is also what a PluginsConfig
+// built as a struct literal — by an embedder, by a test — gets, and a zero
+// value that read as "signatures off" would silently disarm every such
+// assembly. Turning verification off is possible, but only by writing
+// "require_signature": false down.
+func (c PluginsConfig) SignatureRequired() bool {
+	if c.RequireSignature == nil {
+		return true
+	}
+	return *c.RequireSignature
 }
 
 // PluginLimitsConfig is the deployment-wide resource ceiling every plugin is
@@ -367,6 +417,13 @@ func Load(ctx context.Context, opts Options) (Config, error) {
 		cfg.Server.FileBaseURL = trimmed
 	}
 
+	// Normalize the signature policy into an explicit statement, through the
+	// one function that decides what an absent one means. A config that came
+	// through Load therefore says what it does rather than leaving the next
+	// reader to remember which way an absent pointer falls.
+	required := cfg.Plugins.SignatureRequired()
+	cfg.Plugins.RequireSignature = &required
+
 	if err := validatePlugins(cfg.Plugins); err != nil {
 		return Config{}, err
 	}
@@ -500,6 +557,12 @@ func defaultConfig() Config {
 		// Manifest stays empty on purpose: plugins are off until an operator
 		// names a deployment manifest. Everything else is defaulted so that
 		// naming one is the only edit a working plugin deployment needs.
+		//
+		// RequireSignature stays nil on purpose too, and is the one default
+		// NOT written here: a non-nil default would be indistinguishable from
+		// an operator's own "true" and would sit in front of
+		// SignatureRequired, leaving the meaning of an absent setting decided
+		// in two places instead of one. Nil is read as "required" there.
 		Plugins: PluginsConfig{
 			Root:        "plugins",
 			Limits:      PluginLimitsConfig{TimeoutMs: 10000, MaxMemoryPages: 256, MaxInstances: 4},

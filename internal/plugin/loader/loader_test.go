@@ -22,6 +22,7 @@ import (
 	"github.com/stardust/legion-agent/internal/lifecycle"
 	"github.com/stardust/legion-agent/internal/plugin/host"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
+	"github.com/stardust/legion-agent/internal/plugin/sign"
 	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
 	"github.com/stardust/legion-agent/internal/toolauth"
@@ -249,6 +250,17 @@ const defaultTestApplyWait = 30 * time.Second
 func newHarnessWithApplyWait(t *testing.T, applyWait time.Duration) *harness {
 	t.Helper()
 
+	return newHarnessWith(t, applyWait, nil)
+}
+
+// newHarnessWith is the one harness constructor the other two delegate to. Its
+// keyring is the deployment's trust set, exactly as loader.Config.Keyring
+// documents it: nil is the "this deployment does not require signatures"
+// statement every test but signature_test.go's makes, and a non-nil one makes
+// every package this harness loads have to carry a signature it verifies.
+func newHarnessWith(t *testing.T, applyWait time.Duration, keyring *sign.Keyring) *harness {
+	t.Helper()
+
 	h := &harness{
 		t:        t,
 		root:     t.TempDir(),
@@ -265,6 +277,7 @@ func newHarnessWithApplyWait(t *testing.T, applyWait time.Duration) *harness {
 		DeployLimits: manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
 		Gate:         h.gate,
 		ApplyWait:    applyWait,
+		Keyring:      keyring,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

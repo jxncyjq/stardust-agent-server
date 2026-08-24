@@ -2,6 +2,7 @@ package loader
 
 import (
 	"context"
+	"crypto/ed25519"
 	"errors"
 	"fmt"
 	"os"
@@ -15,6 +16,7 @@ import (
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/lifecycle"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
+	"github.com/stardust/legion-agent/internal/plugin/sign"
 	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
 	"github.com/stardust/legion-agent/internal/toolauth"
@@ -1630,4 +1632,394 @@ func TestE2EResumeRefusedByATakenToolNameStaysSuspendedWithItsReason(t *testing.
 	}
 	h.requireSuspendedInstanceIntact("after the refused resume", e2eChainBPlugin)
 	h.requireSuspendedInstanceIntact("after the refused resume", e2eChainCPlugin)
+}
+
+// ---------------------------------------------------------------------------
+// a5a Task 5: the signature acceptance pass, at the seam where a refusal is
+// observable — the real *tool.Registry and the process-global gateable
+// catalog — driven from a plugins.json on disk through the real Loader.Apply.
+//
+// The operator-facing half of this acceptance (the real `agent plugins
+// keygen`/`sign`/`reload` commands, the real serve assembly, and the
+// require_signature switch) lives in internal/cli/plugins_command_test.go:
+// those seams are in package cli, which imports THIS package, so an in-package
+// test here cannot reach them without an import cycle. See
+// TestSignedDeploymentAcceptanceFromKeygenThroughEveryTamper there.
+//
+// # Bounds (fork-bomb regime)
+//
+// Neither test below loops.
+// TestE2ESignedDeploymentKeepsServingTheVerifiedInstanceThroughEveryTamper
+// performs a literal FIVE Apply calls, written out one after another, and
+// asserts the ledger's owner count against a declared ceiling of 2 after every
+// one of them;
+// TestE2EAnUnverifiableEntryContributesNothingWhileItsSignedSiblingServes
+// performs exactly one. Nothing here waits on anything: no channel, no sleep,
+// no polling.
+
+// signPackageAs signs dir/plugin.json's RAW BYTES under the given key id and
+// writes dir/plugin.sig beside it. The key id is a parameter because a
+// signature naming a key the deployment does not trust is one of the refusals
+// this acceptance has to provoke, and it is indistinguishable from a trusted
+// one until the keyring is consulted.
+func signPackageAs(t *testing.T, dir string, priv ed25519.PrivateKey, id sign.KeyID) {
+	t.Helper()
+
+	manifestData, err := os.ReadFile(filepath.Join(dir, "plugin.json"))
+	if err != nil {
+		t.Fatalf("read plugin.json in %s: %v", dir, err)
+	}
+	sig, err := sign.Sign(priv, id, manifestData)
+	if err != nil {
+		t.Fatalf("sign plugin.json in %s: %v", dir, err)
+	}
+	doc, err := sign.MarshalSignature(sig)
+	if err != nil {
+		t.Fatalf("encode plugin.sig for %s: %v", dir, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "plugin.sig"), doc, 0o644); err != nil {
+		t.Fatalf("write plugin.sig in %s: %v", dir, err)
+	}
+}
+
+// readFileForRestore reads a file a test is about to tamper with, so the
+// tampering can be undone exactly. It returns the bytes rather than writing
+// them anywhere: a test that forgets to restore leaves a temp directory
+// behind, never the repository.
+func readFileForRestore(t *testing.T, path string) []byte {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	return append([]byte(nil), data...)
+}
+
+// writeBack restores a file readFileForRestore saved.
+func writeBack(t *testing.T, path string, data []byte) {
+	t.Helper()
+
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("restore %s: %v", path, err)
+	}
+}
+
+// flipOneByte rewrites path with its LAST byte incremented — one byte changed,
+// the file's length and every other byte identical. It is the smallest edit
+// that can be made to a binary, which is the point: the sha256 the signed
+// plugin.json pins is what has to notice it.
+func flipOneByte(t *testing.T, path string) {
+	t.Helper()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s to tamper with it: %v", path, err)
+	}
+	if len(data) == 0 {
+		t.Fatalf("%s is empty; there is no byte to flip and this test would prove nothing", path)
+	}
+	data[len(data)-1]++
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatalf("write the tampered %s: %v", path, err)
+	}
+}
+
+// requireEchoStillServes calls the echo plugin's tool through the real
+// registry and fails unless it answers exactly what the VERIFIED module
+// answers.
+//
+// It is the load-bearing assertion of the tamper rounds below, and it is not
+// satisfiable by a plugin that merely stayed in the ledger: the call reaches
+// the wasm instance, and the fixture echoes its own arguments back, so an
+// answer proves a working instance of the module that was verified is still
+// the one serving. A tampered module that had been mounted would either fail
+// to instantiate or answer differently.
+func (h *harness) requireEchoStillServes(ctx context.Context, when string) {
+	h.t.Helper()
+
+	result, _, err := h.executeAsModel(ctx, domain.ToolCall{
+		ID:        "model-call-echo-" + when,
+		Name:      echoToolName,
+		Arguments: map[string]string{"probe": when},
+	})
+	if err != nil {
+		h.t.Fatalf("%s: Execute(%q): %v", when, echoToolName, err)
+	}
+	if !result.Success {
+		h.t.Fatalf("%s: Execute(%q) result.Success = false (error %q), want true", when, echoToolName, result.Error)
+	}
+	if want := fmt.Sprintf("%s:{%q:%q}", echoToolName, "probe", when); result.Output != want {
+		h.t.Fatalf("%s: Execute(%q) result.Output = %q, want %q", when, echoToolName, result.Output, want)
+	}
+}
+
+// requireRefusedConvergenceLeftEverythingAlone is the "nothing moved" half of
+// every tamper round: the same two owners are in the ledger under the same
+// versions, both tools are still gateable, both status rows still say loaded
+// at 1.0.0, and the echo plugin still answers a real call.
+//
+// Checking the OWNER STRINGS rather than a count is what makes it strong: an
+// owner carries the plugin's version, so an instance that had been swapped for
+// the tampered package would show up here as a different owner even though the
+// count is unchanged.
+func (h *harness) requireRefusedConvergenceLeftEverythingAlone(ctx context.Context, when string) {
+	h.t.Helper()
+
+	h.requireInstanceCeiling(when, 2)
+	wantStrings(h.t, "ledger owners "+when, h.owners(),
+		[]string{"plugin:" + proxyPluginName + "@1.0.0", "plugin:" + echoPluginName + "@1.0.0"})
+	requireGateable(h.t, echoToolName, true, when)
+	requireGateable(h.t, proxyToolName, true, when)
+	for _, row := range h.loader.Status() {
+		if row.State != StateLoaded {
+			h.t.Fatalf("%s: Status row %q state = %q, want %q", when, row.Name, row.State, StateLoaded)
+		}
+		if row.Version != "1.0.0" {
+			h.t.Fatalf("%s: Status row %q version = %q, want 1.0.0: a refused package must not become the "+
+				"mounted one", when, row.Name, row.Version)
+		}
+	}
+	h.requireEchoStillServes(ctx, when)
+}
+
+// requireEchoFailureSays fails unless the echo entry's status row explains the
+// refusal with the given substring. The row is the running instance's — a
+// convergence that refuses a tampered package does NOT unmount the verified
+// instance it already has — so the reason has to travel onto that row, which
+// is where `agent plugins status` reads it from (cli.mergePluginStatus renders
+// a loaded row's LastError as error=...).
+func (h *harness) requireEchoFailureSays(when, want string) {
+	h.t.Helper()
+
+	row := h.statusOf(echoPluginName)
+	if row.LastError == "" {
+		h.t.Fatalf("%s: Status row for %q carries no LastError; the refusal reached no operator", when, echoPluginName)
+	}
+	if !strings.Contains(row.LastError, want) {
+		h.t.Fatalf("%s: Status row for %q LastError = %q, want it to mention %q", when, echoPluginName, row.LastError, want)
+	}
+}
+
+// TestE2ESignedDeploymentKeepsServingTheVerifiedInstanceThroughEveryTamper is
+// the acceptance for what a signature is FOR, at the seam a task actually
+// touches.
+//
+// Two signed plugins are mounted from a plugins.json on disk. Then each of the
+// three ways a package can stop being the one that was signed is applied to
+// ONE of them, and after each the convergence must refuse, say which check
+// failed, and leave the running deployment exactly as it was:
+//
+//  1. one byte of plugin.wasm changes -> refused on the sha256 the signed
+//     plugin.json pins (this is the transitivity claim: the signature covers
+//     plugin.json, and plugin.json covers the binary);
+//  2. plugin.json changes, digest kept correct -> refused on the signature,
+//     which is the only check that can catch it;
+//  3. the package is re-signed by a key the keyring does not hold -> refused
+//     by key id, naming the key that was offered.
+//
+// The positive state is established BEFORE any tampering — both tools serving
+// real calls, both owners in the ledger — so no assertion below can be
+// satisfied by a state that was already true.
+//
+// A fourth round puts the package back the way it was signed and converges
+// cleanly, which is the control that makes the three refusals mean something:
+// without it, "reload had stopped working" would pass rounds 1 to 3 just as
+// well as "verification works".
+//
+// Bound: a literal five Apply calls, written out. No loop, no wait.
+func TestE2ESignedDeploymentKeepsServingTheVerifiedInstanceThroughEveryTamper(t *testing.T) {
+	priv, keyring := newTestKey(t)
+	h := newHarnessWith(t, defaultTestApplyWait, keyring)
+	ctx := context.Background()
+
+	for _, name := range []string{echoToolName, proxyToolName} {
+		if toolauth.IsGateable(name) {
+			t.Fatalf("%q is already gateable before any apply: an earlier test leaked its contribution "+
+				"and this test's gateable assertions would be vacuous", name)
+		}
+	}
+
+	h.writeEcho("1.0.0")
+	h.writeProxy("1.0.0")
+	echoDir := filepath.Join(h.root, "echo")
+	signPackageAs(t, echoDir, priv, testKeyID)
+	signPackageAs(t, filepath.Join(h.root, "proxy"), priv, testKeyID)
+	h.writeManifest(e2eBothEnabledManifest())
+
+	// Apply 1 of 5: the startup convergence.
+	if err := h.applyManifest(ctx); err != nil {
+		t.Fatalf("startup Apply: %v", err)
+	}
+	h.requireInstanceCeiling("after the startup apply", 2)
+	wantStrings(t, "ledger owners after the startup apply", h.owners(),
+		[]string{"plugin:" + proxyPluginName + "@1.0.0", "plugin:" + echoPluginName + "@1.0.0"})
+	requireGateable(t, echoToolName, true, "after the startup apply")
+	requireGateable(t, proxyToolName, true, "after the startup apply")
+	for _, row := range h.loader.Status() {
+		if row.State != StateLoaded || row.LastError != "" {
+			t.Fatalf("Status row %q after the startup apply = %+v, want loaded with no error", row.Name, row)
+		}
+	}
+	h.requireEchoStillServes(ctx, "after the startup apply")
+
+	wasmPath := filepath.Join(echoDir, "plugin.wasm")
+	manifestFile := filepath.Join(echoDir, "plugin.json")
+	signatureFile := filepath.Join(echoDir, "plugin.sig")
+	originalWasm := readFileForRestore(t, wasmPath)
+	originalManifest := readFileForRestore(t, manifestFile)
+	originalSignature := readFileForRestore(t, signatureFile)
+
+	// Round 1 (Apply 2 of 5): the BINARY is tampered with and nothing else.
+	// plugin.sig still verifies — it covers plugin.json, which nobody touched —
+	// so only the digest that signed manifest pins can catch this.
+	flipOneByte(t, wasmPath)
+	err := h.applyManifest(ctx)
+	if err == nil {
+		t.Fatal("Apply() error = nil after one byte of plugin.wasm changed, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "sha256") {
+		t.Errorf("Apply() error = %v, want it to name the sha256 mismatch", err)
+	}
+	h.requireEchoFailureSays("after the tampered module was refused", "sha256")
+	h.requireRefusedConvergenceLeftEverythingAlone(ctx, "after the tampered module was refused")
+	writeBack(t, wasmPath, originalWasm)
+
+	// Round 2 (Apply 3 of 5): the MANIFEST is tampered with, and its declared
+	// sha256 is left correct on purpose. Every check but the signature passes,
+	// so a refusal here can only come from the signature.
+	retagVersion(t, echoDir, "9.9.9")
+	err = h.applyManifest(ctx)
+	if err == nil {
+		t.Fatal("Apply() error = nil after plugin.json changed under its signature, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "signature") {
+		t.Errorf("Apply() error = %v, want it to say the signature did not verify", err)
+	}
+	h.requireEchoFailureSays("after the re-tagged manifest was refused", "signature")
+	h.requireRefusedConvergenceLeftEverythingAlone(ctx, "after the re-tagged manifest was refused")
+	writeBack(t, manifestFile, originalManifest)
+	writeBack(t, signatureFile, originalSignature)
+
+	// Round 3 (Apply 4 of 5): the package is intact and properly signed — by a
+	// key this deployment does not trust. Nothing about the signature is
+	// malformed; the only thing wrong with it is who made it.
+	const rogueKeyID = sign.KeyID("rogue-key")
+	rogue, _ := newTestKeyWithID(t, rogueKeyID)
+	signPackageAs(t, echoDir, rogue, rogueKeyID)
+	err = h.applyManifest(ctx)
+	if err == nil {
+		t.Fatal("Apply() error = nil for a package signed by an untrusted key, want a refusal")
+	}
+	if !strings.Contains(err.Error(), string(rogueKeyID)) {
+		t.Errorf("Apply() error = %v, want it to name the key id the signature was made with", err)
+	}
+	if !strings.Contains(err.Error(), string(testKeyID)) {
+		t.Errorf("Apply() error = %v, want it to name the keys this deployment does trust", err)
+	}
+	h.requireEchoFailureSays("after the untrusted signature was refused", string(rogueKeyID))
+	h.requireRefusedConvergenceLeftEverythingAlone(ctx, "after the untrusted signature was refused")
+
+	// Round 4 (Apply 5 of 5): the control, and the regression test for the
+	// defect this acceptance pass found (see the a5a-task-5 report). The
+	// package is put back exactly as it was signed, and the same deployment
+	// converges cleanly — which is what makes the three refusals above mean
+	// something rather than "reload had stopped working".
+	//
+	// The entry is UNCHANGED as far as the fingerprint is concerned, so it is
+	// not activated again; before the fix, that meant nothing ever cleared the
+	// note round 3 left behind, and `agent plugins status` kept reporting the
+	// untrusted key for the rest of the process's life.
+	signPackageAs(t, echoDir, priv, testKeyID)
+	if err := h.applyManifest(ctx); err != nil {
+		t.Fatalf("Apply() error = %v, want nil: the package is intact and signed by a trusted key again", err)
+	}
+	h.requireInstanceCeiling("after the package was signed properly again", 2)
+	wantStrings(t, "ledger owners after the package was signed properly again", h.owners(),
+		[]string{"plugin:" + proxyPluginName + "@1.0.0", "plugin:" + echoPluginName + "@1.0.0"})
+	for _, row := range h.loader.Status() {
+		if row.State != StateLoaded {
+			t.Fatalf("Status row %q state = %q, want %q", row.Name, row.State, StateLoaded)
+		}
+		if row.LastError != "" {
+			t.Fatalf("Status row %q still carries error %q after a convergence that succeeded; an operator "+
+				"who fixed the package can never tell a stale failure from a live one", row.Name, row.LastError)
+		}
+	}
+	h.requireEchoStillServes(ctx, "after the package was signed properly again")
+}
+
+// TestE2EAnUnverifiableEntryContributesNothingWhileItsSignedSiblingServes is
+// the refusal's blast radius, at the two authorities a refused plugin must not
+// reach: the tool registry a model calls through, and the PROCESS-GLOBAL
+// gateable catalog a per-agent disabled_tools list resolves against.
+//
+// A tool that is callable but not gateable is an authorization bypass, and a
+// tool that is gateable but belongs to a plugin that never mounted is a ghost
+// entry in every agent's permission UI. Neither may survive a refusal, and
+// "the plugin is not in the ledger" does not prove either of them on its own.
+//
+// The signed sibling in the same plugins.json is the control: it proves the
+// deployment converged at all, so the unsigned entry's absence is a refusal
+// rather than an Apply that did nothing.
+//
+// Bound: exactly one Apply. No loop, no wait.
+func TestE2EAnUnverifiableEntryContributesNothingWhileItsSignedSiblingServes(t *testing.T) {
+	priv, keyring := newTestKey(t)
+	h := newHarnessWith(t, defaultTestApplyWait, keyring)
+	ctx := context.Background()
+
+	for _, name := range []string{echoToolName, proxyToolName} {
+		if toolauth.IsGateable(name) {
+			t.Fatalf("%q is already gateable before any apply: an earlier test leaked its contribution "+
+				"and this test's gateable assertions would be vacuous", name)
+		}
+	}
+
+	h.writeEcho("1.0.0")
+	h.writeProxy("1.0.0")
+	// Only the echo package is signed. The proxy package is left exactly as it
+	// was written: a complete, correct, UNSIGNED package.
+	signPackageAs(t, filepath.Join(h.root, "echo"), priv, testKeyID)
+	h.writeManifest(e2eBothEnabledManifest())
+
+	err := h.applyManifest(ctx)
+	if err == nil {
+		t.Fatal("Apply() error = nil, want the unsigned entry's refusal reported")
+	}
+	if !strings.Contains(err.Error(), proxyPluginName) {
+		t.Errorf("Apply() error = %v, want it to name the entry that was refused", err)
+	}
+	if !strings.Contains(err.Error(), "plugin.sig") {
+		t.Errorf("Apply() error = %v, want it to name the missing plugin.sig", err)
+	}
+
+	h.requireInstanceCeiling("after the mixed apply", 1)
+	wantStrings(t, "ledger owners after the mixed apply", h.owners(),
+		[]string{"plugin:" + echoPluginName + "@1.0.0"})
+
+	// The signed sibling really converged: its tool is registered, gateable and
+	// answers a model-shaped call.
+	wantStrings(t, "registry tools after the mixed apply", h.toolNames(), []string{echoToolName})
+	requireGateable(t, echoToolName, true, "after the mixed apply")
+	h.requireEchoStillServes(ctx, "after the mixed apply")
+
+	// The refused one reached neither authority.
+	requireGateable(t, proxyToolName, false, "after the mixed apply")
+	_, _, execErr := h.executeAsModel(ctx, domain.ToolCall{ID: "model-call-proxy", Name: proxyToolName})
+	if execErr == nil {
+		t.Fatalf("Execute(%q) error = nil, want an error: a refused plugin's tool must not be callable", proxyToolName)
+	}
+	if !errors.Is(execErr, tool.ErrToolNotFound) {
+		t.Errorf("Execute(%q) error = %v, want %v", proxyToolName, execErr, tool.ErrToolNotFound)
+	}
+
+	// And the operator can see why, on a row of its own.
+	row := h.statusOf(proxyPluginName)
+	if row.State != StateFailed {
+		t.Fatalf("Status row for %q state = %q, want %q", proxyPluginName, row.State, StateFailed)
+	}
+	if !strings.Contains(row.LastError, "plugin.sig") {
+		t.Errorf("Status row for %q LastError = %q, want it to say the signature was the problem", proxyPluginName, row.LastError)
+	}
 }

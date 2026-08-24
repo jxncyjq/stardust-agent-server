@@ -60,6 +60,7 @@ import (
 	"github.com/stardust/legion-agent/internal/plugin/host"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
 	"github.com/stardust/legion-agent/internal/plugin/perm"
+	"github.com/stardust/legion-agent/internal/plugin/sign"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
@@ -169,10 +170,16 @@ const (
 	StateFailed = "failed"
 )
 
-// Config is everything a Loader needs. Every field except DeployLimits is
-// required; New reports a missing one by name rather than defaulting it,
-// because each missing field would turn into a nil dereference or a silently
-// unrecorded convergence at the first Apply.
+// Config is everything a Loader needs. Every field except DeployLimits and
+// Keyring is required; New reports a missing one by name rather than defaulting
+// it, because each missing field would turn into a nil dereference or a
+// silently unrecorded convergence at the first Apply.
+//
+// The two exceptions are exceptions for opposite reasons: a zero DeployLimits
+// is simply "this deployment sets no ceiling of its own", while a nil Keyring
+// is a POLICY STATEMENT ("this deployment does not require signatures") that
+// New cannot tell apart from a forgotten field — which is why the field's own
+// doc puts the burden of never letting nil arise by accident on the caller.
 type Config struct {
 	// Ledger is where every activation files its revocation handles, and what
 	// an unload disposes. It is the single source of "what is actually
@@ -227,6 +234,25 @@ type Config struct {
 	// expires, NOTHING is applied and the failure says how many tasks were in
 	// the way.
 	ApplyWait time.Duration
+
+	// Keyring is the deployment's trust set: the public keys a plugin
+	// package's detached signature (plugin.sig) must verify against before
+	// anything is mounted from it. It is handed to manifest.LoadPackage on
+	// every convergence.
+	//
+	// A nil Keyring means THIS DEPLOYMENT DOES NOT REQUIRE SIGNATURES, and it
+	// is the one field here whose absence is a legitimate configuration rather
+	// than a wiring mistake — which is exactly why it is dangerous, and why
+	// the caller that builds this Config must let nil arise ONLY from an
+	// explicit "not required" statement. A nil that arrived because a keyring
+	// file could not be read, or because a field was forgotten, is a security
+	// control that switched itself off while the logs looked normal; the
+	// assembly is required to fail loudly in those cases instead of passing
+	// nil (see cli.resolvePluginKeyring, the only place that decides this).
+	//
+	// nil does NOT relax manifest.LoadPackage's sha256 check, which runs
+	// either way.
+	Keyring *sign.Keyring
 
 	// DeployLimits is the deployment's resource ceiling, applied to every
 	// plugin by manifest.AssembleSpec (each limit is min(plugin's request,
@@ -333,6 +359,11 @@ type Loader struct {
 	gate         *taskgate.TaskGate
 	applyWait    time.Duration
 
+	// keyring is Config.Keyring, verbatim: the deployment's trust set, or nil
+	// when it has explicitly stated that it does not require signatures. See
+	// Config.Keyring for why nil may only ever mean that.
+	keyring *sign.Keyring
+
 	mu        sync.Mutex
 	instances map[string]*instance
 	failures  map[string]failure
@@ -359,6 +390,16 @@ func New(cfg Config) (*Loader, error) {
 		return nil, fmt.Errorf("new plugin loader: Config.ApplyWait is %s; it must be positive, "+
 			"since an apply that waits forever for a task boundary holds the gate shut against every new task", cfg.ApplyWait)
 	}
+	if cfg.Keyring == nil {
+		// The one state this constructor cannot tell apart from a mistake, said
+		// out loud once per Loader. A deployment that verifies nothing is a
+		// legitimate choice; a deployment that verifies nothing because a field
+		// was forgotten looks exactly the same from in here, and the difference
+		// has to be visible somewhere an operator can find it.
+		cfg.Logger.Warn("plugin signature verification is disabled",
+			"component", "plugin-loader",
+			"consequence", "packages are accepted on their sha256 alone, which travels inside the very manifest it describes")
+	}
 	return &Loader{
 		ledger:       cfg.Ledger,
 		deps:         cfg.Deps,
@@ -367,9 +408,89 @@ func New(cfg Config) (*Loader, error) {
 		deployLimits: cfg.DeployLimits,
 		gate:         cfg.Gate,
 		applyWait:    cfg.ApplyWait,
+		keyring:      cfg.Keyring,
 		instances:    make(map[string]*instance),
 		failures:     make(map[string]failure),
 	}, nil
+}
+
+// SignaturePolicy is a Loader's signature-verification policy in comparable
+// form: whether a trust set is in force at all, and exactly which keys are in
+// it.
+//
+// It exists for one caller: a command that re-reads the deployment config
+// while a Loader is already running (`agent plugins reload` does) has to be
+// able to tell whether the policy it just read is the policy the running
+// Loader was BUILT with. The keyring is frozen when serve assembles the
+// Loader, so converging a new manifest without that comparison would apply the
+// operator's new manifest under their old trust set — a signature policy that
+// looks applied and is not.
+type SignaturePolicy struct {
+	// Enforced is whether this Loader verifies signatures at all. False is the
+	// deployment's deliberate "signatures are not required" statement, which
+	// is the only way a nil keyring may arise (see Config.Keyring).
+	Enforced bool
+
+	// KeyIDs are the ids of the trusted keys, sorted (sign.Keyring.IDs). It is
+	// empty exactly when Enforced is false: sign.ParseKeyring refuses an empty
+	// trust set, so an enforcing policy always names at least one key.
+	KeyIDs []sign.KeyID
+}
+
+// SignaturePolicyOf describes the policy a Loader built with keyring enforces.
+// A nil keyring — the one legitimate "this deployment does not require
+// signatures" value — is the unenforced policy.
+//
+// It is exported so that a caller which has resolved a keyring from a config
+// but has not built a Loader from it (reload does exactly that) computes the
+// policy through the same function Loader.SignaturePolicy uses, rather than
+// growing a second, drifting idea of what a policy is.
+func SignaturePolicyOf(keyring *sign.Keyring) SignaturePolicy {
+	if keyring == nil {
+		return SignaturePolicy{}
+	}
+	return SignaturePolicy{Enforced: true, KeyIDs: keyring.IDs()}
+}
+
+// Equal reports whether p and other are the same policy: the same enforcement
+// state over the same set of key ids. Key order does not matter in principle,
+// but both sides come from sign.Keyring.IDs, which sorts — so this compares
+// element by element rather than paying for a set.
+func (p SignaturePolicy) Equal(other SignaturePolicy) bool {
+	if p.Enforced != other.Enforced || len(p.KeyIDs) != len(other.KeyIDs) {
+		return false
+	}
+	for i, id := range p.KeyIDs {
+		if id != other.KeyIDs[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// String renders p for an operator reading an error message: the enforcement
+// state first, because that is the part that decides whether anything is
+// checked at all, then the trusted key ids so a changed trust set is visible
+// rather than merely asserted.
+func (p SignaturePolicy) String() string {
+	if !p.Enforced {
+		return "signatures not required"
+	}
+	ids := make([]string, 0, len(p.KeyIDs))
+	for _, id := range p.KeyIDs {
+		ids = append(ids, string(id))
+	}
+	return fmt.Sprintf("signatures required, trusted keys [%s]", strings.Join(ids, " "))
+}
+
+// SignaturePolicy returns the policy this Loader is enforcing right now.
+//
+// No lock is taken: keyring is written once in New and never again, so there
+// is nothing here for a concurrent Apply to race with. The returned KeyIDs
+// slice is freshly built by sign.Keyring.IDs on every call, so a caller cannot
+// reach into the Loader's trust set through it.
+func (l *Loader) SignaturePolicy() SignaturePolicy {
+	return SignaturePolicyOf(l.keyring)
 }
 
 // Apply converges the running plugin set toward dep, resolving each entry's
@@ -507,6 +628,25 @@ func (l *Loader) converge(ctx context.Context, wanted []manifest.Entry, declared
 			// Unchanged: leave the running instance exactly as it is. Rebuilding
 			// it would discard whatever the guest holds in memory and pay a fresh
 			// instantiation for no change at all.
+			//
+			// Its recorded explanation is NOT left as it is, though. prepare
+			// returns nil only for an entry whose package was read, verified,
+			// assembled and fingerprinted cleanly just now, which disproves
+			// whatever an earlier convergence recorded against it — a tampered
+			// plugin.wasm, a signature that did not verify, a manifest that
+			// would not assemble. Left in place that note would never come off:
+			// an unchanged entry is never activated again, and activate is the
+			// only other place that clears it, so an operator who fixed the
+			// package and reloaded successfully would go on reading the failure
+			// they had already fixed on every `agent plugins status`.
+			//
+			// A SUSPENDED instance is skipped. Its note explains a withdrawal
+			// that is still in force, and convergeDependencies deliberately does
+			// not rewrite it for a plugin that was already suspended before this
+			// convergence began.
+			if inst := l.mounted(entry.Name); !inst.plugin.Suspended() {
+				inst.lastError = ""
+			}
 			continue
 		}
 		plans = append(plans, plan)
@@ -655,7 +795,14 @@ func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string)
 		return nil, l.fail(ctx, entry.Name, "", stepSource, err, nil)
 	}
 
-	pm, wasm, err := manifest.LoadPackage(dir)
+	// l.keyring is the deployment's trust set, or nil when the deployment has
+	// EXPLICITLY stated that it does not require signatures (Config.Keyring).
+	// Either way LoadPackage's sha256 check runs; a non-nil keyring adds the
+	// signature check, whose failure is an ordinary activation failure — it
+	// goes through l.fail like every other one, so the entry lands in
+	// StateFailed with a LastError naming the signature, and the other entries
+	// keep converging.
+	pm, wasm, err := manifest.LoadPackage(dir, l.keyring)
 	if err != nil {
 		return nil, l.fail(ctx, entry.Name, "", stepLoadPackage, err, nil)
 	}

@@ -1,11 +1,18 @@
 package manifest
 
 import (
+	"bytes"
+	"crypto/ed25519"
+	"encoding/base64"
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/stardust/legion-agent/internal/plugin/sign"
 )
 
 // --- fixtures --------------------------------------------------------------
@@ -464,7 +471,7 @@ func TestAssembleSpec_TimeoutMsOverflowsDuration_Fails(t *testing.T) {
 // --- LoadPackage -------------------------------------------------------------
 
 func TestLoadPackage_ValidFixture(t *testing.T) {
-	pm, wasm, err := LoadPackage("testdata/pkg")
+	pm, wasm, err := LoadPackage("testdata/pkg", nil)
 	if err != nil {
 		t.Fatalf("LoadPackage: unexpected error: %v", err)
 	}
@@ -494,7 +501,7 @@ func TestLoadPackage_SHA256Mismatch(t *testing.T) {
 		"tools": [{"name": "t", "group": "g", "timeout_ms": 1000}]
 	}`, mustReadWasmFixture(t))
 
-	_, _, err := LoadPackage(dir)
+	_, _, err := LoadPackage(dir, nil)
 	requireErrorContains(t, err, "sha256")
 	requireErrorContains(t, err, validSHA256) // expected digest named
 	// actual digest of the real fixture wasm must also be named
@@ -507,7 +514,7 @@ func TestLoadPackage_MissingWasm(t *testing.T) {
 		t.Fatalf("write plugin.json: %v", err)
 	}
 
-	_, _, err := LoadPackage(dir)
+	_, _, err := LoadPackage(dir, nil)
 	requireErrorContains(t, err, "plugin.wasm")
 }
 
@@ -517,7 +524,7 @@ func TestLoadPackage_MissingManifest(t *testing.T) {
 		t.Fatalf("write plugin.wasm: %v", err)
 	}
 
-	_, _, err := LoadPackage(dir)
+	_, _, err := LoadPackage(dir, nil)
 	requireErrorContains(t, err, "plugin.json")
 }
 
@@ -538,4 +545,329 @@ func mustReadWasmFixture(t *testing.T) []byte {
 		t.Fatalf("read testdata/pkg/plugin.wasm: %v", err)
 	}
 	return data
+}
+
+// --- LoadPackage: signature verification -------------------------------------
+//
+// Every key pair and every plugin.sig below is minted here, at test time, into
+// a t.TempDir(). None of it is committed under testdata/: checking a private
+// key into git — even a throwaway one used only by a test — trains exactly the
+// reflex this whole feature exists to prevent.
+
+// newKeyring mints a fresh Ed25519 key pair and returns a Keyring trusting
+// exactly that one public key under id, along with the private key to sign
+// with. The keyring is built by feeding a real keyring document through
+// sign.ParseKeyring rather than by reaching into sign's internals, so the
+// tests below exercise the same construction path a deployment does.
+func newKeyring(t *testing.T, id sign.KeyID) (*sign.Keyring, ed25519.PrivateKey) {
+	t.Helper()
+	pub, priv, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	doc := fmt.Sprintf(`{"keys":[{"id":%q,"algorithm":"ed25519","public_key":%q}]}`,
+		string(id), base64.StdEncoding.EncodeToString(pub))
+	kr, err := sign.ParseKeyring([]byte(doc))
+	if err != nil {
+		t.Fatalf("parse generated keyring: %v", err)
+	}
+	return kr, priv
+}
+
+// writeSignatureDoc writes sig into dir as a plugin.sig document, without
+// signing anything itself. Tests that need a well-formed-but-wrong signature
+// (one altered byte) use this so that the refusal they observe comes from the
+// cryptographic check and not from sign.ParseSignature's shape checks.
+//
+// It encodes through sign.MarshalSignature rather than formatting the JSON
+// here. That is the point of MarshalSignature existing: the plugin.sig format
+// has exactly one reader (sign.ParseSignature) and must have exactly one
+// writer, or a test and the signing command would encode the same file
+// independently and only one of them would learn about a new field.
+func writeSignatureDoc(t *testing.T, dir string, sig sign.Signature) {
+	t.Helper()
+	doc, err := sign.MarshalSignature(sig)
+	if err != nil {
+		t.Fatalf("marshal plugin.sig: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "plugin.sig"), doc, 0o644); err != nil {
+		t.Fatalf("write plugin.sig: %v", err)
+	}
+}
+
+// writeSignature signs message with priv under id and writes the resulting
+// plugin.sig into dir.
+func writeSignature(t *testing.T, dir string, priv ed25519.PrivateKey, id sign.KeyID, message []byte) {
+	t.Helper()
+	sig, err := sign.Sign(priv, id, message)
+	if err != nil {
+		t.Fatalf("sign message: %v", err)
+	}
+	writeSignatureDoc(t, dir, sig)
+}
+
+// signedPackage assembles a complete, correctly signed package — plugin.json
+// and plugin.wasm copied from testdata/pkg, plus a freshly produced plugin.sig
+// over plugin.json's raw bytes — in a fresh temporary directory, and returns
+// that directory with a Keyring trusting the key that signed it.
+func signedPackage(t *testing.T) (string, *sign.Keyring) {
+	t.Helper()
+	dir := t.TempDir()
+	manifestData := mustReadFixture(t, "pkg/plugin.json")
+	writePackage(t, dir, string(manifestData), mustReadWasmFixture(t))
+	kr, priv := newKeyring(t, "ops-2026")
+	writeSignature(t, dir, priv, "ops-2026", manifestData)
+	return dir, kr
+}
+
+func TestLoadPackage_ValidSignatureLoads(t *testing.T) {
+	dir, kr := signedPackage(t)
+
+	pm, wasm, err := LoadPackage(dir, kr)
+	if err != nil {
+		t.Fatalf("LoadPackage: unexpected error: %v", err)
+	}
+	if pm.Name != "legion-jira" {
+		t.Errorf("Name = %q, want %q", pm.Name, "legion-jira")
+	}
+	if pm.Version != "1.2.0" {
+		t.Errorf("Version = %q, want %q", pm.Version, "1.2.0")
+	}
+	if pm.ABI != 1 {
+		t.Errorf("ABI = %d, want 1", pm.ABI)
+	}
+	if pm.SHA256 != "15f5822f4c269c1e6edf849d10c3c5c0b003b7b1d1bc58ec10e83ef9e8331ab5" {
+		t.Errorf("SHA256 = %q, want the fixture wasm's digest", pm.SHA256)
+	}
+	if len(pm.Tools) != 1 || pm.Tools[0].Name != "jira_search" {
+		t.Errorf("Tools = %+v, want exactly one named jira_search", pm.Tools)
+	}
+	if !bytes.Equal(wasm, mustReadWasmFixture(t)) {
+		t.Errorf("returned wasm bytes differ from testdata/pkg/plugin.wasm")
+	}
+}
+
+func TestLoadPackage_MissingSignatureWithKeyring(t *testing.T) {
+	dir, kr := signedPackage(t)
+	if err := os.Remove(filepath.Join(dir, "plugin.sig")); err != nil {
+		t.Fatalf("remove plugin.sig: %v", err)
+	}
+
+	_, _, err := LoadPackage(dir, kr)
+	if err == nil {
+		t.Fatal("LoadPackage: want an error for a package with no plugin.sig, got nil")
+	}
+	// The missing case has its own wording, distinct from an
+	// unreadable-but-present plugin.sig (see
+	// TestLoadPackage_UnreadableSignatureFile) — a future caller must never
+	// be able to key on "not exist" and treat it as "package absent, skip".
+	requireErrorContains(t, err, "plugin.sig is missing")
+}
+
+// TestLoadPackage_UnreadableSignatureFile pins the missing/unreadable
+// distinction from the other side: a plugin.sig that exists but cannot be
+// read as a regular file (here, it exists as a directory) must be reported
+// with the generic "read plugin.sig" wording, never the "is missing" wording
+// that fs.ErrNotExist gets — the two failure modes must stay
+// distinguishable, and neither may claim the package has no signature.
+func TestLoadPackage_UnreadableSignatureFile(t *testing.T) {
+	dir, kr := signedPackage(t)
+	if err := os.Remove(filepath.Join(dir, "plugin.sig")); err != nil {
+		t.Fatalf("remove plugin.sig: %v", err)
+	}
+	if err := os.Mkdir(filepath.Join(dir, "plugin.sig"), 0o755); err != nil {
+		t.Fatalf("mkdir plugin.sig: %v", err)
+	}
+
+	_, _, err := LoadPackage(dir, kr)
+	if err == nil {
+		t.Fatal("LoadPackage: want an error for a plugin.sig that exists but cannot be read, got nil")
+	}
+	requireErrorContains(t, err, "read plugin.sig")
+	if strings.Contains(err.Error(), "is missing") {
+		t.Errorf("error %q says plugin.sig is missing, but plugin.sig exists (as a directory); "+
+			"the missing and unreadable cases must say different things", err)
+	}
+}
+
+func TestLoadPackage_SignatureAlteredByOneByte(t *testing.T) {
+	dir, kr := signedPackage(t)
+	sigData, err := os.ReadFile(filepath.Join(dir, "plugin.sig"))
+	if err != nil {
+		t.Fatalf("read plugin.sig: %v", err)
+	}
+	sig, err := sign.ParseSignature(sigData)
+	if err != nil {
+		t.Fatalf("parse generated plugin.sig: %v", err)
+	}
+	// Flip one bit of the signature value, leaving the document's shape — key
+	// id, algorithm, signature length — untouched, so that the refusal can
+	// only come from the cryptographic check.
+	sig.Value[0] ^= 0x01
+	writeSignatureDoc(t, dir, sig)
+
+	_, _, err = LoadPackage(dir, kr)
+	if err == nil {
+		t.Fatal("LoadPackage: want an error for a signature altered by one byte, got nil")
+	}
+	requireErrorContains(t, err, "does not verify")
+	requireErrorContains(t, err, "ops-2026")
+}
+
+func TestLoadPackage_SignedByUntrustedKey(t *testing.T) {
+	dir, kr := signedPackage(t)
+	// A second, perfectly valid key pair that the keyring does not trust. Its
+	// own keyring is discarded on purpose: the point is that a real signature
+	// made by a key we never trusted is refused.
+	_, attackerPriv := newKeyring(t, "attacker-2027")
+	writeSignature(t, dir, attackerPriv, "attacker-2027", mustReadFixture(t, "pkg/plugin.json"))
+
+	_, _, err := LoadPackage(dir, kr)
+	if err == nil {
+		t.Fatal("LoadPackage: want an error for a package signed by an untrusted key, got nil")
+	}
+	requireErrorContains(t, err, "attacker-2027")
+	requireErrorContains(t, err, "not in the keyring")
+}
+
+// TestLoadPackage_ImpersonationWithTrustedKeyID covers the attack shape
+// TestLoadPackage_SignedByUntrustedKey does not: there, the key id itself is
+// untrusted, so refusal comes from sign.Keyring.Verify's unknown-id branch.
+// Here an attacker who holds no trusted key signs with their OWN key but
+// labels the signature with a key_id the keyring DOES trust ("ops-2026"),
+// hoping the id alone is enough. It is not: Verify resolves the named id to
+// its one trusted public key and checks strictly against that key, so this
+// must be refused by the cryptographic branch — the same one
+// TestLoadPackage_SignatureAlteredByOneByte exercises — giving Task 1's
+// "Verify never iterates keys hoping one works" guarantee a package-level
+// witness for the impersonation case specifically, not just bit-flip.
+func TestLoadPackage_ImpersonationWithTrustedKeyID(t *testing.T) {
+	dir, kr := signedPackage(t)
+	// A second, real key pair the keyring does not trust.
+	_, attackerPriv := newKeyring(t, "attacker-2027")
+	manifestData := mustReadFixture(t, "pkg/plugin.json")
+	// Sign with the attacker's own key, but claim the id "ops-2026" — the
+	// one key signedPackage's keyring actually trusts.
+	writeSignature(t, dir, attackerPriv, "ops-2026", manifestData)
+
+	_, _, err := LoadPackage(dir, kr)
+	if err == nil {
+		t.Fatal("LoadPackage: want an error for a signature made by an untrusted key but labeled " +
+			"with a trusted key id, got nil")
+	}
+	requireErrorContains(t, err, "does not verify")
+	requireErrorContains(t, err, "ops-2026")
+}
+
+// TestLoadPackage_ManifestAlteredByOneByte is the reason the whole mechanism
+// exists: a plugin.json edited after signing, whose own shape is still
+// perfectly valid, must be refused.
+func TestLoadPackage_ManifestAlteredByOneByte(t *testing.T) {
+	dir, kr := signedPackage(t)
+	original := mustReadFixture(t, "pkg/plugin.json")
+	altered := bytes.Replace(original, []byte(`"version": "1.2.0"`), []byte(`"version": "1.2.1"`), 1)
+	if bytes.Equal(altered, original) {
+		t.Fatal("fixture plugin.json no longer contains the version field this test alters")
+	}
+	// The altered manifest is still a valid manifest on its own — nothing but
+	// the signature can tell that it was changed.
+	if _, perr := ParsePlugin(altered); perr != nil {
+		t.Fatalf("altered manifest should still parse; the signature must be what refuses it: %v", perr)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "plugin.json"), altered, 0o644); err != nil {
+		t.Fatalf("write altered plugin.json: %v", err)
+	}
+
+	_, _, err := LoadPackage(dir, kr)
+	if err == nil {
+		t.Fatal("LoadPackage: want an error for a plugin.json altered after signing, got nil")
+	}
+	requireErrorContains(t, err, "does not verify")
+}
+
+// TestLoadPackage_WasmAlteredWithManifestAndSignatureIntact proves the plan's
+// central argument: one signature covers both files. The signature and the
+// declared sha256 are left exactly as signed, so the only thing that can
+// refuse the swapped binary is the digest check — and it must.
+func TestLoadPackage_WasmAlteredWithManifestAndSignatureIntact(t *testing.T) {
+	dir, kr := signedPackage(t)
+	wasm := mustReadWasmFixture(t)
+	wasm[0] ^= 0xff
+	if err := os.WriteFile(filepath.Join(dir, "plugin.wasm"), wasm, 0o644); err != nil {
+		t.Fatalf("write altered plugin.wasm: %v", err)
+	}
+
+	_, _, err := LoadPackage(dir, kr)
+	if err == nil {
+		t.Fatal("LoadPackage: want an error for an altered plugin.wasm, got nil")
+	}
+	requireErrorContains(t, err, "sha256")
+	requireErrorContains(t, err, "legion-jira")
+}
+
+// TestLoadPackage_NilKeyringSkipsVerificationNotDigest pins the contract's one
+// declared optional: a nil keyring means this deployment does not require
+// signatures, so an unsigned package loads — but the sha256 check is NOT part
+// of that concession and still refuses a mismatched binary.
+func TestLoadPackage_NilKeyringSkipsVerificationNotDigest(t *testing.T) {
+	unsigned := t.TempDir()
+	writePackage(t, unsigned, string(mustReadFixture(t, "pkg/plugin.json")), mustReadWasmFixture(t))
+
+	pm, _, err := LoadPackage(unsigned, nil)
+	if err != nil {
+		t.Fatalf("LoadPackage with a nil keyring: unexpected error: %v", err)
+	}
+	if pm.Name != "legion-jira" {
+		t.Errorf("Name = %q, want %q", pm.Name, "legion-jira")
+	}
+
+	corrupted := t.TempDir()
+	wasm := mustReadWasmFixture(t)
+	wasm[0] ^= 0xff
+	writePackage(t, corrupted, string(mustReadFixture(t, "pkg/plugin.json")), wasm)
+
+	_, _, err = LoadPackage(corrupted, nil)
+	if err == nil {
+		t.Fatal("LoadPackage with a nil keyring: want a sha256 error for an altered plugin.wasm, got nil")
+	}
+	requireErrorContains(t, err, "sha256")
+}
+
+// TestLoadPackage_MalformedSignatureDocument covers the remaining refusal in
+// verifyManifestSignature: a plugin.sig that is present but is not a
+// signature document at all must be refused, not read as "no signature" and
+// certainly not as a valid one.
+func TestLoadPackage_MalformedSignatureDocument(t *testing.T) {
+	dir, kr := signedPackage(t)
+	if err := os.WriteFile(filepath.Join(dir, "plugin.sig"), []byte("not a signature document"), 0o644); err != nil {
+		t.Fatalf("write malformed plugin.sig: %v", err)
+	}
+
+	_, _, err := LoadPackage(dir, kr)
+	if err == nil {
+		t.Fatal("LoadPackage: want an error for a malformed plugin.sig, got nil")
+	}
+	requireErrorContains(t, err, "parse plugin.sig")
+}
+
+// TestLoadPackage_EmptySignatureFile pins that a zero-byte plugin.sig is
+// refused the same way any other malformed document is (sign.ParseSignature
+// sees io.EOF from json.Decoder), and — more importantly — that it is NOT
+// treated the same as a missing plugin.sig: the file is present, so this
+// must go through verifyManifestSignature's parse failure, never through the
+// fs.ErrNotExist branch os.ReadFile would take for a genuinely absent file.
+func TestLoadPackage_EmptySignatureFile(t *testing.T) {
+	dir, kr := signedPackage(t)
+	if err := os.WriteFile(filepath.Join(dir, "plugin.sig"), []byte{}, 0o644); err != nil {
+		t.Fatalf("truncate plugin.sig: %v", err)
+	}
+
+	_, _, err := LoadPackage(dir, kr)
+	if err == nil {
+		t.Fatal("LoadPackage: want an error for a zero-byte plugin.sig, got nil")
+	}
+	requireErrorContains(t, err, "parse plugin.sig")
+	if strings.Contains(err.Error(), "is missing") {
+		t.Errorf("error %q says plugin.sig is missing, but an empty file is not the same as no file", err)
+	}
 }
