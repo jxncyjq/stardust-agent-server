@@ -97,10 +97,19 @@ type packageEntry struct {
 //
 // Unpack reads the entire archive into memory (bounded — see limits) and
 // validates all of it before creating destDir or writing a single file. A
-// refusal therefore leaves nothing behind: there is no state in which a
-// hostile entry was rejected but the entries beside it were kept. Skipping a
-// bad entry and continuing is exactly how a hostile package becomes an
-// accepted package minus one file, so Unpack never does it.
+// validation refusal therefore leaves nothing behind: there is no state in
+// which a hostile entry was rejected but the entries beside it were kept —
+// not a byte reaches disk before every entry has been judged acceptable.
+// Skipping a bad entry and continuing is exactly how a hostile package
+// becomes an accepted package minus one file, so Unpack never does it.
+//
+// This guarantee covers validation only. Once writeFiles has started, an I/O
+// failure partway through (a full disk, a permission error on the second
+// file) is not rolled back: destDir can be left holding an incomplete
+// package, with nothing marking it as such. Making destDir's replacement
+// atomic is not this function's job — it belongs to whatever decides where
+// destDir lives (a cache, most likely: unpack into a temporary directory and
+// rename the whole thing into place only once Unpack returns nil).
 //
 // # The layout contract
 //
@@ -215,6 +224,21 @@ func decodeEntries(archive []byte, destDir string, limits UnpackLimits) ([]packa
 			// smuggle a traversal past this point either.
 			continue
 		case tar.TypeReg:
+		case tar.TypeXHeader, tar.TypeXGlobalHeader:
+			// `git archive --format=tar.gz` is a common way to pack a
+			// repository, and it always emits a pax_global_header entry.
+			// This is refused like any other non-regular entry (the whole
+			// archive, never a skip — see the controller decision recorded
+			// in the review this branch closes), but with wording of its
+			// own: "is a tar extended header" is accurate yet useless to an
+			// operator who has no idea their packaging tool put it there.
+			// Naming the actual cause turns a confusing refusal into an
+			// actionable one.
+			return nil, fmt.Errorf(
+				"entry %q is a tar extended header, which `git archive` output always includes; "+
+					"a plugin package must be built with `tar`, not `git archive`",
+				hdr.Name,
+			)
 		default:
 			return nil, fmt.Errorf(
 				"entry %q is a %s; a plugin package may contain only regular files and directories",

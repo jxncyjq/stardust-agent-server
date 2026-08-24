@@ -22,12 +22,15 @@ import (
 
 // tarEntry describes one entry buildTarGz should write. Non-regular entries
 // (symlink, hard link, device, FIFO) carry no content; only typeflag and, for
-// links, linkname matter for them.
+// links, linkname matter for them. paxRecords is only used for extended
+// header entries (tar.TypeXHeader / tar.TypeXGlobalHeader), the shape a
+// `git archive`-produced pax_global_header entry takes.
 type tarEntry struct {
-	name     string
-	typeflag byte
-	content  []byte
-	linkname string
+	name       string
+	typeflag   byte
+	content    []byte
+	linkname   string
+	paxRecords map[string]string
 }
 
 // regularEntry is the common case: one regular file with content.
@@ -45,11 +48,21 @@ func buildTarGz(t *testing.T, entries ...tarEntry) []byte {
 	gz := gzip.NewWriter(&buf)
 	tw := tar.NewWriter(gz)
 	for _, e := range entries {
-		hdr := &tar.Header{
-			Name:     e.name,
-			Typeflag: e.typeflag,
-			Mode:     0o644,
-			Linkname: e.linkname,
+		// A TypeXGlobalHeader entry (a `git archive` pax_global_header) is
+		// special-cased by archive/tar itself: it refuses any field but
+		// Name, Typeflag and PAXRecords ("only PAXRecords should be set for
+		// TypeXGlobalHeader"), matching what git archive actually produces.
+		var hdr *tar.Header
+		if e.typeflag == tar.TypeXGlobalHeader {
+			hdr = &tar.Header{Name: e.name, Typeflag: e.typeflag, PAXRecords: e.paxRecords}
+		} else {
+			hdr = &tar.Header{
+				Name:       e.name,
+				Typeflag:   e.typeflag,
+				Mode:       0o644,
+				Linkname:   e.linkname,
+				PAXRecords: e.paxRecords,
+			}
 		}
 		if e.typeflag == tar.TypeReg {
 			hdr.Size = int64(len(e.content))
@@ -516,6 +529,154 @@ func TestUnpack_NonPositiveLimits_AreRejected(t *testing.T) {
 			requireNothingWritten(t, dest)
 		})
 	}
+}
+
+// --- Review follow-up: git archive, untested fail-loud branches, declared
+// vs. actual entry size, and an over-permissive existing destDir.
+
+// A `git archive --format=tar.gz` output always contains a pax_global_header
+// entry (typeflag 'g'). It is refused whole like any other non-regular
+// entry — the reviewer's own warning governs here: honoring it would mean
+// opening a second "skip this entry" path, and "refuse whole, never skip"
+// is the structural invariant this file exists to hold. What changes is the
+// wording: "is a tar extended header" is accurate but useless to an operator
+// who has no idea their packaging tool produced one, so the refusal names
+// the actual cause and the fix (use tar, not git archive) instead.
+func TestUnpack_GitArchiveExtendedHeader_IsRejectedWithActionableMessage(t *testing.T) {
+	dest := newDest(t)
+	entries := append([]tarEntry{
+		{name: "pax_global_header", typeflag: tar.TypeXGlobalHeader, paxRecords: map[string]string{"comment": "deadbeef"}},
+	}, validEntries("")...)
+
+	err := Unpack(buildTarGz(t, entries...), dest, testUnpackLimits())
+
+	requireErrorContains(t, err, "git archive")
+	requireErrorContains(t, err, "tar")
+	requireNothingWritten(t, dest)
+}
+
+// A regular file may not be named "." — that name is accepted only for a
+// directory entry (see TestUnpack_DotSlashPrefixedNames_AreAccepted), where
+// it means "the archive root itself". A *regular file* claiming that name is
+// nonsensical and decodeEntries refuses it outright (unpack.go's
+// `if name == "."` branch) rather than trying to make sense of it.
+func TestUnpack_RegularFileNamedDot_IsRejected(t *testing.T) {
+	dest := newDest(t)
+	entries := append(validEntries(""), regularEntry(".", []byte("x")))
+
+	err := Unpack(buildTarGz(t, entries...), dest, testUnpackLimits())
+
+	requireErrorContains(t, err, "archive root")
+	requireNothingWritten(t, dest)
+}
+
+// An empty entry name is reachable, not theoretical: archive/tar's Writer
+// accepts Name == "" without error and Reader.Next hands it back unchanged
+// (verified directly — WriteHeader on a Header with an empty Name returns
+// nil, and the resulting entry round-trips through Reader.Next with
+// Name == ""). validateEntryName refuses it before any name-shape check
+// would even have something to look at.
+func TestUnpack_EmptyEntryName_IsRejected(t *testing.T) {
+	dest := newDest(t)
+	entries := append(validEntries(""), tarEntry{name: "", typeflag: tar.TypeReg, content: []byte("x")})
+
+	err := Unpack(buildTarGz(t, entries...), dest, testUnpackLimits())
+
+	requireErrorContains(t, err, "empty name")
+	requireNothingWritten(t, dest)
+}
+
+// buildTarGzWithLyingEntrySize hand-assembles a gzipped tar whose one entry
+// declares declaredSize in its header while len(actualContent) bytes
+// physically follow it. archive/tar's own Writer refuses to produce this
+// (tw.Write returns "archive/tar: write too long" the moment written bytes
+// would exceed the header's declared Size), so the header is written
+// through tar.Writer — self-contained: a short ASCII name stays within one
+// 512-byte USTAR block, confirmed by inspection — and the content that
+// follows is written directly to the underlying buffer instead, padded to
+// its own (not the declared) 512-byte boundary, then closed with a bare
+// end-of-archive marker. There is deliberately no valid way to append
+// further entries after this one; see the comment on the test that calls
+// this for why.
+func buildTarGzWithLyingEntrySize(t *testing.T, name string, declaredSize int64, actualContent []byte) []byte {
+	t.Helper()
+
+	var raw bytes.Buffer
+	tw := tar.NewWriter(&raw)
+	if err := tw.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeReg, Mode: 0o644, Size: declaredSize}); err != nil {
+		t.Fatalf("write lying header: %v", err)
+	}
+	if _, err := raw.Write(actualContent); err != nil {
+		t.Fatalf("write physical content: %v", err)
+	}
+	if pad := (512 - len(actualContent)%512) % 512; pad > 0 {
+		raw.Write(make([]byte, pad))
+	}
+	raw.Write(make([]byte, 1024)) // end-of-archive marker: two zero blocks
+
+	var gzBuf bytes.Buffer
+	gz := gzip.NewWriter(&gzBuf)
+	if _, err := gz.Write(raw.Bytes()); err != nil {
+		t.Fatalf("gzip write: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		t.Fatalf("gzip close: %v", err)
+	}
+	return gzBuf.Bytes()
+}
+
+// M-4 asked for a fixture whose header declares a small size while the
+// entry body physically carries MaxEntryBytes+1 bytes, to pin that Unpack
+// counts bytes actually read rather than trusting hdr.Size. Direct
+// experimentation (see the report's fix-pass section for the probe and its
+// output) established that this cannot be built as a fixture that
+// distinguishes the two: archive/tar.Reader's Read never yields more than
+// the header's own declared Size for an entry, no matter what bytes
+// physically follow it in the stream — "trust hdr.Size" and "count bytes
+// actually read from a *tar.Reader" are the same operation, because the
+// library enforces the boundary itself before any caller-side code sees a
+// byte. Placing MaxEntryBytes+1 bytes after a 10-byte declared header
+// therefore does not smuggle those bytes into the entry: decodeEntries reads
+// exactly 10 bytes for it (well under the limit, not rejected on that
+// ground), and the stream is left desynced, so archive/tar refuses the
+// *next* header as corrupt. That still refuses this archive as a whole —
+// nothing is written — but not for the reason M-4 wanted pinned, and the
+// mutation it was meant to catch (checking hdr.Size instead of bytes read)
+// does not make this test fail, because it produces the identical desync.
+// Kept anyway: it is still a real regression test for "a size-inconsistent
+// entry is refused, never partially accepted."
+func TestUnpack_EntryDeclaredSizeSmallerThanPhysicalContent_IsRejected(t *testing.T) {
+	dest := newDest(t)
+	limits := testUnpackLimits()
+	limits.MaxEntryBytes = 1 << 10
+
+	archive := buildTarGzWithLyingEntrySize(t, "plugin.wasm", 10, bytes.Repeat([]byte("A"), int(limits.MaxEntryBytes)+1))
+
+	err := Unpack(archive, dest, limits)
+
+	if err == nil {
+		t.Fatal("want error for an entry whose declared size disagrees with its physical content, got nil")
+	}
+	requireNothingWritten(t, dest)
+}
+
+// unpack.go's explicit Chmod(destDir, 0o700) exists for exactly this case: a
+// destination directory that already exists and is more permissive than a
+// directory holding an executable wasm module and its signature should be.
+func TestUnpack_ExistingDestDirTooPermissive_IsTightened(t *testing.T) {
+	dest := newDest(t)
+	if err := os.MkdirAll(dest, 0o777); err != nil {
+		t.Fatalf("mkdir %s: %v", dest, err)
+	}
+	if err := os.Chmod(dest, 0o777); err != nil {
+		t.Fatalf("chmod %s: %v", dest, err)
+	}
+
+	if err := Unpack(buildTarGz(t, validEntries("")...), dest, testUnpackLimits()); err != nil {
+		t.Fatalf("Unpack: %v", err)
+	}
+
+	requirePerm(t, dest, 0o700)
 }
 
 // An empty destination is a programming error in the caller, not a runtime

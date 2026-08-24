@@ -1,13 +1,20 @@
-// Package fetch pulls one remote plugin artifact's bytes over HTTP(S) and
-// verifies them against a caller-supplied sha256 digest before ever handing
-// them back. It is the narrow, dangerous middle of the remote-source path —
-// the first code in this repository that pulls bytes off a network — and it
-// deliberately knows nothing beyond that: it does not unpack an archive
-// (internal/plugin/loader's job), does not cache anything to disk (also the
-// loader's job), does not read policy such as
+// Package fetch pulls one remote plugin artifact's bytes over HTTP(S),
+// verifies them against a caller-supplied sha256 digest, and — once verified
+// — unpacks them into a package directory on disk. It is the narrow,
+// dangerous middle of the remote-source path: the first code in this
+// repository that pulls bytes off a network, and the first that writes an
+// untrusted archive's contents to the filesystem.
+//
+// The package's two entry points sit on either side of that filesystem
+// boundary. Fetch retrieves and verifies bytes; it never touches the
+// filesystem — see Fetch's doc comment. Unpack is the package's only writer:
+// it decodes and validates an entire archive in memory first, and writes to
+// disk — creating the destination directory and the files inside it — only
+// after the whole archive has been judged acceptable; see Unpack's doc
+// comment for what "acceptable" means and what gets refused. Fetch does not
+// unpack, and Unpack does not fetch. Neither reads policy such as
 // plugins.allow_insecure_sources (the caller's job — see Fetch's doc
-// comment), and does not know what a "plugin" is at all. It returns bytes or
-// an error; nothing it does ever touches the filesystem.
+// comment), caches anything, or reads back what it just wrote.
 package fetch
 
 import (
