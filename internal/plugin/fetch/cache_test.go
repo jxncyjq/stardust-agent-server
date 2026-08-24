@@ -475,6 +475,36 @@ func TestCache_Put_RefusedArchive_LeavesNoDigestDirectory(t *testing.T) {
 	}
 }
 
+func TestCache_Put_DigestPathIsAFile_IsReportedAndNothingIsDeleted(t *testing.T) {
+	c, _ := newTestCache(t)
+	archive, digest := testArchive(t)
+	dir := c.Dir(digest)
+
+	if err := os.MkdirAll(filepath.Dir(dir), 0o700); err != nil {
+		t.Fatalf("create %s: %v", filepath.Dir(dir), err)
+	}
+	const occupied = "not a package directory"
+	if err := os.WriteFile(dir, []byte(occupied), 0o600); err != nil {
+		t.Fatalf("write %s: %v", dir, err)
+	}
+
+	got, err := c.Put(digest, archive, testUnpackLimits())
+	requireErrorContains(t, err, "not a directory")
+	if got != "" {
+		t.Fatalf("Put returned path %q alongside its error", got)
+	}
+	// Put replaces an incomplete package directory, but a cache holding
+	// something that is not a directory at all was not built by these rules,
+	// so nothing here may delete it.
+	content, readErr := os.ReadFile(dir)
+	if readErr != nil {
+		t.Fatalf("read %s: %v", dir, readErr)
+	}
+	if string(content) != occupied {
+		t.Fatalf("%s content = %q, want it untouched (%q)", dir, content, occupied)
+	}
+}
+
 func TestCache_Put_InvalidLimits_ReturnsError(t *testing.T) {
 	c, _ := newTestCache(t)
 	archive, digest := testArchive(t)

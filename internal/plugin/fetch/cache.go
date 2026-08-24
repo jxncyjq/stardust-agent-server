@@ -178,6 +178,9 @@ func (c *Cache) Has(digest string) (bool, error) {
 // An incomplete directory that is already at the digest path — left by a
 // process killed before this rule existed, or by a hand-edited cache — is
 // replaced whole rather than written into or left to wedge the digest forever.
+// Something that is not a directory at all standing at that path is a
+// different matter: that is a cache nobody built by these rules, so Put
+// reports it and deletes nothing.
 func (c *Cache) Put(digest string, archive []byte, limits UnpackLimits) (dir string, err error) {
 	hexDigits, parseErr := parseDigest(digest)
 	if parseErr != nil {
@@ -280,7 +283,11 @@ func isHexDigest(s string) bool {
 //     is already won by both.
 //   - An incomplete one. Nothing may read it (Has refuses it) and nothing else
 //     will ever replace it (its digest directory exists), so it is removed and
-//     the rename retried. This is the only place the cache deletes anything.
+//     the rename retried. This is the only place the cache deletes anything,
+//     and it deletes only something no reader was allowed to use. Between that
+//     removal and the retry a concurrent Has reports a miss for a moment; the
+//     worst that costs is one redundant fetch, whereas the alternative —
+//     leaving the directory alone — wedges the digest permanently.
 //
 // Any other rename failure is reported, naming both attempts.
 func commit(tmp, final string) error {
