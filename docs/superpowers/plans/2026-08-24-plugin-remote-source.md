@@ -83,24 +83,29 @@ func ParseKeyring(data []byte) (*Keyring, error)
   - `func (e Entry) IsRemote() bool`
   - `func (e Entry) RemoteURL() (*url.URL, error)`
 
-**判别规则**（写进 `Entry.Source` 与 `IsRemote` 的 doc）：`source` 以 `https://` 开头即远程，否则按既有语义当作相对部署根的本地目录。**`http://`（无 TLS）一律拒绝**——插件代码是要在宿主里执行的字节，明文传输没有可讨论的余地；即便有 digest 兜底，也不该让一个可被中间人观察和阻断的通道进入信任链。
+**判别规则**（写进 `Entry.Source` 与 `IsRemote` 的 doc）：`source` 以 `https://` 或 `http://` 开头即远程，否则按既有语义当作相对部署根的本地目录。
 
-**六条校验规则，逐条要有测试：**
+**`http://` 默认拒绝，但可由部署显式解锁**（调试期要能用本地静态服务器）。解锁开关是 Task 5 的 `plugins.allow_insecure_sources`，缺省 `false`；本 task 只做形状校验与判别，**不读该开关**——清单层不知道策略，策略在装配层。因此本 task 对 `http://` 的产出是「这是一条不安全的远程来源」这个事实，而不是「拒绝」这个动作。
 
-1. 远程条目**必须**有 `digest`，缺失即报错点名该条目。这是本期的信任锚。
+明文传输在有 digest 的前提下**丢的是什么、不丢的是什么**，要写进开关的 doc（Task 5），这里先记清楚：digest 仍然逐字节把守完整性，所以中间人**换不掉**字节；丢的是机密性（谁在拉哪个插件是可观察的）与可用性（连接可被阻断），另外攻击者可以持续投喂一个**旧但合法**的版本。这就是它只该用于调试的理由。
+
+**七条校验规则，逐条要有测试：**
+
+1. 远程条目**必须**有 `digest`，缺失即报错点名该条目。这是本期的信任锚。**`http://` 与 `https://` 一视同仁**——恰恰因为明文通道更弱，digest 在那里更不能免。
 2. 本地条目**不得**有 `digest`：本地目录的信任来自签名与部署方对自己磁盘的控制，写一个不会被校验的字段会让读者以为它生效了。
 3. `digest` 形状必须是 `sha256:` 加 64 位十六进制，否则报错点名实际值。**只接受 sha256**——多一种算法就多一条「用弱算法签发」的路径，本期不需要。
-4. `source` 以 `http://` 开头 → 报错，错误里说明必须用 HTTPS。
-5. `source` 是 `https://` 但 URL 解析失败、或含用户信息（`https://user:pass@host/...`）→ 报错。凭据不该出现在一份会被提交进 git 的部署清单里。
-6. 既有的本地路径规则（绝对路径、`..`）保持不变，且要有测试证明扩展没有把它们放松。
+4. `IsRemote()` 对 `https://` 与 `http://` 都为真；新增 `func (e Entry) IsInsecureSource() bool`，只对 `http://` 为真，供 Task 5 的策略判断。
+5. URL 解析失败、或含用户信息（`https://user:pass@host/...`）→ 报错。凭据不该出现在一份会被提交进 git 的部署清单里。**这条对两种 scheme 都适用。**
+6. 除 `http`/`https` 之外的 scheme（`file://`、`ftp://`、`ssh://`…）→ 报错点名该 scheme。**不要用「不是 https 就当本地路径」的写法**：那会让 `file:///etc/passwd` 被 `filepath.Join` 当成相对路径去拼，是一条静默的语义错位。
+7. 既有的本地路径规则（绝对路径、`..`）保持不变，且要有测试证明扩展没有把它们放松。
 
-- [ ] **Step 1: 写失败测试**（上述六条，每条断言**确实返回 error** 且点名字段/值；外加正向：一条远程条目与一条本地条目在同一份清单里各自解析正确，逐字段断言）
+- [ ] **Step 1: 写失败测试**（上述七条，每条断言**确实返回 error** 且点名字段/值；外加正向：一条 https 远程、一条 http 远程、一条本地条目在同一份清单里各自解析正确且 `IsRemote`/`IsInsecureSource` 取值正确，逐字段断言）
 
 - [ ] **Step 2: 实现**
 
 - [ ] **Step 3: 变异验证（两个）**
   - 把「远程必须有 digest」改成可选 → 该测试应 FAIL
-  - 把 `http://` 的拒绝去掉 → 该测试应 FAIL
+  - 把「非 http/https 的 scheme 报错」改成「当作本地路径」→ `file://` 那条测试应 FAIL
 
 - [ ] **Step 4: 提交**
 
@@ -245,6 +250,7 @@ go test ./internal/plugin/fetch/ -race -count=1 -p 1 -timeout 120s
   "cache": "./var/plugin-cache",
   "keyring": "./configs/plugin-keyring.json",
   "require_signature": true,
+  "allow_insecure_sources": false,
   "fetch": { "timeout_ms": 30000, "max_bytes": 33554432 },
   "limits": { "timeout_ms": 10000, "max_memory_pages": 256, "max_instances": 4 },
   "apply_wait_ms": 60000
@@ -257,21 +263,26 @@ go test ./internal/plugin/fetch/ -race -count=1 -p 1 -timeout 120s
 2. 未命中 → `Fetch`（摘要把守）→ `cache.Put`（解包 + 原子就位）→ 用缓存目录。
 3. 拿到目录之后，**原样交给既有的 `LoadPackage(dir, keyring)`**——验签、sha256 校验一步不少。远程与本地在这一行之后完全同路。
 
-**五条策略规则，逐条要有测试：**
+**八条策略规则，逐条要有测试：**
 
 1. **有远程条目但 `cache` 未配 → serve 装配失败**，错误说明远程来源需要缓存目录。不许临时目录兜底：缓存位置是部署决定，静默选一个地方写文件是另一种降级。
 2. **拉取失败不阻断其余条目**：走既有失败通道，`Apply` 返回合并错误，`plugins status` 里该条目 `State=failed` 且 `LastError` 说明是拉取/摘要问题。
 3. **缓存命中路径必须证明没有联网**：测试里给一个「一旦被请求就让测试失败」的 handler，断言命中时它没被碰过。
 4. `fetch.timeout_ms` / `max_bytes` 缺省值写进 config 的字段 doc；**缺省必须是有限值**，不许 0 表示无限。
 5. 既有的本地条目行为一字不变——要有测试证明。
+6. **`allow_insecure_sources` 缺省 `false`**，用 `*bool` 解析后归一（与 `require_signature` 同一手法、同一方向：安全开关的缺省在安全那一侧）。缺省下遇到 `http://` 条目 → **serve 装配失败**，错误点名该条目与其 URL，并说明这是调试用途、要用必须显式开。
+7. **开关为 `true` 时**：`http://` 条目允许拉取，但每一条都要在装配期打一条 **Warn**，点名条目与 URL，并说明代价（明文可被观察与阻断、可被投喂旧但合法的版本；digest 仍然保证字节完整性）。一条不打 Warn 就悄悄用明文的部署，是这条开关最容易被滥用的形态。
+8. **开关只影响 scheme，不影响其它任何一道门**：`http://` 条目的 digest 仍然必填、仍然逐字节校验，签名仍然照验。要有测试证明——开着开关时把 digest 改错，该条目仍然 failed。
 
-- [ ] **Step 1: 写失败测试**（上述五条；全部用 `httptest.Server`，`Apply` 循环轮数写字面量 ≤5）
+- [ ] **Step 1: 写失败测试**（上述八条；全部用 `httptest.Server`，`Apply` 循环轮数写字面量 ≤5）
 
 - [ ] **Step 2: 实现**
 
-- [ ] **Step 3: 变异验证（两个）**
+- [ ] **Step 3: 变异验证（四个）**
   - 让缓存命中时也去拉一次 → 「命中不联网」测试应 FAIL
   - 跳过 `LoadPackage`、直接信任拉下来的包 → A5a 的验签测试应 FAIL（**这条最要紧**：它证明远程路径没有绕过签名这道门）
+  - 把 `allow_insecure_sources` 的缺省从 `false` 改成 `true` → 「缺省拒绝 http」的测试应 FAIL
+  - 让 `allow_insecure_sources: true` 顺带跳过 digest 校验 → 规则 8 的测试应 FAIL
 
 - [ ] **Step 4: `-race`（串行）**
 
@@ -302,7 +313,9 @@ keygen 产钥 → sign 给包签名 → 打成 tar.gz → 起 httptest.Server �
 - digest 与实际字节不符 → 该条目 failed、`status` 里可见原因、**缓存目录里不留任何东西**
 - 包里 `plugin.json` 被改（签名未同步）→ 拉取成功但 `LoadPackage` 验签失败 → failed。**这条证明两道门各自独立**：digest 过了不等于签名过了
 - tarball 里含 `../evil` → 拒绝，缓存目录外无任何文件被创建
-- `http://` 的 source → 装配期就拒绝
+- `http://` 的 source 且 `allow_insecure_sources` 缺省（未写）→ 装配期就拒绝，错误点名该条目
+- **同一个 `http://` 条目，`allow_insecure_sources: true` → 挂载成功**，且装配期有一条点名它的 Warn。这条是调试通道的正向验收
+- 承上，开着开关但把 digest 改错 → 该条目 failed。**证明开关只放开了 scheme，没放开任何一道门**
 
 - [ ] **Step 3: 全量回归**
 
@@ -314,7 +327,7 @@ go build ./... && go vet ./... && go test ./... -count=1 -timeout 300s && gofmt 
 
 - [ ] **Step 4: 文档回写**
 
-§7 供应链一行补上：远程来源为 HTTPS tarball，条目必须声明 sha256 摘要，拉取按流校验、不符不落盘；缓存内容寻址，命中不联网；解包拒绝路径穿越、非普通文件与解压炸弹；**digest 与签名是两道独立的门**。§9 路线图 A5b 标交付，并写明 OCI 传输仍未做。
+§7 供应链一行补上：远程来源为 HTTPS tarball，条目必须声明 sha256 摘要，拉取按流校验、不符不落盘；缓存内容寻址，命中不联网；解包拒绝路径穿越、非普通文件与解压炸弹；**digest 与签名是两道独立的门**。同时写明**明文 `http://` 仅在 `plugins.allow_insecure_sources: true` 下可用，缺省拒绝，仅供调试**，并写清它丢的是机密性与可用性、不丢完整性（digest 仍逐字节把守）。§9 路线图 A5b 标交付，并写明 OCI 传输仍未做。
 
 - [ ] **Step 5: 提交并开 PR**
 
@@ -326,5 +339,6 @@ go build ./... && go vet ./... && go test ./... -count=1 -timeout 300s && gofmt 
 - 摘要在字节落盘前把关，签名在加载前把关，两道门互不替代
 - 缓存内容寻址：命中即用、不联网，重启与离线部署不依赖网络
 - 解包拒绝路径穿越、符号链接与解压炸弹，且拒绝的是整个包而不是单个条目
+- 调试可用明文 `http://`：需显式 `allow_insecure_sources: true`，每条都打 Warn，且 digest 与签名两道门一道不少
 
 **尚未包含**：OCI registry 传输、`legion plugin install|search` 与 GUI 同意流（A5c）、缓存清理与容量上限、镜像与代理配置、密钥吊销与透明日志。
