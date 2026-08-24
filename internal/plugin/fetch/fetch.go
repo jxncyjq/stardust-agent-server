@@ -163,16 +163,24 @@ func Fetch(ctx context.Context, client *http.Client, u *url.URL, digest string, 
 	}
 
 	hasher := sha256.New()
-	// Reading MaxBytes+1 (never more) is what separates "exactly at the
-	// limit" from "over the limit" below, while still bounding the read to
-	// one byte past the limit no matter how much more the server sends.
+	// limited never yields more than MaxBytes+1 bytes, no matter how much
+	// more the server sends afterward — that is what bounds the read
+	// against a hostile or malfunctioning server. Given that cap, ReadAll
+	// can only come back in one of two shapes: at most MaxBytes bytes (the
+	// body ended within the limit), or exactly MaxBytes+1 bytes (the body
+	// reached or exceeded it — LimitReader can never report more). Reading
+	// exactly MaxBytes+1 is therefore both the *only* signal "over limit"
+	// needs and, deliberately, the only one checked below: the check is
+	// written so that it can only ever fire because limited actually
+	// capped the read, not as a second, independent measurement of the
+	// full body's length that would happen to agree with it.
 	limited := io.LimitReader(resp.Body, limits.MaxBytes+1)
 	tee := io.TeeReader(limited, hasher)
 	body, err := io.ReadAll(tee)
 	if err != nil {
 		return nil, fmt.Errorf("fetch %s: read body: %w", u, err)
 	}
-	if int64(len(body)) > limits.MaxBytes {
+	if int64(len(body)) == limits.MaxBytes+1 {
 		return nil, fmt.Errorf("fetch %s: response body exceeds the %d byte limit", u, limits.MaxBytes)
 	}
 
