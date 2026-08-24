@@ -49,6 +49,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -57,6 +58,7 @@ import (
 
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/lifecycle"
+	"github.com/stardust/legion-agent/internal/plugin/fetch"
 	"github.com/stardust/legion-agent/internal/plugin/host"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
 	"github.com/stardust/legion-agent/internal/plugin/perm"
@@ -122,11 +124,14 @@ const (
 // The convergence steps a single entry passes through, as they appear in a
 // RuntimeEventActivationFailed message. Naming the step is what lets an
 // operator tell "the entry points outside the deployment root" (source) from
+// "the remote artifact could not be obtained, or was not the artifact its
+// digest names" (fetch) from
 // "the package on disk is wrong" (load-package) from "the deployment's
 // authorization is wrong" (assemble-spec) from "the plugin itself would not
 // come up" (activate).
 const (
 	stepSource       = "source"
+	stepFetch        = "fetch"
 	stepLoadPackage  = "load-package"
 	stepIdentity     = "identity"
 	stepAssembleSpec = "assemble-spec"
@@ -254,12 +259,74 @@ type Config struct {
 	// either way.
 	Keyring *sign.Keyring
 
+	// Remote is how an entry whose source is a URL gets its package onto disk:
+	// the cache it is filed in, the client it is fetched with, the bounds both
+	// steps run under, and whether plaintext sources are permitted at all.
+	//
+	// Its zero value is a legitimate deployment — one whose entries are all
+	// local — and NOT a fallback: a Loader with no cache refuses a remote
+	// entry instead of downloading it somewhere of its own choosing. See
+	// RemoteConfig.
+	Remote RemoteConfig
+
 	// DeployLimits is the deployment's resource ceiling, applied to every
 	// plugin by manifest.AssembleSpec (each limit is min(plugin's request,
 	// this), with zero on either side meaning "not declared"). Its zero value
 	// is therefore legitimate — it means the deployment sets no ceiling of its
 	// own and every plugin's own limits stand.
 	DeployLimits manifest.Limits
+}
+
+// RemoteConfig is everything a Loader needs to turn an entry whose source is a
+// URL into a package directory: where fetched packages are filed, what fetches
+// them, the bounds the download and the unpack run under, and whether a
+// plaintext source is permitted at all.
+//
+// # The zero value means "this deployment has no remote entries"
+//
+// A nil Cache is not "download somewhere temporary": it is the statement that
+// this deployment did not configure a place for downloaded code, and a remote
+// entry met under it FAILS, naming what is missing. Where code that is about
+// to run is written to disk is a deployment decision; picking a directory here
+// would make that decision invisible. A deployment whose entries are all local
+// leaves this whole struct zero and behaves exactly as it did before remote
+// sources existed.
+//
+// # What it does NOT relax
+//
+// AllowInsecureSources relaxes the URL SCHEME and nothing else. Whatever it
+// says, a remote entry still carries a mandatory digest, the fetched bytes are
+// still verified against that digest before they touch the filesystem, and the
+// resulting directory still goes through manifest.LoadPackage — the same
+// sha256 check and the same signature verification a local package gets. The
+// digest answers "should these bytes be accepted"; the signature answers
+// "should this package load". Neither answers the other's question.
+type RemoteConfig struct {
+	// Cache files fetched packages under the digest that names them, so that a
+	// package fetched once is not fetched again. Nil means no remote source is
+	// configured — see the type's doc comment.
+	Cache *fetch.Cache
+
+	// Client fetches artifacts. It is REQUIRED whenever Cache is set (a nil
+	// one panics inside fetch.Fetch) and is deliberately separate from the
+	// client a plugin granted the "http" capability calls out with: that one
+	// is bounded by the per-call plugin timeout, which has nothing to do with
+	// how long an artifact download may take.
+	Client *http.Client
+
+	// FetchLimits bounds one artifact download. Every field must be positive
+	// whenever Cache is set; there is no "zero means unlimited".
+	FetchLimits fetch.Limits
+
+	// UnpackLimits bounds the decompressed archive. Every field must be
+	// positive whenever Cache is set.
+	UnpackLimits fetch.UnpackLimits
+
+	// AllowInsecureSources permits an entry whose source is "http://". False —
+	// the safe side, and the value a deployment that says nothing gets — makes
+	// such an entry fail before any request is built. It affects the scheme and
+	// nothing else; see the type's doc comment.
+	AllowInsecureSources bool
 }
 
 // InstanceStatus is what one deployment entry actually came to, for
@@ -364,6 +431,10 @@ type Loader struct {
 	// Config.Keyring for why nil may only ever mean that.
 	keyring *sign.Keyring
 
+	// remote is Config.Remote, verbatim. Its zero value is the deployment that
+	// configured no remote source at all; see RemoteConfig.
+	remote RemoteConfig
+
 	mu        sync.Mutex
 	instances map[string]*instance
 	failures  map[string]failure
@@ -390,6 +461,9 @@ func New(cfg Config) (*Loader, error) {
 		return nil, fmt.Errorf("new plugin loader: Config.ApplyWait is %s; it must be positive, "+
 			"since an apply that waits forever for a task boundary holds the gate shut against every new task", cfg.ApplyWait)
 	}
+	if err := validateRemote(cfg.Remote); err != nil {
+		return nil, err
+	}
 	if cfg.Keyring == nil {
 		// The one state this constructor cannot tell apart from a mistake, said
 		// out loud once per Loader. A deployment that verifies nothing is a
@@ -409,9 +483,45 @@ func New(cfg Config) (*Loader, error) {
 		gate:         cfg.Gate,
 		applyWait:    cfg.ApplyWait,
 		keyring:      cfg.Keyring,
+		remote:       cfg.Remote,
 		instances:    make(map[string]*instance),
 		failures:     make(map[string]failure),
 	}, nil
+}
+
+// validateRemote checks the remote source configuration a configured cache
+// makes load-bearing, naming the offending field.
+//
+// With no cache there is nothing to check: that is the deployment with no
+// remote entries, and every other field is unused. With one, each of these
+// would otherwise surface far from its cause — a nil Client as a panic inside
+// fetch.Fetch, a non-positive limit as a bound that does not bound — so they
+// are refused where the wiring happens instead.
+func validateRemote(remote RemoteConfig) error {
+	if remote.Cache == nil {
+		return nil
+	}
+	switch {
+	case remote.Client == nil:
+		return errors.New("new plugin loader: Config.Remote.Client is nil while a plugin cache is configured; " +
+			"a remote entry cannot be fetched without an HTTP client")
+	case remote.FetchLimits.Timeout <= 0:
+		return fmt.Errorf("new plugin loader: Config.Remote.FetchLimits.Timeout is %s; it must be positive, "+
+			"since a download with no deadline never fails and never finishes", remote.FetchLimits.Timeout)
+	case remote.FetchLimits.MaxBytes <= 0:
+		return fmt.Errorf("new plugin loader: Config.Remote.FetchLimits.MaxBytes is %d; it must be positive, "+
+			"since zero does not mean unlimited: it is the cap on bytes read from a remote source", remote.FetchLimits.MaxBytes)
+	case remote.UnpackLimits.MaxEntries <= 0:
+		return fmt.Errorf("new plugin loader: Config.Remote.UnpackLimits.MaxEntries is %d; it must be positive",
+			remote.UnpackLimits.MaxEntries)
+	case remote.UnpackLimits.MaxTotalBytes <= 0:
+		return fmt.Errorf("new plugin loader: Config.Remote.UnpackLimits.MaxTotalBytes is %d; it must be positive",
+			remote.UnpackLimits.MaxTotalBytes)
+	case remote.UnpackLimits.MaxEntryBytes <= 0:
+		return fmt.Errorf("new plugin loader: Config.Remote.UnpackLimits.MaxEntryBytes is %d; it must be positive",
+			remote.UnpackLimits.MaxEntryBytes)
+	}
+	return nil
 }
 
 // SignaturePolicy is a Loader's signature-verification policy in comparable
@@ -790,9 +900,22 @@ type convergePlan struct {
 // and reports the failure, instead of unmounting a working plugin for a
 // replacement that never existed.
 func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string) (*convergePlan, error) {
-	dir, err := packageDir(entry.Name, root, entry.Source)
-	if err != nil {
-		return nil, l.fail(ctx, entry.Name, "", stepSource, err, nil)
+	// The two kinds of source differ HERE and nowhere else: a local entry
+	// resolves against the deployment root, a remote one is fetched into the
+	// cache. Everything from LoadPackage down is one path — that is the whole
+	// point of doing the fetch here rather than deeper in.
+	var dir string
+	var err error
+	if entry.IsRemote() {
+		dir, err = l.remoteDir(ctx, entry)
+		if err != nil {
+			return nil, l.fail(ctx, entry.Name, "", stepFetch, err, nil)
+		}
+	} else {
+		dir, err = packageDir(entry.Name, root, entry.Source)
+		if err != nil {
+			return nil, l.fail(ctx, entry.Name, "", stepSource, err, nil)
+		}
 	}
 
 	// l.keyring is the deployment's trust set, or nil when the deployment has
@@ -1080,6 +1203,69 @@ func (l *Loader) publish(ctx context.Context, eventType, message string) {
 // instance being disposed first — which converge does.
 func ownerFor(name, version string) lifecycle.Owner {
 	return lifecycle.Owner("plugin:" + name + "@" + version)
+}
+
+// remoteDir returns the directory holding entry's package, fetching it first
+// if the cache does not already have it. It is packageDir's counterpart for an
+// entry whose source is a URL, and everything after it — LoadPackage, the
+// identity check, AssembleSpec, activation — is the same code a local entry
+// travels.
+//
+// # A cache hit does not go online
+//
+// The digest names one exact sequence of bytes, so a hit is the same package a
+// fetch would produce. There is nothing to revalidate and nothing to expire:
+// the request is not made at all. That is what lets a restart, or a machine
+// with no network, mount the plugins the first start mounted.
+//
+// # Two gates, in this order
+//
+// A missing cache and a refused scheme are both decided BEFORE any request is
+// built, so neither can be discovered halfway through a download:
+//
+//   - No cache configured is a failure, never a temporary directory. Where
+//     downloaded code lands is a deployment decision (see RemoteConfig).
+//   - An "http://" source is refused unless the deployment turned plaintext on
+//     explicitly, and the refusal names the entry and its URL.
+//
+// What it does NOT decide is whether the bytes are acceptable — fetch.Fetch
+// verifies them against entry.Digest before they reach the filesystem — or
+// whether the package may load, which is manifest.LoadPackage's answer, given
+// on the directory this returns exactly as it is for a local one.
+func (l *Loader) remoteDir(ctx context.Context, entry manifest.Entry) (string, error) {
+	if l.remote.Cache == nil {
+		return "", fmt.Errorf("plugin %q: source %q is remote, but this deployment configured no plugin cache "+
+			"directory; a remote package has to be written somewhere, and that location is a deployment decision "+
+			"rather than one this process may make on its own", entry.Name, entry.Source)
+	}
+	if entry.IsInsecureSource() && !l.remote.AllowInsecureSources {
+		return "", fmt.Errorf("plugin %q: source %q is plaintext http, which this deployment does not permit; "+
+			"plaintext is a debugging aid and has to be turned on explicitly", entry.Name, entry.Source)
+	}
+
+	hit, err := l.remote.Cache.Has(entry.Digest)
+	if err != nil {
+		return "", fmt.Errorf("plugin %q: look up %s in the plugin cache: %w", entry.Name, entry.Digest, err)
+	}
+	if hit {
+		// Same digest, same bytes. Nothing is requested, and nothing needs to
+		// be: content addressing leaves no staleness to revalidate.
+		return l.remote.Cache.Dir(entry.Digest), nil
+	}
+
+	u, err := entry.RemoteURL()
+	if err != nil {
+		return "", fmt.Errorf("plugin %q: %w", entry.Name, err)
+	}
+	archive, err := fetch.Fetch(ctx, l.remote.Client, u, entry.Digest, l.remote.FetchLimits)
+	if err != nil {
+		return "", fmt.Errorf("plugin %q: %w", entry.Name, err)
+	}
+	dir, err := l.remote.Cache.Put(entry.Digest, archive, l.remote.UnpackLimits)
+	if err != nil {
+		return "", fmt.Errorf("plugin %q: %w", entry.Name, err)
+	}
+	return dir, nil
 }
 
 // packageDir resolves one entry's Source against the deployment root, refusing

@@ -22,6 +22,7 @@ import (
 
 	"github.com/stardust/legion-agent/internal/app"
 	"github.com/stardust/legion-agent/internal/config"
+	"github.com/stardust/legion-agent/internal/plugin/fetch"
 	"github.com/stardust/legion-agent/internal/plugin/host"
 	"github.com/stardust/legion-agent/internal/plugin/loader"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
@@ -138,6 +139,14 @@ func assemblePlugins(ctx context.Context, application *app.App, cfg config.Confi
 
 	deployment, err := readPluginDeployment(cfg.Plugins.Manifest)
 	if err != nil {
+		return err
+	}
+	// The deployment's remote entries are checked against the deployment's
+	// remote POLICY before a loader exists: both failures here are statements
+	// about the config as a whole ("you named a remote source and nowhere to
+	// put it", "you named a plaintext source and did not turn plaintext on"),
+	// and neither is repairable by letting the rest of the manifest converge.
+	if err := checkRemoteSources(deployment, cfg.Plugins, deps.Logger); err != nil {
 		return err
 	}
 	pluginLoader, err := newPluginLoader(application, cfg, deps)
@@ -290,6 +299,11 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 			"remedy", `remove "require_signature": false to enforce the trust set that is already configured`)
 	}
 
+	remote, err := resolvePluginRemote(cfg.Plugins)
+	if err != nil {
+		return nil, err
+	}
+
 	return loader.New(loader.Config{
 		Ledger: application.PluginLedger(),
 		Deps: func(name string, pluginConfig json.RawMessage) host.Deps {
@@ -317,7 +331,134 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 		Gate:      deps.Gate,
 		ApplyWait: time.Duration(cfg.Plugins.ApplyWaitMs) * time.Millisecond,
 		Keyring:   keyring,
+		Remote:    remote,
 	})
+}
+
+// The bounds one fetched plugin package is unpacked under. They bound the
+// DECOMPRESSED archive, which is why they are not derived from
+// plugins.fetch.max_bytes: that one caps the compressed bytes read off the
+// network, and a compression ratio can be enormous.
+//
+// They are constants rather than settings because a plugin package is three
+// files of known kinds — plugin.json, plugin.wasm, plugin.sig — and an archive
+// that does not fit these is not a large package, it is not a package. A
+// deployment that genuinely needs a bigger wasm module changes them here, in
+// one place, rather than every deployment carrying three more knobs it will
+// never touch.
+const (
+	// pluginUnpackMaxEntries bounds the tar entries read. Three files, plus
+	// room for a single wrapping directory and its entry.
+	pluginUnpackMaxEntries = 16
+
+	// pluginUnpackMaxEntryBytes bounds any single file in the archive; the
+	// wasm module is the only one that is ever large.
+	pluginUnpackMaxEntryBytes = 64 << 20
+
+	// pluginUnpackMaxTotalBytes bounds the whole decompressed archive,
+	// including the tar headers and padding between entries.
+	pluginUnpackMaxTotalBytes = 128 << 20
+)
+
+// resolvePluginRemote turns the deployment's remote-source settings into the
+// loader's RemoteConfig, and is the only place a plugin cache is built.
+//
+// An unconfigured "plugins.cache" returns the zero RemoteConfig — the
+// deployment that fetches nothing. That is NOT a quiet degradation: an entry
+// that actually needs a cache has already been refused by checkRemoteSources
+// at assembly, and the loader refuses one again if it ever meets it (a manifest
+// reloaded under a running serve, for instance). A configured cache directory
+// that cannot be created fails assembly with the path named, the same
+// "configured means you meant it" rule the manifest and the keyring follow.
+//
+// The HTTP client is its own, deliberately not the one plugins granted "http"
+// call out with: that client is bounded by the per-call plugin timeout, which
+// has nothing to say about how long an artifact download may take. Its timeout
+// is fetch's own bound as well, so a download is bounded even if a future edit
+// drops the per-call context deadline.
+func resolvePluginRemote(cfg config.PluginsConfig) (loader.RemoteConfig, error) {
+	path := strings.TrimSpace(cfg.Cache)
+	if path == "" {
+		return loader.RemoteConfig{}, nil
+	}
+	cache, err := fetch.NewCache(path)
+	if err != nil {
+		return loader.RemoteConfig{}, fmt.Errorf("open plugin cache %q: %w", path, err)
+	}
+	timeout := time.Duration(cfg.Fetch.TimeoutMs) * time.Millisecond
+	return loader.RemoteConfig{
+		Cache:                cache,
+		Client:               &http.Client{Timeout: timeout},
+		FetchLimits:          fetch.Limits{MaxBytes: cfg.Fetch.MaxBytes, Timeout: timeout},
+		UnpackLimits:         fetch.UnpackLimits{MaxEntries: pluginUnpackMaxEntries, MaxTotalBytes: pluginUnpackMaxTotalBytes, MaxEntryBytes: pluginUnpackMaxEntryBytes},
+		AllowInsecureSources: cfg.InsecureSourcesAllowed(),
+	}, nil
+}
+
+// insecurePluginSourceWarning is the message every plaintext plugin source
+// gets at assembly. It is a constant so that the warning a test counts is the
+// warning production writes: a deployment where one entry's warning went
+// missing is exactly how "allow_insecure_sources" gets abused.
+const insecurePluginSourceWarning = "plugin source is plaintext http"
+
+// checkRemoteSources holds the deployment's remote entries against the
+// deployment's remote policy, before any loader is built.
+//
+// Two refusals, both fatal to serve assembly, and both about the config as a
+// whole rather than one entry's bad luck:
+//
+//   - A remote entry with no "plugins.cache" configured. There is deliberately
+//     no fallback to a temporary directory: where downloaded code is written
+//     is a deployment decision, and choosing one here would make it invisible.
+//   - A plaintext "http://" entry while "allow_insecure_sources" is off — the
+//     default, and the safe side of a security switch. The error names the
+//     entry, its URL, and the setting that turns plaintext on.
+//
+// And one warning, written for EVERY plaintext entry when the switch IS on: a
+// plaintext artifact can be watched and blocked in transit, and an operator
+// can be fed an old-but-legitimately-signed version. The digest still
+// guarantees the bytes are the bytes the manifest names, and the signature is
+// still verified, but neither of those makes plaintext a thing to run silently.
+//
+// Only ENABLED entries are checked, which is the same set the loader prepares:
+// a disabled entry is never fetched, and refusing to start over one nothing
+// would download would be a rule about text rather than about behaviour. An
+// operator who enables it later meets exactly these rules then.
+func checkRemoteSources(deployment manifest.Deployment, cfg config.PluginsConfig, logger *slog.Logger) error {
+	if logger == nil {
+		return errors.New("check plugin remote sources: Logger is nil; a plaintext source would be used with no record of it")
+	}
+	cacheConfigured := strings.TrimSpace(cfg.Cache) != ""
+	insecureAllowed := cfg.InsecureSourcesAllowed()
+	for _, entry := range deployment.Plugins {
+		if !entry.Enabled || !entry.IsRemote() {
+			continue
+		}
+		if !cacheConfigured {
+			return fmt.Errorf("plugin %q has the remote source %q, but no \"plugins.cache\" directory is configured; "+
+				"a fetched package has to be written somewhere, and this process will not pick that location itself "+
+				"(configure \"plugins.cache\", or install the plugin under \"plugins.root\" instead)",
+				entry.Name, entry.Source)
+		}
+		if !entry.IsInsecureSource() {
+			continue
+		}
+		if !insecureAllowed {
+			return fmt.Errorf("plugin %q has the plaintext source %q; plugin artifacts are fetched over https, "+
+				"and plaintext is a debugging aid that has to be turned on explicitly with "+
+				`"allow_insecure_sources": true in the plugins config`, entry.Name, entry.Source)
+		}
+		logger.Warn(insecurePluginSourceWarning,
+			"component", "cli",
+			"plugin", entry.Name,
+			"source", entry.Source,
+			"consequence", "the download can be observed and blocked in transit, and an old but legitimately "+
+				"signed version can be served in place of the current one",
+			"retained", "the digest still guarantees the bytes are the ones the manifest names, and the package's "+
+				"signature is still verified",
+			"remedy", `serve the artifact over https, or remove "allow_insecure_sources": true`)
+	}
+	return nil
 }
 
 // resolvePluginKeyring turns the deployment's signature POLICY into the trust

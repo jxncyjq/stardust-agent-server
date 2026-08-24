@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"archive/tar"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
@@ -14,6 +16,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -130,8 +134,10 @@ func boolPtr(v bool) *bool { return &v }
 
 // writeSignatureConfig rewrites the fixture's agent.json with the given
 // signature policy, leaving every other plugin setting as newPluginFixture
-// wrote it.
-func (f *pluginFixture) writeSignatureConfig(applyWaitMs int, policy signaturePolicy) {
+// wrote it. Any extra settings are spliced into the plugins section verbatim,
+// which is how the remote-source tests add "cache", "allow_insecure_sources"
+// and "fetch" without every other test having to know they exist.
+func (f *pluginFixture) writeSignatureConfig(applyWaitMs int, policy signaturePolicy, extra ...string) {
 	f.t.Helper()
 
 	settings := []string{
@@ -146,6 +152,7 @@ func (f *pluginFixture) writeSignatureConfig(applyWaitMs int, policy signaturePo
 	if policy.requireSignature != nil {
 		settings = append(settings, fmt.Sprintf(`"require_signature": %t`, *policy.requireSignature))
 	}
+	settings = append(settings, extra...)
 	f.writeConfig(fmt.Sprintf(`{
 		"storage": {"driver": "memory"},
 		"context_files": {"root": %s},
@@ -301,6 +308,11 @@ type manifestEntry struct {
 	enabled      bool
 	capabilities []string
 	tools        []string
+
+	// digest is the entry's "digest" key, mandatory on a remote source and
+	// refused on a local one (manifest.ParseDeployment). An empty one omits
+	// the key entirely, which is what every local fixture wants.
+	digest string
 }
 
 // writeManifest writes plugins.json with the given entries.
@@ -310,6 +322,7 @@ func (f *pluginFixture) writeManifest(entries ...manifestEntry) {
 	type rawEntry struct {
 		Name    string                `json:"name"`
 		Source  string                `json:"source"`
+		Digest  string                `json:"digest,omitempty"`
 		Enabled bool                  `json:"enabled"`
 		Grant   manifest.GrantDecl    `json:"grant"`
 		Tools   []manifest.ToolAccept `json:"tools"`
@@ -325,6 +338,7 @@ func (f *pluginFixture) writeManifest(entries ...manifestEntry) {
 		raw.Plugins = append(raw.Plugins, rawEntry{
 			Name:    e.name,
 			Source:  e.source,
+			Digest:  e.digest,
 			Enabled: e.enabled,
 			Grant:   manifest.GrantDecl{Capabilities: e.capabilities},
 			Tools:   accepts,
@@ -2820,5 +2834,217 @@ func TestTheSignatureRequirementIsASwitchOverTheSamePackageOnDisk(t *testing.T) 
 		t.Fatalf("plugins status error = %v, want nil", err)
 	} else if !strings.Contains(out, "loaded") {
 		t.Fatalf("plugins status output = %q, want the entry reported as loaded", out)
+	}
+}
+
+// remotePluginPackageFiles are the three files a plugin package archive
+// carries, the same three fetch.Unpack insists on.
+var remotePluginPackageFiles = [...]string{"plugin.json", "plugin.wasm", "plugin.sig"}
+
+// archivePackage packs the package the fixture wrote at source into the
+// gzipped tar a remote source serves, and then REMOVES the directory: a test
+// that mounts the result can only have got it over the wire, because nothing
+// is left under the deployment root to load instead.
+func (f *pluginFixture) archivePackage(source string) []byte {
+	f.t.Helper()
+
+	dir := filepath.Join(f.root, source)
+	buf := &bytes.Buffer{}
+	gz := gzip.NewWriter(buf)
+	tw := tar.NewWriter(gz)
+	for _, name := range remotePluginPackageFiles {
+		data, err := os.ReadFile(filepath.Join(dir, name))
+		if err != nil {
+			f.t.Fatalf("read %s in %s: %v", name, dir, err)
+		}
+		if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(len(data)), Typeflag: tar.TypeReg}); err != nil {
+			f.t.Fatalf("write tar header for %s: %v", name, err)
+		}
+		if _, err := tw.Write(data); err != nil {
+			f.t.Fatalf("write tar body for %s: %v", name, err)
+		}
+	}
+	if err := tw.Close(); err != nil {
+		f.t.Fatalf("close tar writer: %v", err)
+	}
+	if err := gz.Close(); err != nil {
+		f.t.Fatalf("close gzip writer: %v", err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		f.t.Fatalf("remove staged package %s: %v", dir, err)
+	}
+	return buf.Bytes()
+}
+
+// digestOfArchive spells data's sha256 the way a deployment entry does.
+func digestOfArchive(data []byte) string {
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:])
+}
+
+// serveArchive starts a plaintext server handing archive to every GET. Plain
+// http is deliberate: the assembly builds its own HTTP client, which does not
+// trust httptest's TLS certificate, so a plaintext source with
+// allow_insecure_sources on is the only way to exercise the real assembled
+// client end to end.
+func serveArchive(t *testing.T, archive []byte) *httptest.Server {
+	t.Helper()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if _, err := w.Write(archive); err != nil {
+			t.Errorf("write archive to client: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// serveNotFound starts a plaintext server that 404s every request, for the
+// tests that are about assembly-time policy rather than about a download.
+func serveNotFound(t *testing.T) *httptest.Server {
+	t.Helper()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "no such artifact", http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestAssemblePluginsRefusesARemoteEntryWithNoCacheConfigured is rule 1: where
+// downloaded plugin code is written is a deployment decision. Falling back to
+// a temporary directory would be a silent one, so serve refuses to start.
+func TestAssemblePluginsRefusesARemoteEntryWithNoCacheConfigured(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	source := "https://example.invalid/echo.tgz"
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: source, enabled: true, tools: []string{testEchoTool},
+		digest: digestOfArchive([]byte("any artifact")),
+	})
+
+	err := f.assemble()
+
+	if err == nil {
+		t.Fatal("assemblePlugins() error = nil, want an error: a remote entry needs a configured cache directory")
+	}
+	if !strings.Contains(err.Error(), "plugins.cache") {
+		t.Errorf("assemblePlugins() error = %v, want it to name the missing plugins.cache setting", err)
+	}
+	if !strings.Contains(err.Error(), testEchoPlugin) {
+		t.Errorf("assemblePlugins() error = %v, want it to name the remote entry %q", err, testEchoPlugin)
+	}
+}
+
+// TestAssemblePluginsRefusesAnInsecureRemoteSourceByDefault is rule 6: the
+// config says nothing about plaintext sources, so a http:// entry stops serve
+// with an error naming the entry, its URL and the way out.
+func TestAssemblePluginsRefusesAnInsecureRemoteSourceByDefault(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writeSignatureConfig(30_000, signaturePolicy{requireSignature: boolPtr(false)},
+		fmt.Sprintf("\"cache\": %s", jsonString(filepath.Join(f.dir, "plugin-cache"))))
+	source := "http://example.invalid/echo.tgz"
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: source, enabled: true, tools: []string{testEchoTool},
+		digest: digestOfArchive([]byte("any artifact")),
+	})
+
+	err := f.assemble()
+
+	if err == nil {
+		t.Fatal("assemblePlugins() error = nil, want an error: a plaintext source is refused unless it is turned on explicitly")
+	}
+	if !strings.Contains(err.Error(), source) {
+		t.Errorf("assemblePlugins() error = %v, want it to name the offending URL %s", err, source)
+	}
+	if !strings.Contains(err.Error(), testEchoPlugin) {
+		t.Errorf("assemblePlugins() error = %v, want it to name the entry %q", err, testEchoPlugin)
+	}
+	if !strings.Contains(err.Error(), "allow_insecure_sources") {
+		t.Errorf("assemblePlugins() error = %v, want it to name the switch that turns plaintext on", err)
+	}
+}
+
+// TestAssemblePluginsWarnsOnEveryAllowedInsecureRemoteSource is rule 7: with
+// the switch on, EVERY plaintext entry gets a Warn naming it and its URL. A
+// deployment that quietly used plaintext because one entry's warning was
+// dropped is exactly how this switch gets abused.
+func TestAssemblePluginsWarnsOnEveryAllowedInsecureRemoteSource(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writeSignatureConfig(30_000, signaturePolicy{requireSignature: boolPtr(false)},
+		fmt.Sprintf("\"cache\": %s", jsonString(filepath.Join(f.dir, "plugin-cache"))),
+		`"allow_insecure_sources": true`)
+	srv := serveNotFound(t)
+	echoSource := srv.URL + "/echo.tgz"
+	proxySource := srv.URL + "/proxy.tgz"
+	f.writeManifest(
+		manifestEntry{
+			name: testEchoPlugin, source: echoSource, enabled: true, tools: []string{testEchoTool},
+			digest: digestOfArchive([]byte("echo artifact")),
+		},
+		manifestEntry{
+			name: testProxyPlugin, source: proxySource, enabled: true,
+			capabilities: []string{"tool"}, tools: []string{testProxyTool},
+			digest: digestOfArchive([]byte("proxy artifact")),
+		},
+	)
+
+	logs := &bytes.Buffer{}
+	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	// The entries themselves cannot be fetched from this server, which is
+	// beside the point: a failed entry does not stop startup, and the warning
+	// is written before anything is downloaded.
+	if err := f.assembleWithLogger(logger); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil (an unfetchable entry must not stop startup)", err)
+	}
+	written := logs.String()
+	for _, want := range []string{echoSource, proxySource, testEchoPlugin, testProxyPlugin} {
+		if !strings.Contains(written, want) {
+			t.Errorf("startup log = %q, want a warning naming %s", written, want)
+		}
+	}
+	if got := strings.Count(written, insecurePluginSourceWarning); got != 2 {
+		t.Errorf("startup log = %q, want exactly 2 plaintext warnings, got %d", written, got)
+	}
+}
+
+// TestAssemblePluginsMountsARemotePackageThroughTheConfiguredCache is the
+// wiring in one test: a manifest entry naming a URL and a digest is fetched,
+// filed under its digest in the configured cache, and mounted — through the
+// same assembly serve runs, with the HTTP client the assembly builds.
+func TestAssemblePluginsMountsARemotePackageThroughTheConfiguredCache(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	priv, keyringPath := f.newKeyring("keyring.json")
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.signPackage("staging", priv)
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	// Signatures are REQUIRED here on purpose: a fetched package must pass the
+	// same verification a local one does.
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(true)},
+		fmt.Sprintf("\"cache\": %s", jsonString(cacheDir)),
+		`"allow_insecure_sources": true`)
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: srv.URL + "/echo.tgz", enabled: true,
+		tools: []string{testEchoTool}, digest: digest,
+	})
+
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	out, err := f.run("status")
+	if err != nil {
+		t.Fatalf("plugins status error = %v, want nil", err)
+	}
+	if !strings.Contains(out, "loaded") || !strings.Contains(out, testEchoPlugin) {
+		t.Fatalf("plugins status output = %q, want the remote entry mounted", out)
+	}
+	cached := filepath.Join(cacheDir, "sha256", strings.TrimPrefix(digest, "sha256:"))
+	for _, name := range remotePluginPackageFiles {
+		if _, err := os.Stat(filepath.Join(cached, name)); err != nil {
+			t.Errorf("stat %s in the cache: %v; a fetched package must be filed under its digest", name, err)
+		}
 	}
 }

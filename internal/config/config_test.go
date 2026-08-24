@@ -728,3 +728,148 @@ func TestPluginsConfigZeroValueRequiresSignature(t *testing.T) {
 		t.Error("PluginsConfig{}.SignatureRequired() = false, want true: an unstated policy is the strict one")
 	}
 }
+
+// TestLoadPluginsInsecureSourcesDefaultToRefused is the remote-source half of
+// the same rule the signature switch holds: a plugins section that says
+// nothing about plaintext sources REFUSES them. allow_insecure_sources is a
+// debugging aid, and a debugging aid whose absent setting meant "on" would be
+// on in every deployment written before it existed.
+func TestLoadPluginsInsecureSourcesDefaultToRefused(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(path, []byte(`{
+		"plugins": {
+			"manifest": "plugins.json",
+			"root": "plugins",
+			"require_signature": false,
+			"limits": {"timeout_ms": 1000},
+			"apply_wait_ms": 1000
+		}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", path, err)
+	}
+
+	cfg, err := Load(context.Background(), Options{Path: path})
+	if err != nil {
+		t.Fatalf("Load(%q) error = %v, want nil", path, err)
+	}
+	if cfg.Plugins.InsecureSourcesAllowed() {
+		t.Errorf("Load(%q).Plugins.InsecureSourcesAllowed() = true, want false: an absent switch must be the safe side", path)
+	}
+	if cfg.Plugins.AllowInsecureSources == nil {
+		t.Fatalf("Load(%q).Plugins.AllowInsecureSources = nil, want a normalized pointer: Load must state the policy explicitly", path)
+	}
+	if *cfg.Plugins.AllowInsecureSources {
+		t.Errorf("Load(%q).Plugins.AllowInsecureSources = %t, want false", path, *cfg.Plugins.AllowInsecureSources)
+	}
+	if cfg.Plugins.Cache != "" {
+		t.Errorf("Load(%q).Plugins.Cache = %q, want empty: where downloaded plugin code is written is a deployment "+
+			"decision, so there is no default location", path, cfg.Plugins.Cache)
+	}
+}
+
+// TestLoadPluginsInsecureSourcesCanBeAllowedExplicitly is the other half: the
+// switch is reachable, but only by writing it down.
+func TestLoadPluginsInsecureSourcesCanBeAllowedExplicitly(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(path, []byte(`{
+		"plugins": {
+			"manifest": "plugins.json",
+			"root": "plugins",
+			"cache": "var/plugin-cache",
+			"require_signature": false,
+			"allow_insecure_sources": true,
+			"limits": {"timeout_ms": 1000},
+			"apply_wait_ms": 1000
+		}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", path, err)
+	}
+
+	cfg, err := Load(context.Background(), Options{Path: path})
+	if err != nil {
+		t.Fatalf("Load(%q) error = %v, want nil", path, err)
+	}
+	if !cfg.Plugins.InsecureSourcesAllowed() {
+		t.Errorf("Load(%q).Plugins.InsecureSourcesAllowed() = false, want true: an explicit true must be honored", path)
+	}
+	if cfg.Plugins.Cache != "var/plugin-cache" {
+		t.Errorf("Load(%q).Plugins.Cache = %q, want var/plugin-cache", path, cfg.Plugins.Cache)
+	}
+}
+
+// TestPluginsConfigZeroValueRefusesInsecureSources covers the path Load does
+// not travel: a PluginsConfig built as a struct literal has a nil pointer, and
+// nil must read as "refused" there too.
+func TestPluginsConfigZeroValueRefusesInsecureSources(t *testing.T) {
+	t.Parallel()
+	if (PluginsConfig{}).InsecureSourcesAllowed() {
+		t.Error("PluginsConfig{}.InsecureSourcesAllowed() = true, want false: an unstated policy is the safe one")
+	}
+}
+
+// TestLoadPluginsFetchBoundsDefaultToFiniteValues pins that the download
+// bounds are defaulted, and defaulted to FINITE values. A deployment that
+// never wrote a fetch section still downloads under a timeout and a byte cap.
+func TestLoadPluginsFetchBoundsDefaultToFiniteValues(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(path, []byte(`{
+		"plugins": {
+			"manifest": "plugins.json",
+			"root": "plugins",
+			"require_signature": false,
+			"limits": {"timeout_ms": 1000},
+			"apply_wait_ms": 1000
+		}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", path, err)
+	}
+
+	cfg, err := Load(context.Background(), Options{Path: path})
+	if err != nil {
+		t.Fatalf("Load(%q) error = %v, want nil", path, err)
+	}
+	if cfg.Plugins.Fetch.TimeoutMs != 30000 {
+		t.Errorf("Load(%q).Plugins.Fetch.TimeoutMs = %d, want 30000", path, cfg.Plugins.Fetch.TimeoutMs)
+	}
+	if cfg.Plugins.Fetch.MaxBytes != 33554432 {
+		t.Errorf("Load(%q).Plugins.Fetch.MaxBytes = %d, want 33554432", path, cfg.Plugins.Fetch.MaxBytes)
+	}
+}
+
+// TestLoadRejectsUnboundedPluginFetchBounds is the fail-loud half: zero does
+// not mean unlimited here. A deployment that writes one down as 0 is told so
+// by name rather than left with a download nothing bounds.
+func TestLoadRejectsUnboundedPluginFetchBounds(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		fetch string
+		want  string
+	}{
+		{"no timeout", `{"timeout_ms": 0, "max_bytes": 1024}`, "plugins.fetch.timeout_ms"},
+		{"negative timeout", `{"timeout_ms": -1, "max_bytes": 1024}`, "plugins.fetch.timeout_ms"},
+		{"no byte cap", `{"timeout_ms": 1000, "max_bytes": 0}`, "plugins.fetch.max_bytes"},
+		{"negative byte cap", `{"timeout_ms": 1000, "max_bytes": -1}`, "plugins.fetch.max_bytes"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			path := filepath.Join(t.TempDir(), "agent.json")
+			body := `{"plugins": {"manifest": "plugins.json", "root": "plugins", "require_signature": false, ` +
+				`"limits": {"timeout_ms": 1000}, "apply_wait_ms": 1000, "fetch": ` + tc.fetch + `}}`
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatalf("WriteFile(%q) error = %v, want nil", path, err)
+			}
+			_, err := Load(context.Background(), Options{Path: path})
+			if err == nil {
+				t.Fatalf("Load(%q) error = nil, want an error naming %s", path, tc.want)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("Load(%q) error = %v, want it to name %s", path, err, tc.want)
+			}
+		})
+	}
+}

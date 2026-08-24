@@ -72,6 +72,38 @@ type PluginsConfig struct {
 	// loads.
 	Root string `json:"root"`
 
+	// Cache is the directory unpacked REMOTE plugin packages are filed in,
+	// under the sha256 digest that names them (see
+	// internal/plugin/fetch.Cache). Like Manifest, a relative path resolves
+	// against the PROCESS working directory.
+	//
+	// It has NO default, and its absence is not "use a temporary directory":
+	// a manifest with a remote entry and no cache configured fails serve
+	// assembly, naming the entry. Where downloaded code is written to disk is
+	// a deployment decision, and choosing a directory on the operator's behalf
+	// would be exactly the silent degradation this project's rules forbid. A
+	// deployment whose entries are all local needs no cache and configures
+	// none.
+	Cache string `json:"cache"`
+
+	// AllowInsecureSources permits plugin sources whose URL scheme is
+	// "http://", as a POINTER so that "the operator wrote false" and "the
+	// operator wrote nothing" stay distinguishable. Read it through
+	// InsecureSourcesAllowed rather than dereferencing it: nil means REFUSED.
+	//
+	// It is the same technique RequireSignature uses, pointed the same way: a
+	// security switch's unstated value must be the safe one. Turning it on is
+	// a debugging aid, and it relaxes THE SCHEME AND NOTHING ELSE — a plaintext
+	// entry still carries a mandatory digest, its bytes are still checked
+	// against that digest, and its package is still signature-verified.
+	//
+	// Load normalizes it to a non-nil pointer, so a config that came through
+	// Load states its policy explicitly.
+	AllowInsecureSources *bool `json:"allow_insecure_sources"`
+
+	// Fetch bounds the download of one remote plugin artifact.
+	Fetch PluginFetchConfig `json:"fetch"`
+
 	// Keyring is the path to the trust keyring (a document of public keys, see
 	// internal/plugin/sign.ParseKeyring) every plugin package's signature is
 	// checked against. Like Manifest, a relative path resolves against the
@@ -131,6 +163,37 @@ func (c PluginsConfig) SignatureRequired() bool {
 		return true
 	}
 	return *c.RequireSignature
+}
+
+// InsecureSourcesAllowed reports whether this deployment permits plugin
+// sources served over plaintext http://.
+//
+// An UNSTATED policy (AllowInsecureSources nil) is REFUSED, which is also what
+// a PluginsConfig built as a struct literal — by an embedder, by a test — gets.
+// Allowing plaintext is possible, but only by writing
+// "allow_insecure_sources": true down.
+func (c PluginsConfig) InsecureSourcesAllowed() bool {
+	if c.AllowInsecureSources == nil {
+		return false
+	}
+	return *c.AllowInsecureSources
+}
+
+// PluginFetchConfig bounds the download of one remote plugin artifact. Both
+// fields are FINITE and both are defaulted (30s, 32 MiB); neither reads zero
+// as "unlimited", and a zero or negative value fails config validation by name
+// whenever a manifest is configured. An unbounded download of code that is
+// about to be executed is not a configuration this deployment offers.
+type PluginFetchConfig struct {
+	// TimeoutMs bounds one artifact download end to end, redirects included,
+	// in milliseconds. Default 30000.
+	TimeoutMs int `json:"timeout_ms"`
+
+	// MaxBytes is the hard cap on the response body of one artifact download.
+	// Default 33554432 (32 MiB). It bounds the COMPRESSED bytes coming off the
+	// network; the decompressed package is bounded separately, where the
+	// archive is unpacked.
+	MaxBytes int64 `json:"max_bytes"`
 }
 
 // PluginLimitsConfig is the deployment-wide resource ceiling every plugin is
@@ -424,6 +487,11 @@ func Load(ctx context.Context, opts Options) (Config, error) {
 	required := cfg.Plugins.SignatureRequired()
 	cfg.Plugins.RequireSignature = &required
 
+	// The plaintext-source switch is normalized the same way, through the one
+	// function that decides what an absent one means.
+	insecure := cfg.Plugins.InsecureSourcesAllowed()
+	cfg.Plugins.AllowInsecureSources = &insecure
+
 	if err := validatePlugins(cfg.Plugins); err != nil {
 		return Config{}, err
 	}
@@ -452,6 +520,14 @@ func validatePlugins(cfg PluginsConfig) error {
 	if cfg.Limits.TimeoutMs <= 0 {
 		return fmt.Errorf("plugins.limits.timeout_ms is %d; it must be positive, "+
 			"since it also bounds the outbound HTTP requests of a plugin granted the http capability", cfg.Limits.TimeoutMs)
+	}
+	if cfg.Fetch.TimeoutMs <= 0 {
+		return fmt.Errorf("plugins.fetch.timeout_ms is %d; it must be positive, "+
+			"since a remote plugin artifact download with no deadline never fails and never finishes", cfg.Fetch.TimeoutMs)
+	}
+	if cfg.Fetch.MaxBytes <= 0 {
+		return fmt.Errorf("plugins.fetch.max_bytes is %d; it must be positive, "+
+			"since zero does not mean unlimited here: it is the cap on bytes downloaded from a remote plugin source", cfg.Fetch.MaxBytes)
 	}
 	return nil
 }
@@ -563,9 +639,13 @@ func defaultConfig() Config {
 		// an operator's own "true" and would sit in front of
 		// SignatureRequired, leaving the meaning of an absent setting decided
 		// in two places instead of one. Nil is read as "required" there.
+		// AllowInsecureSources is nil for the same reason, and reads as
+		// "refused"; Cache is empty for a different one — see its doc comment:
+		// there is no safe default location for downloaded code.
 		Plugins: PluginsConfig{
 			Root:        "plugins",
 			Limits:      PluginLimitsConfig{TimeoutMs: 10000, MaxMemoryPages: 256, MaxInstances: 4},
+			Fetch:       PluginFetchConfig{TimeoutMs: 30000, MaxBytes: 33554432},
 			ApplyWaitMs: 60000,
 		},
 	}
