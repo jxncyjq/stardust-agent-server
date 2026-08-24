@@ -261,6 +261,24 @@ func newHarnessWithApplyWait(t *testing.T, applyWait time.Duration) *harness {
 func newHarnessWith(t *testing.T, applyWait time.Duration, keyring *sign.Keyring) *harness {
 	t.Helper()
 
+	return newHarnessWithRemoteAndWait(t, applyWait, keyring, RemoteConfig{})
+}
+
+// newHarnessWithRemote is newHarnessWith plus a remote source configuration,
+// for the tests that mount a package the Loader has to fetch (remote_test.go).
+// Its zero RemoteConfig is the deployment that configured no cache, which is
+// every other test in this package.
+func newHarnessWithRemote(t *testing.T, keyring *sign.Keyring, remote RemoteConfig) *harness {
+	t.Helper()
+
+	return newHarnessWithRemoteAndWait(t, defaultTestApplyWait, keyring, remote)
+}
+
+// newHarnessWithRemoteAndWait is the one harness constructor every other one
+// delegates to.
+func newHarnessWithRemoteAndWait(t *testing.T, applyWait time.Duration, keyring *sign.Keyring, remote RemoteConfig) *harness {
+	t.Helper()
+
 	h := &harness{
 		t:        t,
 		root:     t.TempDir(),
@@ -278,6 +296,7 @@ func newHarnessWith(t *testing.T, applyWait time.Duration, keyring *sign.Keyring
 		Gate:         h.gate,
 		ApplyWait:    applyWait,
 		Keyring:      keyring,
+		Remote:       remote,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
