@@ -1326,6 +1326,17 @@ func ownerFor(name, version string) lifecycle.Owner {
 // verifies them against entry.Digest before they reach the filesystem — or
 // whether the package may load, which is manifest.LoadPackage's answer, given
 // on the directory this returns exactly as it is for a local one.
+//
+// NOTE-10 (drift risk, recorded on this side too): internal/cli's
+// resolvePluginPackageDir (plugins_command.go) is a hand-kept copy of this
+// function's remote branch — `agent plugins grant` has to resolve the same
+// directory without a running Loader to ask, and cannot call this method
+// across the package boundary. Its own doc comment names the judgement call:
+// document the duplication rather than export a shared resolver, since the
+// fix batch that found the drift was scoped to internal/cli alone. Anyone
+// changing this function's security-relevant checks (the cache-configured
+// refusal, the insecure-source refusal, the digest lookup) MUST check
+// resolvePluginPackageDir for the same edit.
 func (l *Loader) remoteDir(ctx context.Context, entry manifest.Entry) (string, error) {
 	if l.remote.Cache == nil {
 		return "", fmt.Errorf("plugin %q: source %q is remote, but this deployment configured no plugin cache "+
@@ -1374,6 +1385,17 @@ func (l *Loader) remoteDir(ctx context.Context, entry manifest.Entry) (string, e
 // are refused by name, naming the entry and the source, rather than silently
 // loading a module from wherever the string pointed — a plugin's wasm is code
 // that runs, so where it is read from is a trust decision.
+//
+// NOTE-10 (drift risk, recorded on this side too): internal/cli's
+// localPluginPackageDir (plugins_command.go) is a hand-kept copy of this
+// function — `agent plugins grant` needs the identical root-escape refusal
+// to check a plugin's declared capabilities without a running Loader, and
+// cannot call this function across the package boundary. Its own doc
+// comment names the judgement call: document the duplication rather than
+// export a shared resolver, since the fix batch that found the drift was
+// scoped to internal/cli alone. Anyone tightening or loosening this
+// function's absolute-path or root-escape refusal MUST check
+// localPluginPackageDir for the same edit.
 func packageDir(name, root, source string) (string, error) {
 	if filepath.IsAbs(source) {
 		return "", fmt.Errorf("plugin %q: source %q is absolute; a plugin source must be relative to the "+
