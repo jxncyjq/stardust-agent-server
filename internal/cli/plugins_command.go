@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
@@ -625,10 +626,12 @@ func readPluginDeployment(path string) (manifest.Deployment, error) {
 //     (to resolve the same cache, fetch limits, remote-source policy and
 //     trust set a running serve would use — see resolvePluginRemote and
 //     resolvePluginKeyring) and each DOES write the deployment manifest.
-//     install appends one verified, still-disabled entry; grant authorizes an
-//     existing one to run with its declared capabilities; deny revokes that
-//     authorization while keeping the entry's registration (source, digest,
-//     tools) intact. All three are REGISTRATIONS or authorization decisions on
+//     install appends one verified entry, disabled unless --grant names the
+//     plugin's complete capability set (in which case it is written already
+//     authorized, in the same step); grant authorizes an existing entry to
+//     run with its declared capabilities; deny revokes that authorization
+//     while keeping the entry's registration (source, digest, tools) intact.
+//     All three are REGISTRATIONS or authorization decisions on
 //     disk, not a start: nothing any of them does reaches a running process
 //     until `agent plugins reload`, which is the only reason they are not
 //     grouped with status and reload instead.
@@ -1040,8 +1043,15 @@ func writePluginStatus(w io.Writer, manifestPath, root string, rows []pluginStat
 // --- install -----------------------------------------------------------
 
 // newPluginsInstallCommand builds `agent plugins install <url>`, which
-// fetches, verifies and registers a remote plugin package WITHOUT
-// authorizing it to run.
+// fetches and verifies a remote plugin package and registers it in the
+// deployment manifest. Whether the written entry is authorized to run
+// depends on --grant: with none given the entry is registered but not
+// authorized (rule 4); with a non-empty --grant it is registered AND
+// authorized in the same step (see resolveInstallGrants and D9's rationale
+// in the fix brief) — install can never produce a "partially authorized"
+// entry, because a grant that does not name EVERY capability the plugin
+// declares is refused outright rather than written (see resolveInstallGrants
+// for why a partial grant would otherwise never be able to mount).
 //
 // Order of operations, exactly as runPluginsInstall performs it and not
 // negotiable (see its doc comment for why):
@@ -1049,8 +1059,12 @@ func writePluginStatus(w io.Writer, manifestPath, root string, rows []pluginStat
 //  1. fetch.Fetch — the digest gates the bytes; mismatched bytes never reach
 //     disk.
 //  2. remote.Cache.Put — unpack and atomic placement in the plugin cache.
-//  3. manifest.LoadPackage(dir, keyring) — SIGNATURE VERIFICATION. Nothing
-//     past this step runs if it fails.
+//  3. manifest.LoadPackage(dir, keyring) — SIGNATURE VERIFICATION, but only
+//     when this deployment's plugins config sets "require_signature": true;
+//     with it false, LoadPackage skips signature checking entirely and only
+//     the wasm sha256 check runs (the command's own output says so on that
+//     path — see the "signature NOT verified" line in runPluginsInstall).
+//     Nothing past this step runs if verification that DID run fails.
 //  4. manifest.DraftEntry -> manifest.AddEntry -> manifest.WriteDeployment.
 //
 // Nothing is ever written to plugins.json before step 3 succeeds: a
@@ -1067,46 +1081,62 @@ func writePluginStatus(w io.Writer, manifestPath, root string, rows []pluginStat
 // command and then have serve refuse to fetch or load it, with the
 // contradiction invisible in both commands' output.
 //
-// The written entry is always "enabled": false, whether or not --grant is
-// given: install REGISTERS a package, it never authorizes one to run — see
-// manifest.DraftEntry's doc comment, which enforces the same rule one layer
-// down and offers no parameter to override it either. Its
-// "grant.capabilities" is empty unless --grant names capabilities, in which
-// case each one is checked against the plugin's own plugin.json declaration
-// and, once checked, pre-filled into the entry — the entry still does not
-// run until `agent plugins grant` (or a hand edit) flips "enabled" to true.
+// With no --grant, the written entry is "enabled": false with an empty
+// "grant.capabilities": install REGISTERS a package, it does not authorize
+// one to run — see manifest.DraftEntry's doc comment, which enforces the
+// same rule one layer down and offers no parameter to override it either.
+// The next step is `agent plugins grant`.
+//
+// With a non-empty --grant, the named capabilities must be EXACTLY the set
+// pm.Capabilities declares (not a subset — resolveInstallGrants refuses a
+// partial grant by naming what is missing, because
+// manifest.reconcileCapabilities would otherwise refuse the resulting entry
+// at the next reload, discoverable only as a StateFailed row). The written
+// entry then comes out both "enabled": true and carrying that grant
+// ("grant.capabilities" set, GrantStated true) in the same step: naming a
+// complete --grant IS the authorization decision, not a draft of one.
+// --grant only fills Grant.Capabilities — allowed hosts and paths are still
+// `agent plugins grant`'s job.
 //
 // install does not reload a running service, and does not need one to exist:
 // it edits the deployment manifest on disk. Run `agent plugins reload` to
-// converge a running serve onto the manifest this command just changed —
-// and note that an entry install just wrote is enabled:false, so a reload
-// alone will not mount it; `agent plugins grant` is the remaining step.
+// converge a running serve onto the manifest this command just changed. With
+// no --grant, the entry install just wrote is enabled:false, so a reload
+// alone will not mount it — `agent plugins grant` is the remaining step;
+// with --grant, the entry is already enabled and a reload alone applies it.
 func newPluginsInstallCommand(out io.Writer) *cobra.Command {
 	var configPath string
 	var digestFlag string
 	var grantFlag string
 	cmd := &cobra.Command{
 		Use:   "install <url>",
-		Short: "Fetch, verify and register a remote plugin package without authorizing it to run",
-		Long: "Fetch, verify and register a remote plugin package without authorizing it to run.\n\n" +
+		Short: "Fetch, verify and register a remote plugin package, authorizing it only if --grant is given",
+		Long: "Fetch, verify and register a remote plugin package.\n\n" +
 			"install fetches the package at <url>, checks its bytes against --digest, unpacks it into the\n" +
-			"configured plugin cache, and verifies its signature under the deployment's trust set. Only once\n" +
-			"that verification passes does it append an entry to plugins.json: \"enabled\": false always, and\n" +
-			"an empty \"grant.capabilities\" unless --grant names capabilities the plugin itself declares in\n" +
-			"plugin.json, which are then pre-filled in (the entry stays disabled either way).\n\n" +
-			"install never reloads a running service and never authorizes the plugin to run: run\n" +
-			"`agent plugins grant` to authorize the entry, then `agent plugins reload` to converge it.",
+			"configured plugin cache, and, if this deployment's plugins config sets \"require_signature\": true,\n" +
+			"verifies its signature under the deployment's trust set (with it false, NOTHING is verified --\n" +
+			"only the wasm sha256 check runs, and the command's own output says so). Only once verification\n" +
+			"that DID run passes does it append an entry to plugins.json.\n\n" +
+			"With no --grant, the entry is written \"enabled\": false with an empty \"grant.capabilities\":\n" +
+			"install registers the package without authorizing it; run `agent plugins grant` to authorize it.\n\n" +
+			"With --grant naming EXACTLY the capabilities the plugin declares in plugin.json (not a subset --\n" +
+			"a partial grant would write an entry that can never load), the entry is written \"enabled\": true\n" +
+			"with that grant already recorded: naming a complete --grant IS the authorization decision. --grant\n" +
+			"only fills capabilities; allowed hosts and paths are still `agent plugins grant`'s job.\n\n" +
+			"install never reloads a running service: run `agent plugins reload` to converge it afterward.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runPluginsInstall(cmd.Context(), out, args[0], digestFlag, grantFlag, configPath)
+			return runPluginsInstall(cmd.Context(), out, args[0], digestFlag, grantFlag,
+				cmd.Flags().Changed("grant"), configPath)
 		},
 	}
 	cmd.Flags().StringVar(&digestFlag, "digest", "",
 		`sha256 digest the fetched package must match, as "sha256:<hex>" (required: a remote entry is `+
 			"never installed unverified)")
 	cmd.Flags().StringVar(&grantFlag, "grant", "",
-		"comma-separated capabilities to pre-fill into the entry's grant; each must be a capability the "+
-			"plugin itself declares, and the entry stays disabled either way")
+		"comma-separated capabilities to grant; must name EXACTLY the set the plugin declares in plugin.json "+
+			"(not a subset), and authorizes the entry immediately (\"enabled\": true); allowed hosts and paths "+
+			"are still `agent plugins grant`'s job, not this flag's")
 	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file")
 	return cmd
 }
@@ -1114,7 +1144,8 @@ func newPluginsInstallCommand(out io.Writer) *cobra.Command {
 // runPluginsInstall is newPluginsInstallCommand's RunE body. See that
 // command's doc comment for the order of operations this function follows
 // and why it is not negotiable.
-func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag, grantFlag, configPath string) error {
+func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag, grantFlag string,
+	grantFlagChanged bool, configPath string) error {
 	source := strings.TrimSpace(sourceArg)
 	if source == "" {
 		return errors.New("plugins install: the source URL is empty")
@@ -1127,7 +1158,7 @@ func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag
 
 	cfg, err := config.Load(ctx, config.Options{Path: configPath})
 	if err != nil {
-		return err
+		return fmt.Errorf("plugins install: %w", err)
 	}
 	if strings.TrimSpace(cfg.Plugins.Manifest) == "" {
 		return errors.New(`plugins install: no "plugins.manifest" is configured, so install has no ` +
@@ -1151,9 +1182,32 @@ func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag
 	// back is a foundational problem this command should report cheaply,
 	// before spending a network round trip and a cache write on a package
 	// whose entry could never be appended to it anyway.
+	//
+	// D10: install deliberately does NOT bootstrap a missing plugins.json —
+	// reusing readPluginDeployment keeps it agreeing with status and reload
+	// on what "the deployment manifest" means, and inventing one here would
+	// be install quietly creating deployment state nobody configured. But a
+	// bare "file does not exist" is install's own first-run failure, not a
+	// pre-existing deployment's, so it gets a remedy attached here rather
+	// than inside readPluginDeployment (status and reload keep the bare
+	// message; their context is "a deployment already exists").
 	existing, err := readPluginDeployment(cfg.Plugins.Manifest)
 	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return fmt.Errorf(`plugins install: %w; install will not create this file itself -- the `+
+				`deployment's desired state is the operator's to establish -- create it first with the `+
+				`content {"plugins": []} to start from an empty deployment`, err)
+		}
 		return err
+	}
+	// F5: snapshotted now, before the fetch below, so a re-read immediately
+	// before the write (see the re-read near AddEntry/WriteDeployment) can
+	// detect a concurrent edit made while this download was in flight and
+	// refuse to silently overwrite it from a stale copy. A byte comparison
+	// is sufficient; nothing here needs a lock.
+	snapshot, err := os.ReadFile(cfg.Plugins.Manifest)
+	if err != nil {
+		return fmt.Errorf("plugins install: snapshot plugin deployment manifest %q: %w", cfg.Plugins.Manifest, err)
 	}
 
 	// Rule 9: where a fetched package is written is a deployment decision, and
@@ -1188,11 +1242,14 @@ func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag
 	}
 
 	// The ONLY sanctioned constructor for the trust set — see
-	// resolvePluginKeyring's own doc comment. The second return value (a
-	// keyring that loaded but is not enforced) is discarded rather than
-	// warned about: newPluginLoader's Warn is written once, at the assembly
-	// that actually drops it, and install neither builds nor holds a Loader.
-	keyring, _, err := resolvePluginKeyring(cfg.Plugins)
+	// resolvePluginKeyring's own doc comment. Unlike newPluginLoader (which
+	// Warns once, at the assembly that drops an unenforced keyring), install
+	// neither builds nor holds a Loader to log through — so the second
+	// return value (droppedKeyringPath, the path of a keyring that loaded
+	// but this policy does not enforce) is kept here instead, to fold into
+	// the "signature NOT verified" line in this command's own success
+	// output below, the only channel install has for a warning at all.
+	keyring, droppedKeyringPath, err := resolvePluginKeyring(cfg.Plugins)
 	if err != nil {
 		return err
 	}
@@ -1228,27 +1285,60 @@ func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag
 	// Rule 5: granting a capability the plugin never declared is a config
 	// error, not generosity. Checked before DraftEntry so a bad --grant never
 	// reaches plugins.json either.
-	grants, err := resolveInstallGrants(grantFlag, pm)
+	grants, err := resolveInstallGrants(grantFlag, grantFlagChanged, pm)
 	if err != nil {
 		return err
 	}
 
 	// Step 4a: the draft. DraftEntry alone decides Name (from pm.Name, never
 	// from anything this command was given) and Tools; it always produces
-	// Enabled: false and empty Grant.Capabilities, with no parameter to
-	// override either — see its own doc comment.
+	// Enabled: false, GrantStated: false and empty Grant.Capabilities, with
+	// no parameter to override any of them — see its own doc comment. That
+	// layering stays correct: DraftEntry never authorizes anything, and the
+	// override below happens here, in this command's own code, deliberately
+	// not inside DraftEntry, so it is visible and reviewable rather than
+	// buried in a helper every caller reaches for.
 	entry, err := manifest.DraftEntry(pm, source, digest)
 	if err != nil {
 		return fmt.Errorf("plugins install: %w", err)
 	}
-	// --grant is applied here, in this command's own code, deliberately not
-	// inside DraftEntry: DraftEntry's refusal to accept an authorization
-	// parameter is what forces this override to happen somewhere visible and
-	// reviewable rather than inside a helper every caller reaches for. Enabled
-	// is left exactly as DraftEntry set it — false — regardless of grants:
-	// install registers a package, it does not authorize one to run.
+	// D9: a non-empty --grant IS an authorization decision, not a draft of
+	// one — resolveInstallGrants above already refused anything but a grant
+	// naming EXACTLY pm.Capabilities, so this can never write an entry that
+	// reconcileCapabilities would refuse for a partial grant. Enabled and
+	// GrantStated must be set TOGETHER: MarshalDeployment omits the whole
+	// "grant" block when GrantStated is false, so Enabled=true with
+	// GrantStated left false would write an authorized entry carrying NO
+	// capabilities at all, which reconcileCapabilities refuses just the same
+	// — the entry would still land in `failed` on the next reload.
 	if len(grants) > 0 {
 		entry.Grant.Capabilities = grants
+		entry.Enabled = true
+		entry.GrantStated = true
+	}
+
+	// F5: existing was snapshotted above, before the fetch — a window that
+	// spans an entire artifact download, seconds to minutes under the
+	// configured limits, long enough for a hand edit or another `agent
+	// plugins grant`/`deny` to have changed plugins.json in the meantime.
+	// WriteDeployment is atomic but performs no compare-and-swap, so without
+	// this re-read a stale rewrite would silently revert that edit — both
+	// commands would report success and the next reload would quietly
+	// unmount or mount something nobody decided to. Refuse instead.
+	current, err := os.ReadFile(cfg.Plugins.Manifest)
+	if err != nil {
+		return fmt.Errorf("plugins install: re-read plugin deployment manifest %q before write: %w",
+			cfg.Plugins.Manifest, err)
+	}
+	if !bytes.Equal(snapshot, current) {
+		// %s, not %q: on Windows a %q-quoted path doubles every backslash,
+		// which would stop it matching a caller's raw path string built
+		// straight from filepath.Join -- unlike the wrapped-error case just
+		// above, there is no underlying *PathError here to carry a second,
+		// unquoted copy of the path along for free.
+		return fmt.Errorf(`plugins install: plugin deployment manifest %s changed while this package was `+
+			`downloading; refusing to overwrite that edit with a stale copy -- re-run "agent plugins `+
+			`install" to register the entry on top of the current state`, cfg.Plugins.Manifest)
 	}
 
 	// Step 4b/4c: AddEntry is rule 6 (a duplicate name is refused, naming it)
@@ -1263,7 +1353,7 @@ func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag
 	}
 
 	if len(grants) > 0 {
-		if _, err := fmt.Fprintf(out, "installed %q (version %s) from %s, with capabilities pre-granted: %s.\n",
+		if _, err := fmt.Fprintf(out, "installed %q (version %s) from %s, with capabilities granted: %s.\n",
 			pm.Name, pm.Version, source, strings.Join(grants, ", ")); err != nil {
 			return fmt.Errorf("write plugins install output: %w", err)
 		}
@@ -1271,30 +1361,75 @@ func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag
 		pm.Name, pm.Version, source); err != nil {
 		return fmt.Errorf("write plugins install output: %w", err)
 	}
-	if _, err := fmt.Fprintf(out, "the entry is registered but NOT authorized to run (\"enabled\": false in "+
+
+	// D9: a non-empty --grant already authorized the entry above (Enabled
+	// and GrantStated both true) -- claiming "NOT authorized" about an entry
+	// this call just enabled would contradict what was written, so the two
+	// branches say different things and name different remaining steps.
+	if len(grants) > 0 {
+		if _, err := fmt.Fprintf(out, "the entry is registered AND authorized to run (\"enabled\": true in "+
+			"%s); run `agent plugins reload` to apply.\n", cfg.Plugins.Manifest); err != nil {
+			return fmt.Errorf("write plugins install output: %w", err)
+		}
+	} else if _, err := fmt.Fprintf(out, "the entry is registered but NOT authorized to run (\"enabled\": false in "+
 		"%s); run `agent plugins grant %s` to authorize it, then `agent plugins reload` to apply.\n",
 		cfg.Plugins.Manifest, pm.Name); err != nil {
 		return fmt.Errorf("write plugins install output: %w", err)
+	}
+
+	// F4: the help text and doc comments only promise verification when this
+	// deployment's policy actually requires one. keyring is nil here exactly
+	// when it did not run, so this is the one line that lets an operator
+	// tell a verified install apart from an unverified one without reading
+	// the config -- and it names the dropped keyring too, when one WAS
+	// configured but this policy does not enforce it.
+	if keyring == nil {
+		msg := `signature NOT verified: this deployment sets "require_signature": false`
+		if droppedKeyringPath != "" {
+			msg = fmt.Sprintf(`signature NOT verified: this deployment configured a keyring (%s) but sets `+
+				`"require_signature": false, so it was not enforced`, droppedKeyringPath)
+		}
+		if _, err := fmt.Fprintln(out, msg); err != nil {
+			return fmt.Errorf("write plugins install output: %w", err)
+		}
 	}
 	return nil
 }
 
 // resolveInstallGrants parses --grant's comma-separated capability list and
-// checks every entry against pm.Capabilities, the plugin's OWN declaration in
-// plugin.json. An empty grantFlag returns a nil slice, which is what tells
-// runPluginsInstall to leave DraftEntry's empty Grant.Capabilities exactly as
-// it drafted it rather than overwrite it with another empty one.
+// checks it against pm.Capabilities, the plugin's OWN declaration in
+// plugin.json. An ABSENT flag (grantFlagChanged false) returns a nil slice,
+// which is what tells runPluginsInstall to leave DraftEntry's empty
+// Grant.Capabilities exactly as it drafted it rather than overwrite it with
+// another empty one. An EXPLICITLY EMPTY flag (grantFlagChanged true, but
+// nothing but whitespace after trimming — "--grant" or "--grant   ") is
+// refused rather than silently treated the same as absent: a malformed flag
+// value is not the same as an absent one, and grantFlagChanged is what lets
+// this function tell the two apart. "--grant log,,http" is refused the same
+// way, by the per-field empty check below, regardless of grantFlagChanged.
 //
-// Every named capability must be one pm declares: granting a capability the
-// plugin never asked for is a config error, not generosity, and the error
-// names both the capability and the plugin's actual declaration so the
-// operator does not have to go looking for plugin.json to see what was
-// available. An empty item — "--grant log,,http", or "--grant " with nothing
-// after it — is refused by name rather than silently dropped: a malformed
-// flag value is not the same as an absent one.
-func resolveInstallGrants(grantFlag string, pm manifest.PluginManifest) ([]string, error) {
+// The two sets — what --grant names and what pm.Capabilities declares — must
+// be EQUAL, not merely "--grant is a subset of what's declared". Every named
+// capability must be one pm declares (an extra name the plugin never asked
+// for is a config error, not generosity, refused by naming both the
+// capability and the plugin's actual declaration), AND every declared
+// capability must be named (a missing one is refused too, naming what was
+// left out): manifest.reconcileCapabilities (assemble.go) refuses any entry
+// whose grant does not cover every capability the plugin declares, so a
+// strict subset here would pass this check and then write an entry that
+// install reports as installed and that can then never mount — silently
+// parked in `failed`, discoverable only by reading `agent plugins status`.
+// This mirrors `agent plugins grant`'s resolveGrantCapabilities exactly —
+// same contract, so which command an operator used never changes whether a
+// plugin's declared capabilities can install-then-fail-to-mount.
+func resolveInstallGrants(grantFlag string, grantFlagChanged bool, pm manifest.PluginManifest) ([]string, error) {
 	trimmed := strings.TrimSpace(grantFlag)
 	if trimmed == "" {
+		if grantFlagChanged {
+			return nil, fmt.Errorf(`plugins install: --grant was given but names no capability; an ` +
+				`explicitly empty --grant is refused the same as a malformed one -- omit the flag entirely ` +
+				`to install with no capabilities granted`)
+		}
 		return nil, nil
 	}
 	fields := strings.Split(trimmed, ",")
@@ -1310,6 +1445,21 @@ func resolveInstallGrants(grantFlag string, pm manifest.PluginManifest) ([]strin
 				"is a config error, not generosity", capability, pm.Name, pm.Capabilities)
 		}
 		grants = append(grants, capability)
+	}
+
+	// F1: require the two sets to be EQUAL — see the doc comment above for
+	// why a strict subset must be refused here rather than written.
+	var missing []string
+	for _, declared := range pm.Capabilities {
+		if !slices.Contains(grants, declared) {
+			missing = append(missing, declared)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("plugins install: --grant %q does not grant %v, which plugin %q declares in "+
+			"plugin.json; a partial grant produces an entry the deployment can never load (every declared "+
+			"capability must be granted, not a subset) -- name the complete list, or omit --grant to install "+
+			"without authorizing it", grantFlag, missing, pm.Name)
 	}
 	return grants, nil
 }

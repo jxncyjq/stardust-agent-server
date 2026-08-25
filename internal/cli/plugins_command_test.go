@@ -3382,10 +3382,10 @@ func (f *pluginFixture) requireEntry(dep manifest.Deployment, name string) manif
 // TestPluginsInstallLeavesPluginsJSONByteForByteUnchangedWhenSignatureVerificationFails
 // is rule 1, the core invariant of `agent plugins install`: nothing is ever
 // written to plugins.json before manifest.LoadPackage's signature check has
-// passed. The fetched package here is deliberately left unsigned (signPackage
-// is never called) under a keyring that requires a signature, so LoadPackage
-// refuses it — and plugins.json must come out of the call exactly as it went
-// in, not merely "no error was able to change it", the actual bytes.
+// passed. The fetched package here is signed under the keyring's trusted key
+// ID by a DIFFERENT, untrusted key pair, so LoadPackage refuses it — and
+// plugins.json must come out of the call exactly as it went in, not merely
+// "no error was able to change it", the actual bytes.
 func TestPluginsInstallLeavesPluginsJSONByteForByteUnchangedWhenSignatureVerificationFails(t *testing.T) {
 	f := newPluginFixture(t, 30_000)
 	// The keyring trusts ONE key (registered under testPluginKeyID). The
@@ -3560,6 +3560,13 @@ func TestPluginsInstallRefusesAGrantForAnUndeclaredCapability(t *testing.T) {
 	if err == nil {
 		t.Fatalf("plugins install output = %q, error = nil, want an error: the plugin only declares \"log\"", out)
 	}
+	// F8: "http" alone is a weak assertion -- every error in this command
+	// that names the source URL also contains "http". Assert on the
+	// distinguishing fragment instead, so this test cannot pass on the
+	// wrong error for the right-looking reason.
+	if !strings.Contains(err.Error(), "does not declare") {
+		t.Errorf("plugins install error = %v, want it to say the plugin does not declare the capability", err)
+	}
 	if !strings.Contains(err.Error(), "http") {
 		t.Errorf("plugins install error = %v, want it to name the undeclared capability %q", err, "http")
 	}
@@ -3573,6 +3580,154 @@ func TestPluginsInstallRefusesAGrantForAnUndeclaredCapability(t *testing.T) {
 	}
 	if !bytes.Equal(before, after) {
 		t.Fatalf("plugins.json changed after a refused --grant:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+// TestPluginsInstallRefusesAPartialGrantThatCanNeverMount is F1 [blocking]:
+// --grant naming a STRICT SUBSET of what the plugin declares used to be
+// accepted (resolveInstallGrants only checked that every granted capability
+// was declared, never the reverse), producing an entry
+// manifest.reconcileCapabilities (assemble.go) can never accept -- install
+// reported success, `agent serve` started fine, and the plugin sat silently
+// in `failed`, discoverable only by reading `agent plugins status`. The
+// plugin here declares log AND http; --grant names only log, and must be
+// refused by naming the missing capability, with plugins.json left
+// byte-for-byte unchanged -- the same contract `agent plugins grant`'s
+// resolveGrantCapabilities already enforces (equal sets, not a subset).
+func TestPluginsInstallRefusesAPartialGrantThatCanNeverMount(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log", "http"}, []string{testEchoTool})
+	f.signPackageWithAnyKey("staging")
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
+	f.writeManifest()
+
+	before, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json before install: %v", err)
+	}
+
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "log")
+	if err == nil {
+		t.Fatalf("plugins install output = %q, error = nil, want an error: the plugin declares log AND http, "+
+			"--grant only named log", out)
+	}
+	if !strings.Contains(err.Error(), "http") {
+		t.Errorf("plugins install error = %v, want it to name the missing capability %q", err, "http")
+	}
+	if !strings.Contains(err.Error(), "partial") {
+		t.Errorf("plugins install error = %v, want it to say a partial grant produces an entry that can "+
+			"never load", err)
+	}
+
+	after, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json after install: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("plugins.json changed after a refused partial grant:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+// TestPluginsInstallWithACompleteGrantAuthorizesTheEntryImmediately is D9: a
+// non-empty --grant is an authorization decision, not a draft of one --
+// naming the plugin's COMPLETE declared capability set must set
+// Enabled=true AND GrantStated=true in the same write, or the written entry
+// would be enabled with no capabilities recorded at all (MarshalDeployment
+// omits the whole grant block when GrantStated is false), which
+// reconcileCapabilities refuses just as surely as F1's partial grant did.
+// The success output must say so too: an entry this call just enabled
+// cannot be reported as "NOT authorized".
+func TestPluginsInstallWithACompleteGrantAuthorizesTheEntryImmediately(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log", "http"}, []string{testEchoTool})
+	f.signPackageWithAnyKey("staging")
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
+	f.writeManifest()
+
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "log,http")
+	if err != nil {
+		t.Fatalf("plugins install error = %v, want nil", err)
+	}
+	if strings.Contains(out, "NOT authorized") {
+		t.Errorf("plugins install output = %q, want it NOT to say NOT authorized: a complete --grant just "+
+			"enabled this entry", out)
+	}
+	if !strings.Contains(out, "AND authorized") {
+		t.Errorf("plugins install output = %q, want it to say the entry is registered AND authorized", out)
+	}
+	if strings.Contains(out, "agent plugins grant") {
+		t.Errorf("plugins install output = %q, want it NOT to tell the operator to run `agent plugins grant`: "+
+			"the entry is already authorized", out)
+	}
+
+	entry := f.requireEntry(f.readDeployment(), testEchoPlugin)
+	if !entry.Enabled {
+		t.Errorf("entry.Enabled = false, want true: --grant named the plugin's complete capability set (D9)")
+	}
+	if !entry.GrantStated {
+		t.Errorf("entry.GrantStated = false, want true: Enabled=true with GrantStated=false would write an " +
+			"authorized entry with no capabilities on disk, which reconcileCapabilities refuses")
+	}
+	wantCaps := []string{"log", "http"}
+	if !slices.Equal(entry.Grant.Capabilities, wantCaps) {
+		t.Errorf("entry.Grant.Capabilities = %v, want %v", entry.Grant.Capabilities, wantCaps)
+	}
+}
+
+// TestPluginsInstallRefusesAnExplicitlyEmptyGrant is F2: the doc comment on
+// resolveInstallGrants states that an empty --grant item is refused by name
+// rather than silently dropped, but the code used to special-case the
+// WHOLE-FLAG-empty case (an explicitly passed "--grant" or "--grant   ")
+// and return nil, nil for it -- installing successfully with no capabilities
+// granted and no error, contradicting the doc comment and (for a plugin that
+// declares required capabilities, as here) letting a scripted
+// `--grant "$CAPS"` with an unset CAPS install unauthorized-and-silent
+// rather than fail loudly. An OMITTED --grant must still behave exactly as
+// before (rule 4 covers that; this test only covers the flag being present
+// and empty).
+func TestPluginsInstallRefusesAnExplicitlyEmptyGrant(t *testing.T) {
+	for _, grantValue := range []string{"", "   "} {
+		t.Run(fmt.Sprintf("grant=%q", grantValue), func(t *testing.T) {
+			f := newPluginFixture(t, 30_000)
+			f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+			f.signPackageWithAnyKey("staging")
+			archive := f.archivePackage("staging")
+			digest := digestOfArchive(archive)
+			srv := serveArchive(t, archive)
+			cacheDir := filepath.Join(f.dir, "plugin-cache")
+			f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
+			f.writeManifest()
+
+			before, err := os.ReadFile(f.manifestPath)
+			if err != nil {
+				t.Fatalf("read plugins.json before install: %v", err)
+			}
+
+			out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", grantValue)
+			if err == nil {
+				t.Fatalf("plugins install output = %q, error = nil, want an error: --grant was explicitly "+
+					"given but empty", out)
+			}
+			if !strings.Contains(err.Error(), "--grant") {
+				t.Errorf("plugins install error = %v, want it to name --grant", err)
+			}
+
+			after, err := os.ReadFile(f.manifestPath)
+			if err != nil {
+				t.Fatalf("read plugins.json after install: %v", err)
+			}
+			if !bytes.Equal(before, after) {
+				t.Fatalf("plugins.json changed after a refused empty --grant:\nbefore=%s\nafter=%s", before, after)
+			}
+		})
 	}
 }
 
@@ -3690,6 +3845,98 @@ func TestPluginsInstallRefusesAnUnconfiguredCache(t *testing.T) {
 	}
 }
 
+// TestPluginsInstallNamesTheRemedyWhenPluginsManifestDoesNotExist is D10: not
+// bootstrapping a missing plugins.json is the right call (reusing
+// readPluginDeployment keeps install agreeing with status and reload on what
+// "the deployment manifest" means), but the resulting first-run error used to
+// be a bare "open ...: no such file", naming only the path. install is
+// exactly the command an operator reaches for when no deployment exists yet,
+// so its error has to say that install will not create the file itself and
+// what minimal content starts one.
+func TestPluginsInstallNamesTheRemedyWhenPluginsManifestDoesNotExist(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
+	// Deliberately no f.writeManifest() call: cfg.Plugins.Manifest is
+	// configured (writeInstallConfig sets it via writeSignatureConfig), but
+	// nothing has ever been written to that path.
+	if _, err := os.Stat(f.manifestPath); err == nil {
+		t.Fatalf("test setup is wrong: %s must not exist yet", f.manifestPath)
+	}
+
+	out, err := f.run("install", "https://example.invalid/echo.tgz", "--digest", digestOfArchive([]byte("x")))
+	if err == nil {
+		t.Fatalf("plugins install output = %q, error = nil, want an error: plugins.json does not exist yet", out)
+	}
+	if !strings.Contains(err.Error(), f.manifestPath) {
+		t.Errorf("plugins install error = %v, want it to name the path %q", err, f.manifestPath)
+	}
+	if !strings.Contains(err.Error(), "will not create") {
+		t.Errorf("plugins install error = %v, want it to say install will not create the file itself", err)
+	}
+	if !strings.Contains(err.Error(), `{"plugins": []}`) {
+		t.Errorf(`plugins install error = %v, want it to name {"plugins": []} as the minimal starting content`, err)
+	}
+}
+
+// TestPluginsInstallRefusesAConcurrentEditDuringTheDownload is F5: the
+// deployment is snapshotted before the download and a document built from
+// that snapshot is written after it, with no compare-and-swap in between --
+// a window that spans an entire artifact download, seconds to minutes under
+// the configured timeout and byte cap. A server handler that mutates
+// plugins.json itself, from inside the request the fetch is blocked on,
+// stands in for an operator (or another `agent plugins` invocation) editing
+// the file while this install is still downloading -- reproduced
+// deterministically instead of racing a real clock. install must refuse
+// rather than silently rewrite the file from its now-stale snapshot, and the
+// concurrent edit must survive exactly as written.
+func TestPluginsInstallRefusesAConcurrentEditDuringTheDownload(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", nil, []string{testEchoTool})
+	f.signPackageWithAnyKey("staging")
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
+	f.writeManifest()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Stand in for a concurrent edit landing WHILE this download is in
+		// flight, from inside the very request the fetch is blocked on.
+		concurrent := manifest.Deployment{Plugins: []manifest.Entry{{
+			Name:    "concurrently-installed-plugin",
+			Source:  "elsewhere",
+			Enabled: true,
+			Tools:   []manifest.ToolAccept{{Name: testEchoTool}},
+		}}}
+		if err := manifest.WriteDeployment(f.manifestPath, concurrent); err != nil {
+			t.Errorf("write concurrent edit to plugins.json: %v", err)
+		}
+		if _, err := w.Write(archive); err != nil {
+			t.Errorf("write archive to client: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest)
+	if err == nil {
+		t.Fatalf("plugins install output = %q, error = nil, want an error: plugins.json changed while this "+
+			"package was downloading", out)
+	}
+	if !strings.Contains(err.Error(), f.manifestPath) {
+		t.Errorf("plugins install error = %v, want it to name the manifest path %q", err, f.manifestPath)
+	}
+	if !strings.Contains(err.Error(), "changed") {
+		t.Errorf("plugins install error = %v, want it to say the manifest changed underneath it", err)
+	}
+
+	after := f.readDeployment()
+	if len(after.Plugins) != 1 || after.Plugins[0].Name != "concurrently-installed-plugin" {
+		t.Fatalf("plugins.json after install = %+v, want ONLY the concurrent edit still present -- install "+
+			"must refuse rather than silently revert it", after.Plugins)
+	}
+}
+
 // TestPluginsInstallAndServeAgreeOnCacheAndTrustSettings is the reuse
 // invariant the brief calls out by name: install resolves its cache, HTTP
 // client, fetch/unpack limits and remote-source policy through
@@ -3699,20 +3946,27 @@ func TestPluginsInstallRefusesAnUnconfiguredCache(t *testing.T) {
 // cleanly through this command and then have serve refuse to fetch or load
 // it, with the contradiction invisible in both commands' output.
 //
-// This test installs a package with --grant naming one declared capability
-// (the entry still comes out disabled and — since Part A — carries NO grant
-// block at all: DraftEntry leaves GrantStated false, and MarshalDeployment
-// omits an unstated grant block regardless of what --grant pre-checked in
-// memory before the write; see manifest.Entry.GrantStated), then actually
-// authorizes it with the real `agent plugins grant` (Task 4). It then runs
-// the SAME assembly `agent serve` runs, against the SAME config. That
-// assembly re-resolves the cache and the trust set from scratch — it only
-// succeeds, and only mounts the plugin, if its resolution of both agrees
-// with what install already used.
+// The fixture declares TWO capabilities and --grant names both: a
+// single-capability fixture would make "the granted set" and "the declared
+// set" trivially identical no matter which direction resolveInstallGrants
+// checked, so it could never tell F1's fix (require EQUAL sets) apart from
+// the original one-directional (subset only) check — this is the review's
+// F1 finding about the original version of this test. With two capabilities,
+// the happy path only succeeds because --grant genuinely names the complete
+// declared set.
+//
+// This test installs the package with a complete --grant, which (D9) both
+// registers AND authorizes the entry in the same step, then also runs
+// `agent plugins grant` (Task 4) — a re-grant of an already-authorized entry
+// — to prove grant's resolvers agree with install's and serve's too, not
+// only install's. It then runs the SAME assembly `agent serve` runs, against
+// the SAME config. That assembly re-resolves the cache and the trust set
+// from scratch — it only succeeds, and only mounts the plugin, if its
+// resolution of both agrees with what install already used.
 func TestPluginsInstallAndServeAgreeOnCacheAndTrustSettings(t *testing.T) {
 	f := newPluginFixture(t, 30_000)
 	priv, keyringPath := f.newKeyring("keyring.json")
-	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log", "http"}, []string{testEchoTool})
 	f.signPackage("staging", priv)
 	archive := f.archivePackage("staging")
 	digest := digestOfArchive(archive)
@@ -3721,22 +3975,21 @@ func TestPluginsInstallAndServeAgreeOnCacheAndTrustSettings(t *testing.T) {
 	f.writeInstallConfig(signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(true)}, cacheDir)
 	f.writeManifest()
 
-	if _, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "log"); err != nil {
+	if _, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "log,http"); err != nil {
 		t.Fatalf("plugins install error = %v, want nil", err)
 	}
 
+	wantCaps := []string{"log", "http"}
 	entry := f.requireEntry(f.readDeployment(), testEchoPlugin)
-	if entry.Enabled {
-		t.Fatalf("entry.Enabled = true right after install, want false")
+	if !entry.Enabled {
+		t.Fatalf("entry.Enabled = false right after install with a complete --grant, want true (D9)")
 	}
-	if entry.GrantStated {
-		t.Fatalf("entry.GrantStated = true right after install, want false: install never authorizes a plugin, " +
-			"and DraftEntry's own GrantStated zero value means no grant block is ever written for it")
+	if !entry.GrantStated {
+		t.Fatalf("entry.GrantStated = false right after install with a complete --grant, want true (D9): " +
+			"MarshalDeployment omits the whole grant block unless GrantStated is also set")
 	}
-	if len(entry.Grant.Capabilities) != 0 {
-		t.Fatalf("entry.Grant.Capabilities = %v, want empty: --grant's pre-check happens in memory before the "+
-			"write, but nothing about it is persisted while the entry stays unauthorized (GrantStated false)",
-			entry.Grant.Capabilities)
+	if !slices.Equal(entry.Grant.Capabilities, wantCaps) {
+		t.Fatalf("entry.Grant.Capabilities = %v, want %v right after install", entry.Grant.Capabilities, wantCaps)
 	}
 
 	// install already filed the package under the path resolvePluginRemote
@@ -3749,16 +4002,17 @@ func TestPluginsInstallAndServeAgreeOnCacheAndTrustSettings(t *testing.T) {
 		}
 	}
 
-	// The real authorization step: `agent plugins grant` (Task 4) resolves
-	// the SAME plugin package (from the SAME cache, under the SAME trust
-	// set) to check "log" against the plugin's own declaration, then writes
-	// Enabled true, GrantStated true and Grant.Capabilities = ["log"].
-	if _, err := f.run("grant", testEchoPlugin, "--capabilities", "log"); err != nil {
+	// `agent plugins grant` (Task 4) resolves the SAME plugin package (from
+	// the SAME cache, under the SAME trust set) install did, re-checking
+	// "log,http" against the plugin's own declaration on an entry install
+	// already authorized -- a legal re-grant, and proof grant's resolvers
+	// agree too, not only install's.
+	if _, err := f.run("grant", testEchoPlugin, "--capabilities", "log,http"); err != nil {
 		t.Fatalf("plugins grant error = %v, want nil", err)
 	}
 	granted := f.requireEntry(f.readDeployment(), testEchoPlugin)
-	if !granted.Enabled || !granted.GrantStated || !slices.Equal(granted.Grant.Capabilities, []string{"log"}) {
-		t.Fatalf("entry after grant = %+v, want Enabled=true GrantStated=true Grant.Capabilities=[log]", granted)
+	if !granted.Enabled || !granted.GrantStated || !slices.Equal(granted.Grant.Capabilities, wantCaps) {
+		t.Fatalf("entry after grant = %+v, want Enabled=true GrantStated=true Grant.Capabilities=%v", granted, wantCaps)
 	}
 
 	if err := f.assemble(); err != nil {
