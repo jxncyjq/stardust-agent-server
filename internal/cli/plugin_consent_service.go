@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
+	"sync"
 
 	"github.com/stardust/legion-agent/internal/plugin/consent"
 	"github.com/stardust/legion-agent/internal/plugin/loader"
@@ -32,6 +34,30 @@ type PluginConsentService struct {
 	pluginsFn    func() *loader.Loader
 	keyringFn    func() *sign.Keyring
 	remote       loader.RemoteConfig
+	logger       *slog.Logger
+
+	// mu serializes Grant and Deny against each other IN THIS PROCESS, held
+	// for the whole read -> validate -> write -> converge sequence.
+	//
+	// consent.RefuseDeploymentChanged is a compare-and-swap with no swap:
+	// it re-reads the manifest and compares it against the snapshot, but
+	// nothing stops another goroutine writing in the gap between that check
+	// and manifest.WriteDeployment. Two GUI windows authorizing two
+	// different plugins at once would both pass the check, and the second
+	// write would revert the first plugin's authorization while both
+	// requests returned 200 -- a silent rollback on an authorization
+	// boundary, which is worse than a crash. That window was tolerable for a
+	// hand-speed CLI; on HTTP, concurrency is the normal case.
+	//
+	// Cross-process safety still rests entirely on RefuseDeploymentChanged
+	// (another `agent plugins grant` shares no mutex with this one), so this
+	// removes the half that is removable rather than replacing the guard.
+	// The lock is held across resolvePluginPackageDir, which may download a
+	// remote package: authorization is a low-frequency operator action, and
+	// releasing the lock for the download is exactly what would put the gap
+	// back. List deliberately does NOT take it -- it only reads, and a
+	// reader blocked behind a package download would be a worse trade.
+	mu sync.Mutex
 }
 
 // NewPluginConsentService builds a PluginConsentService.
@@ -59,13 +85,25 @@ type PluginConsentService struct {
 // resolve a REMOTE entry's package directory on a cache hit -- it never
 // drives a network fetch, so its zero value (no "plugins.cache" configured)
 // is a legitimate, supported input, not a caller error.
-func NewPluginConsentService(manifestPath, root string, pluginsFn func() *loader.Loader, keyringFn func() *sign.Keyring, remote loader.RemoteConfig) *PluginConsentService {
+//
+// logger is where a convergence that ran and reported errors is recorded
+// (see applyAndReport). It must not be nil: the loader logs a per-entry
+// activation failure itself, but Apply has failure paths that never reach
+// the loader's own logging, and dropping those would make a grant that
+// changed nothing indistinguishable from one that worked. A nil logger is a
+// wiring mistake at the call site, not a state to tolerate, so it panics
+// rather than silently discarding those records.
+func NewPluginConsentService(manifestPath, root string, pluginsFn func() *loader.Loader, keyringFn func() *sign.Keyring, remote loader.RemoteConfig, logger *slog.Logger) *PluginConsentService {
+	if logger == nil {
+		panic("cli: NewPluginConsentService: logger is nil; a convergence that reported errors would be recorded nowhere")
+	}
 	return &PluginConsentService{
 		manifestPath: manifestPath,
 		root:         root,
 		pluginsFn:    pluginsFn,
 		keyringFn:    keyringFn,
 		remote:       remote,
+		logger:       logger,
 	}
 }
 
@@ -239,20 +277,36 @@ const pluginConsentDenyActor = "POST /v1/plugins/{name}/deny"
 //  7. applyAndReport converges the loader and turns the outcome into the
 //     ConsentResult the four-outcome contract on server.ConsentResult
 //     describes.
+//
+// Step 4 is preceded by consent.NormalizeList on each of the three lists,
+// the same refusal of an empty or repeated item `agent plugins grant` gets
+// from splitFlagList. Both paths call the SAME function for it, because a
+// duplicate slips through every later set check unnoticed and would be
+// written into plugins.json by whichever path skipped the rule.
+//
+// The whole sequence runs under s.mu, so a second concurrent Grant or Deny
+// in this process cannot land its write inside step 5's compare-and-swap
+// window -- see s.mu's own comment. Every error is classified with one of
+// internal/server's sentinels where a class applies, so the handler can map
+// it to a status code without reading its text.
 func (s *PluginConsentService) Grant(ctx context.Context, name string, req server.GrantRequest) (server.ConsentResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	pluginLoader := s.pluginsFn()
 	if pluginLoader == nil {
-		return server.ConsentResult{}, fmt.Errorf("plugin consent: no plugin loader attached to this process; " +
-			"plugins are assembled by `agent serve`, and a loader belongs to the service that built it")
+		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w; "+
+			"plugins are assembled by `agent serve`, and a loader belongs to the service that built it",
+			name, server.ErrPluginUnavailable)
 	}
 
 	dep, snapshot, err := consent.ReadDeploymentWithSnapshot(s.manifestPath)
 	if err != nil {
-		return server.ConsentResult{}, err
+		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w: %w", name, server.ErrPluginStorage, err)
 	}
 	entry, err := consent.FindEntry(dep, name)
 	if err != nil {
-		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w", name, err)
+		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w: %w", name, server.ErrPluginNotFound, err)
 	}
 
 	dir, err := resolvePluginPackageDir(ctx, entry, s.remote, s.root)
@@ -264,15 +318,28 @@ func (s *PluginConsentService) Grant(ctx context.Context, name string, req serve
 		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w", name, err)
 	}
 
-	capabilities, err := consent.ResolveCapabilities(pluginConsentGrantActor, req.Capabilities, pm)
+	requestedCaps, err := consent.NormalizeList(pluginConsentGrantActor, "capabilities", req.Capabilities)
 	if err != nil {
 		return server.ConsentResult{}, err
 	}
-	hosts, err := consent.ResolveAllowedHosts(pluginConsentGrantActor, req.AllowedHosts, pm)
+	requestedHosts, err := consent.NormalizeList(pluginConsentGrantActor, "allowed_hosts", req.AllowedHosts)
 	if err != nil {
 		return server.ConsentResult{}, err
 	}
-	paths, err := consent.ResolveAllowedPaths(pluginConsentGrantActor, req.AllowedPaths, pm)
+	requestedPaths, err := consent.NormalizeList(pluginConsentGrantActor, "allowed_paths", req.AllowedPaths)
+	if err != nil {
+		return server.ConsentResult{}, err
+	}
+
+	capabilities, err := consent.ResolveCapabilities(pluginConsentGrantActor, requestedCaps, pm)
+	if err != nil {
+		return server.ConsentResult{}, err
+	}
+	hosts, err := consent.ResolveAllowedHosts(pluginConsentGrantActor, requestedHosts, pm)
+	if err != nil {
+		return server.ConsentResult{}, err
+	}
+	paths, err := consent.ResolveAllowedPaths(pluginConsentGrantActor, requestedPaths, pm)
 	if err != nil {
 		return server.ConsentResult{}, err
 	}
@@ -284,7 +351,7 @@ func (s *PluginConsentService) Grant(ctx context.Context, name string, req serve
 	}
 
 	if err := consent.RefuseDeploymentChanged(pluginConsentGrantActor, s.manifestPath, snapshot); err != nil {
-		return server.ConsentResult{}, err
+		return server.ConsentResult{}, classifyDeploymentGuardError("grant", name, err)
 	}
 
 	updated, err := manifest.UpdateEntry(dep, name, func(e manifest.Entry) (manifest.Entry, error) {
@@ -297,7 +364,7 @@ func (s *PluginConsentService) Grant(ctx context.Context, name string, req serve
 		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w", name, err)
 	}
 	if err := manifest.WriteDeployment(s.manifestPath, updated); err != nil {
-		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w", name, err)
+		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w: %w", name, server.ErrPluginStorage, err)
 	}
 
 	result, err := s.applyAndReport(ctx, pluginLoader, updated, name)
@@ -335,22 +402,30 @@ func (s *PluginConsentService) Grant(ctx context.Context, name string, req serve
 // server.PluginView.DeclaredUnresolved's own doc comment for why those two
 // states must stay distinguishable), so the returned View is marked
 // DeclaredUnresolved unconditionally instead.
+//
+// Like Grant, the whole read -> write -> converge sequence runs under s.mu
+// (see its own comment) and every error is classified with one of
+// internal/server's sentinels where a class applies.
 func (s *PluginConsentService) Deny(ctx context.Context, name string) (server.ConsentResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	pluginLoader := s.pluginsFn()
 	if pluginLoader == nil {
-		return server.ConsentResult{}, fmt.Errorf("plugin consent: no plugin loader attached to this process; " +
-			"plugins are assembled by `agent serve`, and a loader belongs to the service that built it")
+		return server.ConsentResult{}, fmt.Errorf("plugin consent: deny %q: %w; "+
+			"plugins are assembled by `agent serve`, and a loader belongs to the service that built it",
+			name, server.ErrPluginUnavailable)
 	}
 
 	dep, snapshot, err := consent.ReadDeploymentWithSnapshot(s.manifestPath)
 	if err != nil {
-		return server.ConsentResult{}, err
+		return server.ConsentResult{}, fmt.Errorf("plugin consent: deny %q: %w: %w", name, server.ErrPluginStorage, err)
 	}
 	if _, err := consent.FindEntry(dep, name); err != nil {
-		return server.ConsentResult{}, fmt.Errorf("plugin consent: deny %q: %w", name, err)
+		return server.ConsentResult{}, fmt.Errorf("plugin consent: deny %q: %w: %w", name, server.ErrPluginNotFound, err)
 	}
 	if err := consent.RefuseDeploymentChanged(pluginConsentDenyActor, s.manifestPath, snapshot); err != nil {
-		return server.ConsentResult{}, err
+		return server.ConsentResult{}, classifyDeploymentGuardError("deny", name, err)
 	}
 
 	updated, err := manifest.UpdateEntry(dep, name, func(e manifest.Entry) (manifest.Entry, error) {
@@ -365,7 +440,7 @@ func (s *PluginConsentService) Deny(ctx context.Context, name string) (server.Co
 		return server.ConsentResult{}, fmt.Errorf("plugin consent: deny %q: %w", name, err)
 	}
 	if err := manifest.WriteDeployment(s.manifestPath, updated); err != nil {
-		return server.ConsentResult{}, fmt.Errorf("plugin consent: deny %q: %w", name, err)
+		return server.ConsentResult{}, fmt.Errorf("plugin consent: deny %q: %w: %w", name, server.ErrPluginStorage, err)
 	}
 
 	result, err := s.applyAndReport(ctx, pluginLoader, updated, name)
@@ -387,44 +462,100 @@ func (s *PluginConsentService) Deny(ctx context.Context, name string) (server.Co
 // ld.Apply's error is deliberately NOT surfaced as-is: the disk write
 // already landed, so — per taskgate.ApplyAtBoundary's own doc comment —
 // this is never "nothing happened". It is either "not applied yet"
-// (Apply's error wraps context.DeadlineExceeded/context.Canceled from a
-// boundary wait that timed out or was cancelled, or taskgate.ErrApplyPending
-// / taskgate.ErrApplyInProgress from a concurrent apply already holding the
-// gate) or "applied, and THIS entry's own state in the loader's Status() is
-// the honest answer" — which covers both a clean convergence and this
-// entry specifically failing to activate, and also covers an unrelated
+// (taskgate.ErrBoundaryNotReached from a boundary wait that timed out or was
+// cancelled, or taskgate.ErrApplyInProgress from a concurrent apply already
+// holding the gate) or "applied, and THIS entry's own state in the loader's
+// Status() is the honest answer" — which covers both a clean convergence and
+// this entry specifically failing to activate, and also covers an unrelated
 // entry failing while this one converged fine: Apply's error can name
 // either, and only Status() says which one this entry got.
+//
+// Those TWO taskgate sentinels are the whole test, and the bare ctx
+// sentinels are deliberately not consulted. gpc-task-3 review, Critical-1:
+// Apply passes the same ctx down through converge -> prepare -> remoteDir ->
+// fetch.Fetch, which derives its own deadline from it and wraps
+// context.DeadlineExceeded when a download times out. Keying on
+// context.DeadlineExceeded/context.Canceled therefore read a convergence
+// that RAN AND FAILED as one still to come — an operator waiting forever for
+// something that already happened — and, in the other direction, reported
+// "your authorization has not taken effect yet" about a plugin that was
+// already running with its new capabilities. Only taskgate knows first hand
+// whether fn ran; ErrBoundaryNotReached is it saying so.
+//
+// A non-nil applyErr on the CONVERGED branch is kept, not dropped: it goes
+// into ConvergenceDetail (see server.ConsentResult — "convergence ran, and
+// these errors happened" is one of its documented states) and is logged.
+// Most of what it names the loader has already logged per entry, but
+// loader.Apply has two failure paths that return BEFORE the gate and never
+// reach that logging; dropping the error would turn those into "reported
+// success, applied nothing", which is the same class of lie as Critical-1,
+// only silent.
 func (s *PluginConsentService) applyAndReport(ctx context.Context, pluginLoader *loader.Loader, dep manifest.Deployment, name string) (server.ConsentResult, error) {
 	applyErr := pluginLoader.Apply(ctx, dep, s.root)
-	if applyErr != nil && (errors.Is(applyErr, context.DeadlineExceeded) ||
-		errors.Is(applyErr, context.Canceled) ||
-		errors.Is(applyErr, taskgate.ErrApplyPending) ||
-		errors.Is(applyErr, taskgate.ErrApplyInProgress)) {
-		return server.ConsentResult{PendingConvergence: true, ConvergenceDetail: applyErr.Error()}, nil
-	}
 
 	entry, err := consent.FindEntry(dep, name)
 	if err != nil {
 		return server.ConsentResult{}, fmt.Errorf(
 			"plugin consent: entry %q vanished from its own deployment between write and status read: %w", name, err)
 	}
+	// Name and the Granted* fields are known on BOTH branches -- they are
+	// what was just written to disk, independently of whether anything
+	// converged -- so the pending branch reports them too. A pending
+	// response with no name is one the GUI cannot match back to the row it
+	// came from.
 	view := server.PluginView{
 		Name:         name,
 		GrantedCaps:  entry.Grant.Capabilities,
 		GrantedHosts: entry.Grant.AllowedHosts,
 		GrantedPaths: entry.Grant.AllowedPaths,
 	}
+
+	if applyErr != nil && (errors.Is(applyErr, taskgate.ErrBoundaryNotReached) ||
+		errors.Is(applyErr, taskgate.ErrApplyInProgress)) {
+		s.logger.Warn("plugin consent convergence did not run",
+			"component", "cli",
+			"plugin", name,
+			"manifest", s.manifestPath,
+			"consequence", "the deployment manifest already carries this decision, but no plugin was mounted or unmounted for it",
+			"remedy", "retry once the task gate is idle, or run `agent plugins reload`",
+			"error", applyErr)
+		return server.ConsentResult{View: view, PendingConvergence: true, ConvergenceDetail: applyErr.Error()}, nil
+	}
+
+	convergenceDetail := ""
+	if applyErr != nil {
+		convergenceDetail = applyErr.Error()
+		s.logger.Warn("plugin consent convergence reported errors",
+			"component", "cli",
+			"plugin", name,
+			"manifest", s.manifestPath,
+			"consequence", "the decision is on disk and convergence ran; this entry's own reported state says whether IT came up",
+			"error", applyErr)
+	}
 	for _, row := range mergePluginStatus(dep, pluginLoader.Status()) {
 		if row.Name != name {
 			continue
 		}
 		view.Version, view.State, view.Detail, view.Tools = row.Version, row.State, row.Detail, row.Tools
-		return server.ConsentResult{View: view}, nil
+		return server.ConsentResult{View: view, ConvergenceDetail: convergenceDetail}, nil
 	}
 	// mergePluginStatus emits exactly one row per dep.Plugins entry (see its
 	// own doc comment), and consent.FindEntry just above proved name is one
 	// of them -- reaching here means that invariant broke.
 	return server.ConsentResult{}, fmt.Errorf(
 		"plugin consent: entry %q produced no status row after converging; this should be unreachable", name)
+}
+
+// classifyDeploymentGuardError turns consent.RefuseDeploymentChanged's error
+// into one carrying the server sentinel that names its class: a detected
+// concurrent edit is a conflict the caller can retry (409), while a failure
+// to re-read the manifest at all is a server-side I/O fault (500). Both
+// arrive from the same call, so without this they would share one status.
+//
+// action is "grant" or "deny", for the message only.
+func classifyDeploymentGuardError(action, name string, err error) error {
+	if errors.Is(err, consent.ErrDeploymentChanged) {
+		return fmt.Errorf("plugin consent: %s %q: %w: %w", action, name, server.ErrPluginDeploymentChanged, err)
+	}
+	return fmt.Errorf("plugin consent: %s %q: %w: %w", action, name, server.ErrPluginStorage, err)
 }

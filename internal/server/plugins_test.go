@@ -4,11 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/stardust/legion-agent/internal/adapter"
+	"github.com/stardust/legion-agent/internal/security"
 )
 
 // fakePluginConsent is a test double for PluginConsent whose List, Grant and
@@ -465,6 +469,104 @@ func TestPluginsDenyRequiresPluginWritePermission(t *testing.T) {
 	fake := &fakePluginConsent{denyResult: ConsentResult{View: PluginView{Name: "jira", State: "disabled"}}}
 	srv := NewHTTPServer(Config{Plugins: fake, AdminToken: "token"})
 
+	// Both read-only roles, not just operator: the asymmetry with the grant
+	// test above was one of gpc-task-3 review Minor-6's coverage gaps.
+	for _, role := range []string{"operator", "viewer"} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/plugins/jira/deny", nil)
+		req.Header.Set("Authorization", "Bearer token")
+		req.Header.Set("X-Company-ID", "company-1")
+		req.Header.Set("X-Role", role)
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("POST /v1/plugins/jira/deny role=%s status = %d, want %d body=%s", role, rec.Code, http.StatusForbidden, rec.Body.String())
+		}
+	}
+
+	req := adminGrantRequest(t, "/v1/plugins/jira/deny", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /v1/plugins/jira/deny role=admin status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+}
+
+// --- gpc-task-3 review fixes ------------------------------------------------
+
+// TestPluginsDenyWithoutConsentServiceReports404 is Grant's counterpart on
+// the other mutating endpoint (gpc-task-3 review Minor-6, the missing
+// symmetry): a process that assembled no plugin loader reports 404, not a
+// 200 that implies the revocation took effect.
+func TestPluginsDenyWithoutConsentServiceReports404(t *testing.T) {
+	t.Parallel()
+	srv := NewHTTPServer(Config{})
+
+	req := adminGrantRequest(t, "/v1/plugins/jira/deny", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("POST /v1/plugins/jira/deny without a plugin consent service status = %d, want %d body=%s",
+			rec.Code, http.StatusNotFound, rec.Body.String())
+	}
+}
+
+// requirePluginRBACDenialAudited asserts the audit log holds an
+// access_denied.rbac record naming the plugin resource.
+func requirePluginRBACDenialAudited(t *testing.T, audit *adapter.MemoryAuditLog, endpoint string) {
+	t.Helper()
+
+	events, err := audit.Events()
+	if err != nil {
+		t.Fatalf("audit.Events() error = %v, want nil", err)
+	}
+	wantHash := hashResource(string(security.ResourcePlugin))
+	for _, event := range events {
+		if event.Action == "access_denied.rbac" && event.Hash == wantHash {
+			return
+		}
+	}
+	t.Fatalf("%s refused a caller with no plugin write permission but recorded no access_denied.rbac audit "+
+		"event for the plugin resource; events = %+v", endpoint, events)
+}
+
+// TestPluginsGrantRBACDenialIsAudited is gpc-task-3 review Minor-6's most
+// important surviving mutation: the brief REQUIRED that a denial be
+// audited, the handler does it correctly, and NOTHING pinned it -- deleting
+// s.auditRBACDenied from either handler left every test green, so a future
+// reshuffle would drop the audit trail for refused authorization attempts in
+// silence. The 403 is the visible half; this is the half nobody sees until
+// they go looking for who tried.
+func TestPluginsGrantRBACDenialIsAudited(t *testing.T) {
+	t.Parallel()
+	audit := adapter.NewMemoryAuditLog()
+	fake := &fakePluginConsent{grantResult: ConsentResult{View: PluginView{Name: "jira", State: "loaded"}}}
+	srv := NewHTTPServer(Config{Plugins: fake, AdminToken: "token", Audit: audit})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/plugins/jira/grant", strings.NewReader(`{"capabilities":["log"]}`))
+	req.Header.Set("Authorization", "Bearer token")
+	req.Header.Set("X-Company-ID", "company-1")
+	req.Header.Set("X-Role", "viewer")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("POST /v1/plugins/jira/grant role=viewer status = %d, want %d body=%s",
+			rec.Code, http.StatusForbidden, rec.Body.String())
+	}
+	if fake.grantName != "" {
+		t.Fatalf("Grant was called with name = %q despite the refusal; the gate must run first", fake.grantName)
+	}
+	requirePluginRBACDenialAudited(t, audit, "POST /v1/plugins/{name}/grant")
+}
+
+// TestPluginsDenyRBACDenialIsAudited is
+// TestPluginsGrantRBACDenialIsAudited on the other mutating endpoint: the
+// mutation survived in BOTH handlers, so both need pinning.
+func TestPluginsDenyRBACDenialIsAudited(t *testing.T) {
+	t.Parallel()
+	audit := adapter.NewMemoryAuditLog()
+	fake := &fakePluginConsent{denyResult: ConsentResult{View: PluginView{Name: "jira", State: "disabled"}}}
+	srv := NewHTTPServer(Config{Plugins: fake, AdminToken: "token", Audit: audit})
+
 	req := httptest.NewRequest(http.MethodPost, "/v1/plugins/jira/deny", nil)
 	req.Header.Set("Authorization", "Bearer token")
 	req.Header.Set("X-Company-ID", "company-1")
@@ -472,6 +574,128 @@ func TestPluginsDenyRequiresPluginWritePermission(t *testing.T) {
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden {
-		t.Fatalf("POST /v1/plugins/jira/deny role=operator status = %d, want %d body=%s", rec.Code, http.StatusForbidden, rec.Body.String())
+		t.Fatalf("POST /v1/plugins/jira/deny role=operator status = %d, want %d body=%s",
+			rec.Code, http.StatusForbidden, rec.Body.String())
+	}
+	if fake.denyName != "" {
+		t.Fatalf("Deny was called with name = %q despite the refusal; the gate must run first", fake.denyName)
+	}
+	requirePluginRBACDenialAudited(t, audit, "POST /v1/plugins/{name}/deny")
+}
+
+// TestPluginsConsentErrorClassSelectsStatus is gpc-task-3 review Minor-8:
+// every failure used to arrive as 400, leaving the GUI unable to tell "your
+// request is wrong" from "the server's disk is broken" except by matching on
+// error text -- the one thing that really drifts. The mapping is by error
+// CLASS, which is why it is mechanical and does not amount to the handler
+// re-deciding anything.
+func TestPluginsConsentErrorClassSelectsStatus(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"unknown plugin", fmt.Errorf("grant %q: %w", "jira", ErrPluginNotFound), http.StatusNotFound},
+		{"concurrent edit", fmt.Errorf("grant %q: %w", "jira", ErrPluginDeploymentChanged), http.StatusConflict},
+		{"manifest I/O", fmt.Errorf("grant %q: %w", "jira", ErrPluginStorage), http.StatusInternalServerError},
+		{"no loader attached", fmt.Errorf("grant %q: %w", "jira", ErrPluginUnavailable), http.StatusServiceUnavailable},
+		{"rejected request", errors.New(`names capability "http", which plugin "jira" does not declare`), http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			grantSrv := NewHTTPServer(Config{Plugins: &fakePluginConsent{grantErr: tc.err}, AdminToken: "token"})
+			rec := httptest.NewRecorder()
+			grantSrv.ServeHTTP(rec, adminGrantRequest(t, "/v1/plugins/jira/grant", GrantRequest{Capabilities: []string{"log"}}))
+			if rec.Code != tc.want {
+				t.Errorf("POST /v1/plugins/jira/grant (%s) status = %d, want %d body=%s",
+					tc.name, rec.Code, tc.want, rec.Body.String())
+			}
+
+			denySrv := NewHTTPServer(Config{Plugins: &fakePluginConsent{denyErr: tc.err}, AdminToken: "token"})
+			rec = httptest.NewRecorder()
+			denySrv.ServeHTTP(rec, adminGrantRequest(t, "/v1/plugins/jira/deny", nil))
+			if rec.Code != tc.want {
+				t.Errorf("POST /v1/plugins/jira/deny (%s) status = %d, want %d body=%s",
+					tc.name, rec.Code, tc.want, rec.Body.String())
+			}
+		})
+	}
+}
+
+// TestPluginsGrantPendingResponseCarriesTheEntryItNames is gpc-task-3 review
+// Minor-7: a pending response used to travel with a zero-value View, so the
+// GUI got back "pending_convergence": true with no name on it and no way to
+// match it to the row the operator clicked. Name and the granted lists ARE
+// known -- they are what was just written to disk -- and the handler must
+// pass them through.
+func TestPluginsGrantPendingResponseCarriesTheEntryItNames(t *testing.T) {
+	t.Parallel()
+	fake := &fakePluginConsent{grantResult: ConsentResult{
+		View:               PluginView{Name: "jira", GrantedCaps: []string{"log"}},
+		PendingConvergence: true,
+		ConvergenceDetail:  "another plugin change is already being applied",
+	}}
+	srv := NewHTTPServer(Config{Plugins: fake, AdminToken: "token"})
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, adminGrantRequest(t, "/v1/plugins/jira/grant", GrantRequest{Capabilities: []string{"log"}}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /v1/plugins/jira/grant (pending) status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var resp struct {
+		grantConsentResponse
+		GrantedCaps []string `json:"granted_capabilities"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, rec.Body.String())
+	}
+	if !resp.PendingConvergence {
+		t.Fatalf("pending_convergence = false, want true body=%s", rec.Body.String())
+	}
+	if resp.Name != "jira" {
+		t.Errorf("name = %q, want %q: a pending response the GUI cannot match to a row is not a kinder answer", resp.Name, "jira")
+	}
+	if !reflect.DeepEqual(resp.GrantedCaps, []string{"log"}) {
+		t.Errorf("granted_capabilities = %v, want [log]: they are already on disk", resp.GrantedCaps)
+	}
+	if resp.State != "" {
+		t.Errorf("state = %q, want empty: nothing converged, so there is no loader state to report", resp.State)
+	}
+}
+
+// TestParsePluginConsentName pins the route parser's guards, which
+// gpc-task-3 review Minor-6 found had no direct test at all: deleting the
+// empty-name and embedded-slash refusals left every test green, and either
+// one would hand the consent service a name the route never meant.
+func TestParsePluginConsentName(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		path     string
+		suffix   string
+		wantName string
+		wantOK   bool
+	}{
+		{"grant", "/v1/plugins/jira/grant", "/grant", "jira", true},
+		{"deny", "/v1/plugins/jira/deny", "/deny", "jira", true},
+		{"name with a dash", "/v1/plugins/legion-test-plugin/grant", "/grant", "legion-test-plugin", true},
+		{"empty name", "/v1/plugins//grant", "/grant", "", false},
+		{"extra path segment", "/v1/plugins/jira/extra/grant", "/grant", "", false},
+		{"wrong prefix", "/v2/plugins/jira/grant", "/grant", "", false},
+		{"wrong suffix", "/v1/plugins/jira/reload", "/grant", "", false},
+		{"suffix asked for is the other one", "/v1/plugins/jira/deny", "/grant", "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			gotName, gotOK := parsePluginConsentName(tc.path, tc.suffix)
+			if gotOK != tc.wantOK || gotName != tc.wantName {
+				t.Fatalf("parsePluginConsentName(%q, %q) = (%q, %t), want (%q, %t)",
+					tc.path, tc.suffix, gotName, gotOK, tc.wantName, tc.wantOK)
+			}
+		})
 	}
 }

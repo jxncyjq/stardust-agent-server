@@ -420,3 +420,116 @@ func TestApplyAtBoundaryStopsForACancelledContextWhenGateIsIdle(t *testing.T) {
 		t.Fatalf("ApplyAtBoundary after the cancelled-ctx case: unexpected error: %v", err)
 	}
 }
+
+// --- gpc-task-3 review Critical-1 / Minor-5 ---------------------------------
+
+// TestApplyAtBoundaryMarksEveryGiveUpAsBoundaryNotReached pins what
+// ErrBoundaryNotReached was added for: a caller must be able to ask "did fn
+// run?" and get an answer that is not an inference.
+//
+// All three give-up paths carry it -- the wait expiring, a ctx that was
+// already done when the gate turned out to be idle, and a second overlapping
+// apply -- and each still carries the underlying cause alongside, so
+// errors.Is reaches both.
+func TestApplyAtBoundaryMarksEveryGiveUpAsBoundaryNotReached(t *testing.T) {
+	t.Parallel()
+
+	t.Run("wait expires", func(t *testing.T) {
+		t.Parallel()
+
+		g := NewTaskGate()
+		end := taskGateMustBegin(t, g)
+		defer end()
+
+		err := g.ApplyAtBoundary(context.Background(), time.Millisecond, func() error {
+			t.Error("fn ran even though a task was still in flight")
+			return nil
+		})
+		if !errors.Is(err, ErrBoundaryNotReached) {
+			t.Fatalf("error = %v, want it to wrap ErrBoundaryNotReached", err)
+		}
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("error = %v, want it to still carry the underlying deadline", err)
+		}
+	})
+
+	t.Run("ctx already done at an idle gate", func(t *testing.T) {
+		t.Parallel()
+
+		g := NewTaskGate()
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		err := g.ApplyAtBoundary(ctx, taskGateTestWait, func() error {
+			t.Error("fn ran even though ctx was already cancelled")
+			return nil
+		})
+		if !errors.Is(err, ErrBoundaryNotReached) {
+			t.Fatalf("error = %v, want it to wrap ErrBoundaryNotReached", err)
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want it to still carry the underlying cancellation", err)
+		}
+	})
+
+	t.Run("a second overlapping apply", func(t *testing.T) {
+		t.Parallel()
+
+		g := NewTaskGate()
+		var inner error
+		outer := g.ApplyAtBoundary(context.Background(), taskGateTestWait, func() error {
+			inner = g.ApplyAtBoundary(context.Background(), taskGateTestWait, func() error {
+				t.Error("the second apply ran fn while the first held the gate")
+				return nil
+			})
+			return nil
+		})
+		if outer != nil {
+			t.Fatalf("outer ApplyAtBoundary: unexpected error: %v", outer)
+		}
+		// The consumer that this symbol was exported for (internal/cli's
+		// plugin consent service) reports "nothing was applied" off exactly
+		// this sentinel, so a rename or a rewording must break here.
+		if !errors.Is(inner, ErrApplyInProgress) {
+			t.Fatalf("inner error = %v, want it to wrap ErrApplyInProgress", inner)
+		}
+
+		taskGateMustBegin(t, g)()
+	})
+}
+
+// TestApplyAtBoundaryDoesNotMarkFnsOwnCtxErrorAsBoundaryNotReached is the
+// other half of Critical-1, and the half that was actually broken.
+//
+// ApplyAtBoundary hands its ctx straight to fn, and a real fn (a plugin
+// convergence) derives its own download deadline from it -- so an fn that
+// RAN and failed returns an error wrapping the very context.DeadlineExceeded
+// a wait that never reached fn would have wrapped. A caller that read the
+// bare ctx sentinel as "nothing was applied" therefore reported a
+// convergence that had already happened, and failed, as one still to come.
+// Only ErrBoundaryNotReached separates the two, and fn's error must never
+// carry it.
+func TestApplyAtBoundaryDoesNotMarkFnsOwnCtxErrorAsBoundaryNotReached(t *testing.T) {
+	t.Parallel()
+
+	g := NewTaskGate()
+	ran := false
+	err := g.ApplyAtBoundary(context.Background(), taskGateTestWait, func() error {
+		ran = true
+		// Stand in for fetch.Fetch's own context.WithTimeout expiring
+		// inside a convergence that really did run.
+		return fmt.Errorf("fetch plugin package: %w", context.DeadlineExceeded)
+	})
+	if !ran {
+		t.Fatal("fn never ran; this test is about the error of an fn that DID")
+	}
+	if err == nil {
+		t.Fatal("error = nil, want fn's own failure reported")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want it to still carry fn's own deadline", err)
+	}
+	if errors.Is(err, ErrBoundaryNotReached) {
+		t.Fatalf("error = %v, must NOT wrap ErrBoundaryNotReached: fn ran, and something WAS applied", err)
+	}
+}

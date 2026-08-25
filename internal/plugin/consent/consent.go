@@ -22,6 +22,7 @@ package consent
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"slices"
@@ -29,6 +30,59 @@ import (
 
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
 )
+
+// ErrDeploymentChanged is what RefuseDeploymentChanged reports when the
+// deployment manifest on disk no longer matches the snapshot the caller took
+// before it started: somebody else's edit landed in the window, and writing
+// now would silently revert it.
+//
+// It is a sentinel because a caller has to tell that apart from the OTHER
+// failure RefuseDeploymentChanged can report -- being unable to re-read the
+// file at all -- which is an I/O fault, not a conflict, and deserves a
+// different answer (an HTTP caller maps the first to 409 and the second to
+// 500). Both come back from the same call, so only a sentinel separates
+// them.
+var ErrDeploymentChanged = errors.New("the plugin deployment manifest changed while this operation was running")
+
+// NormalizeList refuses an empty or repeated item in a proposed grant list,
+// and returns the list to record.
+//
+// It exists so the CLI and an HTTP endpoint cannot disagree about what a
+// well-formed list IS. splitFlagList (internal/cli) used to carry both
+// checks itself, which made them properties of comma-splitting rather than
+// of the grant: a JSON caller handing over ["log","log"] passed every later
+// set-membership check -- a duplicate never makes either direction of
+// ResolveCapabilities' equality test notice anything missing -- and wrote the
+// literal repeated list into plugins.json. That is one rule behaving
+// differently on two paths, which is precisely what this package exists to
+// prevent.
+//
+// Splitting a raw flag string into a []string remains the caller's job (see
+// this package's own doc comment); NormalizeList only validates the parsed
+// list, so it is equally callable on a comma-split flag and on a decoded
+// JSON array.
+//
+// actor names whoever is asking, for the error message ("plugins grant",
+// "POST /v1/plugins/{name}/grant"). subject names the input that carried the
+// list -- callers that have the raw text worth quoting are free to include
+// it (`--capabilities "log,log"`), callers that do not name the field
+// ("capabilities"). An empty or nil list is legitimate and returns nil.
+func NormalizeList(actor, subject string, items []string) ([]string, error) {
+	if len(items) == 0 {
+		return nil, nil
+	}
+	seen := make(map[string]struct{}, len(items))
+	for _, item := range items {
+		if item == "" {
+			return nil, fmt.Errorf("%s: %s contains an empty entry", actor, subject)
+		}
+		if _, dup := seen[item]; dup {
+			return nil, fmt.Errorf("%s: %s names %q more than once", actor, subject, item)
+		}
+		seen[item] = struct{}{}
+	}
+	return items, nil
+}
 
 // ResolveCapabilities checks a proposed capability grant against what the
 // plugin itself declares, and returns the set to record.
@@ -225,6 +279,10 @@ func ReadDeploymentWithSnapshot(path string) (manifest.Deployment, []byte, error
 // apart. actor (e.g. "plugins install", "plugins grant", "plugins deny",
 // "POST /v1/plugins/{name}/grant") labels the error and names the command
 // or endpoint an operator should re-run.
+//
+// A detected change is reported wrapping ErrDeploymentChanged; a failure to
+// re-read the file at all is not, because it is an I/O fault rather than a
+// conflict and a caller may owe it a different answer.
 func RefuseDeploymentChanged(actor, manifestPath string, snapshot []byte) error {
 	current, err := os.ReadFile(manifestPath)
 	if err != nil {
@@ -238,7 +296,7 @@ func RefuseDeploymentChanged(actor, manifestPath string, snapshot []byte) error 
 		// unquoted copy of the path along for free.
 		return fmt.Errorf(`%s: plugin deployment manifest %s changed while this command was running; refusing `+
 			`to overwrite that edit with a stale copy -- re-run "agent %s" to apply on top of the current `+
-			`state`, actor, manifestPath, actor)
+			`state: %w`, actor, manifestPath, actor, ErrDeploymentChanged)
 	}
 	return nil
 }

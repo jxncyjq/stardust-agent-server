@@ -3,14 +3,19 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/stardust/legion-agent/internal/config"
 	"github.com/stardust/legion-agent/internal/plugin/loader"
@@ -42,7 +47,7 @@ func TestPluginConsentServiceListReturnsDeclaredAndGrantedSeparately(t *testing.
 		t.Fatalf("assemblePlugins() error = %v, want nil", err)
 	}
 
-	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins, func() *sign.Keyring { return nil }, loader.RemoteConfig{})
+	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins, func() *sign.Keyring { return nil }, loader.RemoteConfig{}, testConsentLogger())
 	views, err := svc.List(context.Background())
 	if err != nil {
 		t.Fatalf("List() error = %v, want nil", err)
@@ -84,7 +89,7 @@ func TestPluginConsentServiceListReturnsDeclaredAndGrantedSeparately(t *testing.
 // Loader.
 func TestPluginConsentServiceListErrorsWithoutALoader(t *testing.T) {
 	svc := NewPluginConsentService("does-not-matter.json", "root",
-		func() *loader.Loader { return nil }, func() *sign.Keyring { return nil }, loader.RemoteConfig{})
+		func() *loader.Loader { return nil }, func() *sign.Keyring { return nil }, loader.RemoteConfig{}, testConsentLogger())
 	_, err := svc.List(context.Background())
 	if err == nil {
 		t.Fatal("List() error = nil, want an error naming the missing loader")
@@ -108,7 +113,7 @@ func TestPluginConsentServiceListErrorsWhenManifestUnreadable(t *testing.T) {
 	// the read failure from the loader (which assembled fine against the
 	// fixture's real, empty manifest).
 	svc := NewPluginConsentService(filepath.Join(f.dir, "missing-plugins.json"), f.root,
-		f.application.Plugins, func() *sign.Keyring { return nil }, loader.RemoteConfig{})
+		f.application.Plugins, func() *sign.Keyring { return nil }, loader.RemoteConfig{}, testConsentLogger())
 	if _, err := svc.List(context.Background()); err == nil {
 		t.Fatal("List() error = nil, want an error naming the unreadable manifest")
 	}
@@ -135,7 +140,7 @@ func TestPluginConsentServiceListErrorsWhenLocalPackageIsBroken(t *testing.T) {
 		t.Fatalf("corrupt plugin.json: %v", err)
 	}
 
-	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins, func() *sign.Keyring { return nil }, loader.RemoteConfig{})
+	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins, func() *sign.Keyring { return nil }, loader.RemoteConfig{}, testConsentLogger())
 	_, err := svc.List(context.Background())
 	if err == nil {
 		t.Fatal("List() error = nil, want an error naming the unreadable plugin.json")
@@ -198,7 +203,7 @@ func TestPluginConsentServiceListResolvesRemoteEntryOnCacheHit(t *testing.T) {
 	srv.Close()
 
 	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
-		func() *sign.Keyring { return nil }, f.resolveFixtureRemote())
+		func() *sign.Keyring { return nil }, f.resolveFixtureRemote(), testConsentLogger())
 	views, err := svc.List(context.Background())
 	if err != nil {
 		t.Fatalf("List() error = %v, want nil", err)
@@ -250,7 +255,7 @@ func TestPluginConsentServiceListReportsUnresolvedForRemoteCacheMiss(t *testing.
 	}
 
 	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
-		func() *sign.Keyring { return nil }, f.resolveFixtureRemote())
+		func() *sign.Keyring { return nil }, f.resolveFixtureRemote(), testConsentLogger())
 	views, err := svc.List(context.Background())
 	if err != nil {
 		t.Fatalf("List() error = %v, want nil: a cache miss must be reported, not fail the whole call", err)
@@ -274,7 +279,7 @@ func TestPluginConsentServiceListReportsUnresolvedForRemoteCacheMiss(t *testing.
 // the same way every List test above wires it.
 func (f *pluginFixture) newGrantTestService() *PluginConsentService {
 	return NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
-		func() *sign.Keyring { return nil }, loader.RemoteConfig{})
+		func() *sign.Keyring { return nil }, loader.RemoteConfig{}, testConsentLogger())
 }
 
 // TestPluginConsentServiceGrantRefusesAStrictCapabilitySubset is rule 2 of
@@ -399,7 +404,7 @@ func TestPluginConsentServiceGrantRefusesAConcurrentEditDuringTheDownload(t *tes
 	}
 
 	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
-		func() *sign.Keyring { return nil }, f.resolveFixtureRemote())
+		func() *sign.Keyring { return nil }, f.resolveFixtureRemote(), testConsentLogger())
 	_, err := svc.Grant(context.Background(), testEchoPlugin, server.GrantRequest{Capabilities: []string{"log"}})
 	if err == nil {
 		t.Fatal("Grant() error = nil, want an error: plugins.json changed while the package was downloading")
@@ -409,6 +414,12 @@ func TestPluginConsentServiceGrantRefusesAConcurrentEditDuringTheDownload(t *tes
 	}
 	if !strings.Contains(err.Error(), "changed") {
 		t.Errorf("Grant() error = %v, want it to say the manifest changed underneath it", err)
+	}
+	// gpc-task-3 review Minor-8: a concurrent edit is a CONFLICT, and the
+	// handler is only able to answer 409 instead of a blanket 400 because
+	// the error carries the class rather than only the words.
+	if !errors.Is(err, server.ErrPluginDeploymentChanged) {
+		t.Errorf("Grant() error = %v, want it to wrap server.ErrPluginDeploymentChanged", err)
 	}
 
 	after := f.readDeployment()
@@ -622,4 +633,461 @@ func TestPluginConsentServiceGrantReportsFailedNotPendingWhenEntryFailsToActivat
 	if !written.Enabled {
 		t.Errorf("entry.Enabled = false, want true: the write happens before Apply, so it must have landed even though this entry then failed to activate")
 	}
+}
+
+// --- gpc-task-3 review fixes ------------------------------------------------
+
+const (
+	// testConsentSecondPlugin and testConsentSecondTool name a SECOND
+	// deployment entry, for the tests that need two rows to act on at once.
+	// The committed guest binary self-describes as testEchoPlugin, so an
+	// entry under this name never activates cleanly -- which is fine for
+	// every test here, none of which asserts its loader state.
+	testConsentSecondPlugin = "legion-test-plugin-b"
+	testConsentSecondTool   = "echo_tool_b"
+)
+
+// testConsentLogger is the discarding logger every PluginConsentService test
+// that does not inspect the log wires in. It is not optional: the
+// constructor refuses a nil logger, because a convergence that reported
+// errors and was recorded nowhere is the failure Important-2 was about.
+func testConsentLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
+
+// lockedBuffer is an io.Writer over a bytes.Buffer safe for a logger that
+// may be written from more than one goroutine, so -race has nothing to say
+// about a test that reads back what was logged.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// newCapturingConsentLogger returns a logger and a func reading back
+// everything written through it.
+func newCapturingConsentLogger() (*slog.Logger, func() string) {
+	sink := &lockedBuffer{}
+	return slog.New(slog.NewTextHandler(sink, nil)), sink.String
+}
+
+// serveNeverResponding starts a plaintext server that accepts a request and
+// answers it only once the CLIENT gives up, so a fetch against it can end no
+// way but on its own deadline. Holding the handler on the request's own ctx
+// (rather than on a channel the test closes) is what lets httptest's Close
+// return: the moment the fetch's derived deadline fires, the connection
+// drops and the handler returns with it.
+func serveNeverResponding(t *testing.T) *httptest.Server {
+	t.Helper()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// TestPluginConsentServiceGrantReportsFailedNotPendingWhenConvergenceFetchTimesOut
+// is gpc-task-3 review Critical-1: the four-outcome discrimination must not
+// be inferred from ctx sentinels.
+//
+// The deployment holds a SECOND, enabled remote entry whose source never
+// answers, so the fetch inside convergence dies on the deadline fetch.Fetch
+// derives from the very ctx Apply was given. Apply's returned error
+// therefore wraps context.DeadlineExceeded even though convergence RAN to
+// completion -- structurally identical, to errors.Is, to the error a
+// boundary wait that never reached fn produces.
+//
+// The granted entry meanwhile fails on its own (this deployment requires a
+// signature the fixture package does not carry, exactly as the
+// activation-failure test above arranges), so the honest answer is outcome
+// 4: convergence ran, this entry failed. Reporting it as pending -- which
+// keying on context.DeadlineExceeded did -- leaves an operator waiting for a
+// convergence that already happened and will never come again on its own.
+func TestPluginConsentServiceGrantReportsFailedNotPendingWhenConvergenceFetchTimesOut(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	_, keyringPath := f.newKeyring("keyring.json")
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	hung := serveNeverResponding(t)
+	// A 200ms fetch timeout keeps this fast: the download only has to run
+	// long enough to die on its own deadline rather than on anything else.
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(true)},
+		fmt.Sprintf("\"cache\": %s", jsonString(cacheDir)),
+		`"allow_insecure_sources": true`,
+		`"fetch": {"timeout_ms": 200, "max_bytes": 33554432}`)
+	// Deliberately never signed, so the LOADER's own signature check (which
+	// this deployment requires) fails it while Grant's own nil-keyring read
+	// still succeeds -- see the activation-failure test above.
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.0.0", nil, []string{testEchoTool})
+	f.writeManifest(
+		manifestEntry{
+			name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+		},
+		manifestEntry{
+			name: testConsentSecondPlugin, source: hung.URL + "/never.tgz", enabled: true,
+			tools: []string{testConsentSecondTool}, digest: digestOfArchive([]byte("never served")),
+		},
+	)
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	logger, logged := newCapturingConsentLogger()
+	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
+		func() *sign.Keyring { return nil }, f.resolveFixtureRemote(), logger)
+	result, err := svc.Grant(context.Background(), testEchoPlugin, server.GrantRequest{})
+	if err != nil {
+		t.Fatalf("Grant() error = %v, want nil: the write already landed, so this is a ConsentResult not an error", err)
+	}
+	if result.PendingConvergence {
+		t.Fatalf("Grant() PendingConvergence = true, want false: convergence RAN -- the deadline that fired "+
+			"was the DOWNLOAD's, inside it, not a boundary wait that never reached it (detail=%q)",
+			result.ConvergenceDetail)
+	}
+	if result.View.State != loader.StateFailed {
+		t.Fatalf("Grant() View.State = %q, want %q", result.View.State, loader.StateFailed)
+	}
+	// Important-2: the convergence error is kept, not dropped -- both on the
+	// wire and in the log.
+	if result.ConvergenceDetail == "" {
+		t.Errorf("Grant() ConvergenceDetail is empty, want the errors convergence reported")
+	}
+	if out := logged(); !strings.Contains(out, testEchoPlugin) {
+		t.Errorf("nothing naming plugin %q was logged for a convergence that reported errors; log = %q",
+			testEchoPlugin, out)
+	}
+}
+
+// TestPluginConsentServiceGrantReportsPendingWhenAnotherApplyHoldsTheGate is
+// gpc-task-3 review Minor-5: taskgate.ErrApplyInProgress was exported for
+// exactly this path and nothing pinned it -- the line consuming it could be
+// deleted with every test still green.
+//
+// A second apply already inside its fn holds the gate, so Grant's own Apply
+// is refused before it can converge anything. That is outcome 3 (nothing was
+// applied), and it must be reported as pending rather than as this entry's
+// state, which is still whatever the previous convergence left.
+//
+// It also pins Minor-7: the pending View carries the facts already on disk.
+func TestPluginConsentServiceGrantReportsPendingWhenAnotherApplyHoldsTheGate(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	inside := make(chan struct{})
+	release := make(chan struct{})
+	held := make(chan error, 1)
+	go func() {
+		held <- f.gate.ApplyAtBoundary(context.Background(), time.Minute, func() error {
+			close(inside)
+			<-release
+			return nil
+		})
+	}()
+	// No sleep and no polling: the other apply has provably entered fn by
+	// the time this returns, so the gate is provably held.
+	<-inside
+
+	svc := f.newGrantTestService()
+	result, err := svc.Grant(context.Background(), testEchoPlugin, server.GrantRequest{Capabilities: []string{"log"}})
+	close(release)
+	if holdErr := <-held; holdErr != nil {
+		t.Fatalf("the apply holding the gate failed: %v", holdErr)
+	}
+	if err != nil {
+		t.Fatalf("Grant() error = %v, want nil: the write already landed", err)
+	}
+	if !result.PendingConvergence {
+		t.Fatalf("Grant() PendingConvergence = false, want true: another apply held the gate, so nothing was applied")
+	}
+	if !strings.Contains(result.ConvergenceDetail, "already being applied") {
+		t.Errorf("Grant() ConvergenceDetail = %q, want it to name the concurrent apply", result.ConvergenceDetail)
+	}
+	// Minor-7: Name and the just-written Granted* are KNOWN here even though
+	// nothing converged. A pending response with no name is one the GUI
+	// cannot match back to the row it came from.
+	if result.View.Name != testEchoPlugin {
+		t.Errorf("Grant() pending View.Name = %q, want %q", result.View.Name, testEchoPlugin)
+	}
+	if !slices.Equal(result.View.GrantedCaps, []string{"log"}) {
+		t.Errorf("Grant() pending View.GrantedCaps = %v, want [log]: it is already on disk", result.View.GrantedCaps)
+	}
+	if result.View.State != "" {
+		t.Errorf("Grant() pending View.State = %q, want empty: no convergence produced any loader state", result.View.State)
+	}
+}
+
+// grantBarrier releases once two goroutines have reached the same point, or
+// after wait if only one ever does.
+//
+// It is how the concurrency test below observes an interleaving instead of
+// racing for one: the two Grants are held together at a point INSIDE the
+// read -> check -> write sequence, so a service with no lock is guaranteed
+// to have both of them holding the same stale snapshot. The timeout is the
+// other side of the same coin -- once the sequence really is serialized the
+// second goroutine cannot reach the barrier at all, so the first has to be
+// able to go on alone rather than deadlock.
+type grantBarrier struct {
+	mu      sync.Mutex
+	arrived int
+	both    chan struct{}
+	wait    time.Duration
+}
+
+func newGrantBarrier(wait time.Duration) *grantBarrier {
+	return &grantBarrier{both: make(chan struct{}), wait: wait}
+}
+
+func (b *grantBarrier) arrive() {
+	b.mu.Lock()
+	b.arrived++
+	reached := b.arrived == 2
+	if reached {
+		close(b.both)
+	}
+	b.mu.Unlock()
+	if reached {
+		return
+	}
+	select {
+	case <-b.both:
+	case <-time.After(b.wait):
+	}
+}
+
+// TestPluginConsentServiceConcurrentGrantsDoNotRevertEachOther is gpc-task-3
+// review Important-3: consent.RefuseDeploymentChanged is a read-then-check
+// with nothing holding the file between it and manifest.WriteDeployment, so
+// two in-process authorizations of two DIFFERENT plugins could both pass the
+// check and the loser's write could silently revert the winner's -- with
+// both requests reporting success. A silent rollback on an authorization
+// boundary is worse than a crash.
+//
+// keyringFn is called from inside Grant, after the snapshot read and before
+// the write, which makes it the barrier point: both goroutines are held
+// there together, so without s.mu both hold a snapshot that predates the
+// other's write. The run then ends one of three ways and ALL of them are
+// failures this test catches: the compare-and-swap notices and one Grant
+// returns a conflict; it does not, and one authorization is gone from disk;
+// or the two atomic rewrites collide in the filesystem (which is what
+// Windows reports, where a rename onto a file another handle is replacing
+// fails outright). All three are the same unsynchronized read-modify-write.
+// With s.mu the second goroutine never reaches the barrier while the first
+// holds the lock, so it reads AFTER that write and both survive.
+func TestPluginConsentServiceConcurrentGrantsDoNotRevertEachOther(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("echo-a", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.writePackage("echo-b", testEchoWasm, testConsentSecondPlugin, "1.0.0",
+		[]string{"log"}, []string{testConsentSecondTool})
+	f.writeManifest(
+		manifestEntry{name: testEchoPlugin, source: "echo-a", enabled: false, tools: []string{testEchoTool}, omitGrant: true},
+		manifestEntry{
+			name: testConsentSecondPlugin, source: "echo-b", enabled: false,
+			tools: []string{testConsentSecondTool}, omitGrant: true,
+		},
+	)
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	barrier := newGrantBarrier(time.Second)
+	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
+		func() *sign.Keyring {
+			barrier.arrive()
+			return nil
+		}, loader.RemoteConfig{}, testConsentLogger())
+
+	errs := make(chan error, 2)
+	for _, name := range []string{testEchoPlugin, testConsentSecondPlugin} {
+		go func() {
+			_, err := svc.Grant(context.Background(), name, server.GrantRequest{Capabilities: []string{"log"}})
+			errs <- err
+		}()
+	}
+	for range 2 {
+		if err := <-errs; err != nil {
+			t.Fatalf("Grant() error = %v, want nil: two authorizations of two different plugins must both succeed", err)
+		}
+	}
+
+	dep := f.readDeployment()
+	for _, name := range []string{testEchoPlugin, testConsentSecondPlugin} {
+		entry := f.requireEntry(dep, name)
+		if !entry.Enabled {
+			t.Errorf("entry %q Enabled = false, want true: one concurrent authorization silently reverted the other", name)
+		}
+		if !slices.Equal(entry.Grant.Capabilities, []string{"log"}) {
+			t.Errorf("entry %q Grant.Capabilities = %v, want [log]", name, entry.Grant.Capabilities)
+		}
+	}
+}
+
+// TestPluginConsentServiceGrantReportsDeclarationAndRecordsGrantStated pins
+// two of gpc-task-3 review Minor-6's surviving mutations at once: deleting
+// Grant's `result.View.Declared* = pm.*` lines, and deleting its
+// `e.GrantStated = true`, both left every test green.
+//
+// The plugin declares two hosts and is granted one, so Declared and Granted
+// cannot both be read off a single field.
+func TestPluginConsentServiceGrantReportsDeclarationAndRecordsGrantStated(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackageWithNetwork("echo", testEchoWasm, testEchoPlugin, "1.0.0",
+		[]string{"log"}, []string{testEchoTool},
+		manifest.Network{AllowedHosts: []string{"jira.example.com", "wiki.example.com"}},
+		manifest.Filesystem{AllowedPaths: []string{"/srv/echo"}})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	svc := f.newGrantTestService()
+	result, err := svc.Grant(context.Background(), testEchoPlugin, server.GrantRequest{
+		Capabilities: []string{"log"},
+		AllowedHosts: []string{"jira.example.com"},
+		AllowedPaths: []string{"/srv/echo"},
+	})
+	if err != nil {
+		t.Fatalf("Grant() error = %v, want nil", err)
+	}
+	if result.View.DeclaredUnresolved {
+		t.Errorf("Grant() View.DeclaredUnresolved = true, want false: Grant loaded the package, so it knows")
+	}
+	if !slices.Equal(result.View.DeclaredCaps, []string{"log"}) {
+		t.Errorf("Grant() View.DeclaredCaps = %v, want [log]", result.View.DeclaredCaps)
+	}
+	wantDeclaredHosts := []string{"jira.example.com", "wiki.example.com"}
+	if !slices.Equal(result.View.DeclaredHosts, wantDeclaredHosts) {
+		t.Errorf("Grant() View.DeclaredHosts = %v, want %v", result.View.DeclaredHosts, wantDeclaredHosts)
+	}
+	if !slices.Equal(result.View.DeclaredPaths, []string{"/srv/echo"}) {
+		t.Errorf("Grant() View.DeclaredPaths = %v, want [/srv/echo]", result.View.DeclaredPaths)
+	}
+	if !slices.Equal(result.View.GrantedHosts, []string{"jira.example.com"}) {
+		t.Errorf("Grant() View.GrantedHosts = %v, want [jira.example.com]", result.View.GrantedHosts)
+	}
+	if slices.Equal(result.View.DeclaredHosts, result.View.GrantedHosts) {
+		t.Fatalf("DeclaredHosts and GrantedHosts must be reported separately, both came back %v", result.View.DeclaredHosts)
+	}
+
+	entry := f.requireEntry(f.readDeployment(), testEchoPlugin)
+	if !entry.GrantStated {
+		t.Errorf("entry.GrantStated = false, want true: an authorization IS a stated decision")
+	}
+}
+
+// TestPluginConsentServiceGrantRefusesADuplicateCapabilityOverHTTP is
+// gpc-task-3 review Minor-9: `agent plugins grant --capabilities log,log`
+// was refused by splitFlagList while the JSON body
+// {"capabilities":["log","log"]} was accepted and written to plugins.json
+// verbatim -- a duplicate makes neither direction of ResolveCapabilities'
+// set-equality test notice anything missing. Both paths now go through the
+// same consent.NormalizeList.
+func TestPluginConsentServiceGrantRefusesADuplicateCapabilityOverHTTP(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+	before, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json before grant: %v", err)
+	}
+
+	svc := f.newGrantTestService()
+	_, err = svc.Grant(context.Background(), testEchoPlugin, server.GrantRequest{Capabilities: []string{"log", "log"}})
+	if err == nil {
+		t.Fatal(`Grant() error = nil, want an error: "log" is named twice`)
+	}
+	if !strings.Contains(err.Error(), "more than once") {
+		t.Errorf("Grant() error = %v, want it to say a capability was named more than once", err)
+	}
+
+	after, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json after grant: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("plugins.json changed after a refused duplicate capability:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+// TestPluginConsentServiceReportsUnknownPluginAsNotFound is gpc-task-3
+// review Minor-8 on both mutating methods: an unknown name is not a
+// malformed request, and the handler can only answer 404 instead of a
+// blanket 400 because the error carries its class.
+func TestPluginConsentServiceReportsUnknownPluginAsNotFound(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+	svc := f.newGrantTestService()
+
+	_, grantErr := svc.Grant(context.Background(), "no-such-plugin", server.GrantRequest{})
+	if !errors.Is(grantErr, server.ErrPluginNotFound) {
+		t.Errorf("Grant(no-such-plugin) error = %v, want it to wrap server.ErrPluginNotFound", grantErr)
+	}
+	_, denyErr := svc.Deny(context.Background(), "no-such-plugin")
+	if !errors.Is(denyErr, server.ErrPluginNotFound) {
+		t.Errorf("Deny(no-such-plugin) error = %v, want it to wrap server.ErrPluginNotFound", denyErr)
+	}
+}
+
+// TestPluginConsentServiceReportsAMissingLoaderAsUnavailable is the last of
+// Minor-8's classes: a process with no loader attached (mid-shutdown, say)
+// got a well-formed request it simply cannot serve right now, which is a 503
+// rather than "your request is wrong".
+func TestPluginConsentServiceReportsAMissingLoaderAsUnavailable(t *testing.T) {
+	svc := NewPluginConsentService("does-not-matter.json", "root",
+		func() *loader.Loader { return nil }, func() *sign.Keyring { return nil },
+		loader.RemoteConfig{}, testConsentLogger())
+
+	if _, err := svc.Grant(context.Background(), "any", server.GrantRequest{}); !errors.Is(err, server.ErrPluginUnavailable) {
+		t.Errorf("Grant() error = %v, want it to wrap server.ErrPluginUnavailable", err)
+	}
+	if _, err := svc.Deny(context.Background(), "any"); !errors.Is(err, server.ErrPluginUnavailable) {
+		t.Errorf("Deny() error = %v, want it to wrap server.ErrPluginUnavailable", err)
+	}
+}
+
+// TestNewPluginConsentServicePanicsOnANilLogger pins the constructor's
+// fail-loud refusal: a nil logger would silently discard every record of a
+// convergence that reported errors, which is the very thing Important-2
+// added the logging for.
+func TestNewPluginConsentServicePanicsOnANilLogger(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("NewPluginConsentService(nil logger) did not panic, want a panic naming the nil logger")
+		}
+		if msg := fmt.Sprint(r); !strings.Contains(msg, "logger") {
+			t.Fatalf("panic = %q, want it to name the nil logger", msg)
+		}
+	}()
+	NewPluginConsentService("m.json", "root", func() *loader.Loader { return nil },
+		func() *sign.Keyring { return nil }, loader.RemoteConfig{}, nil)
 }

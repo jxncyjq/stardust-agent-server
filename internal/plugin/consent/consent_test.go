@@ -1,6 +1,7 @@
 package consent
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -313,5 +314,85 @@ func TestRefuseDeploymentChangedAcceptsAnUnchangedFile(t *testing.T) {
 
 	if err := RefuseDeploymentChanged(testActor, path, snapshot); err != nil {
 		t.Fatalf("RefuseDeploymentChanged: unexpected error: %v", err)
+	}
+}
+
+// --- NormalizeList (gpc-task-3 review Minor-9) ---------------------------
+
+func TestNormalizeListReturnsAWellFormedListUnchanged(t *testing.T) {
+	got, err := NormalizeList(testActor, "capabilities", []string{"log", "http"})
+	if err != nil {
+		t.Fatalf("NormalizeList() error = %v, want nil", err)
+	}
+	if !slices.Equal(got, []string{"log", "http"}) {
+		t.Fatalf("NormalizeList() = %v, want [log http]", got)
+	}
+}
+
+func TestNormalizeListAcceptsAnEmptyList(t *testing.T) {
+	got, err := NormalizeList(testActor, "capabilities", nil)
+	if err != nil {
+		t.Fatalf("NormalizeList(nil) error = %v, want nil", err)
+	}
+	if got != nil {
+		t.Fatalf("NormalizeList(nil) = %v, want nil: naming nothing is legitimate", got)
+	}
+}
+
+// TestNormalizeListRefusesARepeatedItemAndNamesIt is the rule the CLI's
+// splitFlagList used to own alone, which is why an HTTP body could carry
+// ["log","log"] straight into plugins.json: a duplicate makes neither
+// direction of ResolveCapabilities' set-equality test notice anything
+// missing, so nothing downstream would ever catch it.
+func TestNormalizeListRefusesARepeatedItemAndNamesIt(t *testing.T) {
+	_, err := NormalizeList(testActor, "capabilities", []string{"log", "log"})
+
+	requireErrorContainsActor(t, err, "capabilities", `"log"`, "more than once")
+}
+
+// TestNormalizeListRefusesAnEmptyItem keeps "a,,b" (and its JSON equivalent
+// ["a","","b"]) distinguishable from an absent list: a malformed value is
+// not the same as naming nothing.
+func TestNormalizeListRefusesAnEmptyItem(t *testing.T) {
+	_, err := NormalizeList(testActor, "allowed_hosts", []string{"jira.example.com", ""})
+
+	requireErrorContainsActor(t, err, "allowed_hosts", "empty entry")
+}
+
+// TestRefuseDeploymentChangedWrapsErrDeploymentChanged pins the class an
+// HTTP caller maps to 409: a concurrent edit is a conflict, and telling it
+// apart from "the manifest could not be re-read at all" (an I/O fault, 500)
+// is only possible through the sentinel -- both come back from this one
+// call.
+func TestRefuseDeploymentChangedWrapsErrDeploymentChanged(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "plugins.json")
+	original := []byte(`{"plugins":[]}`)
+	if err := os.WriteFile(path, original, 0o644); err != nil {
+		t.Fatalf("write plugins.json: %v", err)
+	}
+	snapshot := append([]byte(nil), original...)
+	if err := os.WriteFile(path, []byte(`{"plugins":[{"name":"alpha","source":"./alpha"}]}`), 0o644); err != nil {
+		t.Fatalf("rewrite plugins.json: %v", err)
+	}
+
+	err := RefuseDeploymentChanged(testActor, path, snapshot)
+
+	if !errors.Is(err, ErrDeploymentChanged) {
+		t.Fatalf("RefuseDeploymentChanged() error = %v, want it to wrap ErrDeploymentChanged", err)
+	}
+}
+
+// TestRefuseDeploymentChangedDoesNotWrapErrDeploymentChangedForAMissingFile
+// is the other side: an unreadable manifest is not a conflict, and reporting
+// it as one would tell the caller to retry a request that will never work.
+func TestRefuseDeploymentChangedDoesNotWrapErrDeploymentChangedForAMissingFile(t *testing.T) {
+	err := RefuseDeploymentChanged(testActor, filepath.Join(t.TempDir(), "never-written.json"), []byte(`{"plugins":[]}`))
+
+	if err == nil {
+		t.Fatal("RefuseDeploymentChanged() error = nil, want an error naming the unreadable manifest")
+	}
+	if errors.Is(err, ErrDeploymentChanged) {
+		t.Fatalf("RefuseDeploymentChanged() error = %v, must NOT wrap ErrDeploymentChanged: it is an I/O fault, not a conflict", err)
 	}
 }

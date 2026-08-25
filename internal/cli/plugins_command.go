@@ -1839,26 +1839,25 @@ func resolveGrantAllowedPaths(allowedPathsFlag string, pm manifest.PluginManifes
 // and write a nonsense repeated entry to plugins.json). It returns nil for an
 // empty or all-whitespace flagValue. cmdContext and flagName only label the
 // error.
+//
+// Only the SPLITTING is done here. Refusing the empty and repeated items is
+// consent.NormalizeList's job, because it is a property of a well-formed
+// grant rather than of comma-splitting: an HTTP caller hands over a decoded
+// JSON array that this function never sees, and a rule living only here
+// would be a rule the CLI enforces and that endpoint does not (gpc-task-3
+// review, Minor-9). The error text is unchanged — subject carries the
+// quoted flag value the message always named.
 func splitFlagList(cmdContext, flagName, flagValue string) ([]string, error) {
 	trimmed := strings.TrimSpace(flagValue)
 	if trimmed == "" {
 		return nil, nil
 	}
 	fields := strings.Split(trimmed, ",")
-	seen := make(map[string]struct{}, len(fields))
 	out := make([]string, 0, len(fields))
 	for _, field := range fields {
-		item := strings.TrimSpace(field)
-		if item == "" {
-			return nil, fmt.Errorf("%s: --%s %q contains an empty entry", cmdContext, flagName, flagValue)
-		}
-		if _, dup := seen[item]; dup {
-			return nil, fmt.Errorf("%s: --%s %q names %q more than once", cmdContext, flagName, flagValue, item)
-		}
-		seen[item] = struct{}{}
-		out = append(out, item)
+		out = append(out, strings.TrimSpace(field))
 	}
-	return out, nil
+	return consent.NormalizeList(cmdContext, fmt.Sprintf("--%s %q", flagName, flagValue), out)
 }
 
 // resolvePluginPackageDir resolves entry's package directory the same way a

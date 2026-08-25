@@ -15,6 +15,24 @@ import (
 // the two deserve different responses, and only the caller knows which.
 var ErrApplyPending = errors.New("a plugin change is waiting for a task boundary")
 
+// ErrBoundaryNotReached is what ApplyAtBoundary reports when it gave up before
+// running fn: nothing was applied. It is a sentinel so a caller can tell that
+// apart from an error fn itself produced, which ctx.Err() alone cannot.
+//
+// The distinction is not academic. ApplyAtBoundary passes the caller's ctx
+// straight through to fn, and a convergence that fetches a remote plugin
+// package derives its own timeout from that same ctx — so an fn that ran and
+// failed on its own deadline returns an error wrapping exactly the
+// context.DeadlineExceeded a boundary wait that never reached fn would have
+// wrapped. A caller that keyed on the bare ctx sentinels to decide "did the
+// apply happen?" would read those two opposite outcomes as one, and report a
+// convergence that already ran and failed as one still to come.
+//
+// It always travels alongside ctx.Err(), so errors.Is still reaches the
+// underlying cancellation for a caller that wants to know WHY the boundary
+// went unreached rather than only THAT it did.
+var ErrBoundaryNotReached = errors.New("the task boundary was not reached; nothing was applied")
+
 // ErrApplyInProgress is what a second, overlapping ApplyAtBoundary reports.
 // The convergence belongs to the first caller: a second one that returned nil
 // would claim an apply it never performed, and one that shared the first's
@@ -223,15 +241,24 @@ func (g *TaskGate) finish() {
 //
 // It reports an error, without having run fn, when:
 //
-//   - the wait expires or ctx is cancelled first — the error wraps ctx.Err()
-//     and names how many tasks are still running. Nothing is changed: applying
-//     anyway is the mid-task change this gate exists to prevent, and giving up
-//     loudly lets the caller retry at a calmer moment;
+//   - the wait expires or ctx is cancelled first — the error wraps
+//     ErrBoundaryNotReached and ctx.Err(), and names how many tasks are still
+//     running. Nothing is changed: applying anyway is the mid-task change this
+//     gate exists to prevent, and giving up loudly lets the caller retry at a
+//     calmer moment;
 //   - ctx is already done even though the gate turns out to be idle right
 //     now — a cancelled ctx means "don't do this", and that holds whether or
-//     not any waiting was ever needed to reach the boundary;
+//     not any waiting was ever needed to reach the boundary. This error wraps
+//     ErrBoundaryNotReached and ctx.Err() too;
 //   - another apply is already pending — that convergence belongs to its own
 //     caller, and reporting success here would claim an apply that never ran.
+//     This one wraps ErrApplyInProgress.
+//
+// Those three, and only those three, are the "fn never ran" outcomes, and
+// ErrBoundaryNotReached/ErrApplyInProgress are how a caller recognizes them.
+// A caller must NOT infer them from ctx.Err() alone: ctx is passed through to
+// fn, so an fn that ran and failed on its own derived deadline reports the
+// very same context.DeadlineExceeded — see ErrBoundaryNotReached.
 //
 // A wait of zero or less means "apply only if the gate is idle right now":
 // there is no wait to expire, so a task in flight is reported immediately.
@@ -304,6 +331,12 @@ func (g *TaskGate) endApply() {
 // Giving up is an error naming the tasks that are still running and how long
 // the wait actually ran: the caller has to be able to tell "nothing was
 // applied, and here is what was in the way" from a successful apply.
+//
+// Both giving-up paths wrap ErrBoundaryNotReached ALONGSIDE the ctx error
+// rather than the ctx error alone. The ctx error on its own is not a marker
+// for "fn never ran" — ctx reaches fn too, so fn can produce the identical
+// sentinel from a deadline of its own — and this is the only place that
+// knows, first hand, that fn was never called.
 func (g *TaskGate) awaitIdle(ctx context.Context, wait time.Duration, idle <-chan struct{}) error {
 	start := time.Now()
 	waitCtx, cancel := context.WithTimeout(ctx, wait)
@@ -321,7 +354,8 @@ func (g *TaskGate) awaitIdle(ctx context.Context, wait time.Duration, idle <-cha
 	case <-idle:
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("apply plugin change at task boundary: ctx was already done "+
-				"once the boundary was reached, nothing was applied: %w", err)
+				"once the boundary was reached, so fn was never called: %w: %w",
+				ErrBoundaryNotReached, err)
 		}
 		return nil
 	default:
@@ -332,7 +366,7 @@ func (g *TaskGate) awaitIdle(ctx context.Context, wait time.Duration, idle <-cha
 	// in the error contradict the "still running" it is reporting.
 	running := g.runningCount()
 	return fmt.Errorf("apply plugin change at task boundary: waited %s for the running tasks to finish, "+
-		"%d task(s) still running, nothing was applied: %w", time.Since(start), running, waitCtx.Err())
+		"%d task(s) still running: %w: %w", time.Since(start), running, ErrBoundaryNotReached, waitCtx.Err())
 }
 
 // runningCount reports how many tasks are in flight right now. It is a snapshot

@@ -3,12 +3,46 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
 
 	"github.com/stardust/legion-agent/internal/security"
 )
+
+// ErrPluginNotFound is what PluginConsent.Grant/.Deny report when the
+// deployment manifest holds no entry under the requested name.
+//
+// The four sentinels declared here exist so the HTTP handlers can turn a
+// failure into a status code by CLASS instead of by matching on error text,
+// which is the thing that really drifts. They are declared in this package,
+// not in the implementation's, because the status contract is this package's
+// to own and the implementation lives on the other side of the interface —
+// see pluginConsentStatus for the mapping, which is mechanical: classifying
+// an error is not re-deciding authorization, so it does not breach the rule
+// that these handlers judge no capability or allowlist of their own.
+var ErrPluginNotFound = errors.New("no such plugin in the deployment manifest")
+
+// ErrPluginDeploymentChanged is what PluginConsent.Grant/.Deny report when
+// the deployment manifest was edited by somebody else while the request was
+// in flight, so writing now would silently revert that edit. It is a
+// conflict the caller can resolve by re-reading and retrying, which is a
+// different answer from "your request was malformed".
+var ErrPluginDeploymentChanged = errors.New("the plugin deployment manifest changed while this request was running")
+
+// ErrPluginStorage is what PluginConsent.Grant/.Deny report when the
+// deployment manifest could not be read, parsed or written — an I/O or
+// on-disk-state fault on the server, not a defect in the request. Reporting
+// it as a 4xx would tell an operator to fix a request that was never the
+// problem.
+var ErrPluginStorage = errors.New("the plugin deployment manifest could not be read or written")
+
+// ErrPluginUnavailable is what PluginConsent.Grant/.Deny report when this
+// process has no plugin loader attached to converge against right now (it
+// was detached mid-shutdown, say). The request is well formed and may
+// succeed later, which is exactly what a 503 says and a 400 does not.
+var ErrPluginUnavailable = errors.New("no plugin loader is attached to this process")
 
 // PluginConsent is the plugin-authorization surface the HTTP layer consumes.
 //
@@ -34,11 +68,18 @@ type PluginConsent interface {
 	// the write); a nil error means the manifest already carries this grant,
 	// with the ConsentResult's PendingConvergence/View reporting whether and
 	// how it went on to converge.
+	//
+	// An error that belongs to one of the classes this package declares
+	// (ErrPluginNotFound, ErrPluginDeploymentChanged, ErrPluginStorage,
+	// ErrPluginUnavailable) must be returned wrapping that sentinel, so the
+	// handler can map it to a status code without reading its text. An error
+	// carrying none of them is a rejected request and reports 400.
 	Grant(ctx context.Context, name string, req GrantRequest) (ConsentResult, error)
 
 	// Deny revokes the deployment entry named name's authorization to run.
 	// Like Grant, a non-nil error means the manifest was not changed; a nil
-	// error means it already records the revocation.
+	// error means it already records the revocation, and an error in one of
+	// this package's classes carries the matching sentinel.
 	Deny(ctx context.Context, name string) (ConsentResult, error)
 }
 
@@ -62,11 +103,18 @@ type GrantRequest struct {
 //   - PendingConvergence is true when convergence did NOT run (a
 //     concurrent apply already in flight, or the wait for a task boundary
 //     timed out or was cancelled): the write landed, but nothing has been
-//     applied yet, and View is the zero value because there is nothing new
-//     to report. ConvergenceDetail names why, for the caller to surface.
+//     applied yet. View carries the facts that are already ON DISK — Name
+//     and the Granted* fields just written — and no loader state at all
+//     (State, Version, Detail and Tools stay empty, because no convergence
+//     produced any). Name in particular is not withheld: a response the GUI
+//     cannot match back to the row it came from is not a kinder answer.
+//     ConvergenceDetail names why convergence did not run.
 //   - PendingConvergence is false and View.State is not "failed" when
 //     convergence ran and this entry came up (or went down, for a deny)
-//     cleanly.
+//     cleanly. ConvergenceDetail is non-empty here only when the
+//     convergence reported errors that this entry nonetheless survived —
+//     an unrelated entry failing, say. "Convergence ran, and these errors
+//     happened" is a legitimate state, and dropping it would hide it.
 //   - PendingConvergence is false and View.State is "failed" when
 //     convergence ran but THIS entry specifically failed to activate (a
 //     broken package, a tool-name conflict, …) — View.Detail names why.
@@ -168,7 +216,8 @@ type pluginConsentResponse struct {
 // rules here is exactly the divergence this whole surface exists to
 // prevent. Every validation failure, the concurrent-edit guard, and the
 // four-outcome convergence reporting all come back through the single
-// ConsentResult (or error) Grant returns.
+// ConsentResult (or error) Grant returns; an error's CLASS, and nothing
+// else, picks the status code — see pluginConsentStatus.
 func (s *HTTPServer) handleGrantPlugin(w http.ResponseWriter, r *http.Request) {
 	principal := security.PrincipalFromRequest(r)
 	if !s.policy.Allows(principal, security.ActionWritePlugin, security.ResourcePlugin) {
@@ -192,7 +241,7 @@ func (s *HTTPServer) handleGrantPlugin(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := s.plugins.Grant(r.Context(), name, req)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("grant plugin %q: %v", name, err))
+		writeError(w, pluginConsentStatus(err), fmt.Sprintf("grant plugin %q: %v", name, err))
 		return
 	}
 	writeJSON(w, http.StatusOK, pluginConsentResponse{
@@ -224,7 +273,7 @@ func (s *HTTPServer) handleDenyPlugin(w http.ResponseWriter, r *http.Request) {
 	}
 	result, err := s.plugins.Deny(r.Context(), name)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("deny plugin %q: %v", name, err))
+		writeError(w, pluginConsentStatus(err), fmt.Sprintf("deny plugin %q: %v", name, err))
 		return
 	}
 	writeJSON(w, http.StatusOK, pluginConsentResponse{
@@ -232,6 +281,36 @@ func (s *HTTPServer) handleDenyPlugin(w http.ResponseWriter, r *http.Request) {
 		PendingConvergence: result.PendingConvergence,
 		ConvergenceDetail:  result.ConvergenceDetail,
 	})
+}
+
+// pluginConsentStatus maps one of PluginConsent's error classes to the HTTP
+// status that names it, defaulting to 400 for an error carrying none of
+// them.
+//
+// The mapping is mechanical on purpose: without it every failure a grant can
+// have — an unknown plugin, a concurrent edit, a disk that will not write,
+// and a genuinely malformed request — arrives at the GUI as the same 400,
+// leaving it to match on error text to tell "your request is wrong" from
+// "the server's disk is broken". Error text is the thing that drifts; an
+// errors.Is against an exported sentinel is not.
+//
+// Classifying an error is not re-deciding authorization, so this does not
+// breach handleGrantPlugin's rule that the handler judges no capability or
+// allowlist of its own: which rule rejected the request, and why, still
+// comes entirely from the service.
+func pluginConsentStatus(err error) int {
+	switch {
+	case errors.Is(err, ErrPluginNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, ErrPluginDeploymentChanged):
+		return http.StatusConflict
+	case errors.Is(err, ErrPluginStorage):
+		return http.StatusInternalServerError
+	case errors.Is(err, ErrPluginUnavailable):
+		return http.StatusServiceUnavailable
+	default:
+		return http.StatusBadRequest
+	}
 }
 
 // parsePluginConsentName extracts the {name} path segment from

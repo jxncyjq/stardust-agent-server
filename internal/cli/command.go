@@ -2379,7 +2379,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 			return ServeResult{}, fmt.Errorf("plugin consent service: resolve remote source policy: %w", err)
 		}
 		pluginConsent = NewPluginConsentService(cfg.Plugins.Manifest, cfg.Plugins.Root, pluginApp.Plugins,
-			func() *sign.Keyring { return pluginKeyring }, pluginRemote)
+			func() *sign.Keyring { return pluginKeyring }, pluginRemote, logger)
 	}
 	liveTasks := task.NewSchedulerWithSink(taskSink)
 	httpTasks := server.TaskStore(liveTasks)
