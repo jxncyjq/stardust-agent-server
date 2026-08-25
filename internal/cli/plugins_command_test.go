@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -330,6 +331,15 @@ type manifestEntry struct {
 	// refused on a local one (manifest.ParseDeployment). An empty one omits
 	// the key entirely, which is what every local fixture wants.
 	digest string
+
+	// omitGrant, when true, leaves the JSON "grant" key out of this entry
+	// entirely — the shape `agent plugins install` writes (manifest.DraftEntry
+	// leaves GrantStated false), and what Part A's GrantStated exists to tell
+	// apart from an entry whose grant block is merely empty. capabilities is
+	// meaningless when this is true and every existing caller leaves it
+	// false, so every entry written before this field existed keeps carrying
+	// an explicit (if possibly empty) "grant" block exactly as before.
+	omitGrant bool
 }
 
 // writeManifest writes plugins.json with the given entries.
@@ -341,7 +351,7 @@ func (f *pluginFixture) writeManifest(entries ...manifestEntry) {
 		Source  string                `json:"source"`
 		Digest  string                `json:"digest,omitempty"`
 		Enabled bool                  `json:"enabled"`
-		Grant   manifest.GrantDecl    `json:"grant"`
+		Grant   *manifest.GrantDecl   `json:"grant,omitempty"`
 		Tools   []manifest.ToolAccept `json:"tools"`
 	}
 	raw := struct {
@@ -352,12 +362,16 @@ func (f *pluginFixture) writeManifest(entries ...manifestEntry) {
 		for _, toolName := range e.tools {
 			accepts = append(accepts, manifest.ToolAccept{Name: toolName})
 		}
+		var grant *manifest.GrantDecl
+		if !e.omitGrant {
+			grant = &manifest.GrantDecl{Capabilities: e.capabilities}
+		}
 		raw.Plugins = append(raw.Plugins, rawEntry{
 			Name:    e.name,
 			Source:  e.source,
 			Digest:  e.digest,
 			Enabled: e.enabled,
-			Grant:   manifest.GrantDecl{Capabilities: e.capabilities},
+			Grant:   grant,
 			Tools:   accepts,
 		})
 	}
@@ -632,6 +646,84 @@ func TestPluginsStatusDistinguishesDisabledFromNotConverged(t *testing.T) {
 	}
 	if strings.Contains(out, "disabled") {
 		t.Errorf("plugins status output = %q, want the entry no longer reported as disabled", out)
+	}
+}
+
+// TestPluginsStatusDistinguishesUnauthorizedFromDisabled is rule 4 (and the
+// mutation-verification target for Part B: collapsing pluginStateUnauthorized
+// back into pluginStateDisabled must fail this test). An entry nobody has
+// ever made a grant decision about ("grant" key never present) reads
+// differently from one an operator explicitly denied, and each row names a
+// different next step.
+func TestPluginsStatusDistinguishesUnauthorizedFromDisabled(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	out, err := f.run("status")
+	if err != nil {
+		t.Fatalf("plugins status error = %v, want nil", err)
+	}
+	if !strings.Contains(out, "unauthorized") {
+		t.Fatalf("plugins status output = %q, want the never-granted entry reported as unauthorized", out)
+	}
+	if !strings.Contains(out, "agent plugins grant") {
+		t.Errorf("plugins status output = %q, want the unauthorized row to name `agent plugins grant` as the "+
+			"next step", out)
+	}
+	if strings.Contains(out, "disabled") {
+		t.Errorf("plugins status output = %q, want the never-granted entry not labelled disabled", out)
+	}
+
+	// Record an explicit decision the direct way: `agent plugins deny` sets
+	// GrantStated true while keeping the entry disabled, which is what
+	// distinguishes the row from the one above.
+	if _, err := f.run("deny", testEchoPlugin); err != nil {
+		t.Fatalf("plugins deny error = %v, want nil", err)
+	}
+	out, err = f.run("status")
+	if err != nil {
+		t.Fatalf("plugins status error = %v, want nil", err)
+	}
+	if !strings.Contains(out, "disabled") {
+		t.Fatalf("plugins status output = %q, want the denied entry reported as disabled", out)
+	}
+	if strings.Contains(out, "unauthorized") {
+		t.Errorf("plugins status output = %q, want the denied entry no longer reported as unauthorized", out)
+	}
+}
+
+// TestPluginsStatusNeverLabelsAnEnabledOldStyleEntryUnauthorized is rule 5's
+// companion at the layer an operator actually reads: an entry written before
+// Part A existed — "enabled": true, no grant block at all — must never show
+// up as unauthorized just because manifest.Entry.GrantStated is false. This
+// holds structurally (the unauthorized branch only runs when !entry.Enabled),
+// but this test pins it against a regression that checked GrantStated
+// without also checking Enabled.
+func TestPluginsStatusNeverLabelsAnEnabledOldStyleEntryUnauthorized(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}, omitGrant: true,
+	})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	out, err := f.run("status")
+	if err != nil {
+		t.Fatalf("plugins status error = %v, want nil", err)
+	}
+	if strings.Contains(out, "unauthorized") {
+		t.Fatalf("plugins status output = %q, want an enabled old-style entry never labelled unauthorized", out)
+	}
+	if !strings.Contains(out, "loaded") {
+		t.Errorf("plugins status output = %q, want the entry mounted and loaded", out)
 	}
 }
 
@@ -3607,14 +3699,16 @@ func TestPluginsInstallRefusesAnUnconfiguredCache(t *testing.T) {
 // cleanly through this command and then have serve refuse to fetch or load
 // it, with the contradiction invisible in both commands' output.
 //
-// This test installs a package with --grant pre-filling one declared
-// capability (the entry still comes out disabled — install never authorizes
-// a plugin to run), then hand-authorizes it the way `agent plugins grant`
-// will (Task 4, not built yet): flip "enabled" to true, leaving everything
-// install wrote untouched. It then runs the SAME assembly `agent serve`
-// runs, against the SAME config. That assembly re-resolves the cache and the
-// trust set from scratch — it only succeeds, and only mounts the plugin, if
-// its resolution of both agrees with what install already used.
+// This test installs a package with --grant naming one declared capability
+// (the entry still comes out disabled and — since Part A — carries NO grant
+// block at all: DraftEntry leaves GrantStated false, and MarshalDeployment
+// omits an unstated grant block regardless of what --grant pre-checked in
+// memory before the write; see manifest.Entry.GrantStated), then actually
+// authorizes it with the real `agent plugins grant` (Task 4). It then runs
+// the SAME assembly `agent serve` runs, against the SAME config. That
+// assembly re-resolves the cache and the trust set from scratch — it only
+// succeeds, and only mounts the plugin, if its resolution of both agrees
+// with what install already used.
 func TestPluginsInstallAndServeAgreeOnCacheAndTrustSettings(t *testing.T) {
 	f := newPluginFixture(t, 30_000)
 	priv, keyringPath := f.newKeyring("keyring.json")
@@ -3631,13 +3725,18 @@ func TestPluginsInstallAndServeAgreeOnCacheAndTrustSettings(t *testing.T) {
 		t.Fatalf("plugins install error = %v, want nil", err)
 	}
 
-	dep := f.readDeployment()
-	entry := f.requireEntry(dep, testEchoPlugin)
+	entry := f.requireEntry(f.readDeployment(), testEchoPlugin)
 	if entry.Enabled {
 		t.Fatalf("entry.Enabled = true right after install, want false")
 	}
-	if len(entry.Grant.Capabilities) != 1 || entry.Grant.Capabilities[0] != "log" {
-		t.Fatalf(`entry.Grant.Capabilities = %v, want ["log"] pre-filled by --grant`, entry.Grant.Capabilities)
+	if entry.GrantStated {
+		t.Fatalf("entry.GrantStated = true right after install, want false: install never authorizes a plugin, " +
+			"and DraftEntry's own GrantStated zero value means no grant block is ever written for it")
+	}
+	if len(entry.Grant.Capabilities) != 0 {
+		t.Fatalf("entry.Grant.Capabilities = %v, want empty: --grant's pre-check happens in memory before the "+
+			"write, but nothing about it is persisted while the entry stays unauthorized (GrantStated false)",
+			entry.Grant.Capabilities)
 	}
 
 	// install already filed the package under the path resolvePluginRemote
@@ -3650,15 +3749,16 @@ func TestPluginsInstallAndServeAgreeOnCacheAndTrustSettings(t *testing.T) {
 		}
 	}
 
-	dep, err := manifest.UpdateEntry(dep, testEchoPlugin, func(e manifest.Entry) (manifest.Entry, error) {
-		e.Enabled = true
-		return e, nil
-	})
-	if err != nil {
-		t.Fatalf("UpdateEntry: %v", err)
+	// The real authorization step: `agent plugins grant` (Task 4) resolves
+	// the SAME plugin package (from the SAME cache, under the SAME trust
+	// set) to check "log" against the plugin's own declaration, then writes
+	// Enabled true, GrantStated true and Grant.Capabilities = ["log"].
+	if _, err := f.run("grant", testEchoPlugin, "--capabilities", "log"); err != nil {
+		t.Fatalf("plugins grant error = %v, want nil", err)
 	}
-	if err := manifest.WriteDeployment(f.manifestPath, dep); err != nil {
-		t.Fatalf("WriteDeployment: %v", err)
+	granted := f.requireEntry(f.readDeployment(), testEchoPlugin)
+	if !granted.Enabled || !granted.GrantStated || !slices.Equal(granted.Grant.Capabilities, []string{"log"}) {
+		t.Fatalf("entry after grant = %+v, want Enabled=true GrantStated=true Grant.Capabilities=[log]", granted)
 	}
 
 	if err := f.assemble(); err != nil {
@@ -3675,5 +3775,246 @@ func TestPluginsInstallAndServeAgreeOnCacheAndTrustSettings(t *testing.T) {
 	}
 	if !strings.Contains(out, "loaded") || !strings.Contains(out, testEchoPlugin) {
 		t.Fatalf("plugins status output = %q, want the entry mounted", out)
+	}
+}
+
+// --- agent plugins grant ----------------------------------------------------
+
+// TestPluginsGrantAuthorizesAnEntryWithItsDeclaredCapabilities is rule 1 (and
+// rule 6's second half — a grant round-trips with GrantStated true): grant
+// makes the entry Enabled, records GrantStated, carries the named
+// capabilities and the named hosts/paths — all read back from disk, not
+// merely from the command's own claim.
+func TestPluginsGrantAuthorizesAnEntryWithItsDeclaredCapabilities(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", []string{"log", "http"}, []string{testEchoTool})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+
+	before := f.requireEntry(f.readDeployment(), testEchoPlugin)
+	if before.GrantStated {
+		t.Fatalf("test setup is wrong: the entry must start with GrantStated false (rule 6's first half)")
+	}
+
+	out, err := f.run("grant", testEchoPlugin,
+		"--capabilities", "log,http", "--allowed-hosts", "example.com", "--allowed-paths", "/data")
+	if err != nil {
+		t.Fatalf("plugins grant error = %v, want nil", err)
+	}
+	if !strings.Contains(out, "agent plugins reload") {
+		t.Errorf("plugins grant output = %q, want it to say changes take effect on `agent plugins reload`", out)
+	}
+
+	entry := f.requireEntry(f.readDeployment(), testEchoPlugin)
+	if !entry.Enabled {
+		t.Errorf("entry.Enabled = false, want true after grant")
+	}
+	if !entry.GrantStated {
+		t.Errorf("entry.GrantStated = false, want true after grant (rule 6's second half)")
+	}
+	wantCaps := []string{"log", "http"}
+	if !slices.Equal(entry.Grant.Capabilities, wantCaps) {
+		t.Errorf("entry.Grant.Capabilities = %v, want %v", entry.Grant.Capabilities, wantCaps)
+	}
+	if want := []string{"example.com"}; !slices.Equal(entry.Grant.AllowedHosts, want) {
+		t.Errorf("entry.Grant.AllowedHosts = %v, want %v", entry.Grant.AllowedHosts, want)
+	}
+	if want := []string{"/data"}; !slices.Equal(entry.Grant.AllowedPaths, want) {
+		t.Errorf("entry.Grant.AllowedPaths = %v, want %v", entry.Grant.AllowedPaths, want)
+	}
+}
+
+// TestPluginsGrantAllowsAPureComputePluginWithNoCapabilities is the whole
+// motivation for GrantStated made concrete: a plugin that declares zero
+// capabilities is a legitimate target of an explicit, empty grant — an
+// operator decided it needs nothing and is still allowed to run — and must
+// come out authorized (Enabled true, GrantStated true), not indistinguishable
+// from one nobody has ever decided about.
+func TestPluginsGrantAllowsAPureComputePluginWithNoCapabilities(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+
+	if _, err := f.run("grant", testEchoPlugin); err != nil {
+		t.Fatalf("plugins grant error = %v, want nil: a pure-compute plugin may be granted zero capabilities", err)
+	}
+
+	entry := f.requireEntry(f.readDeployment(), testEchoPlugin)
+	if !entry.Enabled {
+		t.Errorf("entry.Enabled = false, want true after grant")
+	}
+	if !entry.GrantStated {
+		t.Errorf("entry.GrantStated = false, want true after grant")
+	}
+	if len(entry.Grant.Capabilities) != 0 {
+		t.Errorf("entry.Grant.Capabilities = %v, want empty", entry.Grant.Capabilities)
+	}
+}
+
+// TestPluginsGrantRefusesAnUndeclaredCapability is rule 2: naming a
+// capability the plugin itself never declared in plugin.json is a config
+// error, not generosity, refused by name with nothing written to
+// plugins.json.
+func TestPluginsGrantRefusesAnUndeclaredCapability(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", []string{"log"}, []string{testEchoTool})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+	before, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json before grant: %v", err)
+	}
+
+	out, err := f.run("grant", testEchoPlugin, "--capabilities", "log,http")
+	if err == nil {
+		t.Fatalf("plugins grant output = %q, error = nil, want an error: the plugin only declares \"log\"", out)
+	}
+	if !strings.Contains(err.Error(), "http") {
+		t.Errorf("plugins grant error = %v, want it to name the undeclared capability %q", err, "http")
+	}
+	if !strings.Contains(err.Error(), testEchoPlugin) {
+		t.Errorf("plugins grant error = %v, want it to name the plugin %q", err, testEchoPlugin)
+	}
+
+	after, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json after grant: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("plugins.json changed after a refused grant:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+// TestPluginsGrantRefusesAPartialGrantMissingADeclaredCapability is the Task
+// 3 review's correction, folded into Task 4: manifest.reconcileCapabilities
+// (assemble.go) refuses any entry whose grant does not cover EVERY capability
+// the plugin declares, so granting a strict subset would write an entry that
+// can never load — discoverable only as a StateFailed row after the next
+// reload. grant refuses it up front instead, naming the missing capability,
+// with nothing written to plugins.json.
+func TestPluginsGrantRefusesAPartialGrantMissingADeclaredCapability(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", []string{"log", "http"}, []string{testEchoTool})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+	before, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json before grant: %v", err)
+	}
+
+	out, err := f.run("grant", testEchoPlugin, "--capabilities", "log")
+	if err == nil {
+		t.Fatalf("plugins grant output = %q, error = nil, want an error: the plugin also declares \"http\", "+
+			"which a partial grant would leave ungranted", out)
+	}
+	if !strings.Contains(err.Error(), "http") {
+		t.Errorf("plugins grant error = %v, want it to name the missing declared capability %q", err, "http")
+	}
+
+	after, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json after grant: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("plugins.json changed after a refused partial grant:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+// TestPluginsGrantRefusesAnUnknownEntry pins findPluginEntry's error path:
+// grant cannot authorize an entry that was never registered, and the error
+// names both the requested name and (when there is one) what does exist.
+func TestPluginsGrantRefusesAnUnknownEntry(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writeManifest()
+
+	_, err := f.run("grant", "does-not-exist", "--capabilities", "log")
+	if err == nil {
+		t.Fatal("plugins grant error = nil, want an error: no such entry")
+	}
+	if !strings.Contains(err.Error(), "does-not-exist") {
+		t.Errorf("plugins grant error = %v, want it to name the unknown entry", err)
+	}
+}
+
+// --- agent plugins deny ------------------------------------------------------
+
+// TestPluginsDenyRevokesAuthorizationButKeepsRegistration is rule 3: deny
+// flips Enabled false and empties capabilities, but keeps GrantStated true (a
+// decision WAS made) and leaves source, digest and tools untouched.
+func TestPluginsDenyRevokesAuthorizationButKeepsRegistration(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", []string{"log"}, []string{testEchoTool})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: true, capabilities: []string{"log"}, tools: []string{testEchoTool},
+	})
+	before := f.requireEntry(f.readDeployment(), testEchoPlugin)
+
+	out, err := f.run("deny", testEchoPlugin)
+	if err != nil {
+		t.Fatalf("plugins deny error = %v, want nil", err)
+	}
+	if !strings.Contains(out, "agent plugins reload") {
+		t.Errorf("plugins deny output = %q, want it to say changes take effect on `agent plugins reload`", out)
+	}
+
+	after := f.requireEntry(f.readDeployment(), testEchoPlugin)
+	if after.Enabled {
+		t.Errorf("entry.Enabled = true, want false after deny")
+	}
+	if len(after.Grant.Capabilities) != 0 {
+		t.Errorf("entry.Grant.Capabilities = %v, want empty after deny", after.Grant.Capabilities)
+	}
+	if !after.GrantStated {
+		t.Errorf("entry.GrantStated = false, want true after deny: a decision WAS made")
+	}
+	if after.Source != before.Source {
+		t.Errorf("entry.Source = %q, want unchanged %q", after.Source, before.Source)
+	}
+	if after.Digest != before.Digest {
+		t.Errorf("entry.Digest = %q, want unchanged %q", after.Digest, before.Digest)
+	}
+	if len(after.Tools) != len(before.Tools) {
+		t.Fatalf("entry.Tools = %+v, want unchanged %+v", after.Tools, before.Tools)
+	}
+	for i := range before.Tools {
+		if after.Tools[i] != before.Tools[i] {
+			t.Errorf("entry.Tools[%d] = %+v, want unchanged %+v", i, after.Tools[i], before.Tools[i])
+		}
+	}
+}
+
+// TestPluginsDenyDoesNotNeedThePackageOnDisk pins the design decision that
+// deny never loads the plugin package and never touches a loader: unlike
+// grant, it only edits plugins.json, so it must succeed even when the
+// package files that install/grant would need are entirely absent.
+func TestPluginsDenyDoesNotNeedThePackageOnDisk(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	// Deliberately no writePackage call.
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: true, capabilities: []string{"log"}, tools: []string{testEchoTool},
+	})
+
+	if _, err := f.run("deny", testEchoPlugin); err != nil {
+		t.Fatalf("plugins deny error = %v, want nil: deny only edits plugins.json, it never loads the package", err)
+	}
+}
+
+// TestPluginsDenyRefusesAnUnknownEntry mirrors
+// TestPluginsGrantRefusesAnUnknownEntry for deny's own UpdateEntry call.
+func TestPluginsDenyRefusesAnUnknownEntry(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writeManifest()
+
+	_, err := f.run("deny", "does-not-exist")
+	if err == nil {
+		t.Fatal("plugins deny error = nil, want an error: no such entry")
+	}
+	if !strings.Contains(err.Error(), "does-not-exist") {
+		t.Errorf("plugins deny error = %v, want it to name the unknown entry", err)
 	}
 }

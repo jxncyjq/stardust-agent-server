@@ -14,12 +14,22 @@ import (
 
 // sampleEntry returns a minimal, already-valid local Entry named name, for
 // tests that only care about identity and ordering, not content.
+//
+// GrantStated is deliberately true here (an explicit, if empty, grant
+// decision) rather than left at its false zero value: a false GrantStated
+// entry's "grant" key is omitted entirely on write (see entryDoc's doc
+// comment in edit.go), which means Grant.Capabilities always reads back nil
+// regardless of what it held before the write — exactly the shape Part A's
+// own dedicated tests in this file cover. A round-trip fidelity check that
+// used a false-GrantStated fixture would be asserting a Capabilities value
+// MarshalDeployment never even attempts to preserve, not a real regression.
 func sampleEntry(name string) Entry {
 	return Entry{
-		Name:   name,
-		Source: "./plugins/" + name,
-		Grant:  GrantDecl{Capabilities: []string{}},
-		Tools:  []ToolAccept{{Name: "do_thing"}},
+		Name:        name,
+		Source:      "./plugins/" + name,
+		Grant:       GrantDecl{Capabilities: []string{}},
+		GrantStated: true,
+		Tools:       []ToolAccept{{Name: "do_thing"}},
 	}
 }
 
@@ -269,12 +279,13 @@ func TestMarshalDeployment_RoundTrip_PreservesRemoteEntryDigest(t *testing.T) {
 	original := Deployment{
 		Plugins: []Entry{
 			{
-				Name:    "legion-remote",
-				Source:  "https://plugins.example.com/legion-remote.tar.gz",
-				Digest:  "sha256:" + validSHA256,
-				Enabled: true,
-				Grant:   GrantDecl{Capabilities: []string{"http"}},
-				Tools:   []ToolAccept{{Name: "fetch_thing"}},
+				Name:        "legion-remote",
+				Source:      "https://plugins.example.com/legion-remote.tar.gz",
+				Digest:      "sha256:" + validSHA256,
+				Enabled:     true,
+				Grant:       GrantDecl{Capabilities: []string{"http"}},
+				GrantStated: true,
+				Tools:       []ToolAccept{{Name: "fetch_thing"}},
 			},
 		},
 	}
@@ -294,6 +305,136 @@ func TestMarshalDeployment_RoundTrip_PreservesRemoteEntryDigest(t *testing.T) {
 	if got, want := roundTripped.Plugins[0].Digest, original.Plugins[0].Digest; got != want {
 		t.Fatalf("Digest = %q after a Marshal/Parse round trip, want %q\nmarshaled:\n%s", got, want, marshaled)
 	}
+}
+
+// --- Part A: GrantStated governs whether "grant" is written at all --------
+
+// TestMarshalDeployment_OmitsGrantBlockWhenNotStated is Part A's core
+// contract on the write side: an entry whose GrantStated is false — nobody
+// has ever recorded a grant decision for it — must marshal with NO "grant"
+// key at all, not an empty "grant": {}. This checks the actual bytes rather
+// than a round-tripped struct, since a round trip through ParseDeployment
+// cannot tell "grant omitted" apart from "grant": {} in the direction that
+// matters here (both come back GrantStated true only for the latter).
+func TestMarshalDeployment_OmitsGrantBlockWhenNotStated(t *testing.T) {
+	dep := Deployment{Plugins: []Entry{{
+		Name:   "legion-jira",
+		Source: "./plugins/legion-jira",
+		Tools:  []ToolAccept{{Name: "jira_search"}},
+		// GrantStated left at its zero value: false.
+	}}}
+
+	data, err := MarshalDeployment(dep)
+	if err != nil {
+		t.Fatalf("MarshalDeployment: %v", err)
+	}
+	entry := decodeOneEntry(t, data)
+	if _, present := entry["grant"]; present {
+		t.Errorf("marshaled entry = %s, want no \"grant\" key at all when GrantStated is false", data)
+	}
+}
+
+// TestMarshalDeployment_KeepsGrantBlockWhenStatedEvenIfEmpty is the other
+// side: an entry whose GrantStated is true — an explicit `agent plugins
+// deny`, or a hand-authorized entry with deliberately zero capabilities —
+// keeps its "grant" key on the wire even though Grant.Capabilities is
+// empty, because omitting it would silently turn a recorded decision back
+// into "never authorized" on the very next read.
+func TestMarshalDeployment_KeepsGrantBlockWhenStatedEvenIfEmpty(t *testing.T) {
+	dep := Deployment{Plugins: []Entry{{
+		Name:        "legion-jira",
+		Source:      "./plugins/legion-jira",
+		Grant:       GrantDecl{Capabilities: []string{}},
+		GrantStated: true,
+		Tools:       []ToolAccept{{Name: "jira_search"}},
+	}}}
+
+	data, err := MarshalDeployment(dep)
+	if err != nil {
+		t.Fatalf("MarshalDeployment: %v", err)
+	}
+	entry := decodeOneEntry(t, data)
+	if _, present := entry["grant"]; !present {
+		t.Errorf("marshaled entry = %s, want a \"grant\" key present: GrantStated is true", data)
+	}
+
+	roundTripped, err := ParseDeployment(data)
+	if err != nil {
+		t.Fatalf("ParseDeployment(marshaled): %v", err)
+	}
+	if !roundTripped.Plugins[0].GrantStated {
+		t.Errorf("GrantStated = false after round trip, want true")
+	}
+}
+
+// TestMarshalDeployment_DraftedEntryRoundTripsWithGrantStatedFalse is the
+// brief's own end-to-end demand for rule 6's first half: DraftEntry (install's
+// entry constructor, draft.go) leaves GrantStated false by zero value, so an
+// entry install writes must come back out of a full
+// AddEntry/WriteDeployment/(disk)/ParseDeployment cycle still reporting
+// GrantStated false — "never authorized" — rather than this package assuming
+// DraftEntry's zero value survives MarshalDeployment/ParseDeployment
+// untested. Rule 6's second half — after `agent plugins grant`, the same
+// entry parses back with GrantStated true — is covered at the CLI layer by
+// internal/cli's TestPluginsGrantAuthorizesAnEntryWithItsDeclaredCapabilities,
+// which reads the real file `agent plugins grant` wrote back through this
+// same ParseDeployment.
+func TestMarshalDeployment_DraftedEntryRoundTripsWithGrantStatedFalse(t *testing.T) {
+	pm := draftManifest()
+	drafted, err := DraftEntry(pm, "https://example.com/plugin.wasm", draftDigest)
+	if err != nil {
+		t.Fatalf("DraftEntry: %v", err)
+	}
+	if drafted.GrantStated {
+		t.Fatalf("DraftEntry's own GrantStated = true, want false (zero value); this test's premise is wrong")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "plugins.json")
+	dep, err := AddEntry(Deployment{}, drafted)
+	if err != nil {
+		t.Fatalf("AddEntry: %v", err)
+	}
+	if err := WriteDeployment(path, dep); err != nil {
+		t.Fatalf("WriteDeployment: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	entry := decodeOneEntry(t, data)
+	if _, present := entry["grant"]; present {
+		t.Errorf("written plugins.json = %s, want no \"grant\" key: DraftEntry leaves GrantStated false", data)
+	}
+
+	roundTripped, err := ParseDeployment(data)
+	if err != nil {
+		t.Fatalf("ParseDeployment(%s): %v", path, err)
+	}
+	if roundTripped.Plugins[0].GrantStated {
+		t.Errorf("GrantStated = true after Write/Parse, want false: an install-drafted entry must read back as " +
+			"never authorized")
+	}
+}
+
+// decodeOneEntry decodes data (a marshaled deployment with exactly one
+// plugin) into a generic map, for tests that need to assert on JSON KEY
+// PRESENCE rather than a decoded Go value — the distinction Part A's
+// GrantStated exists to make, which a round trip through ParseDeployment
+// cannot itself observe (see TestMarshalDeployment_OmitsGrantBlockWhenNotStated).
+func decodeOneEntry(t *testing.T, data []byte) map[string]any {
+	t.Helper()
+	var decoded struct {
+		Plugins []map[string]any `json:"plugins"`
+	}
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		t.Fatalf("unmarshal %s: %v", data, err)
+	}
+	if len(decoded.Plugins) != 1 {
+		t.Fatalf("decoded %d plugins, want exactly 1: %s", len(decoded.Plugins), data)
+	}
+	return decoded.Plugins[0]
 }
 
 // --- Rule 5: WriteDeployment writes atomically -----------------------------

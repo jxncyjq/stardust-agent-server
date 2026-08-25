@@ -97,20 +97,27 @@ func UpdateEntry(dep Deployment, name string, mutate func(Entry) (Entry, error))
 //     "config" key) without changing what a round trip decodes back to:
 //     an omitted "digest"/"config" and an empty-string/nil one decode to
 //     the same Go zero value either way.
-//   - Grant and Tools carry no omitempty: GrantDecl is a struct, for which
-//     omitempty is a no-op in encoding/json, and Tools' nil/non-nil
-//     distinction survives a plain (non-omitempty) round trip on its own
-//     (encoding a nil slice produces JSON null, which decodes back to nil;
-//     an empty slice produces "[]", which decodes back to a non-nil empty
-//     slice) — adding omitempty here would only change output shape, not
-//     correctness, so it is left off to keep the tag list aligned with
-//     rawEntry's.
+//   - Grant is `*GrantDecl` with `omitempty`, mirroring rawEntry.Grant
+//     (manifest.go): MarshalDeployment sets this pointer only when
+//     Entry.GrantStated is true, so the "grant" key is omitted entirely —
+//     not written as an empty "grant": {} — for an entry nobody has ever
+//     recorded an authorization decision about. An install-drafted entry
+//     (DraftEntry leaves GrantStated at its zero value, false) therefore
+//     round-trips with no "grant" key at all, which is what lets
+//     ParseDeployment read it back as GrantStated false — "never
+//     authorized" — rather than as an explicit, if empty, decision.
+//   - Tools carries no omitempty: its nil/non-nil distinction survives a
+//     plain (non-omitempty) round trip on its own (encoding a nil slice
+//     produces JSON null, which decodes back to nil; an empty slice
+//     produces "[]", which decodes back to a non-nil empty slice) — adding
+//     omitempty here would only change output shape, not correctness, so
+//     it is left off.
 type entryDoc struct {
 	Name    string          `json:"name"`
 	Source  string          `json:"source"`
 	Digest  string          `json:"digest,omitempty"`
 	Enabled bool            `json:"enabled"`
-	Grant   GrantDecl       `json:"grant"`
+	Grant   *GrantDecl      `json:"grant,omitempty"`
 	Tools   []ToolAccept    `json:"tools"`
 	Config  json.RawMessage `json:"config,omitempty"`
 }
@@ -136,15 +143,23 @@ type deploymentDoc struct {
 func MarshalDeployment(dep Deployment) ([]byte, error) {
 	doc := deploymentDoc{Plugins: make([]entryDoc, len(dep.Plugins))}
 	for i, entry := range dep.Plugins {
-		doc.Plugins[i] = entryDoc{
+		ed := entryDoc{
 			Name:    entry.Name,
 			Source:  entry.Source,
 			Digest:  entry.Digest,
 			Enabled: entry.Enabled,
-			Grant:   entry.Grant,
 			Tools:   entry.Tools,
 			Config:  entry.Config,
 		}
+		// Only a STATED grant is written at all — see entryDoc's doc
+		// comment. entry.Grant is copied into its own local rather than
+		// taking &entry.Grant directly so this cannot alias the range
+		// variable across iterations regardless of Go version.
+		if entry.GrantStated {
+			grant := entry.Grant
+			ed.Grant = &grant
+		}
+		doc.Plugins[i] = ed
 	}
 
 	data, err := json.MarshalIndent(doc, "", "  ")
