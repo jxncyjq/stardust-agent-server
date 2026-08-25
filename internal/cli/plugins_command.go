@@ -50,14 +50,28 @@ import (
 const (
 	// pluginStateUnauthorized means "enabled": false AND the manifest entry
 	// has never carried a grant block at all (manifest.Entry.GrantStated is
-	// false): nobody has ever made an authorization decision about this
-	// plugin, as distinct from pluginStateDisabled below, where an operator
-	// explicitly decided it should not run. See manifest.Entry.GrantStated's
-	// own doc comment for why an empty capabilities list alone cannot answer
-	// this question — a pure-compute plugin legitimately has zero
-	// capabilities and can still be explicitly authorized (`agent plugins
-	// grant` with none named). The next step for this state is `agent
-	// plugins grant`, not nothing.
+	// false): plugins.json itself carries no record of an authorization
+	// decision for this plugin, as distinct from pluginStateDisabled below,
+	// where the file DOES record one (a grant block is present, even if
+	// empty), even if it was later revoked (`agent plugins deny` leaves
+	// GrantStated true for exactly this reason).
+	//
+	// This wording is deliberately narrower than "nobody has ever decided
+	// anything": GrantStated can only observe THIS FILE, not the operator's
+	// intent, so a hand-written "enabled": false entry with no grant block —
+	// indistinguishable here from one written before this field existed —
+	// also lands here, even though typing "enabled": false was itself a
+	// decision. Reporting it unauthorized rather than disabled is the
+	// deliberate, conservative call: the cost of being wrong is an operator
+	// being told to run `agent plugins grant`, which is itself a no-op until
+	// they name capabilities and cannot silently re-enable anything, versus
+	// the alternative of classifying an unrecorded decision as "nothing to
+	// see here" and having it never surface for review. See
+	// manifest.Entry.GrantStated's own doc comment for why an empty
+	// capabilities list alone cannot answer this question either — a
+	// pure-compute plugin legitimately has zero capabilities and can still be
+	// explicitly authorized (`agent plugins grant` with none named). The next
+	// step for this state is `agent plugins grant`, not nothing.
 	pluginStateUnauthorized = "unauthorized"
 
 	// pluginStateDisabled means the manifest entry says "enabled": false AND
@@ -863,8 +877,14 @@ func mergePluginStatus(deployment manifest.Deployment, statuses []loader.Instanc
 			// plain "!entry.Enabled" case below, or every unauthorized entry
 			// would be reported as disabled instead.
 			row.State = pluginStateUnauthorized
-			row.Detail = detailFor("reason", `no grant decision has ever been recorded for this entry; run `+
-				`"agent plugins grant" to authorize it`)
+			// NOTE-6: worded to say only what plugins.json itself supports —
+			// "no grant block is present" — rather than asserting the wider
+			// claim that nobody ever decided anything (see
+			// pluginStateUnauthorized's own doc comment for why that wider
+			// claim is not always true, and why this state is still the
+			// right one to report anyway).
+			row.Detail = detailFor("reason", `plugins.json records no grant block for this entry, so it has `+
+				`never been authorized here; run "agent plugins grant" to authorize it`)
 		case !entry.Enabled:
 			row.State = pluginStateDisabled
 			row.Detail = detailFor("reason", `the manifest entry sets "enabled": false`)
@@ -1501,6 +1521,13 @@ func newPluginsGrantCommand(out io.Writer) *cobra.Command {
 			"the plugin declares, so a partial grant is refused here rather than written and left to fail\n" +
 			"silently at the next reload. A plugin that declares no capabilities is granted with\n" +
 			"--capabilities left empty.\n\n" +
+			"--allowed-hosts and --allowed-paths are checked differently: each named host/path must be one\n" +
+			"the plugin itself declares in plugin.json's \"network.allowed_hosts\" / \"filesystem.allowed_paths\",\n" +
+			"but naming a strict SUBSET of what is declared is accepted -- a legitimate narrowing, not a\n" +
+			"partial grant. Only a name the plugin never declared is refused: AssembleSpec reconciles a grant's\n" +
+			"hosts/paths against the plugin's own declaration by intersection, silently dropping anything the\n" +
+			"plugin did not itself ask for, so an undeclared name would otherwise sit in plugins.json looking\n" +
+			"authoritative while granting nothing.\n\n" +
 			"grant never reloads a running service: run `agent plugins reload` to apply.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -1511,9 +1538,13 @@ func newPluginsGrantCommand(out io.Writer) *cobra.Command {
 		"comma-separated capabilities to grant; must name exactly the set the plugin itself declares in "+
 			"plugin.json (empty for a plugin that declares none)")
 	cmd.Flags().StringVar(&allowedHostsFlag, "allowed-hosts", "",
-		"comma-separated hosts the http capability may reach")
+		"comma-separated hosts the http capability may reach; each must be one the plugin itself declares in "+
+			`plugin.json's "network.allowed_hosts" (a subset of what is declared is fine; an undeclared host `+
+			"is refused, since AssembleSpec would otherwise silently drop it from the grant)")
 	cmd.Flags().StringVar(&allowedPathsFlag, "allowed-paths", "",
-		"comma-separated paths the fs capability may reach")
+		"comma-separated paths the fs capability may reach; each must be one the plugin itself declares in "+
+			`plugin.json's "filesystem.allowed_paths" (a subset of what is declared is fine; an undeclared `+
+			"path is refused, since AssembleSpec would otherwise silently drop it from the grant)")
 	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file")
 	return cmd
 }
@@ -1569,11 +1600,11 @@ func runPluginsGrant(ctx context.Context, out io.Writer, nameArg, capabilitiesFl
 	if err != nil {
 		return err
 	}
-	hosts, err := splitFlagList("plugins grant", "allowed-hosts", allowedHostsFlag)
+	hosts, err := resolveGrantAllowedHosts(allowedHostsFlag, pm)
 	if err != nil {
 		return err
 	}
-	paths, err := splitFlagList("plugins grant", "allowed-paths", allowedPathsFlag)
+	paths, err := resolveGrantAllowedPaths(allowedPathsFlag, pm)
 	if err != nil {
 		return err
 	}
@@ -1648,22 +1679,103 @@ func resolveGrantCapabilities(capabilitiesFlag string, pm manifest.PluginManifes
 	return capabilities, nil
 }
 
-// splitFlagList splits a comma-separated flag value into trimmed, non-empty
-// fields, refusing an empty item by name (a malformed value like "a,,b" is
-// not the same as an absent one) and returning nil for an empty or
-// all-whitespace flagValue. cmdContext and flagName only label the error.
+// resolveGrantAllowedHosts parses --allowed-hosts and checks each named host
+// against pm.Network.AllowedHosts, the plugin's OWN declaration in
+// plugin.json — the same set AssembleSpec (assemble.go) intersects a grant's
+// AllowedHosts against (SHOULD-FIX-4).
+//
+// Unlike resolveGrantCapabilities, this is deliberately NOT a set-equality
+// check: AssembleSpec's own rule for hosts is a plain declared ∩ granted
+// intersection, and an empty result there is explicitly legal (see
+// AssembleSpec's own doc comment) — there is no "every declared host must be
+// granted" requirement anywhere in the manifest layer to enforce, and
+// inventing one here would be exactly the new validation concept the fix
+// brief asks NOT to invent. So naming a strict subset of what the plugin
+// declares is accepted as a legitimate narrowing.
+//
+// What IS checked is the direction that silently misfires today: a host
+// --allowed-hosts names that the plugin never declared is not an error
+// anywhere else in this package, but AssembleSpec would drop it from the
+// intersection at the next reload with nothing anywhere saying so, leaving
+// plugins.json recording a host that grants nothing and looks authoritative
+// (the concrete scenario the review's SHOULD-FIX-4 finding describes: a
+// typo'd hostname that "succeeds" and then denies every outbound call).
+// Refusing it by name here, before it is ever written, matches the
+// "config error, not generosity" principle --capabilities already enforces.
+//
+// Comparison is case-insensitive, matching intersectPreserveOrder's own
+// comparison for hosts (DNS names are case-insensitive).
+func resolveGrantAllowedHosts(allowedHostsFlag string, pm manifest.PluginManifest) ([]string, error) {
+	hosts, err := splitFlagList("plugins grant", "allowed-hosts", allowedHostsFlag)
+	if err != nil {
+		return nil, err
+	}
+	declared := make(map[string]struct{}, len(pm.Network.AllowedHosts))
+	for _, host := range pm.Network.AllowedHosts {
+		declared[strings.ToLower(host)] = struct{}{}
+	}
+	for _, host := range hosts {
+		if _, ok := declared[strings.ToLower(host)]; !ok {
+			return nil, fmt.Errorf(`plugins grant: --allowed-hosts names host %q, which plugin %q does not `+
+				`declare in plugin.json's "network"."allowed_hosts" (it declares: %v); AssembleSpec would `+
+				`silently drop an undeclared host from the grant at the next reload, so this is refused here `+
+				`instead`, host, pm.Name, pm.Network.AllowedHosts)
+		}
+	}
+	return hosts, nil
+}
+
+// resolveGrantAllowedPaths is resolveGrantAllowedHosts for
+// pm.Filesystem.AllowedPaths — see that function's doc comment for the
+// reasoning, which applies identically here (SHOULD-FIX-4). Paths are
+// compared exactly, not case-insensitively, matching
+// intersectPreserveOrder's own comparison (paths are not case-insensitive in
+// general).
+func resolveGrantAllowedPaths(allowedPathsFlag string, pm manifest.PluginManifest) ([]string, error) {
+	paths, err := splitFlagList("plugins grant", "allowed-paths", allowedPathsFlag)
+	if err != nil {
+		return nil, err
+	}
+	declared := make(map[string]struct{}, len(pm.Filesystem.AllowedPaths))
+	for _, path := range pm.Filesystem.AllowedPaths {
+		declared[path] = struct{}{}
+	}
+	for _, path := range paths {
+		if _, ok := declared[path]; !ok {
+			return nil, fmt.Errorf(`plugins grant: --allowed-paths names path %q, which plugin %q does not `+
+				`declare in plugin.json's "filesystem"."allowed_paths" (it declares: %v); AssembleSpec would `+
+				`silently drop an undeclared path from the grant at the next reload, so this is refused here `+
+				`instead`, path, pm.Name, pm.Filesystem.AllowedPaths)
+		}
+	}
+	return paths, nil
+}
+
+// splitFlagList splits a comma-separated flag value into trimmed, non-empty,
+// non-duplicate fields, refusing an empty item by name (a malformed value
+// like "a,,b" is not the same as an absent one) and refusing a repeated item
+// by name too (NOTE-7: "a,a" against a declared set that contains "a" would
+// otherwise pass every set-membership check built on top of this function
+// and write a nonsense repeated entry to plugins.json). It returns nil for an
+// empty or all-whitespace flagValue. cmdContext and flagName only label the
+// error.
 func splitFlagList(cmdContext, flagName, flagValue string) ([]string, error) {
 	trimmed := strings.TrimSpace(flagValue)
 	if trimmed == "" {
 		return nil, nil
 	}
 	fields := strings.Split(trimmed, ",")
+	seen := make(map[string]struct{}, len(fields))
 	out := make([]string, 0, len(fields))
 	for _, field := range fields {
 		item := strings.TrimSpace(field)
 		if item == "" {
 			return nil, fmt.Errorf("%s: --%s %q contains an empty entry", cmdContext, flagName, flagValue)
 		}
+		if _, dup := seen[item]; dup {
+			return nil, fmt.Errorf("%s: --%s %q names %q more than once", cmdContext, flagName, flagValue, item)
+		}
+		seen[item] = struct{}{}
 		out = append(out, item)
 	}
 	return out, nil
@@ -1701,6 +1813,24 @@ func findPluginEntry(dep manifest.Deployment, name string) (manifest.Entry, erro
 // remote Source is served from remote's plugin cache — a cache hit costs no
 // network, exactly like install's own remote path, and a miss fetches
 // through the same fetch.Fetch/Cache.Put install uses.
+//
+// NOTE-10 (duplicated trust boundary, judgement call recorded): this remote
+// branch and localPluginPackageDir together are a second, hand-kept copy of
+// loader.go's packageDir/remoteDir — the boundary that decides where
+// executable wasm is read from. The review flagged the drift risk this
+// creates: if internal/plugin/loader ever tightens either rule, this copy
+// does not follow automatically, and `agent plugins grant` would keep
+// validating a plugin's declared capabilities against a package resolved by
+// the OLD rule. The durable fix is exporting the loader's resolver and
+// calling it from here instead of re-implementing it; that touches
+// internal/plugin/loader, which this fix batch's brief put out of scope
+// (only internal/cli/plugins_command.go and its test may change), so the
+// judgement call this batch makes is: document the duplication at both
+// copies (this one names loader.go's packageDir/remoteDir; a symmetrical
+// note belongs on those functions the next time loader.go is touched) and
+// defer the export, rather than deepen the change beyond its authorized
+// files. Anyone editing internal/plugin/loader's packageDir or remoteDir
+// MUST check this function and localPluginPackageDir for the same edit.
 func resolvePluginPackageDir(ctx context.Context, entry manifest.Entry, remote loader.RemoteConfig, root string) (string, error) {
 	if !entry.IsRemote() {
 		return localPluginPackageDir(entry.Name, root, entry.Source)
@@ -1749,6 +1879,12 @@ func resolvePluginPackageDir(ctx context.Context, entry manifest.Entry, remote l
 // deployment root is supposed to bound; grant must enforce that bound
 // exactly as strictly as a running Loader does, not more loosely just
 // because no loader happens to be present.
+//
+// NOTE-10: this is a hand-kept copy, not a shared implementation — see
+// resolvePluginPackageDir's doc comment for the drift risk that creates and
+// why this fix batch documents rather than closes it. Anyone editing
+// internal/plugin/loader's packageDir MUST check this function for the same
+// edit.
 func localPluginPackageDir(name, root, source string) (string, error) {
 	if filepath.IsAbs(source) {
 		return "", fmt.Errorf("plugin %q: source %q is absolute; a plugin source must be relative to the "+
@@ -1789,21 +1925,27 @@ func newPluginsDenyCommand(out io.Writer) *cobra.Command {
 			"deny never reloads a running service: run `agent plugins reload` to apply.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runPluginsDeny(out, args[0], configPath)
+			return runPluginsDeny(cmd.Context(), out, args[0], configPath)
 		},
 	}
 	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file")
 	return cmd
 }
 
-// runPluginsDeny is newPluginsDenyCommand's RunE body.
-func runPluginsDeny(out io.Writer, nameArg, configPath string) error {
+// runPluginsDeny is newPluginsDenyCommand's RunE body. ctx bounds
+// config.Load exactly the way every other subcommand in this file bounds it
+// (status, reload, install, grant) — deny used to be the one command that
+// ignored the command's own context and called config.Load with
+// context.Background() instead (SHOULD-FIX-5), which would have made it the
+// one subcommand that could not be cancelled if config.Load ever grew an I/O
+// timeout or a remote config source.
+func runPluginsDeny(ctx context.Context, out io.Writer, nameArg, configPath string) error {
 	name := strings.TrimSpace(nameArg)
 	if name == "" {
 		return errors.New("plugins deny: the plugin name is empty")
 	}
 
-	cfg, err := config.Load(context.Background(), config.Options{Path: configPath})
+	cfg, err := config.Load(ctx, config.Options{Path: configPath})
 	if err != nil {
 		return err
 	}
