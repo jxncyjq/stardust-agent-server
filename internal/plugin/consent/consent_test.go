@@ -194,6 +194,26 @@ func TestRefuseUnnamedAllowlistRefusesFSWithNoPathsNamedWhenSomeAreDeclared(t *t
 	requireErrorContainsActor(t, err, "--capabilities", "fs", pm.Name)
 }
 
+func TestRefuseUnnamedAllowlistAcceptsFSWhenTheDeclaredAllowlistIsEmpty(t *testing.T) {
+	pm := pluginManifest([]string{"fs"}, nil, nil)
+
+	err := RefuseUnnamedAllowlist(testActor, "--capabilities", []string{"fs"}, pm, nil, nil,
+		"name a host", "name a path")
+	if err != nil {
+		t.Fatalf("RefuseUnnamedAllowlist: unexpected error: %v", err)
+	}
+}
+
+func TestRefuseUnnamedAllowlistAcceptsFSWhenAPathIsNamed(t *testing.T) {
+	pm := pluginManifest([]string{"fs"}, nil, []string{"/data"})
+
+	err := RefuseUnnamedAllowlist(testActor, "--capabilities", []string{"fs"}, pm,
+		nil, []string{"/data"}, "name a host", "name a path")
+	if err != nil {
+		t.Fatalf("RefuseUnnamedAllowlist: unexpected error: %v", err)
+	}
+}
+
 // --- FindEntry --------------------------------------------------------------
 
 func TestFindEntryReturnsTheMatchingEntry(t *testing.T) {
