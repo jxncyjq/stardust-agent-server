@@ -140,9 +140,25 @@ type deploymentDoc struct {
 // decodes through (see entryDoc's doc comment for the traps that mirroring
 // has to avoid, chief among them Entry.Enabled's absent-vs-false
 // distinction).
+//
+// MarshalDeployment refuses (returns an error, writes nothing) any entry
+// whose Grant holds a Capability, AllowedHost or AllowedPath while
+// GrantStated is false: only a STATED grant is ever written (see entryDoc's
+// doc comment), so silently proceeding would drop that data from the
+// document while still reporting success — the exact shape CLAUDE.md
+// section 0 forbids. A caller that hits this must either set GrantStated to
+// record the decision, or clear Grant if it was never meant to be one.
 func MarshalDeployment(dep Deployment) ([]byte, error) {
 	doc := deploymentDoc{Plugins: make([]entryDoc, len(dep.Plugins))}
 	for i, entry := range dep.Plugins {
+		if !entry.GrantStated && (len(entry.Grant.Capabilities) > 0 ||
+			len(entry.Grant.AllowedHosts) > 0 || len(entry.Grant.AllowedPaths) > 0) {
+			return nil, fmt.Errorf("marshal deployment manifest: plugin %q carries a grant "+
+				"(capabilities %v, allowed_hosts %v, allowed_paths %v) but GrantStated is false; writing it "+
+				"would silently discard the grant — set GrantStated when recording an authorization decision, "+
+				"or clear Grant", entry.Name, entry.Grant.Capabilities, entry.Grant.AllowedHosts,
+				entry.Grant.AllowedPaths)
+		}
 		ed := entryDoc{
 			Name:    entry.Name,
 			Source:  entry.Source,

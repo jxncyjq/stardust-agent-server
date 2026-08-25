@@ -437,6 +437,97 @@ func decodeOneEntry(t *testing.T, data []byte) map[string]any {
 	return decoded.Plugins[0]
 }
 
+// --- BLOCKING-1 fix: MarshalDeployment refuses a Grant it would silently
+// discard ---------------------------------------------------------------
+
+// TestMarshalDeployment_RefusesUnstatedGrant is BLOCKING-1's core regression
+// test: an Entry that carries a populated Grant while GrantStated is false
+// must never marshal successfully, because the "grant" key would be omitted
+// entirely (see entryDoc's doc comment) and the write would silently
+// discard data the caller handed in while still reporting success. Each
+// subtest covers exactly one GrantDecl field, independently — a guard that
+// only checked Capabilities would let an AllowedHosts-only or
+// AllowedPaths-only entry slip through and lose data just the same.
+func TestMarshalDeployment_RefusesUnstatedGrant(t *testing.T) {
+	cases := []struct {
+		name  string
+		grant GrantDecl
+	}{
+		{"capabilities", GrantDecl{Capabilities: []string{"log"}}},
+		{"allowed_hosts", GrantDecl{AllowedHosts: []string{"api.example.com"}}},
+		{"allowed_paths", GrantDecl{AllowedPaths: []string{"/tmp/legion"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dep := Deployment{Plugins: []Entry{{
+				Name:   "legion-jira",
+				Source: "./plugins/legion-jira",
+				Grant:  tc.grant,
+				// GrantStated left at its zero value: false.
+				Tools: []ToolAccept{{Name: "jira_search"}},
+			}}}
+
+			_, err := MarshalDeployment(dep)
+			if err == nil {
+				t.Fatalf("MarshalDeployment: want an error for a populated %s grant with GrantStated "+
+					"false, got nil", tc.name)
+			}
+			requireErrorContains(t, err, "legion-jira")
+			requireErrorContains(t, err, "GrantStated")
+		})
+	}
+}
+
+// TestWriteDeployment_RefusesUnstatedGrant_LeavesPathUnchanged is
+// BLOCKING-1's WriteDeployment-level regression test: the refusal must
+// surface through WriteDeployment too, and must leave an existing
+// plugins.json byte-for-byte unchanged rather than truncating it — the same
+// "no partial write" guarantee rule 5's other refusal tests pin.
+func TestWriteDeployment_RefusesUnstatedGrant_LeavesPathUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "plugins.json")
+	original := Deployment{Plugins: []Entry{sampleEntry("legion-jira")}}
+	if err := WriteDeployment(path, original); err != nil {
+		t.Fatalf("seed WriteDeployment: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read seeded %s: %v", path, err)
+	}
+
+	bad := Deployment{Plugins: []Entry{{
+		Name:   "legion-notify",
+		Source: "./plugins/legion-notify",
+		Grant:  GrantDecl{Capabilities: []string{"log"}},
+		// GrantStated left at its zero value: false.
+		Tools: []ToolAccept{{Name: "notify_send"}},
+	}}}
+
+	if err := WriteDeployment(path, bad); err == nil {
+		t.Fatalf("WriteDeployment: want an error for a populated grant with GrantStated false, got nil")
+	} else {
+		requireErrorContains(t, err, "legion-notify")
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s after the refused write: %v", path, err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("WriteDeployment changed %s despite refusing to write it:\nbefore:\n%s\nafter:\n%s",
+			path, before, after)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir %s: %v", dir, err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "plugins.json" {
+		t.Fatalf("directory after the refused write = %v, want exactly [plugins.json] (no leftover temp file)",
+			entries)
+	}
+}
+
 // --- Rule 5: WriteDeployment writes atomically -----------------------------
 
 // TestWriteDeployment_WriteThenReadBack_RoundTrips is the happy-path
