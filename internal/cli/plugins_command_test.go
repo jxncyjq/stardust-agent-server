@@ -3628,6 +3628,20 @@ func TestPluginsInstallWithoutGrantRegistersWithNoCapabilitiesAndStaysDisabled(t
 		t.Errorf("entry.Grant.Capabilities = %v, want empty: --grant was not given", entry.Grant.Capabilities)
 	}
 
+	// SHOULD-FIX-2: pin the WRITTEN SHAPE, not just the parsed field --
+	// entry.Grant.Capabilities reading empty is also true of an entry whose
+	// "grant" key is present but empty ("grant": {"capabilities": []}),
+	// which is the shape the --help text used to (wrongly) describe. The
+	// raw bytes must contain no "grant" key at all: MarshalDeployment omits
+	// it entirely whenever GrantStated is false (edit.go:174).
+	raw, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json after install: %v", err)
+	}
+	if strings.Contains(string(raw), `"grant"`) {
+		t.Errorf(`plugins.json = %s, want NO "grant" key at all with no --grant given`, raw)
+	}
+
 	// Item 0 (the leftover from BLOCKING-2): pin the success message ITSELF
 	// against the file it describes, on the --grant-absent path. Before this
 	// assertion existed, nothing anywhere checked install's output string, so
@@ -4624,5 +4638,329 @@ func TestPluginsDenyRefusesAnUnknownEntry(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "does-not-exist") {
 		t.Errorf("plugins deny error = %v, want it to name the unknown entry", err)
+	}
+}
+
+// --- BLOCKING-1: grant and deny carry install's concurrent-edit guard too ---
+
+// TestPluginsGrantRefusesAConcurrentEditDuringTheDownload mirrors
+// TestPluginsInstallRefusesAConcurrentEditDuringTheDownload for `agent
+// plugins grant`: resolvePluginPackageDir performs a full artifact download
+// on a cache MISS, exactly like install's own fetch, and grant used to
+// write a document built from the read it took before that download with no
+// compare-and-swap in between. The entry granted here is remote with
+// nothing yet in the plugin cache, which is what puts grant on the download
+// path rather than the cheap cache-hit one. A server handler that mutates
+// plugins.json from inside the very request the fetch is blocked on stands
+// in for a concurrent edit the same way install's test does. grant must
+// refuse rather than silently rewrite the file from its now-stale snapshot,
+// and the concurrent edit must survive exactly as written.
+func TestPluginsGrantRefusesAConcurrentEditDuringTheDownload(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.signPackageWithAnyKey("staging")
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// Stand in for a concurrent edit landing WHILE this download is in
+		// flight, from inside the very request the fetch is blocked on.
+		concurrent := manifest.Deployment{Plugins: []manifest.Entry{{
+			Name:    "concurrently-installed-plugin",
+			Source:  "elsewhere",
+			Enabled: true,
+			Tools:   []manifest.ToolAccept{{Name: testEchoTool}},
+		}}}
+		if err := manifest.WriteDeployment(f.manifestPath, concurrent); err != nil {
+			t.Errorf("write concurrent edit to plugins.json: %v", err)
+		}
+		if _, err := w.Write(archive); err != nil {
+			t.Errorf("write archive to client: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: srv.URL + "/echo.tgz", digest: digest, enabled: false,
+		tools: []string{testEchoTool}, omitGrant: true,
+	})
+
+	out, err := f.run("grant", testEchoPlugin, "--capabilities", "log")
+	if err == nil {
+		t.Fatalf("plugins grant output = %q, error = nil, want an error: plugins.json changed while the "+
+			"package was downloading", out)
+	}
+	if !strings.Contains(err.Error(), f.manifestPath) {
+		t.Errorf("plugins grant error = %v, want it to name the manifest path %q", err, f.manifestPath)
+	}
+	if !strings.Contains(err.Error(), "changed") {
+		t.Errorf("plugins grant error = %v, want it to say the manifest changed underneath it", err)
+	}
+
+	after := f.readDeployment()
+	if len(after.Plugins) != 1 || after.Plugins[0].Name != "concurrently-installed-plugin" {
+		t.Fatalf("plugins.json after grant = %+v, want ONLY the concurrent edit still present -- grant must "+
+			"refuse rather than silently revert it", after.Plugins)
+	}
+}
+
+// TestPluginsDenyRefusesAConcurrentEdit mirrors
+// TestPluginsInstallRefusesAConcurrentEditDuringTheDownload for deny's much
+// shorter window (BLOCKING-1's milder half, per the review): deny loads no
+// package and makes no network call, so it has no naturally-occurring
+// blocking point a test could inject a concurrent edit into the way
+// install's and grant's tests do inside an HTTP handler. pluginsDenyConcurrentEditTestHook
+// (production code, always nil outside a test) stands in for that missing
+// window instead, landing the concurrent edit right after deny snapshots
+// the manifest and right before it checks the snapshot for a change. deny
+// must refuse rather than silently rewrite the file from its now-stale
+// snapshot, and the concurrent edit must survive exactly as written.
+func TestPluginsDenyRefusesAConcurrentEdit(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: true, capabilities: []string{"log"}, tools: []string{testEchoTool},
+	})
+
+	t.Cleanup(func() { pluginsDenyConcurrentEditTestHook = nil })
+	pluginsDenyConcurrentEditTestHook = func() {
+		concurrent := manifest.Deployment{Plugins: []manifest.Entry{{
+			Name:    "concurrently-installed-plugin",
+			Source:  "elsewhere",
+			Enabled: true,
+			Tools:   []manifest.ToolAccept{{Name: testEchoTool}},
+		}}}
+		if err := manifest.WriteDeployment(f.manifestPath, concurrent); err != nil {
+			t.Errorf("write concurrent edit to plugins.json: %v", err)
+		}
+	}
+
+	out, err := f.run("deny", testEchoPlugin)
+	if err == nil {
+		t.Fatalf("plugins deny output = %q, error = nil, want an error: plugins.json changed underneath it", out)
+	}
+	if !strings.Contains(err.Error(), f.manifestPath) {
+		t.Errorf("plugins deny error = %v, want it to name the manifest path %q", err, f.manifestPath)
+	}
+	if !strings.Contains(err.Error(), "changed") {
+		t.Errorf("plugins deny error = %v, want it to say the manifest changed underneath it", err)
+	}
+
+	after := f.readDeployment()
+	if len(after.Plugins) != 1 || after.Plugins[0].Name != "concurrently-installed-plugin" {
+		t.Fatalf("plugins.json after deny = %+v, want ONLY the concurrent edit still present -- deny must "+
+			"refuse rather than silently revert it", after.Plugins)
+	}
+}
+
+// --- SHOULD-FIX-1: install and grant agree on duplicate capability names ---
+
+// TestPluginsInstallRefusesADuplicateGrantCapability mirrors
+// TestPluginsGrantRefusesADuplicateCapability for install's --grant:
+// resolveInstallGrants used to split "--grant" with its own inline
+// strings.Split and never refused a repeated name, so "log,log" against a
+// plugin declaring only "log" used to install successfully and write the
+// literal repeated list ["log","log"] to plugins.json. resolveInstallGrants
+// now goes through splitFlagList, the same helper grant's
+// resolveGrantCapabilities uses, which refuses a repeated field by name.
+func TestPluginsInstallRefusesADuplicateGrantCapability(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.signPackageWithAnyKey("staging")
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
+	f.writeManifest()
+
+	before, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json before install: %v", err)
+	}
+
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "log,log")
+	if err == nil {
+		t.Fatalf("plugins install output = %q, error = nil, want an error: \"log\" is named twice", out)
+	}
+	if !strings.Contains(err.Error(), "more than once") {
+		t.Errorf("plugins install error = %v, want it to say a capability was named more than once", err)
+	}
+	if !strings.Contains(err.Error(), "log") {
+		t.Errorf("plugins install error = %v, want it to name the duplicated capability %q", err, "log")
+	}
+
+	after, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json after install: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("plugins.json changed after a refused duplicate --grant:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+// --- SHOULD-FIX-2: install's --help matches the shape install actually writes ---
+
+// TestPluginsInstallHelpMatchesTheWrittenShapeWithNoGrant pins the
+// --help text against what install actually writes on the --grant-absent
+// path: the help used to say the written entry carries an empty
+// "grant.capabilities", but DraftEntry leaves GrantStated false and
+// MarshalDeployment omits the WHOLE "grant" key in that case (edit.go:174)
+// -- an operator who hand-writes an entry matching the old help text would
+// get "disabled" instead of "unauthorized", the exact confusion
+// pluginStateUnauthorized's conservative classification exists to prevent.
+func TestPluginsInstallHelpMatchesTheWrittenShapeWithNoGrant(t *testing.T) {
+	// newPluginsInstallCommand's Long text is read directly (white-box: this
+	// test file is `package cli`) rather than run through the CLI and
+	// captured from `out`, because cobra's default help printer writes to
+	// os.Stdout, not the io.Writer Execute was given -- capturing that
+	// reliably would test cobra's plumbing, not this command's text.
+	cmd := newPluginsInstallCommand(io.Discard)
+	if strings.Contains(cmd.Long, "grant.capabilities") {
+		t.Errorf(`plugins install --help Long = %q, want it NOT to claim an empty "grant.capabilities" is `+
+			`written -- no "grant" key is written at all`, cmd.Long)
+	}
+	if !strings.Contains(cmd.Long, `NO "grant" block`) {
+		t.Errorf(`plugins install --help Long = %q, want it to say NO "grant" block is written with no --grant`,
+			cmd.Long)
+	}
+}
+
+// --- SHOULD-FIX-4: install --grant refuses http/fs without a matching allowlist ---
+
+// TestPluginsInstallRefusesAnHTTPGrantWithoutAllowedHosts is SHOULD-FIX-4 on
+// the install path: --grant only ever fills Grant.Capabilities, never
+// AllowedHosts, so granting "http" on a plugin that itself declares a
+// non-empty "network"."allowed_hosts" would install an entry with http
+// enabled and an allowlist that AssembleSpec's declared-∩-granted
+// intersection reduces to nothing (assemble.go:234-235, and an empty
+// intersection is legal there) — every outbound call denied after the next
+// reload, with nothing in install's own output naming why. install must
+// refuse instead, naming the remaining `agent plugins grant --allowed-hosts`
+// step, with nothing written to plugins.json.
+func TestPluginsInstallRefusesAnHTTPGrantWithoutAllowedHosts(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackageWithNetwork("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"http"}, []string{testEchoTool},
+		manifest.Network{AllowedHosts: []string{"api.example.com"}}, manifest.Filesystem{})
+	f.signPackageWithAnyKey("staging")
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
+	f.writeManifest()
+
+	before, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json before install: %v", err)
+	}
+
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "http")
+	if err == nil {
+		t.Fatalf("plugins install output = %q, error = nil, want an error: --grant names \"http\" but names no "+
+			"allowed hosts, and the plugin declares some", out)
+	}
+	if !strings.Contains(err.Error(), "allowed_hosts") {
+		t.Errorf("plugins install error = %v, want it to name \"allowed_hosts\"", err)
+	}
+	if !strings.Contains(err.Error(), "--allowed-hosts") {
+		t.Errorf("plugins install error = %v, want it to name the remaining --allowed-hosts step", err)
+	}
+
+	after, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json after install: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("plugins.json changed after a refused http --grant:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+// TestPluginsInstallRefusesAnFSGrantWithoutAllowedPaths mirrors
+// TestPluginsInstallRefusesAnHTTPGrantWithoutAllowedHosts for the "fs"
+// capability and "filesystem"."allowed_paths".
+func TestPluginsInstallRefusesAnFSGrantWithoutAllowedPaths(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackageWithNetwork("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"fs"}, []string{testEchoTool},
+		manifest.Network{}, manifest.Filesystem{AllowedPaths: []string{"/data"}})
+	f.signPackageWithAnyKey("staging")
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
+	f.writeManifest()
+
+	before, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json before install: %v", err)
+	}
+
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "fs")
+	if err == nil {
+		t.Fatalf("plugins install output = %q, error = nil, want an error: --grant names \"fs\" but names no "+
+			"allowed paths, and the plugin declares some", out)
+	}
+	if !strings.Contains(err.Error(), "allowed_paths") {
+		t.Errorf("plugins install error = %v, want it to name \"allowed_paths\"", err)
+	}
+	if !strings.Contains(err.Error(), "--allowed-paths") {
+		t.Errorf("plugins install error = %v, want it to name the remaining --allowed-paths step", err)
+	}
+
+	after, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json after install: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("plugins.json changed after a refused fs --grant:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+// --- SHOULD-FIX-5: grant names the effective hosts/paths in its success line ---
+
+// TestPluginsGrantSuccessLineNamesTheEffectiveHostsAndPaths is SHOULD-FIX-5:
+// grant replaces the WHOLE GrantDecl every time, and --allowed-hosts /
+// --allowed-paths default to empty, so a re-grant that only names
+// --capabilities silently wipes a previously granted allowlist. The success
+// line now names the effective hosts and paths, including "none" when there
+// are none, so an operator sees the loss before the next reload denies
+// every request rather than after.
+func TestPluginsGrantSuccessLineNamesTheEffectiveHostsAndPaths(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackageWithNetwork("echo", testEchoWasm, testEchoPlugin, "1.2.0", []string{"log", "http"}, []string{testEchoTool},
+		manifest.Network{AllowedHosts: []string{"example.com"}}, manifest.Filesystem{})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+
+	out, err := f.run("grant", testEchoPlugin, "--capabilities", "log,http", "--allowed-hosts", "example.com")
+	if err != nil {
+		t.Fatalf("plugins grant error = %v, want nil", err)
+	}
+	if !strings.Contains(out, "allowed hosts: example.com") {
+		t.Errorf("plugins grant output = %q, want it to name the granted host", out)
+	}
+	if !strings.Contains(out, "allowed paths: none") {
+		t.Errorf("plugins grant output = %q, want it to say \"none\" for the ungranted paths", out)
+	}
+
+	// Re-grant naming only --capabilities: the previously granted host is
+	// silently dropped by design (SHOULD-FIX-5 keeps grant declarative
+	// rather than carrying values forward), but the success line must now
+	// say so instead of leaving hosts unmentioned.
+	out, err = f.run("grant", testEchoPlugin, "--capabilities", "log,http")
+	if err != nil {
+		t.Fatalf("plugins grant error = %v, want nil", err)
+	}
+	if !strings.Contains(out, "allowed hosts: none") {
+		t.Errorf("plugins grant output = %q, want it to say \"none\": the re-grant named no --allowed-hosts, "+
+			"which wipes the previously granted example.com", out)
+	}
+
+	entry := f.requireEntry(f.readDeployment(), testEchoPlugin)
+	if len(entry.Grant.AllowedHosts) != 0 {
+		t.Errorf("entry.Grant.AllowedHosts = %v, want empty after the re-grant wiped it", entry.Grant.AllowedHosts)
 	}
 }

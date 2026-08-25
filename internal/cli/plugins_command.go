@@ -608,15 +608,67 @@ func pluginRemotePolicy(cfg config.PluginsConfig) (loader.RemotePolicy, error) {
 // failures name the path: "configured but unreadable" is a startup failure, and
 // an operator has to be able to see which file was meant.
 func readPluginDeployment(path string) (manifest.Deployment, error) {
+	deployment, _, err := readPluginDeploymentWithSnapshot(path)
+	return deployment, err
+}
+
+// readPluginDeploymentWithSnapshot reads and parses path exactly once,
+// returning both the parsed Deployment and the raw bytes it was parsed
+// from. The raw bytes are the "snapshot" refusePluginDeploymentChanged
+// later compares against.
+//
+// A caller that instead read the file a second time to take its snapshot
+// (as install used to, before this fix) parses read #1 but compares a
+// separate read #2 against a later read #3 — a race between reads #1 and #2
+// that an edit could land in and pass the comparison unnoticed (the
+// review's NOTE-1). Reading once and keeping both the parse and the bytes
+// it came from removes that window entirely.
+func readPluginDeploymentWithSnapshot(path string) (manifest.Deployment, []byte, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return manifest.Deployment{}, fmt.Errorf("read plugin deployment manifest %q: %w", path, err)
+		return manifest.Deployment{}, nil, fmt.Errorf("read plugin deployment manifest %q: %w", path, err)
 	}
 	deployment, err := manifest.ParseDeployment(data)
 	if err != nil {
-		return manifest.Deployment{}, fmt.Errorf("parse plugin deployment manifest %q: %w", path, err)
+		return manifest.Deployment{}, nil, fmt.Errorf("parse plugin deployment manifest %q: %w", path, err)
 	}
-	return deployment, nil
+	return deployment, data, nil
+}
+
+// refusePluginDeploymentChanged re-reads manifestPath and compares it, byte
+// for byte, against snapshot — the bytes readPluginDeploymentWithSnapshot
+// captured earlier, before the caller went on to do something that can take
+// a while (a remote package fetch for install and, on a cache miss, for
+// grant too; even deny's plain read-modify-write has a window of its own,
+// just a much shorter one). WriteDeployment is atomic but performs no
+// compare-and-swap, so without this check a concurrent edit landing in that
+// window would be silently reverted by a stale rewrite: both commands would
+// report success, and the next `agent plugins reload` would quietly mount
+// or unmount something nobody decided to. Refuse instead of overwriting it.
+//
+// This is F5's guard, originally install-only, lifted here so install,
+// grant and deny all carry the IDENTICAL guard instead of three separately
+// worded ones — see the review's BLOCKING-1: a guard that holds on one
+// writer and not the other is not a guard, and two spellings of one guard
+// is how they drift apart. cmdContext (e.g. "plugins install", "plugins
+// grant", "plugins deny") labels the error and names the command an
+// operator should re-run.
+func refusePluginDeploymentChanged(cmdContext, manifestPath string, snapshot []byte) error {
+	current, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return fmt.Errorf("%s: re-read plugin deployment manifest %q before write: %w", cmdContext, manifestPath, err)
+	}
+	if !bytes.Equal(snapshot, current) {
+		// %s, not %q: on Windows a %q-quoted path doubles every backslash,
+		// which would stop it matching a caller's raw path string built
+		// straight from filepath.Join -- unlike the wrapped-error case just
+		// above, there is no underlying *PathError here to carry a second,
+		// unquoted copy of the path along for free.
+		return fmt.Errorf(`%s: plugin deployment manifest %s changed while this command was running; refusing `+
+			`to overwrite that edit with a stale copy -- re-run "agent %s" to apply on top of the current `+
+			`state`, cmdContext, manifestPath, cmdContext)
+	}
+	return nil
 }
 
 // newPluginsCommand builds `agent plugins`, the operator's handle on the WASM
@@ -1101,11 +1153,14 @@ func writePluginStatus(w io.Writer, manifestPath, root string, rows []pluginStat
 // command and then have serve refuse to fetch or load it, with the
 // contradiction invisible in both commands' output.
 //
-// With no --grant, the written entry is "enabled": false with an empty
-// "grant.capabilities": install REGISTERS a package, it does not authorize
-// one to run — see manifest.DraftEntry's doc comment, which enforces the
-// same rule one layer down and offers no parameter to override it either.
-// The next step is `agent plugins grant`.
+// With no --grant, the written entry keeps "enabled": false and NO "grant"
+// block at all — not an empty "grant.capabilities", the whole key is
+// omitted (manifest.DraftEntry leaves GrantStated false, and
+// MarshalDeployment omits the entire "grant" key whenever GrantStated is
+// false — see edit.go:174): install REGISTERS a package, it does not
+// authorize one to run — see manifest.DraftEntry's doc comment, which
+// enforces the same rule one layer down and offers no parameter to
+// override it either. The next step is `agent plugins grant`.
 //
 // With a non-empty --grant, the named capabilities must be EXACTLY the set
 // pm.Capabilities declares (not a subset — resolveInstallGrants refuses a
@@ -1137,7 +1192,7 @@ func newPluginsInstallCommand(out io.Writer) *cobra.Command {
 			"verifies its signature under the deployment's trust set (with it false, NOTHING is verified --\n" +
 			"only the wasm sha256 check runs, and the command's own output says so). Only once verification\n" +
 			"that DID run passes does it append an entry to plugins.json.\n\n" +
-			"With no --grant, the entry is written \"enabled\": false with an empty \"grant.capabilities\":\n" +
+			"With no --grant, the entry is written \"enabled\": false with NO \"grant\" block at all:\n" +
 			"install registers the package without authorizing it; run `agent plugins grant` to authorize it.\n\n" +
 			"With --grant naming EXACTLY the capabilities the plugin declares in plugin.json (not a subset --\n" +
 			"a partial grant would write an entry that can never load), the entry is written \"enabled\": true\n" +
@@ -1211,7 +1266,14 @@ func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag
 	// pre-existing deployment's, so it gets a remedy attached here rather
 	// than inside readPluginDeployment (status and reload keep the bare
 	// message; their context is "a deployment already exists").
-	existing, err := readPluginDeployment(cfg.Plugins.Manifest)
+	// existing and snapshot are read together, in one pass, by
+	// readPluginDeploymentWithSnapshot: existing is used below to build the
+	// updated document, and snapshot is what refusePluginDeploymentChanged
+	// compares the file against right before the write, to catch an edit
+	// that lands anywhere in the window this function is about to open --
+	// the fetch, unpack and signature verification below can take seconds
+	// to minutes under the configured limits.
+	existing, snapshot, err := readPluginDeploymentWithSnapshot(cfg.Plugins.Manifest)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf(`plugins install: %w; install will not create this file itself -- the `+
@@ -1219,15 +1281,6 @@ func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag
 				`content {"plugins": []} to start from an empty deployment`, err)
 		}
 		return err
-	}
-	// F5: snapshotted now, before the fetch below, so a re-read immediately
-	// before the write (see the re-read near AddEntry/WriteDeployment) can
-	// detect a concurrent edit made while this download was in flight and
-	// refuse to silently overwrite it from a stale copy. A byte comparison
-	// is sufficient; nothing here needs a lock.
-	snapshot, err := os.ReadFile(cfg.Plugins.Manifest)
-	if err != nil {
-		return fmt.Errorf("plugins install: snapshot plugin deployment manifest %q: %w", cfg.Plugins.Manifest, err)
 	}
 
 	// Rule 9: where a fetched package is written is a deployment decision, and
@@ -1337,28 +1390,14 @@ func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag
 		entry.GrantStated = true
 	}
 
-	// F5: existing was snapshotted above, before the fetch — a window that
-	// spans an entire artifact download, seconds to minutes under the
-	// configured limits, long enough for a hand edit or another `agent
-	// plugins grant`/`deny` to have changed plugins.json in the meantime.
-	// WriteDeployment is atomic but performs no compare-and-swap, so without
-	// this re-read a stale rewrite would silently revert that edit — both
-	// commands would report success and the next reload would quietly
-	// unmount or mount something nobody decided to. Refuse instead.
-	current, err := os.ReadFile(cfg.Plugins.Manifest)
-	if err != nil {
-		return fmt.Errorf("plugins install: re-read plugin deployment manifest %q before write: %w",
-			cfg.Plugins.Manifest, err)
-	}
-	if !bytes.Equal(snapshot, current) {
-		// %s, not %q: on Windows a %q-quoted path doubles every backslash,
-		// which would stop it matching a caller's raw path string built
-		// straight from filepath.Join -- unlike the wrapped-error case just
-		// above, there is no underlying *PathError here to carry a second,
-		// unquoted copy of the path along for free.
-		return fmt.Errorf(`plugins install: plugin deployment manifest %s changed while this package was `+
-			`downloading; refusing to overwrite that edit with a stale copy -- re-run "agent plugins `+
-			`install" to register the entry on top of the current state`, cfg.Plugins.Manifest)
+	// F5, shared with grant and deny via refusePluginDeploymentChanged (see
+	// its own doc comment for why this exists): existing/snapshot were
+	// captured together above, before the fetch — a window that spans an
+	// entire artifact download, seconds to minutes under the configured
+	// limits, long enough for a hand edit or another `agent plugins
+	// grant`/`deny` to have changed plugins.json in the meantime.
+	if err := refusePluginDeploymentChanged("plugins install", cfg.Plugins.Manifest, snapshot); err != nil {
+		return err
 	}
 
 	// Step 4b/4c: AddEntry is rule 6 (a duplicate name is refused, naming it)
@@ -1416,17 +1455,35 @@ func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag
 	return nil
 }
 
-// resolveInstallGrants parses --grant's comma-separated capability list and
-// checks it against pm.Capabilities, the plugin's OWN declaration in
-// plugin.json. An ABSENT flag (grantFlagChanged false) returns a nil slice,
-// which is what tells runPluginsInstall to leave DraftEntry's empty
-// Grant.Capabilities exactly as it drafted it rather than overwrite it with
-// another empty one. An EXPLICITLY EMPTY flag (grantFlagChanged true, but
-// nothing but whitespace after trimming — "--grant" or "--grant   ") is
-// refused rather than silently treated the same as absent: a malformed flag
-// value is not the same as an absent one, and grantFlagChanged is what lets
-// this function tell the two apart. "--grant log,,http" is refused the same
-// way, by the per-field empty check below, regardless of grantFlagChanged.
+// resolveInstallGrants parses --grant's comma-separated capability list via
+// splitFlagList — the SAME helper resolveGrantCapabilities uses via `agent
+// plugins grant` — and checks the result against pm.Capabilities, the
+// plugin's OWN declaration in plugin.json.
+//
+// Sharing splitFlagList here is SHOULD-FIX-1's fix: resolveInstallGrants
+// used to split "--grant" with its own inline strings.Split and never
+// refused a repeated name, so `--grant log,log` on a plugin declaring only
+// "log" used to SUCCEED and write the literal repeated list
+// ["log","log"] to plugins.json — nothing downstream complains
+// (validateCapabilities checks names only, reconcileCapabilities builds a
+// set), so the garbage was permanent and invisible, while the identical
+// input to `agent plugins grant --capabilities log,log` was already refused
+// by splitFlagList's own duplicate check (NOTE-7). The two commands
+// validate one concept; they must not validate it two different ways.
+//
+// An ABSENT flag (grantFlagChanged false) returns a nil slice, which is what
+// tells runPluginsInstall to leave DraftEntry's empty Grant.Capabilities
+// exactly as it drafted it rather than overwrite it with another empty one.
+// An EXPLICITLY EMPTY flag (grantFlagChanged true, but nothing but
+// whitespace after trimming — "--grant" or "--grant   ") is refused rather
+// than silently treated the same as absent: a malformed flag value is not
+// the same as an absent one, and grantFlagChanged is what lets this
+// function tell the two apart. This whole-flag-empty case has to be checked
+// here, before splitFlagList ever runs, because splitFlagList itself treats
+// an all-whitespace value as "no items" (returns nil, nil) rather than an
+// error — only this caller has grantFlagChanged to tell an absent flag from
+// a present-but-empty one apart. "--grant log,,http" is refused the same
+// way splitFlagList refuses it for grant, by its own per-field empty check.
 //
 // The two sets — what --grant names and what pm.Capabilities declares — must
 // be EQUAL, not merely "--grant is a subset of what's declared". Every named
@@ -1442,6 +1499,20 @@ func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag
 // This mirrors `agent plugins grant`'s resolveGrantCapabilities exactly —
 // same contract, so which command an operator used never changes whether a
 // plugin's declared capabilities can install-then-fail-to-mount.
+//
+// Finally (SHOULD-FIX-4): --grant only ever fills Grant.Capabilities —
+// AllowedHosts and AllowedPaths are left nil, exactly like a freshly
+// drafted entry's own zero value. AssembleSpec intersects declared against
+// granted (assemble.go:234-235) and an EMPTY intersection is legal there
+// (see AssembleSpec's own doc comment), so granting "http" or "fs" here on
+// a plugin that itself declares a non-empty allowed_hosts/allowed_paths
+// would mount the plugin with that capability true and an allowlist
+// reaching nothing — every outbound call denied by perm.Grant after the
+// next reload, with nothing in install's own output, status output or the
+// log saying why. This is the identical failure shape
+// resolveGrantAllowedHosts/resolveGrantAllowedPaths were written to prevent
+// on the grant path — caught there, left open here until now. Refuse it
+// here too, naming the remaining `agent plugins grant` step.
 func resolveInstallGrants(grantFlag string, grantFlagChanged bool, pm manifest.PluginManifest) ([]string, error) {
 	trimmed := strings.TrimSpace(grantFlag)
 	if trimmed == "" {
@@ -1452,19 +1523,16 @@ func resolveInstallGrants(grantFlag string, grantFlagChanged bool, pm manifest.P
 		}
 		return nil, nil
 	}
-	fields := strings.Split(trimmed, ",")
-	grants := make([]string, 0, len(fields))
-	for _, field := range fields {
-		capability := strings.TrimSpace(field)
-		if capability == "" {
-			return nil, fmt.Errorf(`plugins install: --grant %q contains an empty capability name`, grantFlag)
-		}
+	grants, err := splitFlagList("plugins install", "grant", grantFlag)
+	if err != nil {
+		return nil, err
+	}
+	for _, capability := range grants {
 		if !slices.Contains(pm.Capabilities, capability) {
 			return nil, fmt.Errorf("plugins install: --grant names capability %q, which plugin %q does not "+
 				"declare in plugin.json (it declares: %v); granting a capability the plugin did not ask for "+
 				"is a config error, not generosity", capability, pm.Name, pm.Capabilities)
 		}
-		grants = append(grants, capability)
 	}
 
 	// F1: require the two sets to be EQUAL — see the doc comment above for
@@ -1480,6 +1548,22 @@ func resolveInstallGrants(grantFlag string, grantFlagChanged bool, pm manifest.P
 			"plugin.json; a partial grant produces an entry the deployment can never load (every declared "+
 			"capability must be granted, not a subset) -- name the complete list, or omit --grant to install "+
 			"without authorizing it", grantFlag, missing, pm.Name)
+	}
+
+	// SHOULD-FIX-4 — see the doc comment above.
+	if slices.Contains(grants, "http") && len(pm.Network.AllowedHosts) > 0 {
+		return nil, fmt.Errorf(`plugins install: --grant names "http", but plugin %q declares `+
+			`"network"."allowed_hosts" in plugin.json (%v); --grant only fills capabilities, not allowed `+
+			`hosts, so this would authorize http with an allowlist that reaches nothing -- omit --grant to `+
+			`install without authorizing it, then run "agent plugins grant %s --capabilities ... `+
+			`--allowed-hosts ..." to authorize it with the hosts named too`, pm.Name, pm.Network.AllowedHosts, pm.Name)
+	}
+	if slices.Contains(grants, "fs") && len(pm.Filesystem.AllowedPaths) > 0 {
+		return nil, fmt.Errorf(`plugins install: --grant names "fs", but plugin %q declares `+
+			`"filesystem"."allowed_paths" in plugin.json (%v); --grant only fills capabilities, not allowed `+
+			`paths, so this would authorize fs with an allowlist that reaches nothing -- omit --grant to `+
+			`install without authorizing it, then run "agent plugins grant %s --capabilities ... `+
+			`--allowed-paths ..." to authorize it with the paths named too`, pm.Name, pm.Filesystem.AllowedPaths, pm.Name)
 	}
 	return grants, nil
 }
@@ -1565,7 +1649,13 @@ func runPluginsGrant(ctx context.Context, out io.Writer, nameArg, capabilitiesFl
 			`to authorize`)
 	}
 
-	existing, err := readPluginDeployment(cfg.Plugins.Manifest)
+	// existing and snapshot are read together, in one pass -- snapshot is
+	// what refusePluginDeploymentChanged compares the file against right
+	// before the write below, to catch an edit that lands anywhere in the
+	// window this function is about to open: resolvePluginPackageDir just
+	// below can perform a full artifact download on a cache miss, a window
+	// as long as install's own fetch (BLOCKING-1).
+	existing, snapshot, err := readPluginDeploymentWithSnapshot(cfg.Plugins.Manifest)
 	if err != nil {
 		return err
 	}
@@ -1609,6 +1699,15 @@ func runPluginsGrant(ctx context.Context, out io.Writer, nameArg, capabilitiesFl
 		return err
 	}
 
+	// BLOCKING-1: existing/snapshot were captured together above, before
+	// resolvePluginPackageDir's possible download and before LoadPackage --
+	// see refusePluginDeploymentChanged's own doc comment for why this
+	// check exists and why it is shared with install and deny rather than
+	// reimplemented per command.
+	if err := refusePluginDeploymentChanged("plugins grant", cfg.Plugins.Manifest, snapshot); err != nil {
+		return err
+	}
+
 	updated, err := manifest.UpdateEntry(existing, name, func(e manifest.Entry) (manifest.Entry, error) {
 		e.Enabled = true
 		e.GrantStated = true
@@ -1630,7 +1729,22 @@ func runPluginsGrant(ctx context.Context, out io.Writer, nameArg, capabilitiesFl
 	if len(capabilities) > 0 {
 		description = "capabilities: " + strings.Join(capabilities, ", ")
 	}
-	if _, err := fmt.Fprintf(out, "granted %q (%s); run `agent plugins reload` to apply.\n", name, description); err != nil {
+	// SHOULD-FIX-5: grant replaces the WHOLE GrantDecl every time, and
+	// --allowed-hosts/--allowed-paths default to empty, so a re-grant that
+	// only names --capabilities silently wipes a previously granted
+	// allowlist. Naming the EFFECTIVE hosts and paths here -- including
+	// "none" when there are none -- is how an operator notices that before
+	// the next reload denies every request, instead of after.
+	hostsDescription := "none"
+	if len(hosts) > 0 {
+		hostsDescription = strings.Join(hosts, ", ")
+	}
+	pathsDescription := "none"
+	if len(paths) > 0 {
+		pathsDescription = strings.Join(paths, ", ")
+	}
+	if _, err := fmt.Fprintf(out, "granted %q (%s; allowed hosts: %s; allowed paths: %s); run `agent plugins "+
+		"reload` to apply.\n", name, description, hostsDescription, pathsDescription); err != nil {
 		return fmt.Errorf("write plugins grant output: %w", err)
 	}
 	return nil
@@ -1939,6 +2053,17 @@ func newPluginsDenyCommand(out io.Writer) *cobra.Command {
 // context.Background() instead (SHOULD-FIX-5), which would have made it the
 // one subcommand that could not be cancelled if config.Load ever grew an I/O
 // timeout or a remote config source.
+// pluginsDenyConcurrentEditTestHook, when non-nil, is called by
+// runPluginsDeny right after it snapshots the deployment manifest and
+// before it checks the snapshot for a concurrent edit (BLOCKING-1). deny,
+// unlike install and grant, performs no blocking I/O of its own between
+// those two points, so a test has no naturally-occurring window to land a
+// concurrent edit inside deterministically the way
+// TestPluginsInstallRefusesAConcurrentEditDuringTheDownload stands one up
+// inside an HTTP handler its fetch blocks on -- this hook is deny's
+// equivalent seam. Left nil outside tests; production code never sets it.
+var pluginsDenyConcurrentEditTestHook func()
+
 func runPluginsDeny(ctx context.Context, out io.Writer, nameArg, configPath string) error {
 	name := strings.TrimSpace(nameArg)
 	if name == "" {
@@ -1954,8 +2079,20 @@ func runPluginsDeny(ctx context.Context, out io.Writer, nameArg, configPath stri
 			`to deny`)
 	}
 
-	existing, err := readPluginDeployment(cfg.Plugins.Manifest)
+	// existing and snapshot are read together, in one pass -- snapshot is
+	// what refusePluginDeploymentChanged compares the file against right
+	// before the write below (BLOCKING-1). deny loads no package and makes
+	// no network call, so this window is far shorter than install's or
+	// grant's, but the shape -- and the guard -- is identical; see
+	// refusePluginDeploymentChanged's own doc comment.
+	existing, snapshot, err := readPluginDeploymentWithSnapshot(cfg.Plugins.Manifest)
 	if err != nil {
+		return err
+	}
+	if pluginsDenyConcurrentEditTestHook != nil {
+		pluginsDenyConcurrentEditTestHook()
+	}
+	if err := refusePluginDeploymentChanged("plugins deny", cfg.Plugins.Manifest, snapshot); err != nil {
 		return err
 	}
 	updated, err := manifest.UpdateEntry(existing, name, func(e manifest.Entry) (manifest.Entry, error) {
