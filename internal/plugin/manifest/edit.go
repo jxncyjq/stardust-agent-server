@@ -166,13 +166,30 @@ func MarshalDeployment(dep Deployment) ([]byte, error) {
 // a Name, bypassing AddEntry) leaves path completely untouched.
 //
 // The write itself is atomic: a temp file is created beside path, in the
-// same directory (so the final rename is a same-filesystem move, which is
-// atomic with respect to a concurrent reader on every platform this package
-// runs on), written and synced, and then renamed over path. A process
-// killed at any point before the rename leaves path exactly as it was
-// before the call; a process killed during or after the rename leaves path
-// holding either the old document or the complete new one, never a
+// same directory (so the final rename is a same-filesystem move), written
+// and synced, chmod'd to match path's existing permission bits (or 0644 if
+// path does not exist yet — os.CreateTemp always creates the temp file mode
+// 0600, and skipping this step would silently narrow path's permissions to
+// 0600 on every write, an operator-visible regression on any platform whose
+// permission bits are actually enforced), and then renamed over path. A
+// process killed at any point before the rename leaves path exactly as it
+// was before the call; a process killed during or after the rename leaves
+// path holding either the old document or the complete new one, never a
 // half-written mixture that the next startup would fail to parse.
+//
+// The rename's atomicity with respect to a concurrent reader is
+// platform-dependent. On Linux and macOS, rename(2) does not care whether
+// another process holds path open, so a concurrent reader always observes
+// either the complete old document or the complete new one, never a
+// mixture, and the rename itself cannot fail because of that reader. On
+// Windows, a reader that has path open (even just for reading, without
+// FILE_SHARE_DELETE) can make the rename fail outright with an
+// access-denied error; WriteDeployment then returns that error and leaves
+// path holding its old content rather than silently replacing it out from
+// under the reader — see internal/approval/toolgate_store.go's mu field
+// comment for the same NTFS behavior elsewhere in this repo. A caller that
+// expects WriteDeployment to succeed while another process may have path
+// open for reading must account for this platform difference.
 func WriteDeployment(path string, dep Deployment) (err error) {
 	data, merr := MarshalDeployment(dep)
 	if merr != nil {
@@ -215,6 +232,17 @@ func WriteDeployment(path string, dep Deployment) (err error) {
 	if cerr := tmp.Close(); cerr != nil {
 		return fmt.Errorf("write deployment manifest %q: close temp file %q: %w", path, tmpPath, cerr)
 	}
+
+	mode := fs.FileMode(0o644)
+	if info, statErr := os.Stat(path); statErr == nil {
+		mode = info.Mode().Perm()
+	} else if !errors.Is(statErr, fs.ErrNotExist) {
+		return fmt.Errorf("write deployment manifest %q: stat existing file for its permissions: %w", path, statErr)
+	}
+	if cherr := os.Chmod(tmpPath, mode); cherr != nil {
+		return fmt.Errorf("write deployment manifest %q: set mode on temp file %q: %w", path, tmpPath, cherr)
+	}
+
 	if rerr := os.Rename(tmpPath, path); rerr != nil {
 		return fmt.Errorf("write deployment manifest %q: rename temp file into place: %w", path, rerr)
 	}

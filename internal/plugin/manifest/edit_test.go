@@ -1,10 +1,14 @@
 package manifest
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"testing"
 )
 
@@ -21,14 +25,19 @@ func sampleEntry(name string) Entry {
 
 // requireDeploymentsEquivalent asserts got and want hold the same plugins in
 // the same order, comparing every Entry field, with one deliberate
-// exception: Config is compared by decoded JSON value rather than by raw
+// exception: Config is compared after json.Compact rather than by raw
 // bytes. json.MarshalIndent reformats an embedded json.RawMessage's
 // whitespace to match its surrounding indentation (a compact
 // {"project": "LEGION"} fixture value re-encodes with newlines and
 // two-space indentation) even though the value it encodes never changes;
-// comparing raw bytes here would fail on that harmless reformatting and, by
-// forcing this helper to special-case it away entirely, mask a real
-// Config-preservation bug at the same time.
+// comparing raw bytes here would fail on that harmless reformatting.
+// json.Compact removes only insignificant whitespace — it does not touch
+// numbers or reorder keys — so this still catches real corruption that a
+// decode-into-`any`-then-compare would hide: unmarshaling JSON into `any`
+// turns every number into float64, so a 20-digit id losing precision (or a
+// key silently dropped) would decode to something reflect.DeepEqual still
+// calls equal. Comparing decoded values is what would mask a defect here;
+// comparing compacted bytes is what avoids it.
 func requireDeploymentsEquivalent(t *testing.T, got, want Deployment) {
 	t.Helper()
 	if len(got.Plugins) != len(want.Plugins) {
@@ -55,14 +64,14 @@ func rawMessageEquivalent(t *testing.T, a, b json.RawMessage) bool {
 	if len(a) == 0 || len(b) == 0 {
 		return false
 	}
-	var av, bv any
-	if err := json.Unmarshal(a, &av); err != nil {
-		t.Fatalf("unmarshal Config %s: %v", a, err)
+	var ac, bc bytes.Buffer
+	if err := json.Compact(&ac, a); err != nil {
+		t.Fatalf("compact Config %s: %v", a, err)
 	}
-	if err := json.Unmarshal(b, &bv); err != nil {
-		t.Fatalf("unmarshal Config %s: %v", b, err)
+	if err := json.Compact(&bc, b); err != nil {
+		t.Fatalf("compact Config %s: %v", b, err)
 	}
-	return reflect.DeepEqual(av, bv)
+	return bytes.Equal(ac.Bytes(), bc.Bytes())
 }
 
 // --- Rule 1: AddEntry on a duplicate name errors, naming the name ---------
@@ -113,6 +122,36 @@ func TestUpdateEntry_MutatesNamedEntry_LeavesOthersUntouched(t *testing.T) {
 	// The caller's Deployment must be left untouched.
 	if dep.Plugins[1].Enabled {
 		t.Errorf("UpdateEntry mutated the caller's Deployment")
+	}
+}
+
+// TestUpdateEntry_MutateError_WrapsAndReturnsWithoutModifyingDep covers the
+// forward path UpdateEntry's own doc comment promises but which nothing
+// previously exercised: "If mutate itself returns an error, UpdateEntry
+// wraps and returns it without modifying dep." A caller (Task 4's grant
+// authorization) relies on exactly this path to reject an ungranted
+// capability from inside mutate, so an UpdateEntry that silently discarded
+// mutate's error would let that rejection vanish with every other test
+// still green.
+func TestUpdateEntry_MutateError_WrapsAndReturnsWithoutModifyingDep(t *testing.T) {
+	dep := Deployment{Plugins: []Entry{sampleEntry("legion-jira"), sampleEntry("legion-notify")}}
+	sentinel := errors.New("mutate refused: capability not granted")
+
+	_, err := UpdateEntry(dep, "legion-notify", func(Entry) (Entry, error) {
+		return Entry{}, sentinel
+	})
+	if err == nil {
+		t.Fatalf("UpdateEntry: want an error when mutate fails, got nil")
+	}
+	if !errors.Is(err, sentinel) {
+		t.Errorf("UpdateEntry error = %v, want it to wrap the sentinel error (errors.Is)", err)
+	}
+	requireErrorContains(t, err, "legion-notify")
+
+	// dep itself, and both of its entries, must be left untouched.
+	if !reflect.DeepEqual(dep.Plugins[0], sampleEntry("legion-jira")) ||
+		!reflect.DeepEqual(dep.Plugins[1], sampleEntry("legion-notify")) {
+		t.Errorf("UpdateEntry modified dep despite mutate returning an error")
 	}
 }
 
@@ -219,6 +258,44 @@ func TestMarshalDeployment_RoundTrip_PreservesExplicitEnabledFalse(t *testing.T)
 	}
 }
 
+// TestMarshalDeployment_RoundTrip_PreservesRemoteEntryDigest covers the
+// entry shape neither round-trip test above does: a REMOTE entry carrying a
+// Digest. The repo fixture and the hand-built Deployment above both use
+// only local entries (validateEntrySource forbids a local entry from
+// carrying a Digest at all), so a MarshalDeployment change that dropped
+// Digest on encode would have gone uncaught — the same digest Task 3's
+// install path writes into every remote entry it produces.
+func TestMarshalDeployment_RoundTrip_PreservesRemoteEntryDigest(t *testing.T) {
+	original := Deployment{
+		Plugins: []Entry{
+			{
+				Name:    "legion-remote",
+				Source:  "https://plugins.example.com/legion-remote.tar.gz",
+				Digest:  "sha256:" + validSHA256,
+				Enabled: true,
+				Grant:   GrantDecl{Capabilities: []string{"http"}},
+				Tools:   []ToolAccept{{Name: "fetch_thing"}},
+			},
+		},
+	}
+
+	marshaled, err := MarshalDeployment(original)
+	if err != nil {
+		t.Fatalf("MarshalDeployment: %v", err)
+	}
+
+	roundTripped, err := ParseDeployment(marshaled)
+	if err != nil {
+		t.Fatalf("ParseDeployment(MarshalDeployment(original)): %v\nmarshaled:\n%s", err, marshaled)
+	}
+
+	requireDeploymentsEquivalent(t, roundTripped, original)
+
+	if got, want := roundTripped.Plugins[0].Digest, original.Plugins[0].Digest; got != want {
+		t.Fatalf("Digest = %q after a Marshal/Parse round trip, want %q\nmarshaled:\n%s", got, want, marshaled)
+	}
+}
+
 // --- Rule 5: WriteDeployment writes atomically -----------------------------
 
 // TestWriteDeployment_WriteThenReadBack_RoundTrips is the happy-path
@@ -270,7 +347,18 @@ func TestWriteDeployment_WriteThenReadBack_RoundTrips(t *testing.T) {
 // — so it would succeed and silently replace path's content out from under
 // the very reader holding it open: precisely the failure mode a temp file
 // plus rename exists to rule out.
+//
+// This mechanism is Windows NTFS specific: POSIX rename(2) does not care
+// whether another process holds the destination open, so held would not
+// block the rename on Linux or macOS and the assertion below would never
+// fire there — this test is skipped on those platforms in favor of
+// TestWriteDeployment_CannotCreateTempFile_LeavesPathUntouched, which
+// guards the same rule with a mechanism that actually fails on them.
 func TestWriteDeployment_FailedWriteLeavesPathUntouched(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("forced-rename-failure mechanism is Windows NTFS specific")
+	}
+
 	dir := t.TempDir()
 	path := filepath.Join(dir, "plugins.json")
 	original := Deployment{Plugins: []Entry{sampleEntry("legion-jira")}}
@@ -300,6 +388,138 @@ func TestWriteDeployment_FailedWriteLeavesPathUntouched(t *testing.T) {
 	if string(after) != string(before) {
 		t.Fatalf("WriteDeployment changed %s despite failing to write it:\nbefore:\n%s\nafter:\n%s",
 			path, before, after)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir %s: %v", dir, err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "plugins.json" {
+		t.Fatalf("directory after the failed write = %v, want exactly [plugins.json] (no leftover temp file)",
+			entries)
+	}
+}
+
+// TestWriteDeployment_CannotCreateTempFile_LeavesPathUntouched is rule 5's
+// platform-independent companion to
+// TestWriteDeployment_FailedWriteLeavesPathUntouched above: it forces the
+// write to fail by a mechanism that works the same way on every POSIX
+// platform this package's tests run on, so rule 5 has a working assertion
+// on Linux — the only platform CI actually runs this package's tests on —
+// where the held-open-handle mechanism above does not apply.
+//
+// Removing dir's write bit means os.CreateTemp can no longer create a new
+// file there (adding a directory entry needs write permission on the
+// directory itself, not on any file inside it), so a correctly atomic
+// WriteDeployment must fail before it ever touches path, leaving path
+// holding whatever it held before. A mutated WriteDeployment that instead
+// wrote directly into path (os.WriteFile(path, data, ...), or
+// os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, ...) then Write) would not need
+// to create anything in dir at all: truncating and rewriting an EXISTING
+// file only needs write permission on the file itself, which this test
+// deliberately leaves untouched — so that mutation succeeds here and
+// silently replaces path's content, exactly the defect rule 5 exists to
+// rule out. This is what makes the test genuinely redden under the
+// direct-write mutation on Linux, rather than merely failing early for an
+// unrelated reason the way making path itself a directory would (a direct
+// write into a directory fails too, so that shape cannot tell the two
+// implementations apart).
+//
+// Skipped on Windows: os.Chmod does not restrict directory writes there, so
+// this mechanism has no effect on that platform — Windows already has its
+// own dedicated test above.
+func TestWriteDeployment_CannotCreateTempFile_LeavesPathUntouched(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("os.Chmod does not restrict directory writes on Windows; see TestWriteDeployment_FailedWriteLeavesPathUntouched")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "plugins.json")
+	original := Deployment{Plugins: []Entry{sampleEntry("legion-jira")}}
+	if err := WriteDeployment(path, original); err != nil {
+		t.Fatalf("seed WriteDeployment: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read seeded %s: %v", path, err)
+	}
+
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatalf("chmod %s to read-only: %v", dir, err)
+	}
+	defer func() {
+		// Restore before t.TempDir()'s own cleanup tries to remove dir,
+		// which needs write permission on it to unlink plugins.json.
+		if err := os.Chmod(dir, 0o755); err != nil {
+			t.Fatalf("restore chmod on %s: %v", dir, err)
+		}
+	}()
+
+	replacement := Deployment{Plugins: []Entry{sampleEntry("legion-notify")}}
+	if err := WriteDeployment(path, replacement); err == nil {
+		t.Fatalf("WriteDeployment succeeded with %s not writable; want an error from the blocked temp-file create",
+			dir)
+	}
+
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s after the failed write: %v", path, err)
+	}
+	if string(after) != string(before) {
+		t.Fatalf("WriteDeployment changed %s despite failing to write it:\nbefore:\n%s\nafter:\n%s",
+			path, before, after)
+	}
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir %s: %v", dir, err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "plugins.json" {
+		t.Fatalf("directory after the failed write = %v, want exactly [plugins.json] (no leftover temp file)",
+			entries)
+	}
+}
+
+// TestWriteDeployment_PreservesExistingFilePermissions is SHOULD-FIX-4's
+// regression test: os.CreateTemp always creates its temp file mode 0600,
+// and without an explicit chmod before the rename, path's mode would
+// silently narrow to 0600 on every write regardless of what it was before.
+// plugins.json is operator-managed config, often git-controlled and
+// sometimes read by a different service identity than the one running
+// "agent plugins install" — a silent permission narrowing produces no error
+// at write time and only surfaces later as an access failure somewhere else
+// entirely.
+//
+// Gated to non-Windows: Windows does not expose the POSIX-style permission
+// bits this test asserts on (chmod there mostly toggles the read-only
+// attribute), so there is nothing meaningful to assert there.
+func TestWriteDeployment_PreservesExistingFilePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not enforce the POSIX permission bits this test asserts on")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "plugins.json")
+	dep := Deployment{Plugins: []Entry{sampleEntry("legion-jira")}}
+	if err := WriteDeployment(path, dep); err != nil {
+		t.Fatalf("seed WriteDeployment: %v", err)
+	}
+	if err := os.Chmod(path, 0o640); err != nil {
+		t.Fatalf("chmod %s: %v", path, err)
+	}
+
+	replacement := Deployment{Plugins: []Entry{sampleEntry("legion-notify")}}
+	if err := WriteDeployment(path, replacement); err != nil {
+		t.Fatalf("WriteDeployment: %v", err)
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat %s: %v", path, err)
+	}
+	if got, want := info.Mode().Perm(), fs.FileMode(0o640); got != want {
+		t.Fatalf("mode of %s after WriteDeployment = %v, want %v (os.CreateTemp's 0600 must not silently "+
+			"replace the target's existing permission bits)", path, got, want)
 	}
 }
 
