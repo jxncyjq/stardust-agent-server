@@ -213,6 +213,23 @@ func (f *pluginFixture) signPackage(source string, priv ed25519.PrivateKey) {
 	}
 }
 
+// signPackageWithAnyKey signs the package at source with a freshly generated
+// key pair that is never registered in any keyring, and writes plugin.sig
+// beside it via signPackage. It is for a test whose deployment does not
+// require, or does not care about, signature verification but still needs a
+// plugin.sig file physically present: archivePackage requires all three
+// files fetch.Unpack insists an archive holds, plugin.sig among them,
+// regardless of whether the deployment ever checks it.
+func (f *pluginFixture) signPackageWithAnyKey(source string) {
+	f.t.Helper()
+
+	_, priv, err := sign.GenerateKey()
+	if err != nil {
+		f.t.Fatalf("GenerateKey: %v", err)
+	}
+	f.signPackage(source, priv)
+}
+
 // jsonString quotes s as a JSON string literal, so a Windows temp path's
 // backslashes reach the decoder escaped rather than as broken escapes.
 func jsonString(s string) string {
@@ -3220,5 +3237,443 @@ func TestAssemblePluginsFetchesUnderTheConfiguredByteCap(t *testing.T) {
 	}
 	if toolauth.IsGateable(testEchoTool) {
 		t.Errorf("IsGateable(%q) = true, want false: nothing may mount from a download that was refused", testEchoTool)
+	}
+}
+
+// --- agent plugins install --------------------------------------------------
+
+// writeInstallConfig writes the fixture's agent.json with a plugin cache
+// configured (which `agent plugins install` requires) and plaintext sources
+// allowed, since serveArchive and serveNotFound only ever serve http. A test
+// that wants a DIFFERENT remote policy — no cache, no insecure sources —
+// calls writeSignatureConfig directly instead, the same way the assembly
+// tests above do.
+func (f *pluginFixture) writeInstallConfig(policy signaturePolicy, cacheDir string) {
+	f.t.Helper()
+
+	f.writeSignatureConfig(30_000, policy,
+		fmt.Sprintf("\"cache\": %s", jsonString(cacheDir)),
+		`"allow_insecure_sources": true`)
+}
+
+// readDeployment re-reads and parses the fixture's plugins.json from disk —
+// not what a test just wrote in memory, but what `agent plugins install`
+// actually left behind.
+func (f *pluginFixture) readDeployment() manifest.Deployment {
+	f.t.Helper()
+
+	data, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		f.t.Fatalf("read plugins.json %s: %v", f.manifestPath, err)
+	}
+	dep, err := manifest.ParseDeployment(data)
+	if err != nil {
+		f.t.Fatalf("parse plugins.json %s: %v", f.manifestPath, err)
+	}
+	return dep
+}
+
+// requireEntry returns the entry named name from dep, failing the test
+// immediately if none exists.
+func (f *pluginFixture) requireEntry(dep manifest.Deployment, name string) manifest.Entry {
+	f.t.Helper()
+
+	for _, entry := range dep.Plugins {
+		if entry.Name == name {
+			return entry
+		}
+	}
+	f.t.Fatalf("plugins.json has no entry named %q (have: %v)", name, dep.Plugins)
+	return manifest.Entry{}
+}
+
+// TestPluginsInstallLeavesPluginsJSONByteForByteUnchangedWhenSignatureVerificationFails
+// is rule 1, the core invariant of `agent plugins install`: nothing is ever
+// written to plugins.json before manifest.LoadPackage's signature check has
+// passed. The fetched package here is deliberately left unsigned (signPackage
+// is never called) under a keyring that requires a signature, so LoadPackage
+// refuses it — and plugins.json must come out of the call exactly as it went
+// in, not merely "no error was able to change it", the actual bytes.
+func TestPluginsInstallLeavesPluginsJSONByteForByteUnchangedWhenSignatureVerificationFails(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	// The keyring trusts ONE key (registered under testPluginKeyID). The
+	// package below is signed under the SAME key id, by a DIFFERENT, untrusted
+	// key pair — a signature that is present, well-formed, and refused, not
+	// merely absent. archivePackage requires a plugin.sig file to exist
+	// (it is one of the three files fetch.Unpack insists an archive holds), so
+	// an untrusted-but-present signature is how this test reaches LoadPackage's
+	// verification failure through the full fetch -> cache -> load pipeline.
+	_, keyringPath := f.newKeyring("keyring.json")
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", nil, []string{testEchoTool})
+	_, untrustedPriv, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	f.signPackage("staging", untrustedPriv)
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeInstallConfig(signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(true)}, cacheDir)
+	f.writeManifest()
+
+	before, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json before install: %v", err)
+	}
+
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest)
+	if err == nil {
+		t.Fatalf("plugins install output = %q, error = nil, want an error: the package is signed by a key "+
+			"this deployment's keyring does not trust", out)
+	}
+	if !strings.Contains(err.Error(), "signature") {
+		t.Errorf("plugins install error = %v, want it to name the signature verification failure", err)
+	}
+
+	after, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json after install: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("plugins.json changed after a failed signature verification:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+// TestPluginsInstallLeavesNothingBehindOnADigestMismatch is rule 2: a fetched
+// package whose bytes do not match --digest never reaches plugins.json, and
+// (since fetch.Fetch never returns unverified bytes to its caller)
+// remote.Cache.Put is never even called, so nothing is left in the plugin
+// cache directory either.
+func TestPluginsInstallLeavesNothingBehindOnADigestMismatch(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", nil, []string{testEchoTool})
+	f.signPackageWithAnyKey("staging")
+	archive := f.archivePackage("staging")
+	srv := serveArchive(t, archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
+	f.writeManifest()
+
+	before, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json before install: %v", err)
+	}
+
+	wrongDigest := digestOfArchive([]byte("not the archive that was actually served"))
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", wrongDigest)
+	if err == nil {
+		t.Fatalf("plugins install output = %q, error = nil, want an error: the digest does not match the "+
+			"fetched bytes", out)
+	}
+	if !strings.Contains(err.Error(), "digest mismatch") {
+		t.Errorf("plugins install error = %v, want it to report a digest mismatch", err)
+	}
+
+	after, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json after install: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("plugins.json changed after a digest mismatch:\nbefore=%s\nafter=%s", before, after)
+	}
+
+	entries, err := os.ReadDir(cacheDir)
+	if err != nil {
+		t.Fatalf("read plugin cache dir %s: %v", cacheDir, err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("plugin cache dir %s has %d entries after a digest mismatch, want 0: nothing may reach the "+
+			"cache from a fetch that was never verified", cacheDir, len(entries))
+	}
+}
+
+// TestPluginsInstallRefusesAMissingDigest is rule 3: a remote entry always
+// requires a digest, and install offers no "install now, verify later" hatch
+// — the command refuses before ever resolving a config or building a request.
+func TestPluginsInstallRefusesAMissingDigest(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
+	f.writeManifest()
+
+	out, err := f.run("install", "https://example.invalid/echo.tgz")
+	if err == nil {
+		t.Fatalf("plugins install output = %q, error = nil, want an error: --digest is required", out)
+	}
+	if !strings.Contains(err.Error(), "--digest") {
+		t.Errorf("plugins install error = %v, want it to name --digest", err)
+	}
+}
+
+// TestPluginsInstallWithoutGrantRegistersWithNoCapabilitiesAndStaysDisabled is
+// rule 4: with no --grant, the written entry has empty capabilities AND
+// "enabled": false, and the command's own output tells the operator plainly
+// that the plugin is registered but not authorized, naming both `agent
+// plugins grant` and `agent plugins reload` as the remaining steps.
+func TestPluginsInstallWithoutGrantRegistersWithNoCapabilitiesAndStaysDisabled(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.signPackageWithAnyKey("staging")
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
+	f.writeManifest()
+
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest)
+	if err != nil {
+		t.Fatalf("plugins install error = %v, want nil", err)
+	}
+	if !strings.Contains(out, "NOT authorized") {
+		t.Errorf("plugins install output = %q, want it to say the entry is registered but NOT authorized", out)
+	}
+	if !strings.Contains(out, "agent plugins grant") || !strings.Contains(out, "agent plugins reload") {
+		t.Errorf("plugins install output = %q, want it to name both `agent plugins grant` and `agent plugins "+
+			"reload` as the remaining steps", out)
+	}
+
+	entry := f.requireEntry(f.readDeployment(), testEchoPlugin)
+	if entry.Enabled {
+		t.Errorf("entry.Enabled = true, want false: install must never authorize a plugin to run")
+	}
+	if len(entry.Grant.Capabilities) != 0 {
+		t.Errorf("entry.Grant.Capabilities = %v, want empty: --grant was not given", entry.Grant.Capabilities)
+	}
+}
+
+// TestPluginsInstallRefusesAGrantForAnUndeclaredCapability is rule 5:
+// granting a capability the plugin's own plugin.json never declared is a
+// config error, not generosity, and it must be refused by name — with
+// nothing written to plugins.json, since the refusal happens after
+// verification but before DraftEntry/AddEntry/WriteDeployment ever run.
+func TestPluginsInstallRefusesAGrantForAnUndeclaredCapability(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.signPackageWithAnyKey("staging")
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
+	f.writeManifest()
+
+	before, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json before install: %v", err)
+	}
+
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "http")
+	if err == nil {
+		t.Fatalf("plugins install output = %q, error = nil, want an error: the plugin only declares \"log\"", out)
+	}
+	if !strings.Contains(err.Error(), "http") {
+		t.Errorf("plugins install error = %v, want it to name the undeclared capability %q", err, "http")
+	}
+	if !strings.Contains(err.Error(), testEchoPlugin) {
+		t.Errorf("plugins install error = %v, want it to name the plugin %q", err, testEchoPlugin)
+	}
+
+	after, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json after install: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("plugins.json changed after a refused --grant:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+// TestPluginsInstallRefusesADuplicateName is rule 6, inherited from
+// manifest.AddEntry (Task 2): an entry already named in plugins.json is left
+// alone, and the operator is pointed at `agent plugins grant` or a manual
+// edit instead of having their existing authorization decision silently
+// erased.
+func TestPluginsInstallRefusesADuplicateName(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", nil, []string{testEchoTool})
+	f.signPackageWithAnyKey("staging")
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "already-here", enabled: false, tools: []string{testEchoTool},
+	})
+
+	before, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json before install: %v", err)
+	}
+
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest)
+	if err == nil {
+		t.Fatalf("plugins install output = %q, error = nil, want an error: %q is already in plugins.json",
+			out, testEchoPlugin)
+	}
+	if !strings.Contains(err.Error(), testEchoPlugin) {
+		t.Errorf("plugins install error = %v, want it to name the existing entry %q", err, testEchoPlugin)
+	}
+
+	after, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json after install: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("plugins.json changed after a refused duplicate install:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+// TestPluginsInstallRefusesAnUnconfiguredManifest is rule 7: install needs a
+// desired-state manifest to register the new entry into, and refuses,
+// naming the setting, rather than inventing a location of its own.
+func TestPluginsInstallRefusesAnUnconfiguredManifest(t *testing.T) {
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{"storage": {"driver": "memory"}}`), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	out := &bytes.Buffer{}
+	err := Execute(app.New(), out, []string{"plugins", "install", "https://example.invalid/echo.tgz",
+		"--digest", digestOfArchive([]byte("x")), "--config", configPath})
+	if err == nil {
+		t.Fatalf("plugins install output = %q, error = nil, want an error: no plugins.manifest is configured",
+			out.String())
+	}
+	if !strings.Contains(err.Error(), "plugins.manifest") {
+		t.Errorf("plugins install error = %v, want it to name plugins.manifest", err)
+	}
+}
+
+// TestPluginsInstallRefusesAPlaintextSourceByDefault is rule 8 (added by the
+// brief, not the plan): a plaintext http:// source is refused BEFORE
+// fetching, the same way (*loader.Loader).remoteDir refuses one already
+// deployed. The source names a domain ("example.invalid") that will never
+// resolve, so if the refusal were checked too late — after a request was
+// already attempted — this test would fail on a DNS error instead of the
+// expected message, which is exactly how a regression here would be caught.
+func TestPluginsInstallRefusesAPlaintextSourceByDefault(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	// Deliberately no "allow_insecure_sources" -- the safe default.
+	f.writeSignatureConfig(30_000, signaturePolicy{requireSignature: boolPtr(false)},
+		fmt.Sprintf("\"cache\": %s", jsonString(cacheDir)))
+	f.writeManifest()
+
+	source := "http://example.invalid/echo.tgz"
+	out, err := f.run("install", source, "--digest", digestOfArchive([]byte("x")))
+	if err == nil {
+		t.Fatalf("plugins install output = %q, error = nil, want an error: plaintext is refused by default", out)
+	}
+	if !strings.Contains(err.Error(), source) {
+		t.Errorf("plugins install error = %v, want it to name the offending URL %s", err, source)
+	}
+	if !strings.Contains(err.Error(), "allow_insecure_sources") {
+		t.Errorf("plugins install error = %v, want it to name the switch that turns plaintext on", err)
+	}
+}
+
+// TestPluginsInstallRefusesAnUnconfiguredCache is rule 9 (added by the brief,
+// not the plan): a remote package has to be written somewhere, and install
+// will not pick a location on the operator's behalf any more than
+// (*loader.Loader).remoteDir does for an already-deployed entry.
+func TestPluginsInstallRefusesAnUnconfiguredCache(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	// Deliberately no "cache" key at all.
+	f.writeSignatureConfig(30_000, signaturePolicy{requireSignature: boolPtr(false)})
+	f.writeManifest()
+
+	source := "https://example.invalid/echo.tgz"
+	out, err := f.run("install", source, "--digest", digestOfArchive([]byte("x")))
+	if err == nil {
+		t.Fatalf("plugins install output = %q, error = nil, want an error: no plugins.cache is configured", out)
+	}
+	if !strings.Contains(err.Error(), "plugins.cache") {
+		t.Errorf("plugins install error = %v, want it to name plugins.cache", err)
+	}
+	if !strings.Contains(err.Error(), source) {
+		t.Errorf("plugins install error = %v, want it to name the source %s", err, source)
+	}
+}
+
+// TestPluginsInstallAndServeAgreeOnCacheAndTrustSettings is the reuse
+// invariant the brief calls out by name: install resolves its cache, HTTP
+// client, fetch/unpack limits and remote-source policy through
+// resolvePluginRemote, and its trust set through resolvePluginKeyring — the
+// same two functions newPluginLoader calls to build the loader `agent serve`
+// runs. If install derived its own copies of either, a package could install
+// cleanly through this command and then have serve refuse to fetch or load
+// it, with the contradiction invisible in both commands' output.
+//
+// This test installs a package with --grant pre-filling one declared
+// capability (the entry still comes out disabled — install never authorizes
+// a plugin to run), then hand-authorizes it the way `agent plugins grant`
+// will (Task 4, not built yet): flip "enabled" to true, leaving everything
+// install wrote untouched. It then runs the SAME assembly `agent serve`
+// runs, against the SAME config. That assembly re-resolves the cache and the
+// trust set from scratch — it only succeeds, and only mounts the plugin, if
+// its resolution of both agrees with what install already used.
+func TestPluginsInstallAndServeAgreeOnCacheAndTrustSettings(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	priv, keyringPath := f.newKeyring("keyring.json")
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.signPackage("staging", priv)
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeInstallConfig(signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(true)}, cacheDir)
+	f.writeManifest()
+
+	if _, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "log"); err != nil {
+		t.Fatalf("plugins install error = %v, want nil", err)
+	}
+
+	dep := f.readDeployment()
+	entry := f.requireEntry(dep, testEchoPlugin)
+	if entry.Enabled {
+		t.Fatalf("entry.Enabled = true right after install, want false")
+	}
+	if len(entry.Grant.Capabilities) != 1 || entry.Grant.Capabilities[0] != "log" {
+		t.Fatalf(`entry.Grant.Capabilities = %v, want ["log"] pre-filled by --grant`, entry.Grant.Capabilities)
+	}
+
+	// install already filed the package under the path resolvePluginRemote
+	// resolves for this exact "cache" setting. If serve's assembly resolved a
+	// DIFFERENT path, this file would not be sitting here.
+	cached := filepath.Join(cacheDir, "sha256", strings.TrimPrefix(digest, "sha256:"))
+	for _, name := range remotePluginPackageFiles {
+		if _, err := os.Stat(filepath.Join(cached, name)); err != nil {
+			t.Errorf("stat %s in the cache install populated: %v", name, err)
+		}
+	}
+
+	dep, err := manifest.UpdateEntry(dep, testEchoPlugin, func(e manifest.Entry) (manifest.Entry, error) {
+		e.Enabled = true
+		return e, nil
+	})
+	if err != nil {
+		t.Fatalf("UpdateEntry: %v", err)
+	}
+	if err := manifest.WriteDeployment(f.manifestPath, dep); err != nil {
+		t.Fatalf("WriteDeployment: %v", err)
+	}
+
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil: serve must resolve the same cache and trust set "+
+			"install used", err)
+	}
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = false after serve assembly, want true: serve should have mounted the "+
+			"plugin install registered", testEchoTool)
+	}
+	out, err := f.run("status")
+	if err != nil {
+		t.Fatalf("plugins status error = %v, want nil", err)
+	}
+	if !strings.Contains(out, "loaded") || !strings.Contains(out, testEchoPlugin) {
+		t.Fatalf("plugins status output = %q, want the entry mounted", out)
 	}
 }

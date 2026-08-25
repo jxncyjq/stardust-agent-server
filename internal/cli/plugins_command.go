@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -588,7 +589,7 @@ func readPluginDeployment(path string) (manifest.Deployment, error) {
 }
 
 // newPluginsCommand builds `agent plugins`, the operator's handle on the WASM
-// plugin deployment. Its four subcommands fall into two groups that share
+// plugin deployment. Its five subcommands fall into two groups that share
 // nothing but the noun:
 //
 //   - status and reload are a view of THIS PROCESS: both read the loader serve
@@ -596,19 +597,29 @@ func readPluginDeployment(path string) (manifest.Deployment, error) {
 //     belongs to the serve that built it, so running them against a process
 //     that never assembled one reports exactly that instead of an empty answer
 //     that reads like "no plugins".
-//   - keygen and sign touch no loader, no config and no running service. They
-//     are the tools that PRODUCE what verification consumes, and they ship
-//     alongside it deliberately: a deployment that can check signatures but
-//     has no way to make one has exactly one option left, turning the
-//     requirement off, which is the outcome signature verification exists to
-//     prevent.
+//   - keygen, sign and install touch no loader and start no running service —
+//     that is what puts install in this group rather than the one above, and
+//     nothing else about it resembles keygen or sign. keygen and sign touch no
+//     config either: they are the tools that PRODUCE what verification
+//     consumes, and they ship alongside it deliberately — a deployment that
+//     can check signatures but has no way to make one has exactly one option
+//     left, turning the requirement off, which is the outcome signature
+//     verification exists to prevent. install is the odd member: it DOES read
+//     the plugins config (to resolve the same cache, fetch limits,
+//     remote-source policy and trust set a running serve would use — see
+//     resolvePluginRemote and resolvePluginKeyring) and it DOES write the
+//     deployment manifest, appending one verified, still-disabled entry to
+//     plugins.json. That is a REGISTRATION on disk, not a start: nothing it
+//     does reaches a running process until `agent plugins reload`, which is
+//     the only reason it is not grouped with status and reload instead.
 func newPluginsCommand(application *app.App, out io.Writer) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "plugins",
-		Short: "Inspect and reload the WASM plugin deployment, and sign plugin packages",
+		Short: "Inspect, install and reload the WASM plugin deployment, and sign plugin packages",
 	}
 	cmd.AddCommand(newPluginsStatusCommand(application, out))
 	cmd.AddCommand(newPluginsReloadCommand(application, out))
+	cmd.AddCommand(newPluginsInstallCommand(out))
 	cmd.AddCommand(newPluginsKeygenCommand(out))
 	cmd.AddCommand(newPluginsSignCommand(out))
 	return cmd
@@ -993,6 +1004,283 @@ func writePluginStatus(w io.Writer, manifestPath, root string, rows []pluginStat
 		}
 	}
 	return nil
+}
+
+// --- install -----------------------------------------------------------
+
+// newPluginsInstallCommand builds `agent plugins install <url>`, which
+// fetches, verifies and registers a remote plugin package WITHOUT
+// authorizing it to run.
+//
+// Order of operations, exactly as runPluginsInstall performs it and not
+// negotiable (see its doc comment for why):
+//
+//  1. fetch.Fetch — the digest gates the bytes; mismatched bytes never reach
+//     disk.
+//  2. remote.Cache.Put — unpack and atomic placement in the plugin cache.
+//  3. manifest.LoadPackage(dir, keyring) — SIGNATURE VERIFICATION. Nothing
+//     past this step runs if it fails.
+//  4. manifest.DraftEntry -> manifest.AddEntry -> manifest.WriteDeployment.
+//
+// Nothing is ever written to plugins.json before step 3 succeeds: a
+// verification failure — bad signature, a missing one under a required
+// policy, or a digest mismatch caught even earlier, in step 1 — leaves the
+// deployment manifest byte-for-byte untouched, and leaves nothing behind in
+// the plugin cache either.
+//
+// install shares its cache, HTTP client, fetch/unpack limits and
+// insecure-source policy with a running serve through resolvePluginRemote,
+// and its trust set through resolvePluginKeyring — the same two functions
+// newPluginLoader calls to build the loader `agent serve` runs. Deriving its
+// own copies of either here would let a package install cleanly through this
+// command and then have serve refuse to fetch or load it, with the
+// contradiction invisible in both commands' output.
+//
+// The written entry is always "enabled": false, whether or not --grant is
+// given: install REGISTERS a package, it never authorizes one to run — see
+// manifest.DraftEntry's doc comment, which enforces the same rule one layer
+// down and offers no parameter to override it either. Its
+// "grant.capabilities" is empty unless --grant names capabilities, in which
+// case each one is checked against the plugin's own plugin.json declaration
+// and, once checked, pre-filled into the entry — the entry still does not
+// run until `agent plugins grant` (or a hand edit) flips "enabled" to true.
+//
+// install does not reload a running service, and does not need one to exist:
+// it edits the deployment manifest on disk. Run `agent plugins reload` to
+// converge a running serve onto the manifest this command just changed —
+// and note that an entry install just wrote is enabled:false, so a reload
+// alone will not mount it; `agent plugins grant` is the remaining step.
+func newPluginsInstallCommand(out io.Writer) *cobra.Command {
+	var configPath string
+	var digestFlag string
+	var grantFlag string
+	cmd := &cobra.Command{
+		Use:   "install <url>",
+		Short: "Fetch, verify and register a remote plugin package without authorizing it to run",
+		Long: "Fetch, verify and register a remote plugin package without authorizing it to run.\n\n" +
+			"install fetches the package at <url>, checks its bytes against --digest, unpacks it into the\n" +
+			"configured plugin cache, and verifies its signature under the deployment's trust set. Only once\n" +
+			"that verification passes does it append an entry to plugins.json: \"enabled\": false always, and\n" +
+			"an empty \"grant.capabilities\" unless --grant names capabilities the plugin itself declares in\n" +
+			"plugin.json, which are then pre-filled in (the entry stays disabled either way).\n\n" +
+			"install never reloads a running service and never authorizes the plugin to run: run\n" +
+			"`agent plugins grant` to authorize the entry, then `agent plugins reload` to converge it.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runPluginsInstall(cmd.Context(), out, args[0], digestFlag, grantFlag, configPath)
+		},
+	}
+	cmd.Flags().StringVar(&digestFlag, "digest", "",
+		`sha256 digest the fetched package must match, as "sha256:<hex>" (required: a remote entry is `+
+			"never installed unverified)")
+	cmd.Flags().StringVar(&grantFlag, "grant", "",
+		"comma-separated capabilities to pre-fill into the entry's grant; each must be a capability the "+
+			"plugin itself declares, and the entry stays disabled either way")
+	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file")
+	return cmd
+}
+
+// runPluginsInstall is newPluginsInstallCommand's RunE body. See that
+// command's doc comment for the order of operations this function follows
+// and why it is not negotiable.
+func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag, grantFlag, configPath string) error {
+	source := strings.TrimSpace(sourceArg)
+	if source == "" {
+		return errors.New("plugins install: the source URL is empty")
+	}
+	digest := strings.TrimSpace(digestFlag)
+	if digest == "" {
+		return errors.New(`plugins install: --digest is empty; a remote plugin entry requires a sha256 digest, ` +
+			`and this command will not install a package now and verify it later`)
+	}
+
+	cfg, err := config.Load(ctx, config.Options{Path: configPath})
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(cfg.Plugins.Manifest) == "" {
+		return errors.New(`plugins install: no "plugins.manifest" is configured, so install has no ` +
+			`desired-state manifest to register this plugin's entry into; configure "plugins.manifest" first`)
+	}
+
+	// A minimal Entry built only to classify source (IsRemote, IsInsecureSource,
+	// RemoteURL) exactly the way a deployed entry's Source is classified
+	// everywhere else in this package — see manifest.Entry's doc comment. Its
+	// Digest is left unset: classification does not need it, and setting it
+	// here would risk this probe silently absorbing a validation DraftEntry is
+	// supposed to be the one to perform, later, on the real entry.
+	probe := manifest.Entry{Source: source}
+	if !probe.IsRemote() {
+		return fmt.Errorf(`plugins install: source %q is not an http:// or https:// URL; this command only `+
+			"installs from a remote source (add a local package directly to the deployment manifest instead)",
+			source)
+	}
+
+	// Read before anything is fetched: a manifest this package cannot read
+	// back is a foundational problem this command should report cheaply,
+	// before spending a network round trip and a cache write on a package
+	// whose entry could never be appended to it anyway.
+	existing, err := readPluginDeployment(cfg.Plugins.Manifest)
+	if err != nil {
+		return err
+	}
+
+	// Rule 9: where a fetched package is written is a deployment decision, and
+	// this command will not pick one on the operator's behalf any more than
+	// (*loader.Loader).remoteDir does (loader.go's remoteDir carries the same
+	// refusal and the wording below stays consistent with it).
+	if strings.TrimSpace(cfg.Plugins.Cache) == "" {
+		return fmt.Errorf(`plugins install: source %q is remote, but this deployment configured no `+
+			`"plugins.cache" directory; a fetched package has to be written somewhere, and this process will `+
+			`not pick that location itself (configure "plugins.cache", or install the plugin under `+
+			`"plugins.root" instead)`, source)
+	}
+	// The ONLY sanctioned constructor for the cache, HTTP client, fetch/unpack
+	// limits and insecure-source policy — see resolvePluginRemote's own doc
+	// comment. Routing through it here is what guarantees this command and a
+	// running serve agree on every one of those.
+	remote, err := resolvePluginRemote(cfg.Plugins)
+	if err != nil {
+		return err
+	}
+
+	// Rule 8, and it runs BEFORE fetch.Fetch is ever called: remoteDir
+	// (loader.go) enforces the identical refusal on a manifest entry that is
+	// already deployed, and install has to enforce it here too, or it becomes
+	// the hole around that check — an operator could install over plaintext
+	// through this command and only discover at `agent plugins reload` that
+	// the running deployment refuses to fetch it.
+	if probe.IsInsecureSource() && !remote.AllowInsecureSources {
+		return fmt.Errorf(`plugins install: source %q is plaintext http, which this deployment does not `+
+			`permit; plugin artifacts are fetched over https, and plaintext is a debugging aid that has to be `+
+			`turned on explicitly with "allow_insecure_sources": true in the plugins config`, source)
+	}
+
+	// The ONLY sanctioned constructor for the trust set — see
+	// resolvePluginKeyring's own doc comment. The second return value (a
+	// keyring that loaded but is not enforced) is discarded rather than
+	// warned about: newPluginLoader's Warn is written once, at the assembly
+	// that actually drops it, and install neither builds nor holds a Loader.
+	keyring, _, err := resolvePluginKeyring(cfg.Plugins)
+	if err != nil {
+		return err
+	}
+
+	u, err := probe.RemoteURL()
+	if err != nil {
+		return fmt.Errorf("plugins install: %w", err)
+	}
+
+	// Step 1: the digest gates the bytes. A digest mismatch — or any other
+	// fetch failure — returns here with nothing written anywhere: Fetch never
+	// touches the filesystem, so there is nothing in the cache to clean up,
+	// and nothing below this line runs to touch plugins.json.
+	archive, err := fetch.Fetch(ctx, remote.Client, u, digest, remote.FetchLimits)
+	if err != nil {
+		return fmt.Errorf("plugins install: %w", err)
+	}
+	// Step 2: unpack and atomic placement under the digest that names it.
+	dir, err := remote.Cache.Put(digest, archive, remote.UnpackLimits)
+	if err != nil {
+		return fmt.Errorf("plugins install: %w", err)
+	}
+	// Step 3: SIGNATURE VERIFICATION. Rule 1 — the core invariant of this
+	// whole command — is that plugins.json is byte-for-byte unchanged when
+	// this fails, which holds simply because nothing below this line has run
+	// yet: no Deployment has been mutated, and WriteDeployment has not been
+	// called.
+	pm, _, err := manifest.LoadPackage(dir, keyring)
+	if err != nil {
+		return fmt.Errorf("plugins install: %w", err)
+	}
+
+	// Rule 5: granting a capability the plugin never declared is a config
+	// error, not generosity. Checked before DraftEntry so a bad --grant never
+	// reaches plugins.json either.
+	grants, err := resolveInstallGrants(grantFlag, pm)
+	if err != nil {
+		return err
+	}
+
+	// Step 4a: the draft. DraftEntry alone decides Name (from pm.Name, never
+	// from anything this command was given) and Tools; it always produces
+	// Enabled: false and empty Grant.Capabilities, with no parameter to
+	// override either — see its own doc comment.
+	entry, err := manifest.DraftEntry(pm, source, digest)
+	if err != nil {
+		return fmt.Errorf("plugins install: %w", err)
+	}
+	// --grant is applied here, in this command's own code, deliberately not
+	// inside DraftEntry: DraftEntry's refusal to accept an authorization
+	// parameter is what forces this override to happen somewhere visible and
+	// reviewable rather than inside a helper every caller reaches for. Enabled
+	// is left exactly as DraftEntry set it — false — regardless of grants:
+	// install registers a package, it does not authorize one to run.
+	if len(grants) > 0 {
+		entry.Grant.Capabilities = grants
+	}
+
+	// Step 4b/4c: AddEntry is rule 6 (a duplicate name is refused, naming it)
+	// and WriteDeployment is the atomic, self-verifying write Task 2 built.
+	// Both run only now, after every verification above has passed.
+	updated, err := manifest.AddEntry(existing, entry)
+	if err != nil {
+		return fmt.Errorf("plugins install: %w", err)
+	}
+	if err := manifest.WriteDeployment(cfg.Plugins.Manifest, updated); err != nil {
+		return fmt.Errorf("plugins install: %w", err)
+	}
+
+	if len(grants) > 0 {
+		if _, err := fmt.Fprintf(out, "installed %q (version %s) from %s, with capabilities pre-granted: %s.\n",
+			pm.Name, pm.Version, source, strings.Join(grants, ", ")); err != nil {
+			return fmt.Errorf("write plugins install output: %w", err)
+		}
+	} else if _, err := fmt.Fprintf(out, "installed %q (version %s) from %s, with no capabilities granted.\n",
+		pm.Name, pm.Version, source); err != nil {
+		return fmt.Errorf("write plugins install output: %w", err)
+	}
+	if _, err := fmt.Fprintf(out, "the entry is registered but NOT authorized to run (\"enabled\": false in "+
+		"%s); run `agent plugins grant %s` to authorize it, then `agent plugins reload` to apply.\n",
+		cfg.Plugins.Manifest, pm.Name); err != nil {
+		return fmt.Errorf("write plugins install output: %w", err)
+	}
+	return nil
+}
+
+// resolveInstallGrants parses --grant's comma-separated capability list and
+// checks every entry against pm.Capabilities, the plugin's OWN declaration in
+// plugin.json. An empty grantFlag returns a nil slice, which is what tells
+// runPluginsInstall to leave DraftEntry's empty Grant.Capabilities exactly as
+// it drafted it rather than overwrite it with another empty one.
+//
+// Every named capability must be one pm declares: granting a capability the
+// plugin never asked for is a config error, not generosity, and the error
+// names both the capability and the plugin's actual declaration so the
+// operator does not have to go looking for plugin.json to see what was
+// available. An empty item — "--grant log,,http", or "--grant " with nothing
+// after it — is refused by name rather than silently dropped: a malformed
+// flag value is not the same as an absent one.
+func resolveInstallGrants(grantFlag string, pm manifest.PluginManifest) ([]string, error) {
+	trimmed := strings.TrimSpace(grantFlag)
+	if trimmed == "" {
+		return nil, nil
+	}
+	fields := strings.Split(trimmed, ",")
+	grants := make([]string, 0, len(fields))
+	for _, field := range fields {
+		capability := strings.TrimSpace(field)
+		if capability == "" {
+			return nil, fmt.Errorf(`plugins install: --grant %q contains an empty capability name`, grantFlag)
+		}
+		if !slices.Contains(pm.Capabilities, capability) {
+			return nil, fmt.Errorf("plugins install: --grant names capability %q, which plugin %q does not "+
+				"declare in plugin.json (it declares: %v); granting a capability the plugin did not ask for "+
+				"is a config error, not generosity", capability, pm.Name, pm.Capabilities)
+		}
+		grants = append(grants, capability)
+	}
+	return grants, nil
 }
 
 // --- keygen / sign ---------------------------------------------------------
