@@ -96,6 +96,68 @@ func TestDraftEntry_EmptyToolsErrors(t *testing.T) {
 	requireErrorContains(t, err, pm.Name)
 }
 
+// --- S1: DraftEntry enforces Entry's Source/Digest pairing rules ----------
+//
+// DraftEntry's doc comment promises the returned Entry honours Entry's own
+// Source/Digest pairing rules (see Source's and Digest's doc comments in
+// manifest.go). source and digest are the only untrusted, caller-computed
+// inputs DraftEntry takes, so every shape that ParseDeployment would later
+// refuse must already be refused here, naming the drafting step rather than
+// a parse failure one layer later. Each case below is one of the six shapes
+// the review's probe table found DraftEntry previously accepted silently.
+func TestDraftEntry_RejectsMismatchedSourceDigest(t *testing.T) {
+	cases := []struct {
+		name    string
+		source  string
+		digest  string
+		wantErr string
+	}{
+		{
+			name:    "remote with no digest",
+			source:  "https://example.com/plugin.wasm",
+			digest:  "",
+			wantErr: "is remote and has no digest",
+		},
+		{
+			name:    "local with digest",
+			source:  "plugins/legion-jira",
+			digest:  draftDigest,
+			wantErr: "is a local path",
+		},
+		{
+			name:    "foreign scheme file://",
+			source:  "file:///etc/passwd",
+			digest:  "",
+			wantErr: `names scheme "file"`,
+		},
+		{
+			name:    "empty source",
+			source:  "",
+			digest:  "",
+			wantErr: "source is empty",
+		},
+		{
+			name:    "malformed digest",
+			source:  "https://example.com/plugin.wasm",
+			digest:  "sha256:not-a-valid-digest",
+			wantErr: `is not "sha256:" followed by 64 hex digits`,
+		},
+		{
+			name:    "userinfo in URL",
+			source:  "https://user:pass@example.com/plugin.wasm",
+			digest:  draftDigest,
+			wantErr: "carries userinfo",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := DraftEntry(draftManifest(), tc.source, tc.digest)
+			requireErrorContains(t, err, tc.wantErr)
+		})
+	}
+}
+
 // --- Positive: full field-by-field assertion of the draft's content -------
 
 func TestDraftEntry_PopulatesAllFields(t *testing.T) {
@@ -120,5 +182,39 @@ func TestDraftEntry_PopulatesAllFields(t *testing.T) {
 	}
 	if !reflect.DeepEqual(entry, want) {
 		t.Errorf("DraftEntry(%+v, %q, %q) = %+v, want %+v", pm, source, draftDigest, entry, want)
+	}
+	// %+v renders both a nil slice and []string{} as "Capabilities:[]", so
+	// the DeepEqual failure above cannot distinguish "Grant never
+	// constructed" from "Grant constructed with a nil slice" — both would
+	// print identically to want's []string{}. Assert non-nil-ness
+	// explicitly so a regression to nil fails with a message that names the
+	// actual defect instead of looking like a framework bug.
+	if entry.Grant.Capabilities == nil {
+		t.Error("Grant.Capabilities is nil, want non-nil empty slice ([]string{}); " +
+			"nil marshals to \"capabilities\":null, but the deployment shape requires \"capabilities\":[]")
+	}
+}
+
+// --- S2: the documented local-source shape (empty digest) is covered ------
+
+func TestDraftEntry_LocalSourceEmptyDigest(t *testing.T) {
+	pm := draftManifest()
+
+	entry, err := DraftEntry(pm, "plugins/legion-jira", "")
+	if err != nil {
+		t.Fatalf("DraftEntry: unexpected error: %v", err)
+	}
+	if entry.Digest != "" {
+		t.Errorf("Digest = %q, want empty for a local source", entry.Digest)
+	}
+	if entry.IsRemote() {
+		t.Errorf("IsRemote() = true, want false for a local source")
+	}
+	if entry.Enabled != false {
+		t.Errorf("Enabled = %v, want false; install must never authorize a plugin to run", entry.Enabled)
+	}
+	if len(entry.Grant.Capabilities) != 0 {
+		t.Errorf("Grant.Capabilities = %v, want empty; a draft must not authorize any capability",
+			entry.Grant.Capabilities)
 	}
 }

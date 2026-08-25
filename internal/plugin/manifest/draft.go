@@ -7,8 +7,14 @@ import "fmt"
 // no filesystem, makes no request, and reads no config. Verifying pm is the
 // caller's job (see PluginManifest's doc comment); source and digest are
 // what the caller resolved the plugin's package to (a remote URL with its
-// sha256, or a local package path with an empty digest, matching Entry's
-// own Source/Digest pairing rules).
+// sha256, or a local package path with an empty digest), and DraftEntry
+// itself enforces that the pair matches Entry's own Source/Digest pairing
+// rules — a source and digest that do not pair (a foreign URL scheme, an
+// empty source, a remote source with no or malformed digest, a local
+// source carrying a digest, or a URL carrying userinfo) is refused here,
+// naming the drafting step, rather than accepted and left for
+// ParseDeployment to reject one layer later against a less actionable parse
+// failure.
 //
 // The draft is deliberately inert:
 //
@@ -27,12 +33,16 @@ import "fmt"
 //     identity.
 //
 // DraftEntry returns an error naming pm.Name if pm.Tools is empty: such a
-// plugin would be refused by AssembleSpec anyway (internal/plugin/manifest/
-// assemble.go), so failing here names the cause earlier and more
-// actionably.
+// plugin would already have been refused by ParsePlugin (manifest.go), so
+// an already-verified PluginManifest cannot trip this guard — it is kept as
+// defence in depth for a hand-built PluginManifest, failing here names the
+// cause earlier and more actionably than a later, unrelated failure would.
 func DraftEntry(pm PluginManifest, source, digest string) (Entry, error) {
 	if len(pm.Tools) == 0 {
 		return Entry{}, fmt.Errorf("draft entry for plugin %q: manifest declares no tools", pm.Name)
+	}
+	if source == "" {
+		return Entry{}, fmt.Errorf("draft entry for plugin %q: source is empty", pm.Name)
 	}
 
 	tools := make([]ToolAccept, len(pm.Tools))
@@ -40,12 +50,21 @@ func DraftEntry(pm PluginManifest, source, digest string) (Entry, error) {
 		tools[i] = ToolAccept{Name: tool.Name}
 	}
 
-	return Entry{
+	entry := Entry{
 		Name:    pm.Name,
 		Source:  source,
 		Digest:  digest,
 		Enabled: false,
 		Grant:   GrantDecl{Capabilities: []string{}},
 		Tools:   tools,
-	}, nil
+	}
+
+	if err := rejectForeignScheme(pm.Name, source); err != nil {
+		return Entry{}, fmt.Errorf("draft entry for plugin %q: %w", pm.Name, err)
+	}
+	if err := validateEntrySource(entry); err != nil {
+		return Entry{}, fmt.Errorf("draft entry for plugin %q: %w", pm.Name, err)
+	}
+
+	return entry, nil
 }
