@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/stardust/legion-agent/internal/plugin/consent"
@@ -9,6 +10,7 @@ import (
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
 	"github.com/stardust/legion-agent/internal/plugin/sign"
 	"github.com/stardust/legion-agent/internal/server"
+	"github.com/stardust/legion-agent/internal/taskgate"
 )
 
 // PluginConsentService is internal/cli's implementation of
@@ -197,4 +199,232 @@ func (s *PluginConsentService) resolveDeclaredPackageDir(ctx context.Context, en
 		return "", false, fmt.Errorf("plugin consent: resolve package directory for %q: %w", entry.Name, err)
 	}
 	return dir, true, nil
+}
+
+// pluginConsentActor labels every consent.* call Grant makes, so its error
+// messages point an operator at this endpoint rather than at
+// `agent plugins grant`.
+const pluginConsentGrantActor = "POST /v1/plugins/{name}/grant"
+
+// pluginConsentDenyActor is pluginConsentGrantActor's counterpart for Deny.
+const pluginConsentDenyActor = "POST /v1/plugins/{name}/deny"
+
+// Grant implements server.PluginConsent: it authorizes the deployment entry
+// named name to run with req's capabilities/allowed hosts/allowed paths,
+// following the same sequence `agent plugins grant` (runPluginsGrant) does,
+// step for step:
+//
+//  1. consent.ReadDeploymentWithSnapshot reads the target state and the
+//     exact bytes it came from.
+//  2. consent.FindEntry locates the entry -- an unknown name is refused
+//     here, before anything is loaded or fetched.
+//  3. resolvePluginPackageDir resolves the entry's package directory,
+//     fetching a remote one on a cache miss (unlike List's
+//     resolveDeclaredPackageDir, which a GET must never do -- see that
+//     function's own doc comment), and manifest.LoadPackage reads the
+//     plugin's OWN declaration. Because this either resolves a real
+//     directory or fails outright, there is no "we could not tell what it
+//     declares, so let the check pass" state for Grant to fall into: a
+//     resolution failure is reported as an ordinary write-failed error,
+//     with nothing written.
+//  4. consent.ResolveCapabilities / ResolveAllowedHosts / ResolveAllowedPaths
+//     / RefuseUnnamedAllowlist validate req against that declaration --
+//     entirely through consent.*, so this endpoint can never enforce a rule
+//     `agent plugins grant` does not also enforce.
+//  5. consent.RefuseDeploymentChanged re-checks the snapshot from step 1,
+//     catching an edit that landed in the window steps 3-4 opened.
+//  6. manifest.UpdateEntry + manifest.WriteDeployment write the grant to
+//     disk. Every error returned above this point leaves the manifest
+//     untouched; every path below it has already written.
+//  7. applyAndReport converges the loader and turns the outcome into the
+//     ConsentResult the four-outcome contract on server.ConsentResult
+//     describes.
+func (s *PluginConsentService) Grant(ctx context.Context, name string, req server.GrantRequest) (server.ConsentResult, error) {
+	pluginLoader := s.pluginsFn()
+	if pluginLoader == nil {
+		return server.ConsentResult{}, fmt.Errorf("plugin consent: no plugin loader attached to this process; " +
+			"plugins are assembled by `agent serve`, and a loader belongs to the service that built it")
+	}
+
+	dep, snapshot, err := consent.ReadDeploymentWithSnapshot(s.manifestPath)
+	if err != nil {
+		return server.ConsentResult{}, err
+	}
+	entry, err := consent.FindEntry(dep, name)
+	if err != nil {
+		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w", name, err)
+	}
+
+	dir, err := resolvePluginPackageDir(ctx, entry, s.remote, s.root)
+	if err != nil {
+		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w", name, err)
+	}
+	pm, _, err := manifest.LoadPackage(dir, s.keyringFn())
+	if err != nil {
+		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w", name, err)
+	}
+
+	capabilities, err := consent.ResolveCapabilities(pluginConsentGrantActor, req.Capabilities, pm)
+	if err != nil {
+		return server.ConsentResult{}, err
+	}
+	hosts, err := consent.ResolveAllowedHosts(pluginConsentGrantActor, req.AllowedHosts, pm)
+	if err != nil {
+		return server.ConsentResult{}, err
+	}
+	paths, err := consent.ResolveAllowedPaths(pluginConsentGrantActor, req.AllowedPaths, pm)
+	if err != nil {
+		return server.ConsentResult{}, err
+	}
+	if err := consent.RefuseUnnamedAllowlist(pluginConsentGrantActor, "capabilities", capabilities, pm, hosts, paths,
+		`name at least one of the declared hosts in "allowed_hosts" to authorize it with the hosts named too`,
+		`name at least one of the declared paths in "allowed_paths" to authorize it with the paths named too`,
+	); err != nil {
+		return server.ConsentResult{}, err
+	}
+
+	if err := consent.RefuseDeploymentChanged(pluginConsentGrantActor, s.manifestPath, snapshot); err != nil {
+		return server.ConsentResult{}, err
+	}
+
+	updated, err := manifest.UpdateEntry(dep, name, func(e manifest.Entry) (manifest.Entry, error) {
+		e.Enabled = true
+		e.GrantStated = true
+		e.Grant = manifest.GrantDecl{Capabilities: capabilities, AllowedHosts: hosts, AllowedPaths: paths}
+		return e, nil
+	})
+	if err != nil {
+		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w", name, err)
+	}
+	if err := manifest.WriteDeployment(s.manifestPath, updated); err != nil {
+		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w", name, err)
+	}
+
+	result, err := s.applyAndReport(ctx, pluginLoader, updated, name)
+	if err != nil {
+		return server.ConsentResult{}, err
+	}
+	// Grant, unlike Deny, always has pm in hand by this point -- LoadPackage
+	// above already succeeded, so the entry's declaration is genuinely
+	// resolved (never a cache-miss "we don't know" state; see step 3 in
+	// this method's own doc comment) and DeclaredUnresolved stays false.
+	result.View.DeclaredCaps = pm.Capabilities
+	result.View.DeclaredHosts = pm.Network.AllowedHosts
+	result.View.DeclaredPaths = pm.Filesystem.AllowedPaths
+	return result, nil
+}
+
+// Deny implements server.PluginConsent: it revokes the deployment entry
+// named name's authorization to run -- flips Enabled false, clears Grant,
+// but keeps GrantStated true (a decision WAS made, see
+// manifest.Entry.GrantStated) and leaves Source, Digest and Tools untouched
+// -- and converges, following the same shape `agent plugins deny`
+// (runPluginsDeny) does.
+//
+// Deny deliberately skips Grant's steps 3-4 (LoadPackage and the
+// capability/allowlist validation): it never loads the plugin's own
+// package, and never touches a running loader beyond the convergence at the
+// end. Revoking a plugin must not depend on that plugin's package still
+// being loadable -- a broken, tampered or now-unreachable package is
+// exactly the kind of entry an operator most needs to be able to deny, and
+// making that depend on a clean LoadPackage would defeat the point.
+//
+// Because Deny never resolves the plugin's declaration, it has no pm to
+// report Declared* fields from. Reporting them as empty-but-resolved would
+// misrepresent "Deny didn't look" as "this plugin declares nothing" (see
+// server.PluginView.DeclaredUnresolved's own doc comment for why those two
+// states must stay distinguishable), so the returned View is marked
+// DeclaredUnresolved unconditionally instead.
+func (s *PluginConsentService) Deny(ctx context.Context, name string) (server.ConsentResult, error) {
+	pluginLoader := s.pluginsFn()
+	if pluginLoader == nil {
+		return server.ConsentResult{}, fmt.Errorf("plugin consent: no plugin loader attached to this process; " +
+			"plugins are assembled by `agent serve`, and a loader belongs to the service that built it")
+	}
+
+	dep, snapshot, err := consent.ReadDeploymentWithSnapshot(s.manifestPath)
+	if err != nil {
+		return server.ConsentResult{}, err
+	}
+	if _, err := consent.FindEntry(dep, name); err != nil {
+		return server.ConsentResult{}, fmt.Errorf("plugin consent: deny %q: %w", name, err)
+	}
+	if err := consent.RefuseDeploymentChanged(pluginConsentDenyActor, s.manifestPath, snapshot); err != nil {
+		return server.ConsentResult{}, err
+	}
+
+	updated, err := manifest.UpdateEntry(dep, name, func(e manifest.Entry) (manifest.Entry, error) {
+		e.Enabled = false
+		e.GrantStated = true
+		e.Grant = manifest.GrantDecl{}
+		// Source, Digest and Tools are left exactly as they were: deny
+		// revokes authorization, it does not throw away the registration.
+		return e, nil
+	})
+	if err != nil {
+		return server.ConsentResult{}, fmt.Errorf("plugin consent: deny %q: %w", name, err)
+	}
+	if err := manifest.WriteDeployment(s.manifestPath, updated); err != nil {
+		return server.ConsentResult{}, fmt.Errorf("plugin consent: deny %q: %w", name, err)
+	}
+
+	result, err := s.applyAndReport(ctx, pluginLoader, updated, name)
+	if err != nil {
+		return server.ConsentResult{}, err
+	}
+	result.View.DeclaredUnresolved = true
+	return result, nil
+}
+
+// applyAndReport converges pluginLoader toward dep (which the caller has
+// already written to disk) and turns the outcome into a ConsentResult per
+// the four-outcome contract server.ConsentResult documents. It is called
+// only AFTER Grant/Deny's own write has already succeeded, so every error
+// it can still report is the "entry vanished from its own deployment"
+// invariant violation at the bottom -- a genuine write failure is reported
+// by the caller, earlier, before applyAndReport is ever invoked.
+//
+// ld.Apply's error is deliberately NOT surfaced as-is: the disk write
+// already landed, so — per taskgate.ApplyAtBoundary's own doc comment —
+// this is never "nothing happened". It is either "not applied yet"
+// (Apply's error wraps context.DeadlineExceeded/context.Canceled from a
+// boundary wait that timed out or was cancelled, or taskgate.ErrApplyPending
+// / taskgate.ErrApplyInProgress from a concurrent apply already holding the
+// gate) or "applied, and THIS entry's own state in the loader's Status() is
+// the honest answer" — which covers both a clean convergence and this
+// entry specifically failing to activate, and also covers an unrelated
+// entry failing while this one converged fine: Apply's error can name
+// either, and only Status() says which one this entry got.
+func (s *PluginConsentService) applyAndReport(ctx context.Context, pluginLoader *loader.Loader, dep manifest.Deployment, name string) (server.ConsentResult, error) {
+	applyErr := pluginLoader.Apply(ctx, dep, s.root)
+	if applyErr != nil && (errors.Is(applyErr, context.DeadlineExceeded) ||
+		errors.Is(applyErr, context.Canceled) ||
+		errors.Is(applyErr, taskgate.ErrApplyPending) ||
+		errors.Is(applyErr, taskgate.ErrApplyInProgress)) {
+		return server.ConsentResult{PendingConvergence: true, ConvergenceDetail: applyErr.Error()}, nil
+	}
+
+	entry, err := consent.FindEntry(dep, name)
+	if err != nil {
+		return server.ConsentResult{}, fmt.Errorf(
+			"plugin consent: entry %q vanished from its own deployment between write and status read: %w", name, err)
+	}
+	view := server.PluginView{
+		Name:         name,
+		GrantedCaps:  entry.Grant.Capabilities,
+		GrantedHosts: entry.Grant.AllowedHosts,
+		GrantedPaths: entry.Grant.AllowedPaths,
+	}
+	for _, row := range mergePluginStatus(dep, pluginLoader.Status()) {
+		if row.Name != name {
+			continue
+		}
+		view.Version, view.State, view.Detail, view.Tools = row.Version, row.State, row.Detail, row.Tools
+		return server.ConsentResult{View: view}, nil
+	}
+	// mergePluginStatus emits exactly one row per dep.Plugins entry (see its
+	// own doc comment), and consent.FindEntry just above proved name is one
+	// of them -- reaching here means that invariant broke.
+	return server.ConsentResult{}, fmt.Errorf(
+		"plugin consent: entry %q produced no status row after converging; this should be unreachable", name)
 }

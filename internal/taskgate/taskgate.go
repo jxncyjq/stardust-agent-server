@@ -15,12 +15,18 @@ import (
 // the two deserve different responses, and only the caller knows which.
 var ErrApplyPending = errors.New("a plugin change is waiting for a task boundary")
 
-// errApplyInProgress is what a second, overlapping ApplyAtBoundary reports.
+// ErrApplyInProgress is what a second, overlapping ApplyAtBoundary reports.
 // The convergence belongs to the first caller: a second one that returned nil
 // would claim an apply it never performed, and one that shared the first's
 // pending flag would clear it while the first was still inside fn — reopening
 // the gate mid-apply, which is exactly what this type exists to prevent.
-var errApplyInProgress = errors.New("another plugin change is already being applied")
+//
+// It is exported (originally errApplyInProgress) so a caller outside this
+// package can distinguish "another apply is already running" from a genuine
+// convergence failure via errors.Is — internal/cli's plugin consent service
+// needs exactly that distinction to report the "convergence did not happen"
+// outcome instead of misreporting it as a converged, failed entry.
+var ErrApplyInProgress = errors.New("another plugin change is already being applied")
 
 // TaskGate serializes plugin changes against task boundaries: a task that has
 // started keeps the capability catalog it started with, and a new target state
@@ -265,7 +271,7 @@ func (g *TaskGate) beginApply() (<-chan struct{}, error) {
 	defer g.mu.Unlock()
 
 	if g.pending {
-		return nil, fmt.Errorf("apply plugin change at task boundary: %w", errApplyInProgress)
+		return nil, fmt.Errorf("apply plugin change at task boundary: %w", ErrApplyInProgress)
 	}
 	g.pending = true
 	g.idle = make(chan struct{})

@@ -15,6 +15,19 @@ const (
 	// sensitive deployment configuration that restriction exists to protect,
 	// and Task 3 adds mutating grant/deny actions on this same resource.
 	ActionReadPlugin Action = "read_plugin"
+
+	// ActionWritePlugin is authorizing or revoking a plugin's capabilities
+	// (POST /v1/plugins/{name}/grant and .../deny). It is deliberately
+	// granted to NEITHER the operator NOR the viewer role below: unlike the
+	// read actions, which every operator carries alongside audit/quality/
+	// task/workflow, a grant/deny call changes what code is allowed to run
+	// with what capabilities -- the same security boundary
+	// consent.ResolveCapabilities and its siblings exist to protect on the
+	// validation side. Restricting the write action to admin is the
+	// conservative default for a boundary this sensitive; widening it to
+	// operator is a deliberate future decision, not an oversight to "fix"
+	// by adding it to the operator case below.
+	ActionWritePlugin Action = "write_plugin"
 )
 
 type Resource string
