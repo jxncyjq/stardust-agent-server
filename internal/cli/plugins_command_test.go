@@ -4927,15 +4927,23 @@ func TestPluginsInstallRefusesAnFSGrantWithoutAllowedPaths(t *testing.T) {
 // line now names the effective hosts and paths, including "none" when there
 // are none, so an operator sees the loss before the next reload denies
 // every request rather than after.
+//
+// The plugin here declares "log" only, not "http": NEW-1's shared guard
+// (refuseUnnamedAllowlist) now refuses re-granting "http" without naming any
+// of a non-empty declared allowed_hosts (see
+// TestPluginsGrantRefusesAnHTTPCapabilityWithoutAllowedHosts), so a re-grant
+// that silently wipes a host is only reachable when the capability gating
+// that host is not itself being (re-)granted -- which is exactly what this
+// case exercises.
 func TestPluginsGrantSuccessLineNamesTheEffectiveHostsAndPaths(t *testing.T) {
 	f := newPluginFixture(t, 30_000)
-	f.writePackageWithNetwork("echo", testEchoWasm, testEchoPlugin, "1.2.0", []string{"log", "http"}, []string{testEchoTool},
+	f.writePackageWithNetwork("echo", testEchoWasm, testEchoPlugin, "1.2.0", []string{"log"}, []string{testEchoTool},
 		manifest.Network{AllowedHosts: []string{"example.com"}}, manifest.Filesystem{})
 	f.writeManifest(manifestEntry{
 		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
 	})
 
-	out, err := f.run("grant", testEchoPlugin, "--capabilities", "log,http", "--allowed-hosts", "example.com")
+	out, err := f.run("grant", testEchoPlugin, "--capabilities", "log", "--allowed-hosts", "example.com")
 	if err != nil {
 		t.Fatalf("plugins grant error = %v, want nil", err)
 	}
@@ -4949,8 +4957,9 @@ func TestPluginsGrantSuccessLineNamesTheEffectiveHostsAndPaths(t *testing.T) {
 	// Re-grant naming only --capabilities: the previously granted host is
 	// silently dropped by design (SHOULD-FIX-5 keeps grant declarative
 	// rather than carrying values forward), but the success line must now
-	// say so instead of leaving hosts unmentioned.
-	out, err = f.run("grant", testEchoPlugin, "--capabilities", "log,http")
+	// say so instead of leaving hosts unmentioned. "http" is not among the
+	// granted capabilities here, so NEW-1's guard does not apply.
+	out, err = f.run("grant", testEchoPlugin, "--capabilities", "log")
 	if err != nil {
 		t.Fatalf("plugins grant error = %v, want nil", err)
 	}
@@ -4962,5 +4971,154 @@ func TestPluginsGrantSuccessLineNamesTheEffectiveHostsAndPaths(t *testing.T) {
 	entry := f.requireEntry(f.readDeployment(), testEchoPlugin)
 	if len(entry.Grant.AllowedHosts) != 0 {
 		t.Errorf("entry.Grant.AllowedHosts = %v, want empty after the re-grant wiped it", entry.Grant.AllowedHosts)
+	}
+}
+
+// --- NEW-1: grant follows the same http/fs allowlist rule install does ---
+
+// TestPluginsGrantRefusesAnHTTPCapabilityWithoutAllowedHosts is NEW-1: before
+// this fix, `agent plugins grant jira --capabilities http,log` on a plugin
+// declaring "network"."allowed_hosts" in plugin.json succeeded and wrote an
+// empty AllowedHosts -- character for character the state
+// TestPluginsInstallRefusesAnHTTPGrantWithoutAllowedHosts already refused on
+// the install path, because resolveGrantAllowedHosts only ever checked that
+// a NAMED host is declared, never that a host is named at all when "http" is
+// granted. refuseUnnamedAllowlist (shared with resolveInstallGrants) closes
+// the same hole here: granting "http" with no --allowed-hosts on a plugin
+// that declares a non-empty allowed_hosts is refused, naming the remaining
+// --allowed-hosts step, with nothing written to plugins.json.
+func TestPluginsGrantRefusesAnHTTPCapabilityWithoutAllowedHosts(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackageWithNetwork("echo", testEchoWasm, testEchoPlugin, "1.2.0", []string{"http"}, []string{testEchoTool},
+		manifest.Network{AllowedHosts: []string{"jira.example.com"}}, manifest.Filesystem{})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+	before, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json before grant: %v", err)
+	}
+
+	out, err := f.run("grant", testEchoPlugin, "--capabilities", "http")
+	if err == nil {
+		t.Fatalf("plugins grant output = %q, error = nil, want an error: --capabilities names \"http\" but names "+
+			"no allowed hosts, and the plugin declares some", out)
+	}
+	if !strings.Contains(err.Error(), "allowed_hosts") {
+		t.Errorf("plugins grant error = %v, want it to name \"allowed_hosts\"", err)
+	}
+	if !strings.Contains(err.Error(), "--allowed-hosts") {
+		t.Errorf("plugins grant error = %v, want it to name the remaining --allowed-hosts step", err)
+	}
+
+	after, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json after grant: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("plugins.json changed after a refused http --capabilities grant:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+// TestPluginsGrantRefusesAnFSCapabilityWithoutAllowedPaths mirrors
+// TestPluginsGrantRefusesAnHTTPCapabilityWithoutAllowedHosts for the "fs"
+// capability and "filesystem"."allowed_paths" (NEW-1).
+func TestPluginsGrantRefusesAnFSCapabilityWithoutAllowedPaths(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackageWithNetwork("echo", testEchoWasm, testEchoPlugin, "1.2.0", []string{"fs"}, []string{testEchoTool},
+		manifest.Network{}, manifest.Filesystem{AllowedPaths: []string{"/data"}})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+	before, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json before grant: %v", err)
+	}
+
+	out, err := f.run("grant", testEchoPlugin, "--capabilities", "fs")
+	if err == nil {
+		t.Fatalf("plugins grant output = %q, error = nil, want an error: --capabilities names \"fs\" but names "+
+			"no allowed paths, and the plugin declares some", out)
+	}
+	if !strings.Contains(err.Error(), "allowed_paths") {
+		t.Errorf("plugins grant error = %v, want it to name \"allowed_paths\"", err)
+	}
+	if !strings.Contains(err.Error(), "--allowed-paths") {
+		t.Errorf("plugins grant error = %v, want it to name the remaining --allowed-paths step", err)
+	}
+
+	after, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json after grant: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("plugins.json changed after a refused fs --capabilities grant:\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
+// TestPluginsGrantAllowsHTTPAndFSCapabilitiesWithEmptyDeclaredAllowlists is
+// NEW-1's first edge case, walked for both capabilities at once: a plugin
+// that declares "http"/"fs" but an EMPTY allowed_hosts/allowed_paths (a
+// deny-all-by-declaration plugin, not an operator-forgot-to-name-it one) must
+// NOT be refused -- refuseUnnamedAllowlist's guard only fires when the
+// plugin's OWN declaration is non-empty (len(...) > 0), and there is no CLI
+// flag that could satisfy it here anyway (naming any host/path against an
+// empty declared set is refused elsewhere as undeclared, by
+// resolveGrantAllowedHosts/resolveGrantAllowedPaths).
+func TestPluginsGrantAllowsHTTPAndFSCapabilitiesWithEmptyDeclaredAllowlists(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackageWithNetwork("echo", testEchoWasm, testEchoPlugin, "1.2.0", []string{"http", "fs"}, []string{testEchoTool},
+		manifest.Network{}, manifest.Filesystem{})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+
+	if _, err := f.run("grant", testEchoPlugin, "--capabilities", "http,fs"); err != nil {
+		t.Fatalf("plugins grant error = %v, want nil: an empty declared allowed_hosts/allowed_paths is not the "+
+			"same as an operator who forgot to name one", err)
+	}
+
+	entry := f.requireEntry(f.readDeployment(), testEchoPlugin)
+	if !entry.Enabled {
+		t.Errorf("entry.Enabled = false, want true after grant")
+	}
+	wantCaps := []string{"http", "fs"}
+	if !slices.Equal(entry.Grant.Capabilities, wantCaps) {
+		t.Errorf("entry.Grant.Capabilities = %v, want %v", entry.Grant.Capabilities, wantCaps)
+	}
+	if len(entry.Grant.AllowedHosts) != 0 {
+		t.Errorf("entry.Grant.AllowedHosts = %v, want empty", entry.Grant.AllowedHosts)
+	}
+	if len(entry.Grant.AllowedPaths) != 0 {
+		t.Errorf("entry.Grant.AllowedPaths = %v, want empty", entry.Grant.AllowedPaths)
+	}
+}
+
+// TestPluginsGrantAllowsANonNetworkCapabilityRegardlessOfDeclaredAllowedHosts
+// is NEW-1's third edge case: a plugin declaring neither "http" nor "fs" is
+// entirely unaffected by refuseUnnamedAllowlist, which only ever inspects
+// grants for those two names. The plugin here still declares a non-empty
+// "network"."allowed_hosts" (legal: nothing in manifest validation ties
+// Network to capabilities) precisely to prove the guard keys off the GRANTED
+// capability set, not off whatever the plugin happens to declare in
+// "network"/"filesystem".
+func TestPluginsGrantAllowsANonNetworkCapabilityRegardlessOfDeclaredAllowedHosts(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackageWithNetwork("echo", testEchoWasm, testEchoPlugin, "1.2.0", []string{"log"}, []string{testEchoTool},
+		manifest.Network{AllowedHosts: []string{"example.com"}}, manifest.Filesystem{})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+
+	if _, err := f.run("grant", testEchoPlugin, "--capabilities", "log"); err != nil {
+		t.Fatalf("plugins grant error = %v, want nil: \"log\" alone never triggers the http/fs allowlist guard", err)
+	}
+
+	entry := f.requireEntry(f.readDeployment(), testEchoPlugin)
+	if !entry.Enabled {
+		t.Errorf("entry.Enabled = false, want true after grant")
+	}
+	if len(entry.Grant.AllowedHosts) != 0 {
+		t.Errorf("entry.Grant.AllowedHosts = %v, want empty: --allowed-hosts was never named", entry.Grant.AllowedHosts)
 	}
 }

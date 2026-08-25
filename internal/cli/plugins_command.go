@@ -1171,7 +1171,11 @@ func writePluginStatus(w io.Writer, manifestPath, root string, rows []pluginStat
 // ("grant.capabilities" set, GrantStated true) in the same step: naming a
 // complete --grant IS the authorization decision, not a draft of one.
 // --grant only fills Grant.Capabilities — allowed hosts and paths are still
-// `agent plugins grant`'s job.
+// `agent plugins grant`'s job. If the plugin's own plugin.json declares a
+// non-empty allowed_hosts (for "http") or allowed_paths (for "fs"), --grant
+// refuses to name that capability at all rather than write an entry
+// authorized with an allowlist that reaches nothing (NEW-1/SHOULD-FIX-4) —
+// omit --grant and name the hosts/paths with `agent plugins grant` instead.
 //
 // install does not reload a running service, and does not need one to exist:
 // it edits the deployment manifest on disk. Run `agent plugins reload` to
@@ -1197,7 +1201,9 @@ func newPluginsInstallCommand(out io.Writer) *cobra.Command {
 			"With --grant naming EXACTLY the capabilities the plugin declares in plugin.json (not a subset --\n" +
 			"a partial grant would write an entry that can never load), the entry is written \"enabled\": true\n" +
 			"with that grant already recorded: naming a complete --grant IS the authorization decision. --grant\n" +
-			"only fills capabilities; allowed hosts and paths are still `agent plugins grant`'s job.\n\n" +
+			"only fills capabilities; allowed hosts and paths are still `agent plugins grant`'s job, and if the\n" +
+			"plugin declares a non-empty allowed_hosts/allowed_paths, --grant refuses http/fs outright rather\n" +
+			"than authorize an allowlist that reaches nothing.\n\n" +
 			"install never reloads a running service: run `agent plugins reload` to converge it afterward.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -1550,22 +1556,72 @@ func resolveInstallGrants(grantFlag string, grantFlagChanged bool, pm manifest.P
 			"without authorizing it", grantFlag, missing, pm.Name)
 	}
 
-	// SHOULD-FIX-4 — see the doc comment above.
-	if slices.Contains(grants, "http") && len(pm.Network.AllowedHosts) > 0 {
-		return nil, fmt.Errorf(`plugins install: --grant names "http", but plugin %q declares `+
-			`"network"."allowed_hosts" in plugin.json (%v); --grant only fills capabilities, not allowed `+
-			`hosts, so this would authorize http with an allowlist that reaches nothing -- omit --grant to `+
-			`install without authorizing it, then run "agent plugins grant %s --capabilities ... `+
-			`--allowed-hosts ..." to authorize it with the hosts named too`, pm.Name, pm.Network.AllowedHosts, pm.Name)
-	}
-	if slices.Contains(grants, "fs") && len(pm.Filesystem.AllowedPaths) > 0 {
-		return nil, fmt.Errorf(`plugins install: --grant names "fs", but plugin %q declares `+
-			`"filesystem"."allowed_paths" in plugin.json (%v); --grant only fills capabilities, not allowed `+
-			`paths, so this would authorize fs with an allowlist that reaches nothing -- omit --grant to `+
-			`install without authorizing it, then run "agent plugins grant %s --capabilities ... `+
-			`--allowed-paths ..." to authorize it with the paths named too`, pm.Name, pm.Filesystem.AllowedPaths, pm.Name)
+	// SHOULD-FIX-4 / NEW-1 — see refuseUnnamedAllowlist's doc comment: grant
+	// (runPluginsGrant) calls the same function, so install and grant refuse
+	// this shape identically instead of one refusing what the other silently
+	// accepts. install has no --allowed-hosts/--allowed-paths flags of its
+	// own, so it always calls with hosts/paths nil -- the "named none" branch
+	// fires whenever the plugin declares a non-empty allowlist at all.
+	if err := refuseUnnamedAllowlist("plugins install", "--grant", grants, pm, nil, nil,
+		fmt.Sprintf(`omit --grant to install without authorizing it, then run "agent plugins grant %s `+
+			`--capabilities ... --allowed-hosts ..." to authorize it with the hosts named too`, pm.Name),
+		fmt.Sprintf(`omit --grant to install without authorizing it, then run "agent plugins grant %s `+
+			`--capabilities ... --allowed-paths ..." to authorize it with the paths named too`, pm.Name)); err != nil {
+		return nil, err
 	}
 	return grants, nil
+}
+
+// refuseUnnamedAllowlist is the ONE rule shared by install's --grant
+// (resolveInstallGrants) and grant's --capabilities (runPluginsGrant),
+// closing NEW-1: granting "http" (or "fs") while the plugin declares a
+// non-empty "network"."allowed_hosts" (or "filesystem"."allowed_paths") in
+// plugin.json, and naming none of those hosts/paths in this same call, would
+// mount the plugin with that capability true and an allowlist that reaches
+// nothing -- authoritative-looking, granting nothing, with nothing in the
+// command's own output saying why (SHOULD-FIX-4's failure shape). Before
+// this fix the two commands enforced only one direction each of the same
+// concept: install refused this shape outright, while grant's own
+// resolveGrantAllowedHosts/resolveGrantAllowedPaths only refused a NAMED
+// host/path the plugin never declared and stayed silent when none was named
+// at all -- `agent plugins grant jira --capabilities http,log` on a plugin
+// declaring allowed_hosts would succeed and write an empty allowlist,
+// character for character the state install refused. One shared function
+// closes both directions the same way, instead of drifting the way two
+// hand-written copies of one rule always eventually do.
+//
+// grants is the already set-equality-checked capability list about to be
+// written; hosts and paths are what THIS call names (nil for install, which
+// has no such flags at all). hostsRemedy and pathsRemedy are the exact
+// next-step text to append -- install and grant point the operator at
+// different places, since only grant itself accepts
+// --allowed-hosts/--allowed-paths.
+//
+// This is deliberately keyed on the plugin's DECLARATION, not the effective
+// allowlist AssembleSpec computes after intersecting it against what is
+// granted: a plugin declaring "capabilities": ["http"] with an EMPTY
+// "allowed_hosts" (or "fs" with no "allowed_paths") does NOT trip this
+// guard, and must not -- that is a legitimate "reaches nothing by the
+// plugin's own design" state neither command has any flag to fix (naming
+// any host/path there would itself be refused as undeclared), not the
+// "operator forgot to name what the plugin asked for" state this guard
+// exists to catch. A plugin declaring neither http nor fs is unaffected
+// either way; the guard never evaluates for it.
+func refuseUnnamedAllowlist(cmdContext, flagLabel string, grants []string, pm manifest.PluginManifest,
+	hosts, paths []string, hostsRemedy, pathsRemedy string) error {
+	if slices.Contains(grants, "http") && len(pm.Network.AllowedHosts) > 0 && len(hosts) == 0 {
+		return fmt.Errorf(`%s: %s names "http", but plugin %q declares "network"."allowed_hosts" in `+
+			`plugin.json (%v); %s only fills capabilities, not allowed hosts, so this would authorize http `+
+			`with an allowlist that reaches nothing -- %s`,
+			cmdContext, flagLabel, pm.Name, pm.Network.AllowedHosts, flagLabel, hostsRemedy)
+	}
+	if slices.Contains(grants, "fs") && len(pm.Filesystem.AllowedPaths) > 0 && len(paths) == 0 {
+		return fmt.Errorf(`%s: %s names "fs", but plugin %q declares "filesystem"."allowed_paths" in `+
+			`plugin.json (%v); %s only fills capabilities, not allowed paths, so this would authorize fs `+
+			`with an allowlist that reaches nothing -- %s`,
+			cmdContext, flagLabel, pm.Name, pm.Filesystem.AllowedPaths, flagLabel, pathsRemedy)
+	}
+	return nil
 }
 
 // --- grant / deny ------------------------------------------------------
@@ -1696,6 +1752,19 @@ func runPluginsGrant(ctx context.Context, out io.Writer, nameArg, capabilitiesFl
 	}
 	paths, err := resolveGrantAllowedPaths(allowedPathsFlag, pm)
 	if err != nil {
+		return err
+	}
+
+	// SHOULD-FIX-4 / NEW-1 — see refuseUnnamedAllowlist's doc comment: the
+	// same function install's resolveInstallGrants calls, so this command
+	// refuses the identical shape install refuses (granting http/fs while
+	// the plugin declares a non-empty allowlist and none of it is named
+	// here) instead of silently writing an empty allowlist install would
+	// have refused to write.
+	if err := refuseUnnamedAllowlist("plugins grant", "--capabilities", capabilities, pm, hosts, paths,
+		"name at least one of the declared hosts with --allowed-hosts to authorize it with the hosts named too",
+		"name at least one of the declared paths with --allowed-paths to authorize it with the paths named too",
+	); err != nil {
 		return err
 	}
 
@@ -2046,13 +2115,6 @@ func newPluginsDenyCommand(out io.Writer) *cobra.Command {
 	return cmd
 }
 
-// runPluginsDeny is newPluginsDenyCommand's RunE body. ctx bounds
-// config.Load exactly the way every other subcommand in this file bounds it
-// (status, reload, install, grant) — deny used to be the one command that
-// ignored the command's own context and called config.Load with
-// context.Background() instead (SHOULD-FIX-5), which would have made it the
-// one subcommand that could not be cancelled if config.Load ever grew an I/O
-// timeout or a remote config source.
 // pluginsDenyConcurrentEditTestHook, when non-nil, is called by
 // runPluginsDeny right after it snapshots the deployment manifest and
 // before it checks the snapshot for a concurrent edit (BLOCKING-1). deny,
@@ -2064,6 +2126,13 @@ func newPluginsDenyCommand(out io.Writer) *cobra.Command {
 // equivalent seam. Left nil outside tests; production code never sets it.
 var pluginsDenyConcurrentEditTestHook func()
 
+// runPluginsDeny is newPluginsDenyCommand's RunE body. ctx bounds
+// config.Load exactly the way every other subcommand in this file bounds it
+// (status, reload, install, grant) — deny used to be the one command that
+// ignored the command's own context and called config.Load with
+// context.Background() instead (SHOULD-FIX-5), which would have made it the
+// one subcommand that could not be cancelled if config.Load ever grew an I/O
+// timeout or a remote config source.
 func runPluginsDeny(ctx context.Context, out io.Writer, nameArg, configPath string) error {
 	name := strings.TrimSpace(nameArg)
 	if name == "" {
