@@ -2650,3 +2650,671 @@ func TestE2EAnAllowedPlaintextSourceIsStillHeldToItsDigest(t *testing.T) {
 	src.requireHits(t, "with plaintext allowed and the digest wrong", 1)
 	requireNoFilesUnder(t, cache.Root(), "with plaintext allowed and the digest wrong")
 }
+
+// ---------------------------------------------------------------------------
+// A5c acceptance: install registers without authorizing, grant and deny are
+// the explicit acts that follow, driven from a plugins.json FILE the same
+// way `agent plugins install|grant|deny` write and read it.
+//
+// # Why this section calls manifest functions directly instead of the real
+// `agent plugins install|grant|deny` commands
+//
+// Those commands live in internal/cli (runPluginsInstall, runPluginsGrant,
+// runPluginsDeny in plugins_command.go), and internal/cli imports
+// internal/plugin/loader (for loader.RemoteConfig, among other things) — so
+// a test in THIS package cannot import internal/cli without creating an
+// import cycle. simulateInstall, simulateGrant and simulateDeny below are
+// this package's own copy of those three commands' core bodies, built from
+// the IDENTICAL production primitives the real commands call — fetch.Fetch,
+// fetch.Cache.Put, manifest.LoadPackage, manifest.DraftEntry,
+// manifest.AddEntry, manifest.UpdateEntry, manifest.WriteDeployment — in the
+// same order, with the same "verify everything before writing anything"
+// discipline the real commands' own comments describe (see runPluginsInstall's
+// Step 1..4c). What they deliberately do NOT reproduce is config.Load, cobra
+// flag parsing, or install's F5 concurrent-edit snapshot/re-read guard: none
+// of those belong to this package, and internal/cli's own extensive test
+// suite (plugins_command_test.go) already covers that command surface end to
+// end. This section covers the manifest-layer contract those commands are
+// built from, driven all the way through a REAL Loader.Apply against a real
+// plugins.json file on disk — the one thing internal/cli's tests cannot do,
+// since asserting what a Loader mounts from there would itself require
+// importing this package.
+//
+// # Bounds (fork-bomb regime)
+//
+// The one test that mounts anything more than once
+// (TestE2EInstallGrantDenyLifecycleFromAManifestFile) applies exactly three
+// times, written out in order (install-only, after grant, after deny), each
+// followed by requireInstanceCeiling with that step's own literal ceiling
+// (0, 1, 0). TestE2EInstallRefusesADuplicateNameKeepingTheExistingEntrysAuthorization
+// applies exactly once. There is no loop anywhere in this section. The two
+// remaining rejection tests never call Loader.Apply at all — a signature
+// failure and an undeclared-capability grant are both caught before an entry
+// could ever be enabled, so neither mounts a wasm instance.
+
+// readDeploymentFile reads and parses path exactly the way internal/cli's
+// readPluginDeployment does (os.ReadFile then manifest.ParseDeployment). It
+// is this package's own copy of that one-line helper, for the same reason
+// simulateInstall is: internal/cli is not importable from here.
+func readDeploymentFile(path string) (manifest.Deployment, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return manifest.Deployment{}, fmt.Errorf("read deployment manifest %q: %w", path, err)
+	}
+	dep, err := manifest.ParseDeployment(data)
+	if err != nil {
+		return manifest.Deployment{}, fmt.Errorf("parse deployment manifest %q: %w", path, err)
+	}
+	return dep, nil
+}
+
+// installOutcome is what a successful simulateInstall reports: the entry as
+// written, and the verified plugin manifest it was drafted from, so a caller
+// can assert against the plugin's own declared tools/capabilities without
+// loading the package a second time.
+type installOutcome struct {
+	entry manifest.Entry
+	pm    manifest.PluginManifest
+}
+
+// simulateInstall performs the fetch/verify/register sequence
+// runPluginsInstall performs after its own config and flag parsing — see
+// this section's header for why it is a copy rather than a call into
+// internal/cli.
+//
+// On any failure it returns the error and writes NOTHING to path: Fetch,
+// Cache.Put and LoadPackage all run before AddEntry or WriteDeployment is
+// ever reached, exactly as runPluginsInstall orders them (its own Step
+// 1..4c comments), so a fetch, digest, signature or grant-validation
+// failure leaves an existing plugins.json byte-for-byte as it found it —
+// never "installed then failed", never installed at all.
+//
+// grantCapabilities, when non-nil, mirrors an inline `--grant`: it must name
+// exactly pm.Capabilities (every name grantCapabilities lists must be
+// declared, and every declared capability must be listed — the same
+// EQUAL-sets rule resolveInstallGrants enforces, checked here before
+// DraftEntry's result is touched, so a bad --grant never reaches
+// plugins.json either), and the resulting entry is then written Enabled:
+// true, GrantStated: true. A nil grantCapabilities leaves DraftEntry's
+// result exactly as drafted — Enabled: false, GrantStated: false,
+// Grant.Capabilities empty — install's ordinary, no --grant path.
+func simulateInstall(ctx context.Context, remote RemoteConfig, keyring *sign.Keyring, path, source, digest string, grantCapabilities []string) (installOutcome, error) {
+	probe := manifest.Entry{Source: source}
+	u, err := probe.RemoteURL()
+	if err != nil {
+		return installOutcome{}, fmt.Errorf("simulate install: %w", err)
+	}
+
+	// Step 1: the digest gates the bytes. A digest mismatch, or any other
+	// fetch failure, returns here with nothing written anywhere.
+	archive, err := fetch.Fetch(ctx, remote.Client, u, digest, remote.FetchLimits)
+	if err != nil {
+		return installOutcome{}, fmt.Errorf("simulate install: %w", err)
+	}
+	// Step 2: unpack and atomic placement under the digest that names it.
+	dir, err := remote.Cache.Put(digest, archive, remote.UnpackLimits)
+	if err != nil {
+		return installOutcome{}, fmt.Errorf("simulate install: %w", err)
+	}
+	// Step 3: SIGNATURE VERIFICATION. Nothing below this line has run yet
+	// when this fails: no Deployment has been read or mutated, and
+	// WriteDeployment has not been called — which is what makes "plugins.json
+	// unchanged on a signature failure" hold.
+	pm, _, err := manifest.LoadPackage(dir, keyring)
+	if err != nil {
+		return installOutcome{}, fmt.Errorf("simulate install: %w", err)
+	}
+
+	// Step 4a: the draft. DraftEntry alone decides Name and Tools; it always
+	// produces Enabled: false, GrantStated: false and empty
+	// Grant.Capabilities, with no parameter to override any of them.
+	entry, err := manifest.DraftEntry(pm, source, digest)
+	if err != nil {
+		return installOutcome{}, fmt.Errorf("simulate install: %w", err)
+	}
+	if grantCapabilities != nil {
+		var extra, missing []string
+		for _, c := range grantCapabilities {
+			if !slices.Contains(pm.Capabilities, c) {
+				extra = append(extra, c)
+			}
+		}
+		for _, c := range pm.Capabilities {
+			if !slices.Contains(grantCapabilities, c) {
+				missing = append(missing, c)
+			}
+		}
+		if len(extra) > 0 || len(missing) > 0 {
+			return installOutcome{}, fmt.Errorf("simulate install: --grant %v does not match plugin %q's "+
+				"declared capabilities %v (undeclared: %v, missing: %v); granting a capability the plugin did "+
+				"not ask for is a config error, not generosity, and a partial grant produces an entry the "+
+				"deployment can never load", grantCapabilities, pm.Name, pm.Capabilities, extra, missing)
+		}
+		entry.Grant.Capabilities = grantCapabilities
+		entry.Enabled = true
+		entry.GrantStated = true
+	}
+
+	// Step 4b/4c: AddEntry (a duplicate name is refused, naming it) and
+	// WriteDeployment (atomic, self-verifying) — both only now, after every
+	// verification above has passed.
+	existing, err := readDeploymentFile(path)
+	if err != nil {
+		return installOutcome{}, fmt.Errorf("simulate install: %w", err)
+	}
+	updated, err := manifest.AddEntry(existing, entry)
+	if err != nil {
+		return installOutcome{}, fmt.Errorf("simulate install: %w", err)
+	}
+	if err := manifest.WriteDeployment(path, updated); err != nil {
+		return installOutcome{}, fmt.Errorf("simulate install: %w", err)
+	}
+	return installOutcome{entry: entry, pm: pm}, nil
+}
+
+// simulateGrant is runPluginsGrant's core mutation: it authorizes name to
+// run with exactly capabilities. Unlike the real command, it does not
+// re-load the plugin's own plugin.json to check capabilities against —
+// callers here already know what the plugin declares (this section's own
+// simulateInstall built it), so the equivalent guard
+// (resolveGrantCapabilities) is exercised where it matters for THIS file:
+// as the loader-level enforcement of the identical rule
+// (manifest.AssembleSpec's reconcileCapabilities), which already has
+// end-to-end coverage elsewhere in this file
+// (TestE2EUngrantedCapabilityIsRefusedByName) and in
+// TestE2EInstallRefusesAGrantForACapabilityThePluginNeverDeclared below
+// (install's own --grant, which shares the same EQUAL-sets rule).
+func simulateGrant(path, name string, capabilities []string) (manifest.Entry, error) {
+	existing, err := readDeploymentFile(path)
+	if err != nil {
+		return manifest.Entry{}, fmt.Errorf("simulate grant: %w", err)
+	}
+	var result manifest.Entry
+	updated, err := manifest.UpdateEntry(existing, name, func(e manifest.Entry) (manifest.Entry, error) {
+		e.Enabled = true
+		e.GrantStated = true
+		e.Grant = manifest.GrantDecl{Capabilities: capabilities}
+		result = e
+		return e, nil
+	})
+	if err != nil {
+		return manifest.Entry{}, fmt.Errorf("simulate grant: %w", err)
+	}
+	if err := manifest.WriteDeployment(path, updated); err != nil {
+		return manifest.Entry{}, fmt.Errorf("simulate grant: %w", err)
+	}
+	return result, nil
+}
+
+// simulateDeny is runPluginsDeny's core mutation: it revokes name's
+// authorization — enabled:false, an explicitly STATED empty grant — while
+// leaving Source, Digest and Tools exactly as they were. Deleting the entry
+// would throw away the source and digest; deny never does that.
+func simulateDeny(path, name string) (manifest.Entry, error) {
+	existing, err := readDeploymentFile(path)
+	if err != nil {
+		return manifest.Entry{}, fmt.Errorf("simulate deny: %w", err)
+	}
+	var result manifest.Entry
+	updated, err := manifest.UpdateEntry(existing, name, func(e manifest.Entry) (manifest.Entry, error) {
+		e.Enabled = false
+		e.GrantStated = true
+		e.Grant = manifest.GrantDecl{}
+		// Source, Digest and Tools are left exactly as they were.
+		result = e
+		return e, nil
+	})
+	if err != nil {
+		return manifest.Entry{}, fmt.Errorf("simulate deny: %w", err)
+	}
+	if err := manifest.WriteDeployment(path, updated); err != nil {
+		return manifest.Entry{}, fmt.Errorf("simulate deny: %w", err)
+	}
+	return result, nil
+}
+
+// e2eInstallPluginVersion is the version the install/grant/deny lifecycle
+// tests' package declares. Spelled out once so every assertion below that
+// names it agrees with the one that built the package.
+const e2eInstallPluginVersion = "1.0.0"
+
+// e2eInstallCapability is the one capability the install/grant/deny
+// lifecycle test's package declares — a capability the echo guest never
+// actually imports (per loader_test.go's fixture note: the guest describes
+// itself through abi.OpManifest, and host.Activate only requires that every
+// import it DOES make is covered by the grant — see
+// TestPluginsGrantAllowsAPureComputePluginWithNoCapabilities in
+// internal/cli for the same "declared but unused capability" shape), so
+// this test can prove a declared-and-granted capability round-trips through
+// plugins.json without needing a guest built specifically to exercise it.
+const e2eInstallCapability = "log"
+
+// TestE2EInstallGrantDenyLifecycleFromAManifestFile is Part A of the A5c
+// acceptance pass, and the phase's central claim end to end:
+//
+//	keygen a key -> sign a package -> tar.gz it -> serve it over https
+//	  -> install: plugins.json gains ONE entry, enabled:false, no "grant"
+//	     key at all, source and digest recorded
+//	  -> reload: the entry does NOT mount — no Status row, no
+//	     activation_failed event, not gateable, not callable
+//	  -> grant: the entry gains enabled:true and a STATED grant
+//	  -> reload: the entry mounts, its tool is gateable and answers a
+//	     model-shaped call
+//	  -> deny: the entry returns to enabled:false with an EXPLICITLY STATED
+//	     empty grant ("grant" key present, capabilities empty) — a
+//	     different on-disk shape from install's "no grant key at all" —
+//	     while source, digest and tools are untouched
+//	  -> reload: the tool is gone, but the entry — and its source/digest —
+//	     remain in plugins.json
+//
+// Every claim is checked against the actual bytes plugins.json holds at that
+// step, not only against the parsed Entry or a simulated command's returned
+// error: MarshalDeployment writes a "grant" key only when GrantStated is
+// true (see its own doc comment), so "no grant key at all" versus "an
+// explicit, empty grant key" is the on-disk encoding this whole phase is
+// built to make distinguishable, and a test that only inspected the parsed
+// struct could not tell a bug that flattened the two apart from one that
+// kept them distinct.
+//
+// The step that matters most is the first reload: Status() carries no row
+// for this entry at all (see loader.go's converge — a !entry.Enabled entry
+// is filtered out of both wanted and desired before any activation is
+// attempted, and any PRIOR failure recorded against the name is deleted
+// too), so it is neither StateLoaded nor StateFailed. The human-readable
+// "unauthorized" label (as opposed to "disabled") is rendered by
+// internal/cli from exactly this combination of facts — an entry present in
+// plugins.json, Status() silent about it, Enabled false, GrantStated false
+// — and is covered end to end there, not here, because internal/cli imports
+// this package and a test here cannot call the renderer without an import
+// cycle (see TestPluginsStatusDistinguishesUnauthorizedFromDisabled,
+// internal/cli/plugins_command_test.go — the same layering this file's own
+// A4b section header already documents for `agent plugins status` in
+// general). What this test proves is the underlying fact that label is
+// built from: a freshly installed entry is silent, not red.
+//
+// Bound: exactly three Apply calls, written out in order, each followed by
+// requireInstanceCeiling with that step's own literal ceiling (0, 1, 0). No
+// loop anywhere in this test.
+func TestE2EInstallGrantDenyLifecycleFromAManifestFile(t *testing.T) {
+	requireGateableIsClean(t)
+	ctx := context.Background()
+
+	// `agent plugins keygen`, then `agent plugins sign`: the package is
+	// built, signed and packed OUTSIDE any deployment root — exactly the
+	// shape a plugin fetched from a URL arrives in.
+	priv, keyring := newTestKey(t)
+	dir := filepath.Join(t.TempDir(), "echo-install-src")
+	writePackage(t, dir, pkg{
+		wasm:         fixtureWasm(t, echoWasmFile),
+		name:         echoPluginName,
+		version:      e2eInstallPluginVersion,
+		capabilities: []string{e2eInstallCapability},
+		tools:        []string{echoToolName},
+	})
+	signPackage(t, dir, priv)
+	archive := tarGzPackage(t, dir)
+	digest := digestOf(archive)
+	src := newE2ESource(t, httptest.NewTLSServer, archive)
+	cache := newTestCache(t)
+	remote := remoteFor(t, src.srv, cache, false)
+	h := newHarnessWithRemote(t, keyring, remote)
+
+	// D10: install never bootstraps a missing plugins.json — an operator
+	// creates it first with {"plugins": []}. This test does the same.
+	h.writeManifest(e2eEmptyManifest())
+
+	// --- install: registers, does not authorize ---------------------------
+
+	outcome, err := simulateInstall(ctx, remote, keyring, h.manifestPath(), src.url(), digest, nil)
+	if err != nil {
+		t.Fatalf("simulate install: %v", err)
+	}
+	if outcome.entry.Name != echoPluginName {
+		t.Errorf("installed entry.Name = %q, want %q (from the plugin's own manifest, never the caller)",
+			outcome.entry.Name, echoPluginName)
+	}
+	if outcome.entry.Source != src.url() {
+		t.Errorf("installed entry.Source = %q, want %q", outcome.entry.Source, src.url())
+	}
+	if outcome.entry.Digest != digest {
+		t.Errorf("installed entry.Digest = %q, want %q", outcome.entry.Digest, digest)
+	}
+	if outcome.entry.Enabled {
+		t.Error("installed entry.Enabled = true, want false: install must never authorize what it registers")
+	}
+	if outcome.entry.GrantStated {
+		t.Error("installed entry.GrantStated = true, want false: nobody has made a grant decision yet")
+	}
+	if len(outcome.entry.Grant.Capabilities) != 0 {
+		t.Errorf("installed entry.Grant.Capabilities = %v, want empty", outcome.entry.Grant.Capabilities)
+	}
+	if len(outcome.entry.Tools) != 1 || outcome.entry.Tools[0].Name != echoToolName {
+		t.Fatalf("installed entry.Tools = %+v, want exactly [{Name: %q}]", outcome.entry.Tools, echoToolName)
+	}
+
+	installedRaw, err := os.ReadFile(h.manifestPath())
+	if err != nil {
+		t.Fatalf("read plugins.json after install: %v", err)
+	}
+	if !strings.Contains(string(installedRaw), `"enabled": false`) {
+		t.Errorf("plugins.json after install = %s, want it to record \"enabled\": false", installedRaw)
+	}
+	if strings.Contains(string(installedRaw), `"grant"`) {
+		t.Errorf(`plugins.json after install = %s, want NO "grant" key at all: GrantStated is false, and `+
+			`MarshalDeployment omits the key entirely for an entry nobody has decided about yet`, installedRaw)
+	}
+	if !strings.Contains(string(installedRaw), digest) || !strings.Contains(string(installedRaw), src.url()) {
+		t.Errorf("plugins.json after install = %s, want it to record the source %q and digest %q",
+			installedRaw, src.url(), digest)
+	}
+	if deployed := h.readManifest(); len(deployed.Plugins) != 1 {
+		t.Fatalf("plugins.json after install holds %d entries, want exactly 1: %+v",
+			len(deployed.Plugins), deployed.Plugins)
+	}
+
+	// --- reload: install alone must not mount it, and must not fail either -
+
+	if err := h.applyManifest(ctx); err != nil {
+		t.Fatalf("reload after install-only: %v", err)
+	}
+	h.requireInstanceCeiling("after the install-only reload", 0)
+	wantStrings(t, "ledger owners after the install-only reload", h.owners(), nil)
+	wantStrings(t, "registry tools after the install-only reload", h.toolNames(), nil)
+	requireGateable(t, echoToolName, false, "after the install-only reload")
+	if status := h.loader.Status(); len(status) != 0 {
+		t.Errorf("Status() after the install-only reload = %#v, want no rows at all: an installed-but-"+
+			"unauthorized entry must not appear as a failure", status)
+	}
+	if failed := h.eventsOfType(RuntimeEventActivationFailed); len(failed) != 0 {
+		t.Errorf("plugin/activation_failed events after the install-only reload = %d, want 0: registering an "+
+			"entry must never even attempt an activation", len(failed))
+	}
+	if _, _, err := h.executeAsModel(ctx, domain.ToolCall{ID: "model-call-unauthorized", Name: echoToolName}); !errors.Is(err, tool.ErrToolNotFound) {
+		t.Errorf("Execute(%q) against an installed-but-unauthorized entry = %v, want %v",
+			echoToolName, err, tool.ErrToolNotFound)
+	}
+
+	// --- grant: the explicit act that authorizes it ------------------------
+
+	granted, err := simulateGrant(h.manifestPath(), echoPluginName, []string{e2eInstallCapability})
+	if err != nil {
+		t.Fatalf("simulate grant: %v", err)
+	}
+	if !granted.Enabled {
+		t.Error("granted entry.Enabled = false, want true")
+	}
+	if !granted.GrantStated {
+		t.Error("granted entry.GrantStated = false, want true")
+	}
+	if want := []string{e2eInstallCapability}; !slices.Equal(granted.Grant.Capabilities, want) {
+		t.Errorf("granted entry.Grant.Capabilities = %v, want %v", granted.Grant.Capabilities, want)
+	}
+	if granted.Source != outcome.entry.Source || granted.Digest != outcome.entry.Digest {
+		t.Errorf("grant changed Source/Digest: got (%q, %q), want the installed values (%q, %q) kept intact",
+			granted.Source, granted.Digest, outcome.entry.Source, outcome.entry.Digest)
+	}
+
+	// --- reload: grant must mount it, and it must actually SERVE ----------
+
+	if err := h.applyManifest(ctx); err != nil {
+		t.Fatalf("reload after grant: %v", err)
+	}
+	h.requireInstanceCeiling("after the grant reload", 1)
+	wantStrings(t, "ledger owners after the grant reload", h.owners(),
+		[]string{"plugin:" + echoPluginName + "@" + e2eInstallPluginVersion})
+	wantStrings(t, "registry tools after the grant reload", h.toolNames(), []string{echoToolName})
+	requireGateable(t, echoToolName, true, "after the grant reload")
+	if row := h.statusOf(echoPluginName); row.State != StateLoaded || row.Version != e2eInstallPluginVersion {
+		t.Fatalf("Status() row for %q after the grant reload = %+v, want %q at %q",
+			echoPluginName, row, StateLoaded, e2eInstallPluginVersion)
+	}
+	result, _, err := h.executeAsModel(ctx, domain.ToolCall{
+		ID: "model-call-granted", Name: echoToolName, Arguments: map[string]string{"text": "granted"},
+	})
+	if err != nil {
+		t.Fatalf("Execute(%q) after the grant reload: %v", echoToolName, err)
+	}
+	if want := echoToolName + `:{"text":"granted"}`; !result.Success || result.Output != want {
+		t.Errorf("Execute(%q) after the grant reload = %+v, want a successful %q", echoToolName, result, want)
+	}
+
+	// --- deny: revokes, keeps the registration -----------------------------
+
+	denied, err := simulateDeny(h.manifestPath(), echoPluginName)
+	if err != nil {
+		t.Fatalf("simulate deny: %v", err)
+	}
+	if denied.Enabled {
+		t.Error("denied entry.Enabled = true, want false")
+	}
+	if !denied.GrantStated {
+		t.Error("denied entry.GrantStated = false, want true: deny STATES an empty grant, it does not un-state one")
+	}
+	if len(denied.Grant.Capabilities) != 0 || len(denied.Grant.AllowedHosts) != 0 || len(denied.Grant.AllowedPaths) != 0 {
+		t.Errorf("denied entry.Grant = %+v, want entirely empty", denied.Grant)
+	}
+	if denied.Source != outcome.entry.Source || denied.Digest != outcome.entry.Digest {
+		t.Errorf("deny changed Source/Digest: got (%q, %q), want the installed values (%q, %q) kept intact",
+			denied.Source, denied.Digest, outcome.entry.Source, outcome.entry.Digest)
+	}
+	if !slices.EqualFunc(denied.Tools, outcome.entry.Tools, func(a, b manifest.ToolAccept) bool { return a.Name == b.Name }) {
+		t.Errorf("deny changed Tools: got %+v, want the installed value %+v kept intact",
+			denied.Tools, outcome.entry.Tools)
+	}
+
+	deniedRaw, err := os.ReadFile(h.manifestPath())
+	if err != nil {
+		t.Fatalf("read plugins.json after deny: %v", err)
+	}
+	if !strings.Contains(string(deniedRaw), `"enabled": false`) {
+		t.Errorf("plugins.json after deny = %s, want it to record \"enabled\": false", deniedRaw)
+	}
+	if !strings.Contains(string(deniedRaw), `"grant"`) {
+		t.Errorf(`plugins.json after deny = %s, want a "grant" key present (even if empty): deny STATES an `+
+			`empty grant, a different on-disk shape from install's "no grant key at all" -- an operator who `+
+			`authorized this plugin and then denied it must be distinguishable from one nobody ever decided `+
+			`about`, deniedRaw)
+	}
+	if !strings.Contains(string(deniedRaw), digest) || !strings.Contains(string(deniedRaw), src.url()) {
+		t.Errorf("plugins.json after deny = %s, want the source %q and digest %q still recorded",
+			deniedRaw, src.url(), digest)
+	}
+
+	// --- reload: deny must unmount it, keeping the entry -------------------
+
+	if err := h.applyManifest(ctx); err != nil {
+		t.Fatalf("reload after deny: %v", err)
+	}
+	h.requireInstanceCeiling("after the deny reload", 0)
+	wantStrings(t, "ledger owners after the deny reload", h.owners(), nil)
+	wantStrings(t, "registry tools after the deny reload", h.toolNames(), nil)
+	requireGateable(t, echoToolName, false, "after the deny reload")
+	if status := h.loader.Status(); len(status) != 0 {
+		t.Errorf("Status() after the deny reload = %#v, want no rows: a denied entry is unauthorized again, "+
+			"not failed", status)
+	}
+	if _, _, err := h.executeAsModel(ctx, domain.ToolCall{ID: "model-call-denied", Name: echoToolName}); !errors.Is(err, tool.ErrToolNotFound) {
+		t.Errorf("Execute(%q) after the deny reload = %v, want %v", echoToolName, err, tool.ErrToolNotFound)
+	}
+
+	finalDeployed := h.readManifest()
+	if len(finalDeployed.Plugins) != 1 {
+		t.Fatalf("plugins.json after the deny reload holds %d entries, want the entry KEPT, not removed: %+v",
+			len(finalDeployed.Plugins), finalDeployed.Plugins)
+	}
+	if final := finalDeployed.Plugins[0]; final.Name != echoPluginName || final.Source != outcome.entry.Source ||
+		final.Digest != outcome.entry.Digest {
+		t.Errorf("the surviving entry = %+v, want Name/Source/Digest unchanged from the install (%q, %q, %q)",
+			final, echoPluginName, outcome.entry.Source, outcome.entry.Digest)
+	}
+}
+
+// TestE2EInstallLeavesPluginsJSONByteForByteUnchangedWhenSignatureFails is
+// Part B's first rejection: a package whose plugin.json changed after it was
+// signed. The digest still matches (retagVersion recomputes it, exactly as
+// remote_test.go's TestApplyStillVerifiesTheSignatureOfARemotePackage does),
+// so only the signature can catch it — and simulateInstall never reaches
+// AddEntry or WriteDeployment when LoadPackage fails, so plugins.json is
+// provably untouched: not "installed then failed", never installed at all.
+//
+// Bound: no Apply anywhere in this test — the entry never gets far enough to
+// be enabled, so nothing here could ever mount a wasm instance.
+func TestE2EInstallLeavesPluginsJSONByteForByteUnchangedWhenSignatureFails(t *testing.T) {
+	ctx := context.Background()
+	priv, keyring := newTestKey(t)
+	dir, _ := signedEchoArchive(t, priv, e2eInstallPluginVersion)
+	retagVersion(t, dir, "9.9.9")
+	archive := tarGzPackage(t, dir)
+	digest := digestOf(archive)
+	src := newE2ESource(t, httptest.NewTLSServer, archive)
+	cache := newTestCache(t)
+	remote := remoteFor(t, src.srv, cache, false)
+	path := filepath.Join(t.TempDir(), "plugins.json")
+	if err := os.WriteFile(path, []byte(e2eEmptyManifest()), 0o644); err != nil {
+		t.Fatalf("write initial plugins.json: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("snapshot plugins.json: %v", err)
+	}
+
+	_, err = simulateInstall(ctx, remote, keyring, path, src.url(), digest, nil)
+
+	if err == nil {
+		t.Fatal("simulate install with a tampered-after-signing package error = nil, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "signature") {
+		t.Errorf("simulate install error = %v, want it to name the signature", err)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("re-read plugins.json: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("plugins.json changed on a signature failure: before %s, after %s -- an entry must never be "+
+			"written and then reported failed, it must never be written at all", before, after)
+	}
+}
+
+// TestE2EInstallRefusesAGrantForACapabilityThePluginNeverDeclared is Part
+// B's second rejection: an inline --grant naming a capability the plugin's
+// own plugin.json does not declare. It is refused BEFORE plugins.json is
+// touched — simulateInstall's grant-equality check runs after DraftEntry but
+// before AddEntry/WriteDeployment — so the manifest is provably unchanged,
+// exactly like the signature refusal above: granting a capability the
+// plugin never asked for is a config error, not generosity, and it never
+// gets the chance to be written down.
+func TestE2EInstallRefusesAGrantForACapabilityThePluginNeverDeclared(t *testing.T) {
+	ctx := context.Background()
+	priv, keyring := newTestKey(t)
+	dir := filepath.Join(t.TempDir(), "echo-install-src")
+	writePackage(t, dir, pkg{
+		wasm:         fixtureWasm(t, echoWasmFile),
+		name:         echoPluginName,
+		version:      e2eInstallPluginVersion,
+		capabilities: []string{e2eInstallCapability},
+		tools:        []string{echoToolName},
+	})
+	signPackage(t, dir, priv)
+	archive := tarGzPackage(t, dir)
+	digest := digestOf(archive)
+	src := newE2ESource(t, httptest.NewTLSServer, archive)
+	cache := newTestCache(t)
+	remote := remoteFor(t, src.srv, cache, false)
+	path := filepath.Join(t.TempDir(), "plugins.json")
+	if err := os.WriteFile(path, []byte(e2eEmptyManifest()), 0o644); err != nil {
+		t.Fatalf("write initial plugins.json: %v", err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("snapshot plugins.json: %v", err)
+	}
+
+	const undeclared = "http"
+	_, err = simulateInstall(ctx, remote, keyring, path, src.url(), digest, []string{undeclared})
+
+	if err == nil {
+		t.Fatal("simulate install with --grant naming an undeclared capability error = nil, want a refusal")
+	}
+	if !strings.Contains(err.Error(), undeclared) {
+		t.Errorf("simulate install error = %v, want it to name %q", err, undeclared)
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("re-read plugins.json: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("plugins.json changed on an undeclared-capability grant: before %s, after %s", before, after)
+	}
+}
+
+// TestE2EInstallRefusesADuplicateNameKeepingTheExistingEntrysAuthorization
+// is Part B's third rejection: a second install attempt for a name already
+// in plugins.json. AddEntry refuses it by name (manifest/edit.go), and the
+// existing entry — by now granted and actually mounted, so it has both an
+// authorization decision AND a running instance worth losing — must survive
+// byte for byte.
+//
+// Bound: one Apply, to actually mount the first install after granting it,
+// so "the existing entry's authorization is preserved" is a claim about a
+// RUNNING plugin, not just a JSON field nobody ever acted on.
+func TestE2EInstallRefusesADuplicateNameKeepingTheExistingEntrysAuthorization(t *testing.T) {
+	requireGateableIsClean(t)
+	ctx := context.Background()
+	priv, keyring := newTestKey(t)
+	dir := filepath.Join(t.TempDir(), "echo-install-src")
+	writePackage(t, dir, pkg{
+		wasm:    fixtureWasm(t, echoWasmFile),
+		name:    echoPluginName,
+		version: e2eInstallPluginVersion,
+		tools:   []string{echoToolName},
+	})
+	signPackage(t, dir, priv)
+	archive := tarGzPackage(t, dir)
+	digest := digestOf(archive)
+	src := newE2ESource(t, httptest.NewTLSServer, archive)
+	cache := newTestCache(t)
+	remote := remoteFor(t, src.srv, cache, false)
+	h := newHarnessWithRemote(t, keyring, remote)
+	h.writeManifest(e2eEmptyManifest())
+
+	if _, err := simulateInstall(ctx, remote, keyring, h.manifestPath(), src.url(), digest, nil); err != nil {
+		t.Fatalf("simulate first install: %v", err)
+	}
+	// A pure-compute plugin (no capabilities declared) is granted with an
+	// empty list — a legitimate, explicit authorization decision.
+	if _, err := simulateGrant(h.manifestPath(), echoPluginName, nil); err != nil {
+		t.Fatalf("simulate grant of the first install: %v", err)
+	}
+	if err := h.applyManifest(ctx); err != nil {
+		t.Fatalf("reload after granting the first install: %v", err)
+	}
+	h.requireInstanceCeiling("after the first install was granted and reloaded", 1)
+	requireGateable(t, echoToolName, true, "after the first install was granted and reloaded")
+
+	before, err := os.ReadFile(h.manifestPath())
+	if err != nil {
+		t.Fatalf("snapshot plugins.json: %v", err)
+	}
+
+	_, err = simulateInstall(ctx, remote, keyring, h.manifestPath(), src.url(), digest, nil)
+
+	if err == nil {
+		t.Fatal("simulate second install of the same name error = nil, want a refusal")
+	}
+	if !strings.Contains(err.Error(), echoPluginName) {
+		t.Errorf("simulate install error = %v, want it to name %q", err, echoPluginName)
+	}
+	after, err := os.ReadFile(h.manifestPath())
+	if err != nil {
+		t.Fatalf("re-read plugins.json: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("plugins.json changed on a duplicate-name install: before %s, after %s -- the existing "+
+			"entry's authorization must be preserved exactly, not merely by field but byte for byte", before, after)
+	}
+	// And the running instance is still running: a refused second install
+	// must not have touched anything the first one authorized.
+	requireGateable(t, echoToolName, true, "after the refused duplicate install")
+	h.requireInstanceCeiling("after the refused duplicate install", 1)
+}

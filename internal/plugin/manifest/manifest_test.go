@@ -394,6 +394,9 @@ func TestParseDeployment_ValidFixture(t *testing.T) {
 	if jira.Enabled != true {
 		t.Errorf("Plugins[0].Enabled = %v, want true (explicit)", jira.Enabled)
 	}
+	if !jira.GrantStated {
+		t.Errorf("Plugins[0].GrantStated = false, want true: the fixture carries a \"grant\" block")
+	}
 	wantCaps := []string{"log", "http"}
 	if !equalStrings(jira.Grant.Capabilities, wantCaps) {
 		t.Errorf("Plugins[0].Grant.Capabilities = %v, want %v", jira.Grant.Capabilities, wantCaps)
@@ -426,6 +429,9 @@ func TestParseDeployment_ValidFixture(t *testing.T) {
 	if notify.Enabled != true {
 		t.Errorf("Plugins[1].Enabled = %v, want true (defaulted, field absent from fixture)", notify.Enabled)
 	}
+	if !notify.GrantStated {
+		t.Errorf("Plugins[1].GrantStated = false, want true: the fixture carries a \"grant\" block for this entry too")
+	}
 }
 
 func TestParseDeployment_EnabledExplicitFalse(t *testing.T) {
@@ -439,6 +445,71 @@ func TestParseDeployment_EnabledExplicitFalse(t *testing.T) {
 	}
 	if dep.Plugins[0].Enabled != false {
 		t.Errorf("Enabled = %v, want false (explicit)", dep.Plugins[0].Enabled)
+	}
+}
+
+// TestParseDeployment_GrantStatedFollowsGrantKeyPresence is Part A's core
+// contract on the read side: GrantStated tracks whether the "grant" key
+// itself was present, not whether it named anything — an explicit but empty
+// "grant": {} must still set GrantStated true, distinct from a "grant" key
+// missing entirely.
+func TestParseDeployment_GrantStatedFollowsGrantKeyPresence(t *testing.T) {
+	cases := []struct {
+		name            string
+		json            string
+		wantGrantStated bool
+	}{
+		{
+			name:            "grant key absent",
+			json:            `{"plugins": [{"name": "p", "source": "./p"}]}`,
+			wantGrantStated: false,
+		},
+		{
+			name:            "grant key present but empty",
+			json:            `{"plugins": [{"name": "p", "source": "./p", "grant": {}}]}`,
+			wantGrantStated: true,
+		},
+		{
+			name:            "grant key present with capabilities",
+			json:            `{"plugins": [{"name": "p", "source": "./p", "grant": {"capabilities": ["log"]}}]}`,
+			wantGrantStated: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dep, err := ParseDeployment([]byte(tc.json))
+			if err != nil {
+				t.Fatalf("ParseDeployment: unexpected error: %v", err)
+			}
+			if got := dep.Plugins[0].GrantStated; got != tc.wantGrantStated {
+				t.Errorf("GrantStated = %v, want %v", got, tc.wantGrantStated)
+			}
+		})
+	}
+}
+
+// TestParseDeployment_BackCompatEnabledTrueWithNoGrantIsNeverUnauthorized is
+// rule 5, and the brief's explicit back-compat requirement: an OLD entry
+// with "enabled": true and no grant block at all must parse with
+// GrantStated false (nobody ever recorded a grant decision) and Enabled
+// true. This package only reports the two fields honestly; it is
+// internal/cli's mergePluginStatus that must never read this combination as
+// "unauthorized" (pinned by
+// TestPluginsStatusNeverLabelsAnEnabledOldStyleEntryUnauthorized there,
+// which is structurally guaranteed anyway since that state only checks
+// GrantStated when Enabled is false).
+func TestParseDeployment_BackCompatEnabledTrueWithNoGrantIsNeverUnauthorized(t *testing.T) {
+	data := []byte(`{"plugins": [{"name": "p", "source": "./p", "enabled": true}]}`)
+	dep, err := ParseDeployment(data)
+	if err != nil {
+		t.Fatalf("ParseDeployment: unexpected error: %v", err)
+	}
+	entry := dep.Plugins[0]
+	if !entry.Enabled {
+		t.Errorf("Enabled = false, want true (explicit in the fixture)")
+	}
+	if entry.GrantStated {
+		t.Errorf("GrantStated = true, want false: no \"grant\" key was present in this old-style entry")
 	}
 }
 

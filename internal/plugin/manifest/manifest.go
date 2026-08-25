@@ -273,7 +273,40 @@ type Entry struct {
 	// default is documented here rather than assumed silently.
 	Enabled bool
 
-	Grant  GrantDecl
+	// Grant is this entry's capability authorization: which of the plugin's
+	// declared capabilities are actually granted, and which hosts/paths its
+	// http and fs capabilities may reach. It is always a value, never absent
+	// on its own — GrantStated (below) is the separate field that tells an
+	// entry someone has actually recorded a grant decision for (even an
+	// empty one) apart from one nobody ever has.
+	Grant GrantDecl
+
+	// GrantStated reports whether plugins.json's "grant" key was present for
+	// this entry at all, independently of what it contained.
+	// ParseDeployment sets it true whenever the raw JSON carried a "grant"
+	// block — even an explicit empty one, {"capabilities": []} — and false
+	// when the key was absent entirely, mirroring how rawEntry.Enabled's own
+	// *bool intermediate distinguishes "omitted" from "explicit zero value"
+	// (see that field's doc comment) for exactly the same reason: decoding
+	// straight into a bare GrantDecl could never tell "nobody wrote a grant
+	// block" apart from "somebody wrote an empty one".
+	//
+	// GrantStated answers "did anyone ever record a grant decision about
+	// this plugin", not "is any capability granted right now" — those are
+	// different questions, and answering the second when asked the first is
+	// exactly the bug this field exists to prevent. A pure-compute plugin
+	// can legitimately declare zero capabilities and still have
+	// GrantStated true (an operator explicitly decided its grant is empty —
+	// see `agent plugins deny`, which sets it while clearing Capabilities),
+	// while an entry `agent plugins install` just wrote has GrantStated
+	// false with an equally empty Grant.Capabilities (see DraftEntry) —
+	// nobody has decided anything about it yet. Checking
+	// len(Grant.Capabilities) == 0 in place of GrantStated would conflate
+	// the two: an operator who hand-disabled an already-authorized,
+	// legitimately zero-capability plugin would be told to go authorize it
+	// again.
+	GrantStated bool
+
 	Tools  []ToolAccept
 	Config json.RawMessage
 }
@@ -476,17 +509,22 @@ func validateRequires(name string, requires []string, contributedTools map[strin
 	return nil
 }
 
-// rawEntry mirrors Entry's JSON shape exactly, except Enabled is a pointer:
-// decoding into this intermediate type is what lets ParseDeployment tell
-// "enabled omitted" (nil, defaults to true) apart from "enabled": false
-// (explicit, stays false) before it ever constructs the public Entry (see
-// Entry.Enabled's doc comment for why that distinction is not a fallback).
+// rawEntry mirrors Entry's JSON shape exactly, except Enabled and Grant are
+// pointers: decoding into this intermediate type is what lets ParseDeployment
+// tell "enabled omitted" (nil, defaults to true) apart from "enabled": false
+// (explicit, stays false), and — the identical trick, for the identical
+// reason — "grant omitted" (nil, Entry.GrantStated stays false: nobody has
+// ever recorded an authorization decision) apart from an explicit but empty
+// "grant": {} (non-nil, GrantStated becomes true even though its
+// Capabilities is empty). Both distinctions are made before rawEntry ever
+// constructs the public Entry (see Entry.Enabled's and Entry.GrantStated's
+// own doc comments for why neither is a fallback).
 type rawEntry struct {
 	Name    string          `json:"name"`
 	Source  string          `json:"source"`
 	Digest  string          `json:"digest"`
 	Enabled *bool           `json:"enabled"`
-	Grant   GrantDecl       `json:"grant"`
+	Grant   *GrantDecl      `json:"grant"`
 	Tools   []ToolAccept    `json:"tools"`
 	Config  json.RawMessage `json:"config"`
 }
@@ -544,8 +582,16 @@ func ParseDeployment(data []byte) (Deployment, error) {
 		}
 		seen[re.Name] = struct{}{}
 
+		// grantStated is Entry.GrantStated: whether the "grant" key was
+		// present at all, not whether it named anything. See rawEntry's and
+		// Entry.GrantStated's doc comments.
+		grantStated := re.Grant != nil
+		grant := GrantDecl{}
+		if grantStated {
+			grant = *re.Grant
+		}
 		if err := validateCapabilities(
-			fmt.Sprintf("parse deployment manifest: plugin %q grant", re.Name), re.Grant.Capabilities,
+			fmt.Sprintf("parse deployment manifest: plugin %q grant", re.Name), grant.Capabilities,
 		); err != nil {
 			return Deployment{}, err
 		}
@@ -559,13 +605,14 @@ func ParseDeployment(data []byte) (Deployment, error) {
 			enabled = *re.Enabled
 		}
 		entry := Entry{
-			Name:    re.Name,
-			Source:  re.Source,
-			Digest:  re.Digest,
-			Enabled: enabled,
-			Grant:   re.Grant,
-			Tools:   re.Tools,
-			Config:  re.Config,
+			Name:        re.Name,
+			Source:      re.Source,
+			Digest:      re.Digest,
+			Enabled:     enabled,
+			Grant:       grant,
+			GrantStated: grantStated,
+			Tools:       re.Tools,
+			Config:      re.Config,
 		}
 
 		if err := validateEntrySource(entry); err != nil {
