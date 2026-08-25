@@ -130,6 +130,42 @@ func TestPluginsListReportsServiceError(t *testing.T) {
 	}
 }
 
+// TestPluginsListRequiresPluginReadPermission verifies GET /v1/plugins is
+// gated by security.ActionReadPlugin/security.ResourcePlugin -- the same
+// per-resource RBAC pattern handleAuditEvents and handleQualityEvals follow
+// (governance.go) -- in addition to the blanket authorized() admin-token
+// check TestPluginsListRequiresAuthorization already covers. A caller
+// asserting the viewer role is refused before List is ever called; a caller
+// asserting admin succeeds.
+func TestPluginsListRequiresPluginReadPermission(t *testing.T) {
+	t.Parallel()
+	fake := &fakePluginConsent{views: []PluginView{{Name: "jira"}}}
+	srv := NewHTTPServer(Config{Plugins: fake, AdminToken: "token"})
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/plugins", nil)
+	req.Header.Set("Authorization", "Bearer token")
+	req.Header.Set("X-Company-ID", "company-1")
+	req.Header.Set("X-Role", "viewer")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("GET /v1/plugins viewer status = %d, want %d body=%s", rec.Code, http.StatusForbidden, rec.Body.String())
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/v1/plugins", nil)
+	req.Header.Set("Authorization", "Bearer token")
+	req.Header.Set("X-Company-ID", "company-1")
+	req.Header.Set("X-Role", "admin")
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/plugins admin status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "jira") {
+		t.Fatalf("GET /v1/plugins admin body = %s, want the plugin list", rec.Body.String())
+	}
+}
+
 // TestPluginsListWithoutConsentServiceReports404 verifies the documented
 // distinction: a process that never assembled a plugin loader answers 404
 // naming that plugins are not enabled, rather than 200 with an empty list --

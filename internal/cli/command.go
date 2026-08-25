@@ -2355,16 +2355,17 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// "plugins.manifest" configured -- so the endpoint reports 404 naming
 	// that instead of an empty list, which would read as "no plugins
 	// installed" rather than "plugins are not enabled" (see
-	// handleListPlugins). The keyring is resolved once, here, rather than
-	// inside the closure PluginConsentService calls later: resolvePluginKeyring
-	// can fail, and NewPluginConsentService's keyringFn has nowhere to return
-	// an error to -- so a failure has to surface as a loud startup error now,
-	// not a swallowed one at request time. It is guaranteed to succeed here:
-	// assemblePlugins above already resolved it once (inside newPluginLoader)
-	// on this same cfg.Plugins to build the running loader, so a second,
-	// identical resolution failing would be a contradiction, not a real
-	// config problem -- but it is still checked and returned rather than
-	// assumed, per the fail-loud rule.
+	// handleListPlugins). The keyring and remote-source policy are each
+	// resolved once, here, rather than inside a closure PluginConsentService
+	// calls later: resolvePluginKeyring/resolvePluginRemote can fail, and
+	// NewPluginConsentService has nowhere to return such an error to -- so a
+	// failure has to surface as a loud startup error now, not a swallowed
+	// one at request time. Both are guaranteed to succeed here: assemblePlugins
+	// above already resolved them once (inside newPluginLoader) on this same
+	// cfg.Plugins to build the running loader, so a second, identical
+	// resolution failing would be a contradiction, not a real config problem
+	// -- but each is still checked and returned rather than assumed, per the
+	// fail-loud rule.
 	var pluginConsent server.PluginConsent
 	if pluginApp.Plugins() != nil {
 		pluginKeyring, _, err := resolvePluginKeyring(cfg.Plugins)
@@ -2372,8 +2373,13 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 			cleanup()
 			return ServeResult{}, fmt.Errorf("plugin consent service: resolve trust keyring: %w", err)
 		}
+		pluginRemote, err := resolvePluginRemote(cfg.Plugins)
+		if err != nil {
+			cleanup()
+			return ServeResult{}, fmt.Errorf("plugin consent service: resolve remote source policy: %w", err)
+		}
 		pluginConsent = NewPluginConsentService(cfg.Plugins.Manifest, cfg.Plugins.Root, pluginApp.Plugins,
-			func() *sign.Keyring { return pluginKeyring })
+			func() *sign.Keyring { return pluginKeyring }, pluginRemote)
 	}
 	liveTasks := task.NewSchedulerWithSink(taskSink)
 	httpTasks := server.TaskStore(liveTasks)
