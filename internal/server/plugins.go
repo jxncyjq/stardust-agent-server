@@ -141,11 +141,22 @@ type ConsentResult struct {
 // DeclaredUnresolved distinguishes "this plugin declares nothing" from "the
 // server could not determine what this plugin declares" -- both would
 // otherwise serialize identically as empty/absent Declared* fields. It is
-// true only for a remote-source entry whose package is not (yet) in the
-// local cache: resolving it would require a network fetch, which the
-// read-only List path this view comes from never performs. The consent
-// dialog must render this state distinctly from "requests nothing" rather
-// than rendering an empty checklist either way.
+// true in two cases: (1) a remote-source entry whose package is not (yet) in
+// the local cache -- resolving it would require a network fetch, which the
+// read-only List path this view comes from never performs -- and (2) any
+// entry (local, or remote past a cache hit) whose package directory could
+// not be resolved or whose plugin.json could not be loaded, e.g. a corrupted
+// plugin.wasm or a package directory removed from disk after the deployment
+// manifest still names it. The consent dialog must render this state
+// distinctly from "requests nothing" rather than rendering an empty
+// checklist either way.
+//
+// DeclaredError carries case (2)'s reason -- it is empty for case (1) (a
+// cache miss is an expected, not-yet-fetched state, not a failure) and for
+// any entry whose declaration resolved cleanly. A single broken entry's
+// resolution failure must not fail the whole List call: see List's own doc
+// comment (internal/cli's implementation) for why that would take down the
+// one row deny exists to let an operator reach.
 type PluginView struct {
 	Name               string   `json:"name"`
 	Version            string   `json:"version"`
@@ -156,6 +167,7 @@ type PluginView struct {
 	DeclaredHosts      []string `json:"declared_allowed_hosts"`
 	DeclaredPaths      []string `json:"declared_allowed_paths"`
 	DeclaredUnresolved bool     `json:"declared_unresolved"`
+	DeclaredError      string   `json:"declared_error,omitempty"`
 	GrantedCaps        []string `json:"granted_capabilities"`
 	GrantedHosts       []string `json:"granted_allowed_hosts"`
 	GrantedPaths       []string `json:"granted_allowed_paths"`

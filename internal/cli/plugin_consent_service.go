@@ -131,10 +131,20 @@ func NewPluginConsentService(manifestPath, root string, pluginsFn func() *loader
 // reported in full.
 //
 // An entry (local, or remote past a resolvable cache hit) whose package
-// cannot be resolved or loaded fails List outright (wrapped with the entry's
-// name): a resolvable package is supposed to be readable, so a failure here
-// is a real problem the caller needs to see, not a gap to paper over with an
-// empty declaration.
+// cannot be resolved or loaded is reported as a PER-ROW failure -- view.
+// DeclaredUnresolved = true with view.DeclaredError naming what went wrong
+// (a corrupted plugin.wasm, a package directory renamed or removed from
+// disk, ...) -- rather than failing List as a whole. Deny's own doc comment
+// says revoking a plugin must not depend on its package still being
+// loadable, because a broken or now-unreachable package is exactly the kind
+// of entry an operator most needs to be able to deny; List failing outright
+// on that same entry would make the row carrying its deny button
+// unreachable, defeating that guarantee two files away. Every OTHER row
+// still renders normally, and the entry's own State/Detail (from
+// mergePluginStatus, set above regardless of how this loop ends) is
+// unaffected. Only a failure that breaks every row alike -- reading or
+// parsing plugins.json itself -- fails List outright; see
+// TestPluginConsentServiceListErrorsWhenManifestUnreadable.
 //
 // ctx is accepted for symmetry with server.PluginConsent and future
 // cancellation; every operation List performs today is local disk I/O (a
@@ -176,7 +186,15 @@ func (s *PluginConsentService) List(ctx context.Context) ([]server.PluginView, e
 
 		dir, resolved, resolveErr := s.resolveDeclaredPackageDir(ctx, entry)
 		if resolveErr != nil {
-			return nil, resolveErr
+			// A broken or unreachable package must not take the whole list
+			// down with it -- see this method's own doc comment and
+			// server.PluginView.DeclaredError. Every other row still renders;
+			// this row still carries its State/Detail/Granted* fields, just
+			// no Declared* ones.
+			view.DeclaredUnresolved = true
+			view.DeclaredError = resolveErr.Error()
+			views = append(views, view)
+			continue
 		}
 		if !resolved {
 			view.DeclaredUnresolved = true
@@ -185,7 +203,10 @@ func (s *PluginConsentService) List(ctx context.Context) ([]server.PluginView, e
 		}
 		pm, _, loadErr := manifest.LoadPackage(dir, keyring)
 		if loadErr != nil {
-			return nil, fmt.Errorf("plugin consent: load declared manifest for %q: %w", entry.Name, loadErr)
+			view.DeclaredUnresolved = true
+			view.DeclaredError = fmt.Errorf("plugin consent: load declared manifest for %q: %w", entry.Name, loadErr).Error()
+			views = append(views, view)
+			continue
 		}
 		view.DeclaredCaps = pm.Capabilities
 		view.DeclaredHosts = pm.Network.AllowedHosts
@@ -208,12 +229,16 @@ func (s *PluginConsentService) List(ctx context.Context) ([]server.PluginView, e
 //
 // A remote entry is resolved ONLY on a cache hit. Cache.Has is checked here,
 // BEFORE resolvePluginPackageDir is ever called for a remote entry, so that
-// function's own fetch-on-miss branch is provably unreachable from this
-// path. A remote entry with no configured cache (s.remote.Cache == nil), or
-// whose digest Cache.Has reports absent, returns resolved=false and a nil
-// error: the truth is "we do not know what this plugin declares", not "it
-// declares nothing" -- see List's own doc comment and
-// server.PluginView.DeclaredUnresolved.
+// function's own fetch-on-miss branch is unreachable from this path AS LONG
+// AS nothing can invalidate a Cache.Has hit before resolvePluginPackageDir's
+// own re-check runs -- true today because fetch.Cache exposes no
+// Delete/Evict/Prune anywhere in this repo. A future cache-GC that adds an
+// eviction API would reopen that window; this comment describes the current
+// guarantee, not a permanent one. A remote entry with no configured cache
+// (s.remote.Cache == nil), or whose digest Cache.Has reports absent, returns
+// resolved=false and a nil error: the truth is "we do not know what this
+// plugin declares", not "it declares nothing" -- see List's own doc comment
+// and server.PluginView.DeclaredUnresolved.
 func (s *PluginConsentService) resolveDeclaredPackageDir(ctx context.Context, entry manifest.Entry) (dir string, resolved bool, err error) {
 	if !entry.IsRemote() {
 		dir, err = resolvePluginPackageDir(ctx, entry, s.remote, s.root)

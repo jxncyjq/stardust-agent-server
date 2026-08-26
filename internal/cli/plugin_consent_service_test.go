@@ -119,34 +119,76 @@ func TestPluginConsentServiceListErrorsWhenManifestUnreadable(t *testing.T) {
 	}
 }
 
-// TestPluginConsentServiceListErrorsWhenLocalPackageIsBroken verifies that a
-// local entry whose plugin.json cannot be loaded fails List outright (fail
-// loud), rather than reporting that entry with an empty declaration that
-// would misrepresent "unreadable" as "declares nothing".
-func TestPluginConsentServiceListErrorsWhenLocalPackageIsBroken(t *testing.T) {
+// TestPluginConsentServiceListReportsBrokenLocalPackagePerRow is Important-3
+// of the whole-branch final review: a local entry whose plugin.json cannot
+// be loaded (a corrupted plugin.wasm, here) must be reported as THAT ROW's
+// own DeclaredUnresolved/DeclaredError, with the rest of List's response
+// still a 200 -- not fail List outright, which would 500 the whole GET
+// /v1/plugins and take down every other row's deny button along with it (see
+// Deny's own doc comment for why the panel must survive exactly this case).
+// A second, healthy entry in the SAME manifest proves the failure stays
+// scoped to its own row.
+func TestPluginConsentServiceListReportsBrokenLocalPackagePerRow(t *testing.T) {
 	f := newPluginFixture(t, 30_000)
 	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.0.0", nil, []string{testEchoTool})
-	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+	const healthyPlugin = "healthy-plugin"
+	const healthyTool = "healthy_tool"
+	f.writePackage("healthy", testEchoWasm, healthyPlugin, "1.0.0", nil, []string{healthyTool})
+	f.writeManifest(
+		manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}},
+		manifestEntry{name: healthyPlugin, source: "healthy", enabled: true, tools: []string{healthyTool}},
+	)
 	if err := f.assemble(); err != nil {
 		t.Fatalf("assemblePlugins() error = %v, want nil", err)
 	}
 
 	// Corrupt the on-disk package AFTER assembly: the loader already mounted
 	// it from the original bytes, but List's own LoadPackage call re-reads
-	// plugin.json from disk and must surface this rather than silently
-	// reporting an empty declaration.
+	// plugin.json from disk and must surface this per-row rather than
+	// silently reporting an empty declaration OR failing the whole call.
 	pluginJSON := filepath.Join(f.root, "echo", "plugin.json")
 	if err := os.WriteFile(pluginJSON, []byte("not json"), 0o644); err != nil {
 		t.Fatalf("corrupt plugin.json: %v", err)
 	}
 
 	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins, func() *sign.Keyring { return nil }, loader.RemoteConfig{}, testConsentLogger())
-	_, err := svc.List(context.Background())
-	if err == nil {
-		t.Fatal("List() error = nil, want an error naming the unreadable plugin.json")
+	views, err := svc.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v, want nil: one broken package must not fail the whole list", err)
 	}
-	if !strings.Contains(err.Error(), testEchoPlugin) {
-		t.Fatalf("List() error = %v, want it to name plugin %q", err, testEchoPlugin)
+	if len(views) != 2 {
+		t.Fatalf("len(views) = %d, want 2: %+v", len(views), views)
+	}
+	var broken, healthy *server.PluginView
+	for i := range views {
+		switch views[i].Name {
+		case testEchoPlugin:
+			broken = &views[i]
+		case healthyPlugin:
+			healthy = &views[i]
+		}
+	}
+	if broken == nil {
+		t.Fatalf("no row named %q: %+v", testEchoPlugin, views)
+	}
+	if !broken.DeclaredUnresolved {
+		t.Error("broken entry DeclaredUnresolved = false, want true")
+	}
+	if broken.DeclaredError == "" {
+		t.Error("broken entry DeclaredError = empty, want the load failure reason")
+	}
+	if !strings.Contains(broken.DeclaredError, testEchoPlugin) {
+		t.Errorf("broken entry DeclaredError = %q, want it to name plugin %q", broken.DeclaredError, testEchoPlugin)
+	}
+
+	if healthy == nil {
+		t.Fatalf("no row named %q: the healthy entry must still render when its sibling is broken: %+v", healthyPlugin, views)
+	}
+	if healthy.DeclaredUnresolved {
+		t.Errorf("healthy entry DeclaredUnresolved = true, want false: it was not the broken one")
+	}
+	if healthy.DeclaredError != "" {
+		t.Errorf("healthy entry DeclaredError = %q, want empty", healthy.DeclaredError)
 	}
 }
 
