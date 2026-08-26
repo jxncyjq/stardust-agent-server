@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
@@ -24,6 +23,7 @@ import (
 
 	"github.com/stardust/legion-agent/internal/app"
 	"github.com/stardust/legion-agent/internal/config"
+	"github.com/stardust/legion-agent/internal/plugin/consent"
 	"github.com/stardust/legion-agent/internal/plugin/fetch"
 	"github.com/stardust/legion-agent/internal/plugin/host"
 	"github.com/stardust/legion-agent/internal/plugin/loader"
@@ -617,22 +617,14 @@ func readPluginDeployment(path string) (manifest.Deployment, error) {
 // from. The raw bytes are the "snapshot" refusePluginDeploymentChanged
 // later compares against.
 //
-// A caller that instead read the file a second time to take its snapshot
-// (as install used to, before this fix) parses read #1 but compares a
-// separate read #2 against a later read #3 — a race between reads #1 and #2
-// that an edit could land in and pass the comparison unnoticed (the
-// review's NOTE-1). Reading once and keeping both the parse and the bytes
-// it came from removes that window entirely.
+// This is a thin wrapper over consent.ReadDeploymentWithSnapshot -- see
+// that function's doc comment for why reading once matters. Keeping the
+// wrapper (rather than calling consent.ReadDeploymentWithSnapshot at each
+// of this file's three call sites) is what lets install, grant and deny
+// keep referring to "the deployment read", not a package-qualified name, at
+// every one of them.
 func readPluginDeploymentWithSnapshot(path string) (manifest.Deployment, []byte, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return manifest.Deployment{}, nil, fmt.Errorf("read plugin deployment manifest %q: %w", path, err)
-	}
-	deployment, err := manifest.ParseDeployment(data)
-	if err != nil {
-		return manifest.Deployment{}, nil, fmt.Errorf("parse plugin deployment manifest %q: %w", path, err)
-	}
-	return deployment, data, nil
+	return consent.ReadDeploymentWithSnapshot(path)
 }
 
 // refusePluginDeploymentChanged re-reads manifestPath and compares it, byte
@@ -640,35 +632,16 @@ func readPluginDeploymentWithSnapshot(path string) (manifest.Deployment, []byte,
 // captured earlier, before the caller went on to do something that can take
 // a while (a remote package fetch for install and, on a cache miss, for
 // grant too; even deny's plain read-modify-write has a window of its own,
-// just a much shorter one). WriteDeployment is atomic but performs no
-// compare-and-swap, so without this check a concurrent edit landing in that
-// window would be silently reverted by a stale rewrite: both commands would
-// report success, and the next `agent plugins reload` would quietly mount
-// or unmount something nobody decided to. Refuse instead of overwriting it.
+// just a much shorter one).
 //
-// This is F5's guard, originally install-only, lifted here so install,
-// grant and deny all carry the IDENTICAL guard instead of three separately
-// worded ones — see the review's BLOCKING-1: a guard that holds on one
-// writer and not the other is not a guard, and two spellings of one guard
-// is how they drift apart. cmdContext (e.g. "plugins install", "plugins
-// grant", "plugins deny") labels the error and names the command an
-// operator should re-run.
+// This is a thin wrapper over consent.RefuseDeploymentChanged -- see that
+// function's doc comment for why the guard exists and why it is shared
+// across install, grant and deny (F5 / BLOCKING-1: a guard that holds on
+// one writer and not the other is not a guard). cmdContext (e.g. "plugins
+// install", "plugins grant", "plugins deny") labels the error and names the
+// command an operator should re-run.
 func refusePluginDeploymentChanged(cmdContext, manifestPath string, snapshot []byte) error {
-	current, err := os.ReadFile(manifestPath)
-	if err != nil {
-		return fmt.Errorf("%s: re-read plugin deployment manifest %q before write: %w", cmdContext, manifestPath, err)
-	}
-	if !bytes.Equal(snapshot, current) {
-		// %s, not %q: on Windows a %q-quoted path doubles every backslash,
-		// which would stop it matching a caller's raw path string built
-		// straight from filepath.Join -- unlike the wrapped-error case just
-		// above, there is no underlying *PathError here to carry a second,
-		// unquoted copy of the path along for free.
-		return fmt.Errorf(`%s: plugin deployment manifest %s changed while this command was running; refusing `+
-			`to overwrite that edit with a stale copy -- re-run "agent %s" to apply on top of the current `+
-			`state`, cmdContext, manifestPath, cmdContext)
-	}
-	return nil
+	return consent.RefuseDeploymentChanged(cmdContext, manifestPath, snapshot)
 }
 
 // newPluginsCommand builds `agent plugins`, the operator's handle on the WASM
@@ -1607,21 +1580,13 @@ func resolveInstallGrants(grantFlag string, grantFlagChanged bool, pm manifest.P
 // "operator forgot to name what the plugin asked for" state this guard
 // exists to catch. A plugin declaring neither http nor fs is unaffected
 // either way; the guard never evaluates for it.
+//
+// This is a thin wrapper over consent.RefuseUnnamedAllowlist -- see that
+// function's doc comment for the rule itself. cmdContext and flagLabel
+// become consent.RefuseUnnamedAllowlist's actor and subject.
 func refuseUnnamedAllowlist(cmdContext, flagLabel string, grants []string, pm manifest.PluginManifest,
 	hosts, paths []string, hostsRemedy, pathsRemedy string) error {
-	if slices.Contains(grants, "http") && len(pm.Network.AllowedHosts) > 0 && len(hosts) == 0 {
-		return fmt.Errorf(`%s: %s names "http", but plugin %q declares "network"."allowed_hosts" in `+
-			`plugin.json (%v); %s only fills capabilities, not allowed hosts, so this would authorize http `+
-			`with an allowlist that reaches nothing -- %s`,
-			cmdContext, flagLabel, pm.Name, pm.Network.AllowedHosts, flagLabel, hostsRemedy)
-	}
-	if slices.Contains(grants, "fs") && len(pm.Filesystem.AllowedPaths) > 0 && len(paths) == 0 {
-		return fmt.Errorf(`%s: %s names "fs", but plugin %q declares "filesystem"."allowed_paths" in `+
-			`plugin.json (%v); %s only fills capabilities, not allowed paths, so this would authorize fs `+
-			`with an allowlist that reaches nothing -- %s`,
-			cmdContext, flagLabel, pm.Name, pm.Filesystem.AllowedPaths, flagLabel, pathsRemedy)
-	}
-	return nil
+	return consent.RefuseUnnamedAllowlist(cmdContext, flagLabel, grants, pm, hosts, paths, hostsRemedy, pathsRemedy)
 }
 
 // --- grant / deny ------------------------------------------------------
@@ -1715,7 +1680,7 @@ func runPluginsGrant(ctx context.Context, out io.Writer, nameArg, capabilitiesFl
 	if err != nil {
 		return err
 	}
-	entry, err := findPluginEntry(existing, name)
+	entry, err := consent.FindEntry(existing, name)
 	if err != nil {
 		return fmt.Errorf("plugins grant: %w", err)
 	}
@@ -1822,44 +1787,18 @@ func runPluginsGrant(ctx context.Context, out io.Writer, nameArg, capabilitiesFl
 // resolveGrantCapabilities parses --capabilities and checks it against
 // pm.Capabilities, the plugin's OWN declaration in plugin.json.
 //
-// Unlike install's --grant (resolveInstallGrants), which pre-fills a
-// still-disabled entry and tolerates a partial or absent list, grant is the
-// act that actually authorizes the plugin to run, and
-// manifest.reconcileCapabilities (assemble.go) refuses any entry whose grant
-// does not cover EVERY capability the plugin declares — a partial grant
-// would write an entry that can never load, discoverable only as a
-// StateFailed row after the next reload. So the two sets — what
-// --capabilities names and what pm.Capabilities declares — must be EQUAL:
-// an extra name the plugin never asked for is refused for the same reason
-// install refuses it, and a missing declared name is refused just as
-// loudly, naming exactly which one was left out, before anything is written
-// to plugins.json.
+// This is a thin wrapper: splitFlagList's flag parsing stays here (it is
+// CLI-specific -- an HTTP endpoint gets its list already parsed out of JSON,
+// with no comma-separated string to split), and the actual check --
+// including why the two sets must be EQUAL rather than merely compatible --
+// lives in consent.ResolveCapabilities, so a second caller cannot enforce it
+// differently.
 func resolveGrantCapabilities(capabilitiesFlag string, pm manifest.PluginManifest) ([]string, error) {
 	capabilities, err := splitFlagList("plugins grant", "capabilities", capabilitiesFlag)
 	if err != nil {
 		return nil, err
 	}
-
-	for _, capability := range capabilities {
-		if !slices.Contains(pm.Capabilities, capability) {
-			return nil, fmt.Errorf("plugins grant: --capabilities names capability %q, which plugin %q does not "+
-				"declare in plugin.json (it declares: %v); granting a capability the plugin did not ask for is "+
-				"a config error, not generosity", capability, pm.Name, pm.Capabilities)
-		}
-	}
-	var missing []string
-	for _, declared := range pm.Capabilities {
-		if !slices.Contains(capabilities, declared) {
-			missing = append(missing, declared)
-		}
-	}
-	if len(missing) > 0 {
-		return nil, fmt.Errorf("plugins grant: --capabilities %q does not grant %v, which plugin %q declares in "+
-			"plugin.json; a partial grant produces an entry the deployment can never load (every declared "+
-			"capability must be granted, not a subset) -- name the complete list, or use `agent plugins deny` "+
-			"instead of half-authorizing it", capabilitiesFlag, missing, pm.Name)
-	}
-	return capabilities, nil
+	return consent.ResolveCapabilities("plugins grant", capabilities, pm)
 }
 
 // resolveGrantAllowedHosts parses --allowed-hosts and checks each named host
@@ -1867,71 +1806,29 @@ func resolveGrantCapabilities(capabilitiesFlag string, pm manifest.PluginManifes
 // plugin.json — the same set AssembleSpec (assemble.go) intersects a grant's
 // AllowedHosts against (SHOULD-FIX-4).
 //
-// Unlike resolveGrantCapabilities, this is deliberately NOT a set-equality
-// check: AssembleSpec's own rule for hosts is a plain declared ∩ granted
-// intersection, and an empty result there is explicitly legal (see
-// AssembleSpec's own doc comment) — there is no "every declared host must be
-// granted" requirement anywhere in the manifest layer to enforce, and
-// inventing one here would be exactly the new validation concept the fix
-// brief asks NOT to invent. So naming a strict subset of what the plugin
-// declares is accepted as a legitimate narrowing.
-//
-// What IS checked is the direction that silently misfires today: a host
-// --allowed-hosts names that the plugin never declared is not an error
-// anywhere else in this package, but AssembleSpec would drop it from the
-// intersection at the next reload with nothing anywhere saying so, leaving
-// plugins.json recording a host that grants nothing and looks authoritative
-// (the concrete scenario the review's SHOULD-FIX-4 finding describes: a
-// typo'd hostname that "succeeds" and then denies every outbound call).
-// Refusing it by name here, before it is ever written, matches the
-// "config error, not generosity" principle --capabilities already enforces.
-//
-// Comparison is case-insensitive, matching intersectPreserveOrder's own
-// comparison for hosts (DNS names are case-insensitive).
+// This is a thin wrapper: splitFlagList's flag parsing stays here, and the
+// actual check -- including why this is deliberately NOT a set-equality
+// check the way capabilities is -- lives in consent.ResolveAllowedHosts.
 func resolveGrantAllowedHosts(allowedHostsFlag string, pm manifest.PluginManifest) ([]string, error) {
 	hosts, err := splitFlagList("plugins grant", "allowed-hosts", allowedHostsFlag)
 	if err != nil {
 		return nil, err
 	}
-	declared := make(map[string]struct{}, len(pm.Network.AllowedHosts))
-	for _, host := range pm.Network.AllowedHosts {
-		declared[strings.ToLower(host)] = struct{}{}
-	}
-	for _, host := range hosts {
-		if _, ok := declared[strings.ToLower(host)]; !ok {
-			return nil, fmt.Errorf(`plugins grant: --allowed-hosts names host %q, which plugin %q does not `+
-				`declare in plugin.json's "network"."allowed_hosts" (it declares: %v); AssembleSpec would `+
-				`silently drop an undeclared host from the grant at the next reload, so this is refused here `+
-				`instead`, host, pm.Name, pm.Network.AllowedHosts)
-		}
-	}
-	return hosts, nil
+	return consent.ResolveAllowedHosts("plugins grant", hosts, pm)
 }
 
 // resolveGrantAllowedPaths is resolveGrantAllowedHosts for
 // pm.Filesystem.AllowedPaths — see that function's doc comment for the
-// reasoning, which applies identically here (SHOULD-FIX-4). Paths are
-// compared exactly, not case-insensitively, matching
-// intersectPreserveOrder's own comparison (paths are not case-insensitive in
-// general).
+// reasoning, which applies identically here (SHOULD-FIX-4).
+//
+// This is a thin wrapper: splitFlagList's flag parsing stays here, and the
+// actual check lives in consent.ResolveAllowedPaths.
 func resolveGrantAllowedPaths(allowedPathsFlag string, pm manifest.PluginManifest) ([]string, error) {
 	paths, err := splitFlagList("plugins grant", "allowed-paths", allowedPathsFlag)
 	if err != nil {
 		return nil, err
 	}
-	declared := make(map[string]struct{}, len(pm.Filesystem.AllowedPaths))
-	for _, path := range pm.Filesystem.AllowedPaths {
-		declared[path] = struct{}{}
-	}
-	for _, path := range paths {
-		if _, ok := declared[path]; !ok {
-			return nil, fmt.Errorf(`plugins grant: --allowed-paths names path %q, which plugin %q does not `+
-				`declare in plugin.json's "filesystem"."allowed_paths" (it declares: %v); AssembleSpec would `+
-				`silently drop an undeclared path from the grant at the next reload, so this is refused here `+
-				`instead`, path, pm.Name, pm.Filesystem.AllowedPaths)
-		}
-	}
-	return paths, nil
+	return consent.ResolveAllowedPaths("plugins grant", paths, pm)
 }
 
 // splitFlagList splits a comma-separated flag value into trimmed, non-empty,
@@ -1942,48 +1839,25 @@ func resolveGrantAllowedPaths(allowedPathsFlag string, pm manifest.PluginManifes
 // and write a nonsense repeated entry to plugins.json). It returns nil for an
 // empty or all-whitespace flagValue. cmdContext and flagName only label the
 // error.
+//
+// Only the SPLITTING is done here. Refusing the empty and repeated items is
+// consent.NormalizeList's job, because it is a property of a well-formed
+// grant rather than of comma-splitting: an HTTP caller hands over a decoded
+// JSON array that this function never sees, and a rule living only here
+// would be a rule the CLI enforces and that endpoint does not (gpc-task-3
+// review, Minor-9). The error text is unchanged — subject carries the
+// quoted flag value the message always named.
 func splitFlagList(cmdContext, flagName, flagValue string) ([]string, error) {
 	trimmed := strings.TrimSpace(flagValue)
 	if trimmed == "" {
 		return nil, nil
 	}
 	fields := strings.Split(trimmed, ",")
-	seen := make(map[string]struct{}, len(fields))
 	out := make([]string, 0, len(fields))
 	for _, field := range fields {
-		item := strings.TrimSpace(field)
-		if item == "" {
-			return nil, fmt.Errorf("%s: --%s %q contains an empty entry", cmdContext, flagName, flagValue)
-		}
-		if _, dup := seen[item]; dup {
-			return nil, fmt.Errorf("%s: --%s %q names %q more than once", cmdContext, flagName, flagValue, item)
-		}
-		seen[item] = struct{}{}
-		out = append(out, item)
+		out = append(out, strings.TrimSpace(field))
 	}
-	return out, nil
-}
-
-// findPluginEntry returns the entry named name in dep, or an error naming
-// both the requested name and every name that does exist — the same shape
-// manifest.UpdateEntry's own "no entry" error uses — so grant can check the
-// plugin's own declared capabilities BEFORE attempting the UpdateEntry
-// mutation that would otherwise report the identical "no such entry"
-// failure only after a package load was already spent on it.
-func findPluginEntry(dep manifest.Deployment, name string) (manifest.Entry, error) {
-	names := make([]string, 0, len(dep.Plugins))
-	for _, e := range dep.Plugins {
-		names = append(names, e.Name)
-		if e.Name == name {
-			return e, nil
-		}
-	}
-	existing := "(none)"
-	if len(names) > 0 {
-		existing = strings.Join(names, ", ")
-	}
-	return manifest.Entry{}, fmt.Errorf("no entry named %q exists in the deployment manifest; existing entries "+
-		"are: %s", name, existing)
+	return consent.NormalizeList(cmdContext, fmt.Sprintf("--%s %q", flagName, flagValue), out)
 }
 
 // resolvePluginPackageDir resolves entry's package directory the same way a

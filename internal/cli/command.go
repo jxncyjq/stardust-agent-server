@@ -35,6 +35,7 @@ import (
 	"github.com/stardust/legion-agent/internal/manualgate"
 	"github.com/stardust/legion-agent/internal/memory"
 	"github.com/stardust/legion-agent/internal/observability"
+	"github.com/stardust/legion-agent/internal/plugin/sign"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/quality"
 	agentruntime "github.com/stardust/legion-agent/internal/runtime"
@@ -2349,6 +2350,37 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		drainPlugins(pluginApp, cfg.Plugins.Root, logger)
 		closeStore()
 	}
+	// pluginConsent backs GET /v1/plugins (server.Config.Plugins). It is left
+	// nil when this process assembled no plugin loader at all -- no
+	// "plugins.manifest" configured -- so the endpoint reports 404 naming
+	// that instead of an empty list, which would read as "no plugins
+	// installed" rather than "plugins are not enabled" (see
+	// handleListPlugins). The keyring and remote-source policy are each
+	// resolved once, here, rather than inside a closure PluginConsentService
+	// calls later: resolvePluginKeyring/resolvePluginRemote can fail, and
+	// NewPluginConsentService has nowhere to return such an error to -- so a
+	// failure has to surface as a loud startup error now, not a swallowed
+	// one at request time. Both are guaranteed to succeed here: assemblePlugins
+	// above already resolved them once (inside newPluginLoader) on this same
+	// cfg.Plugins to build the running loader, so a second, identical
+	// resolution failing would be a contradiction, not a real config problem
+	// -- but each is still checked and returned rather than assumed, per the
+	// fail-loud rule.
+	var pluginConsent server.PluginConsent
+	if pluginApp.Plugins() != nil {
+		pluginKeyring, _, err := resolvePluginKeyring(cfg.Plugins)
+		if err != nil {
+			cleanup()
+			return ServeResult{}, fmt.Errorf("plugin consent service: resolve trust keyring: %w", err)
+		}
+		pluginRemote, err := resolvePluginRemote(cfg.Plugins)
+		if err != nil {
+			cleanup()
+			return ServeResult{}, fmt.Errorf("plugin consent service: resolve remote source policy: %w", err)
+		}
+		pluginConsent = NewPluginConsentService(cfg.Plugins.Manifest, cfg.Plugins.Root, pluginApp.Plugins,
+			func() *sign.Keyring { return pluginKeyring }, pluginRemote, logger)
+	}
 	liveTasks := task.NewSchedulerWithSink(taskSink)
 	httpTasks := server.TaskStore(liveTasks)
 	if taskStore != nil {
@@ -2715,6 +2747,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		Sessions:            sessionStore,
 		Messages:            messageStore,
 		Skills:              skillManager,
+		Plugins:             pluginConsent,
 		Logger:              logger,
 		Metrics:             metrics,
 		ToolApprovals:       approvalCoordinator,

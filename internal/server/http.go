@@ -109,12 +109,19 @@ type Config struct {
 	// Browser is the per-session browser stream source backing the SSE endpoint
 	// /v1/browser/sessions/{id}/stream. It is optional: when nil the endpoint
 	// reports 503. Satisfied by *browser.Runtime (Subscribe + ReplaySince).
-	Browser             BrowserStreamer
-	Audit               port.AuditLog
-	QualityEvals        QualityEvalStore
-	Sessions            SessionStore
-	Messages            MessageStore
-	Skills              SkillManager
+	Browser      BrowserStreamer
+	Audit        port.AuditLog
+	QualityEvals QualityEvalStore
+	Sessions     SessionStore
+	Messages     MessageStore
+	Skills       SkillManager
+	// Plugins is the plugin-authorization surface backing GET /v1/plugins
+	// (and, from Task 3 onward, the grant/deny endpoints on the same
+	// interface). It is optional the same way Skills is: nil means this
+	// process assembled no plugin loader ("plugins.manifest" not configured),
+	// and the endpoint reports 404 naming that rather than an empty list --
+	// see handleListPlugins.
+	Plugins             PluginConsent
 	ToolApprovals       ApprovalDecider
 	ApprovalTickets     ApprovalLister
 	TaskInterrupter     TaskInterrupter
@@ -169,6 +176,7 @@ type HTTPServer struct {
 	sessions            SessionStore
 	messages            MessageStore
 	skills              SkillManager
+	plugins             PluginConsent
 	toolApprovals       ApprovalDecider
 	approvalTickets     ApprovalLister
 	taskInterrupter     TaskInterrupter
@@ -225,6 +233,7 @@ func NewHTTPServer(cfg Config) *HTTPServer {
 		sessions:            cfg.Sessions,
 		messages:            cfg.Messages,
 		skills:              cfg.Skills,
+		plugins:             cfg.Plugins,
 		toolApprovals:       cfg.ToolApprovals,
 		approvalTickets:     cfg.ApprovalTickets,
 		taskInterrupter:     cfg.TaskInterrupter,
@@ -297,6 +306,12 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleRuntimeEvents(rec, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/quality/evals":
 		s.handleQualityEvals(rec, r)
+	case r.Method == http.MethodGet && r.URL.Path == "/v1/plugins":
+		s.handleListPlugins(rec, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/plugins/") && strings.HasSuffix(r.URL.Path, "/grant"):
+		s.handleGrantPlugin(rec, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/plugins/") && strings.HasSuffix(r.URL.Path, "/deny"):
+		s.handleDenyPlugin(rec, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/files":
 		s.handleServeFile(rec, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/sessions":
