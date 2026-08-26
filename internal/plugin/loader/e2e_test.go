@@ -3446,7 +3446,15 @@ func e2eDeriveRow(entry manifest.Entry, statuses []InstanceStatus) (state, detai
 		case !entry.Enabled:
 			// Mounted, but the manifest now says it should not be — a stale
 			// Status() row from before the reload that will unmount it.
-			return e2eStateDisabled, `the manifest now sets "enabled": false; not yet reloaded`, st.Version, st.Tools
+			//
+			// Report the loader's REAL state here, not "disabled": the plugin is
+			// still running, and only the explanation changes. This mirrors
+			// cli.mergePluginStatus (plugins_command.go, the known && !Enabled
+			// case), which likewise keeps st.State and rewrites only Detail.
+			// Overriding the state would tell a reader the plugin had stopped
+			// when it has not — and this file exists to prove the states are
+			// reported honestly.
+			return st.State, `the manifest now sets "enabled": false; not yet reloaded`, st.Version, st.Tools
 		default:
 			return st.State, st.LastError, st.Version, st.Tools
 		}
