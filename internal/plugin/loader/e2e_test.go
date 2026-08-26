@@ -6,6 +6,9 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/ed25519"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -22,9 +25,11 @@ import (
 
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/lifecycle"
+	"github.com/stardust/legion-agent/internal/plugin/consent"
 	"github.com/stardust/legion-agent/internal/plugin/fetch"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
 	"github.com/stardust/legion-agent/internal/plugin/sign"
+	"github.com/stardust/legion-agent/internal/server"
 	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
 	"github.com/stardust/legion-agent/internal/toolauth"
@@ -3317,4 +3322,894 @@ func TestE2EInstallRefusesADuplicateNameKeepingTheExistingEntrysAuthorization(t 
 	// must not have touched anything the first one authorized.
 	requireGateable(t, echoToolName, true, "after the refused duplicate install")
 	h.requireInstanceCeiling("after the refused duplicate install", 1)
+}
+
+// --- gpc-task-6: the GUI consent flow's endpoints, proven over real net/http ---
+//
+// This is Step 1/2 of the phase's acceptance pass: GET /v1/plugins and POST
+// /v1/plugins/{name}/grant|deny, driven through server.NewHTTPServer's real
+// ServeHTTP (net/http request in, net/http response out — the same call a
+// listening socket would make), backed by a Loader this harness actually
+// mounts and unmounts real wasm instances through.
+//
+// # Why this file writes its own server.PluginConsent instead of using
+// # cli.PluginConsentService
+//
+// cli.PluginConsentService (internal/cli/plugin_consent_service.go) is the
+// PRODUCTION implementation the GUI actually talks to, and it is what this
+// file would use if it could. It cannot: internal/cli imports
+// internal/plugin/loader, and this is an INTERNAL test file (package loader,
+// not loader_test) — the remote-source section above and
+// TestE2EInstallGrantDenyLifecycleFromAManifestFile's own doc comment already
+// document the same constraint for the same reason (an internal test file
+// that imported something depending on the package under test would not
+// compile; go test reports this as an import cycle, because building this
+// package's test binary would need cli, and cli needs the very "loader"
+// identity this test binary IS).
+//
+// e2eConsentAdapter is therefore a LOCAL-ONLY, test-scoped implementation of
+// server.PluginConsent. "Local-only" is the one place it is simpler than
+// production: it skips resolvePluginPackageDir's remote-fetch branch, because
+// every plugin this whole file ever mounts is local. Everything else —
+// validating a grant through internal/plugin/consent's NormalizeList /
+// ResolveCapabilities / ResolveAllowedHosts / ResolveAllowedPaths /
+// RefuseUnnamedAllowlist / RefuseDeploymentChanged, writing through
+// manifest.UpdateEntry + manifest.WriteDeployment, and converging through
+// the SAME *Loader.Apply this whole file already exercises — runs through the
+// identical shared functions cli.PluginConsentService calls. That sharing is
+// the whole point of gpc-task-6's "endpoint and CLI cannot diverge" claim:
+// this adapter proves the HTTP layer reaches those functions correctly: it
+// cannot, by construction, prove cli.PluginConsentService also calls them
+// correctly (that is internal/cli/plugin_consent_service_test.go's job, and
+// it already does — see e.g.
+// TestPluginConsentServiceGrantRefusesAConcurrentEditDuringTheDownload, which
+// this file's own concurrent-edit test below mirrors at this layer).
+//
+// The one thing e2eConsentAdapter reimplements rather than shares is
+// cli.plugins_command.go's unexported mergePluginStatus — the function that
+// turns "no Status() row, Enabled=false, GrantStated=false" into the
+// human-readable label "unauthorized" (as opposed to "disabled"). That
+// renderer cannot be imported here for the same cycle reason, so
+// e2eDeriveRow below reproduces its state rules for the shapes this file's
+// tests actually reach. A REVIEWER SHOULD CHECK: e2eDeriveRow's switch
+// mirrors mergePluginStatus's (plugins_command.go) closely enough for these
+// scenarios, but it is not a byte-for-byte port and does not claim to cover
+// every branch (e.g. it does not special-case StateSuspended, which no test
+// below reaches).
+//
+// # Bounds (fork-bomb regime)
+//
+// Every test below applies a WRITTEN-OUT number of times (one to three), each
+// followed by requireInstanceCeiling with that step's own literal ceiling.
+// None of them loops over Apply, none of them starts a goroutine, and none of
+// them waits on a channel or a timer — the "concurrent edit" test below gets
+// its determinism from a synchronous hook instead of a real race (see its own
+// doc comment for why that is still a faithful exercise of the guard under
+// test).
+
+// e2eConsentGrantActor / e2eConsentDenyActor label e2eConsentAdapter's calls
+// into internal/plugin/consent, mirroring pluginConsentGrantActor /
+// pluginConsentDenyActor (internal/cli/plugin_consent_service.go) so an
+// error's wording matches what the real endpoint would say.
+const (
+	e2eConsentGrantActor = "POST /v1/plugins/{name}/grant"
+	e2eConsentDenyActor  = "POST /v1/plugins/{name}/deny"
+)
+
+// The three manifest-only states server.PluginView.State can report for an
+// entry mergePluginStatus (internal/cli/plugins_command.go) would never hand
+// a Status() row for — see that function's own doc comment for the full
+// state machine. loader.go's own StateLoaded/StateSuspended/StateFailed cover
+// everything Status() DOES report; these three cover what it stays silent
+// about.
+const (
+	e2eStateUnauthorized = "unauthorized"
+	e2eStateDisabled     = "disabled"
+	e2eStatePending      = "pending"
+)
+
+// e2eLocalPackageDir is cli.localPluginPackageDir's local-path resolution
+// (plugins_command.go), copied rather than called for the same import-cycle
+// reason e2eConsentAdapter's own doc comment explains: root-relative,
+// refusing an absolute source or one that escapes root.
+func e2eLocalPackageDir(name, root, source string) (string, error) {
+	if filepath.IsAbs(source) {
+		return "", fmt.Errorf("plugin %q: source %q is absolute; a plugin source must be relative to the "+
+			"deployment root %s", name, source, root)
+	}
+	dir := filepath.Join(root, source)
+	rel, err := filepath.Rel(root, dir)
+	if err != nil {
+		return "", fmt.Errorf("plugin %q: source %q cannot be resolved against the deployment root %s: %w",
+			name, source, root, err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", fmt.Errorf("plugin %q: source %q escapes the deployment root %s (it resolves to %s)",
+			name, source, root, dir)
+	}
+	return dir, nil
+}
+
+// e2eDeriveRow reports one entry's state, detail, version and tools the way
+// mergePluginStatus (internal/cli/plugins_command.go) would, for the shapes
+// this file's gpc-task-6 tests actually reach — see this section's own doc
+// comment for why this is a reimplementation rather than a call into that
+// unexported function, and what it does not claim to cover.
+func e2eDeriveRow(entry manifest.Entry, statuses []InstanceStatus) (state, detail, version string, tools []string) {
+	for _, st := range statuses {
+		if st.Name != entry.Name {
+			continue
+		}
+		switch {
+		case st.State == StateFailed:
+			return StateFailed, st.LastError, st.Version, st.Tools
+		case !entry.Enabled:
+			// Mounted, but the manifest now says it should not be — a stale
+			// Status() row from before the reload that will unmount it.
+			return e2eStateDisabled, `the manifest now sets "enabled": false; not yet reloaded`, st.Version, st.Tools
+		default:
+			return st.State, st.LastError, st.Version, st.Tools
+		}
+	}
+	switch {
+	case !entry.Enabled && !entry.GrantStated:
+		return e2eStateUnauthorized, `plugins.json records no grant block for this entry`, "", nil
+	case !entry.Enabled:
+		return e2eStateDisabled, `the manifest entry sets "enabled": false`, "", nil
+	default:
+		return e2eStatePending, `enabled in the manifest but not converged`, "", nil
+	}
+}
+
+// e2eConsentAdapter implements server.PluginConsent against one harness's
+// real *Loader and plugins.json file — see this section's own doc comment
+// for why it exists instead of cli.PluginConsentService.
+type e2eConsentAdapter struct {
+	h *harness
+
+	// mu mirrors cli.PluginConsentService's own in-process serialization
+	// (see that type's mu field doc comment): the whole
+	// read -> validate -> write -> converge sequence runs under it.
+	mu sync.Mutex
+
+	// afterSnapshot, when non-nil, runs once inside Grant, right after it has
+	// taken its own read-and-snapshot of plugins.json and before anything
+	// else. It is the barrier TestE2EHTTPGrantRefusesAConcurrentEditWithoutRevertingIt
+	// uses to land a second writer's edit deterministically, in the same
+	// single-goroutine spot internal/cli's
+	// TestPluginConsentServiceConcurrentGrantsDoNotRevertEachOther uses
+	// keyringFn for. A nil hook (every other test in this section) changes
+	// nothing.
+	afterSnapshot func()
+}
+
+// List implements server.PluginConsent.List — see cli.PluginConsentService.List's
+// own doc comment for the shape this mirrors (minus the remote-cache-hit
+// branch, which this local-only adapter never needs).
+func (a *e2eConsentAdapter) List(_ context.Context) ([]server.PluginView, error) {
+	dep, _, err := consent.ReadDeploymentWithSnapshot(a.h.manifestPath())
+	if err != nil {
+		return nil, err
+	}
+	statuses := a.h.loader.Status()
+	views := make([]server.PluginView, 0, len(dep.Plugins))
+	for _, entry := range dep.Plugins {
+		state, detail, version, tools := e2eDeriveRow(entry, statuses)
+		view := server.PluginView{
+			Name:         entry.Name,
+			Version:      version,
+			State:        state,
+			Detail:       detail,
+			Tools:        tools,
+			GrantedCaps:  entry.Grant.Capabilities,
+			GrantedHosts: entry.Grant.AllowedHosts,
+			GrantedPaths: entry.Grant.AllowedPaths,
+		}
+		dir, err := e2eLocalPackageDir(entry.Name, a.h.root, entry.Source)
+		if err != nil {
+			return nil, err
+		}
+		pm, _, err := manifest.LoadPackage(dir, nil)
+		if err != nil {
+			return nil, fmt.Errorf("plugin consent: load declared manifest for %q: %w", entry.Name, err)
+		}
+		view.DeclaredCaps = pm.Capabilities
+		view.DeclaredHosts = pm.Network.AllowedHosts
+		view.DeclaredPaths = pm.Filesystem.AllowedPaths
+		views = append(views, view)
+	}
+	return views, nil
+}
+
+// Grant implements server.PluginConsent.Grant — see
+// cli.PluginConsentService.Grant's own doc comment for the seven-step
+// sequence this mirrors (minus the remote-fetch branch of step 3).
+func (a *e2eConsentAdapter) Grant(ctx context.Context, name string, req server.GrantRequest) (server.ConsentResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	dep, snapshot, err := consent.ReadDeploymentWithSnapshot(a.h.manifestPath())
+	if err != nil {
+		return server.ConsentResult{}, fmt.Errorf("%s: %w: %w", e2eConsentGrantActor, server.ErrPluginStorage, err)
+	}
+	if a.afterSnapshot != nil {
+		a.afterSnapshot()
+	}
+
+	entry, err := consent.FindEntry(dep, name)
+	if err != nil {
+		return server.ConsentResult{}, fmt.Errorf("%s: %w: %w", e2eConsentGrantActor, server.ErrPluginNotFound, err)
+	}
+	dir, err := e2eLocalPackageDir(entry.Name, a.h.root, entry.Source)
+	if err != nil {
+		return server.ConsentResult{}, fmt.Errorf("%s: %w", e2eConsentGrantActor, err)
+	}
+	pm, _, err := manifest.LoadPackage(dir, nil)
+	if err != nil {
+		return server.ConsentResult{}, fmt.Errorf("%s: %w", e2eConsentGrantActor, err)
+	}
+
+	requestedCaps, err := consent.NormalizeList(e2eConsentGrantActor, "capabilities", req.Capabilities)
+	if err != nil {
+		return server.ConsentResult{}, err
+	}
+	requestedHosts, err := consent.NormalizeList(e2eConsentGrantActor, "allowed_hosts", req.AllowedHosts)
+	if err != nil {
+		return server.ConsentResult{}, err
+	}
+	requestedPaths, err := consent.NormalizeList(e2eConsentGrantActor, "allowed_paths", req.AllowedPaths)
+	if err != nil {
+		return server.ConsentResult{}, err
+	}
+
+	capabilities, err := consent.ResolveCapabilities(e2eConsentGrantActor, requestedCaps, pm)
+	if err != nil {
+		return server.ConsentResult{}, err
+	}
+	hosts, err := consent.ResolveAllowedHosts(e2eConsentGrantActor, requestedHosts, pm)
+	if err != nil {
+		return server.ConsentResult{}, err
+	}
+	paths, err := consent.ResolveAllowedPaths(e2eConsentGrantActor, requestedPaths, pm)
+	if err != nil {
+		return server.ConsentResult{}, err
+	}
+	if err := consent.RefuseUnnamedAllowlist(e2eConsentGrantActor, "capabilities", capabilities, pm, hosts, paths,
+		`name at least one of the declared hosts in "allowed_hosts" to authorize it with the hosts named too`,
+		`name at least one of the declared paths in "allowed_paths" to authorize it with the paths named too`,
+	); err != nil {
+		return server.ConsentResult{}, err
+	}
+
+	if err := consent.RefuseDeploymentChanged(e2eConsentGrantActor, a.h.manifestPath(), snapshot); err != nil {
+		if errors.Is(err, consent.ErrDeploymentChanged) {
+			return server.ConsentResult{}, fmt.Errorf("%s: %w: %w", e2eConsentGrantActor, server.ErrPluginDeploymentChanged, err)
+		}
+		return server.ConsentResult{}, fmt.Errorf("%s: %w: %w", e2eConsentGrantActor, server.ErrPluginStorage, err)
+	}
+
+	updated, err := manifest.UpdateEntry(dep, name, func(e manifest.Entry) (manifest.Entry, error) {
+		e.Enabled = true
+		e.GrantStated = true
+		e.Grant = manifest.GrantDecl{Capabilities: capabilities, AllowedHosts: hosts, AllowedPaths: paths}
+		return e, nil
+	})
+	if err != nil {
+		return server.ConsentResult{}, fmt.Errorf("%s: %w", e2eConsentGrantActor, err)
+	}
+	if err := manifest.WriteDeployment(a.h.manifestPath(), updated); err != nil {
+		return server.ConsentResult{}, fmt.Errorf("%s: %w: %w", e2eConsentGrantActor, server.ErrPluginStorage, err)
+	}
+
+	result, err := a.applyAndReport(ctx, updated, name)
+	if err != nil {
+		return server.ConsentResult{}, err
+	}
+	result.View.DeclaredCaps = pm.Capabilities
+	result.View.DeclaredHosts = pm.Network.AllowedHosts
+	result.View.DeclaredPaths = pm.Filesystem.AllowedPaths
+	return result, nil
+}
+
+// Deny implements server.PluginConsent.Deny — see
+// cli.PluginConsentService.Deny's own doc comment: Enabled flips false,
+// GrantStated STAYS true (a decision was made, then revoked), and Source,
+// Digest and Tools are left exactly as they were.
+func (a *e2eConsentAdapter) Deny(ctx context.Context, name string) (server.ConsentResult, error) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	dep, snapshot, err := consent.ReadDeploymentWithSnapshot(a.h.manifestPath())
+	if err != nil {
+		return server.ConsentResult{}, fmt.Errorf("%s: %w: %w", e2eConsentDenyActor, server.ErrPluginStorage, err)
+	}
+	if _, err := consent.FindEntry(dep, name); err != nil {
+		return server.ConsentResult{}, fmt.Errorf("%s: %w: %w", e2eConsentDenyActor, server.ErrPluginNotFound, err)
+	}
+	if err := consent.RefuseDeploymentChanged(e2eConsentDenyActor, a.h.manifestPath(), snapshot); err != nil {
+		if errors.Is(err, consent.ErrDeploymentChanged) {
+			return server.ConsentResult{}, fmt.Errorf("%s: %w: %w", e2eConsentDenyActor, server.ErrPluginDeploymentChanged, err)
+		}
+		return server.ConsentResult{}, fmt.Errorf("%s: %w: %w", e2eConsentDenyActor, server.ErrPluginStorage, err)
+	}
+
+	updated, err := manifest.UpdateEntry(dep, name, func(e manifest.Entry) (manifest.Entry, error) {
+		e.Enabled = false
+		e.GrantStated = true
+		e.Grant = manifest.GrantDecl{}
+		// Source, Digest and Tools are left exactly as they were: deny
+		// revokes authorization, it does not throw away the registration.
+		return e, nil
+	})
+	if err != nil {
+		return server.ConsentResult{}, fmt.Errorf("%s: %w", e2eConsentDenyActor, err)
+	}
+	if err := manifest.WriteDeployment(a.h.manifestPath(), updated); err != nil {
+		return server.ConsentResult{}, fmt.Errorf("%s: %w: %w", e2eConsentDenyActor, server.ErrPluginStorage, err)
+	}
+
+	result, err := a.applyAndReport(ctx, updated, name)
+	if err != nil {
+		return server.ConsentResult{}, err
+	}
+	result.View.DeclaredUnresolved = true
+	return result, nil
+}
+
+// applyAndReport converges a.h.loader toward dep (already written to disk)
+// and turns the outcome into a ConsentResult, mirroring
+// cli.PluginConsentService.applyAndReport's own doc comment for the
+// PendingConvergence/failed-entry distinction.
+func (a *e2eConsentAdapter) applyAndReport(ctx context.Context, dep manifest.Deployment, name string) (server.ConsentResult, error) {
+	applyErr := a.h.loader.Apply(ctx, dep, a.h.root)
+
+	entry, err := consent.FindEntry(dep, name)
+	if err != nil {
+		return server.ConsentResult{}, fmt.Errorf(
+			"plugin consent: entry %q vanished from its own deployment between write and status read: %w", name, err)
+	}
+	view := server.PluginView{
+		Name:         name,
+		GrantedCaps:  entry.Grant.Capabilities,
+		GrantedHosts: entry.Grant.AllowedHosts,
+		GrantedPaths: entry.Grant.AllowedPaths,
+	}
+
+	if applyErr != nil && (errors.Is(applyErr, taskgate.ErrBoundaryNotReached) || errors.Is(applyErr, taskgate.ErrApplyInProgress)) {
+		return server.ConsentResult{View: view, PendingConvergence: true, ConvergenceDetail: applyErr.Error()}, nil
+	}
+
+	convergenceDetail := ""
+	if applyErr != nil {
+		convergenceDetail = applyErr.Error()
+	}
+	state, detail, version, tools := e2eDeriveRow(entry, a.h.loader.Status())
+	view.Version, view.State, view.Detail, view.Tools = version, state, detail, tools
+	return server.ConsentResult{View: view, ConvergenceDetail: convergenceDetail}, nil
+}
+
+// e2eAdminRequest builds an authorized request the RBAC gate accepts for
+// both ActionReadPlugin and ActionWritePlugin (an "admin" role clears both —
+// see internal/server/plugins_test.go's own adminGrantRequest, which this
+// mirrors). A nil body sends none (GET, and POST .../deny).
+func e2eAdminRequest(t *testing.T, method, path string, body any) *http.Request {
+	t.Helper()
+
+	reader := strings.NewReader("")
+	if body != nil {
+		data, err := json.Marshal(body)
+		if err != nil {
+			t.Fatalf("encode request body: %v", err)
+		}
+		reader = strings.NewReader(string(data))
+	}
+	req := httptest.NewRequest(method, path, reader)
+	req.Header.Set("Authorization", "Bearer e2e-admin-token")
+	req.Header.Set("X-Company-ID", "e2e-company")
+	req.Header.Set("X-Role", "admin")
+	return req
+}
+
+// e2eListResponse decodes GET /v1/plugins's body.
+type e2eListResponse struct {
+	Plugins []server.PluginView `json:"plugins"`
+}
+
+// e2eConsentResponse decodes handleGrantPlugin/handleDenyPlugin's body:
+// PluginView's fields promoted to the top level, alongside the two
+// convergence-outcome fields — the same shape
+// internal/server/plugins_test.go's grantConsentResponse decodes.
+type e2eConsentResponse struct {
+	server.PluginView
+	PendingConvergence bool   `json:"pending_convergence"`
+	ConvergenceDetail  string `json:"convergence_detail"`
+}
+
+func e2eDecodeListResponse(t *testing.T, rec *httptest.ResponseRecorder) e2eListResponse {
+	t.Helper()
+
+	var resp e2eListResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode GET /v1/plugins response: %v body=%s", err, rec.Body.String())
+	}
+	return resp
+}
+
+func e2eDecodeConsentResponse(t *testing.T, rec *httptest.ResponseRecorder) e2eConsentResponse {
+	t.Helper()
+
+	var resp e2eConsentResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode grant/deny response: %v body=%s", err, rec.Body.String())
+	}
+	return resp
+}
+
+// e2eRowNamed returns the row named name from a GET /v1/plugins response,
+// failing the test if there is none.
+func e2eRowNamed(t *testing.T, list e2eListResponse, name string) server.PluginView {
+	t.Helper()
+
+	for _, v := range list.Plugins {
+		if v.Name == name {
+			return v
+		}
+	}
+	t.Fatalf("GET /v1/plugins reported no row named %q: %+v", name, list.Plugins)
+	return server.PluginView{}
+}
+
+// requireSingleEntry returns dep's one entry named name, failing the test if
+// there is none — the on-disk-state assertions below read plugins.json back
+// through this rather than trusting an HTTP response body, per this task's
+// brief ("assert the on-disk plugins.json at each step, not just HTTP status
+// codes").
+func requireSingleEntry(t *testing.T, dep manifest.Deployment, name string) manifest.Entry {
+	t.Helper()
+
+	for _, e := range dep.Plugins {
+		if e.Name == name {
+			return e
+		}
+	}
+	t.Fatalf("plugins.json has no entry named %q: %+v", name, dep.Plugins)
+	return manifest.Entry{}
+}
+
+// e2eUnauthorizedEchoManifest is the plugins.json an "install" (out of this
+// phase's scope — this task's brief says so explicitly) would have left
+// behind: the echo entry is present, disabled, and carries NO "grant" key at
+// all, so GrantStated is false and e2eDeriveRow (and the real
+// mergePluginStatus) reports it "unauthorized".
+func e2eUnauthorizedEchoManifest() string {
+	return fmt.Sprintf(`{
+  "plugins": [
+    {
+      "name": %q,
+      "source": "echo",
+      "enabled": false,
+      "tools": [{"name": %q}]
+    }
+  ]
+}`, echoPluginName, echoToolName)
+}
+
+// TestE2EHTTPConsentGrantDenyGrantAssertsStateOnDiskAtEveryStep is gpc-task-6's
+// central acceptance: the whole GUI consent loop, driven through the real
+// net/http handlers this phase added, and asserted against the ACTUAL BYTES
+// plugins.json holds at every step, not only against an HTTP response body:
+//
+//	unauthorized entry (installed by writing plugins.json directly — install
+//	itself is out of this phase's scope) -> reload: not mounted, state
+//	unauthorized, no "grant" key on disk -> GET: declared capabilities
+//	visible, granted empty -> POST grant: 200, mounted, tool in the registry
+//	AND actually callable -> GET: state loaded, granted == declared ->
+//	POST deny: 200, tool gone -> GET: state DISABLED, not unauthorized
+//	(GrantStated stayed true — a decision was made, then revoked; Source
+//	survives on disk) -> POST grant again: 200, remounted and callable again
+//
+// See this section's own doc comment for why the server.PluginConsent behind
+// srv is e2eConsentAdapter rather than cli.PluginConsentService.
+//
+// Bound: this test converges exactly three times (the startup apply, the
+// grant, the deny, the second grant — four, not three; each is followed by
+// requireInstanceCeiling with a literal ceiling), written out in order. No
+// loop, no goroutine, no wait.
+func TestE2EHTTPConsentGrantDenyGrantAssertsStateOnDiskAtEveryStep(t *testing.T) {
+	if toolauth.IsGateable(echoToolName) {
+		t.Fatalf("%q is already gateable before any apply: an earlier test leaked its contribution", echoToolName)
+	}
+	h := newHarness(t)
+	ctx := context.Background()
+	adapter := &e2eConsentAdapter{h: h}
+	srv := server.NewHTTPServer(server.Config{Plugins: adapter, AdminToken: "e2e-admin-token"})
+
+	h.writeEcho("1.0.0")
+	h.writeManifest(e2eUnauthorizedEchoManifest())
+	if err := h.applyManifest(ctx); err != nil {
+		t.Fatalf("startup Apply of the unauthorized entry: %v", err)
+	}
+	h.requireInstanceCeiling("after the startup apply", 0)
+	if names := h.toolNames(); slices.Contains(names, echoToolName) {
+		t.Fatalf("registry advertises %q for an unauthorized entry: %v", echoToolName, names)
+	}
+
+	// --- GET: unauthorized, declared visible, granted empty ----------------
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, e2eAdminRequest(t, http.MethodGet, "/v1/plugins", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /v1/plugins status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	row := e2eRowNamed(t, e2eDecodeListResponse(t, rec), echoPluginName)
+	if row.State != e2eStateUnauthorized {
+		t.Fatalf("GET /v1/plugins state = %q, want %q", row.State, e2eStateUnauthorized)
+	}
+	if len(row.GrantedCaps) != 0 {
+		t.Errorf("GET /v1/plugins GrantedCaps = %v, want empty: nothing has been authorized yet", row.GrantedCaps)
+	}
+
+	if entry := requireSingleEntry(t, h.readManifest(), echoPluginName); entry.Enabled || entry.GrantStated {
+		t.Fatalf("plugins.json before any grant = %+v, want Enabled=false and GrantStated=false", entry)
+	}
+	rawBeforeGrant, err := os.ReadFile(h.manifestPath())
+	if err != nil {
+		t.Fatalf("read plugins.json: %v", err)
+	}
+	if strings.Contains(string(rawBeforeGrant), `"grant"`) {
+		t.Fatalf(`plugins.json before any grant = %s, want NO "grant" key: nobody has decided anything yet`, rawBeforeGrant)
+	}
+
+	// --- POST grant: mounts, tool in the registry, and it really serves ----
+
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, e2eAdminRequest(t, http.MethodPost, "/v1/plugins/"+echoPluginName+"/grant", server.GrantRequest{}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST .../grant status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	grantResp := e2eDecodeConsentResponse(t, rec)
+	if grantResp.PendingConvergence {
+		t.Fatalf("POST .../grant PendingConvergence = true, want false body=%s", rec.Body.String())
+	}
+	if grantResp.State != StateLoaded {
+		t.Fatalf("POST .../grant state = %q, want %q body=%s", grantResp.State, StateLoaded, rec.Body.String())
+	}
+	if !slices.Contains(grantResp.Tools, echoToolName) {
+		t.Errorf("POST .../grant Tools = %v, want %q among them", grantResp.Tools, echoToolName)
+	}
+	h.requireInstanceCeiling("after the grant", 1)
+	if names := h.toolNames(); !slices.Contains(names, echoToolName) {
+		t.Fatalf("registry tools after the grant = %v, want %q among them", names, echoToolName)
+	}
+	requireGateable(t, echoToolName, true, "after the grant")
+	if result, _, err := h.executeAsModel(ctx, domain.ToolCall{
+		ID: "model-call-after-grant", Name: echoToolName, Arguments: map[string]string{"text": "granted"},
+	}); err != nil || !result.Success || result.Output != echoToolName+`:{"text":"granted"}` {
+		t.Fatalf("Execute(%q) after the grant = %+v, err=%v", echoToolName, result, err)
+	}
+
+	entryAfterGrant := requireSingleEntry(t, h.readManifest(), echoPluginName)
+	if !entryAfterGrant.Enabled || !entryAfterGrant.GrantStated {
+		t.Fatalf("plugins.json after the grant = %+v, want Enabled=true and GrantStated=true", entryAfterGrant)
+	}
+	if entryAfterGrant.Source != "echo" {
+		t.Errorf("plugins.json after the grant Source = %q, want unchanged %q", entryAfterGrant.Source, "echo")
+	}
+
+	// --- GET: loaded, granted == declared -----------------------------------
+
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, e2eAdminRequest(t, http.MethodGet, "/v1/plugins", nil))
+	row = e2eRowNamed(t, e2eDecodeListResponse(t, rec), echoPluginName)
+	if row.State != StateLoaded {
+		t.Fatalf("GET /v1/plugins state after the grant = %q, want %q", row.State, StateLoaded)
+	}
+	if !slices.Equal(row.GrantedCaps, row.DeclaredCaps) {
+		t.Errorf("GET /v1/plugins GrantedCaps=%v DeclaredCaps=%v after the grant, want them equal (echo declares none)",
+			row.GrantedCaps, row.DeclaredCaps)
+	}
+
+	// --- POST deny: tool gone, entry survives as DISABLED, not unauthorized -
+
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, e2eAdminRequest(t, http.MethodPost, "/v1/plugins/"+echoPluginName+"/deny", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST .../deny status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	denyResp := e2eDecodeConsentResponse(t, rec)
+	if denyResp.PendingConvergence {
+		t.Fatalf("POST .../deny PendingConvergence = true, want false body=%s", rec.Body.String())
+	}
+	// The assertion this task's brief calls out as the one most likely to be
+	// written wrong: after a deny, the state is "disabled", NEVER
+	// "unauthorized" — GrantStated stays true, because a decision WAS made
+	// and then revoked, and an operator's next step differs between the two.
+	if denyResp.State != e2eStateDisabled {
+		t.Fatalf("POST .../deny state = %q, want %q (NOT %q — a decision was made here)",
+			denyResp.State, e2eStateDisabled, e2eStateUnauthorized)
+	}
+	h.requireInstanceCeiling("after the deny", 0)
+	if names := h.toolNames(); slices.Contains(names, echoToolName) {
+		t.Fatalf("registry still advertises %q after the deny: %v", echoToolName, names)
+	}
+	requireGateable(t, echoToolName, false, "after the deny")
+
+	entryAfterDeny := requireSingleEntry(t, h.readManifest(), echoPluginName)
+	if entryAfterDeny.Enabled {
+		t.Errorf("plugins.json after the deny Enabled = true, want false")
+	}
+	if !entryAfterDeny.GrantStated {
+		t.Fatalf("plugins.json after the deny GrantStated = false, want true: a decision was made, then revoked")
+	}
+	if len(entryAfterDeny.Grant.Capabilities) != 0 {
+		t.Errorf("plugins.json after the deny Grant.Capabilities = %v, want empty", entryAfterDeny.Grant.Capabilities)
+	}
+	if entryAfterDeny.Source != "echo" {
+		t.Errorf("plugins.json after the deny Source = %q, want unchanged %q — deny revokes, it does not forget",
+			entryAfterDeny.Source, "echo")
+	}
+	if len(entryAfterDeny.Tools) != 1 || entryAfterDeny.Tools[0].Name != echoToolName {
+		t.Errorf("plugins.json after the deny Tools = %+v, want the original tool accept untouched", entryAfterDeny.Tools)
+	}
+
+	// --- GET: disabled, not unauthorized ------------------------------------
+
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, e2eAdminRequest(t, http.MethodGet, "/v1/plugins", nil))
+	row = e2eRowNamed(t, e2eDecodeListResponse(t, rec), echoPluginName)
+	if row.State != e2eStateDisabled {
+		t.Fatalf("GET /v1/plugins state after the deny = %q, want %q", row.State, e2eStateDisabled)
+	}
+
+	// --- POST grant again: remounts, and it serves again --------------------
+
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, e2eAdminRequest(t, http.MethodPost, "/v1/plugins/"+echoPluginName+"/grant", server.GrantRequest{}))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST .../grant (again) status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	regrantResp := e2eDecodeConsentResponse(t, rec)
+	if regrantResp.PendingConvergence || regrantResp.State != StateLoaded {
+		t.Fatalf("POST .../grant (again) = %+v, want a converged, loaded response", regrantResp)
+	}
+	h.requireInstanceCeiling("after the second grant", 1)
+	requireGateable(t, echoToolName, true, "after the second grant")
+	if result, _, err := h.executeAsModel(ctx, domain.ToolCall{
+		ID: "model-call-after-regrant", Name: echoToolName, Arguments: map[string]string{"text": "again"},
+	}); err != nil || !result.Success || result.Output != echoToolName+`:{"text":"again"}` {
+		t.Fatalf("Execute(%q) after the second grant = %+v, err=%v", echoToolName, result, err)
+	}
+}
+
+// TestE2EHTTPGrantRefusesAStrictCapabilitySubsetAndLeavesTheManifestUnchanged
+// is Step 2's first refusal: consent.ResolveCapabilities requires EQUALITY,
+// not mere coverage (see its own doc comment — a strict subset produces an
+// entry manifest.AssembleSpec can never load). Proven over HTTP against a
+// plugin that actually declares a capability (the proxy fixture declares
+// "tool"), with plugins.json's raw bytes checked before and after: a
+// validation failure must leave the manifest untouched, not merely report an
+// error.
+//
+// Bound: one Apply (the startup convergence of the disabled entry). The
+// refused grant is caught by consent.ResolveCapabilities before Apply is
+// ever called again.
+func TestE2EHTTPGrantRefusesAStrictCapabilitySubsetAndLeavesTheManifestUnchanged(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	adapter := &e2eConsentAdapter{h: h}
+	srv := server.NewHTTPServer(server.Config{Plugins: adapter, AdminToken: "e2e-admin-token"})
+
+	h.writeProxy("1.0.0")
+	h.writeManifest(fmt.Sprintf(`{
+  "plugins": [
+    {
+      "name": %q,
+      "source": "proxy",
+      "enabled": false,
+      "tools": [{"name": %q}]
+    }
+  ]
+}`, proxyPluginName, proxyToolName))
+	if err := h.applyManifest(ctx); err != nil {
+		t.Fatalf("startup Apply: %v", err)
+	}
+	h.requireInstanceCeiling("after the startup apply", 0)
+
+	before, err := os.ReadFile(h.manifestPath())
+	if err != nil {
+		t.Fatalf("snapshot plugins.json: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, e2eAdminRequest(t, http.MethodPost, "/v1/plugins/"+proxyPluginName+"/grant",
+		server.GrantRequest{Capabilities: []string{}}))
+	if rec.Code < 400 || rec.Code >= 600 {
+		t.Fatalf("POST .../grant (strict subset) status = %d, want 4xx/5xx body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "does not grant") {
+		t.Errorf("POST .../grant (strict subset) body = %s, want it to name the missing capability", rec.Body.String())
+	}
+
+	after, err := os.ReadFile(h.manifestPath())
+	if err != nil {
+		t.Fatalf("re-read plugins.json: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("plugins.json changed on a refused grant:\nbefore=%s\nafter=%s", before, after)
+	}
+	h.requireInstanceCeiling("after the refused grant", 0)
+	if names := h.toolNames(); slices.Contains(names, proxyToolName) {
+		t.Fatalf("registry advertises %q after a refused grant: %v", proxyToolName, names)
+	}
+}
+
+// e2eHTTPCapablePluginName / e2eHTTPCapableToolName are the fixture identity
+// TestE2EHTTPGrantRefusesHTTPCapabilityWithNoAllowedHostsWhenThePluginDeclaresSome
+// mounts nothing under: this test's grant is refused before Apply is ever
+// called, so a name distinct from echoPluginName/proxyPluginName is only
+// hygiene, not a requirement for correctness.
+const (
+	e2eHTTPCapablePluginName = "legion-e2e-http-plugin"
+	e2eHTTPCapableToolName   = "e2e_http_tool"
+)
+
+// e2eWriteHTTPCapablePackage writes a plugin package declaring the "http"
+// capability with a non-empty "network"."allowed_hosts" — the one shape
+// loader_test.go's writePackage/pkg has no field for, because none of that
+// file's fixtures need Network populated. It reuses the echo guest's wasm
+// bytes: this package is never activated by any test in this section (every
+// grant that reaches it is refused before Apply runs again), so the guest's
+// actual imports are irrelevant — only plugin.json's declaration is
+// exercised.
+func e2eWriteHTTPCapablePackage(t *testing.T, dir string, hosts []string) {
+	t.Helper()
+
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("create package dir %s: %v", dir, err)
+	}
+	wasm := fixtureWasm(t, echoWasmFile)
+	sum := sha256.Sum256(wasm)
+	pm := manifest.PluginManifest{
+		Name:         e2eHTTPCapablePluginName,
+		Version:      "1.0.0",
+		ABI:          1,
+		SHA256:       hex.EncodeToString(sum[:]),
+		Capabilities: []string{"http"},
+		Limits:       manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
+		Network:      manifest.Network{AllowedHosts: hosts},
+		Tools: []manifest.ToolDecl{{
+			Name: e2eHTTPCapableToolName, Description: "fixture tool", Group: "plugins", RiskLevel: "low", TimeoutMs: 1000,
+		}},
+	}
+	data, err := json.Marshal(pm)
+	if err != nil {
+		t.Fatalf("encode plugin.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "plugin.json"), data, 0o644); err != nil {
+		t.Fatalf("write plugin.json: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "plugin.wasm"), wasm, 0o644); err != nil {
+		t.Fatalf("write plugin.wasm: %v", err)
+	}
+}
+
+// TestE2EHTTPGrantRefusesHTTPCapabilityWithNoAllowedHostsWhenThePluginDeclaresSome
+// is Step 2's second refusal: consent.RefuseUnnamedAllowlist — granting
+// "http" while the plugin declares a non-empty "network"."allowed_hosts" and
+// naming NONE of them would authorize http with an allowlist that reaches
+// nothing (see that function's own doc comment). Proven over HTTP, so the
+// endpoint is shown to enforce the identical rule `agent plugins grant` does,
+// through the one function both call.
+//
+// Bound: one Apply (the startup convergence of the disabled entry). The
+// refused grant never reaches Apply again.
+func TestE2EHTTPGrantRefusesHTTPCapabilityWithNoAllowedHostsWhenThePluginDeclaresSome(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	adapter := &e2eConsentAdapter{h: h}
+	srv := server.NewHTTPServer(server.Config{Plugins: adapter, AdminToken: "e2e-admin-token"})
+
+	e2eWriteHTTPCapablePackage(t, filepath.Join(h.root, "e2e-http"), []string{"jira.example.com", "github.example.com"})
+	h.writeManifest(fmt.Sprintf(`{
+  "plugins": [
+    {
+      "name": %q,
+      "source": "e2e-http",
+      "enabled": false,
+      "tools": [{"name": %q}]
+    }
+  ]
+}`, e2eHTTPCapablePluginName, e2eHTTPCapableToolName))
+	if err := h.applyManifest(ctx); err != nil {
+		t.Fatalf("startup Apply: %v", err)
+	}
+	h.requireInstanceCeiling("after the startup apply", 0)
+
+	before, err := os.ReadFile(h.manifestPath())
+	if err != nil {
+		t.Fatalf("snapshot plugins.json: %v", err)
+	}
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, e2eAdminRequest(t, http.MethodPost, "/v1/plugins/"+e2eHTTPCapablePluginName+"/grant",
+		server.GrantRequest{Capabilities: []string{"http"}}))
+	if rec.Code < 400 || rec.Code >= 600 {
+		t.Fatalf("POST .../grant (http, no hosts named) status = %d, want 4xx/5xx body=%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "allowed_hosts") {
+		t.Errorf("POST .../grant (http, no hosts named) body = %s, want it to name allowed_hosts", rec.Body.String())
+	}
+
+	after, err := os.ReadFile(h.manifestPath())
+	if err != nil {
+		t.Fatalf("re-read plugins.json: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Fatalf("plugins.json changed on a refused grant:\nbefore=%s\nafter=%s", before, after)
+	}
+	h.requireInstanceCeiling("after the refused grant", 0)
+}
+
+// TestE2EHTTPGrantRefusesAConcurrentEditWithoutRevertingIt is Step 2's third
+// refusal: consent.RefuseDeploymentChanged refuses to write over an edit
+// that landed after Grant took its snapshot, rather than silently reverting
+// it.
+//
+// e2eConsentAdapter.afterSnapshot is the barrier this test uses to land that
+// edit deterministically: Grant's own local package resolution is disk I/O
+// with no natural pause point a test could race a goroutine against from the
+// outside, so this hooks the exact moment production Grant would be
+// vulnerable to a second writer (another process, or the same operator's
+// second browser tab) landing an edit in the window between the snapshot
+// read and the write — the same "barrier point" pattern internal/cli's
+// TestPluginConsentServiceConcurrentGrantsDoNotRevertEachOther uses keyringFn
+// for, and TestPluginConsentServiceGrantRefusesAConcurrentEditDuringTheDownload
+// uses a blocked-on httptest.Server handler for.
+//
+// Bound: no goroutine, no channel, no loop — the concurrent edit is written
+// synchronously from inside this one HTTP call.
+func TestE2EHTTPGrantRefusesAConcurrentEditWithoutRevertingIt(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+
+	h.writeEcho("1.0.0")
+	h.writeManifest(e2eUnauthorizedEchoManifest())
+	if err := h.applyManifest(ctx); err != nil {
+		t.Fatalf("startup Apply: %v", err)
+	}
+
+	adapter := &e2eConsentAdapter{h: h}
+	landed := false
+	adapter.afterSnapshot = func() {
+		landed = true
+		concurrent := manifest.Deployment{Plugins: []manifest.Entry{{
+			Name:    "concurrently-edited-plugin",
+			Source:  "elsewhere",
+			Enabled: true,
+			Tools:   []manifest.ToolAccept{{Name: "whatever"}},
+		}}}
+		if err := manifest.WriteDeployment(h.manifestPath(), concurrent); err != nil {
+			t.Errorf("write concurrent edit: %v", err)
+		}
+	}
+	srv := server.NewHTTPServer(server.Config{Plugins: adapter, AdminToken: "e2e-admin-token"})
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, e2eAdminRequest(t, http.MethodPost, "/v1/plugins/"+echoPluginName+"/grant", server.GrantRequest{}))
+	if !landed {
+		t.Fatal("the afterSnapshot hook never ran; this test proves nothing about a concurrent edit")
+	}
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("POST .../grant (concurrent edit) status = %d, want %d body=%s", rec.Code, http.StatusConflict, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "changed") {
+		t.Errorf("POST .../grant (concurrent edit) body = %s, want it to say the manifest changed underneath it", rec.Body.String())
+	}
+
+	after := h.readManifest()
+	if len(after.Plugins) != 1 || after.Plugins[0].Name != "concurrently-edited-plugin" {
+		t.Fatalf("plugins.json after the refused grant = %+v, want ONLY the concurrent edit still present — "+
+			"a refusal must not revert it", after.Plugins)
+	}
+	h.requireInstanceCeiling("after the refused concurrent grant", 0)
 }
