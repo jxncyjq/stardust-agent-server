@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -869,5 +870,99 @@ func TestLoadPackage_EmptySignatureFile(t *testing.T) {
 	requireErrorContains(t, err, "parse plugin.sig")
 	if strings.Contains(err.Error(), "is missing") {
 		t.Errorf("error %q says plugin.sig is missing, but an empty file is not the same as no file", err)
+	}
+}
+
+// --- LoadPackage: ErrUntrustedPackage classification -------------------------
+//
+// These pin which of verifyManifestSignature's four failure paths must be
+// identifiable via errors.Is(err, ErrUntrustedPackage) and which must not.
+// The three trust verdicts (missing signature, corrupt signature, signature
+// that does not verify) get the sentinel; an I/O fault while reading
+// plugin.sig deliberately does not — see ErrUntrustedPackage's doc comment.
+
+// writeTestPackage writes a complete, valid, but unsigned plugin package
+// (plugin.json and plugin.wasm copied from testdata/pkg) into a fresh
+// temporary directory, and returns that directory. It mirrors signedPackage
+// above, minus the signing step, for tests that need to control plugin.sig
+// themselves.
+func writeTestPackage(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	writePackage(t, dir, string(mustReadFixture(t, "pkg/plugin.json")), mustReadWasmFixture(t))
+	return dir
+}
+
+// testKeyring mints a fresh Ed25519 key pair and returns a Keyring trusting
+// exactly that one public key under id "ops-2026" — a deployment that
+// requires signatures. The private key is discarded on purpose: callers that
+// need a package actually signed by a trusted key use signedPackage instead.
+func testKeyring(t *testing.T) *sign.Keyring {
+	t.Helper()
+	kr, _ := newKeyring(t, "ops-2026")
+	return kr
+}
+
+// signTestPackageWithForeignKey signs dir's plugin.json with a freshly
+// minted key pair that no keyring returned by testKeyring trusts, and writes
+// the resulting plugin.sig into dir — a real, well-formed signature that
+// still must be refused because the keyring does not know its key.
+func signTestPackageWithForeignKey(t *testing.T, dir string) {
+	t.Helper()
+	_, foreignPriv := newKeyring(t, "foreign-key")
+	writeSignature(t, dir, foreignPriv, "foreign-key", mustReadFixture(t, "pkg/plugin.json"))
+}
+
+func TestLoadPackageMarksAnUnsignedPackageUntrusted(t *testing.T) {
+	// 包齐全但没有 plugin.sig，且部署要求签名（keyring 非 nil）
+	dir := writeTestPackage(t) // 既有夹具助手：写 plugin.json + plugin.wasm
+	kr := testKeyring(t)       // 既有夹具助手
+	_, _, err := LoadPackage(dir, kr)
+	if err == nil {
+		t.Fatal("LoadPackage on an unsigned package = nil error, want an untrusted-package error")
+	}
+	if !errors.Is(err, ErrUntrustedPackage) {
+		t.Errorf("LoadPackage error = %v, want it to wrap ErrUntrustedPackage", err)
+	}
+}
+
+func TestLoadPackageMarksACorruptSignatureUntrusted(t *testing.T) {
+	dir := writeTestPackage(t)
+	kr := testKeyring(t)
+	if err := os.WriteFile(filepath.Join(dir, "plugin.sig"), []byte("{not json"), 0o644); err != nil {
+		t.Fatalf("write corrupt plugin.sig: %v", err)
+	}
+	_, _, err := LoadPackage(dir, kr)
+	if !errors.Is(err, ErrUntrustedPackage) {
+		t.Errorf("LoadPackage error = %v, want it to wrap ErrUntrustedPackage", err)
+	}
+}
+
+func TestLoadPackageMarksAWrongSignatureUntrusted(t *testing.T) {
+	dir := writeTestPackage(t)
+	kr := testKeyring(t)
+	// 用一把 keyring 不信任的密钥签名
+	signTestPackageWithForeignKey(t, dir) // 见 Step 3 说明；若既有助手可用则复用
+	_, _, err := LoadPackage(dir, kr)
+	if !errors.Is(err, ErrUntrustedPackage) {
+		t.Errorf("LoadPackage error = %v, want it to wrap ErrUntrustedPackage", err)
+	}
+}
+
+// 第四条：I/O 故障不是信任问题，必须 NOT 命中哨兵。
+// 用一个目录冒充 plugin.sig：读它会得到 EISDIR 一类的 I/O 错误，而非 fs.ErrNotExist。
+func TestLoadPackageDoesNotMarkAnIOFailureUntrusted(t *testing.T) {
+	dir := writeTestPackage(t)
+	kr := testKeyring(t)
+	if err := os.Mkdir(filepath.Join(dir, "plugin.sig"), 0o755); err != nil {
+		t.Fatalf("mkdir plugin.sig: %v", err)
+	}
+	_, _, err := LoadPackage(dir, kr)
+	if err == nil {
+		t.Fatal("LoadPackage with an unreadable plugin.sig = nil error, want an I/O error")
+	}
+	if errors.Is(err, ErrUntrustedPackage) {
+		t.Errorf("LoadPackage error = %v, want an I/O failure NOT classified as untrusted: "+
+			"a disk or permission problem is a retryable environment fault, not a trust verdict", err)
 	}
 }

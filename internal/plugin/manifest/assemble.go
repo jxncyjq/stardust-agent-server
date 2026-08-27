@@ -119,6 +119,18 @@ func LoadPackage(dir string, keyring *sign.Keyring) (PluginManifest, []byte, err
 	return pm, wasm, nil
 }
 
+// ErrUntrustedPackage marks the failures that mean "this package is not
+// trustworthy", as opposed to "the package could not be obtained". A caller
+// showing a human why a fetch failed needs that distinction: an untrusted
+// package will never become trustworthy by retrying, and offering a retry for
+// it would be a control that cannot work.
+//
+// It deliberately does NOT cover an I/O error while reading plugin.sig. A
+// disk or permission fault is an environment problem in the same class as a
+// source-site timeout — retrying it is meaningful — and folding it in here
+// would devalue the signal for the failures that really are trust verdicts.
+var ErrUntrustedPackage = errors.New("plugin package is not trusted")
+
 // verifyManifestSignature reads dir/plugin.sig and checks it against keyring
 // over manifestData — plugin.json's raw bytes, exactly as read from disk.
 //
@@ -141,16 +153,18 @@ func verifyManifestSignature(dir string, manifestData []byte, keyring *sign.Keyr
 	sigData, err := os.ReadFile(sigPath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("plugin.sig is missing: this deployment requires a signed package: %w", err)
+			return fmt.Errorf("plugin.sig is missing: this deployment requires a signed package: %w: %w",
+				ErrUntrustedPackage, err)
 		}
+		// NOT ErrUntrustedPackage: see that sentinel's doc comment.
 		return fmt.Errorf("read plugin.sig: %w", err)
 	}
 	sig, err := sign.ParseSignature(sigData)
 	if err != nil {
-		return fmt.Errorf("parse plugin.sig: %w", err)
+		return fmt.Errorf("parse plugin.sig: %w: %w", ErrUntrustedPackage, err)
 	}
 	if err := keyring.Verify(sig, manifestData); err != nil {
-		return fmt.Errorf("verify plugin.json signature: %w", err)
+		return fmt.Errorf("verify plugin.json signature: %w: %w", ErrUntrustedPackage, err)
 	}
 	return nil
 }
