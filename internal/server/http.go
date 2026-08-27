@@ -312,6 +312,8 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleGrantPlugin(rec, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/plugins/") && strings.HasSuffix(r.URL.Path, "/deny"):
 		s.handleDenyPlugin(rec, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/plugins/") && strings.HasSuffix(r.URL.Path, "/resolve"):
+		s.handleResolvePlugin(rec, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/files":
 		s.handleServeFile(rec, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/sessions":

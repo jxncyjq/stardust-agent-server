@@ -174,6 +174,10 @@ func TestPluginConsentServiceListReportsBrokenLocalPackagePerRow(t *testing.T) {
 	if !broken.DeclaredUnresolved {
 		t.Error("broken entry DeclaredUnresolved = false, want true")
 	}
+	if broken.DeclaredUnresolvedReason != server.DeclaredUnresolvedLoadFailed {
+		t.Errorf("broken entry DeclaredUnresolvedReason = %q, want %q: a package that fails to load is not fetchable, and a consent UI must not offer a fetch for it",
+			broken.DeclaredUnresolvedReason, server.DeclaredUnresolvedLoadFailed)
+	}
 	if broken.DeclaredError == "" {
 		t.Error("broken entry DeclaredError = empty, want the load failure reason")
 	}
@@ -189,6 +193,67 @@ func TestPluginConsentServiceListReportsBrokenLocalPackagePerRow(t *testing.T) {
 	}
 	if healthy.DeclaredError != "" {
 		t.Errorf("healthy entry DeclaredError = %q, want empty", healthy.DeclaredError)
+	}
+	if healthy.DeclaredUnresolvedReason != "" {
+		t.Errorf("healthy entry DeclaredUnresolvedReason = %q, want empty: a resolved row has no unresolved reason to report",
+			healthy.DeclaredUnresolvedReason)
+	}
+}
+
+// TestPluginConsentServiceListSeparatesNoCacheFromCacheMiss is I-4 of the
+// whole-branch final review. Both of these report DeclaredUnresolved=true
+// with an EMPTY DeclaredError, and before DeclaredUnresolvedReason existed
+// they were byte-identical JSON:
+//
+//   - a remote entry this deployment simply has not fetched yet, which
+//     PluginConsent.Resolve CAN remedy, and
+//   - a remote entry in a deployment that configured no "plugins.cache" at
+//     all, which Resolve can never remedy -- resolvePluginPackageDir refuses
+//     it outright, so a fetch button on that row is a control that cannot
+//     work.
+//
+// A GUI deciding whether to offer a fetch must not have to guess between
+// them, so List reports which one it is.
+func TestPluginConsentServiceListSeparatesNoCacheFromCacheMiss(t *testing.T) {
+	// No "cache" key at all: resolvePluginRemote leaves RemoteConfig.Cache
+	// nil, which is the deployment-config fact this half of the test is
+	// about. enabled:false keeps assemble() from ever trying to activate
+	// (and so fetch) the entry.
+	noCache := newPluginFixture(t, 30_000)
+	noCache.writeSignatureConfig(30_000, signaturePolicy{requireSignature: boolPtr(false)})
+	noCache.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "https://example.invalid/echo.tgz", enabled: false,
+		tools: []string{testEchoTool}, digest: digestOfArchive([]byte("never fetched")),
+	})
+	if err := noCache.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+	remote := noCache.resolveFixtureRemote()
+	if remote.Cache != nil {
+		t.Fatalf("fixture remote.Cache = %v, want nil: this test needs a deployment with no configured plugin cache", remote.Cache)
+	}
+	svc := NewPluginConsentService(noCache.manifestPath, noCache.root, noCache.application.Plugins,
+		func() *sign.Keyring { return nil }, remote, testConsentLogger())
+	views, err := svc.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v, want nil", err)
+	}
+	if len(views) != 1 {
+		t.Fatalf("len(views) = %d, want 1: %+v", len(views), views)
+	}
+	got := views[0]
+	if !got.DeclaredUnresolved {
+		t.Fatal("DeclaredUnresolved = false, want true: with no cache configured the declaration cannot be resolved")
+	}
+	if got.DeclaredError != "" {
+		t.Errorf("DeclaredError = %q, want empty: no cache configured is a deployment fact, not a load failure", got.DeclaredError)
+	}
+	if got.DeclaredUnresolvedReason != server.DeclaredUnresolvedNoCache {
+		t.Errorf("DeclaredUnresolvedReason = %q, want %q: this row must be distinguishable from a plain cache miss, or the panel offers a fetch that can never succeed",
+			got.DeclaredUnresolvedReason, server.DeclaredUnresolvedNoCache)
+	}
+	if got.DeclaredUnresolvedReason == server.DeclaredUnresolvedNotCached {
+		t.Error("DeclaredUnresolvedReason reports a plain cache miss, but this deployment has no cache to miss")
 	}
 }
 
@@ -308,6 +373,10 @@ func TestPluginConsentServiceListReportsUnresolvedForRemoteCacheMiss(t *testing.
 	got := views[0]
 	if !got.DeclaredUnresolved {
 		t.Fatal("DeclaredUnresolved = false, want true: this entry was never fetched, so its cache does not hold it")
+	}
+	if got.DeclaredUnresolvedReason != server.DeclaredUnresolvedNotCached {
+		t.Errorf("DeclaredUnresolvedReason = %q, want %q: a plain cache miss is the ONE case a deliberate Resolve can remedy, and the panel keys its fetch button on it",
+			got.DeclaredUnresolvedReason, server.DeclaredUnresolvedNotCached)
 	}
 	if len(got.DeclaredCaps) != 0 || len(got.DeclaredHosts) != 0 || len(got.DeclaredPaths) != 0 {
 		t.Errorf("Declared* = caps=%v hosts=%v paths=%v, want all empty when unresolved",
@@ -524,6 +593,10 @@ func TestPluginConsentServiceDenyKeepsFieldsAndGrantStated(t *testing.T) {
 	// as "declares nothing".
 	if !result.View.DeclaredUnresolved {
 		t.Errorf("Deny() View.DeclaredUnresolved = false, want true: Deny never resolves declarations")
+	}
+	if result.View.DeclaredUnresolvedReason != server.DeclaredUnresolvedNotInspected {
+		t.Errorf("Deny() View.DeclaredUnresolvedReason = %q, want %q: nothing failed here, nobody looked",
+			result.View.DeclaredUnresolvedReason, server.DeclaredUnresolvedNotInspected)
 	}
 }
 
@@ -1113,6 +1186,207 @@ func TestPluginConsentServiceReportsAMissingLoaderAsUnavailable(t *testing.T) {
 	}
 	if _, err := svc.Deny(context.Background(), "any"); !errors.Is(err, server.ErrPluginUnavailable) {
 		t.Errorf("Deny() error = %v, want it to wrap server.ErrPluginUnavailable", err)
+	}
+}
+
+// --- Task 2: PluginConsentService.Resolve -----------------------------------
+
+// consentFixture is Resolve's fixture: a single remote deployment entry whose
+// package is served by origin and not yet cached, plus a PluginConsentService
+// wired against it the same way the List/Grant tests above wire theirs (see
+// resolveFixtureRemote) -- Resolve's whole point is fetching a package
+// assembly never touched, so the entry is left disabled and origin stays
+// reachable until a test closes it itself.
+type consentFixture struct {
+	*pluginFixture
+	svc        *PluginConsentService
+	pluginName string
+	origin     *httptest.Server
+}
+
+// newConsentFixture builds a consentFixture around a healthy, unsigned-but-
+// untrusted-doesn't-matter package: the deployment does not require
+// signatures (requireSignature: false) and the service's own keyringFn
+// returns nil, exactly like every List/Grant test fixture above -- signature
+// verification is exercised separately, by
+// newConsentFixtureWithUntrustedPackage.
+func newConsentFixture(t *testing.T) *consentFixture {
+	t.Helper()
+
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.signPackageWithAnyKey("staging")
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
+	// enabled: false keeps assemble() from ever fetching this entry itself --
+	// Resolve is what is supposed to put it in the cache, not assembly.
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: srv.URL + "/echo.tgz", enabled: false,
+		tools: []string{testEchoTool}, digest: digest, omitGrant: true,
+	})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
+		func() *sign.Keyring { return nil }, f.resolveFixtureRemote(), testConsentLogger())
+	return &consentFixture{pluginFixture: f, svc: svc, pluginName: testEchoPlugin, origin: srv}
+}
+
+// newConsentFixtureWithUntrustedPackage is newConsentFixture, except the
+// service's own keyringFn returns a REAL keyring that trusts a different key
+// than the one the package is signed with -- the "signature does not verify"
+// path manifest.ErrUntrustedPackage marks (see that sentinel's own doc
+// comment). The deployment's own assembly-time signature policy is left off
+// (requireSignature: false), same as newConsentFixture: the entry is disabled
+// so assembly never loads it, and only Resolve's own LoadPackage call is
+// under test here.
+func newConsentFixtureWithUntrustedPackage(t *testing.T) *consentFixture {
+	t.Helper()
+
+	f := newPluginFixture(t, 30_000)
+	_, keyringPath := f.newKeyring("keyring.json")
+	keyringData, err := os.ReadFile(keyringPath)
+	if err != nil {
+		t.Fatalf("read keyring %s: %v", keyringPath, err)
+	}
+	keyring, err := sign.ParseKeyring(keyringData)
+	if err != nil {
+		t.Fatalf("parse keyring %s: %v", keyringPath, err)
+	}
+
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	// Signed with a freshly generated key that was never registered anywhere:
+	// the keyring above trusts a DIFFERENT public key under the same
+	// testPluginKeyID, so Verify fails on "signature does not verify against
+	// key", not on an unknown key id.
+	f.signPackageWithAnyKey("staging")
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: srv.URL + "/echo.tgz", enabled: false,
+		tools: []string{testEchoTool}, digest: digest, omitGrant: true,
+	})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
+		func() *sign.Keyring { return keyring }, f.resolveFixtureRemote(), testConsentLogger())
+	return &consentFixture{pluginFixture: f, svc: svc, pluginName: testEchoPlugin, origin: srv}
+}
+
+// TestPluginConsentServiceResolveFillsDeclarationsWithoutTouchingTheManifest
+// is invariant 1 and invariant 4 together: a successful Resolve against a
+// remote entry with a reachable origin fetches and verifies the package,
+// reports its real declared capabilities, and leaves plugins.json byte for
+// byte as it found it -- Resolve is "look", never "write".
+func TestPluginConsentServiceResolveFillsDeclarationsWithoutTouchingTheManifest(t *testing.T) {
+	// 一条远程条目，缓存未命中，源站可达
+	f := newConsentFixture(t) // 既有夹具助手
+	before, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json: %v", err)
+	}
+
+	view, err := f.svc.Resolve(context.Background(), f.pluginName)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if view.DeclaredUnresolved {
+		t.Error("view.DeclaredUnresolved = true after a successful Resolve, want false")
+	}
+	if view.DeclaredUnresolvedReason != "" {
+		t.Errorf("view.DeclaredUnresolvedReason = %q, want empty: a resolved view has no unresolved reason", view.DeclaredUnresolvedReason)
+	}
+	if len(view.DeclaredCaps) == 0 {
+		t.Error("view.DeclaredCaps is empty after a successful Resolve, want the plugin's declared capabilities")
+	}
+
+	after, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("re-read plugins.json: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("plugins.json changed during Resolve:\nbefore: %s\nafter:  %s", before, after)
+	}
+}
+
+// TestPluginConsentServiceResolveDoesNotRefetchOnACacheHit pins
+// resolvePluginPackageDir's cache-hit short circuit reached through Resolve:
+// the first call fetches and caches the package, and the second -- with the
+// origin now offline -- must be served from that cache rather than attempt a
+// second fetch. 缓存命中不联网：先取回一次填满缓存，然后 CLOSE 掉源站再取回一次。
+// 任何意外的第二次 fetch 都会 connection-refused 而不是静默成功。
+func TestPluginConsentServiceResolveDoesNotRefetchOnACacheHit(t *testing.T) {
+	f := newConsentFixture(t)
+	if _, err := f.svc.Resolve(context.Background(), f.pluginName); err != nil {
+		t.Fatalf("first Resolve: %v", err)
+	}
+	f.origin.Close() // 源站下线
+
+	view, err := f.svc.Resolve(context.Background(), f.pluginName)
+	if err != nil {
+		t.Fatalf("second Resolve after the origin went away = %v, want it served from cache", err)
+	}
+	if view.DeclaredUnresolved {
+		t.Error("view.DeclaredUnresolved = true on a cache hit, want false")
+	}
+}
+
+// TestPluginConsentServiceResolveReportsAnUntrustedPackage is Resolve's new
+// error class: a package whose signature does not verify against the
+// service's keyring must come back with manifest.ErrUntrustedPackage on the
+// error chain, so a caller can tell "not trustworthy" apart from "could not
+// be obtained" and refrain from offering a pointless retry -- and, like every
+// other Resolve failure, must leave plugins.json untouched.
+func TestPluginConsentServiceResolveReportsAnUntrustedPackage(t *testing.T) {
+	f := newConsentFixtureWithUntrustedPackage(t) // 源站给出的包签名不被 keyring 信任
+	before, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json: %v", err)
+	}
+
+	_, err = f.svc.Resolve(context.Background(), f.pluginName)
+	if err == nil {
+		t.Fatal("Resolve on an untrusted package = nil error, want an error")
+	}
+	if !errors.Is(err, manifest.ErrUntrustedPackage) {
+		t.Errorf("Resolve error = %v, want it to wrap manifest.ErrUntrustedPackage", err)
+	}
+	// Both sentinels must be on the same error: manifest.ErrUntrustedPackage is
+	// the classification, server.ErrPluginUntrusted is what pluginConsentStatus
+	// actually keys its 422 response on (internal/server/plugins.go). A test
+	// that only checked the first would stay green even if Resolve stopped
+	// attaching the second, and an untrusted package would then report 400
+	// instead of 422 in production.
+	if !errors.Is(err, server.ErrPluginUntrusted) {
+		t.Errorf("Resolve error = %v, want it to also wrap server.ErrPluginUntrusted", err)
+	}
+
+	after, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("re-read plugins.json: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Error("plugins.json changed while Resolve was rejecting an untrusted package")
+	}
+}
+
+// TestPluginConsentServiceResolveReportsAnUnknownEntry mirrors Grant/Deny's
+// own "no such plugin" classification (server.ErrPluginNotFound) through the
+// same consent.FindEntry call.
+func TestPluginConsentServiceResolveReportsAnUnknownEntry(t *testing.T) {
+	f := newConsentFixture(t)
+	_, err := f.svc.Resolve(context.Background(), "no-such-plugin")
+	if !errors.Is(err, server.ErrPluginNotFound) {
+		t.Errorf("Resolve error = %v, want it to wrap server.ErrPluginNotFound", err)
 	}
 }
 

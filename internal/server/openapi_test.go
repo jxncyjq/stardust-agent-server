@@ -104,3 +104,37 @@ func TestOpenAPISpecIncludesErrorResponses(t *testing.T) {
 		t.Errorf("BuildOpenAPISpec().Components.Schemas[ErrorResponse] missing")
 	}
 }
+
+// TestOpenAPISpecDocumentsUntrustedPluginStatus is M-2 of the whole-branch
+// final review: 422 is the single status the cross-repo untrusted-package
+// contract is keyed on, and a spec that omits it is the only place a non-GUI
+// client could have learned the status exists. The sibling grant/deny
+// operations deliberately do NOT declare it -- they never report
+// ErrPluginUntrusted -- so this test also pins that the divergence is
+// one-sided and intentional rather than a shared-helper change that leaked
+// 422 onto every secured endpoint.
+func TestOpenAPISpecDocumentsUntrustedPluginStatus(t *testing.T) {
+	spec := BuildOpenAPISpec()
+	resolve := spec.Paths["/v1/plugins/{name}/resolve"].Post
+	if resolve == nil {
+		t.Fatalf("BuildOpenAPISpec().Paths[/v1/plugins/{name}/resolve].Post = nil, want operation")
+	}
+	if _, ok := resolve.Responses["422"]; !ok {
+		t.Errorf("resolvePlugin.Responses[422] missing: pluginConsentStatus returns %d for ErrPluginUntrusted, and a client is required to branch on it",
+			http.StatusUnprocessableEntity)
+	}
+	for _, status := range []string{"400", "401", "403", "500"} {
+		if _, ok := resolve.Responses[status]; !ok {
+			t.Errorf("resolvePlugin.Responses[%s] missing: the shared secured-endpoint set must survive the extra status", status)
+		}
+	}
+	for _, path := range []string{"/v1/plugins/{name}/grant", "/v1/plugins/{name}/deny"} {
+		op := spec.Paths[path].Post
+		if op == nil {
+			t.Fatalf("BuildOpenAPISpec().Paths[%s].Post = nil, want operation", path)
+		}
+		if _, ok := op.Responses["422"]; ok {
+			t.Errorf("%s declares 422, but only resolve reports ErrPluginUntrusted", path)
+		}
+	}
+}

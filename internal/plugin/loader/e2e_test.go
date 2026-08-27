@@ -3529,6 +3529,43 @@ func (a *e2eConsentAdapter) List(_ context.Context) ([]server.PluginView, error)
 	return views, nil
 }
 
+// Resolve implements server.PluginConsent.Resolve — see
+// cli.PluginConsentService.Resolve's own doc comment for the fetch-and-verify
+// this mirrors (minus the remote-fetch branch, same as List above: this
+// local-only adapter never needs it). No test in this section exercises this
+// method yet; it is implemented for real, not stubbed, so that changes here
+// stay honest about what server.PluginConsent.Resolve actually is meant to do.
+func (a *e2eConsentAdapter) Resolve(_ context.Context, name string) (server.PluginView, error) {
+	dep, _, err := consent.ReadDeploymentWithSnapshot(a.h.manifestPath())
+	if err != nil {
+		return server.PluginView{}, err
+	}
+	entry, err := consent.FindEntry(dep, name)
+	if err != nil {
+		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w: %w", name, server.ErrPluginNotFound, err)
+	}
+	dir, err := e2eLocalPackageDir(entry.Name, a.h.root, entry.Source)
+	if err != nil {
+		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w", name, err)
+	}
+	pm, _, err := manifest.LoadPackage(dir, nil)
+	if err != nil {
+		if errors.Is(err, manifest.ErrUntrustedPackage) {
+			return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w: %w", name, server.ErrPluginUntrusted, err)
+		}
+		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: load declared manifest: %w", name, err)
+	}
+	return server.PluginView{
+		Name:          name,
+		GrantedCaps:   entry.Grant.Capabilities,
+		GrantedHosts:  entry.Grant.AllowedHosts,
+		GrantedPaths:  entry.Grant.AllowedPaths,
+		DeclaredCaps:  pm.Capabilities,
+		DeclaredHosts: pm.Network.AllowedHosts,
+		DeclaredPaths: pm.Filesystem.AllowedPaths,
+	}, nil
+}
+
 // Grant implements server.PluginConsent.Grant — see
 // cli.PluginConsentService.Grant's own doc comment for the seven-step
 // sequence this mirrors (minus the remote-fetch branch of step 3).
@@ -3661,6 +3698,7 @@ func (a *e2eConsentAdapter) Deny(ctx context.Context, name string) (server.Conse
 		return server.ConsentResult{}, err
 	}
 	result.View.DeclaredUnresolved = true
+	result.View.DeclaredUnresolvedReason = server.DeclaredUnresolvedNotInspected
 	return result, nil
 }
 
@@ -4220,4 +4258,40 @@ func TestE2EHTTPGrantRefusesAConcurrentEditWithoutRevertingIt(t *testing.T) {
 			"a refusal must not revert it", after.Plugins)
 	}
 	h.requireInstanceCeiling("after the refused concurrent grant", 0)
+}
+
+// TestE2EConsentAdapterResolveClassifiesEntries pins e2eConsentAdapter.Resolve
+// directly: per that method's own doc comment, no test in this section
+// exercised it at all before this one. It covers the two classifications the
+// method can actually reach -- a known entry resolving successfully, and an
+// unknown name coming back wrapping server.ErrPluginNotFound through the
+// same consent.FindEntry path cli.PluginConsentService.Resolve uses -- so a
+// future change to either stops being silent. (The method's
+// manifest.ErrUntrustedPackage-to-server.ErrPluginUntrusted branch mirrors
+// the real service's classification but is unreachable through THIS adapter:
+// every manifest.LoadPackage call here is hardcoded to a nil keyring, which
+// skips signature verification entirely -- see LoadPackage's own doc
+// comment.)
+func TestE2EConsentAdapterResolveClassifiesEntries(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	adapter := &e2eConsentAdapter{h: h}
+
+	h.writeEcho("1.0.0")
+	h.writeManifest(e2eUnauthorizedEchoManifest())
+	if err := h.applyManifest(ctx); err != nil {
+		t.Fatalf("startup Apply: %v", err)
+	}
+
+	view, err := adapter.Resolve(ctx, echoPluginName)
+	if err != nil {
+		t.Fatalf("Resolve(%q): %v", echoPluginName, err)
+	}
+	if view.Name != echoPluginName {
+		t.Errorf("Resolve(%q).Name = %q, want %q", echoPluginName, view.Name, echoPluginName)
+	}
+
+	if _, err := adapter.Resolve(ctx, "no-such-plugin"); !errors.Is(err, server.ErrPluginNotFound) {
+		t.Errorf("Resolve(%q) error = %v, want it to wrap server.ErrPluginNotFound", "no-such-plugin", err)
+	}
 }

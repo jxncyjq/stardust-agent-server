@@ -11,10 +11,10 @@ import (
 	"github.com/stardust/legion-agent/internal/security"
 )
 
-// ErrPluginNotFound is what PluginConsent.Grant/.Deny report when the
+// ErrPluginNotFound is what PluginConsent.Grant/.Deny/.Resolve report when the
 // deployment manifest holds no entry under the requested name.
 //
-// The four sentinels declared here exist so the HTTP handlers can turn a
+// The five sentinels declared here exist so the HTTP handlers can turn a
 // failure into a status code by CLASS instead of by matching on error text,
 // which is the thing that really drifts. They are declared in this package,
 // not in the implementation's, because the status contract is this package's
@@ -31,7 +31,7 @@ var ErrPluginNotFound = errors.New("no such plugin in the deployment manifest")
 // different answer from "your request was malformed".
 var ErrPluginDeploymentChanged = errors.New("the plugin deployment manifest changed while this request was running")
 
-// ErrPluginStorage is what PluginConsent.Grant/.Deny report when the
+// ErrPluginStorage is what PluginConsent.Grant/.Deny/.Resolve report when the
 // deployment manifest could not be read, parsed or written — an I/O or
 // on-disk-state fault on the server, not a defect in the request. Reporting
 // it as a 4xx would tell an operator to fix a request that was never the
@@ -43,6 +43,13 @@ var ErrPluginStorage = errors.New("the plugin deployment manifest could not be r
 // was detached mid-shutdown, say). The request is well formed and may
 // succeed later, which is exactly what a 503 says and a 400 does not.
 var ErrPluginUnavailable = errors.New("no plugin loader is attached to this process")
+
+// ErrPluginUntrusted is what PluginConsent.Resolve reports when the package
+// was obtained but is not trustworthy — unsigned, corruptly signed, or signed
+// by a key this deployment does not trust. It is deliberately separate from
+// the could-not-obtain classes: retrying an untrusted package can never make
+// it trusted, so a caller must not offer that as a remedy.
+var ErrPluginUntrusted = errors.New("plugin package is not trusted")
 
 // PluginConsent is the plugin-authorization surface the HTTP layer consumes.
 //
@@ -81,6 +88,29 @@ type PluginConsent interface {
 	// error means it already records the revocation, and an error in one of
 	// this package's classes carries the matching sentinel.
 	Deny(ctx context.Context, name string) (ConsentResult, error)
+
+	// Resolve fetches and verifies the package behind the deployment entry
+	// named name so a caller can SEE what it declares, and changes nothing:
+	// unlike Grant and Deny, it never touches the deployment manifest, never
+	// writes a grant, and never converges the loader. It exists for the
+	// remote-entry, not-yet-cached case where List reports
+	// PluginView.DeclaredUnresolved instead of a declaration, because a GET
+	// must never carry a network fetch as a side effect — this is the
+	// deliberate, operator-initiated fetch that closes that gap.
+	//
+	// It closes ONLY that gap. DeclaredUnresolved is also true for entries
+	// no fetch can ever help (no plugins.cache configured, a package that
+	// fails to load) — see PluginView.DeclaredUnresolvedReason, which exists
+	// so a caller offers this call on DeclaredUnresolvedNotCached alone
+	// instead of on the bare boolean.
+	//
+	// An error in one of this package's classes carries the matching
+	// sentinel, same as Grant/Deny. ErrPluginUntrusted is Resolve's own: it
+	// reports a package that was obtained but is not trustworthy (unsigned,
+	// corruptly signed, or signed by an untrusted key) as distinct from one
+	// that merely could not be obtained, so a caller does not offer a retry
+	// that can never succeed.
+	Resolve(ctx context.Context, name string) (PluginView, error)
 }
 
 // GrantRequest is a POST /v1/plugins/{name}/grant request body: the
@@ -157,21 +187,67 @@ type ConsentResult struct {
 // resolution failure must not fail the whole List call: see List's own doc
 // comment (internal/cli's implementation) for why that would take down the
 // one row deny exists to let an operator reach.
+//
+// DeclaredUnresolvedReason says WHICH of those situations produced
+// DeclaredUnresolved, because a caller offering a "fetch it now" control
+// (PluginConsent.Resolve) has to know whether fetching can possibly be the
+// remedy, and the boolean alone cannot tell it: a cache MISS and a
+// deployment with no plugins.cache configured at all both serialized as
+// declared_unresolved:true with an empty declared_error, yet only the first
+// is fetchable. It is one of the DeclaredUnresolved* constants below, always
+// non-empty when DeclaredUnresolved is true and always empty when it is
+// false -- a caller must not have to guess, and must not have to infer the
+// class from error text.
 type PluginView struct {
-	Name               string   `json:"name"`
-	Version            string   `json:"version"`
-	State              string   `json:"state"`
-	Detail             string   `json:"detail,omitempty"`
-	Tools              []string `json:"tools"`
-	DeclaredCaps       []string `json:"declared_capabilities"`
-	DeclaredHosts      []string `json:"declared_allowed_hosts"`
-	DeclaredPaths      []string `json:"declared_allowed_paths"`
-	DeclaredUnresolved bool     `json:"declared_unresolved"`
-	DeclaredError      string   `json:"declared_error,omitempty"`
-	GrantedCaps        []string `json:"granted_capabilities"`
-	GrantedHosts       []string `json:"granted_allowed_hosts"`
-	GrantedPaths       []string `json:"granted_allowed_paths"`
+	Name                     string   `json:"name"`
+	Version                  string   `json:"version"`
+	State                    string   `json:"state"`
+	Detail                   string   `json:"detail,omitempty"`
+	Tools                    []string `json:"tools"`
+	DeclaredCaps             []string `json:"declared_capabilities"`
+	DeclaredHosts            []string `json:"declared_allowed_hosts"`
+	DeclaredPaths            []string `json:"declared_allowed_paths"`
+	DeclaredUnresolved       bool     `json:"declared_unresolved"`
+	DeclaredUnresolvedReason string   `json:"declared_unresolved_reason,omitempty"`
+	DeclaredError            string   `json:"declared_error,omitempty"`
+	GrantedCaps              []string `json:"granted_capabilities"`
+	GrantedHosts             []string `json:"granted_allowed_hosts"`
+	GrantedPaths             []string `json:"granted_allowed_paths"`
 }
+
+// DeclaredUnresolvedNotCached is the PluginView.DeclaredUnresolvedReason for
+// a remote entry whose package is simply not in this deployment's plugin
+// cache yet. It is the ONE reason a deliberate PluginConsent.Resolve can
+// actually remedy: the package is obtainable, nothing has gone wrong, and a
+// GET just may not fetch it. A caller offering a fetch control must offer it
+// on this reason and no other.
+const DeclaredUnresolvedNotCached = "not_cached"
+
+// DeclaredUnresolvedNoCache is the PluginView.DeclaredUnresolvedReason for a
+// remote entry in a deployment that configured no "plugins.cache" directory
+// at all. Resolve refuses it too (resolvePluginPackageDir has nowhere to
+// write the package), so a fetch can never succeed here: the remedy is a
+// deployment-config edit and a restart, which is nothing a consent UI can
+// do. It is reported separately from DeclaredUnresolvedNotCached precisely
+// because the two were indistinguishable before this field existed.
+const DeclaredUnresolvedNoCache = "no_cache_configured"
+
+// DeclaredUnresolvedLoadFailed is the PluginView.DeclaredUnresolvedReason
+// for an entry whose package WAS resolvable -- a local source, or a remote
+// one on a cache hit -- but could not be read: a corrupted plugin.wasm, a
+// missing plugin.json, a package directory removed from disk. DeclaredError
+// carries the reason. A fetch cannot help: a local entry makes no network
+// call at all, and a remote entry is a cache hit that short-circuits before
+// fetching, so both would re-read the same broken bytes.
+const DeclaredUnresolvedLoadFailed = "load_failed"
+
+// DeclaredUnresolvedNotInspected is the PluginView.DeclaredUnresolvedReason
+// for a view produced by an operation that never looked at the package at
+// all -- PluginConsent.Deny, which deliberately skips LoadPackage so that
+// revoking a plugin never depends on that plugin still being loadable. The
+// declaration is unknown because nobody asked, not because anything failed;
+// the next List reports the entry's real reason.
+const DeclaredUnresolvedNotInspected = "not_inspected"
 
 // handleListPlugins serves GET /v1/plugins: every entry in the deployment
 // manifest, carrying both what it DECLARES in its own plugin.json and what
@@ -295,6 +371,36 @@ func (s *HTTPServer) handleDenyPlugin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleResolvePlugin serves POST /v1/plugins/{name}/resolve: the same RBAC
+// gate and route shape as handleGrantPlugin/handleDenyPlugin, but calling
+// s.plugins.Resolve instead — a fetch-and-verify with no request body and no
+// convergence, so the response is a bare PluginView rather than a
+// pluginConsentResponse. See PluginConsent.Resolve's own doc comment for why
+// this exists and what it deliberately does not do.
+func (s *HTTPServer) handleResolvePlugin(w http.ResponseWriter, r *http.Request) {
+	principal := security.PrincipalFromRequest(r)
+	if !s.policy.Allows(principal, security.ActionWritePlugin, security.ResourcePlugin) {
+		s.auditRBACDenied(r, principal, security.ResourcePlugin)
+		writeError(w, http.StatusForbidden, "plugin access denied")
+		return
+	}
+	if s.plugins == nil {
+		writeError(w, http.StatusNotFound, "this process assembled no plugin loader; plugins are not enabled")
+		return
+	}
+	name, ok := parsePluginConsentName(r.URL.Path, "/resolve")
+	if !ok {
+		writeError(w, http.StatusNotFound, "bad plugin resolve path")
+		return
+	}
+	view, err := s.plugins.Resolve(r.Context(), name)
+	if err != nil {
+		writeError(w, pluginConsentStatus(err), fmt.Sprintf("resolve plugin %q: %v", name, err))
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
 // pluginConsentStatus maps one of PluginConsent's error classes to the HTTP
 // status that names it, defaulting to 400 for an error carrying none of
 // them.
@@ -320,13 +426,15 @@ func pluginConsentStatus(err error) int {
 		return http.StatusInternalServerError
 	case errors.Is(err, ErrPluginUnavailable):
 		return http.StatusServiceUnavailable
+	case errors.Is(err, ErrPluginUntrusted):
+		return http.StatusUnprocessableEntity
 	default:
 		return http.StatusBadRequest
 	}
 }
 
 // parsePluginConsentName extracts the {name} path segment from
-// "/v1/plugins/{name}"+suffix (suffix is "/grant" or "/deny"), the same
+// "/v1/plugins/{name}"+suffix (suffix is "/grant", "/deny" or "/resolve"), the same
 // prefix/suffix trim shape parseBrowserActionID uses for
 // "/v1/browser/sessions/{id}/...". ok is false when the path does not carry
 // that shape, or when the extracted name is empty or itself contains a "/"
