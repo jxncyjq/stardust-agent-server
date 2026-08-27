@@ -1284,6 +1284,15 @@ func TestPluginConsentServiceResolveReportsAnUntrustedPackage(t *testing.T) {
 	if !errors.Is(err, manifest.ErrUntrustedPackage) {
 		t.Errorf("Resolve error = %v, want it to wrap manifest.ErrUntrustedPackage", err)
 	}
+	// Both sentinels must be on the same error: manifest.ErrUntrustedPackage is
+	// the classification, server.ErrPluginUntrusted is what pluginConsentStatus
+	// actually keys its 422 response on (internal/server/plugins.go). A test
+	// that only checked the first would stay green even if Resolve stopped
+	// attaching the second, and an untrusted package would then report 400
+	// instead of 422 in production.
+	if !errors.Is(err, server.ErrPluginUntrusted) {
+		t.Errorf("Resolve error = %v, want it to also wrap server.ErrPluginUntrusted", err)
+	}
 
 	after, err := os.ReadFile(f.manifestPath)
 	if err != nil {

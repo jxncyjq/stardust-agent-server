@@ -690,8 +690,19 @@ func TestParsePluginConsentName(t *testing.T) {
 	}{
 		{"grant", "/v1/plugins/jira/grant", "/grant", "jira", true},
 		{"deny", "/v1/plugins/jira/deny", "/deny", "jira", true},
+		{"resolve", "/v1/plugins/jira/resolve", "/resolve", "jira", true},
 		{"name with a dash", "/v1/plugins/legion-test-plugin/grant", "/grant", "legion-test-plugin", true},
 		{"empty name", "/v1/plugins//grant", "/grant", "", false},
+		// The bare "/v1/plugins/resolve" path (no plugin name at all) is NOT
+		// refused: TrimPrefix leaves "resolve", and TrimSuffix("resolve",
+		// "/resolve") is a no-op because "resolve" (7 bytes) does not carry
+		// that 8-byte suffix, so the parser hands back ("resolve", true) -- a
+		// POST with no name silently resolves a plugin literally named
+		// "resolve". This is an inherited quirk shared identically by a bare
+		// "/v1/plugins/grant" and "/v1/plugins/deny", not something this task
+		// introduced or is fixing; this case documents the current behavior
+		// so a future change to it is deliberate, not accidental.
+		{"bare resolve path has no separate name", "/v1/plugins/resolve", "/resolve", "resolve", true},
 		{"extra path segment", "/v1/plugins/jira/extra/grant", "/grant", "", false},
 		{"wrong prefix", "/v2/plugins/jira/grant", "/grant", "", false},
 		{"wrong suffix", "/v1/plugins/jira/reload", "/grant", "", false},

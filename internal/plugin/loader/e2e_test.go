@@ -4258,3 +4258,39 @@ func TestE2EHTTPGrantRefusesAConcurrentEditWithoutRevertingIt(t *testing.T) {
 	}
 	h.requireInstanceCeiling("after the refused concurrent grant", 0)
 }
+
+// TestE2EConsentAdapterResolveClassifiesEntries pins e2eConsentAdapter.Resolve
+// directly: per that method's own doc comment, no test in this section
+// exercised it at all before this one. It covers the two classifications the
+// method can actually reach -- a known entry resolving successfully, and an
+// unknown name coming back wrapping server.ErrPluginNotFound through the
+// same consent.FindEntry path cli.PluginConsentService.Resolve uses -- so a
+// future change to either stops being silent. (The method's
+// manifest.ErrUntrustedPackage-to-server.ErrPluginUntrusted branch mirrors
+// the real service's classification but is unreachable through THIS adapter:
+// every manifest.LoadPackage call here is hardcoded to a nil keyring, which
+// skips signature verification entirely -- see LoadPackage's own doc
+// comment.)
+func TestE2EConsentAdapterResolveClassifiesEntries(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	adapter := &e2eConsentAdapter{h: h}
+
+	h.writeEcho("1.0.0")
+	h.writeManifest(e2eUnauthorizedEchoManifest())
+	if err := h.applyManifest(ctx); err != nil {
+		t.Fatalf("startup Apply: %v", err)
+	}
+
+	view, err := adapter.Resolve(ctx, echoPluginName)
+	if err != nil {
+		t.Fatalf("Resolve(%q): %v", echoPluginName, err)
+	}
+	if view.Name != echoPluginName {
+		t.Errorf("Resolve(%q).Name = %q, want %q", echoPluginName, view.Name, echoPluginName)
+	}
+
+	if _, err := adapter.Resolve(ctx, "no-such-plugin"); !errors.Is(err, server.ErrPluginNotFound) {
+		t.Errorf("Resolve(%q) error = %v, want it to wrap server.ErrPluginNotFound", "no-such-plugin", err)
+	}
+}

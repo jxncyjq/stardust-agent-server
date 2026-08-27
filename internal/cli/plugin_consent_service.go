@@ -426,9 +426,10 @@ func (s *PluginConsentService) Grant(ctx context.Context, name string, req serve
 // NOT to authorize. Callers are expected to say so; the settings panel does.
 //
 // An untrusted package (see manifest.ErrUntrustedPackage) is reported with
-// that sentinel on the error chain, so a caller can tell it apart from a
-// package it merely could not obtain and refrain from offering a retry that
-// could never succeed.
+// that sentinel on the error chain, alongside server.ErrPluginUntrusted --
+// the sentinel the HTTP layer's pluginConsentStatus keys its 422 response on
+// -- so a caller can tell it apart from a package it merely could not obtain
+// and refrain from offering a retry that could never succeed.
 func (s *PluginConsentService) Resolve(ctx context.Context, name string) (server.PluginView, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
