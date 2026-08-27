@@ -68,6 +68,7 @@ func BuildOpenAPISpec() OpenAPISpec {
 			"/v1/plugins":                         {Get: openAPIOperation("listPlugins", "List deployment plugins with their declared and granted capabilities", true)},
 			"/v1/plugins/{name}/grant":            {Post: openAPIOperation("grantPlugin", "Authorize a plugin's declared capabilities, hosts and paths", true)},
 			"/v1/plugins/{name}/deny":             {Post: openAPIOperation("denyPlugin", "Revoke a plugin's authorization to run", true)},
+			"/v1/plugins/{name}/resolve":          {Post: openAPIOperation("resolvePlugin", "Fetch and verify a plugin's package to see what it declares, without authorizing it", true)},
 			"/v1/events":                          {Get: openAPIOperation("subscribeEvents", "Subscribe platform events", true)},
 			"/v1/files":                           {Get: openAPIOperation("getFile", "Stream a generated file from a session's working directory", true)},
 		},

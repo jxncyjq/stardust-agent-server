@@ -32,6 +32,10 @@ type fakePluginConsent struct {
 	denyResult ConsentResult
 	denyErr    error
 	denyName   string
+
+	resolveView PluginView
+	resolveErr  error
+	resolveName string
 }
 
 func (f *fakePluginConsent) List(_ context.Context) ([]PluginView, error) {
@@ -47,6 +51,11 @@ func (f *fakePluginConsent) Grant(_ context.Context, name string, req GrantReque
 func (f *fakePluginConsent) Deny(_ context.Context, name string) (ConsentResult, error) {
 	f.denyName = name
 	return f.denyResult, f.denyErr
+}
+
+func (f *fakePluginConsent) Resolve(_ context.Context, name string) (PluginView, error) {
+	f.resolveName = name
+	return f.resolveView, f.resolveErr
 }
 
 // TestPluginsListReturnsDeclaredAndGrantedSeparately is the handler-level
@@ -697,5 +706,132 @@ func TestParsePluginConsentName(t *testing.T) {
 					tc.path, tc.suffix, gotName, gotOK, tc.wantName, tc.wantOK)
 			}
 		})
+	}
+}
+
+// --- POST /v1/plugins/{name}/resolve ----------------------------------------
+
+// TestPluginsResolveFillsDeclarations is Resolve's happy path: 200, and the
+// PluginView the service returns -- carrying the freshly fetched Declared*
+// fields, with DeclaredUnresolved now false -- travels straight through as
+// the response body, unwrapped by any convergence envelope (unlike
+// grant/deny's pluginConsentResponse, Resolve converges nothing).
+func TestPluginsResolveFillsDeclarations(t *testing.T) {
+	t.Parallel()
+	fake := &fakePluginConsent{resolveView: PluginView{
+		Name: "weather", State: "unauthorized",
+		DeclaredCaps: []string{"http"}, DeclaredUnresolved: false,
+	}}
+	srv := NewHTTPServer(Config{Plugins: fake, AdminToken: "token"})
+
+	req := adminGrantRequest(t, "/v1/plugins/weather/resolve", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", rec.Code, rec.Body.String())
+	}
+	var got PluginView
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if got.DeclaredUnresolved {
+		t.Error("declared_unresolved = true after a successful resolve, want false")
+	}
+	if len(got.DeclaredCaps) != 1 || got.DeclaredCaps[0] != "http" {
+		t.Errorf("declared_capabilities = %v, want [http]", got.DeclaredCaps)
+	}
+	if fake.resolveName != "weather" {
+		t.Errorf("Resolve was called with name = %q, want %q", fake.resolveName, "weather")
+	}
+}
+
+// TestPluginsResolveReportsAnUntrustedPackageAs422 pins pluginConsentStatus's
+// ErrPluginUntrusted branch: a caller cannot retry its way out of an
+// untrusted package, so the GUI must be able to tell this apart from every
+// other resolve failure by status code alone, without matching on text.
+func TestPluginsResolveReportsAnUntrustedPackageAs422(t *testing.T) {
+	t.Parallel()
+	fake := &fakePluginConsent{resolveErr: fmt.Errorf("resolve: %w", ErrPluginUntrusted)}
+	srv := NewHTTPServer(Config{Plugins: fake, AdminToken: "token"})
+
+	req := adminGrantRequest(t, "/v1/plugins/weather/resolve", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422 for an untrusted package; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPluginsResolveRequiresPluginWritePermission is
+// TestPluginsGrantRequiresPluginWritePermission for Resolve: RBAC uses
+// ActionWritePlugin, by SIDE EFFECT (an outbound fetch and a disk write to
+// the plugin cache) rather than by whether the deployment manifest itself
+// changes, so a read-only role must be refused the same as on grant/deny.
+func TestPluginsResolveRequiresPluginWritePermission(t *testing.T) {
+	t.Parallel()
+	fake := &fakePluginConsent{resolveView: PluginView{Name: "weather", State: "unauthorized"}}
+	srv := NewHTTPServer(Config{Plugins: fake, AdminToken: "token"})
+
+	for _, role := range []string{"operator", "viewer"} {
+		req := httptest.NewRequest(http.MethodPost, "/v1/plugins/weather/resolve", nil)
+		req.Header.Set("Authorization", "Bearer token")
+		req.Header.Set("X-Company-ID", "company-1")
+		req.Header.Set("X-Role", role)
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("POST /v1/plugins/weather/resolve role=%s status = %d, want %d body=%s", role, rec.Code, http.StatusForbidden, rec.Body.String())
+		}
+	}
+
+	req := adminGrantRequest(t, "/v1/plugins/weather/resolve", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /v1/plugins/weather/resolve role=admin status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+}
+
+// TestPluginsResolveRBACDenialIsAudited pins that the RBAC gate on
+// handleResolvePlugin actually calls s.auditRBACDenied -- gpc-task-3 review
+// found the grant/deny handlers correctly audited but unpinned; this closes
+// the same gap on resolve from day one instead of waiting for a future
+// review to notice it is missing.
+func TestPluginsResolveRBACDenialIsAudited(t *testing.T) {
+	t.Parallel()
+	audit := adapter.NewMemoryAuditLog()
+	fake := &fakePluginConsent{resolveView: PluginView{Name: "weather"}}
+	srv := NewHTTPServer(Config{Plugins: fake, AdminToken: "token", Audit: audit})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/plugins/weather/resolve", nil)
+	req.Header.Set("Authorization", "Bearer token")
+	req.Header.Set("X-Company-ID", "company-1")
+	req.Header.Set("X-Role", "viewer")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+	if fake.resolveName != "" {
+		t.Fatalf("Resolve was called with name = %q despite the refusal; the gate must run first", fake.resolveName)
+	}
+	requirePluginRBACDenialAudited(t, audit, "POST /v1/plugins/{name}/resolve")
+}
+
+// TestPluginsResolveWithoutConsentServiceReports404 mirrors
+// TestPluginsGrantWithoutConsentServiceReports404/
+// TestPluginsDenyWithoutConsentServiceReports404 for resolve: a process that
+// assembled no plugin loader reports 404, not a 200 that implies a
+// declaration was actually fetched.
+func TestPluginsResolveWithoutConsentServiceReports404(t *testing.T) {
+	t.Parallel()
+	srv := NewHTTPServer(Config{})
+
+	req := adminGrantRequest(t, "/v1/plugins/weather/resolve", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("POST /v1/plugins/weather/resolve without a plugin consent service status = %d, want %d body=%s",
+			rec.Code, http.StatusNotFound, rec.Body.String())
 	}
 }

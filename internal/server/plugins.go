@@ -11,10 +11,10 @@ import (
 	"github.com/stardust/legion-agent/internal/security"
 )
 
-// ErrPluginNotFound is what PluginConsent.Grant/.Deny report when the
+// ErrPluginNotFound is what PluginConsent.Grant/.Deny/.Resolve report when the
 // deployment manifest holds no entry under the requested name.
 //
-// The four sentinels declared here exist so the HTTP handlers can turn a
+// The five sentinels declared here exist so the HTTP handlers can turn a
 // failure into a status code by CLASS instead of by matching on error text,
 // which is the thing that really drifts. They are declared in this package,
 // not in the implementation's, because the status contract is this package's
@@ -31,7 +31,7 @@ var ErrPluginNotFound = errors.New("no such plugin in the deployment manifest")
 // different answer from "your request was malformed".
 var ErrPluginDeploymentChanged = errors.New("the plugin deployment manifest changed while this request was running")
 
-// ErrPluginStorage is what PluginConsent.Grant/.Deny report when the
+// ErrPluginStorage is what PluginConsent.Grant/.Deny/.Resolve report when the
 // deployment manifest could not be read, parsed or written — an I/O or
 // on-disk-state fault on the server, not a defect in the request. Reporting
 // it as a 4xx would tell an operator to fix a request that was never the
@@ -43,6 +43,13 @@ var ErrPluginStorage = errors.New("the plugin deployment manifest could not be r
 // was detached mid-shutdown, say). The request is well formed and may
 // succeed later, which is exactly what a 503 says and a 400 does not.
 var ErrPluginUnavailable = errors.New("no plugin loader is attached to this process")
+
+// ErrPluginUntrusted is what PluginConsent.Resolve reports when the package
+// was obtained but is not trustworthy — unsigned, corruptly signed, or signed
+// by a key this deployment does not trust. It is deliberately separate from
+// the could-not-obtain classes: retrying an untrusted package can never make
+// it trusted, so a caller must not offer that as a remedy.
+var ErrPluginUntrusted = errors.New("plugin package is not trusted")
 
 // PluginConsent is the plugin-authorization surface the HTTP layer consumes.
 //
@@ -81,6 +88,23 @@ type PluginConsent interface {
 	// error means it already records the revocation, and an error in one of
 	// this package's classes carries the matching sentinel.
 	Deny(ctx context.Context, name string) (ConsentResult, error)
+
+	// Resolve fetches and verifies the package behind the deployment entry
+	// named name so a caller can SEE what it declares, and changes nothing:
+	// unlike Grant and Deny, it never touches the deployment manifest, never
+	// writes a grant, and never converges the loader. It exists for the
+	// remote-entry, not-yet-cached case where List reports
+	// PluginView.DeclaredUnresolved instead of a declaration, because a GET
+	// must never carry a network fetch as a side effect — this is the
+	// deliberate, operator-initiated fetch that closes that gap.
+	//
+	// An error in one of this package's classes carries the matching
+	// sentinel, same as Grant/Deny. ErrPluginUntrusted is Resolve's own: it
+	// reports a package that was obtained but is not trustworthy (unsigned,
+	// corruptly signed, or signed by an untrusted key) as distinct from one
+	// that merely could not be obtained, so a caller does not offer a retry
+	// that can never succeed.
+	Resolve(ctx context.Context, name string) (PluginView, error)
 }
 
 // GrantRequest is a POST /v1/plugins/{name}/grant request body: the
@@ -295,6 +319,36 @@ func (s *HTTPServer) handleDenyPlugin(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleResolvePlugin serves POST /v1/plugins/{name}/resolve: the same RBAC
+// gate and route shape as handleGrantPlugin/handleDenyPlugin, but calling
+// s.plugins.Resolve instead — a fetch-and-verify with no request body and no
+// convergence, so the response is a bare PluginView rather than a
+// pluginConsentResponse. See PluginConsent.Resolve's own doc comment for why
+// this exists and what it deliberately does not do.
+func (s *HTTPServer) handleResolvePlugin(w http.ResponseWriter, r *http.Request) {
+	principal := security.PrincipalFromRequest(r)
+	if !s.policy.Allows(principal, security.ActionWritePlugin, security.ResourcePlugin) {
+		s.auditRBACDenied(r, principal, security.ResourcePlugin)
+		writeError(w, http.StatusForbidden, "plugin access denied")
+		return
+	}
+	if s.plugins == nil {
+		writeError(w, http.StatusNotFound, "this process assembled no plugin loader; plugins are not enabled")
+		return
+	}
+	name, ok := parsePluginConsentName(r.URL.Path, "/resolve")
+	if !ok {
+		writeError(w, http.StatusNotFound, "bad plugin resolve path")
+		return
+	}
+	view, err := s.plugins.Resolve(r.Context(), name)
+	if err != nil {
+		writeError(w, pluginConsentStatus(err), fmt.Sprintf("resolve plugin %q: %v", name, err))
+		return
+	}
+	writeJSON(w, http.StatusOK, view)
+}
+
 // pluginConsentStatus maps one of PluginConsent's error classes to the HTTP
 // status that names it, defaulting to 400 for an error carrying none of
 // them.
@@ -320,13 +374,15 @@ func pluginConsentStatus(err error) int {
 		return http.StatusInternalServerError
 	case errors.Is(err, ErrPluginUnavailable):
 		return http.StatusServiceUnavailable
+	case errors.Is(err, ErrPluginUntrusted):
+		return http.StatusUnprocessableEntity
 	default:
 		return http.StatusBadRequest
 	}
 }
 
 // parsePluginConsentName extracts the {name} path segment from
-// "/v1/plugins/{name}"+suffix (suffix is "/grant" or "/deny"), the same
+// "/v1/plugins/{name}"+suffix (suffix is "/grant", "/deny" or "/resolve"), the same
 // prefix/suffix trim shape parseBrowserActionID uses for
 // "/v1/browser/sessions/{id}/...". ok is false when the path does not carry
 // that shape, or when the extracted name is empty or itself contains a "/"

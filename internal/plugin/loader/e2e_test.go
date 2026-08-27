@@ -3529,6 +3529,43 @@ func (a *e2eConsentAdapter) List(_ context.Context) ([]server.PluginView, error)
 	return views, nil
 }
 
+// Resolve implements server.PluginConsent.Resolve — see
+// cli.PluginConsentService.Resolve's own doc comment for the fetch-and-verify
+// this mirrors (minus the remote-fetch branch, same as List above: this
+// local-only adapter never needs it). No test in this section exercises this
+// method yet; it is implemented for real, not stubbed, so that changes here
+// stay honest about what server.PluginConsent.Resolve actually is meant to do.
+func (a *e2eConsentAdapter) Resolve(_ context.Context, name string) (server.PluginView, error) {
+	dep, _, err := consent.ReadDeploymentWithSnapshot(a.h.manifestPath())
+	if err != nil {
+		return server.PluginView{}, err
+	}
+	entry, err := consent.FindEntry(dep, name)
+	if err != nil {
+		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w: %w", name, server.ErrPluginNotFound, err)
+	}
+	dir, err := e2eLocalPackageDir(entry.Name, a.h.root, entry.Source)
+	if err != nil {
+		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w", name, err)
+	}
+	pm, _, err := manifest.LoadPackage(dir, nil)
+	if err != nil {
+		if errors.Is(err, manifest.ErrUntrustedPackage) {
+			return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w: %w", name, server.ErrPluginUntrusted, err)
+		}
+		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: load declared manifest: %w", name, err)
+	}
+	return server.PluginView{
+		Name:          name,
+		GrantedCaps:   entry.Grant.Capabilities,
+		GrantedHosts:  entry.Grant.AllowedHosts,
+		GrantedPaths:  entry.Grant.AllowedPaths,
+		DeclaredCaps:  pm.Capabilities,
+		DeclaredHosts: pm.Network.AllowedHosts,
+		DeclaredPaths: pm.Filesystem.AllowedPaths,
+	}, nil
+}
+
 // Grant implements server.PluginConsent.Grant — see
 // cli.PluginConsentService.Grant's own doc comment for the seven-step
 // sequence this mirrors (minus the remote-fetch branch of step 3).

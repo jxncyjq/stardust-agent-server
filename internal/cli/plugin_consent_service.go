@@ -448,6 +448,9 @@ func (s *PluginConsentService) Resolve(ctx context.Context, name string) (server
 	}
 	pm, _, err := manifest.LoadPackage(dir, s.keyringFn())
 	if err != nil {
+		if errors.Is(err, manifest.ErrUntrustedPackage) {
+			return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w: %w", name, server.ErrPluginUntrusted, err)
+		}
 		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w", name, err)
 	}
 
