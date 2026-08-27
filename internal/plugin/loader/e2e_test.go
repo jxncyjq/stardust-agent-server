@@ -3698,6 +3698,7 @@ func (a *e2eConsentAdapter) Deny(ctx context.Context, name string) (server.Conse
 		return server.ConsentResult{}, err
 	}
 	result.View.DeclaredUnresolved = true
+	result.View.DeclaredUnresolvedReason = server.DeclaredUnresolvedNotInspected
 	return result, nil
 }
 

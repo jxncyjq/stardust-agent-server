@@ -98,6 +98,12 @@ type PluginConsent interface {
 	// must never carry a network fetch as a side effect — this is the
 	// deliberate, operator-initiated fetch that closes that gap.
 	//
+	// It closes ONLY that gap. DeclaredUnresolved is also true for entries
+	// no fetch can ever help (no plugins.cache configured, a package that
+	// fails to load) — see PluginView.DeclaredUnresolvedReason, which exists
+	// so a caller offers this call on DeclaredUnresolvedNotCached alone
+	// instead of on the bare boolean.
+	//
 	// An error in one of this package's classes carries the matching
 	// sentinel, same as Grant/Deny. ErrPluginUntrusted is Resolve's own: it
 	// reports a package that was obtained but is not trustworthy (unsigned,
@@ -181,21 +187,67 @@ type ConsentResult struct {
 // resolution failure must not fail the whole List call: see List's own doc
 // comment (internal/cli's implementation) for why that would take down the
 // one row deny exists to let an operator reach.
+//
+// DeclaredUnresolvedReason says WHICH of those situations produced
+// DeclaredUnresolved, because a caller offering a "fetch it now" control
+// (PluginConsent.Resolve) has to know whether fetching can possibly be the
+// remedy, and the boolean alone cannot tell it: a cache MISS and a
+// deployment with no plugins.cache configured at all both serialized as
+// declared_unresolved:true with an empty declared_error, yet only the first
+// is fetchable. It is one of the DeclaredUnresolved* constants below, always
+// non-empty when DeclaredUnresolved is true and always empty when it is
+// false -- a caller must not have to guess, and must not have to infer the
+// class from error text.
 type PluginView struct {
-	Name               string   `json:"name"`
-	Version            string   `json:"version"`
-	State              string   `json:"state"`
-	Detail             string   `json:"detail,omitempty"`
-	Tools              []string `json:"tools"`
-	DeclaredCaps       []string `json:"declared_capabilities"`
-	DeclaredHosts      []string `json:"declared_allowed_hosts"`
-	DeclaredPaths      []string `json:"declared_allowed_paths"`
-	DeclaredUnresolved bool     `json:"declared_unresolved"`
-	DeclaredError      string   `json:"declared_error,omitempty"`
-	GrantedCaps        []string `json:"granted_capabilities"`
-	GrantedHosts       []string `json:"granted_allowed_hosts"`
-	GrantedPaths       []string `json:"granted_allowed_paths"`
+	Name                     string   `json:"name"`
+	Version                  string   `json:"version"`
+	State                    string   `json:"state"`
+	Detail                   string   `json:"detail,omitempty"`
+	Tools                    []string `json:"tools"`
+	DeclaredCaps             []string `json:"declared_capabilities"`
+	DeclaredHosts            []string `json:"declared_allowed_hosts"`
+	DeclaredPaths            []string `json:"declared_allowed_paths"`
+	DeclaredUnresolved       bool     `json:"declared_unresolved"`
+	DeclaredUnresolvedReason string   `json:"declared_unresolved_reason,omitempty"`
+	DeclaredError            string   `json:"declared_error,omitempty"`
+	GrantedCaps              []string `json:"granted_capabilities"`
+	GrantedHosts             []string `json:"granted_allowed_hosts"`
+	GrantedPaths             []string `json:"granted_allowed_paths"`
 }
+
+// DeclaredUnresolvedNotCached is the PluginView.DeclaredUnresolvedReason for
+// a remote entry whose package is simply not in this deployment's plugin
+// cache yet. It is the ONE reason a deliberate PluginConsent.Resolve can
+// actually remedy: the package is obtainable, nothing has gone wrong, and a
+// GET just may not fetch it. A caller offering a fetch control must offer it
+// on this reason and no other.
+const DeclaredUnresolvedNotCached = "not_cached"
+
+// DeclaredUnresolvedNoCache is the PluginView.DeclaredUnresolvedReason for a
+// remote entry in a deployment that configured no "plugins.cache" directory
+// at all. Resolve refuses it too (resolvePluginPackageDir has nowhere to
+// write the package), so a fetch can never succeed here: the remedy is a
+// deployment-config edit and a restart, which is nothing a consent UI can
+// do. It is reported separately from DeclaredUnresolvedNotCached precisely
+// because the two were indistinguishable before this field existed.
+const DeclaredUnresolvedNoCache = "no_cache_configured"
+
+// DeclaredUnresolvedLoadFailed is the PluginView.DeclaredUnresolvedReason
+// for an entry whose package WAS resolvable -- a local source, or a remote
+// one on a cache hit -- but could not be read: a corrupted plugin.wasm, a
+// missing plugin.json, a package directory removed from disk. DeclaredError
+// carries the reason. A fetch cannot help: a local entry makes no network
+// call at all, and a remote entry is a cache hit that short-circuits before
+// fetching, so both would re-read the same broken bytes.
+const DeclaredUnresolvedLoadFailed = "load_failed"
+
+// DeclaredUnresolvedNotInspected is the PluginView.DeclaredUnresolvedReason
+// for a view produced by an operation that never looked at the package at
+// all -- PluginConsent.Deny, which deliberately skips LoadPackage so that
+// revoking a plugin never depends on that plugin still being loadable. The
+// declaration is unknown because nobody asked, not because anything failed;
+// the next List reports the entry's real reason.
+const DeclaredUnresolvedNotInspected = "not_inspected"
 
 // handleListPlugins serves GET /v1/plugins: every entry in the deployment
 // manifest, carrying both what it DECLARES in its own plugin.json and what

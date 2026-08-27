@@ -174,6 +174,10 @@ func TestPluginConsentServiceListReportsBrokenLocalPackagePerRow(t *testing.T) {
 	if !broken.DeclaredUnresolved {
 		t.Error("broken entry DeclaredUnresolved = false, want true")
 	}
+	if broken.DeclaredUnresolvedReason != server.DeclaredUnresolvedLoadFailed {
+		t.Errorf("broken entry DeclaredUnresolvedReason = %q, want %q: a package that fails to load is not fetchable, and a consent UI must not offer a fetch for it",
+			broken.DeclaredUnresolvedReason, server.DeclaredUnresolvedLoadFailed)
+	}
 	if broken.DeclaredError == "" {
 		t.Error("broken entry DeclaredError = empty, want the load failure reason")
 	}
@@ -189,6 +193,67 @@ func TestPluginConsentServiceListReportsBrokenLocalPackagePerRow(t *testing.T) {
 	}
 	if healthy.DeclaredError != "" {
 		t.Errorf("healthy entry DeclaredError = %q, want empty", healthy.DeclaredError)
+	}
+	if healthy.DeclaredUnresolvedReason != "" {
+		t.Errorf("healthy entry DeclaredUnresolvedReason = %q, want empty: a resolved row has no unresolved reason to report",
+			healthy.DeclaredUnresolvedReason)
+	}
+}
+
+// TestPluginConsentServiceListSeparatesNoCacheFromCacheMiss is I-4 of the
+// whole-branch final review. Both of these report DeclaredUnresolved=true
+// with an EMPTY DeclaredError, and before DeclaredUnresolvedReason existed
+// they were byte-identical JSON:
+//
+//   - a remote entry this deployment simply has not fetched yet, which
+//     PluginConsent.Resolve CAN remedy, and
+//   - a remote entry in a deployment that configured no "plugins.cache" at
+//     all, which Resolve can never remedy -- resolvePluginPackageDir refuses
+//     it outright, so a fetch button on that row is a control that cannot
+//     work.
+//
+// A GUI deciding whether to offer a fetch must not have to guess between
+// them, so List reports which one it is.
+func TestPluginConsentServiceListSeparatesNoCacheFromCacheMiss(t *testing.T) {
+	// No "cache" key at all: resolvePluginRemote leaves RemoteConfig.Cache
+	// nil, which is the deployment-config fact this half of the test is
+	// about. enabled:false keeps assemble() from ever trying to activate
+	// (and so fetch) the entry.
+	noCache := newPluginFixture(t, 30_000)
+	noCache.writeSignatureConfig(30_000, signaturePolicy{requireSignature: boolPtr(false)})
+	noCache.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "https://example.invalid/echo.tgz", enabled: false,
+		tools: []string{testEchoTool}, digest: digestOfArchive([]byte("never fetched")),
+	})
+	if err := noCache.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+	remote := noCache.resolveFixtureRemote()
+	if remote.Cache != nil {
+		t.Fatalf("fixture remote.Cache = %v, want nil: this test needs a deployment with no configured plugin cache", remote.Cache)
+	}
+	svc := NewPluginConsentService(noCache.manifestPath, noCache.root, noCache.application.Plugins,
+		func() *sign.Keyring { return nil }, remote, testConsentLogger())
+	views, err := svc.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v, want nil", err)
+	}
+	if len(views) != 1 {
+		t.Fatalf("len(views) = %d, want 1: %+v", len(views), views)
+	}
+	got := views[0]
+	if !got.DeclaredUnresolved {
+		t.Fatal("DeclaredUnresolved = false, want true: with no cache configured the declaration cannot be resolved")
+	}
+	if got.DeclaredError != "" {
+		t.Errorf("DeclaredError = %q, want empty: no cache configured is a deployment fact, not a load failure", got.DeclaredError)
+	}
+	if got.DeclaredUnresolvedReason != server.DeclaredUnresolvedNoCache {
+		t.Errorf("DeclaredUnresolvedReason = %q, want %q: this row must be distinguishable from a plain cache miss, or the panel offers a fetch that can never succeed",
+			got.DeclaredUnresolvedReason, server.DeclaredUnresolvedNoCache)
+	}
+	if got.DeclaredUnresolvedReason == server.DeclaredUnresolvedNotCached {
+		t.Error("DeclaredUnresolvedReason reports a plain cache miss, but this deployment has no cache to miss")
 	}
 }
 
@@ -308,6 +373,10 @@ func TestPluginConsentServiceListReportsUnresolvedForRemoteCacheMiss(t *testing.
 	got := views[0]
 	if !got.DeclaredUnresolved {
 		t.Fatal("DeclaredUnresolved = false, want true: this entry was never fetched, so its cache does not hold it")
+	}
+	if got.DeclaredUnresolvedReason != server.DeclaredUnresolvedNotCached {
+		t.Errorf("DeclaredUnresolvedReason = %q, want %q: a plain cache miss is the ONE case a deliberate Resolve can remedy, and the panel keys its fetch button on it",
+			got.DeclaredUnresolvedReason, server.DeclaredUnresolvedNotCached)
 	}
 	if len(got.DeclaredCaps) != 0 || len(got.DeclaredHosts) != 0 || len(got.DeclaredPaths) != 0 {
 		t.Errorf("Declared* = caps=%v hosts=%v paths=%v, want all empty when unresolved",
@@ -524,6 +593,10 @@ func TestPluginConsentServiceDenyKeepsFieldsAndGrantStated(t *testing.T) {
 	// as "declares nothing".
 	if !result.View.DeclaredUnresolved {
 		t.Errorf("Deny() View.DeclaredUnresolved = false, want true: Deny never resolves declarations")
+	}
+	if result.View.DeclaredUnresolvedReason != server.DeclaredUnresolvedNotInspected {
+		t.Errorf("Deny() View.DeclaredUnresolvedReason = %q, want %q: nothing failed here, nobody looked",
+			result.View.DeclaredUnresolvedReason, server.DeclaredUnresolvedNotInspected)
 	}
 }
 
@@ -1228,6 +1301,9 @@ func TestPluginConsentServiceResolveFillsDeclarationsWithoutTouchingTheManifest(
 	}
 	if view.DeclaredUnresolved {
 		t.Error("view.DeclaredUnresolved = true after a successful Resolve, want false")
+	}
+	if view.DeclaredUnresolvedReason != "" {
+		t.Errorf("view.DeclaredUnresolvedReason = %q, want empty: a resolved view has no unresolved reason", view.DeclaredUnresolvedReason)
 	}
 	if len(view.DeclaredCaps) == 0 {
 		t.Error("view.DeclaredCaps is empty after a successful Resolve, want the plugin's declared capabilities")

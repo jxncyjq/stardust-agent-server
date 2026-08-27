@@ -130,6 +130,12 @@ func NewPluginConsentService(manifestPath, root string, pluginsFn func() *loader
 // State, Detail and Granted fields are unaffected either way and always
 // reported in full.
 //
+// Every DeclaredUnresolved row also carries a
+// server.PluginView.DeclaredUnresolvedReason, because a cache MISS (which
+// Resolve can fetch) and a deployment with no "plugins.cache" at all (which
+// it can never fetch, and which needs a config edit and a restart instead)
+// are otherwise the same JSON. See that field's own doc comment.
+//
 // An entry (local, or remote past a resolvable cache hit) whose package
 // cannot be resolved or loaded is reported as a PER-ROW failure -- view.
 // DeclaredUnresolved = true with view.DeclaredError naming what went wrong
@@ -184,7 +190,7 @@ func (s *PluginConsentService) List(ctx context.Context) ([]server.PluginView, e
 		view.GrantedHosts = entry.Grant.AllowedHosts
 		view.GrantedPaths = entry.Grant.AllowedPaths
 
-		dir, resolved, resolveErr := s.resolveDeclaredPackageDir(ctx, entry)
+		dir, resolved, reason, resolveErr := s.resolveDeclaredPackageDir(ctx, entry)
 		if resolveErr != nil {
 			// A broken or unreachable package must not take the whole list
 			// down with it -- see this method's own doc comment and
@@ -192,18 +198,21 @@ func (s *PluginConsentService) List(ctx context.Context) ([]server.PluginView, e
 			// this row still carries its State/Detail/Granted* fields, just
 			// no Declared* ones.
 			view.DeclaredUnresolved = true
+			view.DeclaredUnresolvedReason = server.DeclaredUnresolvedLoadFailed
 			view.DeclaredError = resolveErr.Error()
 			views = append(views, view)
 			continue
 		}
 		if !resolved {
 			view.DeclaredUnresolved = true
+			view.DeclaredUnresolvedReason = reason
 			views = append(views, view)
 			continue
 		}
 		pm, _, loadErr := manifest.LoadPackage(dir, keyring)
 		if loadErr != nil {
 			view.DeclaredUnresolved = true
+			view.DeclaredUnresolvedReason = server.DeclaredUnresolvedLoadFailed
 			view.DeclaredError = fmt.Errorf("plugin consent: load declared manifest for %q: %w", entry.Name, loadErr).Error()
 			views = append(views, view)
 			continue
@@ -239,29 +248,38 @@ func (s *PluginConsentService) List(ctx context.Context) ([]server.PluginView, e
 // resolved=false and a nil error: the truth is "we do not know what this
 // plugin declares", not "it declares nothing" -- see List's own doc comment
 // and server.PluginView.DeclaredUnresolved.
-func (s *PluginConsentService) resolveDeclaredPackageDir(ctx context.Context, entry manifest.Entry) (dir string, resolved bool, err error) {
+//
+// Those two not-resolved outcomes are told apart by reason, which is one of
+// server.DeclaredUnresolvedNoCache (nothing to fetch INTO -- a fetch can
+// never succeed until the deployment config gains a "plugins.cache") or
+// server.DeclaredUnresolvedNotCached (obtainable, just not obtained yet --
+// the one case PluginConsent.Resolve can remedy). reason is empty whenever
+// resolved is true or err is non-nil; the caller supplies
+// server.DeclaredUnresolvedLoadFailed for the error case, since a resolution
+// failure and a plugin.json load failure are the same class to a consumer.
+func (s *PluginConsentService) resolveDeclaredPackageDir(ctx context.Context, entry manifest.Entry) (dir string, resolved bool, reason string, err error) {
 	if !entry.IsRemote() {
 		dir, err = resolvePluginPackageDir(ctx, entry, s.remote, s.root)
 		if err != nil {
-			return "", false, fmt.Errorf("plugin consent: resolve package directory for %q: %w", entry.Name, err)
+			return "", false, "", fmt.Errorf("plugin consent: resolve package directory for %q: %w", entry.Name, err)
 		}
-		return dir, true, nil
+		return dir, true, "", nil
 	}
 	if s.remote.Cache == nil {
-		return "", false, nil
+		return "", false, server.DeclaredUnresolvedNoCache, nil
 	}
 	hit, err := s.remote.Cache.Has(entry.Digest)
 	if err != nil {
-		return "", false, fmt.Errorf("plugin consent: check plugin cache for %q: %w", entry.Name, err)
+		return "", false, "", fmt.Errorf("plugin consent: check plugin cache for %q: %w", entry.Name, err)
 	}
 	if !hit {
-		return "", false, nil
+		return "", false, server.DeclaredUnresolvedNotCached, nil
 	}
 	dir, err = resolvePluginPackageDir(ctx, entry, s.remote, s.root)
 	if err != nil {
-		return "", false, fmt.Errorf("plugin consent: resolve package directory for %q: %w", entry.Name, err)
+		return "", false, "", fmt.Errorf("plugin consent: resolve package directory for %q: %w", entry.Name, err)
 	}
-	return dir, true, nil
+	return dir, true, "", nil
 }
 
 // pluginConsentActor labels every consent.* call Grant makes, so its error
@@ -490,7 +508,9 @@ func (s *PluginConsentService) Resolve(ctx context.Context, name string) (server
 // misrepresent "Deny didn't look" as "this plugin declares nothing" (see
 // server.PluginView.DeclaredUnresolved's own doc comment for why those two
 // states must stay distinguishable), so the returned View is marked
-// DeclaredUnresolved unconditionally instead.
+// DeclaredUnresolved unconditionally instead, with
+// server.DeclaredUnresolvedNotInspected as its reason: nothing failed here,
+// nobody looked.
 //
 // Like Grant, the whole read -> write -> converge sequence runs under s.mu
 // (see its own comment) and every error is classified with one of
@@ -537,6 +557,7 @@ func (s *PluginConsentService) Deny(ctx context.Context, name string) (server.Co
 		return server.ConsentResult{}, err
 	}
 	result.View.DeclaredUnresolved = true
+	result.View.DeclaredUnresolvedReason = server.DeclaredUnresolvedNotInspected
 	return result, nil
 }
 

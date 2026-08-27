@@ -68,9 +68,15 @@ func BuildOpenAPISpec() OpenAPISpec {
 			"/v1/plugins":                         {Get: openAPIOperation("listPlugins", "List deployment plugins with their declared and granted capabilities", true)},
 			"/v1/plugins/{name}/grant":            {Post: openAPIOperation("grantPlugin", "Authorize a plugin's declared capabilities, hosts and paths", true)},
 			"/v1/plugins/{name}/deny":             {Post: openAPIOperation("denyPlugin", "Revoke a plugin's authorization to run", true)},
-			"/v1/plugins/{name}/resolve":          {Post: openAPIOperation("resolvePlugin", "Fetch and verify a plugin's package to see what it declares, without authorizing it", true)},
-			"/v1/events":                          {Get: openAPIOperation("subscribeEvents", "Subscribe platform events", true)},
-			"/v1/files":                           {Get: openAPIOperation("getFile", "Stream a generated file from a session's working directory", true)},
+			// 422 is declared explicitly here and nowhere else: it is the one
+			// status a client is REQUIRED to branch on rather than treat
+			// generically (an untrusted package can never become trusted by
+			// retrying, so a client must not offer a retry), and the spec is
+			// the only place a non-GUI client would learn it exists. See
+			// ErrPluginUntrusted and pluginConsentStatus.
+			"/v1/plugins/{name}/resolve": {Post: openAPIOperation("resolvePlugin", "Fetch and verify a plugin's package to see what it declares, without authorizing it", true, "422")},
+			"/v1/events":                 {Get: openAPIOperation("subscribeEvents", "Subscribe platform events", true)},
+			"/v1/files":                  {Get: openAPIOperation("getFile", "Stream a generated file from a session's working directory", true)},
 		},
 		Components: OpenAPIComponents{
 			Schemas: map[string]any{
@@ -109,7 +115,18 @@ func BuildOpenAPISpec() OpenAPISpec {
 	}
 }
 
-func openAPIOperation(id string, summary string, secured bool) *OpenAPIOperation {
+// openAPIOperation builds one operation with the response set every secured
+// endpoint in this API shares (200 plus 400/401/403/500).
+//
+// extraStatuses adds statuses beyond that shared set, for an operation whose
+// contract a client cannot handle generically. It is variadic rather than a
+// required argument on purpose: every existing caller keeps the identical
+// shared shape, so a status appearing on one operation and not its siblings
+// is a deliberate, visible choice at that one call site rather than a
+// silent per-endpoint divergence. Each status must have a description in
+// errorResponse, which panics on one it does not know rather than emitting a
+// response object with an empty description.
+func openAPIOperation(id string, summary string, secured bool, extraStatuses ...string) *OpenAPIOperation {
 	op := &OpenAPIOperation{
 		OperationID: id,
 		Summary:     summary,
@@ -123,6 +140,9 @@ func openAPIOperation(id string, summary string, secured bool) *OpenAPIOperation
 			op.Responses[status] = errorResponse(status)
 		}
 	}
+	for _, status := range extraStatuses {
+		op.Responses[status] = errorResponse(status)
+	}
 	return op
 }
 
@@ -130,15 +150,24 @@ func objectSchema() map[string]any {
 	return map[string]any{"type": "object"}
 }
 
+// errorResponse builds the response object for one error status. An unknown
+// status panics: emitting a response with an empty description would publish
+// a contract that says less than the code does, which is worse than failing
+// the build that introduced it.
 func errorResponse(status string) map[string]any {
 	descriptions := map[string]string{
 		"400": "Bad request",
 		"401": "Unauthorized",
 		"403": "Forbidden",
+		"422": "Unprocessable entity",
 		"500": "Internal server error",
 	}
+	description, ok := descriptions[status]
+	if !ok {
+		panic("server: openapi: no description for error status " + status)
+	}
 	return map[string]any{
-		"description": descriptions[status],
+		"description": description,
 		"content": map[string]any{
 			"application/json": map[string]any{
 				"schema": map[string]any{
