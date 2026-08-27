@@ -406,6 +406,66 @@ func (s *PluginConsentService) Grant(ctx context.Context, name string, req serve
 	return result, nil
 }
 
+// Resolve fetches and verifies the package behind one deployment entry so the
+// caller can SEE what the plugin declares, and stops there: it never touches
+// plugins.json, never writes a grant, never converges. It exists because a
+// remote entry whose package is not cached reports DeclaredUnresolved from
+// List — GET must not carry a network fetch as a side effect — which leaves an
+// operator unable to review what they would be authorizing. This is the
+// deliberate, operator-initiated fetch that closes that gap.
+//
+// It runs the SAME chain Grant does (read the deployment, find the entry,
+// resolvePluginPackageDir, manifest.LoadPackage) and reuses every precondition
+// that chain enforces: a plaintext http source is still refused unless the
+// deployment opted in, and a missing plugin cache is still refused. Resolving
+// through a second, laxer path would be a way around those checks.
+//
+// The package is left in the cache on success. That is intended — it is what
+// spares a following Grant a second download, and it matches what the CLI's
+// own grant already does — and it happens even if the operator then decides
+// NOT to authorize. Callers are expected to say so; the settings panel does.
+//
+// An untrusted package (see manifest.ErrUntrustedPackage) is reported with
+// that sentinel on the error chain, so a caller can tell it apart from a
+// package it merely could not obtain and refrain from offering a retry that
+// could never succeed.
+func (s *PluginConsentService) Resolve(ctx context.Context, name string) (server.PluginView, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	dep, _, err := consent.ReadDeploymentWithSnapshot(s.manifestPath)
+	if err != nil {
+		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w: %w", name, server.ErrPluginStorage, err)
+	}
+	entry, err := consent.FindEntry(dep, name)
+	if err != nil {
+		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w: %w", name, server.ErrPluginNotFound, err)
+	}
+
+	dir, err := resolvePluginPackageDir(ctx, entry, s.remote, s.root)
+	if err != nil {
+		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w", name, err)
+	}
+	pm, _, err := manifest.LoadPackage(dir, s.keyringFn())
+	if err != nil {
+		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w", name, err)
+	}
+
+	// Only Declared*/Granted*/Name are filled: Resolve never touches the
+	// loader (no Apply, no Status() merge, unlike Grant/Deny), so it has no
+	// honest State/Detail/Tools to report -- those stay at their zero value
+	// rather than being guessed at.
+	return server.PluginView{
+		Name:          name,
+		GrantedCaps:   entry.Grant.Capabilities,
+		GrantedHosts:  entry.Grant.AllowedHosts,
+		GrantedPaths:  entry.Grant.AllowedPaths,
+		DeclaredCaps:  pm.Capabilities,
+		DeclaredHosts: pm.Network.AllowedHosts,
+		DeclaredPaths: pm.Filesystem.AllowedPaths,
+	}, nil
+}
+
 // Deny implements server.PluginConsent: it revokes the deployment entry
 // named name's authorization to run -- flips Enabled false, clears Grant,
 // but keeps GrantStated true (a decision WAS made, see
