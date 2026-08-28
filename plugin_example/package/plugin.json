@@ -1,0 +1,29 @@
+{
+  "name": "legion-hello",
+  "version": "0.1.0",
+  "abi": 1,
+  "sha256": "72833b79075593fc266022c00a0b14c2ee05210da9fbaa4749a9d004686057d5",
+  "capabilities": ["log"],
+  "limits": {
+    "timeout_ms": 5000,
+    "max_memory_pages": 64,
+    "max_instances": 2
+  },
+  "tools": [
+    {
+      "name": "hello_echo",
+      "description": "Greet someone by name, from inside a WASM plugin",
+      "group": "example",
+      "risk_level": "low",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "name": { "type": "string", "description": "who to greet" }
+        },
+        "required": ["name"]
+      },
+      "timeout_ms": 3000,
+      "sensitive": false
+    }
+  ]
+}
