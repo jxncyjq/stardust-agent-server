@@ -4,18 +4,36 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-# cdylib is what produces a .wasm with our own exports; a plain lib would not.
+# cdylib 才会产出带自定义导出的 .wasm；普通 lib 不会。
 [lib]
 crate-type = ["cdylib"]
 
-# No dependencies on purpose: the example must build with --offline. A real
-# plugin should depend on serde/serde_json and decode into structs.
+# 每个 feature 对应一个宿主能力。默认只开 log —— 打开一个 feature 就是让本
+# 模块多 import 一个 host 函数，而 import 一个部署没授权的函数会让模块在
+# **实例化**时失败（能力是链接期事实，不是运行期开关）。所以打开 feature 必须
+# 与另外两处联动：
+#
+#   1. scripts/build.sh 里内联的 plugin.json：capabilities 加上同名能力
+#      （http / fs 还要同时声明 network.allowed_hosts / filesystem.allowed_paths，
+#       否则 grant 会拒绝授这两个能力）；
+#   2. 部署侧 `agent plugins grant --capabilities <完整集合>`。
+#
+# 详见 src/host.rs 的模块注释。
+[features]
+default = []
+config-capability = []
+kv-capability = []
+http-capability = []
+fs-capability = []
+tool-capability = []
+
+# 没有依赖是刻意的：示例必须能 `cargo build --offline`。真插件应当依赖
+# serde / serde_json，见 src/json.rs。
 
 [profile.release]
 opt-level = "z"
 lto = true
 strip = true
-# A panic must not unwind out of plugin_invoke into the host. Aborting turns a
-# bug into a wasm trap the host reports, instead of undefined behaviour across
-# the FFI boundary.
+# panic 不能从 plugin_invoke 越过 FFI 边界向外展开。abort 会把 bug 变成一个宿主
+# 能报告的 wasm trap，而不是跨边界的未定义行为。
 panic = "abort"

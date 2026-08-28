@@ -11,6 +11,11 @@ on:
       - "go.sum"
       - "Makefile"
       - "scripts/**"
+      # 示例插件的包（plugin.json / plugin.wasm）由 plugin_example 的 Go 测试
+      # 校验：清单里的 sha256 是否与 wasm 相符、guest 是否答得出两个 op、能力
+      # 门是否仍是链接期的。这些文件不是 .go，漏进这份清单就等于改了它们而 CI
+      # 不跑——正是 2026-08-28 那次改动暴露出来的缺口。
+      - "plugin_example/**"
       - ".github/workflows/agent-ci.yml"
   pull_request:
     paths:
@@ -19,6 +24,11 @@ on:
       - "go.sum"
       - "Makefile"
       - "scripts/**"
+      # 示例插件的包（plugin.json / plugin.wasm）由 plugin_example 的 Go 测试
+      # 校验：清单里的 sha256 是否与 wasm 相符、guest 是否答得出两个 op、能力
+      # 门是否仍是链接期的。这些文件不是 .go，漏进这份清单就等于改了它们而 CI
+      # 不跑——正是 2026-08-28 那次改动暴露出来的缺口。
+      - "plugin_example/**"
       - ".github/workflows/agent-ci.yml"
   workflow_dispatch:
 
