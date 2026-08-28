@@ -55,6 +55,21 @@ const RuntimeEventCallFailed = "plugin/call_failed"
 // overstepped, not that it is broken.
 const CategoryDenied = "denied"
 
+// CategoryTimeout, CategoryTrap and CategoryABI are the remaining
+// plugin/call_failed categories from the design doc's error taxonomy
+// (legion-plugin-system.md §6.9).
+//
+// They differ from CategoryDenied in kind, not degree: a denial means the
+// plugin asked for something it was not authorized to have — it is working
+// exactly as written, just beyond its grant — while all three of these mean
+// the plugin failed to answer at all. That is why these three count toward a
+// plugin's health and CategoryDenied does not.
+const (
+	CategoryTimeout = "timeout"
+	CategoryTrap    = "trap"
+	CategoryABI     = "abi"
+)
+
 // eventCategoryToken renders a failure category as the token it travels as
 // inside a plugin/call_failed message. It is the ONE place the encoding is
 // spelled.
