@@ -107,6 +107,13 @@ const (
 	reasonManifestRemoved = "manifest-removed"
 	reasonDisabled        = "disabled"
 	reasonReplaced        = "replaced"
+
+	// reasonHealth is the unload a plugin brings on itself: consecutive
+	// call faults past the deployment's threshold (see PluginHealthConfig).
+	// It is spelled out as a distinct reason because it is the only unload
+	// NOBODY asked for — an operator reading plugin/unloaded needs to tell it
+	// from a manifest edit at a glance.
+	reasonHealth = "health"
 )
 
 // The reasons a plugin is mounted, as they appear in a RuntimeEventLoaded
@@ -1320,10 +1327,39 @@ func (l *Loader) unload(ctx context.Context, inst *instance, reason string) (int
 // deployment's threshold. Task 4 of the runtime-health plan fills in the
 // unload itself; this step only makes the decision visible so a threshold
 // crossing is never silent.
-func (l *Loader) unloadUnhealthy(_ context.Context, name, category, toolName, reason string) {
-	l.logger.Warn("plugin crossed its consecutive-fault threshold",
-		"plugin", name, "threshold", l.maxConsecutiveFaults,
-		"category", category, "tool", toolName, "reason", reason)
+func (l *Loader) unloadUnhealthy(ctx context.Context, name, category, toolName, reason string) {
+	l.mu.Lock()
+	inst, ok := l.instances[name]
+	if !ok {
+		// Another convergence unmounted it between the threshold crossing and
+		// this call. Nothing to unload, and nothing to explain: whatever
+		// replaced it (or the removal itself) is the current truth.
+		l.mu.Unlock()
+		return
+	}
+	delete(l.instances, name)
+	l.mu.Unlock()
+
+	detail := fmt.Sprintf("health: %d consecutive faults (last: category=%s tool=%s: %s)",
+		l.maxConsecutiveFaults, category, toolName, reason)
+
+	revoked, err := l.unload(ctx, inst, reasonHealth)
+	if err != nil {
+		// The unload still happened as far as the deployment is concerned —
+		// the entry is out of l.instances either way — so the failure is
+		// recorded in the explanation rather than swallowed or retried.
+		l.logger.Error("unhealthy plugin unloaded with failures",
+			"plugin", name, "category", category, "error", err)
+		detail += fmt.Sprintf("; unload reported: %v", err)
+	}
+
+	l.mu.Lock()
+	l.failures[name] = failure{version: inst.version, err: detail}
+	l.mu.Unlock()
+
+	l.logger.Warn("plugin unloaded for repeated faults",
+		"plugin", name, "threshold", l.maxConsecutiveFaults, "category", category,
+		"tool", toolName, "reason", reason, "revoked", revoked)
 }
 
 // recordFault counts one health-relevant failure of a mounted plugin and
