@@ -1,0 +1,228 @@
+// Package plugin_example_test exercises the example plugin in plugin_example/
+// against the REAL host: the same wazero runtime, the same capability gate and
+// the same ABI a mounted plugin runs under.
+//
+// It exists so the example cannot rot silently. A committed package is a claim
+// about three things at once — that plugin.json's digest matches plugin.wasm,
+// that the guest answers both ABI ops, and that the capability gate really is
+// link-time — and every one of them breaks quietly if nothing checks it.
+//
+// It deliberately does NOT go through the loader, the deployment manifest or
+// the consent flow: those have their own tests, and an example test that
+// assembled a whole service would break for reasons that have nothing to do
+// with the example.
+package plugin_example_test
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"slices"
+	"strings"
+	"testing"
+
+	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/plugin/abi"
+	"github.com/stardust/legion-agent/internal/plugin/host"
+	"github.com/stardust/legion-agent/internal/plugin/manifest"
+	"github.com/stardust/legion-agent/internal/plugin/perm"
+)
+
+// examplePages is the linear-memory ceiling this test instantiates under. It
+// matches package/plugin.json's limits.max_memory_pages so the test runs the
+// guest under the same ceiling a deployment would.
+const examplePages = 64
+
+func packageDir(t *testing.T) string {
+	t.Helper()
+	dir, err := filepath.Abs("package")
+	if err != nil {
+		t.Fatalf("resolve package dir: %v", err)
+	}
+	return dir
+}
+
+// readExampleManifest parses package/plugin.json the same way the host does.
+func readExampleManifest(t *testing.T) manifest.PluginManifest {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join(packageDir(t), "plugin.json"))
+	if err != nil {
+		t.Fatalf("read plugin.json: %v", err)
+	}
+	pm, err := manifest.ParsePlugin(data)
+	if err != nil {
+		t.Fatalf("parse plugin.json: %v", err)
+	}
+	return pm
+}
+
+func readExampleWasm(t *testing.T) []byte {
+	t.Helper()
+	wasm, err := os.ReadFile(filepath.Join(packageDir(t), "plugin.wasm"))
+	if err != nil {
+		t.Fatalf("read plugin.wasm (run plugin_example/scripts/build.sh): %v", err)
+	}
+	return wasm
+}
+
+// newExampleInstance compiles the example under grant and returns a live
+// instance plus the buffer the host logger writes to, so a test can assert on
+// what the guest logged.
+func newExampleInstance(t *testing.T, ctx context.Context, grant perm.Grant) (*host.Instance, *bytes.Buffer) {
+	t.Helper()
+	rt := host.NewRuntime(ctx, examplePages)
+	t.Cleanup(func() {
+		if err := rt.Close(ctx); err != nil {
+			t.Errorf("close runtime: %v", err)
+		}
+	})
+
+	compiled, err := host.Compile(ctx, rt, readExampleWasm(t))
+	if err != nil {
+		t.Fatalf("compile example plugin: %v", err)
+	}
+	if err := host.CheckImports(compiled, grant); err != nil {
+		t.Fatalf("check imports under %+v: %v", grant, err)
+	}
+
+	var logged bytes.Buffer
+	deps := host.Deps{
+		PluginName: "legion-hello",
+		Logger:     slog.New(slog.NewTextHandler(&logged, nil)),
+	}
+	if _, err := host.BuildHostModule(ctx, rt, grant, deps); err != nil {
+		t.Fatalf("build host module: %v", err)
+	}
+
+	inst, err := host.NewInstance(ctx, rt, compiled)
+	if err != nil {
+		t.Fatalf("instantiate example plugin: %v", err)
+	}
+	return inst, &logged
+}
+
+// TestExamplePackageDigestMatchesTheModule pins the one thing an author breaks
+// by rebuilding the wasm and forgetting scripts/build.sh: plugin.json carries
+// plugin.wasm's digest, and a mismatch is a load-time refusal, not a warning.
+func TestExamplePackageDigestMatchesTheModule(t *testing.T) {
+	pm := readExampleManifest(t)
+	sum := sha256.Sum256(readExampleWasm(t))
+	actual := hex.EncodeToString(sum[:])
+	if !strings.EqualFold(pm.SHA256, actual) {
+		t.Errorf("plugin.json declares sha256 %s, plugin.wasm hashes to %s; re-run plugin_example/scripts/build.sh",
+			pm.SHA256, actual)
+	}
+}
+
+// TestExampleGuestSelfDescriptionCoversItsDeclaredTools is the cross-check
+// activation performs: the guest's op 0 answer must name every tool
+// plugin.json says the plugin contributes, or the host refuses to mount it.
+func TestExampleGuestSelfDescriptionCoversItsDeclaredTools(t *testing.T) {
+	ctx := context.Background()
+	inst, _ := newExampleInstance(t, ctx, perm.Grant{Log: true})
+
+	out, err := inst.Invoke(ctx, abi.OpManifest, nil)
+	if err != nil {
+		t.Fatalf("invoke op manifest: %v", err)
+	}
+	var self struct {
+		Name     string   `json:"name"`
+		Version  string   `json:"version"`
+		Provides []string `json:"provides"`
+	}
+	if err := json.Unmarshal(out, &self); err != nil {
+		t.Fatalf("decode self-description %q: %v", out, err)
+	}
+
+	pm := readExampleManifest(t)
+	if self.Name != pm.Name {
+		t.Errorf("guest says name %q, plugin.json says %q", self.Name, pm.Name)
+	}
+	for _, declared := range pm.Tools {
+		if !slices.Contains(self.Provides, declared.Name) {
+			t.Errorf("plugin.json declares tool %q, guest provides %v; activation would refuse this package",
+				declared.Name, self.Provides)
+		}
+	}
+}
+
+// TestExampleToolCallReturnsAResultAndLogsThroughTheHost is the closed loop:
+// the host hands the guest a tool call, the guest calls BACK into the host
+// through the granted log capability, and answers with a domain.ToolResult.
+func TestExampleToolCallReturnsAResultAndLogsThroughTheHost(t *testing.T) {
+	ctx := context.Background()
+	inst, logged := newExampleInstance(t, ctx, perm.Grant{Log: true})
+
+	request := []byte(`{"call_id":"call-1","tool":"hello_echo","arguments":{"name":"legion"}}`)
+	out, err := inst.Invoke(ctx, abi.OpCallTool, request)
+	if err != nil {
+		t.Fatalf("invoke op call_tool: %v", err)
+	}
+
+	var result domain.ToolResult
+	if err := json.Unmarshal(out, &result); err != nil {
+		t.Fatalf("decode tool result %q: %v", out, err)
+	}
+	if !result.Success {
+		t.Fatalf("tool result success = false, error = %q, want a successful greeting", result.Error)
+	}
+	if result.Output != "hello, legion!" {
+		t.Errorf("tool result output = %q, want %q", result.Output, "hello, legion!")
+	}
+	// The log line is the proof the capability actually reached the guest:
+	// without it the call could have succeeded on pure computation alone.
+	if !strings.Contains(logged.String(), "hello_echo called with name=legion") {
+		t.Errorf("host logger recorded %q, want the guest's log line", logged.String())
+	}
+}
+
+// TestExampleToolCallReportsAMissingArgumentAsAFailedResult pins the rule a
+// plugin author is most likely to get wrong: a tool that cannot do its job
+// answers with success:false, it does not trap. A trap would take the whole
+// module down with it.
+func TestExampleToolCallReportsAMissingArgumentAsAFailedResult(t *testing.T) {
+	ctx := context.Background()
+	inst, _ := newExampleInstance(t, ctx, perm.Grant{Log: true})
+
+	out, err := inst.Invoke(ctx, abi.OpCallTool, []byte(`{"call_id":"c","tool":"hello_echo","arguments":{}}`))
+	if err != nil {
+		t.Fatalf("invoke op call_tool: %v; a missing argument must be a RESULT, not a trap", err)
+	}
+	var result domain.ToolResult
+	if err := json.Unmarshal(out, &result); err != nil {
+		t.Fatalf("decode tool result %q: %v", out, err)
+	}
+	if result.Success {
+		t.Fatal("tool result success = true for a call with no name argument, want a failed result")
+	}
+	if !strings.Contains(result.Error, "name") {
+		t.Errorf("tool result error = %q, want it to name the missing argument", result.Error)
+	}
+}
+
+// TestExampleRefusesToLinkWithoutItsCapability is why plugin.json's
+// capabilities list is not documentation: an ungranted capability is a MISSING
+// IMPORT, so the module never links — the guest gets no chance to call the
+// function and no DENIED to handle.
+func TestExampleRefusesToLinkWithoutItsCapability(t *testing.T) {
+	ctx := context.Background()
+	rt := host.NewRuntime(ctx, examplePages)
+	t.Cleanup(func() {
+		if err := rt.Close(ctx); err != nil {
+			t.Errorf("close runtime: %v", err)
+		}
+	})
+
+	compiled, err := host.Compile(ctx, rt, readExampleWasm(t))
+	if err != nil {
+		t.Fatalf("compile example plugin: %v", err)
+	}
+	if err := host.CheckImports(compiled, perm.Grant{}); err == nil {
+		t.Fatal("CheckImports with no capabilities granted = nil, want a refusal: the guest imports legion.log")
+	}
+}

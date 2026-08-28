@@ -1,0 +1,21 @@
+[package]
+name = "legion-hello"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# cdylib is what produces a .wasm with our own exports; a plain lib would not.
+[lib]
+crate-type = ["cdylib"]
+
+# No dependencies on purpose: the example must build with --offline. A real
+# plugin should depend on serde/serde_json and decode into structs.
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+# A panic must not unwind out of plugin_invoke into the host. Aborting turns a
+# bug into a wasm trap the host reports, instead of undefined behaviour across
+# the FFI boundary.
+panic = "abort"

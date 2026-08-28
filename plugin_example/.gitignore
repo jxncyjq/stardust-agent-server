@@ -1,0 +1,11 @@
+# Rust build tree.
+guest/target/
+
+# The signed tarball is a release artifact, not source.
+dist/
+
+# plugin.sig is deliberately NOT committed: a signature is a statement by a
+# key holder, and shipping one made with a throwaway example key would invite
+# a deployment to trust a key nobody controls. Run scripts/publish.sh with
+# your own key (see README).
+package/plugin.sig
