@@ -1,0 +1,78 @@
+# legion-plugin
+
+写 Legion Agent WASM 插件的 Rust guest SDK（ABI v1）。零依赖，可 `cargo build --offline`。
+
+## 用它
+
+`Cargo.toml`：
+
+```toml
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+legion-plugin = { path = "…/sdk/rust/legion-plugin" }
+```
+
+`src/lib.rs`：
+
+```rust
+use legion_plugin::{declare_plugin, log_info, ToolCall, ToolResult};
+
+declare_plugin!(
+    name = "legion-hello",
+    version = "0.1.0",
+    tools = [("hello_echo", hello_echo)]
+);
+
+fn hello_echo(call: &ToolCall) -> ToolResult {
+    match call.argument("name") {
+        Some(name) => {
+            log_info(&format!("hello_echo called with name={name}"));
+            ToolResult::ok(format!("hello, {name}!"))
+        }
+        None => ToolResult::fail("missing required argument: name"),
+    }
+}
+```
+
+构建：`cargo build --release --target wasm32-wasip1`。
+
+SDK 生成四个导出（`_initialize` / `plugin_alloc` / `plugin_free` / `plugin_invoke`）、op 分发、内存管理、指针打包、JSON，以及 **op 0 的自述**——`provides` 由 `tools` 列表推导，所以「guest 说自己提供什么」和「实际注册了什么」不会对不上。
+
+## 能力
+
+默认只有 `log`。其余六个 host 函数用 feature 关着：
+
+| 能力 | feature | 函数 |
+|---|---|---|
+| `log` | 默认开 | `log_info` |
+| `config` | `config-capability` | `host::config` |
+| `kv` | `kv-capability` | `host::kv_read` / `host::kv_write` |
+| `http` | `http-capability` | `host::http` |
+| `fs` | `fs-capability` | `host::read` |
+| `tool` | `tool-capability` | `host::invoke_tool` |
+
+打开一个 feature 要**同时**做另两件事，缺一模块就在实例化时失败（能力是链接期事实，不是运行期开关）：
+
+1. `plugin.json` 的 `capabilities` 加上同名能力（`http`/`fs` 还要声明 `network.allowed_hosts` / `filesystem.allowed_paths`）；
+2. 部署侧 `agent plugins grant --capabilities <完整集合>`。
+
+## 两条硬规矩
+
+- **工具失败返回 `ToolResult::fail`，不要 panic。** panic 会 trap 整个模块，代价是实例状态、同实例的在途调用，而且计入插件健康度（连续故障到阈值会被自动卸载）。
+- **初始化放 `_initialize`。** `declare_plugin!` 生成的是空实现；要做初始化就自己写一个 `_initialize` 并把宏那份去掉（把宏展开抄到自己文件里，改那一处）。放到首次调用里做会算进那次工具调用的超时预算。
+
+## 与 Go SDK 的取舍
+
+| | Rust（本 crate） | Go（`pkg/legionplugin`） |
+|---|---|---|
+| 产物体积 | ~40 KB | ~1.9 MB |
+| 工具链 | `rustup target add wasm32-wasip1` | 只要 Go 1.24+ |
+| GC | 无 | 有（SDK 内部按住分配的缓冲区） |
+
+体积敏感（或部署要挂很多插件）用 Rust；团队只有 Go 就用 Go，1.9 MB 是标准 Go 运行时的代价，不是 SDK 的。
+
+## 完整示例
+
+`plugin_example/`：一个跑通过 install → grant → serve → `state:"loaded"` 全程的最小插件。
