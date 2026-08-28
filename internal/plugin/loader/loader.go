@@ -90,6 +90,12 @@ const (
 	// disposal's own failure if it had one (error=).
 	RuntimeEventUnloaded = "plugin/unloaded"
 
+	// RuntimeEventUnloadLeaked reports an unload whose wait for in-flight
+	// calls ran out: the plugin is out of every registry, and guest work is
+	// still running inside a runtime nobody owns any more. It is the design
+	// doc's plugin/unload_leaked (§8).
+	RuntimeEventUnloadLeaked = "plugin/unload_leaked"
+
 	// RuntimeEventActivationFailed reports one plugin that did not come up:
 	// which step failed, how many ledger entries were rolled back, and whether
 	// a previous instance was restored.
@@ -1289,6 +1295,30 @@ func (l *Loader) restore(ctx context.Context, prev *instance) error {
 // the worst of both. The event carries the failure in its error= field, so an
 // operator reading the event stream sees the same thing the returned error
 // says.
+// reportDrainLeak publishes plugin/unload_leaked when disposal gave up waiting
+// for calls still inside the guest.
+//
+// It reports the COUNT, not just the fact: "something is still running" is not
+// actionable, while "3 calls are still inside legion-foo after waiting 5s"
+// tells an operator whether they are looking at one stuck call or at a plugin
+// that never returns. The count is read after the wait, so it is what was left
+// behind rather than what was there when the wait began.
+//
+// Any other disposal failure is left alone — it already travels out of unload
+// as an error and into the entry's lastError. This event exists for the one
+// case where the failure is not the unload itself but what SURVIVED it.
+func (l *Loader) reportDrainLeak(ctx context.Context, inst *instance, disposeErr error) {
+	if disposeErr == nil || !errors.Is(disposeErr, host.ErrDrainIncomplete) {
+		return
+	}
+	inflight := inst.plugin.InflightCalls()
+	waited := inst.plugin.DrainBound()
+	l.logger.Error("plugin unload left calls inside the guest",
+		"plugin", inst.name, "version", inst.version, "inflight", inflight, "waited", waited)
+	l.publish(ctx, RuntimeEventUnloadLeaked,
+		fmt.Sprintf("plugin=%s version=%s inflight=%d waited=%s", inst.name, inst.version, inflight, waited))
+}
+
 func (l *Loader) unload(ctx context.Context, inst *instance, reason string) (int, error) {
 	// Both owners, counted from ONE snapshot: an activation files its wasm
 	// resources and the link to its contributions under inst.owner, and one
@@ -1311,6 +1341,7 @@ func (l *Loader) unload(ctx context.Context, inst *instance, reason string) (int
 			"reason", reason, "revoked", revoked)
 	}
 	l.publish(ctx, RuntimeEventUnloaded, formatUnloadedMessage(inst, reason, revoked, disposeErr))
+	l.reportDrainLeak(ctx, inst, disposeErr)
 
 	if disposeErr != nil {
 		return revoked, fmt.Errorf("unload plugin %q (owner %s, reason %s): %w",

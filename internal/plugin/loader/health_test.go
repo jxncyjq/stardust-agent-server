@@ -2,6 +2,8 @@ package loader
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -119,5 +121,52 @@ func TestUnhealthyUnloadDoesNotBringThePluginBack(t *testing.T) {
 
 	if names := h.toolNames(); len(names) != 0 {
 		t.Errorf("tools still registered after a health unload: %v; there is no automatic retry by design", names)
+	}
+}
+
+// TestUnloadPublishesLeakedWhenDrainDoesNotConverge covers the design doc's
+// fifth event (§8), the only one that had never been emitted: an unload whose
+// wait for in-flight calls ran out leaves guest work running inside a runtime
+// nobody owns any more, and until now that fact appeared nowhere.
+//
+// The drain failure is injected rather than provoked: making a real fixture
+// hang a call past the drain deadline would test wazero's scheduling, not this
+// branch. What this pins is that the Loader recognises host.ErrDrainIncomplete
+// and reports the COUNT — the number is the whole point of the event.
+func TestUnloadPublishesLeakedWhenDrainDoesNotConverge(t *testing.T) {
+	h := newHarness(t)
+	h.apply(h.writeEcho("1.0.0", "echo_tool"))
+	inst := h.loader.mounted(echoPluginName)
+
+	leaked := fmt.Errorf("drain instance pool of plugin %q (waited 5s): %w",
+		echoPluginName, host.ErrDrainIncomplete)
+	h.loader.reportDrainLeak(context.Background(), inst, leaked)
+
+	events := h.eventsOfType(RuntimeEventUnloadLeaked)
+	if len(events) != 1 {
+		t.Fatalf("plugin/unload_leaked events = %d, want 1: a drain that left calls behind must say so",
+			len(events))
+	}
+	if !strings.Contains(events[0].Message, "inflight=") {
+		t.Errorf("event %q does not report how many calls were left behind", events[0].Message)
+	}
+	if !strings.Contains(events[0].Message, echoPluginName) {
+		t.Errorf("event %q does not name the plugin", events[0].Message)
+	}
+}
+
+// TestUnloadPublishesNoLeakOnAnOrdinaryFailure is the other half: a disposal
+// that failed for some other reason already travels out as an error, and
+// reporting it as a leak would tell an operator to go looking for guest work
+// that is not there.
+func TestUnloadPublishesNoLeakOnAnOrdinaryFailure(t *testing.T) {
+	h := newHarness(t)
+	h.apply(h.writeEcho("1.0.0", "echo_tool"))
+	inst := h.loader.mounted(echoPluginName)
+
+	h.loader.reportDrainLeak(context.Background(), inst, errors.New("close wasm runtime: already closed"))
+
+	if events := h.eventsOfType(RuntimeEventUnloadLeaked); len(events) != 0 {
+		t.Errorf("plugin/unload_leaked events for an unrelated disposal failure = %d, want 0", len(events))
 	}
 }
