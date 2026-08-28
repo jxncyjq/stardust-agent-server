@@ -8,27 +8,21 @@ publish = false
 [lib]
 crate-type = ["cdylib"]
 
-# 每个 feature 对应一个宿主能力。默认只开 log —— 打开一个 feature 就是让本
-# 模块多 import 一个 host 函数，而 import 一个部署没授权的函数会让模块在
-# **实例化**时失败（能力是链接期事实，不是运行期开关）。所以打开 feature 必须
-# 与另外两处联动：
-#
-#   1. scripts/build.sh 里内联的 plugin.json：capabilities 加上同名能力
-#      （http / fs 还要同时声明 network.allowed_hosts / filesystem.allowed_paths，
-#       否则 grant 会拒绝授这两个能力）；
-#   2. 部署侧 `agent plugins grant --capabilities <完整集合>`。
-#
-# 详见 src/host.rs 的模块注释。
+[dependencies]
+# SDK 承担 ABI：四个导出、op 分发、内存管理、指针打包、JSON 与 op 0 的自述。
+legion-plugin = { path = "../../sdk/rust/legion-plugin" }
+
+# 每个 feature 透传给 SDK。打开一个就是让最终模块多 import 一个 host 函数，
+# 而 import 一个部署没授权的函数会让模块在**实例化**时失败（能力是链接期事实）。
+# 所以打开 feature 必须三处联动：这里、scripts/build.sh 内联 plugin.json 的
+# capabilities、以及部署侧 grant 的 --capabilities。
 [features]
 default = []
-config-capability = []
-kv-capability = []
-http-capability = []
-fs-capability = []
-tool-capability = []
-
-# 没有依赖是刻意的：示例必须能 `cargo build --offline`。真插件应当依赖
-# serde / serde_json，见 src/json.rs。
+config-capability = ["legion-plugin/config-capability"]
+kv-capability = ["legion-plugin/kv-capability"]
+http-capability = ["legion-plugin/http-capability"]
+fs-capability = ["legion-plugin/fs-capability"]
+tool-capability = ["legion-plugin/tool-capability"]
 
 [profile.release]
 opt-level = "z"

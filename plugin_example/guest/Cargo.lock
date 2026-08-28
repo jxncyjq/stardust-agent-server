@@ -5,3 +5,10 @@ version = 4
 [[package]]
 name = "legion-hello"
 version = "0.1.0"
+dependencies = [
+ "legion-plugin",
+]
+
+[[package]]
+name = "legion-plugin"
+version = "0.1.0"
