@@ -253,12 +253,13 @@ func TestNewSaysSoWhenItIsBuiltWithoutAKeyring(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
 	if _, err := New(Config{
-		Ledger:    h.ledger,
-		Deps:      h.deps,
-		Events:    h.events,
-		Logger:    logger,
-		Gate:      h.gate,
-		ApplyWait: defaultTestApplyWait,
+		Ledger:               h.ledger,
+		Deps:                 h.deps,
+		Events:               h.events,
+		Logger:               logger,
+		Gate:                 h.gate,
+		ApplyWait:            defaultTestApplyWait,
+		MaxConsecutiveFaults: defaultTestMaxFaults,
 	}); err != nil {
 		t.Fatalf("New() error = %v, want nil: a nil Keyring is a policy, not a wiring error", err)
 	}
@@ -269,13 +270,14 @@ func TestNewSaysSoWhenItIsBuiltWithoutAKeyring(t *testing.T) {
 	logs.Reset()
 	_, keyring := newTestKey(t)
 	if _, err := New(Config{
-		Ledger:    h.ledger,
-		Deps:      h.deps,
-		Events:    h.events,
-		Logger:    logger,
-		Gate:      h.gate,
-		ApplyWait: defaultTestApplyWait,
-		Keyring:   keyring,
+		Ledger:               h.ledger,
+		Deps:                 h.deps,
+		Events:               h.events,
+		Logger:               logger,
+		Gate:                 h.gate,
+		ApplyWait:            defaultTestApplyWait,
+		MaxConsecutiveFaults: defaultTestMaxFaults,
+		Keyring:              keyring,
 	}); err != nil {
 		t.Fatalf("New() error = %v, want nil", err)
 	}

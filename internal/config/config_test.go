@@ -873,3 +873,56 @@ func TestLoadRejectsUnboundedPluginFetchBounds(t *testing.T) {
 		})
 	}
 }
+
+// TestLoadPluginsHealthDefaultsToFive pins the default tolerance for a
+// misbehaving plugin. A deployment that says nothing about health still gets a
+// policy — an unstated one that meant "never unload" would leave every
+// deployment that never heard of the setting running plugins that trap on
+// every call.
+func TestLoadPluginsHealthDefaultsToFive(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(path, []byte(`{
+		"plugins": {
+			"manifest": "plugins.json",
+			"root": "plugins",
+			"limits": {"timeout_ms": 1000},
+			"apply_wait_ms": 1000
+		}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", path, err)
+	}
+
+	cfg, err := Load(context.Background(), Options{Path: path})
+	if err != nil {
+		t.Fatalf("Load(%q) error = %v, want nil", path, err)
+	}
+	if cfg.Plugins.Health.MaxConsecutiveFaults != 5 {
+		t.Errorf("Load(%q).Plugins.Health.MaxConsecutiveFaults = %d, want the default 5",
+			path, cfg.Plugins.Health.MaxConsecutiveFaults)
+	}
+}
+
+// TestLoadRejectsANonPositiveHealthThreshold is the other half: zero is not
+// "unlimited", it is an unstated policy, and this project refuses those rather
+// than picking the permissive reading on the operator's behalf.
+func TestLoadRejectsANonPositiveHealthThreshold(t *testing.T) {
+	t.Parallel()
+	path := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(path, []byte(`{
+		"plugins": {
+			"manifest": "plugins.json",
+			"root": "plugins",
+			"limits": {"timeout_ms": 1000},
+			"apply_wait_ms": 1000,
+			"health": {"max_consecutive_faults": 0}
+		}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", path, err)
+	}
+
+	if _, err := Load(context.Background(), Options{Path: path}); err == nil {
+		t.Fatal("Load with max_consecutive_faults=0 error = nil, want a refusal: " +
+			"0 is not 'never unload', it is an unstated policy")
+	}
+}

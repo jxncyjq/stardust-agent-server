@@ -104,6 +104,9 @@ type PluginsConfig struct {
 	// Fetch bounds the download of one remote plugin artifact.
 	Fetch PluginFetchConfig `json:"fetch"`
 
+	// Health is the deployment's tolerance for a plugin that keeps failing.
+	Health PluginHealthConfig `json:"health"`
+
 	// Keyring is the path to the trust keyring (a document of public keys, see
 	// internal/plugin/sign.ParseKeyring) every plugin package's signature is
 	// checked against. Like Manifest, a relative path resolves against the
@@ -194,6 +197,29 @@ type PluginFetchConfig struct {
 	// network; the decompressed package is bounded separately, where the
 	// archive is unpacked.
 	MaxBytes int64 `json:"max_bytes"`
+}
+
+// PluginHealthConfig is the deployment's tolerance for a misbehaving plugin.
+//
+// A plugin whose calls keep failing is not merely useless: it is advertised to
+// the model on every prompt, so each round spends tokens offering a tool that
+// will fail again. Past a threshold the deployment unloads it and says so.
+//
+// The count is CONSECUTIVE — one answered call resets it — and only the
+// failures internal/plugin/host.ClassifyCallFault recognises are counted: a
+// caller's cancellation is not one, a denial is not one (the plugin
+// overstepped, it is not broken), and a tool answering "I could not do it" is
+// not one either (that is the plugin working).
+type PluginHealthConfig struct {
+	// MaxConsecutiveFaults is the count at which a plugin is unloaded. Default
+	// 5.
+	//
+	// It has NO "zero means unlimited" reading: validatePlugins rejects a
+	// non-positive value whenever a manifest is configured. A deployment that
+	// wants a high tolerance states a high number; leaving the policy unstated
+	// and silently getting "never unload" is the degradation this project's
+	// rules forbid.
+	MaxConsecutiveFaults int `json:"max_consecutive_faults"`
 }
 
 // PluginLimitsConfig is the deployment-wide resource ceiling every plugin is
@@ -525,6 +551,11 @@ func validatePlugins(cfg PluginsConfig) error {
 		return fmt.Errorf("plugins.fetch.timeout_ms is %d; it must be positive, "+
 			"since a remote plugin artifact download with no deadline never fails and never finishes", cfg.Fetch.TimeoutMs)
 	}
+	if cfg.Health.MaxConsecutiveFaults <= 0 {
+		return fmt.Errorf("plugins.health.max_consecutive_faults is %d; it must be positive "+
+			"(a deployment that tolerates more failures states a larger number; zero has no "+
+			"'unlimited' reading here)", cfg.Health.MaxConsecutiveFaults)
+	}
 	if cfg.Fetch.MaxBytes <= 0 {
 		return fmt.Errorf("plugins.fetch.max_bytes is %d; it must be positive, "+
 			"since zero does not mean unlimited here: it is the cap on bytes downloaded from a remote plugin source", cfg.Fetch.MaxBytes)
@@ -646,6 +677,7 @@ func defaultConfig() Config {
 			Root:        "plugins",
 			Limits:      PluginLimitsConfig{TimeoutMs: 10000, MaxMemoryPages: 256, MaxInstances: 4},
 			Fetch:       PluginFetchConfig{TimeoutMs: 30000, MaxBytes: 33554432},
+			Health:      PluginHealthConfig{MaxConsecutiveFaults: 5},
 			ApplyWaitMs: 60000,
 		},
 	}

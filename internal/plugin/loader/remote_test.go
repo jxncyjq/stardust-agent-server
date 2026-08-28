@@ -542,13 +542,14 @@ func TestLoaderReportsTheRemotePolicyItWasBuiltWith(t *testing.T) {
 // New test can vary the remote section alone.
 func baseTestConfig(remote RemoteConfig) Config {
 	return Config{
-		Ledger:    lifecycle.NewLedger(),
-		Deps:      func(string, json.RawMessage) host.Deps { return host.Deps{} },
-		Events:    adapter.NewMemoryEventBus(),
-		Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Gate:      taskgate.NewTaskGate(),
-		ApplyWait: defaultTestApplyWait,
-		Remote:    remote,
+		Ledger:               lifecycle.NewLedger(),
+		Deps:                 func(string, json.RawMessage) host.Deps { return host.Deps{} },
+		Events:               adapter.NewMemoryEventBus(),
+		Logger:               slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Gate:                 taskgate.NewTaskGate(),
+		ApplyWait:            defaultTestApplyWait,
+		MaxConsecutiveFaults: defaultTestMaxFaults,
+		Remote:               remote,
 	}
 }
 

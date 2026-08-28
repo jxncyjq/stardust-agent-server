@@ -240,6 +240,13 @@ type Config struct {
 	// the way.
 	ApplyWait time.Duration
 
+	// MaxConsecutiveFaults is how many consecutive health-relevant call
+	// failures (see host.ClassifyCallFault) one mounted plugin may produce
+	// before this Loader unloads it. It comes from
+	// config.PluginHealthConfig.MaxConsecutiveFaults and must be positive:
+	// zero is refused by New rather than read as "never unload".
+	MaxConsecutiveFaults int
+
 	// Keyring is the deployment's trust set: the public keys a plugin
 	// package's detached signature (plugin.sig) must verify against before
 	// anything is mounted from it. It is handed to manifest.LoadPackage on
@@ -385,6 +392,13 @@ type instance struct {
 	tools     []string
 	lastError string
 
+	// faults counts CONSECUTIVE health-relevant call failures of THIS mount
+	// (see host.ClassifyCallFault). It lives on the instance rather than in a
+	// side map so it dies with the mount: a replaced plugin starts clean,
+	// which is the only reading that makes sense for "consecutive failures of
+	// this instance". Guarded by Loader.mu.
+	faults int
+
 	// plugin is the activation's own handle, kept because suspending and
 	// resuming are its methods: the Loader decides WHICH plugins may work, and
 	// host.Plugin is what actually withdraws and re-files their contributions.
@@ -426,6 +440,10 @@ type Loader struct {
 	gate         *taskgate.TaskGate
 	applyWait    time.Duration
 
+	// maxConsecutiveFaults is Config.MaxConsecutiveFaults, the count at which a
+	// mounted plugin is unloaded for repeatedly failing to answer.
+	maxConsecutiveFaults int
+
 	// keyring is Config.Keyring, verbatim: the deployment's trust set, or nil
 	// when it has explicitly stated that it does not require signatures. See
 	// Config.Keyring for why nil may only ever mean that.
@@ -460,6 +478,10 @@ func New(cfg Config) (*Loader, error) {
 	case cfg.ApplyWait <= 0:
 		return nil, fmt.Errorf("new plugin loader: Config.ApplyWait is %s; it must be positive, "+
 			"since an apply that waits forever for a task boundary holds the gate shut against every new task", cfg.ApplyWait)
+	case cfg.MaxConsecutiveFaults <= 0:
+		return nil, fmt.Errorf("new plugin loader: Config.MaxConsecutiveFaults is %d; it must be positive, "+
+			"since zero has no 'never unload' reading: a deployment that tolerates more failures states a "+
+			"larger number (see config.PluginHealthConfig)", cfg.MaxConsecutiveFaults)
 	}
 	if err := validateRemote(cfg.Remote); err != nil {
 		return nil, err
@@ -475,17 +497,18 @@ func New(cfg Config) (*Loader, error) {
 			"consequence", "packages are accepted on their sha256 alone, which travels inside the very manifest it describes")
 	}
 	return &Loader{
-		ledger:       cfg.Ledger,
-		deps:         cfg.Deps,
-		events:       cfg.Events,
-		logger:       cfg.Logger,
-		deployLimits: cfg.DeployLimits,
-		gate:         cfg.Gate,
-		applyWait:    cfg.ApplyWait,
-		keyring:      cfg.Keyring,
-		remote:       cfg.Remote,
-		instances:    make(map[string]*instance),
-		failures:     make(map[string]failure),
+		ledger:               cfg.Ledger,
+		deps:                 cfg.Deps,
+		events:               cfg.Events,
+		logger:               cfg.Logger,
+		deployLimits:         cfg.DeployLimits,
+		gate:                 cfg.Gate,
+		applyWait:            cfg.ApplyWait,
+		maxConsecutiveFaults: cfg.MaxConsecutiveFaults,
+		keyring:              cfg.Keyring,
+		remote:               cfg.Remote,
+		instances:            make(map[string]*instance),
+		failures:             make(map[string]failure),
 	}, nil
 }
 
@@ -1052,6 +1075,19 @@ func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string)
 			"nothing can call", entry.Name)
 		return nil, l.fail(ctx, entry.Name, pm.Version, stepDependencies, missing, nil)
 	}
+	// Health accounting is wired here rather than inside host.Deps' factory
+	// because it belongs to the MOUNT, not to the deployment's dependency
+	// wiring: the counter it feeds lives on this Loader's instance record and
+	// must die when that record does. Config.Deps is caller-supplied and knows
+	// nothing about either.
+	name := entry.Name
+	deps.OnFault = func(faultCtx context.Context, category, toolName, reason string) {
+		if l.recordFault(name, category) {
+			l.unloadUnhealthy(faultCtx, name, category, toolName, reason)
+		}
+	}
+	deps.OnSuccess = func(_ context.Context, _ string) { l.recordSuccess(name) }
+
 	spec.Deps = deps
 	spec.Registry = deps.Tools
 
@@ -1280,6 +1316,53 @@ func (l *Loader) unload(ctx context.Context, inst *instance, reason string) (int
 // it. A convergence is not failed by an event that could not be published — the
 // plugin really is mounted or unmounted — but the loss is recorded rather than
 // swallowed, the same stance the host's own denial events take.
+// unloadUnhealthy unloads a plugin whose consecutive-fault count crossed the
+// deployment's threshold. Task 4 of the runtime-health plan fills in the
+// unload itself; this step only makes the decision visible so a threshold
+// crossing is never silent.
+func (l *Loader) unloadUnhealthy(_ context.Context, name, category, toolName, reason string) {
+	l.logger.Warn("plugin crossed its consecutive-fault threshold",
+		"plugin", name, "threshold", l.maxConsecutiveFaults,
+		"category", category, "tool", toolName, "reason", reason)
+}
+
+// recordFault counts one health-relevant failure of a mounted plugin and
+// reports whether the deployment must now unload it.
+//
+// A denial is not counted and never will be: it means the plugin asked for
+// something outside its grant, which is the grant working, not the plugin
+// breaking. Everything host.ClassifyCallFault does count arrives here already
+// filtered — a caller's cancellation never reaches this function.
+//
+// A fault for a plugin that is no longer mounted is dropped: the call that
+// failed was answered by an instance this Loader has already let go, and
+// counting it against whatever replaced it would punish the new mount for the
+// old one's failures.
+func (l *Loader) recordFault(name, category string) bool {
+	if category == host.CategoryDenied {
+		return false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	inst := l.instances[name]
+	if inst == nil {
+		return false
+	}
+	inst.faults++
+	return inst.faults >= l.maxConsecutiveFaults
+}
+
+// recordSuccess clears a plugin's fault count: health is about CONSECUTIVE
+// failures, so one answered call means it is answering again. Without this a
+// plugin that fails once a day would eventually be unloaded for it.
+func (l *Loader) recordSuccess(name string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if inst := l.instances[name]; inst != nil {
+		inst.faults = 0
+	}
+}
+
 func (l *Loader) publish(ctx context.Context, eventType, message string) {
 	event := domain.RuntimeEvent{Type: eventType, Message: message, CreatedAt: time.Now()}
 	if err := l.events.Publish(ctx, event); err != nil {

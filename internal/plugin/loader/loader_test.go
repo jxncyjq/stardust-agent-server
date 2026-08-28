@@ -244,6 +244,11 @@ func newHarness(t *testing.T) *harness {
 // spent — it is a bound against a wedged gate hanging the suite, not a delay.
 const defaultTestApplyWait = 30 * time.Second
 
+// defaultTestMaxFaults is the health threshold every harness-built Loader
+// starts with. Tests that care about the threshold set it on the loader
+// afterwards; the rest just need New to accept a positive value.
+const defaultTestMaxFaults = 5
+
 // newHarnessWithApplyWait is newHarness with a caller-chosen ApplyWait, for the
 // tests that DO converge with a task in flight and need to pin what happens
 // when the wait runs out.
@@ -288,15 +293,16 @@ func newHarnessWithRemoteAndWait(t *testing.T, applyWait time.Duration, keyring 
 		gate:     taskgate.NewTaskGate(),
 	}
 	loader, err := New(Config{
-		Ledger:       h.ledger,
-		Deps:         h.deps,
-		Events:       &harnessBus{h: h},
-		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
-		DeployLimits: manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
-		Gate:         h.gate,
-		ApplyWait:    applyWait,
-		Keyring:      keyring,
-		Remote:       remote,
+		Ledger:               h.ledger,
+		Deps:                 h.deps,
+		Events:               &harnessBus{h: h},
+		Logger:               slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DeployLimits:         manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
+		Gate:                 h.gate,
+		ApplyWait:            applyWait,
+		MaxConsecutiveFaults: defaultTestMaxFaults,
+		Keyring:              keyring,
+		Remote:               remote,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -475,12 +481,13 @@ func wantStrings(t *testing.T, what string, got, want []string) {
 func TestNewRequiresEveryDependency(t *testing.T) {
 	full := func() Config {
 		return Config{
-			Ledger:    lifecycle.NewLedger(),
-			Deps:      func(string, json.RawMessage) host.Deps { return host.Deps{} },
-			Events:    adapter.NewMemoryEventBus(),
-			Logger:    slog.New(slog.NewTextHandler(io.Discard, nil)),
-			Gate:      taskgate.NewTaskGate(),
-			ApplyWait: defaultTestApplyWait,
+			Ledger:               lifecycle.NewLedger(),
+			Deps:                 func(string, json.RawMessage) host.Deps { return host.Deps{} },
+			Events:               adapter.NewMemoryEventBus(),
+			Logger:               slog.New(slog.NewTextHandler(io.Discard, nil)),
+			Gate:                 taskgate.NewTaskGate(),
+			ApplyWait:            defaultTestApplyWait,
+			MaxConsecutiveFaults: defaultTestMaxFaults,
 		}
 	}
 	cases := []struct {
@@ -1173,13 +1180,14 @@ func TestApplyReportsADepsFactoryWithNoRegistry(t *testing.T) {
 	events := adapter.NewMemoryEventBus()
 	root := t.TempDir()
 	loader, err := New(Config{
-		Ledger:       ledger,
-		Deps:         func(string, json.RawMessage) host.Deps { return host.Deps{} },
-		Events:       events,
-		Logger:       slog.New(slog.NewTextHandler(io.Discard, nil)),
-		DeployLimits: manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
-		Gate:         taskgate.NewTaskGate(),
-		ApplyWait:    defaultTestApplyWait,
+		Ledger:               ledger,
+		Deps:                 func(string, json.RawMessage) host.Deps { return host.Deps{} },
+		Events:               events,
+		Logger:               slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DeployLimits:         manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
+		Gate:                 taskgate.NewTaskGate(),
+		ApplyWait:            defaultTestApplyWait,
+		MaxConsecutiveFaults: defaultTestMaxFaults,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
