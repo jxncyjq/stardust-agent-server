@@ -135,6 +135,24 @@ type Deps struct {
 	// against for a plugin's tool calls. Its ID must be set: an empty identity
 	// would silently be evaluated as "some agent with no role".
 	Agent domain.Agent
+
+	// OnFault is called when a call into this plugin fails in a way that counts
+	// toward its health — see ClassifyCallFault for which failures those are and
+	// why a caller's cancellation is not one of them.
+	//
+	// It is CONTRACT-DECLARED OPTIONAL: nil means nobody is counting, which is
+	// what an embedder that mounts a plugin outside the Loader gets. The Loader
+	// sets it to its own consecutive-fault counter, which is what turns a
+	// repeatedly failing plugin into an unloaded one.
+	OnFault func(ctx context.Context, category, toolName, reason string)
+
+	// OnSuccess is called after a call into this plugin returns an answer —
+	// including an answer that says the tool failed, which is still the plugin
+	// working. It is what makes the fault count CONSECUTIVE: without it a plugin
+	// that fails once an hour would eventually be unloaded for it.
+	//
+	// Optional on the same terms as OnFault.
+	OnSuccess func(ctx context.Context, toolName string)
 }
 
 // BuildHostModule instantiates the `legion` host module (abi.HostModuleName)

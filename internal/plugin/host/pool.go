@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 )
 
 // errPoolDraining is the condition both of acquire's rejection paths report:
@@ -110,6 +111,16 @@ type pool struct {
 	// Done is called after the slot is back in free, so a woken drain always
 	// finds every slot there.
 	inflight sync.WaitGroup
+
+	// inflightN shadows inflight with a readable count, because a
+	// sync.WaitGroup cannot be read and a drain that timed out has to be able
+	// to say HOW MUCH it left behind, not only that something is still there.
+	//
+	// It is a diagnostic, never a decision: the drain still waits on the
+	// WaitGroup. That is why being a moment out of date is acceptable — but it
+	// must never disagree about direction, so every Add(1)/Done() pair updates
+	// it in the same place.
+	inflightN atomic.Int64
 }
 
 // newPool creates a pool of size slots, each of which will hold one instance
@@ -190,10 +201,10 @@ func (p *pool) acquire(ctx context.Context) (*Instance, error) {
 	select {
 	case slot = <-p.free:
 	case <-p.closed:
-		p.inflight.Done()
+		p.inflightDone()
 		return nil, fmt.Errorf("acquire plugin instance: %w", errPoolDraining)
 	case <-ctx.Done():
-		p.inflight.Done()
+		p.inflightDone()
 		return nil, fmt.Errorf("acquire plugin instance: %w", ctx.Err())
 	}
 	// Winning free while closed is also ready is harmless: this caller is
@@ -211,7 +222,7 @@ func (p *pool) acquire(ctx context.Context) (*Instance, error) {
 		// caller took the only entry it is returning), and a slot dropped here
 		// would be lost for the pool's whole lifetime.
 		p.free <- nil
-		p.inflight.Done()
+		p.inflightDone()
 		return nil, fmt.Errorf("create plugin instance: %w", err)
 	}
 	if inst == nil {
@@ -273,6 +284,7 @@ func (p *pool) enter() error {
 		return errPoolDraining
 	}
 	p.inflight.Add(1)
+	p.inflightN.Add(1)
 	return nil
 }
 
@@ -331,7 +343,22 @@ func (p *pool) release(inst *Instance) {
 	default:
 		panic("host: pool.release: free is full although this instance held a slot; pool entry accounting is corrupt")
 	}
+	p.inflightDone()
+}
+
+// inflightDone releases one in-flight registration, keeping the WaitGroup and
+// the readable counter in step. Every path that registered with enter must
+// leave through here.
+func (p *pool) inflightDone() {
+	p.inflightN.Add(-1)
 	p.inflight.Done()
+}
+
+// inflightCount reports how many calls are inside this pool right now. It is
+// read after a drain that did not converge, to report how much guest work
+// outlived the plugin.
+func (p *pool) inflightCount() int {
+	return int(p.inflightN.Load())
 }
 
 // takeBack removes inst from the checked-out set, and panics if it was not

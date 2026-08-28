@@ -55,6 +55,21 @@ const RuntimeEventCallFailed = "plugin/call_failed"
 // overstepped, not that it is broken.
 const CategoryDenied = "denied"
 
+// CategoryTimeout, CategoryTrap and CategoryABI are the remaining
+// plugin/call_failed categories from the design doc's error taxonomy
+// (legion-plugin-system.md §6.9).
+//
+// They differ from CategoryDenied in kind, not degree: a denial means the
+// plugin asked for something it was not authorized to have — it is working
+// exactly as written, just beyond its grant — while all three of these mean
+// the plugin failed to answer at all. That is why these three count toward a
+// plugin's health and CategoryDenied does not.
+const (
+	CategoryTimeout = "timeout"
+	CategoryTrap    = "trap"
+	CategoryABI     = "abi"
+)
+
 // eventCategoryToken renders a failure category as the token it travels as
 // inside a plugin/call_failed message. It is the ONE place the encoding is
 // spelled.
@@ -711,6 +726,35 @@ func (h hostCalls) publishDenial(ctx context.Context, hostFunc, reason string) {
 	if err := h.deps.Events.Publish(ctx, event); err != nil {
 		h.deps.Logger.Error("plugin host call denial event was not published",
 			"plugin", h.deps.PluginName, "host_function", hostFunc, "error", err)
+	}
+}
+
+// publishCallFailed emits one plugin/call_failed event for a failure that did
+// NOT come from a host function — a guest that trapped, timed out or broke the
+// ABI while serving a contributed tool (see pluginToolHandler).
+//
+// It is a package-level function rather than a hostCalls method because the
+// caller has no hostCalls: a tool handler holds the plugin's Deps and nothing
+// else. The event shape is deliberately identical to publishDenial's, so both
+// kinds of failure read the same way in the event stream and EventHasCategory
+// works on either.
+//
+// deps.Events is CONTRACT-DECLARED OPTIONAL (an embedder may mount a plugin
+// with no event bus), so a nil bus is a supported deployment rather than an
+// error. A bus that is present and REFUSES the event is a different thing and
+// is logged at Error: telemetry that never arrived must still be findable.
+func publishCallFailed(ctx context.Context, pluginName string, deps Deps, category, subject, reason string) {
+	if deps.Events == nil {
+		return
+	}
+	event := domain.RuntimeEvent{
+		Type:      RuntimeEventCallFailed,
+		Message:   formatCallFailedMessage(category, pluginName, subject, reason),
+		CreatedAt: time.Now(),
+	}
+	if err := deps.Events.Publish(ctx, event); err != nil && deps.Logger != nil {
+		deps.Logger.Error("plugin call failure event was not published",
+			"plugin", pluginName, "subject", subject, "category", category, "error", err)
 	}
 }
 

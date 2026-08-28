@@ -89,6 +89,13 @@ func drainDeadline(tools []tool.Descriptor) time.Duration {
 	return longest + drainGrace
 }
 
+// ErrDrainIncomplete marks a disposal whose wait for in-flight calls ran out
+// of time: the plugin is gone from every registry, but calls are still running
+// inside its guest. It is a sentinel rather than a message so the Loader can
+// recognise the one failure that deserves its own event (plugin/unload_leaked)
+// without reading error text.
+var ErrDrainIncomplete = errors.New("plugin instance pool did not converge")
+
 // ActivationRollbackError is the value a panicking Activate re-panics with when
 // its own rollback ALSO failed.
 //
@@ -238,6 +245,12 @@ type Plugin struct {
 	// nothing outside this package needs to invoke a guest directly.
 	pool *pool
 
+	// drainBound is how long this plugin's disposal waits for in-flight calls
+	// before giving up (see drainDeadline). It is kept so a caller reporting a
+	// drain that did not converge can say what the wait actually was instead
+	// of guessing at a constant.
+	drainBound time.Duration
+
 	// ledger and owner are what Suspend and Resume act on: the contributions
 	// live under ToolsOwner(owner) in ledger, which is the only place either
 	// method reaches. owner itself is never disposed by them — disposing it
@@ -317,6 +330,15 @@ func (p *Plugin) markDisposed() {
 // Suspended reports whether the plugin's contributions are currently
 // withdrawn. A suspended plugin still holds its wasm runtime and its instance
 // pool; it is only absent from the tool registry and the gateable catalog.
+// InflightCalls reports how many calls are still inside this plugin's guest.
+// It is read after a drain that did not converge, to say how much guest work
+// outlived the unload.
+func (p *Plugin) InflightCalls() int { return p.pool.inflightCount() }
+
+// DrainBound reports how long this plugin's disposal waits for in-flight calls
+// before giving up.
+func (p *Plugin) DrainBound() time.Duration { return p.drainBound }
+
 func (p *Plugin) Suspended() bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -723,6 +745,14 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 		drainCtx, cancel := context.WithTimeout(disposeCtx, drainBound)
 		defer cancel()
 		if derr := instances.drain(drainCtx); derr != nil {
+			// A drain that ran out of time is the one failure a caller can act
+			// on differently: guest work outlived the plugin and is still
+			// running inside a runtime nobody owns any more. ErrDrainIncomplete
+			// marks it so the Loader can report HOW MUCH was left behind
+			// (plugin/unload_leaked) instead of parsing this message.
+			if errors.Is(derr, context.DeadlineExceeded) {
+				derr = fmt.Errorf("%w: %w", ErrDrainIncomplete, derr)
+			}
 			return fmt.Errorf("drain instance pool of plugin %q (waited %s): %w", spec.Name, drainBound, derr)
 		}
 		return nil
@@ -768,12 +798,13 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 	// disposer therefore marks a plugin that is never returned, which is exactly
 	// right: it did not survive the activation either.
 	plugin := &Plugin{
-		Name:     spec.Name,
-		Manifest: manifest,
-		pool:     instances,
-		ledger:   ledger,
-		owner:    owner,
-		spec:     spec,
+		Name:       spec.Name,
+		Manifest:   manifest,
+		pool:       instances,
+		drainBound: drainBound,
+		ledger:     ledger,
+		owner:      owner,
+		spec:       spec,
 	}
 	keep(ledger.Add(owner, ledgerLabelContributions, func() error {
 		plugin.markDisposed()

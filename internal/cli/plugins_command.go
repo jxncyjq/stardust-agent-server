@@ -360,10 +360,11 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 			MaxMemoryPages: cfg.Plugins.Limits.MaxMemoryPages,
 			MaxInstances:   cfg.Plugins.Limits.MaxInstances,
 		},
-		Gate:      deps.Gate,
-		ApplyWait: time.Duration(cfg.Plugins.ApplyWaitMs) * time.Millisecond,
-		Keyring:   keyring,
-		Remote:    remote,
+		Gate:                 deps.Gate,
+		ApplyWait:            time.Duration(cfg.Plugins.ApplyWaitMs) * time.Millisecond,
+		MaxConsecutiveFaults: cfg.Plugins.Health.MaxConsecutiveFaults,
+		Keyring:              keyring,
+		Remote:               remote,
 	})
 }
 

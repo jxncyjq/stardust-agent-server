@@ -839,3 +839,50 @@ func TestPoolReleaseRejectsWhatItNeverHandedOut(t *testing.T) {
 		p.release(foreign)
 	})
 }
+
+// TestPoolInflightCountTracksAcquiredInstances pins the readable counter the
+// unload-leak report depends on. A WaitGroup cannot be read, so this shadow
+// counter is the only way to say HOW MUCH a drain left behind — and a shadow
+// that drifts would report a number nobody can act on.
+func TestPoolInflightCountTracksAcquiredInstances(t *testing.T) {
+	p, _ := newPoolFixture(t, 2)
+
+	if got := p.inflightCount(); got != 0 {
+		t.Fatalf("inflightCount on a fresh pool = %d, want 0", got)
+	}
+	first := mustAcquire(t, p)
+	if got := p.inflightCount(); got != 1 {
+		t.Errorf("inflightCount after one acquire = %d, want 1", got)
+	}
+	second := mustAcquire(t, p)
+	if got := p.inflightCount(); got != 2 {
+		t.Errorf("inflightCount after two acquires = %d, want 2", got)
+	}
+	p.release(first)
+	p.release(second)
+	if got := p.inflightCount(); got != 0 {
+		t.Errorf("inflightCount after both releases = %d, want 0", got)
+	}
+}
+
+// TestDrainThatTimesOutIsMarkedIncomplete pins the sentinel the Loader keys on.
+// Without it the one failure that means "guest work outlived the plugin" would
+// be indistinguishable from any other disposal error.
+func TestDrainThatTimesOutIsMarkedIncomplete(t *testing.T) {
+	p, _ := newPoolFixture(t, 1)
+	held := mustAcquire(t, p) // never released: the drain cannot converge
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := p.drain(ctx)
+	if err == nil {
+		t.Fatal("drain with an unreleased instance = nil error, want a timeout")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("drain error = %v, want it to wrap context.DeadlineExceeded", err)
+	}
+	if got := p.inflightCount(); got != 1 {
+		t.Errorf("inflightCount after the failed drain = %d, want 1: the held call is what was left behind", got)
+	}
+	p.release(held)
+}

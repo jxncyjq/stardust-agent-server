@@ -167,7 +167,7 @@ func (i *Instance) Invoke(ctx context.Context, op int32, in []byte) (out []byte,
 		}
 		ptr = res[0]
 		if ptr == 0 {
-			return nil, fmt.Errorf("alloc %d bytes: guest returned null pointer", len(in))
+			return nil, fmt.Errorf("alloc %d bytes: guest returned null pointer: %w", len(in), ErrGuestABI)
 		}
 		// Registered before the write below, not after: from this point on the
 		// guest holds a reservation that leaks unless it is freed, and the
@@ -190,14 +190,14 @@ func (i *Instance) Invoke(ctx context.Context, op int32, in []byte) (out []byte,
 			}
 		}()
 		if !i.mem.Write(uint32(ptr), in) {
-			return nil, fmt.Errorf("write %d bytes at %d: out of range", len(in), ptr)
+			return nil, fmt.Errorf("write %d bytes at %d: out of range: %w", len(in), ptr, ErrGuestABI)
 		}
 	}
 
 	res, ierr := i.invoke.Call(ctx, uint64(uint32(op)), ptr, uint64(len(in)))
 	if ierr != nil {
 		i.dead = true
-		return nil, fmt.Errorf("invoke op=%d: %w", op, ierr)
+		return nil, fmt.Errorf("invoke op=%d: %w: %w", op, ierr, ErrGuestTrap)
 	}
 
 	outPtr, outLen := abi.UnpackResult(res[0])
@@ -210,7 +210,7 @@ func (i *Instance) Invoke(ctx context.Context, op int32, in []byte) (out []byte,
 		// The guest handed back a region outside its own memory: its result
 		// allocation (whatever it really is) still has to be released, and a
 		// guest whose result pointers are out of range is not fit for reuse.
-		rerr := fmt.Errorf("read result at %d len %d: out of range", outPtr, outLen)
+		rerr := fmt.Errorf("read result at %d len %d: out of range: %w", outPtr, outLen, ErrGuestABI)
 		if _, ferr := i.free.Call(context.WithoutCancel(ctx), uint64(outPtr), uint64(outLen)); ferr != nil {
 			rerr = errors.Join(rerr, fmt.Errorf("free result %d bytes at %d: %w", outLen, outPtr, ferr))
 		}
@@ -227,7 +227,7 @@ func (i *Instance) Invoke(ctx context.Context, op int32, in []byte) (out []byte,
 
 	if _, ferr := i.free.Call(context.WithoutCancel(ctx), uint64(outPtr), uint64(outLen)); ferr != nil {
 		i.dead = true
-		return nil, fmt.Errorf("free result %d bytes at %d: %w", outLen, outPtr, ferr)
+		return nil, fmt.Errorf("free result %d bytes at %d: %w: %w", outLen, outPtr, ferr, ErrGuestABI)
 	}
 
 	return result, nil
