@@ -729,6 +729,35 @@ func (h hostCalls) publishDenial(ctx context.Context, hostFunc, reason string) {
 	}
 }
 
+// publishCallFailed emits one plugin/call_failed event for a failure that did
+// NOT come from a host function — a guest that trapped, timed out or broke the
+// ABI while serving a contributed tool (see pluginToolHandler).
+//
+// It is a package-level function rather than a hostCalls method because the
+// caller has no hostCalls: a tool handler holds the plugin's Deps and nothing
+// else. The event shape is deliberately identical to publishDenial's, so both
+// kinds of failure read the same way in the event stream and EventHasCategory
+// works on either.
+//
+// deps.Events is CONTRACT-DECLARED OPTIONAL (an embedder may mount a plugin
+// with no event bus), so a nil bus is a supported deployment rather than an
+// error. A bus that is present and REFUSES the event is a different thing and
+// is logged at Error: telemetry that never arrived must still be findable.
+func publishCallFailed(ctx context.Context, pluginName string, deps Deps, category, subject, reason string) {
+	if deps.Events == nil {
+		return
+	}
+	event := domain.RuntimeEvent{
+		Type:      RuntimeEventCallFailed,
+		Message:   formatCallFailedMessage(category, pluginName, subject, reason),
+		CreatedAt: time.Now(),
+	}
+	if err := deps.Events.Publish(ctx, event); err != nil && deps.Logger != nil {
+		deps.Logger.Error("plugin call failure event was not published",
+			"plugin", pluginName, "subject", subject, "category", category, "error", err)
+	}
+}
+
 // writeError encodes an error envelope and hands it to the guest.
 func (h hostCalls) writeError(ctx context.Context, m api.Module, code, message string) uint64 {
 	return h.writeJSON(ctx, m, errorBody{Code: code, Message: message})

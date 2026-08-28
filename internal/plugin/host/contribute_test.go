@@ -3,6 +3,9 @@ package host
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"log/slog"
 	"strings"
 	"testing"
 	"time"
@@ -492,4 +495,123 @@ func TestDecodeToolResult(t *testing.T) {
 			t.Errorf("decodeToolResult = %+v, want {c1 true done }", result)
 		}
 	})
+}
+
+// The health-reporting tests below cover Task 2 of the runtime-health plan:
+// a tool call that fails in a way that counts toward the plugin's health must
+// (a) tell its owner through the fault reporter and (b) leave a
+// plugin/call_failed event carrying the category. Neither existed before —
+// only host-function DENIALS published that event, so a guest that trapped,
+// timed out or violated the ABI failed in silence.
+
+func healthTestDeps(bus *adapter.MemoryEventBus) Deps {
+	return Deps{
+		PluginName: "legion-demo",
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Events:     bus,
+	}
+}
+
+func TestPluginToolHandlerReportsATrapAsAFault(t *testing.T) {
+	var got []string
+	report := func(_ context.Context, category, toolName, reason string) {
+		got = append(got, category+":"+toolName+":"+reason)
+	}
+	guest := guestCallerFunc(func(context.Context, int32, []byte) ([]byte, error) {
+		return nil, fmt.Errorf("invoke op=1: %w", ErrGuestTrap)
+	})
+	handler := pluginToolHandler("legion-demo", healthTestDeps(adapter.NewMemoryEventBus()), "demo_echo", guest, report)
+
+	if _, err := handler.Execute(context.Background(), domain.ToolCall{ID: "c1", Name: "demo_echo"}); err == nil {
+		t.Fatal("handler on a trapping guest = nil error, want the trap to propagate")
+	}
+	if len(got) != 1 {
+		t.Fatalf("fault reports = %v, want exactly one", got)
+	}
+	if !strings.HasPrefix(got[0], CategoryTrap+":demo_echo:") {
+		t.Errorf("fault report = %q, want it to start with %q", got[0], CategoryTrap+":demo_echo:")
+	}
+}
+
+func TestPluginToolHandlerReportsNothingOnSuccess(t *testing.T) {
+	var got []string
+	report := func(_ context.Context, category, _, _ string) { got = append(got, category) }
+	guest := guestCallerFunc(func(context.Context, int32, []byte) ([]byte, error) {
+		return []byte(`{"call_id":"","success":true,"output":"fine","error":""}`), nil
+	})
+	handler := pluginToolHandler("legion-demo", healthTestDeps(adapter.NewMemoryEventBus()), "demo_echo", guest, report)
+
+	if _, err := handler.Execute(context.Background(), domain.ToolCall{ID: "c1", Name: "demo_echo"}); err != nil {
+		t.Fatalf("handler on a healthy guest = %v, want nil", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("fault reports on success = %v, want none", got)
+	}
+}
+
+func TestPluginToolHandlerDoesNotReportAFailedToolResultAsAFault(t *testing.T) {
+	// A tool saying "I could not do it" is a business answer, not a plugin
+	// fault (design doc §6.9: plugin_error does not count). Counting it would
+	// unload a plugin for doing exactly what it was asked.
+	var got []string
+	report := func(_ context.Context, category, _, _ string) { got = append(got, category) }
+	guest := guestCallerFunc(func(context.Context, int32, []byte) ([]byte, error) {
+		return []byte(`{"call_id":"","success":false,"output":"","error":"missing argument"}`), nil
+	})
+	handler := pluginToolHandler("legion-demo", healthTestDeps(adapter.NewMemoryEventBus()), "demo_echo", guest, report)
+
+	result, err := handler.Execute(context.Background(), domain.ToolCall{ID: "c1", Name: "demo_echo"})
+	if err != nil {
+		t.Fatalf("handler on a failed tool result = %v, want nil error: a failed result is an answer", err)
+	}
+	if result.Success {
+		t.Error("result.Success = true, want false")
+	}
+	if len(got) != 0 {
+		t.Errorf("fault reports for a failed tool result = %v, want none", got)
+	}
+}
+
+func TestPluginToolHandlerDoesNotReportACallerCancellation(t *testing.T) {
+	var got []string
+	report := func(_ context.Context, category, _, _ string) { got = append(got, category) }
+	guest := guestCallerFunc(func(ctx context.Context, _ int32, _ []byte) ([]byte, error) {
+		return nil, fmt.Errorf("invoke op=1: %w", context.Canceled)
+	})
+	handler := pluginToolHandler("legion-demo", healthTestDeps(adapter.NewMemoryEventBus()), "demo_echo", guest, report)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := handler.Execute(ctx, domain.ToolCall{ID: "c1", Name: "demo_echo"}); err == nil {
+		t.Fatal("handler on a cancelled call = nil error, want the cancellation to propagate")
+	}
+	if len(got) != 0 {
+		t.Errorf("fault reports for a caller cancellation = %v, want none: "+
+			"the plugin never got to answer", got)
+	}
+}
+
+func TestPluginToolHandlerPublishesCallFailedWithCategory(t *testing.T) {
+	bus := adapter.NewMemoryEventBus()
+	guest := guestCallerFunc(func(context.Context, int32, []byte) ([]byte, error) {
+		return nil, fmt.Errorf("read result at 4294901760 len 8: out of range: %w", ErrGuestABI)
+	})
+	handler := pluginToolHandler("legion-demo", healthTestDeps(bus), "demo_echo", guest, nil)
+
+	if _, err := handler.Execute(context.Background(), domain.ToolCall{ID: "c1", Name: "demo_echo"}); err == nil {
+		t.Fatal("handler on an ABI violation = nil error, want it to propagate")
+	}
+	events, err := bus.Events()
+	if err != nil {
+		t.Fatalf("Events: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("published %d events, want 1", len(events))
+	}
+	if !EventHasCategory(events[0], CategoryABI) {
+		t.Errorf("event %q does not carry category %q", events[0].Message, CategoryABI)
+	}
+	if !strings.Contains(events[0].Message, "tool:demo_echo") {
+		t.Errorf("event %q does not name the tool that failed", events[0].Message)
+	}
 }

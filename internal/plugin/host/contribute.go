@@ -100,7 +100,7 @@ func contributeTools(
 	}
 
 	for _, descriptor := range spec.Tools {
-		handler := pluginToolHandler(spec.Name, descriptor.Name, guest)
+		handler := pluginToolHandler(spec.Name, spec.Deps, descriptor.Name, guest, spec.Deps.OnFault)
 		keep(tool.RegisterOwned(ledger, owner, spec.Registry, descriptor, handler))
 
 		// Step 2, and it is not optional: without it the tool is callable and
@@ -117,15 +117,53 @@ func contributeTools(
 	}
 }
 
+// faultReporter is how a tool handler tells its owner that a call failed in a
+// way that counts toward the plugin's health: category is one of
+// CategoryTimeout / CategoryTrap / CategoryABI (never CategoryDenied — that
+// one travels through the host-function path and means the plugin overstepped
+// rather than broke), and reason is the error text.
+//
+// It is a plain function rather than an interface because there is exactly one
+// production implementation (the Loader's counter) and it is CONTRACT-DECLARED
+// OPTIONAL: a nil reporter means nobody is counting, which is what an embedder
+// mounting a plugin outside the Loader gets.
+type faultReporter func(ctx context.Context, category, toolName, reason string)
+
 // pluginToolHandler builds the handler behind one contributed tool: it hands the
 // call to the plugin's guest and reads the guest's answer back as a
-// domain.ToolResult.
+// domain.ToolResult — and, when any of that fails in a way that counts against
+// the plugin, reports the fault twice over.
 //
 // toolName is the descriptor's name, not call.Name: the registry dispatches by
 // name, so the two are equal, and taking the authoritative one means the guest
 // is always asked for the tool this handler was registered as.
-func pluginToolHandler(pluginName, toolName string, guest guestCaller) tool.Handler {
+//
+// Twice, because the two consumers need different things and neither can be
+// derived from the other: report feeds the Loader's consecutive-fault counter
+// (a decision), while the plugin/call_failed event feeds the audit trail (a
+// record). A failure that only counted would be invisible to whoever is
+// reading events; one that was only published would never unload anything.
+//
+// A FAILED TOOL RESULT is not a fault. A guest answering {"success":false} did
+// its job and said no — counting that would unload a plugin for behaving
+// exactly as designed. Only failures ClassifyCallFault recognises count, which
+// deliberately excludes a caller's own cancellation.
+func pluginToolHandler(pluginName string, deps Deps, toolName string, guest guestCaller, report faultReporter) tool.Handler {
 	return tool.HandlerFunc(func(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
+		// fail is the single exit for every failure of this call, so no path
+		// can forget to account for one.
+		fail := func(err error) (domain.ToolResult, error) {
+			category, isFault := ClassifyCallFault(ctx, err)
+			if !isFault {
+				return domain.ToolResult{}, err
+			}
+			if report != nil {
+				report(ctx, category, toolName, err.Error())
+			}
+			publishCallFailed(ctx, pluginName, deps, category, "tool:"+toolName, err.Error())
+			return domain.ToolResult{}, err
+		}
+
 		// Step 3: mark the ctx BEFORE the guest is entered. Everything the guest
 		// reaches from inside this call — a tool call back through call_tool —
 		// runs under it, and that marking is what keeps the plugin's own calls
@@ -142,21 +180,30 @@ func pluginToolHandler(pluginName, toolName string, guest guestCaller) tool.Hand
 			// and still not swallowed: a request the host cannot encode is not a
 			// call that was made, and answering with an empty result would report
 			// it as a tool that ran and produced nothing.
-			return domain.ToolResult{}, fmt.Errorf("encode call of plugin %q tool %q: %w",
-				pluginName, toolName, err)
+			return fail(fmt.Errorf("encode call of plugin %q tool %q: %w",
+				pluginName, toolName, err))
 		}
 		body, err := guest.call(ctx, abi.OpCallTool, request)
 		if err != nil {
-			return domain.ToolResult{}, fmt.Errorf("call plugin %q tool %q: %w", pluginName, toolName, err)
+			return fail(fmt.Errorf("call plugin %q tool %q: %w", pluginName, toolName, err))
 		}
 		result, err := decodeToolResult(body)
 		if err != nil {
-			return domain.ToolResult{}, fmt.Errorf("call plugin %q tool %q: %w", pluginName, toolName, err)
+			// A body nobody can decode is an ABI violation: the guest answered
+			// something that is not the document this op's contract names.
+			return fail(fmt.Errorf("call plugin %q tool %q: %w: %w",
+				pluginName, toolName, err, ErrGuestABI))
 		}
 		// The correlation id belongs to the host. The guest is told which call it
 		// is answering (see guestToolCall) but never gets to choose it, so a
 		// plugin cannot attach its answer to somebody else's call.
 		result.CallID = call.ID
+		// The plugin answered, so its consecutive-fault count starts over. A
+		// failed RESULT counts as answering: the tool said no, which is the
+		// plugin working.
+		if deps.OnSuccess != nil {
+			deps.OnSuccess(ctx, toolName)
+		}
 		return result, nil
 	})
 }
