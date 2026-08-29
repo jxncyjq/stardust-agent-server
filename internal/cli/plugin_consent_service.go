@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"github.com/stardust/legion-agent/internal/plugin/consent"
+	"github.com/stardust/legion-agent/internal/plugin/fetch"
 	"github.com/stardust/legion-agent/internal/plugin/loader"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
 	"github.com/stardust/legion-agent/internal/plugin/sign"
@@ -468,6 +469,15 @@ func (s *PluginConsentService) Resolve(ctx context.Context, name string) (server
 	pm, _, err := manifest.LoadPackage(dir, s.keyringFn())
 	if err != nil {
 		if errors.Is(err, manifest.ErrUntrustedPackage) {
+			// The bytes just failed signature verification, so they do not
+			// belong in a directory this deployment reads from. Only a REMOTE
+			// entry's package lives in the cache — a local entry's directory
+			// is the operator's own tree — and only a trust failure earns
+			// eviction: a package that merely will not load is re-downloaded
+			// identically next time, so removing it buys nothing.
+			if entry.IsRemote() {
+				fetch.EvictUntrusted(s.remote.Cache, entry.Digest, s.logger)
+			}
 			return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w: %w", name, server.ErrPluginUntrusted, err)
 		}
 		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w", name, err)

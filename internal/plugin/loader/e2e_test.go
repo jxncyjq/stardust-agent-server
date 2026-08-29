@@ -2178,6 +2178,23 @@ func e2eCachedPackageDir(cache *fetch.Cache, digest string) string {
 // requireCachedPackage fails unless the cache holds the package named by
 // digest as three non-empty regular files, and nothing else, in the documented
 // directory.
+// requireNoCachedPackage asserts the opposite of requireCachedPackage: nothing
+// is filed under digest.
+//
+// It is what an eviction has to leave behind. "The package was refused" and
+// "the package is gone" are different claims, and only the second one keeps a
+// rejected package from being read back by the next convergence.
+func requireNoCachedPackage(t *testing.T, cache *fetch.Cache, digest, when string) {
+	t.Helper()
+
+	dir := e2eCachedPackageDir(cache, digest)
+	if _, err := os.Stat(dir); err == nil {
+		t.Fatalf("%s: %s still exists; an untrusted package must be evicted from the cache", when, dir)
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("%s: stat %s: %v", when, dir, err)
+	}
+}
+
 func requireCachedPackage(t *testing.T, cache *fetch.Cache, digest, when string) {
 	t.Helper()
 
@@ -2507,9 +2524,15 @@ func TestE2EARemoteDigestMismatchFailsTheEntryAndLeavesTheCacheEmpty(t *testing.
 // left that can refuse the package is the signature over its plugin.json.
 //
 // The proof that the two gates are independent is not the error message: it is
-// that the package IS in the cache, filed whole under its digest, while the
-// entry is failed. Gate one said yes and wrote the bytes down; gate two said
-// no and nothing mounted.
+// that gate one FETCHED the bytes (the origin was hit exactly once and the
+// transport check passed on every byte) while gate two refused them.
+//
+// It used to be proven by the package still sitting in the cache afterwards.
+// That is no longer true, and deliberately so: as of the cache-governance work
+// an untrusted package is EVICTED the moment the signature check refuses it,
+// because bytes that failed verification have no business staying in a
+// directory this deployment reads from. So the assertion below is now the
+// opposite one — the entry failed, the origin was hit, and the cache is clean.
 //
 // Bound: exactly one Apply. No loop, no wait.
 func TestE2EARemotePackageThatPassesItsDigestStillHasToPassItsSignature(t *testing.T) {
@@ -2530,8 +2553,10 @@ func TestE2EARemotePackageThatPassesItsDigestStillHasToPassItsSignature(t *testi
 
 	requireRemoteEchoFailed(ctx, t, h, err, "after the re-tagged package was refused", "signature")
 	src.requireHits(t, "after the re-tagged package was refused", 1)
-	// Gate one passed on exactly these bytes, and said so by filing them.
-	requireCachedPackage(t, cache, digest, "after the re-tagged package was refused")
+	// Gate one passed on exactly these bytes; gate two refused them, and the
+	// refusal takes them off disk. A cached untrusted package would be read
+	// back by every later convergence, so "refused" has to mean "gone".
+	requireNoCachedPackage(t, cache, digest, "after the re-tagged package was refused")
 }
 
 // TestE2EARemoteArchiveThatEscapesItsDirectoryIsRefusedWhole is the unpack
