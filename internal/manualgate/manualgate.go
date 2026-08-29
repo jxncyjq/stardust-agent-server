@@ -89,10 +89,16 @@ func (g *ManualToolGate) resolveRealTool(call domain.ToolCall, tools *tool.Regis
 // this round's calls (Manual mode + an undecided sensitive call). It opens a
 // persisted approval ticket for each such call as a side effect.
 func (g *ManualToolGate) ShouldSuspend(ctx context.Context, task domain.Task, calls []domain.ToolCall, tools *tool.Registry) (bool, error) {
-	if task.Mode != domain.ModeManual {
-		return false, nil
+	// The plugin half runs in EVERY mode -- see suspendForPluginAsks -- so it
+	// is consulted before the Manual-only Sensitive rule below, not inside it.
+	pluginAsked, err := g.suspendForPluginAsks(ctx, task, calls, tools)
+	if err != nil {
+		return false, err
 	}
-	needApproval := false
+	if task.Mode != domain.ModeManual {
+		return pluginAsked, nil
+	}
+	needApproval := pluginAsked
 	for _, call := range calls {
 		name, sensitive, ok := g.resolveRealTool(call, tools)
 		if !ok || !sensitive {
