@@ -5122,3 +5122,80 @@ func TestPluginsGrantAllowsANonNetworkCapabilityRegardlessOfDeclaredAllowedHosts
 		t.Errorf("entry.Grant.AllowedHosts = %v, want empty: --allowed-hosts was never named", entry.Grant.AllowedHosts)
 	}
 }
+
+// TestPluginsReloadRefusesAfterAKeyIsRevoked is the guard that makes a
+// revocation mean something on a running deployment.
+//
+// The trust set is frozen when serve starts, so a revocation added to
+// keyring.json cannot take effect in this process. What must NOT happen is a
+// reload that converges the deployment under the OLD trust set and reports
+// success — the operator would believe the key was withdrawn while packages
+// signed by it kept mounting. The refusal is what sends them to restart serve.
+//
+// The keyring holds TWO keys from the start and the edit only adds a
+// revocation, so the trusted id list is IDENTICAL before and after. That is
+// deliberate: if the edit also changed the key list, the guard would fire on
+// the key list alone and this test would pass with revocations absent from the
+// policy entirely — which is exactly the bug it exists to catch.
+func TestPluginsReloadRefusesAfterAKeyIsRevoked(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+
+	signingPub, signingPriv, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	sparePub, _, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	keys := []map[string]string{
+		{"id": string(testPluginKeyID), "algorithm": "ed25519",
+			"public_key": base64.StdEncoding.EncodeToString(signingPub)},
+		{"id": "spare", "algorithm": "ed25519",
+			"public_key": base64.StdEncoding.EncodeToString(sparePub)},
+	}
+	keyringPath := filepath.Join(f.dir, "keyring.json")
+	writeKeyringDoc(t, keyringPath, keys, nil)
+
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath})
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.signPackage("echo", signingPriv)
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	// Same two keys, one of them now revoked.
+	writeKeyringDoc(t, keyringPath, keys,
+		[]map[string]string{{"key_id": string(testPluginKeyID), "reason": "laptop stolen"}})
+
+	_, err = f.run("reload")
+	if err == nil {
+		t.Fatal("plugins reload after a revocation = nil error, want a refusal: this process still " +
+			"trusts the revoked key")
+	}
+	if !strings.Contains(err.Error(), "restart") {
+		t.Errorf("plugins reload error = %v, want it to say serve must be restarted", err)
+	}
+	if !strings.Contains(err.Error(), string(testPluginKeyID)) {
+		t.Errorf("plugins reload error = %v, want it to name the revoked key", err)
+	}
+}
+
+// writeKeyringDoc writes a keyring document with the given keys and (optional)
+// revocations.
+func writeKeyringDoc(t *testing.T, path string, keys []map[string]string, revoked []map[string]string) {
+	t.Helper()
+
+	doc := map[string]any{"keys": keys}
+	if revoked != nil {
+		doc["revoked"] = revoked
+	}
+	data, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("encode keyring: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write keyring %s: %v", path, err)
+	}
+}

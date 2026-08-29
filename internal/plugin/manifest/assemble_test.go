@@ -966,3 +966,60 @@ func TestLoadPackageDoesNotMarkAnIOFailureUntrusted(t *testing.T) {
 			"a disk or permission problem is a retryable environment fault, not a trust verdict", err)
 	}
 }
+
+// TestLoadPackage_RevokedKeyIsUntrusted pins the classification a revocation
+// depends on: a package signed by a key the deployment has revoked must come
+// back as UNTRUSTED, not merely "failed to load".
+//
+// The distinction is load-bearing three times over — every one of these hangs
+// off ErrUntrustedPackage:
+//
+//   - the HTTP layer answers 422 rather than 400;
+//   - the GUI offers no retry (retrying a revoked key never stops being
+//     revoked);
+//   - the cache EVICTS the package, which is exactly what a revocation is for.
+//
+// The revocation sentinel must survive the wrapping too, or the message
+// degrades to "does not verify" — which is false: the signature is
+// mathematically fine, the key is not.
+func TestLoadPackage_RevokedKeyIsUntrusted(t *testing.T) {
+	dir := t.TempDir()
+	manifestData := mustReadFixture(t, "pkg/plugin.json")
+	writePackage(t, dir, string(manifestData), mustReadWasmFixture(t))
+
+	pub, priv, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	livePub, _, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("generate key: %v", err)
+	}
+	// The revoked key is still listed, which is the realistic shape: an
+	// operator records the revocation and leaves the public key in place so
+	// the refusal can explain itself. A second, live key keeps the trust set
+	// non-empty.
+	doc := fmt.Sprintf(`{"keys":[{"id":"leaked","algorithm":"ed25519","public_key":%q},`+
+		`{"id":"live","algorithm":"ed25519","public_key":%q}],`+
+		`"revoked":[{"key_id":"leaked","revoked_at":"2026-08-29T10:00:00Z","reason":"laptop stolen"}]}`,
+		base64.StdEncoding.EncodeToString(pub), base64.StdEncoding.EncodeToString(livePub))
+	kr, err := sign.ParseKeyring([]byte(doc))
+	if err != nil {
+		t.Fatalf("parse keyring with a revocation: %v", err)
+	}
+	writeSignature(t, dir, priv, "leaked", manifestData)
+
+	_, _, err = LoadPackage(dir, kr)
+	if err == nil {
+		t.Fatal("LoadPackage with a revoked signing key = nil error, want a refusal")
+	}
+	if !errors.Is(err, ErrUntrustedPackage) {
+		t.Errorf("error = %v, want it to wrap ErrUntrustedPackage (422, no retry, cache eviction all key on it)", err)
+	}
+	if !errors.Is(err, sign.ErrRevokedKey) {
+		t.Errorf("error = %v, want it to keep sign.ErrRevokedKey: the signature verifies, the key is revoked", err)
+	}
+	if !strings.Contains(err.Error(), "leaked") || !strings.Contains(err.Error(), "laptop stolen") {
+		t.Errorf("error = %v, want it to name the key and why it was revoked", err)
+	}
+}

@@ -336,3 +336,87 @@ func TestLoaderReportsThePolicyItWasBuiltWith(t *testing.T) {
 		t.Errorf("Loader.SignaturePolicy() = %+v for a Loader built with no keyring, want the unenforced policy", got)
 	}
 }
+
+// newTestKeyringWithRevocation builds a keyring holding two keys, one of which
+// is revoked — the realistic shape, because a revoked key stays listed so that
+// a refusal can say "this key was trusted and is not any more".
+func newTestKeyringWithRevocation(t *testing.T, revokedID sign.KeyID) *sign.Keyring {
+	t.Helper()
+
+	revokedPub, _, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	livePub, _, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	doc := map[string]any{
+		"keys": []map[string]string{
+			{"id": string(revokedID), "algorithm": "ed25519",
+				"public_key": base64.StdEncoding.EncodeToString(revokedPub)},
+			{"id": string(testKeyID), "algorithm": "ed25519",
+				"public_key": base64.StdEncoding.EncodeToString(livePub)},
+		},
+		"revoked": []map[string]string{{"key_id": string(revokedID), "reason": "laptop stolen"}},
+	}
+	data, err := json.Marshal(doc)
+	if err != nil {
+		t.Fatalf("encode keyring: %v", err)
+	}
+	keyring, err := sign.ParseKeyring(data)
+	if err != nil {
+		t.Fatalf("ParseKeyring: %v", err)
+	}
+	return keyring
+}
+
+// TestSignaturePolicyDistinguishesARevocation is what makes revocation real on
+// a running deployment.
+//
+// A revocation added to a keyring changes NOTHING else an observer can see:
+// the revoked key stays listed, so the trusted ids are identical. Without the
+// revocations in the policy, `agent plugins reload` would compare the new
+// config against the running process, find them equal, converge the manifest
+// under the OLD trust set — and print "reload succeeded" while the revoked key
+// kept verifying packages.
+func TestSignaturePolicyDistinguishesARevocation(t *testing.T) {
+	revokedID := sign.KeyID("leaked-key")
+	withRevocation := newTestKeyringWithRevocation(t, revokedID)
+
+	policy := SignaturePolicyOf(withRevocation)
+	if len(policy.RevokedIDs) != 1 || policy.RevokedIDs[0] != revokedID {
+		t.Fatalf("SignaturePolicyOf(...).RevokedIDs = %v, want [%s]", policy.RevokedIDs, revokedID)
+	}
+
+	// Same enforcement, same trusted ids, different revocations: this MUST
+	// compare unequal, or the reload guard never fires.
+	sameKeysNoRevocation := SignaturePolicy{
+		Enforced: true,
+		KeyIDs:   policy.KeyIDs,
+	}
+	if policy.Equal(sameKeysNoRevocation) {
+		t.Error("a policy with a revocation compares equal to one without; reload would converge " +
+			"under the old trust set and report success")
+	}
+	if !policy.Equal(SignaturePolicyOf(withRevocation)) {
+		t.Error("a policy does not compare equal to itself")
+	}
+}
+
+// TestSignaturePolicyStringNamesRevocations: the guard's error message is what
+// an operator acts on, and "the policies differ" without saying HOW leaves
+// them to diff two files by hand.
+func TestSignaturePolicyStringNamesRevocations(t *testing.T) {
+	got := SignaturePolicyOf(newTestKeyringWithRevocation(t, sign.KeyID("leaked-key"))).String()
+
+	if !strings.Contains(got, "revoked") || !strings.Contains(got, "leaked-key") {
+		t.Errorf("SignaturePolicy.String() = %q, want it to name the revoked key", got)
+	}
+	// The revoked key is still a trusted-list entry on disk; the rendering must
+	// not quietly drop it, or two policies would print identically while
+	// comparing unequal.
+	if !strings.Contains(got, string(testKeyID)) {
+		t.Errorf("SignaturePolicy.String() = %q, want it to still name the live key", got)
+	}
+}
