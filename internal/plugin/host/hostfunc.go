@@ -13,6 +13,7 @@ import (
 	"github.com/stardust/legion-agent/internal/plugin/abi"
 	"github.com/stardust/legion-agent/internal/plugin/perm"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/prompt"
 	"github.com/stardust/legion-agent/internal/tool"
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
@@ -153,6 +154,16 @@ type Deps struct {
 	//
 	// Optional on the same terms as OnFault.
 	OnSuccess func(ctx context.Context, toolName string)
+
+	// PromptSegments is where a plugin granted the "prompt" extension files
+	// the block of text it contributes to the system prompt.
+	//
+	// It is CONTRACT-DECLARED OPTIONAL only for a host that grants no plugin
+	// that extension: activating one that WAS granted it with a nil store
+	// fails loud (see contributePromptSegment), because the alternative is a
+	// deployment that believes it installed instructions the model never
+	// sees.
+	PromptSegments *prompt.Segments
 }
 
 // BuildHostModule instantiates the `legion` host module (abi.HostModuleName)

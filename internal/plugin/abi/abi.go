@@ -63,6 +63,16 @@ const (
 	// argument). A guest that does not implement this op must not be granted
 	// the decide extension — activation cross-checks exactly that.
 	OpDecideToolCall int32 = 3
+
+	// OpPromptSegment is the host asking a guest for the block of text it
+	// contributes to the system prompt. The request body is empty and the
+	// answer is {"text":…}.
+	//
+	// It is asked ONCE, at activation, and the answer is cached for as long as
+	// the plugin stays mounted: the block lives in the cache-stable prefix of
+	// every prompt, so an answer that could change per task would defeat the
+	// point of putting it there.
+	OpPromptSegment int32 = 4
 )
 
 // PackResult encodes a pointer and length into the i64 return value of
