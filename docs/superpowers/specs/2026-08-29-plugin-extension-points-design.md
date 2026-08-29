@@ -190,6 +190,6 @@ add("header", …) add("capability", …) add("prefetch", …) add("conversation
 
 ### 9.3 遗留
 
-- **四个 seam 目前对 agent 自己的工具调用不触发。** 插件仍挂在 `newPluginLoader` 建的独立工具注册表上，模型的调用不经过它。这是既有的、文档已记的缺口（「模型够不到插件贡献的工具」），不是 G4 引入的；机制已齐，等那条缝合上才生效。**这是 G4 之后最该做的一件事**——在它之前，本文描述的能力在生产里是死的。
+- ~~**四个 seam 目前对 agent 自己的工具调用不触发。**~~ **已解决（2026-08-29）**：每个 per-agent 注册表现在继承插件注册表（`tool.WithPluginTools`），插件的工具进了模型的目录与派发路径，observe/decide/ask 三个 seam 因此对 agent 自己的调用生效（它们本来就走 parent 链）。计划见 `plans/2026-08-29-plugin-tools-reachable.md`。
 - **真机未验。** G4a–G4d 全部只有测试证据（含 `-race`），没有第三方插件在真机上走过这四个 seam。
 - 本文 §5「明确不做」的四条（`execute` 包装、放宽型决策、改写别家结果、Provider 服务接缝）仍然不做；后者是待决策项 D1。

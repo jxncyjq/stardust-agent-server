@@ -291,19 +291,20 @@ func drainPlugins(application *app.App, root string, logger *slog.Logger) {
 // audit log, so a plugin's call_tool goes through exactly the checks the
 // model's own tool calls do.
 //
-// Two things that registry does NOT do yet, and that the acceptance pass has to
-// close rather than assume:
+// The MODEL reaches these tools because every per-agent registry INHERITS from
+// this one (tool.WithPluginTools), which does the two things that had to happen
+// together:
 //
-//   - The MODEL cannot reach a contributed tool. Both task-runner paths build a
-//     fresh registry per task (defaultTaskRunner.RunTask, and the per-agent
-//     resolver), and a *tool.Registry has no way to inherit from another after
-//     construction, so a plugin's tools live only here. What a plugin
-//     contributes is already fully visible — in the ledger, in `plugins status`
-//     and in the process-global gateable catalog — it is simply not yet in any
-//     task's registry.
-//   - Even reached, a contributed tool would be refused: the role permission
-//     enforcer is a whitelist of "role:tool" keys and no plugin tool is in it,
-//     so Registry.Execute returns ErrPermissionDenied for one.
+//   - resolution and the catalog: a task registry that does not register a name
+//     itself falls back here, so a plugin's tools are both callable and listed;
+//   - permission: the role enforcer is a whitelist of "role:tool" keys and a
+//     plugin's name appears only at run time, so the enforcer takes this
+//     registry as a DYNAMIC source of admissible names. With only the first
+//     half, every plugin tool would resolve and then be refused.
+//
+// The link is a reference, so `plugins reload` reaches task registries that
+// already exist; and a task registry's OWN registrations shadow same-named
+// inherited ones, so a plugin cannot silently replace write_file.
 func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDeps) (*loader.Loader, error) {
 	toolRoot := cfg.ContextFiles.Root
 	absRoot, err := filepath.Abs(toolRoot)
