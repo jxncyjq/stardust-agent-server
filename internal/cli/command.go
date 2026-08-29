@@ -2635,10 +2635,16 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		nil,
 	))
 	metrics := observability.NewMetricsRecorder(nil)
-	listener, err := net.Listen("tcp", addr)
+	listener, listenWarning, err := listenServeAddr(addr)
 	if err != nil {
 		cleanup()
-		return ServeResult{}, fmt.Errorf("listen on %q: %w", addr, err)
+		return ServeResult{}, err
+	}
+	if listenWarning != "" {
+		// A service that landed somewhere other than where it asked must say
+		// so: the GUI reports the port it was given, and an operator chasing
+		// "why is it not on the port I expected" needs this line.
+		logger.Warn("listen address fallback", "detail", listenWarning)
 	}
 
 	if workspaceRootWarning != "" {
