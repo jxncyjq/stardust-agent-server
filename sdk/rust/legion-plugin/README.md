@@ -58,6 +58,42 @@ SDK 生成四个导出（`_initialize` / `plugin_alloc` / `plugin_free` / `plugi
 1. `plugin.json` 的 `capabilities` 加上同名能力（`http`/`fs` 还要声明 `network.allowed_hosts` / `filesystem.allowed_paths`）；
 2. 部署侧 `agent plugins grant --capabilities <完整集合>`。
 
+## 扩展点：观察工具调用
+
+能力是插件调宿主，**扩展点是宿主调插件**。当前只有一个：`observe`——每次工具调用
+**答完之后**回调你一次。宏里多一行：
+
+```rust
+declare_plugin!(
+    name = "legion-hello",
+    version = "0.1.0",
+    tools = [("hello_echo", hello_echo)],
+    observe = log_observation
+);
+
+fn log_observation(o: &ToolObservation) {
+    log_info(&format!("observed tool={} success={}", o.tool, o.success));
+}
+```
+
+没有这一行，宏**不生成** op 2 那条分支（op 2 落到「未知 op」），op 0 的
+`extensions` 也是空的——两者同源，作者不需要维护第二份清单。
+
+同样是三处联动，失败点各不相同：
+
+| 位置 | 缺了会怎样 |
+|---|---|
+| `observe = <fn>` | 部署授权了却没实现 → **激活期拒绝**（宿主拿 op 0 的 `extensions` 交叉校验） |
+| `plugin.json` 的 `"extensions": ["observe"]` | `grant --extensions` 拒绝：没声明的授不了 |
+| `agent plugins grant <name> --extensions observe` | 宿主不注册观察者，op 2 一次也不到达——**静默且正确**，这就是未授权的含义 |
+
+四条边界，都不是可以商量的：
+
+- **改不了任何东西**：观察者没有返回值，宿主丢弃 op 2 的应答。
+- **只看得到跑起来并答了的调用**：被权限 / 策略 / 护栏拒掉的调用从不通知；`success:false` 会通知（工具跑了，答了「不行」）。
+- **看到的是任意工具**，不只是本插件的。
+- **每次 200ms**，跑在调用方的线程上；超时或 trap 计入本插件健康度。
+
 ## 两条硬规矩
 
 - **工具失败返回 `ToolResult::fail`，不要 panic。** panic 会 trap 整个模块，代价是实例状态、同实例的在途调用，而且计入插件健康度（连续故障到阈值会被自动卸载）。
