@@ -277,3 +277,57 @@ func TestExampleObserverDoesNotTrapOnAnUnreadableObservation(t *testing.T) {
 		t.Fatalf("invoke op manifest after a bad observation: %v", err)
 	}
 }
+
+// TestExampleDeciderAnswersBothWays drives abi.OpDecideToolCall as the host
+// does for a plugin granted the decide extension. Both branches are part of
+// the contract: the host fails closed, so a decider that could only ever deny
+// would be indistinguishable from a broken one.
+func TestExampleDeciderAnswersBothWays(t *testing.T) {
+	ctx := context.Background()
+	inst, _ := newExampleInstance(t, ctx, perm.Grant{Log: true})
+
+	for _, tc := range []struct {
+		name         string
+		request      string
+		wantDecision string
+	}{
+		{name: "allows an ordinary tool", request: `{"call_id":"c1","tool":"read_file"}`, wantDecision: "allow"},
+		{name: "refuses the one it guards", request: `{"call_id":"c2","tool":"forbidden_tool"}`, wantDecision: "deny"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := inst.Invoke(ctx, abi.OpDecideToolCall, []byte(tc.request))
+			if err != nil {
+				t.Fatalf("invoke op decide: %v", err)
+			}
+			var answer struct {
+				Decision string `json:"decision"`
+				Reason   string `json:"reason"`
+			}
+			if err := json.Unmarshal(out, &answer); err != nil {
+				t.Fatalf("decode decision %q: %v", out, err)
+			}
+			if answer.Decision != tc.wantDecision {
+				t.Errorf("decision = %q, want %q", answer.Decision, tc.wantDecision)
+			}
+			if tc.wantDecision == "deny" && answer.Reason == "" {
+				t.Error("a deny with no reason leaves the operator nothing to act on")
+			}
+		})
+	}
+}
+
+// TestExampleDeciderRefusesARequestItCannotRead: an unreadable QUESTION must
+// not become an allow. The guest answers deny and says why — the host denies
+// an unreadable ANSWER anyway, so this only makes the reason legible.
+func TestExampleDeciderRefusesARequestItCannotRead(t *testing.T) {
+	ctx := context.Background()
+	inst, _ := newExampleInstance(t, ctx, perm.Grant{Log: true})
+
+	out, err := inst.Invoke(ctx, abi.OpDecideToolCall, []byte(`not json at all`))
+	if err != nil {
+		t.Fatalf("invoke op decide with an unreadable request: %v, want an answer rather than a trap", err)
+	}
+	if !strings.Contains(string(out), `"decision":"deny"`) {
+		t.Errorf("answer = %s, want a deny", out)
+	}
+}

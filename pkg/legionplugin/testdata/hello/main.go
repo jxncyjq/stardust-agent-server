@@ -35,6 +35,19 @@ func init() {
 		legionplugin.Tool{Name: "last_observation", Handler: lastObservation},
 	)
 	legionplugin.Observe(recordObservation)
+	legionplugin.Decide(decideCall)
+}
+
+// decideCall is the decider: the host asks it BEFORE dispatching any tool the
+// agent runs, and its answer can only make the outcome stricter.
+//
+// It refuses exactly one tool, so the SDK's tests can drive both branches
+// through the real ABI. A real gatekeeper would look at the arguments too.
+func decideCall(request legionplugin.ToolDecisionRequest) legionplugin.ToolDecision {
+	if request.Tool == "forbidden_tool" {
+		return legionplugin.Deny("forbidden_tool is refused by legion-hello-go")
+	}
+	return legionplugin.Allow()
 }
 
 // seen is the last observation this plugin was told about.

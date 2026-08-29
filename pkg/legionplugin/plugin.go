@@ -19,6 +19,10 @@ var registry = struct {
 	// is nil for the ordinary plugin, which contributes tools and watches
 	// nothing.
 	observer Observer
+	// decider is the ONE decider Decide may register (see decide.go). It is
+	// nil for the ordinary plugin, which contributes tools and refuses
+	// nothing.
+	decider Decider
 }{tools: map[string]Handler{}}
 
 // Serve records this plugin's identity and its tools. Call it exactly once,

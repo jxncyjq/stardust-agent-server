@@ -58,7 +58,10 @@ pub mod json;
 pub mod tool;
 
 pub use host::log_info;
-pub use tool::{Observer, ToolCall, ToolHandler, ToolObservation, ToolResult};
+pub use tool::{
+    Decider, Observer, ToolCall, ToolDecision, ToolDecisionRequest, ToolHandler, ToolObservation,
+    ToolResult,
+};
 
 /// manifest_json 渲染 op 0 的自述。
 ///
@@ -105,20 +108,32 @@ fn string_list(items: &[&str]) -> String {
 /// 起这个 ABI 版本没有的东西时，得到的是答案而不是一个死掉的模块。
 #[macro_export]
 macro_rules! declare_plugin {
-    // 不带观察者的插件：绝大多数插件长这样。
+    // 四条入口，对应两个可选 seam 的四种组合。它们只做一件事：把「有没有」翻译
+    // 成 @build 里的重复语法，真正的展开只有一份。
     (name = $name:expr, version = $version:expr,
      tools = [$(($tool:expr, $handler:expr)),* $(,)?] $(,)?) => {
         $crate::declare_plugin!(@build name = $name, version = $version,
-            tools = [$(($tool, $handler)),*], observe = []);
+            tools = [$(($tool, $handler)),*], observe = [], decide = []);
     };
-    // 带观察者的插件：多一个 `observe = <fn>`。
     (name = $name:expr, version = $version:expr,
      tools = [$(($tool:expr, $handler:expr)),* $(,)?], observe = $observer:expr $(,)?) => {
         $crate::declare_plugin!(@build name = $name, version = $version,
-            tools = [$(($tool, $handler)),*], observe = [$observer]);
+            tools = [$(($tool, $handler)),*], observe = [$observer], decide = []);
+    };
+    (name = $name:expr, version = $version:expr,
+     tools = [$(($tool:expr, $handler:expr)),* $(,)?], decide = $decider:expr $(,)?) => {
+        $crate::declare_plugin!(@build name = $name, version = $version,
+            tools = [$(($tool, $handler)),*], observe = [], decide = [$decider]);
+    };
+    (name = $name:expr, version = $version:expr,
+     tools = [$(($tool:expr, $handler:expr)),* $(,)?],
+     observe = $observer:expr, decide = $decider:expr $(,)?) => {
+        $crate::declare_plugin!(@build name = $name, version = $version,
+            tools = [$(($tool, $handler)),*], observe = [$observer], decide = [$decider]);
     };
     (@build name = $name:expr, version = $version:expr,
-     tools = [$(($tool:expr, $handler:expr)),*], observe = [$($observer:expr)?]) => {
+     tools = [$(($tool:expr, $handler:expr)),*],
+     observe = [$($observer:expr)?], decide = [$($decider:expr)?]) => {
         /// 宿主用 `WithStartFunctions("_initialize")` 实例化：guest 是 WASI
         /// reactor（没有 `_start`）。
         #[no_mangle]
@@ -140,11 +155,14 @@ macro_rules! declare_plugin {
                 // abi.OpManifest
                 0 => {
                     let provides: &[&str] = &[$($tool),*];
-                    // extensions 与 provides 同源：有 `observe = ...` 才有
-                    // "observe"。宿主会拿部署侧的 grant.extensions 与这份自述
-                    // 交叉校验，所以一个「授权了但没实现」的组合会在激活期被
-                    // 拒绝，而不是每次工具调用都白跑一趟。
-                    let extensions: &[&str] = &[$($crate::declare_plugin!(@observe_name $observer)),*];
+                    // extensions 与 provides 同源：写了 `observe = ...` 才有
+                    // "observe"，写了 `decide = ...` 才有 "decide"。宿主会拿部署
+                    // 侧的 grant.extensions 与这份自述交叉校验，所以一个「授权了
+                    // 但没实现」的组合会在激活期被拒绝，而不是每次调用都白跑。
+                    let extensions: &[&str] = &[
+                        $($crate::declare_plugin!(@name_of observe, $observer),)?
+                        $($crate::declare_plugin!(@name_of decide, $decider),)?
+                    ];
                     $crate::abi::write_out(
                         $crate::manifest_json($name, $version, provides, extensions).as_bytes())
                 }
@@ -188,13 +206,33 @@ macro_rules! declare_plugin {
                         $crate::abi::write_out(b"{}")
                     }
                 )?
+                // abi.OpDecideToolCall —— 同样只在声明了 `decide = ...` 时生成。
+                // 与 op 2 相反的是**失败方向**：这里的答案有后果，所以读不懂的
+                // 请求答 deny 而不是一个无害的确认。宿主对读不懂的**答案**本就
+                // fail-closed，这里答 deny 只是把理由说清楚。
+                $(
+                    3 => {
+                        // SAFETY: 同 op 1——只在本次调用期间借用。
+                        let body = unsafe { $crate::abi::read_in(ptr, len) };
+                        let decision = match $crate::ToolDecisionRequest::parse(body) {
+                            Ok(request) => {
+                                let decider: $crate::Decider = $decider;
+                                decider(&request)
+                            }
+                            Err(err) => $crate::ToolDecision::deny(
+                                ::std::format!("could not decode the decision request: {}", err)),
+                        };
+                        $crate::abi::write_out(decision.to_json().as_bytes())
+                    }
+                )?
                 _ => $crate::abi::write_out(br#"{"error":"unsupported op"}"#),
             }
         }
     };
-    // @observe_name 把「有没有观察者」变成 extensions 里的名字：宏的重复语法只
-    // 会在有 observer 时展开这一项，所以这个参数本身被丢弃。
-    (@observe_name $observer:expr) => { "observe" };
+    // @name_of 把「有没有这个 seam」变成 extensions 里的名字：宏的重复语法只在
+    // 有对应函数时展开这一项，函数本身被丢弃。
+    (@name_of observe, $observer:expr) => { "observe" };
+    (@name_of decide, $decider:expr) => { "decide" };
 }
 
 #[cfg(test)]

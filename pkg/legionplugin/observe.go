@@ -108,10 +108,14 @@ var observeAck = []byte(`{}`)
 // never from a literal an author has to remember to keep in sync — so the
 // guest cannot claim a seam it did not wire up.
 func registeredExtensions() []string {
-	if registry.observer == nil {
-		return nil
+	var extensions []string
+	if registry.observer != nil {
+		extensions = append(extensions, extensionObserve)
 	}
-	return []string{extensionObserve}
+	if registry.decider != nil {
+		extensions = append(extensions, extensionDecide)
+	}
+	return extensions
 }
 
 // extensionObserve is the wire name of the observation seam, mirroring

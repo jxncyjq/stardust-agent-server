@@ -2,9 +2,9 @@
   "name": "legion-hello",
   "version": "0.1.0",
   "abi": 1,
-  "sha256": "08f118462e27d6587238a5d0ccdc576486858dab78bfc639c071343d4cb3dd0c",
+  "sha256": "ea0bc1b07c70362fd6e7f1a3d601ab75d917bb3295f4a25ca713ad433db48db4",
   "capabilities": ["log"],
-  "extensions": ["observe"],
+  "extensions": ["observe", "decide"],
   "limits": {
     "timeout_ms": 5000,
     "max_memory_pages": 64,

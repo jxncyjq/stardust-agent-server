@@ -125,8 +125,8 @@ func TestGoGuestSelfDescribesFromItsRegistry(t *testing.T) {
 	// The same property for the observe seam: what the guest says it
 	// implements comes from Observe, not from a literal an author keeps in
 	// sync by hand. The host refuses a grant naming an extension absent here.
-	if !slices.Equal(self.Extensions, []string{"observe"}) {
-		t.Errorf("extensions = %v, want [observe] (from the registered observer)", self.Extensions)
+	if !slices.Equal(self.Extensions, []string{"observe", "decide"}) {
+		t.Errorf("extensions = %v, want [observe decide] (from what was registered)", self.Extensions)
 	}
 }
 
@@ -342,5 +342,61 @@ func TestGoGuestAnswersAnUnknownOpWithoutTrapping(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "unsupported op") {
 		t.Errorf("unknown op answered %q, want it to say the op is unsupported", out)
+	}
+}
+
+// TestGoGuestDeciderAnswersBothWays drives op 3 exactly as the host does for
+// a plugin granted the decide extension. Both branches matter: a decider that
+// only ever denied would look identical to a broken one (the host fails
+// closed), so "it allowed this call" is as much a part of the contract as
+// "it refused that one".
+func TestGoGuestDeciderAnswersBothWays(t *testing.T) {
+	ctx := context.Background()
+	inst, _ := newGuestInstance(t, ctx, perm.Grant{Log: true})
+
+	for _, tc := range []struct {
+		name         string
+		request      string
+		wantDecision string
+	}{
+		{name: "allows an ordinary tool", request: `{"call_id":"c1","tool":"read_file"}`, wantDecision: "allow"},
+		{name: "refuses the one it guards", request: `{"call_id":"c2","tool":"forbidden_tool"}`, wantDecision: "deny"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, err := inst.Invoke(ctx, abi.OpDecideToolCall, []byte(tc.request))
+			if err != nil {
+				t.Fatalf("invoke op decide: %v", err)
+			}
+			var answer struct {
+				Decision string `json:"decision"`
+				Reason   string `json:"reason"`
+			}
+			if err := json.Unmarshal(out, &answer); err != nil {
+				t.Fatalf("decode decision %q: %v", out, err)
+			}
+			if answer.Decision != tc.wantDecision {
+				t.Errorf("decision = %q, want %q", answer.Decision, tc.wantDecision)
+			}
+			if tc.wantDecision == "deny" && answer.Reason == "" {
+				t.Error("a deny with no reason leaves the operator nothing to act on")
+			}
+		})
+	}
+}
+
+// TestGoGuestDeciderRefusesARequestItCannotRead: the SDK must not turn an
+// unreadable question into an allow. It denies, and says why — the host would
+// deny an unreadable ANSWER anyway, so answering "deny, because I could not
+// read the request" only makes the reason legible.
+func TestGoGuestDeciderRefusesARequestItCannotRead(t *testing.T) {
+	ctx := context.Background()
+	inst, _ := newGuestInstance(t, ctx, perm.Grant{Log: true})
+
+	out, err := inst.Invoke(ctx, abi.OpDecideToolCall, []byte(`not json at all`))
+	if err != nil {
+		t.Fatalf("invoke op decide with an unreadable request: %v, want an answer rather than a trap", err)
+	}
+	if !strings.Contains(string(out), `"decision":"deny"`) {
+		t.Errorf("answer = %s, want a deny", out)
 	}
 }

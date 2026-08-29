@@ -60,6 +60,8 @@ func pluginInvoke(op int32, ptr int32, size int32) int64 {
 		return writeOut(dispatch(readIn(ptr, size)))
 	case opObserveToolResult:
 		return writeOut(observe(readIn(ptr, size)))
+	case opDecideToolCall:
+		return writeOut(decide(readIn(ptr, size)))
 	default:
 		// Never trap on an unknown op: a host that has moved on to an ABI
 		// version this guest does not know should get an answer, not a dead
@@ -80,6 +82,7 @@ const (
 	opManifest          int32 = 0
 	opCallTool          int32 = 1
 	opObserveToolResult int32 = 2
+	opDecideToolCall    int32 = 3
 )
 
 // writeOut copies body into freshly allocated guest memory and packs the
