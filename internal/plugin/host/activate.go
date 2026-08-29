@@ -143,6 +143,16 @@ type Manifest struct {
 	Name     string   `json:"name"`
 	Version  string   `json:"version"`
 	Provides []string `json:"provides"`
+	// Extensions lists the host-side seams the guest says it IMPLEMENTS
+	// (currently only "observe"). It answers a question the deployment
+	// cannot: plugins.json records what an operator authorized, and a grant
+	// naming a seam the binary never implemented would leave the host
+	// calling into a guest that answers "unsupported op" on every tool call,
+	// silently, forever. crossCheck refuses that pairing.
+	//
+	// A guest may implement MORE than it was granted — that plugin is simply
+	// never consulted, which is what an ungranted extension means.
+	Extensions []string `json:"extensions"`
 }
 
 // Spec is everything Activate needs to bring one plugin up. It is the host
@@ -988,12 +998,26 @@ func crossCheck(spec Spec, manifest Manifest) error {
 			"guest declares %v; not declared by the guest: %v",
 			spec.Name, claimed, manifest.Provides, missing)
 	}
+
+	// The same check for extension points, in the one direction that matters:
+	// a GRANT the guest cannot honour. The other direction is legal (see
+	// Manifest.Extensions).
+	for _, granted := range spec.Extensions.Names() {
+		if !slices.Contains(manifest.Extensions, granted) {
+			return fmt.Errorf("cross-check manifest: the deployment grants plugin %q the %q extension, "+
+				"but the guest declares it implements %v; a granted extension the guest does not implement "+
+				"would have the host call into it on every tool call for an answer it cannot give -- "+
+				"either drop it from this entry's grant.extensions, or build a plugin that registers it",
+				spec.Name, granted, manifest.Extensions)
+		}
+	}
 	return nil
 }
 
 // describe renders a manifest for an error message, so a guest that answered
 // with something unusable is quoted rather than summarized away.
 func describe(manifest Manifest) string {
-	return fmt.Sprintf("name=%q version=%q provides=[%s]",
-		manifest.Name, manifest.Version, strings.Join(manifest.Provides, " "))
+	return fmt.Sprintf("name=%q version=%q provides=[%s] extensions=[%s]",
+		manifest.Name, manifest.Version, strings.Join(manifest.Provides, " "),
+		strings.Join(manifest.Extensions, " "))
 }

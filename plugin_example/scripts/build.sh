@@ -27,6 +27,7 @@ cat > "$root/package/plugin.json" <<EOF
   "abi": 1,
   "sha256": "$digest",
   "capabilities": ["log"],
+  "extensions": ["observe"],
   "limits": {
     "timeout_ms": 5000,
     "max_memory_pages": 64,

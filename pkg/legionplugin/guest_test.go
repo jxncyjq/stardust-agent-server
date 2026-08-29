@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -106,9 +107,10 @@ func TestGoGuestSelfDescribesFromItsRegistry(t *testing.T) {
 		t.Fatalf("invoke op manifest: %v", err)
 	}
 	var self struct {
-		Name     string   `json:"name"`
-		Version  string   `json:"version"`
-		Provides []string `json:"provides"`
+		Name       string   `json:"name"`
+		Version    string   `json:"version"`
+		Provides   []string `json:"provides"`
+		Extensions []string `json:"extensions"`
 	}
 	if err := json.Unmarshal(out, &self); err != nil {
 		t.Fatalf("decode self-description %q: %v", out, err)
@@ -116,8 +118,15 @@ func TestGoGuestSelfDescribesFromItsRegistry(t *testing.T) {
 	if self.Name != "legion-hello-go" || self.Version != "0.1.0" {
 		t.Errorf("self-description = %s %s, want legion-hello-go 0.1.0", self.Name, self.Version)
 	}
-	if len(self.Provides) != 2 || self.Provides[0] != "hello_echo" || self.Provides[1] != "live_buffers" {
-		t.Errorf("provides = %v, want [hello_echo live_buffers] (sorted, from the registry)", self.Provides)
+	wantProvides := []string{"hello_echo", "last_observation", "live_buffers"}
+	if !slices.Equal(self.Provides, wantProvides) {
+		t.Errorf("provides = %v, want %v (sorted, from the registry)", self.Provides, wantProvides)
+	}
+	// The same property for the observe seam: what the guest says it
+	// implements comes from Observe, not from a literal an author keeps in
+	// sync by hand. The host refuses a grant naming an extension absent here.
+	if !slices.Equal(self.Extensions, []string{"observe"}) {
+		t.Errorf("extensions = %v, want [observe] (from the registered observer)", self.Extensions)
 	}
 }
 
@@ -278,5 +287,60 @@ func TestGoGuestStaysCorrectAcrossManyCalls(t *testing.T) {
 	if held > 1 {
 		t.Errorf("the guest still holds %d buffers after 200 completed calls, want 1 (this call's own "+
 			"request body): the rest were never freed", held)
+	}
+}
+
+// TestGoGuestObserverSeesACompletedToolCall drives op 2 exactly as the host
+// does when the deployment granted the observe extension, then asks the guest
+// what its observer saw. It is the SDK half of the seam: registration in
+// init survives instantiation, op 2 reaches the registered function, and the
+// observation decodes into the host's own field names.
+func TestGoGuestObserverSeesACompletedToolCall(t *testing.T) {
+	ctx := context.Background()
+	inst, _ := newGuestInstance(t, ctx, perm.Grant{Log: true})
+
+	before, err := inst.Invoke(ctx, abi.OpCallTool, []byte(`{"tool":"last_observation"}`))
+	if err != nil {
+		t.Fatalf("invoke last_observation before any observation: %v", err)
+	}
+	if !strings.Contains(string(before), `"success":false`) {
+		t.Errorf("last_observation before any observation = %s, want a failed result", before)
+	}
+
+	observation := []byte(`{"call_id":"c1","tool":"write_file","arguments":{"path":"/tmp/x"},` +
+		`"success":true,"output":"wrote 3 bytes","error":""}`)
+	if _, err := inst.Invoke(ctx, abi.OpObserveToolResult, observation); err != nil {
+		t.Fatalf("invoke op observe: %v", err)
+	}
+
+	after, err := inst.Invoke(ctx, abi.OpCallTool, []byte(`{"tool":"last_observation"}`))
+	if err != nil {
+		t.Fatalf("invoke last_observation: %v", err)
+	}
+	var result struct {
+		Success bool   `json:"success"`
+		Output  string `json:"output"`
+	}
+	if err := json.Unmarshal(after, &result); err != nil {
+		t.Fatalf("decode result %q: %v", after, err)
+	}
+	if !result.Success || result.Output != "write_file true" {
+		t.Errorf("last_observation = %+v, want the tool and outcome the observer was told about", result)
+	}
+}
+
+// TestGoGuestAnswersAnUnknownOpWithoutTrapping: a host that has moved on to
+// an ABI version this guest does not know must get an answer, not a dead
+// module — every call in flight on the instance would go with it.
+func TestGoGuestAnswersAnUnknownOpWithoutTrapping(t *testing.T) {
+	ctx := context.Background()
+	inst, _ := newGuestInstance(t, ctx, perm.Grant{Log: true})
+
+	out, err := inst.Invoke(ctx, 99, []byte(`{}`))
+	if err != nil {
+		t.Fatalf("invoke an unknown op: %v", err)
+	}
+	if !strings.Contains(string(out), "unsupported op") {
+		t.Errorf("unknown op answered %q, want it to say the op is unsupported", out)
 	}
 }

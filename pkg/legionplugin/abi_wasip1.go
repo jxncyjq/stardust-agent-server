@@ -58,6 +58,8 @@ func pluginInvoke(op int32, ptr int32, size int32) int64 {
 		return writeOut(manifestBody())
 	case opCallTool:
 		return writeOut(dispatch(readIn(ptr, size)))
+	case opObserveToolResult:
+		return writeOut(observe(readIn(ptr, size)))
 	default:
 		// Never trap on an unknown op: a host that has moved on to an ABI
 		// version this guest does not know should get an answer, not a dead
@@ -66,12 +68,18 @@ func pluginInvoke(op int32, ptr int32, size int32) int64 {
 	}
 }
 
-// The two ops of ABI v1, mirroring internal/plugin/abi's constants. They are
+// The ops of ABI v1, mirroring internal/plugin/abi's constants. They are
 // spelled here rather than imported because a guest is compiled on its own,
 // often outside this repository.
+//
+// opObserveToolResult only ever arrives when the deployment granted this
+// plugin the "observe" extension: the host registers no observer without the
+// grant, so an ungranted plugin sees this op zero times rather than seeing it
+// and refusing.
 const (
-	opManifest int32 = 0
-	opCallTool int32 = 1
+	opManifest          int32 = 0
+	opCallTool          int32 = 1
+	opObserveToolResult int32 = 2
 )
 
 // writeOut copies body into freshly allocated guest memory and packs the

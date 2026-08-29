@@ -15,6 +15,10 @@ var registry = struct {
 	name    string
 	version string
 	tools   map[string]Handler
+	// observer is the ONE observer Observe may register (see observe.go). It
+	// is nil for the ordinary plugin, which contributes tools and watches
+	// nothing.
+	observer Observer
 }{tools: map[string]Handler{}}
 
 // Serve records this plugin's identity and its tools. Call it exactly once,
@@ -63,9 +67,10 @@ func manifestBody() []byte {
 	sort.Strings(provides)
 
 	body, err := json.Marshal(manifestDoc{
-		Name:     registry.name,
-		Version:  registry.version,
-		Provides: provides,
+		Name:       registry.name,
+		Version:    registry.version,
+		Provides:   provides,
+		Extensions: registeredExtensions(),
 	})
 	if err != nil {
 		// Unreachable for these field types (strings and a string slice), and

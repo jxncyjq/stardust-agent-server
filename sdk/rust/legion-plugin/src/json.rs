@@ -62,6 +62,11 @@ impl std::fmt::Display for ParseError {
 pub struct Object {
     pub strings: BTreeMap<String, String>,
     pub arguments: BTreeMap<String, String>,
+    /// bools 是顶层的布尔字段。
+    ///
+    /// 它存在只因为宿主真的会发一个：观察文档里的 `success`。其余非字符串标量
+    /// 仍然跳过——见 [`parse`] 的说明。
+    pub bools: BTreeMap<String, bool>,
 }
 
 /// parse 读一个工具调用文档。
@@ -82,6 +87,7 @@ pub fn parse(body: &[u8]) -> Result<Object, ParseError> {
     let mut object = Object {
         strings: BTreeMap::new(),
         arguments: BTreeMap::new(),
+        bools: BTreeMap::new(),
     };
     loop {
         i = skip_ws(bytes, i);
@@ -118,9 +124,32 @@ pub fn parse(body: &[u8]) -> Result<Object, ParseError> {
                 object.arguments = args;
                 i = next;
             }
+            b't' | b'f' => match read_bool(bytes, i) {
+                Some((value, next)) => {
+                    object.bools.insert(key, value);
+                    i = next;
+                }
+                // 不是 true/false 的其它 t/f 开头 token 交给通用跳过，理由与
+                // 下面那条一样：宿主日后加的字段不该把插件变成故障。
+                None => i = skip_value(bytes, i)?,
+            },
             _ => i = skip_value(bytes, i)?,
         }
     }
+}
+
+/// read_bool 读 `true` / `false` 字面量，返回它的值与其后的下标。
+///
+/// 返回 `None`（而不是错误）表示这里不是布尔字面量：调用方会退回通用的跳过路
+/// 径，所以一个本 SDK 不认识的 token 仍然不会让整份文档解析失败。
+fn read_bool(bytes: &[u8], i: usize) -> Option<(bool, usize)> {
+    if bytes[i..].starts_with(b"true") {
+        return Some((true, i + 4));
+    }
+    if bytes[i..].starts_with(b"false") {
+        return Some((false, i + 5));
+    }
+    None
 }
 
 fn skip_ws(bytes: &[u8], mut i: usize) -> usize {

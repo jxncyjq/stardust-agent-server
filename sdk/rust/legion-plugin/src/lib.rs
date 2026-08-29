@@ -58,28 +58,34 @@ pub mod json;
 pub mod tool;
 
 pub use host::log_info;
-pub use tool::{ToolCall, ToolHandler, ToolResult};
+pub use tool::{Observer, ToolCall, ToolHandler, ToolObservation, ToolResult};
 
 /// manifest_json 渲染 op 0 的自述。
 ///
 /// 由 [`declare_plugin!`] 调用，作者不需要碰。`provides` 来自宏收到的工具列表，
 /// 这正是它存在的理由：自述与注册表同源。
-pub fn manifest_json(name: &str, version: &str, provides: &[&str]) -> String {
+pub fn manifest_json(name: &str, version: &str, provides: &[&str], extensions: &[&str]) -> String {
+    format!(
+        "{{\"name\":\"{}\",\"version\":\"{}\",\"provides\":[{}],\"extensions\":[{}]}}",
+        json::escape(name),
+        json::escape(version),
+        string_list(provides),
+        string_list(extensions)
+    )
+}
+
+/// string_list 把一串名字渲染成 JSON 数组的**内容**（不含方括号）。
+fn string_list(items: &[&str]) -> String {
     let mut list = String::new();
-    for (i, tool) in provides.iter().enumerate() {
+    for (i, item) in items.iter().enumerate() {
         if i > 0 {
             list.push(',');
         }
         list.push('"');
-        list.push_str(&json::escape(tool));
+        list.push_str(&json::escape(item));
         list.push('"');
     }
-    format!(
-        "{{\"name\":\"{}\",\"version\":\"{}\",\"provides\":[{}]}}",
-        json::escape(name),
-        json::escape(version),
-        list
-    )
+    list
 }
 
 /// declare_plugin 生成一个插件的全部 ABI 面：四个导出与 op 分发。
@@ -99,7 +105,20 @@ pub fn manifest_json(name: &str, version: &str, provides: &[&str]) -> String {
 /// 起这个 ABI 版本没有的东西时，得到的是答案而不是一个死掉的模块。
 #[macro_export]
 macro_rules! declare_plugin {
-    (name = $name:expr, version = $version:expr, tools = [$(($tool:expr, $handler:expr)),* $(,)?]) => {
+    // 不带观察者的插件：绝大多数插件长这样。
+    (name = $name:expr, version = $version:expr,
+     tools = [$(($tool:expr, $handler:expr)),* $(,)?] $(,)?) => {
+        $crate::declare_plugin!(@build name = $name, version = $version,
+            tools = [$(($tool, $handler)),*], observe = []);
+    };
+    // 带观察者的插件：多一个 `observe = <fn>`。
+    (name = $name:expr, version = $version:expr,
+     tools = [$(($tool:expr, $handler:expr)),* $(,)?], observe = $observer:expr $(,)?) => {
+        $crate::declare_plugin!(@build name = $name, version = $version,
+            tools = [$(($tool, $handler)),*], observe = [$observer]);
+    };
+    (@build name = $name:expr, version = $version:expr,
+     tools = [$(($tool:expr, $handler:expr)),*], observe = [$($observer:expr)?]) => {
         /// 宿主用 `WithStartFunctions("_initialize")` 实例化：guest 是 WASI
         /// reactor（没有 `_start`）。
         #[no_mangle]
@@ -121,7 +140,13 @@ macro_rules! declare_plugin {
                 // abi.OpManifest
                 0 => {
                     let provides: &[&str] = &[$($tool),*];
-                    $crate::abi::write_out($crate::manifest_json($name, $version, provides).as_bytes())
+                    // extensions 与 provides 同源：有 `observe = ...` 才有
+                    // "observe"。宿主会拿部署侧的 grant.extensions 与这份自述
+                    // 交叉校验，所以一个「授权了但没实现」的组合会在激活期被
+                    // 拒绝，而不是每次工具调用都白跑一趟。
+                    let extensions: &[&str] = &[$($crate::declare_plugin!(@observe_name $observer)),*];
+                    $crate::abi::write_out(
+                        $crate::manifest_json($name, $version, provides, extensions).as_bytes())
                 }
                 // abi.OpCallTool
                 1 => {
@@ -146,10 +171,30 @@ macro_rules! declare_plugin {
                     };
                     $crate::abi::write_out(result.to_json().as_bytes())
                 }
+                // abi.OpObserveToolResult —— 只有声明了 `observe = ...` 的插件
+                // 才会生成这条分支；没有它时 op 2 落到下面的「未知 op」，那也
+                // 正是宿主对一个没实现这个 seam 的插件该听到的话。
+                $(
+                    2 => {
+                        // SAFETY: 同 op 1——只在本次调用期间借用。
+                        let body = unsafe { $crate::abi::read_in(ptr, len) };
+                        if let Ok(observation) = $crate::ToolObservation::parse(body) {
+                            let observer: $crate::Observer = $observer;
+                            observer(&observation);
+                        }
+                        // 解析失败时无人可报：这个 seam 按构造就是单向的。宿主
+                        // 会拿到一个格式正确的应答（它随即丢弃），但**不会**拿到
+                        // 一个 trap ——trap 才会伤到那个正等着结果的调用方。
+                        $crate::abi::write_out(b"{}")
+                    }
+                )?
                 _ => $crate::abi::write_out(br#"{"error":"unsupported op"}"#),
             }
         }
     };
+    // @observe_name 把「有没有观察者」变成 extensions 里的名字：宏的重复语法只
+    // 会在有 observer 时展开这一项，所以这个参数本身被丢弃。
+    (@observe_name $observer:expr) => { "observe" };
 }
 
 #[cfg(test)]
@@ -158,16 +203,24 @@ mod tests {
 
     #[test]
     fn manifest_lists_every_tool_it_was_given() {
-        let json = manifest_json("legion-hello", "0.1.0", &["a", "b"]);
+        let json = manifest_json("legion-hello", "0.1.0", &["a", "b"], &[]);
         assert_eq!(
             json,
-            r#"{"name":"legion-hello","version":"0.1.0","provides":["a","b"]}"#
+            r#"{"name":"legion-hello","version":"0.1.0","provides":["a","b"],"extensions":[]}"#
         );
     }
 
     #[test]
     fn manifest_of_a_single_tool_has_no_trailing_comma() {
-        let json = manifest_json("p", "1", &["only"]);
+        let json = manifest_json("p", "1", &["only"], &[]);
         assert!(json.contains(r#""provides":["only"]"#), "got {json}");
+    }
+
+    /// 一个注册了观察者的插件必须**说出来**：宿主拿这份自述与部署侧的
+    /// grant.extensions 交叉校验，缺了它，一个正确的授权反而会被拒。
+    #[test]
+    fn manifest_names_the_extensions_it_implements() {
+        let json = manifest_json("p", "1", &["only"], &["observe"]);
+        assert!(json.contains(r#""extensions":["observe"]"#), "got {json}");
     }
 }
