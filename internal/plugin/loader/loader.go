@@ -1058,6 +1058,18 @@ func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string)
 	// keep converging.
 	pm, wasm, err := manifest.LoadPackage(dir, l.keyring)
 	if err != nil {
+		// An untrusted package does not belong in the cache: the bytes just
+		// failed signature verification, and leaving them there means every
+		// later convergence reads the same rejected package back from a
+		// directory this deployment trusts enough to read.
+		//
+		// Only for a TRUST failure, and only for a REMOTE entry: a package
+		// that merely will not load is re-downloaded identically next time, so
+		// evicting it buys nothing, and a local entry's directory is the
+		// operator's own tree rather than this cache's.
+		if errors.Is(err, manifest.ErrUntrustedPackage) && entry.IsRemote() {
+			fetch.EvictUntrusted(l.remote.Cache, entry.Digest, l.logger)
+		}
 		return nil, l.fail(ctx, entry.Name, "", stepLoadPackage, err, nil)
 	}
 	if pm.Name != entry.Name {

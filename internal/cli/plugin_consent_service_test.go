@@ -1407,3 +1407,66 @@ func TestNewPluginConsentServicePanicsOnANilLogger(t *testing.T) {
 	NewPluginConsentService("m.json", "root", func() *loader.Loader { return nil },
 		func() *sign.Keyring { return nil }, loader.RemoteConfig{}, nil)
 }
+
+// TestPluginConsentServiceResolveEvictsAnUntrustedPackageFromTheCache: a
+// package that failed signature verification is poison, and until this it
+// stayed on disk forever — the next List reported the row as load_failed and
+// the panel stopped offering to fetch it, so those bytes sat in a directory
+// the deployment reads from with nothing able to remove them.
+func TestPluginConsentServiceResolveEvictsAnUntrustedPackageFromTheCache(t *testing.T) {
+	f := newConsentFixtureWithUntrustedPackage(t)
+
+	if _, err := f.svc.Resolve(context.Background(), f.pluginName); err == nil {
+		t.Fatal("Resolve on an untrusted package = nil error, want an error")
+	}
+
+	dep, err := readPluginDeployment(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read deployment: %v", err)
+	}
+	digest := dep.Plugins[0].Digest
+	cached, err := f.resolveFixtureRemote().Cache.Has(digest)
+	if err != nil {
+		t.Fatalf("cache lookup %s: %v", digest, err)
+	}
+	if cached {
+		t.Error("the untrusted package is still in the cache after Resolve refused it")
+	}
+}
+
+// TestPluginConsentServiceResolveKeepsTheCacheWhenTheFailureIsNotATrustFailure
+// is the other half of the rule. A package that merely will not load — a
+// corrupt module, a missing file — is not a trust problem, and evicting it
+// would only make the next attempt download an identical broken package.
+func TestPluginConsentServiceResolveKeepsTheCacheWhenTheFailureIsNotATrustFailure(t *testing.T) {
+	f := newConsentFixture(t)
+	cache := f.resolveFixtureRemote().Cache
+
+	// A first Resolve fetches and caches the healthy package.
+	if _, err := f.svc.Resolve(context.Background(), f.pluginName); err != nil {
+		t.Fatalf("Resolve on a healthy package: %v", err)
+	}
+	dep, err := readPluginDeployment(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read deployment: %v", err)
+	}
+	digest := dep.Plugins[0].Digest
+	dir := cache.Dir(digest)
+
+	// Break the CACHED copy in a way that is not a signature failure — and
+	// keep all three files present, because a MISSING file makes the entry
+	// incomplete, which reads as a cache miss and simply re-downloads. Corrupt
+	// content instead: the digest in plugin.json no longer matches the module,
+	// which LoadPackage refuses without ErrUntrustedPackage.
+	if err := os.WriteFile(filepath.Join(dir, "plugin.wasm"), []byte("not a wasm module"), 0o600); err != nil {
+		t.Fatalf("corrupt the cached package: %v", err)
+	}
+
+	if _, err := f.svc.Resolve(context.Background(), f.pluginName); err == nil {
+		t.Fatal("Resolve on a broken cached package = nil error, want an error")
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Errorf("stat %s: %v; a package that merely fails to load must stay cached — "+
+			"evicting it only re-downloads the same broken bytes", dir, err)
+	}
+}

@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -530,4 +531,215 @@ func isCompletePackage(dir string) (bool, error) {
 		}
 	}
 	return true, nil
+}
+
+// CacheEntry is one directory in the cache, as List reports it.
+//
+// Complete distinguishes a package that can actually be used from a leftover:
+// a directory holding only some of the three package files is what an
+// interrupted unpack or a partial deletion leaves behind. Has() never counts
+// one as a hit, so it is invisible to everything except a listing — and it
+// still occupies disk, which is precisely why it is reported rather than
+// filtered out.
+//
+// ModTime is the entry directory's modification time: when the package was
+// written or last replaced. It is NOT a last-used time — nothing in this
+// repository records reads, because doing so would mean a disk write on every
+// cache hit — so any policy built on it must say "least recently written",
+// not "least recently used".
+type CacheEntry struct {
+	Digest   string
+	Bytes    int64
+	ModTime  time.Time
+	Complete bool
+}
+
+// List reports every entry in the cache, complete or not.
+//
+// It skips the bookkeeping this package keeps alongside entries — the
+// ".unpack-*" staging directories and the "<hex>.lock" files — and anything
+// else whose name is not a digest: a listing exists to answer "which packages
+// are on disk", and reporting a lock file as a package would send an operator
+// looking for a plugin that does not exist.
+//
+// An empty cache lists nothing and is not an error: that is what every
+// deployment looks like before its first remote install.
+func (c *Cache) List() ([]CacheEntry, error) {
+	shard := filepath.Join(c.root, digestAlgorithmDirName)
+	dirEntries, err := os.ReadDir(shard)
+	if errors.Is(err, fs.ErrNotExist) {
+		// The shard directory is created by the first Put. Its absence is an
+		// empty cache, not a broken one.
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read cache directory %s: %w", shard, err)
+	}
+
+	entries := make([]CacheEntry, 0, len(dirEntries))
+	for _, dirEntry := range dirEntries {
+		if !dirEntry.IsDir() || !isHexDigest(dirEntry.Name()) {
+			continue
+		}
+		dir := filepath.Join(shard, dirEntry.Name())
+		info, err := dirEntry.Info()
+		if err != nil {
+			return nil, fmt.Errorf("stat cache entry %s: %w", dir, err)
+		}
+		size, err := directorySize(dir)
+		if err != nil {
+			return nil, err
+		}
+		complete, err := isCompletePackage(dir)
+		if err != nil {
+			return nil, fmt.Errorf("inspect cache entry %s: %w", dir, err)
+		}
+		entries = append(entries, CacheEntry{
+			Digest:   digestAlgorithmDirName + ":" + dirEntry.Name(),
+			Bytes:    size,
+			ModTime:  info.ModTime(),
+			Complete: complete,
+		})
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Digest < entries[j].Digest })
+	return entries, nil
+}
+
+// Remove deletes one entry, reporting whether there was anything to delete.
+//
+// A digest that is not cached is not an error — removal is idempotent, and a
+// caller pruning a list it read a moment ago races with anyone else doing the
+// same — but it answers false rather than claiming a deletion that never
+// happened.
+//
+// It takes the same cross-process digest lock commit does, because the entry
+// it is about to delete may be the one another process is writing right now;
+// deleting a directory mid-unpack would leave that writer committing into
+// nothing.
+//
+// This is the only function in this package that calls os.RemoveAll, so the
+// digest it is handed is PARSED before any path is built from it: a caller
+// that passes an unvalidated string gets a refusal, not a deletion somewhere
+// outside the cache.
+func (c *Cache) Remove(digest string) (removed bool, err error) {
+	hexDigits, err := parseDigest(digest)
+	if err != nil {
+		return false, fmt.Errorf("cache remove: %w", err)
+	}
+	dir := c.dirForHex(hexDigits)
+
+	// Look before locking. The lock file lives beside the entry, in a shard
+	// directory the first Put creates — so on a cache that has never stored
+	// anything, taking the lock would fail with "path not found" for a digest
+	// that plainly is not there. Answering false first is both correct and
+	// cheaper.
+	//
+	// The check is not a race hazard: if a Put commits between here and the
+	// lock, this call simply reports "there was nothing", which is what was
+	// true when it looked. What must NOT happen — deleting a directory while
+	// somebody unpacks into it — is still prevented, because that case has an
+	// entry present and therefore goes through the lock below.
+	if _, statErr := os.Stat(dir); errors.Is(statErr, fs.ErrNotExist) {
+		return false, nil
+	} else if statErr != nil {
+		return false, fmt.Errorf("cache remove %s: stat %s: %w", digest, dir, statErr)
+	}
+
+	unlock, err := c.lockDigestDir(dir)
+	if err != nil {
+		return false, fmt.Errorf("cache remove %s: %w", digest, err)
+	}
+	defer func() {
+		if uerr := unlock(); uerr != nil {
+			err = errors.Join(err, fmt.Errorf("cache remove %s: release lock: %w", digest, uerr))
+		}
+	}()
+
+	// Re-check under the lock: between the look above and here, another
+	// process holding this lock may have removed the entry itself.
+	if _, statErr := os.Stat(dir); errors.Is(statErr, fs.ErrNotExist) {
+		return false, nil
+	} else if statErr != nil {
+		return false, fmt.Errorf("cache remove %s: stat %s: %w", digest, dir, statErr)
+	}
+	if rmErr := os.RemoveAll(dir); rmErr != nil {
+		return false, fmt.Errorf("cache remove %s: %w", digest, rmErr)
+	}
+	return true, nil
+}
+
+// directorySize sums the sizes of every regular file under dir.
+//
+// Sizes, not disk usage: block rounding is filesystem-specific and the number
+// exists to answer "how much would pruning this reclaim", which the sum
+// answers closely enough to act on.
+func directorySize(dir string) (int64, error) {
+	var total int64
+	err := filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			return nil
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		total += info.Size()
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("measure cache entry %s: %w", dir, err)
+	}
+	return total, nil
+}
+
+// RemoveStaleStaging deletes ".unpack-*" staging directories older than
+// minAge, returning the names it removed (or, with dryRun, would remove).
+//
+// These are what an interrupted unpack leaves behind: Put stages a package in
+// one and renames it into place, so a crash, a killed process or a failed
+// verification between those two steps abandons the directory. Nothing ever
+// looks at them again, and nothing else deletes them.
+//
+// minAge is the whole safety argument. A staging directory belonging to a
+// download happening RIGHT NOW is indistinguishable from an abandoned one —
+// both are a temp-named directory with no entry beside it — so age is the only
+// way to tell them apart. A non-positive minAge is refused rather than treated
+// as "remove everything", which would delete a download in progress.
+func (c *Cache) RemoveStaleStaging(minAge time.Duration, dryRun bool) (removed []string, err error) {
+	if minAge <= 0 {
+		return nil, fmt.Errorf("remove stale staging directories: minAge is %s; it must be positive, "+
+			"or a download in progress would be deleted along with the abandoned ones", minAge)
+	}
+	shard := filepath.Join(c.root, digestAlgorithmDirName)
+	dirEntries, err := os.ReadDir(shard)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read cache directory %s: %w", shard, err)
+	}
+
+	cutoff := time.Now().Add(-minAge)
+	for _, dirEntry := range dirEntries {
+		if !dirEntry.IsDir() || !strings.HasPrefix(dirEntry.Name(), tempUnpackDirPrefix) {
+			continue
+		}
+		info, err := dirEntry.Info()
+		if err != nil {
+			return removed, fmt.Errorf("stat staging directory %s: %w", dirEntry.Name(), err)
+		}
+		if info.ModTime().After(cutoff) {
+			continue
+		}
+		if !dryRun {
+			if rmErr := os.RemoveAll(filepath.Join(shard, dirEntry.Name())); rmErr != nil {
+				return removed, fmt.Errorf("remove staging directory %s: %w", dirEntry.Name(), rmErr)
+			}
+		}
+		removed = append(removed, dirEntry.Name())
+	}
+	return removed, nil
 }
