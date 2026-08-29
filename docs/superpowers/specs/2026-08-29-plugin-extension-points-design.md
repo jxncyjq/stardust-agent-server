@@ -1,7 +1,7 @@
 # 插件扩展面设计（G4 spec）
 
 **日期**：2026-08-29
-**状态**：**已决策（2026-08-29）** —— 三个问题都已拍板，见第 6 节。本文是边界，不是实施计划；各期的实施计划另写。
+**状态**：**已实施（2026-08-29）** —— 三个决策见第 6 节，G4a–G4d 四期全部交付并合入 master，实际落点与本文的偏离见第 9 节。本文是边界，不是实施计划；各期的实施计划另写。
 **上游**：路线 `plans/2026-08-28-plugin-gap-closure-roadmap.md` 的 G4；与 dsh Cordis 的比对结论「装载侧已比 Cordis 完整，差距全在扩展面的宽度」。
 
 ---
@@ -161,3 +161,35 @@ add("header", …) add("capability", …) add("prefetch", …) add("conversation
 - 提示词段有「卸载即撤回」「超长截断并 Warn」「边界标记存在」的测试；
 - 观察点有「返回值被丢弃、失败不影响结果」的测试；
 - 每期至少一次 `go test ./...` 与 `-race ./internal/...`。
+
+---
+
+## 9. 实施结果（2026-08-29）
+
+四期全部交付并合入三仓 master。各期的实施计划在 `plans/` 下：`2026-08-29-plugin-observe-extension.md`、`…-plugin-decide-extension.md`、`…-plugin-ask-approval.md`、`…-plugin-prompt-segment.md`。
+
+| 期 | PR | 落点 |
+|---|---|---|
+| G4a 观察点 | server #100 / docs #17 | `tool.Observer` 接缝 + ABI op 2 |
+| G4b 决策点 deny | server #101 / GUI #28 / docs #18 | `tool.Decider` 接缝 + ABI op 3 |
+| G4c 决策点 ask | server #102 / GUI #29 / docs #19 | `manualgate` 开票挂起 + `tool.AskArbiter` 派发期读票 |
+| G4d 提示词段 | server #103 / GUI #30 / docs #20 | ABI op 4 + `internal/prompt` + `cognitive` 稳定前缀块 |
+
+### 9.1 与本文的三处偏离（都是实施中发现本文写得不够准）
+
+1. **决策点不是「包一层 `tool.Policy`」**（§6 决策 A 的 A1 描述）。实际做成注册表上的**决策者接缝**（`Registry.AddDecider`），放在 enforcer 与 policy **之后**被征询。包 Policy 也能拒绝，但拿不到「谁拒的、为什么」，而一个无法归因的拒绝是运维修不了的拒绝；接缝还能按 owner 撤回，与工具贡献同一套 ledger。
+2. **观察点的超时是固定 200ms**，不是本文 §3.1 建议的 `min(descriptor.Timeout/4, 200ms)`。观察点在调用**答完之后**跑，那时工具的超时预算已经花完，再按它取份额没有意义。`min(timeout/4, 200ms)` 用在**决策点**上——那里工具还没开始跑，一个声明 300ms 超时的工具不该把其中 200ms 花在被问「能不能跑」上。
+3. **`ask` 的落点是两处，不是一处**。本文 §6 只说「接 `ToolGate`」；实际必须是 round 边界开票挂起 + 派发期读票两处，因为挂起意味着落 checkpoint 并结束本次 run，而在 registry 里同步阻塞等人审批会把 checkpoint/resume 模型换成「进程崩了就丢」。代价是决策者一轮**被问两次**，因此「决策者无副作用」从惯例升为契约。
+
+### 9.2 本文没有预见、但必须记住的四件事
+
+- **`ask` 不看模式。** 宿主自身的 Sensitive 审批只在 Manual 生效；插件的 ask 在 Auto 模式下同样挂起。装了守门插件的部署，其意图正是「这几类调用要人看一眼」，按模式忽略等于把 ask 静默降级成 allow。代价（无人值守的 Auto 任务会停下等人）写进了手册。
+- **lazy 协议下票必须按内层调用开。** 真正到达注册表的是 `call_tool` 展开后的内层调用，自带 id 与参数；票开在外层 meta 调用上，派发时就查不到，人批过的调用照样被拒。为此把「meta → 真实调用」的展开挪进 `internal/tool`，runtime 与 gate 共用一份。
+- **提示词段问一次，不是每次构建时问。** 本文 §3.3 没说清什么时候取文本。每次 `BuildContext` 问 guest 有三重代价：每任务关键路径多一次 wasm 调用、答案可变则待不进稳定前缀（决策 C 的收益归零）、慢 guest 拖慢每次推理。实际做成激活期 op 4 问一次，答案是部署级事实。
+- **每加一个 seam，都要回头查按 seam 展开的比较函数。** 加 `decide` 时发现 `manifest.sameExtensions` 只比了 `Observe`——于是「把 decide 授给只声明 observe 的插件」能通过，插件带着从没要过的否决权起来。加授权维度时还要搜全链路里所有「重发/复制既有授权」的地方：GUI 的「重试收敛」当时就漏了 extensions，重试会静默撤销一份已授予的权力。
+
+### 9.3 遗留
+
+- **四个 seam 目前对 agent 自己的工具调用不触发。** 插件仍挂在 `newPluginLoader` 建的独立工具注册表上，模型的调用不经过它。这是既有的、文档已记的缺口（「模型够不到插件贡献的工具」），不是 G4 引入的；机制已齐，等那条缝合上才生效。**这是 G4 之后最该做的一件事**——在它之前，本文描述的能力在生产里是死的。
+- **真机未验。** G4a–G4d 全部只有测试证据（含 `-race`），没有第三方插件在真机上走过这四个 seam。
+- 本文 §5「明确不做」的四条（`execute` 包装、放宽型决策、改写别家结果、Provider 服务接缝）仍然不做；后者是待决策项 D1。
