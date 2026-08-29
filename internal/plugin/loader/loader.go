@@ -582,6 +582,18 @@ type SignaturePolicy struct {
 	// empty exactly when Enforced is false: sign.ParseKeyring refuses an empty
 	// trust set, so an enforcing policy always names at least one key.
 	KeyIDs []sign.KeyID
+	// RevokedIDs are the ids the keyring has revoked, sorted
+	// (sign.Keyring.RevokedIDs).
+	//
+	// It is part of the policy because a revocation added to a keyring changes
+	// nothing else an observer can see: the trusted ids may be identical (a
+	// revoked key stays listed so refusals can explain themselves), so without
+	// this field `agent plugins reload` would compare the new config against
+	// the running process, find them equal, and converge the deployment under
+	// the OLD trust set — the revoked key still verifying, with "reload
+	// succeeded" on screen. That is the exact silence a revocation exists to
+	// break.
+	RevokedIDs []sign.KeyID
 }
 
 // SignaturePolicyOf describes the policy a Loader built with keyring enforces.
@@ -596,7 +608,7 @@ func SignaturePolicyOf(keyring *sign.Keyring) SignaturePolicy {
 	if keyring == nil {
 		return SignaturePolicy{}
 	}
-	return SignaturePolicy{Enforced: true, KeyIDs: keyring.IDs()}
+	return SignaturePolicy{Enforced: true, KeyIDs: keyring.IDs(), RevokedIDs: keyring.RevokedIDs()}
 }
 
 // Equal reports whether p and other are the same policy: the same enforcement
@@ -604,11 +616,20 @@ func SignaturePolicyOf(keyring *sign.Keyring) SignaturePolicy {
 // but both sides come from sign.Keyring.IDs, which sorts — so this compares
 // element by element rather than paying for a set.
 func (p SignaturePolicy) Equal(other SignaturePolicy) bool {
-	if p.Enforced != other.Enforced || len(p.KeyIDs) != len(other.KeyIDs) {
+	if p.Enforced != other.Enforced {
 		return false
 	}
-	for i, id := range p.KeyIDs {
-		if id != other.KeyIDs[i] {
+	return sameKeyIDs(p.KeyIDs, other.KeyIDs) && sameKeyIDs(p.RevokedIDs, other.RevokedIDs)
+}
+
+// sameKeyIDs compares two sorted id lists element by element. Both sides come
+// from sign.Keyring, which sorts, so this costs nothing a set would save.
+func sameKeyIDs(a, b []sign.KeyID) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i, id := range a {
+		if id != b[i] {
 			return false
 		}
 	}
@@ -627,7 +648,19 @@ func (p SignaturePolicy) String() string {
 	for _, id := range p.KeyIDs {
 		ids = append(ids, string(id))
 	}
-	return fmt.Sprintf("signatures required, trusted keys [%s]", strings.Join(ids, " "))
+	if len(p.RevokedIDs) == 0 {
+		return fmt.Sprintf("signatures required, trusted keys [%s]", strings.Join(ids, " "))
+	}
+	// Revocations are rendered separately rather than by subtracting them from
+	// the trusted list: an operator comparing two policies in an error message
+	// needs to see WHICH keys were revoked, and a list that silently shrank
+	// would tell them only that something differs.
+	revoked := make([]string, 0, len(p.RevokedIDs))
+	for _, id := range p.RevokedIDs {
+		revoked = append(revoked, string(id))
+	}
+	return fmt.Sprintf("signatures required, trusted keys [%s], revoked keys [%s]",
+		strings.Join(ids, " "), strings.Join(revoked, " "))
 }
 
 // SignaturePolicy returns the policy this Loader is enforcing right now.
