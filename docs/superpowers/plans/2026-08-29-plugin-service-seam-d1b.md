@@ -56,8 +56,13 @@ call_tool { "tool": "service:issue-tracker/search" }
 | T1 | manifest 的 `service_capabilities` 与校验 | 键不在 provides_services / 空名 / 映射到别人的工具，三条各自被拒 |
 | T2 | `host.Deps.Services` 解析器接口 + `callTool` 的解析（含四种失败） | 解析后按真实工具名计预算与派发；解析失败不消耗预算 |
 | T3 | loader 实现解析器并注入（服务→提供者→工具），随挂载/卸载即时变化 | 换提供者后同一个 `service:` 名字解析到新工具；提供者挂起时解析失败 |
-| T4 | 两个 SDK 的便捷调用 + 示例（提供者 + 消费者） | 消费者代码里没有任何提供者的工具名 |
+| T4 | Rust SDK 的 `host::invoke_service`（**Go SDK 本期不做**，见下） | 发出的 tool 名是 `service:<名>/<能力>` |
 | T5 | 文档：手册 §三点五/§4/§9、spec、路线图 | — |
+
+### T4 的范围调整（实施中发现）
+
+- **Go SDK 不加**：它的 `tool` 能力绑定整体还没落地（`host_wasip1.go` 目前只有 log），单独为服务名加一个便捷函数会造出一个没有底座的 API。等 Go SDK 补上 call_tool 时一并加。
+- **不新增第二个示例包**：提供者 + 消费者要两个包，会让 `plugin_example/` 的结构翻倍，而机制已由 loader 的换提供者测试与 host 的接线测试钉住。两侧的完整片段写进手册与 Rust README。
 
 ## 六、明确不做
 
