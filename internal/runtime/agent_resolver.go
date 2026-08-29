@@ -17,6 +17,7 @@ import (
 	"github.com/stardust/legion-agent/internal/contextfiles"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/prompt"
 	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/skill"
 	"github.com/stardust/legion-agent/internal/taskgate"
@@ -54,6 +55,14 @@ type AgentRuntimeResolverConfig struct {
 	// ToolGate gates each tool round for resolver-built runtimes, mirroring
 	// Config.ToolGate on the default runtime. Nil never suspends.
 	ToolGate ToolGate
+
+	// PluginSegments is the process-wide store of plugin-contributed prompt
+	// blocks. It is the SAME store the plugin host writes to, so a plugin
+	// mounted after this resolver was built still reaches the prompts of
+	// every agent — the rendering happens per build, not at wiring time.
+	//
+	// Nil is a deployment with no plugin prompt segments, and costs nothing.
+	PluginSegments *prompt.Segments
 	// Logger reports conditions that are tolerated but worth surfacing, such as
 	// a configured skills root that does not exist. Nil disables that reporting
 	// (tests, embedded use); it never changes what the resolver builds.
@@ -99,6 +108,7 @@ type AgentRuntimeResolver struct {
 	maasFactory       MaasRunnerFactory
 	checkpoints       *sessionstate.Store
 	toolGate          ToolGate
+	pluginSegments    *prompt.Segments
 	logger            *slog.Logger
 	skillUsage        SkillUsageRecorder
 	conversationTurns ConversationTurnLister
@@ -125,6 +135,7 @@ func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolv
 		maasFactory:       cfg.MaasFactory,
 		checkpoints:       cfg.Checkpoints,
 		toolGate:          cfg.ToolGate,
+		pluginSegments:    cfg.PluginSegments,
 		logger:            cfg.Logger,
 		skillUsage:        cfg.SkillUsage,
 		conversationTurns: cfg.ConversationTurns,
@@ -203,7 +214,9 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 	if err != nil {
 		return domain.Agent{}, nil, false, fmt.Errorf("load agent context files for %q: %w", task.AgentID, err)
 	}
-	contextBuilder := cognitive.NewCore(cognitive.NoopCompressor{}).WithContextFiles(contextBlock)
+	contextBuilder := cognitive.NewCore(cognitive.NoopCompressor{}).
+		WithContextFiles(contextBlock).
+		WithPluginSegments(r.pluginSegments)
 	// capabilitySkills is the skill half of the capability catalog for this
 	// agent. It is set only when a skills root is actually available; the tool
 	// half is built per task by the runtime from the effective registry.
