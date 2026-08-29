@@ -214,7 +214,7 @@ go test ./plugin_example/...
 | `TestExampleRefusesToLinkWithoutItsCapability` | 能力是**链接期**事实：不授 `log`，模块根本链接不上，不是调用时返回 DENIED |
 | `TestExampleObserverIsNotifiedThroughTheHost` | 扩展点闭环：宿主发 op 2 → guest 的观察者跑 → 它经 `log` 写下看到了什么。这个 seam 单向，只能靠它留下的痕迹证明它跑过 |
 | `TestExampleObserverDoesNotTrapOnAnUnreadableObservation` | 读不懂的观察文档不能 trap：无人可报，而 trap 会连累那个正等着观察者被通知完的调用方 |
-| `TestExampleDeciderAnswersBothWays` | 决策点两条路都走通：宿主 fail-closed，所以「只会拒绝」的决策者与坏掉的决策者长得一模一样 |
+| `TestExampleDeciderAnswersBothWays` | 决策点三条路都走通（放行/拒绝/送审）：宿主 fail-closed，所以「只会拒绝」的决策者与坏掉的决策者长得一模一样 |
 | `TestExampleDeciderRefusesARequestItCannotRead` | 读不懂的**问题**不能变成放行 |
 
 ## 从这份示例改成你自己的插件

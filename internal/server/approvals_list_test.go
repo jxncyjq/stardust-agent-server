@@ -94,3 +94,37 @@ func TestListApprovalsUnavailableWithoutStore(t *testing.T) {
 		t.Fatalf("status = %d, want 503 when approval store unwired", rec.Code)
 	}
 }
+
+// TestListApprovalsReportsWhoAskedAndWhy: with two possible sources (the
+// host's own Sensitive rule and any plugin granted the decide extension), a
+// pending ticket that does not say which is one an operator cannot judge.
+func TestListApprovalsReportsWhoAskedAndWhy(t *testing.T) {
+	lister := fakeApprovalLister{pending: []approval.ToolApproval{{
+		TicketID: "ticket-1", TaskID: "task-1", SessionKey: "s1", ToolName: "write_file",
+		ToolCallID: "call-1", Status: approval.ApprovalPending,
+		RequestedBy: "plugin:legion-gatekeeper", Reason: "writes are frozen during the incident",
+	}}}
+	srv := NewHTTPServer(Config{AdminToken: "token", ApprovalTickets: lister})
+	req := httptest.NewRequest(http.MethodGet, "/v1/approvals?status=pending", nil)
+	req.Header.Set("Authorization", "Bearer token")
+	rec := httptest.NewRecorder()
+
+	srv.ServeHTTP(rec, req)
+
+	var resp struct {
+		Approvals []map[string]any `json:"approvals"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("Unmarshal error = %v, body=%s", err, rec.Body.String())
+	}
+	if len(resp.Approvals) != 1 {
+		t.Fatalf("approvals len = %d, want 1", len(resp.Approvals))
+	}
+	got := resp.Approvals[0]
+	if got["requested_by"] != "plugin:legion-gatekeeper" {
+		t.Errorf("requested_by = %v, want the plugin that asked", got["requested_by"])
+	}
+	if got["reason"] != "writes are frozen during the incident" {
+		t.Errorf("reason = %v, want the requester's own words", got["reason"])
+	}
+}

@@ -102,6 +102,14 @@ legionplugin.Decide(func(req legionplugin.ToolDecisionRequest) legionplugin.Tool
 - **`ToolDecision` 的零值不是合法回答**：忘了返回会得到一个宿主解不了的文档（于是拒绝），而不是意外的放行。
 - **上限 `min(工具超时/4, 200ms)`**，比观察点更紧：工具还没开始跑。
 
+`Ask(reason)` 是第三种答案：不是拒绝，而是**要人批**。宿主在 round 边界挂起任务、开一张点名本插件与这条理由的票，人批了再从检查点继续；部署里没有审批通道时按拒绝处理。它**不看模式**——Auto 模式下同样会停下来等人。
+
+```go
+if req.Tool == "deploy" {
+	return legionplugin.Ask("deploys are reviewed by a human")
+}
+```
+
 ## 两条硬规矩
 
 - **工具失败返回 `Fail`，不要 panic。** panic 会 trap 整个模块，代价是实例状态、同实例的在途调用，并计入插件健康度（连续故障到阈值会被自动卸载）。
@@ -126,4 +134,4 @@ legionplugin.Decide(func(req legionplugin.ToolDecisionRequest) legionplugin.Tool
 
 ## 示例与测试
 
-`testdata/hello` 是一个完整的最小插件；`guest_test.go` 会把它**构建出来**（不提交产物：3 MB，而且会在 SDK 改动时立刻过期）并用真实 wazero 宿主跑通十件事：自述来自注册表（含 `extensions`）、闭环带 log 回调、缺参数是失败结果而非 trap、未授权即链接失败、GC 守卫确实在按住缓冲区、200 次调用后没有泄漏、op 2 真的到达注册的观察者、未知 op 有答案而不是 trap，以及决策点放行/拒绝两条路都真的走通。
+`testdata/hello` 是一个完整的最小插件；`guest_test.go` 会把它**构建出来**（不提交产物：3 MB，而且会在 SDK 改动时立刻过期）并用真实 wazero 宿主跑通十件事：自述来自注册表（含 `extensions`）、闭环带 log 回调、缺参数是失败结果而非 trap、未授权即链接失败、GC 守卫确实在按住缓冲区、200 次调用后没有泄漏、op 2 真的到达注册的观察者、未知 op 有答案而不是 trap，以及决策点放行/拒绝/送审三条路都真的走通。
