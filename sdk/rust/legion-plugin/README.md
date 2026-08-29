@@ -130,6 +130,25 @@ if request.tool == "deploy" {
 }
 ```
 
+### 提示词段：往系统提示词里加一段文字
+
+`prompt` 是第三个扩展点，也是唯一一个「不是调用」的：宿主在**激活时问一次**，答案在插件挂着期间进每一次推理。宏里再多一行（三个 seam 按 `observe` → `decide` → `prompt` 的顺序写）：
+
+```rust
+declare_plugin!(
+    name = "legion-jira",
+    version = "0.1.0",
+    tools = [("jira_search", jira_search)],
+    prompt = prompt_segment
+);
+
+fn prompt_segment() -> String {
+    String::from("When citing a Jira issue, link it as https://jira.example.com/browse/KEY.")
+}
+```
+
+四条边界：**只问一次**（可以读配置，但别每次说不一样的话——它待在稳定前缀里）；**带围栏**（`--- plugin "<名字>" (untrusted…) ---`）；**有上限**（单插件 2048 rune、合计 8192 rune，超长截断留痕）；**答不出来 = 插件挂不上**（空字符串则是合法的「没话说」）。
+
 ## 两条硬规矩
 
 - **工具失败返回 `ToolResult::fail`，不要 panic。** panic 会 trap 整个模块，代价是实例状态、同实例的在途调用，而且计入插件健康度（连续故障到阈值会被自动卸载）。
