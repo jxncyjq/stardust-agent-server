@@ -733,7 +733,7 @@ func newPluginsStatusCommand(application *app.App, out io.Writer) *cobra.Command
 				mergePluginStatus(deployment, pluginLoader.Status()))
 		},
 	}
-	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file")
+	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file (default: ~/.stardust/agent.json, or $STARDUST_HOME/agent.json)")
 	return cmd
 }
 
@@ -823,7 +823,7 @@ func newPluginsReloadCommand(application *app.App, out io.Writer) *cobra.Command
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file")
+	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file (default: ~/.stardust/agent.json, or $STARDUST_HOME/agent.json)")
 	return cmd
 }
 
@@ -1192,7 +1192,7 @@ func newPluginsInstallCommand(out io.Writer) *cobra.Command {
 		"comma-separated capabilities to grant; must name EXACTLY the set the plugin declares in plugin.json "+
 			"(not a subset), and authorizes the entry immediately (\"enabled\": true); allowed hosts and paths "+
 			"are still `agent plugins grant`'s job, not this flag's")
-	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file")
+	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file (default: ~/.stardust/agent.json, or $STARDUST_HOME/agent.json)")
 	return cmd
 }
 
@@ -1651,7 +1651,7 @@ func newPluginsGrantCommand(out io.Writer) *cobra.Command {
 		"comma-separated paths the fs capability may reach; each must be one the plugin itself declares in "+
 			`plugin.json's "filesystem.allowed_paths" (a subset of what is declared is fine; an undeclared `+
 			"path is refused, since AssembleSpec would otherwise silently drop it from the grant)")
-	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file")
+	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file (default: ~/.stardust/agent.json, or $STARDUST_HOME/agent.json)")
 	return cmd
 }
 
@@ -1986,7 +1986,7 @@ func newPluginsDenyCommand(out io.Writer) *cobra.Command {
 			return runPluginsDeny(cmd.Context(), out, args[0], configPath)
 		},
 	}
-	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file")
+	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file (default: ~/.stardust/agent.json, or $STARDUST_HOME/agent.json)")
 	return cmd
 }
 

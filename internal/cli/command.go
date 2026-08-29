@@ -175,7 +175,7 @@ func newRunCommand(application *app.App, out io.Writer) *cobra.Command {
 	cmd.Flags().StringVar(&maasURL, "maas-url", "", "MaaS inference base URL")
 	cmd.Flags().StringVar(&maasAPIKey, "maas-api-key", "", "MaaS API key")
 	cmd.Flags().StringVar(&maasProfile, "maas-profile", "", "MaaS profile name")
-	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file")
+	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file (default: ~/.stardust/agent.json, or $STARDUST_HOME/agent.json)")
 	cmd.Flags().BoolVar(&noContextFiles, "no-context-files", false, "disable AGENTS/SOUL/TOOLS/USER/MEMORY context file loading")
 	return cmd
 }
@@ -313,7 +313,7 @@ func newTUICommand(application *app.App, out io.Writer) *cobra.Command {
 			return err
 		},
 	}
-	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file")
+	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file (default: ~/.stardust/agent.json, or $STARDUST_HOME/agent.json)")
 	cmd.Flags().StringVar(&maasURL, "maas-url", "", "MaaS inference base URL")
 	cmd.Flags().StringVar(&maasAPIKey, "maas-api-key", "", "MaaS API key")
 	cmd.Flags().StringVar(&maasProfile, "maas-profile", "", "MaaS profile name")
@@ -1392,7 +1392,7 @@ func newServeCommand(application *app.App, out io.Writer) *cobra.Command {
 			return err
 		},
 	}
-	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file")
+	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file (default: ~/.stardust/agent.json, or $STARDUST_HOME/agent.json)")
 	cmd.Flags().StringVar(&addr, "addr", "", "HTTP listen address")
 	return cmd
 }
@@ -1574,7 +1574,7 @@ func newBackupCommand(out io.Writer) *cobra.Command {
 			return err
 		},
 	}
-	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file")
+	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file (default: ~/.stardust/agent.json, or $STARDUST_HOME/agent.json)")
 	cmd.Flags().StringVar(&backupPath, "out", "", "backup output path")
 	return cmd
 }
@@ -1604,7 +1604,7 @@ func newRestoreCommand(out io.Writer) *cobra.Command {
 			return err
 		},
 	}
-	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file")
+	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file (default: ~/.stardust/agent.json, or $STARDUST_HOME/agent.json)")
 	cmd.Flags().StringVar(&backupPath, "in", "", "backup input path")
 	return cmd
 }
@@ -1673,7 +1673,7 @@ func newDataRetentionCommand(out io.Writer) *cobra.Command {
 			return err
 		},
 	}
-	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file")
+	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file (default: ~/.stardust/agent.json, or $STARDUST_HOME/agent.json)")
 	cmd.Flags().IntVar(&auditDays, "audit-days", 0, "delete audit events older than this many days")
 	cmd.Flags().IntVar(&runtimeDays, "runtime-days", 0, "delete runtime events older than this many days")
 	cmd.Flags().IntVar(&qualityDays, "quality-days", 0, "delete quality history older than this many days")
@@ -1740,7 +1740,7 @@ func newDataExportCommand(out io.Writer) *cobra.Command {
 			return err
 		},
 	}
-	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file")
+	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file (default: ~/.stardust/agent.json, or $STARDUST_HOME/agent.json)")
 	cmd.Flags().StringVar(&exportPath, "out", "", "export output path")
 	return cmd
 }
@@ -1836,7 +1836,7 @@ func newSkillSyncCommand(out io.Writer) *cobra.Command {
 			return nil
 		},
 	}
-	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file")
+	cmd.Flags().StringVar(&configPath, "config", "", "agent JSON config file (default: ~/.stardust/agent.json, or $STARDUST_HOME/agent.json)")
 	cmd.Flags().StringVar(&registryURL, "registry-url", "", "skill registry index URL")
 	cmd.Flags().StringVar(&installRoot, "install-root", "", "skill install root")
 	cmd.Flags().StringVar(&agentName, "agent", "", "registered agent id whose skills config should be used")

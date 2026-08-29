@@ -460,21 +460,49 @@ type TasksConfig struct {
 	DoneStatuses    []string `json:"done_statuses"`
 }
 
+// Load reads the agent configuration.
+//
+// The path it reads is decided in this order:
+//
+//  1. opts.Path, when the caller named one (`--config`). A named file that is
+//     missing or undecodable is an ERROR: the operator said which file to use.
+//  2. the default location — <STARDUST_HOME or ~/.stardust>/agent.json — when
+//     a regular file is actually there. A file found here is loaded on exactly
+//     the same terms: if it cannot be decoded, Load fails rather than falling
+//     back to built-in defaults, because running a deployment on settings
+//     nobody wrote while the operator's real config sits unread is the worse
+//     outcome by far.
+//  3. nothing. Built-in defaults, no error — this is what a fresh install
+//     looks like before its first config file exists, and it is a supported
+//     way to run (a demo-response agent with no MaaS and no plugins).
+//
+// Environment variables are overlaid last (applyEnv) in every case.
+//
+// NOTE ON RELATIVE PATHS: values inside the config that name files —
+// storage.path, plugins.manifest/root/cache/keyring, context_files roots —
+// still resolve against the PROCESS WORKING DIRECTORY, not against the
+// directory the config was read from. Loading ~/.stardust/agent.json from
+// some other directory therefore does NOT move those paths into ~/.stardust.
+// Use absolute paths there, or run from the directory they are relative to.
 func Load(ctx context.Context, opts Options) (Config, error) {
 	if err := ctx.Err(); err != nil {
 		return Config{}, err
 	}
 	cfg := defaultConfig()
-	if opts.Path != "" {
-		data, err := os.ReadFile(opts.Path)
+	path := opts.Path
+	if path == "" {
+		path = DefaultConfigPathIfPresent()
+	}
+	if path != "" {
+		data, err := os.ReadFile(path)
 		if errors.Is(err, os.ErrNotExist) {
-			return Config{}, fmt.Errorf("%w: %s", ErrConfigNotFound, opts.Path)
+			return Config{}, fmt.Errorf("%w: %s", ErrConfigNotFound, path)
 		}
 		if err != nil {
-			return Config{}, fmt.Errorf("read config %q: %w", opts.Path, err)
+			return Config{}, fmt.Errorf("read config %q: %w", path, err)
 		}
 		if err := json.Unmarshal(data, &cfg); err != nil {
-			return Config{}, fmt.Errorf("decode config %q: %w", opts.Path, err)
+			return Config{}, fmt.Errorf("decode config %q: %w", path, err)
 		}
 	}
 	if err := applyEnv(&cfg); err != nil {
