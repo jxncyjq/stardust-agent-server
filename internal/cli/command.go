@@ -2032,6 +2032,21 @@ type defaultTaskRunner struct {
 	// legitimate "no session history configured" state.
 	conversationTurns agentruntime.ConversationTurnLister
 	sessionCfg        config.SessionConfig
+	// askArbiter answers, at dispatch time, whether a call a plugin's decider
+	// wanted approved HAS been approved. It is the same gate that opens those
+	// tickets at the round boundary — nothing else can read them back.
+	//
+	// The per-agent resolver installs its own; this path needs it for the same
+	// reason and was missed, which a real-machine run turned into "the human
+	// approved it and the call was refused anyway".
+	askArbiter tool.AskArbiter
+	// pluginTools is the registry mounted plugins contribute to. Every task
+	// registry this runner builds INHERITS from it, exactly as the per-agent
+	// resolver's do — this path serves every task whose agent_id is not in the
+	// agent registry, which is the GUI's own path and every default-agent
+	// task, so leaving it out would mean "plugins work, except for most
+	// tasks". A real-machine run caught precisely that.
+	pluginTools *tool.Registry
 }
 
 // RunTask builds a fresh workspace tool registry rooted at task.WorkingDir (or
@@ -2045,14 +2060,29 @@ type defaultTaskRunner struct {
 // no I/O), so this trades a small per-call allocation for a per-task sandbox
 // root — an intentional trade given the tool sandbox is a security boundary
 // (CLAUDE.md fail-loud/security posture).
-func (d *defaultTaskRunner) RunTask(ctx context.Context, agent domain.Agent, task domain.Task) (domain.TaskRun, error) {
-	root := strings.TrimSpace(task.WorkingDir)
-	if root == "" {
-		root = d.contextRoot
+// taskRoot is the sandbox root for one task: its own WorkingDir, or the
+// deployment's context root when it has none.
+func (d *defaultTaskRunner) taskRoot(task domain.Task) string {
+	if root := strings.TrimSpace(task.WorkingDir); root != "" {
+		return root
 	}
+	return d.contextRoot
+}
+
+// buildTaskTools builds the registry one default-agent task runs with.
+//
+// It is a method of its own so a test can assert what a task's registry can
+// reach without standing up a whole runtime — which is how the omission this
+// path had (no plugin tools) reached a real machine in the first place.
+func (d *defaultTaskRunner) buildTaskTools(task domain.Task) *tool.Registry {
+	root := d.taskRoot(task)
 	tools := tool.NewFileReadWriteWorkspaceRegistry(root, d.audit,
 		tool.WithAgentsInjection(d.toolMaxFileChars, d.homeDir),
-		tool.WithProjectRoot(root))
+		tool.WithProjectRoot(root),
+		tool.WithPluginTools(d.pluginTools))
+	if d.askArbiter != nil {
+		tools.SetAskArbiter(d.askArbiter)
+	}
 	tool.RegisterTaskLedgerTools(tools, d.taskLedger)
 	tool.RegisterAgentMessageTools(tools, d.messageStore)
 	tool.RegisterWebTools(tools, d.webOptions)
@@ -2062,6 +2092,12 @@ func (d *defaultTaskRunner) RunTask(ctx context.Context, agent domain.Agent, tas
 	}
 	tool.RegisterSessionSearchTool(tools, d.sessionSearcher)
 	agentruntime.RegisterMoAConsultTool(tools, d.maasResolver)
+	return tools
+}
+
+func (d *defaultTaskRunner) RunTask(ctx context.Context, agent domain.Agent, task domain.Task) (domain.TaskRun, error) {
+	root := d.taskRoot(task)
+	tools := d.buildTaskTools(task)
 	runtimeCfg := d.runtimeCfg
 	runtimeCfg.Tools = tools
 	runtimeCfg.ToolRoot = root
@@ -2596,6 +2632,8 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		// Same store the resolver path uses, so both runners read one history.
 		conversationTurns: conversationTurns,
 		sessionCfg:        cfg.Session,
+		pluginTools:       pluginTools,
+		askArbiter:        manualGate,
 	}
 	coordinator := agentruntime.NewCoordinator(agentruntime.CoordinatorConfig{
 		Agent:              serveDefaultAgent(),
