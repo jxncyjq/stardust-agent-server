@@ -126,6 +126,23 @@ type PluginManifest struct {
 	Filesystem   Filesystem `json:"filesystem"`
 	Tools        []ToolDecl `json:"tools"`
 
+	// ConfigSchema optionally describes the shape of the deployment-side
+	// configuration this plugin expects (the "config" of its plugins.json
+	// entry). It is a SUBSET of JSON Schema — see ParseConfigSchema for the
+	// exact keyword list — and it is what turns a typo in plugins.json from a
+	// runtime surprise inside the guest into a load-time refusal that names
+	// the field.
+	//
+	// Absent means "this plugin makes no claim about its configuration", which
+	// is what every plugin written before this field existed says: its config
+	// is then passed through unchecked, exactly as before.
+	//
+	// It carries ",omitempty" because this struct is also MARSHALLED — tests
+	// and packaging tools build a plugin.json from it — and a nil RawMessage
+	// would otherwise be written as the literal null, which ParsePlugin would
+	// then have to read as "a schema that declares nothing", i.e. an error.
+	ConfigSchema json.RawMessage `json:"config_schema,omitempty"`
+
 	// Requires lists the names of tools this plugin calls through
 	// call_tool: external dependencies on tools other plugins contribute.
 	// It is NOT a second capability list — that role belongs to
@@ -452,6 +469,15 @@ func validatePlugin(pm PluginManifest) error {
 	if pm.Limits.MaxInstances < 1 {
 		return fmt.Errorf("parse plugin manifest %q: limits.max_instances is %d, want >= 1",
 			pm.Name, pm.Limits.MaxInstances)
+	}
+	if hasConfigSchema(pm.ConfigSchema) {
+		// The schema is the PLUGIN AUTHOR's declaration, so a broken one is
+		// refused when the package is read rather than when a deployment
+		// happens to write a config: turning an author's mistake into an
+		// operator's mystery helps nobody.
+		if _, err := ParseConfigSchema(pm.ConfigSchema); err != nil {
+			return fmt.Errorf("parse plugin manifest %q: %w", pm.Name, err)
+		}
 	}
 	if len(pm.Tools) == 0 {
 		return fmt.Errorf("parse plugin manifest %q: tools is empty; a plugin exists to contribute tools",
