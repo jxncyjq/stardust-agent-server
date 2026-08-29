@@ -29,6 +29,7 @@ import (
 	"strings"
 
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
+	"github.com/stardust/legion-agent/internal/plugin/perm"
 )
 
 // ErrDeploymentChanged is what RefuseDeploymentChanged reports when the
@@ -321,4 +322,41 @@ func FindEntry(dep manifest.Deployment, name string) (manifest.Entry, error) {
 	}
 	return manifest.Entry{}, fmt.Errorf("no entry named %q exists in the deployment manifest; existing entries "+
 		"are: %s", name, existing)
+}
+
+// ResolveExtensions checks a proposed extension grant against what the plugin
+// declares, and returns the set to record.
+//
+// It is deliberately NOT the same rule as ResolveCapabilities above, and the
+// asymmetry is the point:
+//
+//   - capabilities must be granted in FULL, because manifest.reconcileCapabilities
+//     refuses an entry whose grant does not cover every declared capability —
+//     a partial capability grant produces an entry that can never load;
+//   - extensions may be granted in PART, because "you may observe, but you may
+//     not decide" is a sentence a deployment must be able to say. Granting
+//     none is a legal, meaningful answer: the plugin still contributes its
+//     tools and participates in nothing else.
+//
+// What is refused is the other direction — naming an extension the plugin
+// never declared — for the same reason an undeclared capability is refused:
+// handing a plugin something it did not ask for is a config error, not
+// generosity. Do not "simplify" these two functions into one.
+func ResolveExtensions(actor string, granted []string, pm manifest.PluginManifest) ([]string, error) {
+	if len(granted) == 0 {
+		return nil, nil
+	}
+	for _, extension := range granted {
+		if !slices.Contains(pm.Extensions, extension) {
+			return nil, fmt.Errorf("%s: names extension %q, which plugin %q does not declare in "+
+				"plugin.json (it declares: %v); granting an extension the plugin did not ask for is "+
+				"a config error, not generosity", actor, extension, pm.Name, pm.Extensions)
+		}
+	}
+	// Parsed for its own rules (unknown name, repeat); the caller records the
+	// names, and manifest.AssembleSpec reconciles them again at load time.
+	if _, err := perm.ParseExtensions(granted); err != nil {
+		return nil, fmt.Errorf("%s: %w", actor, err)
+	}
+	return granted, nil
 }

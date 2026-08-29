@@ -122,6 +122,13 @@ type GrantRequest struct {
 	Capabilities []string `json:"capabilities"`
 	AllowedHosts []string `json:"allowed_hosts"`
 	AllowedPaths []string `json:"allowed_paths"`
+	// Extensions names the host-side seams this plugin may be consulted at
+	// (currently only "observe"). Unlike Capabilities it may be a SUBSET of
+	// what the plugin declares, and an absent or empty list grants NONE —
+	// which is a complete, meaningful answer: the plugin still contributes
+	// its tools, it simply participates in nothing else. See
+	// consent.ResolveExtensions for why the two rules differ.
+	Extensions []string `json:"extensions"`
 }
 
 // ConsentResult is what PluginConsent.Grant and .Deny return once their
@@ -207,12 +214,14 @@ type PluginView struct {
 	DeclaredCaps             []string `json:"declared_capabilities"`
 	DeclaredHosts            []string `json:"declared_allowed_hosts"`
 	DeclaredPaths            []string `json:"declared_allowed_paths"`
+	DeclaredExtensions       []string `json:"declared_extensions"`
 	DeclaredUnresolved       bool     `json:"declared_unresolved"`
 	DeclaredUnresolvedReason string   `json:"declared_unresolved_reason,omitempty"`
 	DeclaredError            string   `json:"declared_error,omitempty"`
 	GrantedCaps              []string `json:"granted_capabilities"`
 	GrantedHosts             []string `json:"granted_allowed_hosts"`
 	GrantedPaths             []string `json:"granted_allowed_paths"`
+	GrantedExtensions        []string `json:"granted_extensions"`
 }
 
 // DeclaredUnresolvedNotCached is the PluginView.DeclaredUnresolvedReason for
