@@ -33,8 +33,10 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
+	"time"
 )
 
 // signatureAlgorithm is the only algorithm name ParseKeyring and
@@ -69,7 +71,33 @@ type Signature struct {
 // passed its shape checks and that no two entries share an id.
 type Keyring struct {
 	keys map[KeyID]ed25519.PublicKey
+	// revoked names keys this deployment has withdrawn trust from. A key may
+	// appear here AND in keys: revocation wins, and keeping the public key is
+	// what lets Verify say "this key was trusted and is not any more" instead
+	// of the far less useful "unknown key id".
+	revoked map[KeyID]Revocation
 }
+
+// Revocation records that a key is no longer trusted, with whatever the
+// operator chose to write down about it.
+//
+// At and Reason are optional and are used ONLY to build a better refusal: an
+// operator reading "signed by a revoked key" while deciding whether a package
+// is safe is helped enormously by "revoked 2026-08-29, laptop stolen".
+type Revocation struct {
+	KeyID  KeyID
+	At     time.Time
+	Reason string
+}
+
+// ErrRevokedKey marks a signature made by a key this deployment has revoked.
+//
+// It is a sentinel because the distinction matters upward: a package signed by
+// a revoked key is UNTRUSTED (internal/plugin/manifest wraps it as such, which
+// is what gives it a 422, no retry offer, and eviction from the cache), while
+// the message must still say revocation rather than "does not verify" — the
+// signature is mathematically fine, the key is not.
+var ErrRevokedKey = errors.New("signing key is revoked")
 
 // rawKeyEntry mirrors one entry of a keyring document's "keys" array for
 // decoding, before ParseKeyring has validated and base64-decoded it.
@@ -87,7 +115,19 @@ type rawKeyEntry struct {
 //	  ]
 //	}
 type rawKeyring struct {
-	Keys []rawKeyEntry `json:"keys"`
+	Keys    []rawKeyEntry   `json:"keys"`
+	Revoked []rawRevocation `json:"revoked"`
+}
+
+// rawRevocation mirrors one entry of a keyring document's "revoked" array:
+//
+//	{ "key_id": "ops-2026", "revoked_at": "2026-08-29T10:00:00Z", "reason": "laptop stolen" }
+//
+// revoked_at and reason are optional; key_id is not.
+type rawRevocation struct {
+	KeyID     KeyID  `json:"key_id"`
+	RevokedAt string `json:"revoked_at"`
+	Reason    string `json:"reason"`
 }
 
 // ParseKeyring decodes and validates a keyring document (the deployment's
@@ -132,6 +172,33 @@ func ParseKeyring(data []byte) (*Keyring, error) {
 			"signing would refuse every plugin")
 	}
 
+	revoked := make(map[KeyID]Revocation, len(raw.Revoked))
+	for i, entry := range raw.Revoked {
+		if entry.KeyID == "" {
+			return nil, fmt.Errorf("parse keyring: revoked[%d] has no key_id", i)
+		}
+		if _, dup := revoked[entry.KeyID]; dup {
+			// Two records for one id: which one is in force, and which
+			// timestamp does a refusal quote? There is no answer, so this is a
+			// document to fix rather than a case to pick a winner for.
+			return nil, fmt.Errorf("parse keyring: key id %q is revoked twice; a revocation must name each "+
+				"key once so the refusal can say when and why", entry.KeyID)
+		}
+		revocation := Revocation{KeyID: entry.KeyID, Reason: entry.Reason}
+		if entry.RevokedAt != "" {
+			at, err := time.Parse(time.RFC3339, entry.RevokedAt)
+			if err != nil {
+				// An unparseable timestamp would travel verbatim into the
+				// message an operator reads while deciding whether a package
+				// is safe.
+				return nil, fmt.Errorf("parse keyring: key %q revoked_at %q is not RFC 3339: %w",
+					entry.KeyID, entry.RevokedAt, err)
+			}
+			revocation.At = at
+		}
+		revoked[entry.KeyID] = revocation
+	}
+
 	keys := make(map[KeyID]ed25519.PublicKey, len(raw.Keys))
 	for i, entry := range raw.Keys {
 		if entry.ID == "" {
@@ -155,7 +222,54 @@ func ParseKeyring(data []byte) (*Keyring, error) {
 		}
 		keys[entry.ID] = ed25519.PublicKey(pub)
 	}
-	return &Keyring{keys: keys}, nil
+
+	// Every key revoked is an empty trust set spelled differently, and
+	// ParseKeyring already refuses an empty "keys" list for the same reason:
+	// with mandatory signing it refuses every plugin, and saying so once here
+	// beats saying it at every mount.
+	live := 0
+	for id := range keys {
+		if _, gone := revoked[id]; !gone {
+			live++
+		}
+	}
+	if live == 0 {
+		return nil, fmt.Errorf("parse keyring: every key in the trust set is revoked; that is an empty "+
+			"trust set, which combined with mandatory signing would refuse every plugin (revoked: %v)",
+			sortedKeyIDs(revoked))
+	}
+	return &Keyring{keys: keys, revoked: revoked}, nil
+}
+
+// RevokedIDs returns the ids of every revoked key, sorted.
+//
+// Sorted because it feeds a POLICY COMPARISON: internal/plugin/loader carries
+// this list in its SignaturePolicy, and `agent plugins reload` refuses to
+// converge when the config's policy differs from the running one. An unstable
+// order there would make a policy compare unequal to itself.
+func (k *Keyring) RevokedIDs() []KeyID {
+	if k == nil {
+		panic("sign: RevokedIDs called on a nil *Keyring")
+	}
+	return sortedKeyIDs(k.revoked)
+}
+
+// Revoked reports the revocation record for id, if it has one.
+func (k *Keyring) Revoked(id KeyID) (Revocation, bool) {
+	if k == nil {
+		panic("sign: Revoked called on a nil *Keyring")
+	}
+	revocation, ok := k.revoked[id]
+	return revocation, ok
+}
+
+func sortedKeyIDs(revoked map[KeyID]Revocation) []KeyID {
+	ids := make([]KeyID, 0, len(revoked))
+	for id := range revoked {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids
 }
 
 // IDs returns the ids of every key in the keyring, sorted for a
@@ -213,6 +327,14 @@ func (k *Keyring) Verify(sig Signature, message []byte) error {
 	}
 	if sig.Algorithm != signatureAlgorithm {
 		return fmt.Errorf("verify signature: algorithm is %q, want %q", sig.Algorithm, signatureAlgorithm)
+	}
+	// Revocation is checked BEFORE the key lookup, and that order is the
+	// point: a revoked key may still be listed in "keys" (keeping the public
+	// key is what lets this message explain itself), so looking the key up
+	// first and verifying against it would accept exactly the signatures this
+	// feature exists to refuse.
+	if revocation, gone := k.revoked[sig.KeyID]; gone {
+		return fmt.Errorf("verify signature: key %q%s: %w", sig.KeyID, revocation.describe(), ErrRevokedKey)
 	}
 	pub, ok := k.keys[sig.KeyID]
 	if !ok {
@@ -517,4 +639,23 @@ func ParsePrivateKey(data []byte) (KeyID, ed25519.PrivateKey, error) {
 			raw.KeyID, len(priv), ed25519.PrivateKeySize)
 	}
 	return raw.KeyID, ed25519.PrivateKey(priv), nil
+}
+
+// describe renders the optional context of a revocation for an error message:
+// when it happened and why, when the operator wrote either down.
+//
+// It returns "" when neither was recorded, so the caller's message reads
+// naturally with or without it — a revocation with no metadata is still a
+// revocation, and refusing to state it would be worse than stating it plainly.
+func (r Revocation) describe() string {
+	switch {
+	case !r.At.IsZero() && r.Reason != "":
+		return fmt.Sprintf(" was revoked at %s (%s)", r.At.Format(time.RFC3339), r.Reason)
+	case !r.At.IsZero():
+		return fmt.Sprintf(" was revoked at %s", r.At.Format(time.RFC3339))
+	case r.Reason != "":
+		return fmt.Sprintf(" was revoked (%s)", r.Reason)
+	default:
+		return " was revoked"
+	}
 }
