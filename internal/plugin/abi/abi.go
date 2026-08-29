@@ -40,6 +40,17 @@ const (
 	// OpCallTool is the plugin_invoke operation the host uses to ask the
 	// guest to execute one of the tools the plugin contributes.
 	OpCallTool int32 = 1
+
+	// OpObserveToolResult is the host telling a guest, read-only, that a tool
+	// call answered. The body is a JSON observation (host.guestToolObservation:
+	// the call and its result together); the guest's answer is READ AND
+	// DISCARDED.
+	//
+	// It is the first op the HOST initiates for reasons other than running the
+	// guest's own tool, which is why the guest may simply not implement it: an
+	// unknown op answers with a small error body by convention, and the host
+	// discards that like any other answer.
+	OpObserveToolResult int32 = 2
 )
 
 // PackResult encodes a pointer and length into the i64 return value of
