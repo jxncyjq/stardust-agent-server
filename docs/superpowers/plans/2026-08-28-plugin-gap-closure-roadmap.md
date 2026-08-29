@@ -2,7 +2,7 @@
 
 **日期**：2026-08-28
 **上游依据**：设计文档 `docs/design/architecture/legion-plugin-system.md`（docs 仓）§6.9 / §8 / §9；与 dsh Cordis 的逐项比对（2026-08-28）
-**当前基线**：P0 / P0.5 / P1 / P2-A4a / P2-A4b / P3-A5a / P3-A5b / P3-A5c / GUI 同意流 **全部已交付并合入 master**；`plugin_example/` 与参考手册已交付
+**当前基线**：P0 / P0.5 / P1 / P2-A4a / P2-A4b / P3-A5a / P3-A5b / P3-A5c / GUI 同意流 **全部已交付并合入 master**；`plugin_example/` 与参考手册已交付。本路线图的 **G1 / G2 / G3 / G5 / G6 / G7 已交付并合入 master**；**G4 拆成 a-d 四步，G4a（只读观察点）已交付**，G4b/G4c/G4d 待做（见下）
 
 这份文档只做一件事：把「与 Cordis 比对后确认还缺的东西」排成可执行的期次。**每一期开工时另写自己的 TDD 实施计划**（仓内惯例，见 `plans/2026-08-2x-*.md`），本文件只定范围、顺序、验收与边界。
 
@@ -93,6 +93,17 @@ Cordis 是**进程内 TS 插件内核**——dsh 的一切（shell / llm / sessi
 ### G4 扩展面：拦截点与 prompt 段
 
 **为什么**：这是与 Cordis 差距最大的一块，也是「插件能不能做横切能力」的分水岭。Cordis 插件可以挂 `tools/pre-execute`（waterfall 策略）、`tools/execute`（around 包装）、`tools/post-execute`（改写结果）、`tools/result`（只读通知），外加 `tools.guard()` 单调守护，还能贡献 systemPrompt 段。Legion 宿主自己有审批与模式策略，但**插件参与不进去**：今天插件只能贡献 tool。
+
+**拆期与进度**（spec 见 `2026-08-29-plugin-observe-extension.md`）：
+
+| 步 | 内容 | 状态 |
+|---|---|---|
+| G4a | 只读观察点（`observe` 扩展点）：`perm.Extensions`、`tool.Observer` seam、op 2、grant/HTTP/视图、两个 SDK、激活期交叉校验 | **已交付** |
+| G4b | 决策点 deny：包一层 `tool.Policy`，多插件取最严，失败 fail-closed | 待做 |
+| G4c | 决策点 `ask`：接进 `runtime.ToolGate` 的既有审批队列，必须说清是哪个插件要的；`-race` 必跑 | 待做 |
+| G4d | prompt 段：稳定前缀块、长度上限、`--- plugin "x" (untrusted) ---` 边界标记、token 说明 | 待做 |
+
+G4a 落下来的三条不可违反的事实：**未授权 = 不存在的注册**（不是运行期 if）；**授权是子集**（能力才是全等）；**授权了而 guest 没实现 = 激活期拒绝**（否则宿主会在每次工具调用上回调一个只会答 unsupported op 的 guest，静默且永远）。
 
 **范围**（需先写 spec，因为每一条都有安全含义）：
 - 插件可注册**只读观察点**（对应 `tools/result`）——最安全，先做；

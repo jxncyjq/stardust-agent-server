@@ -26,7 +26,38 @@ func init() {
 		// A real plugin would not ship it — but a plugin author debugging a
 		// leak might add exactly this.
 		legionplugin.Tool{Name: "live_buffers", Handler: liveBuffers},
+		// last_observation exists for the same reason live_buffers does: it
+		// is the only way a test can ask the guest what its OBSERVER saw. The
+		// observe seam is one-way by construction — the host discards
+		// whatever op 2 answers — so proving the observer ran means asking
+		// the guest afterwards, through the one direction that does return
+		// something.
+		legionplugin.Tool{Name: "last_observation", Handler: lastObservation},
 	)
+	legionplugin.Observe(recordObservation)
+}
+
+// seen is the last observation this plugin was told about.
+//
+// A single variable is enough because a plugin instance serves ONE call at a
+// time: the host's pool hands an instance to a call exclusively for its whole
+// duration, so nothing here races.
+var seen legionplugin.ToolObservation
+
+// recordObservation is the observer. It returns nothing, does almost nothing,
+// and that is the shape of this seam: it runs inside somebody else's tool
+// call, bounded at 200ms, and every millisecond it spends is spent by that
+// caller.
+func recordObservation(observation legionplugin.ToolObservation) {
+	seen = observation
+}
+
+// lastObservation reports what the observer saw, as "<tool> <success>".
+func lastObservation(legionplugin.ToolCall) legionplugin.ToolResult {
+	if seen.Tool == "" {
+		return legionplugin.Fail("no observation has arrived yet")
+	}
+	return legionplugin.OK(seen.Tool + " " + strconv.FormatBool(seen.Success))
 }
 
 // helloEcho greets by name, logging through the host on the way.

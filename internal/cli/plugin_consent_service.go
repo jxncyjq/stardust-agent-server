@@ -190,6 +190,7 @@ func (s *PluginConsentService) List(ctx context.Context) ([]server.PluginView, e
 		view.GrantedCaps = entry.Grant.Capabilities
 		view.GrantedHosts = entry.Grant.AllowedHosts
 		view.GrantedPaths = entry.Grant.AllowedPaths
+		view.GrantedExtensions = entry.Grant.Extensions
 
 		dir, resolved, reason, resolveErr := s.resolveDeclaredPackageDir(ctx, entry)
 		if resolveErr != nil {
@@ -221,6 +222,7 @@ func (s *PluginConsentService) List(ctx context.Context) ([]server.PluginView, e
 		view.DeclaredCaps = pm.Capabilities
 		view.DeclaredHosts = pm.Network.AllowedHosts
 		view.DeclaredPaths = pm.Filesystem.AllowedPaths
+		view.DeclaredExtensions = pm.Extensions
 		views = append(views, view)
 	}
 	return views, nil
@@ -374,6 +376,10 @@ func (s *PluginConsentService) Grant(ctx context.Context, name string, req serve
 	if err != nil {
 		return server.ConsentResult{}, err
 	}
+	requestedExtensions, err := consent.NormalizeList(pluginConsentGrantActor, "extensions", req.Extensions)
+	if err != nil {
+		return server.ConsentResult{}, err
+	}
 
 	capabilities, err := consent.ResolveCapabilities(pluginConsentGrantActor, requestedCaps, pm)
 	if err != nil {
@@ -384,6 +390,10 @@ func (s *PluginConsentService) Grant(ctx context.Context, name string, req serve
 		return server.ConsentResult{}, err
 	}
 	paths, err := consent.ResolveAllowedPaths(pluginConsentGrantActor, requestedPaths, pm)
+	if err != nil {
+		return server.ConsentResult{}, err
+	}
+	extensions, err := consent.ResolveExtensions(pluginConsentGrantActor, requestedExtensions, pm)
 	if err != nil {
 		return server.ConsentResult{}, err
 	}
@@ -401,7 +411,12 @@ func (s *PluginConsentService) Grant(ctx context.Context, name string, req serve
 	updated, err := manifest.UpdateEntry(dep, name, func(e manifest.Entry) (manifest.Entry, error) {
 		e.Enabled = true
 		e.GrantStated = true
-		e.Grant = manifest.GrantDecl{Capabilities: capabilities, AllowedHosts: hosts, AllowedPaths: paths}
+		e.Grant = manifest.GrantDecl{
+			Capabilities: capabilities,
+			AllowedHosts: hosts,
+			AllowedPaths: paths,
+			Extensions:   extensions,
+		}
 		return e, nil
 	})
 	if err != nil {
@@ -422,6 +437,7 @@ func (s *PluginConsentService) Grant(ctx context.Context, name string, req serve
 	result.View.DeclaredCaps = pm.Capabilities
 	result.View.DeclaredHosts = pm.Network.AllowedHosts
 	result.View.DeclaredPaths = pm.Filesystem.AllowedPaths
+	result.View.DeclaredExtensions = pm.Extensions
 	return result, nil
 }
 
@@ -488,13 +504,15 @@ func (s *PluginConsentService) Resolve(ctx context.Context, name string) (server
 	// honest State/Detail/Tools to report -- those stay at their zero value
 	// rather than being guessed at.
 	return server.PluginView{
-		Name:          name,
-		GrantedCaps:   entry.Grant.Capabilities,
-		GrantedHosts:  entry.Grant.AllowedHosts,
-		GrantedPaths:  entry.Grant.AllowedPaths,
-		DeclaredCaps:  pm.Capabilities,
-		DeclaredHosts: pm.Network.AllowedHosts,
-		DeclaredPaths: pm.Filesystem.AllowedPaths,
+		Name:               name,
+		GrantedCaps:        entry.Grant.Capabilities,
+		GrantedHosts:       entry.Grant.AllowedHosts,
+		GrantedPaths:       entry.Grant.AllowedPaths,
+		GrantedExtensions:  entry.Grant.Extensions,
+		DeclaredCaps:       pm.Capabilities,
+		DeclaredHosts:      pm.Network.AllowedHosts,
+		DeclaredPaths:      pm.Filesystem.AllowedPaths,
+		DeclaredExtensions: pm.Extensions,
 	}, nil
 }
 
@@ -624,10 +642,11 @@ func (s *PluginConsentService) applyAndReport(ctx context.Context, pluginLoader 
 	// response with no name is one the GUI cannot match back to the row it
 	// came from.
 	view := server.PluginView{
-		Name:         name,
-		GrantedCaps:  entry.Grant.Capabilities,
-		GrantedHosts: entry.Grant.AllowedHosts,
-		GrantedPaths: entry.Grant.AllowedPaths,
+		Name:              name,
+		GrantedCaps:       entry.Grant.Capabilities,
+		GrantedHosts:      entry.Grant.AllowedHosts,
+		GrantedPaths:      entry.Grant.AllowedPaths,
+		GrantedExtensions: entry.Grant.Extensions,
 	}
 
 	if applyErr != nil && (errors.Is(applyErr, taskgate.ErrBoundaryNotReached) ||

@@ -306,6 +306,50 @@ func (f *pluginFixture) writePackageWithRequires(source, wasmFile, name, version
 	}
 }
 
+// writePackageWithExtensions is writePackage plus a plugin.json "extensions"
+// declaration — the list of host-side seams the plugin ASKS to participate in.
+// A grant may name a subset of these (see consent.ResolveExtensions), so a
+// fixture needs to be able to declare more than it is granted.
+func (f *pluginFixture) writePackageWithExtensions(source, wasmFile, name, version string,
+	tools, extensions []string) {
+	f.t.Helper()
+
+	dir := filepath.Join(f.root, source)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		f.t.Fatalf("create package dir %s: %v", dir, err)
+	}
+	wasm := readWasmFixture(f.t, wasmFile)
+	sum := sha256.Sum256(wasm)
+	decls := make([]manifest.ToolDecl, 0, len(tools))
+	for _, toolName := range tools {
+		decls = append(decls, manifest.ToolDecl{
+			Name:        toolName,
+			Description: "fixture tool " + toolName,
+			Group:       "plugins",
+			RiskLevel:   "low",
+			TimeoutMs:   1000,
+		})
+	}
+	data, err := json.Marshal(manifest.PluginManifest{
+		Name:       name,
+		Version:    version,
+		ABI:        1,
+		SHA256:     hex.EncodeToString(sum[:]),
+		Limits:     manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
+		Tools:      decls,
+		Extensions: extensions,
+	})
+	if err != nil {
+		f.t.Fatalf("encode plugin.json for %s: %v", name, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "plugin.json"), data, 0o644); err != nil {
+		f.t.Fatalf("write plugin.json for %s: %v", name, err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "plugin.wasm"), wasm, 0o644); err != nil {
+		f.t.Fatalf("write plugin.wasm for %s: %v", name, err)
+	}
+}
+
 // writePackageWithNetwork is writePackage plus explicit Network/Filesystem
 // declarations, for SHOULD-FIX-4's tests: `agent plugins grant`'s
 // --allowed-hosts/--allowed-paths validation checks a named host/path
@@ -5197,5 +5241,73 @@ func writeKeyringDoc(t *testing.T, path string, keys []map[string]string, revoke
 	}
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatalf("write keyring %s: %v", path, err)
+	}
+}
+
+// TestPluginsGrantWritesExtensions covers the operator-facing half of the
+// extension grant: --extensions lands in plugins.json, and only names the
+// plugin declared are accepted.
+func TestPluginsGrantWritesExtensions(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackageWithExtensions("echo", testEchoWasm, testEchoPlugin, "1.2.0",
+		[]string{testEchoTool}, []string{"observe"})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+
+	if _, err := f.run("grant", testEchoPlugin, "--extensions", "observe"); err != nil {
+		t.Fatalf("plugins grant --extensions: %v", err)
+	}
+
+	dep, err := readPluginDeployment(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read deployment: %v", err)
+	}
+	if len(dep.Plugins) != 1 {
+		t.Fatalf("deployment has %d entries, want 1", len(dep.Plugins))
+	}
+	if got := dep.Plugins[0].Grant.Extensions; len(got) != 1 || got[0] != "observe" {
+		t.Errorf("grant.extensions = %v, want [observe]", got)
+	}
+}
+
+// TestPluginsGrantWithNoExtensionsGrantsNone: leaving the flag off is a
+// meaningful answer — the plugin contributes its tools and participates in
+// nothing else — not an implicit "all of them".
+func TestPluginsGrantWithNoExtensionsGrantsNone(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackageWithExtensions("echo", testEchoWasm, testEchoPlugin, "1.2.0",
+		[]string{testEchoTool}, []string{"observe"})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+
+	if _, err := f.run("grant", testEchoPlugin); err != nil {
+		t.Fatalf("plugins grant: %v", err)
+	}
+
+	dep, err := readPluginDeployment(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read deployment: %v", err)
+	}
+	if got := dep.Plugins[0].Grant.Extensions; len(got) != 0 {
+		t.Errorf("grant.extensions = %v, want none: an omitted flag grants nothing", got)
+	}
+}
+
+func TestPluginsGrantRefusesAnUndeclaredExtension(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackageWithExtensions("echo", testEchoWasm, testEchoPlugin, "1.2.0",
+		[]string{testEchoTool}, nil) // declares no extensions
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+
+	_, err := f.run("grant", testEchoPlugin, "--extensions", "observe")
+	if err == nil {
+		t.Fatal("plugins grant --extensions for an undeclared extension = nil error, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "observe") {
+		t.Errorf("error = %v, want it to name the extension", err)
 	}
 }

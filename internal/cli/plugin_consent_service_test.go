@@ -1470,3 +1470,121 @@ func TestPluginConsentServiceResolveKeepsTheCacheWhenTheFailureIsNotATrustFailur
 			"evicting it only re-downloads the same broken bytes", dir, err)
 	}
 }
+
+// TestPluginConsentServiceGrantRecordsASubsetOfDeclaredExtensions is the HTTP
+// half of the extension grant, and it pins the rule that separates extensions
+// from capabilities: a plugin may declare an extension and be granted NONE of
+// it. The plugin still contributes its tools; it simply is not consulted at
+// that seam.
+func TestPluginConsentServiceGrantRecordsASubsetOfDeclaredExtensions(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackageWithExtensions("echo", testEchoWasm, testEchoPlugin, "1.0.0",
+		[]string{testEchoTool}, []string{"observe"})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	svc := f.newGrantTestService()
+	result, err := svc.Grant(context.Background(), testEchoPlugin, server.GrantRequest{})
+	if err != nil {
+		t.Fatalf("Grant() error = %v, want nil", err)
+	}
+	if !slices.Equal(result.View.DeclaredExtensions, []string{"observe"}) {
+		t.Errorf("Grant() View.DeclaredExtensions = %v, want [observe]", result.View.DeclaredExtensions)
+	}
+	if len(result.View.GrantedExtensions) != 0 {
+		t.Errorf("Grant() View.GrantedExtensions = %v, want none: an absent list grants nothing",
+			result.View.GrantedExtensions)
+	}
+	if got := f.requireEntry(f.readDeployment(), testEchoPlugin).Grant.Extensions; len(got) != 0 {
+		t.Errorf("entry.Grant.Extensions = %v, want none", got)
+	}
+}
+
+func TestPluginConsentServiceGrantRecordsAGrantedExtension(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackageWithExtensions("echo", testEchoWasm, testEchoPlugin, "1.0.0",
+		[]string{testEchoTool}, []string{"observe"})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	svc := f.newGrantTestService()
+	result, err := svc.Grant(context.Background(), testEchoPlugin,
+		server.GrantRequest{Extensions: []string{"observe"}})
+	if err != nil {
+		t.Fatalf("Grant() error = %v, want nil", err)
+	}
+	if !slices.Equal(result.View.GrantedExtensions, []string{"observe"}) {
+		t.Errorf("Grant() View.GrantedExtensions = %v, want [observe]", result.View.GrantedExtensions)
+	}
+	if got := f.requireEntry(f.readDeployment(), testEchoPlugin).Grant.Extensions; !slices.Equal(got, []string{"observe"}) {
+		t.Errorf("entry.Grant.Extensions = %v, want [observe]", got)
+	}
+}
+
+// TestPluginConsentServiceGrantRefusesAnUndeclaredExtensionOverHTTP: the same
+// refusal the CLI gives, on the same shared consent rule. A grant naming a
+// seam the plugin never asked for is a config error, and writing it would
+// leave plugins.json claiming an authorization the loader then refuses.
+func TestPluginConsentServiceGrantRefusesAnUndeclaredExtensionOverHTTP(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackageWithExtensions("echo", testEchoWasm, testEchoPlugin, "1.0.0",
+		[]string{testEchoTool}, nil)
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	svc := f.newGrantTestService()
+	_, err := svc.Grant(context.Background(), testEchoPlugin,
+		server.GrantRequest{Extensions: []string{"observe"}})
+	if err == nil {
+		t.Fatal("Grant() with an undeclared extension = nil error, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "observe") {
+		t.Errorf("Grant() error = %v, want it to name the extension", err)
+	}
+	if got := f.requireEntry(f.readDeployment(), testEchoPlugin).Grant.Extensions; len(got) != 0 {
+		t.Errorf("entry.Grant.Extensions = %v, want none: a refused grant must not be written", got)
+	}
+}
+
+// TestPluginConsentServiceListSurfacesExtensionsSeparately: declared and
+// granted are two different facts on this seam too, and the consent dialog
+// renders the checkbox from the first and its state from the second.
+func TestPluginConsentServiceListSurfacesExtensionsSeparately(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackageWithExtensions("echo", testEchoWasm, testEchoPlugin, "1.0.0",
+		[]string{testEchoTool}, []string{"observe"})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	svc := f.newGrantTestService()
+	views, err := svc.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v, want nil", err)
+	}
+	if len(views) != 1 {
+		t.Fatalf("List() returned %d views, want 1", len(views))
+	}
+	if !slices.Equal(views[0].DeclaredExtensions, []string{"observe"}) {
+		t.Errorf("List() DeclaredExtensions = %v, want [observe]", views[0].DeclaredExtensions)
+	}
+	if len(views[0].GrantedExtensions) != 0 {
+		t.Errorf("List() GrantedExtensions = %v, want none: nothing has been granted yet",
+			views[0].GrantedExtensions)
+	}
+}

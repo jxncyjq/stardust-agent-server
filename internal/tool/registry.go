@@ -71,6 +71,12 @@ type Registry struct {
 	mu        sync.RWMutex
 	handlers  map[string]Handler
 	describes map[string]Descriptor
+	// observers are notified after a completed call (see observer.go). They
+	// live under the same lock as the handler maps because registration and
+	// revocation race the same way, but they are always COPIED before being
+	// called — see notifyObservers for why holding the lock across a
+	// notification would deadlock a plugin that unloads itself.
+	observers []*registeredObserver
 }
 
 func NewRegistry(policy Policy, enforcer PermissionEnforcer, guards Guardrails) *Registry {
@@ -329,6 +335,11 @@ func (r *Registry) Execute(ctx context.Context, agent domain.Agent, call domain.
 	if err := r.appendAudit(ctx, agent, call, "tool_executed"); err != nil {
 		return domain.ToolResult{}, err
 	}
+	// Observers run last, on a result that is already final: nothing they do
+	// can change what this function returns. See Observer for why the
+	// exclusions above (permission/policy/guardrail refusals, handler errors)
+	// are part of the contract rather than an oversight.
+	r.notifyObservers(ctx, call, result)
 	return result, nil
 }
 

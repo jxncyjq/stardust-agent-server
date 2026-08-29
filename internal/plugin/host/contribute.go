@@ -99,6 +99,20 @@ func contributeTools(
 			"contributed tool would be dropped, so a panicking contribution could not be rolled back", spec.Name))
 	}
 
+	// The observe extension, when the deployment granted it: one registration
+	// per plugin, filed under the SAME contribution owner the tools are, so a
+	// suspend or an unload takes the plugin off this seam together with its
+	// tools. A plugin whose tools were withdrawn but which kept watching every
+	// call would be a plugin the deployment believes it has disabled.
+	//
+	// Not granted means not registered — there is nothing in the host to call,
+	// which is the same shape as an ungranted capability being absent from the
+	// host module rather than refusing at call time.
+	if spec.Extensions.Observe {
+		keep(tool.ObserveOwned(ledger, owner, spec.Registry, "plugin:"+spec.Name,
+			newPluginObserver(spec.Deps, guest)))
+	}
+
 	for _, descriptor := range spec.Tools {
 		handler := pluginToolHandler(spec.Name, spec.Deps, descriptor.Name, guest, spec.Deps.OnFault)
 		keep(tool.RegisterOwned(ledger, owner, spec.Registry, descriptor, handler))

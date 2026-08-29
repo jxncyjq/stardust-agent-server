@@ -10,12 +10,18 @@
 //!
 //! 完整的能力表、边界与取舍见 `sdk/rust/legion-plugin/README.md`。
 
-use legion_plugin::{declare_plugin, log_info, ToolCall, ToolResult};
+use legion_plugin::{declare_plugin, log_info, ToolCall, ToolObservation, ToolResult};
 
 declare_plugin!(
     name = "legion-hello",
     version = "0.1.0",
-    tools = [("hello_echo", hello_echo)]
+    tools = [("hello_echo", hello_echo)],
+    // observe 是一个**扩展点**，不是能力：宿主在每次工具调用答完之后回调这里。
+    // 它同样是三处联动——这一行、`plugin.json` 的 `extensions`、部署侧的
+    // `agent plugins grant --extensions observe`。少了最后一步，宿主根本不会
+    // 注册观察者（未授权 = 不存在的注册，不是运行期检查）；少了中间那步，激活
+    // 期的交叉校验会拒绝这次授权。
+    observe = log_observation
 );
 
 /// hello_echo 读入参 `name`，经 `log` 能力回调宿主写一行日志，再把问候语作为
@@ -33,4 +39,20 @@ fn hello_echo(call: &ToolCall) -> ToolResult {
         }
         None => ToolResult::fail("missing required argument: name"),
     }
+}
+
+/// log_observation 是观察者：宿主每完成一次工具调用（**任意工具**，不只是本
+/// 插件自己的）就调它一次，把调用与结果一起给过来。
+///
+/// 它什么也不返回，也改不了任何东西——调用方拿到结果那一刻就已经定了，宿主会
+/// 丢弃这里的应答。这就是这个 seam 敢交给不受信代码的原因。
+///
+/// 它必须**快**：这段代码跑在别人的工具调用里，宿主给每次通知 200ms 上限，超
+/// 时按故障计入本插件的健康度。要做贵的活儿，就把需要的东西记下来，留到自己
+/// 的下一次工具调用里做。
+fn log_observation(observation: &ToolObservation) {
+    log_info(&format!(
+        "observed tool={} success={}",
+        observation.tool, observation.success
+    ));
 }

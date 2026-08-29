@@ -158,4 +158,10 @@ type manifestDoc struct {
 	Name     string   `json:"name"`
 	Version  string   `json:"version"`
 	Provides []string `json:"provides"`
+	// Extensions is derived from Observe the same way Provides is derived
+	// from Serve: what the guest says it implements cannot drift from what it
+	// actually dispatches. The host refuses a grant naming an extension that
+	// is absent here (see host.crossCheck), so an author who forgets to
+	// register one is told at activation rather than never.
+	Extensions []string `json:"extensions,omitempty"`
 }

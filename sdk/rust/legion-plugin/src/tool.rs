@@ -95,6 +95,59 @@ impl ToolResult {
 /// ToolHandler 是一个工具的实现：拿到调用，给出结果。
 pub type ToolHandler = fn(&ToolCall) -> ToolResult;
 
+/// ToolObservation 是宿主在一次工具调用**答完之后**告诉插件的那件事：调用本身
+/// 与它的结果，一起给。
+///
+/// 只有被授予 `observe` 扩展点的插件会收到它，而且 `tool` 是 agent 跑过的任意
+/// 工具，不限于本插件自己的——这正是这个 seam 的用途。
+///
+/// 它是单向的：观察者没有返回值，宿主会丢弃 op 2 的应答，所以插件在这里改不了
+/// 任何东西。调用方拿到结果那一刻就已经定了。
+pub struct ToolObservation {
+    pub call_id: String,
+    pub tool: String,
+    pub arguments: BTreeMap<String, String>,
+    pub success: bool,
+    pub output: String,
+    pub error: String,
+}
+
+impl ToolObservation {
+    /// parse 读一次 `abi::OP_OBSERVE_TOOL_RESULT` 的请求体。
+    ///
+    /// 缺 `tool` 或缺 `success` 都是错误，不是默认值：一个不知道自己在看哪个
+    /// 工具、或者猜一个 `success=false` 的观察者，会把「宿主发来的文档变了」
+    /// 记成「那个工具失败了」——那是最难查的一类脏数据。
+    pub fn parse(body: &[u8]) -> Result<ToolObservation, json::ParseError> {
+        let object = json::parse(body)?;
+        let tool = object
+            .strings
+            .get("tool")
+            .filter(|value| !value.is_empty())
+            .ok_or(json::ParseError::MissingField("tool"))?
+            .clone();
+        let success = *object
+            .bools
+            .get("success")
+            .ok_or(json::ParseError::MissingField("success"))?;
+        Ok(ToolObservation {
+            call_id: object.strings.get("call_id").cloned().unwrap_or_default(),
+            tool,
+            arguments: object.arguments,
+            success,
+            output: object.strings.get("output").cloned().unwrap_or_default(),
+            error: object.strings.get("error").cloned().unwrap_or_default(),
+        })
+    }
+}
+
+/// Observer 是观察者的实现：拿到一次已完成调用，**什么也不返回**。
+///
+/// 没有返回值是契约本身，不是省略。另外它必须**快**：它跑在别人的工具调用里，
+/// 宿主给每次通知 200ms 的上限，超时会记进本插件的健康度，连续失败足够多次会
+/// 被卸载。贵的活儿留到自己的下一次调用里做。
+pub type Observer = fn(&ToolObservation);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +202,48 @@ mod tests {
         let json = ToolResult::fail("missing required argument: name").to_json();
         assert!(json.contains("\"success\":false"), "got {json}");
         assert!(json.contains("missing required argument: name"), "got {json}");
+    }
+}
+
+#[cfg(test)]
+mod observation_tests {
+    use super::*;
+
+    #[test]
+    fn parses_an_observation_with_its_result() {
+        let observation = ToolObservation::parse(
+            br#"{"call_id":"c1","tool":"write_file","arguments":{"path":"/tmp/x"},"success":true,"output":"wrote 3 bytes","error":""}"#,
+        )
+        .expect("a well-formed observation must parse");
+        assert_eq!(observation.call_id, "c1");
+        assert_eq!(observation.tool, "write_file");
+        assert_eq!(observation.arguments.get("path").map(String::as_str), Some("/tmp/x"));
+        assert!(observation.success);
+        assert_eq!(observation.output, "wrote 3 bytes");
+    }
+
+    #[test]
+    fn parses_a_failed_observation() {
+        let observation =
+            ToolObservation::parse(br#"{"tool":"read_file","success":false,"error":"no such file"}"#)
+                .expect("parse");
+        assert!(!observation.success, "success=false must not read as true");
+        assert_eq!(observation.error, "no such file");
+    }
+
+    #[test]
+    fn a_missing_success_field_is_an_error_not_a_guess() {
+        assert_eq!(
+            ToolObservation::parse(br#"{"tool":"read_file"}"#).err(),
+            Some(json::ParseError::MissingField("success"))
+        );
+    }
+
+    #[test]
+    fn a_missing_tool_field_is_an_error() {
+        assert_eq!(
+            ToolObservation::parse(br#"{"success":true}"#).err(),
+            Some(json::ParseError::MissingField("tool"))
+        );
     }
 }

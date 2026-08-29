@@ -53,6 +53,35 @@ GOOS=wasip1 GOARCH=wasm go build -tags legion_kv -buildmode=c-shared -o plugin.w
 # 3) 部署侧 agent plugins grant <name> --capabilities log,kv
 ```
 
+## 扩展点：观察工具调用
+
+能力是插件调宿主，**扩展点是宿主调插件**。当前只有一个：`observe`——每次工具调用
+**答完之后**回调你一次。
+
+```go
+func init() {
+	legionplugin.Serve("legion-audit", "0.1.0", legionplugin.Tool{ /* … */ })
+	legionplugin.Observe(func(o legionplugin.ToolObservation) {
+		legionplugin.LogInfo("saw " + o.Tool)
+	})
+}
+```
+
+同样是**三处联动**，但失败点各不相同：
+
+| 位置 | 缺了会怎样 |
+|---|---|
+| `legionplugin.Observe(...)` | 部署授权了却没实现 → **激活期拒绝**（op 0 的 `extensions` 由本 SDK 从注册推导，宿主拿它交叉校验） |
+| `plugin.json` 的 `"extensions": ["observe"]` | `grant --extensions` 拒绝：没声明的授不了 |
+| `agent plugins grant <name> --extensions observe` | 宿主不注册观察者，op 2 一次也不到达——**静默且正确**，这就是未授权的含义 |
+
+四条边界，都不是可以商量的：
+
+- **改不了任何东西。** 观察者没有返回值，宿主丢弃 op 2 的应答；调用方的结果在观察者跑之前就定了。
+- **只看得到跑起来并答了的调用。** 被权限 / 策略 / 护栏拒掉的调用从不通知（它没发生过），handler 返回 Go error 也不通知（那是宿主或工具的故障）。`success:false` **会**通知：工具跑了，答了「不行」。
+- **看到的是任意工具**，不只是本插件的。
+- **每次 200ms**，跑在调用方的 goroutine 上；超时或 trap 计入本插件健康度。贵的活儿留到自己的下一次工具调用里做。
+
 ## 两条硬规矩
 
 - **工具失败返回 `Fail`，不要 panic。** panic 会 trap 整个模块，代价是实例状态、同实例的在途调用，并计入插件健康度（连续故障到阈值会被自动卸载）。
@@ -77,4 +106,4 @@ GOOS=wasip1 GOARCH=wasm go build -tags legion_kv -buildmode=c-shared -o plugin.w
 
 ## 示例与测试
 
-`testdata/hello` 是一个完整的最小插件；`guest_test.go` 会把它**构建出来**（不提交产物：3 MB，而且会在 SDK 改动时立刻过期）并用真实 wazero 宿主跑通六件事：自述来自注册表、闭环带 log 回调、缺参数是失败结果而非 trap、未授权即链接失败、GC 守卫确实在按住缓冲区、以及 200 次调用后没有泄漏。
+`testdata/hello` 是一个完整的最小插件；`guest_test.go` 会把它**构建出来**（不提交产物：3 MB，而且会在 SDK 改动时立刻过期）并用真实 wazero 宿主跑通八件事：自述来自注册表（含 `extensions`）、闭环带 log 回调、缺参数是失败结果而非 trap、未授权即链接失败、GC 守卫确实在按住缓冲区、200 次调用后没有泄漏、op 2 真的到达注册的观察者、以及未知 op 有答案而不是 trap。

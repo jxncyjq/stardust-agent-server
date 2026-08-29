@@ -1620,6 +1620,7 @@ func newPluginsGrantCommand(out io.Writer) *cobra.Command {
 	var capabilitiesFlag string
 	var allowedHostsFlag string
 	var allowedPathsFlag string
+	var extensionsFlag string
 	cmd := &cobra.Command{
 		Use:   "grant <name>",
 		Short: "Authorize a registered plugin entry to run with its declared capabilities",
@@ -1641,7 +1642,8 @@ func newPluginsGrantCommand(out io.Writer) *cobra.Command {
 			"grant never reloads a running service: run `agent plugins reload` to apply.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return runPluginsGrant(cmd.Context(), out, args[0], capabilitiesFlag, allowedHostsFlag, allowedPathsFlag, configPath)
+			return runPluginsGrant(cmd.Context(), out, args[0], capabilitiesFlag, allowedHostsFlag,
+				allowedPathsFlag, extensionsFlag, configPath)
 		},
 	}
 	cmd.Flags().StringVar(&capabilitiesFlag, "capabilities", "",
@@ -1651,6 +1653,10 @@ func newPluginsGrantCommand(out io.Writer) *cobra.Command {
 		"comma-separated hosts the http capability may reach; each must be one the plugin itself declares in "+
 			`plugin.json's "network.allowed_hosts" (a subset of what is declared is fine; an undeclared host `+
 			"is refused, since AssembleSpec would otherwise silently drop it from the grant)")
+	cmd.Flags().StringVar(&extensionsFlag, "extensions", "",
+		"comma-separated host-side extension points this plugin may be consulted at (currently: observe); "+
+			"unlike --capabilities this may be a SUBSET of what the plugin declares, and leaving it empty "+
+			"grants none — the plugin still contributes its tools")
 	cmd.Flags().StringVar(&allowedPathsFlag, "allowed-paths", "",
 		"comma-separated paths the fs capability may reach; each must be one the plugin itself declares in "+
 			`plugin.json's "filesystem.allowed_paths" (a subset of what is declared is fine; an undeclared `+
@@ -1660,7 +1666,8 @@ func newPluginsGrantCommand(out io.Writer) *cobra.Command {
 }
 
 // runPluginsGrant is newPluginsGrantCommand's RunE body.
-func runPluginsGrant(ctx context.Context, out io.Writer, nameArg, capabilitiesFlag, allowedHostsFlag, allowedPathsFlag, configPath string) error {
+func runPluginsGrant(ctx context.Context, out io.Writer, nameArg, capabilitiesFlag, allowedHostsFlag,
+	allowedPathsFlag, extensionsFlag, configPath string) error {
 	name := strings.TrimSpace(nameArg)
 	if name == "" {
 		return errors.New("plugins grant: the plugin name is empty")
@@ -1724,6 +1731,10 @@ func runPluginsGrant(ctx context.Context, out io.Writer, nameArg, capabilitiesFl
 	if err != nil {
 		return err
 	}
+	extensions, err := resolveGrantExtensions(extensionsFlag, pm)
+	if err != nil {
+		return err
+	}
 
 	// SHOULD-FIX-4 / NEW-1 — see refuseUnnamedAllowlist's doc comment: the
 	// same function install's resolveInstallGrants calls, so this command
@@ -1754,6 +1765,7 @@ func runPluginsGrant(ctx context.Context, out io.Writer, nameArg, capabilitiesFl
 			Capabilities: capabilities,
 			AllowedHosts: hosts,
 			AllowedPaths: paths,
+			Extensions:   extensions,
 		}
 		return e, nil
 	})
@@ -2476,4 +2488,19 @@ func verifyOwnSignature(doc []byte, id sign.KeyID, priv ed25519.PrivateKey, mess
 			"deployment would refuse this package; nothing was written: %w", id, err)
 	}
 	return nil
+}
+
+// resolveGrantExtensions parses --extensions and checks each name against the
+// plugin's own declaration.
+//
+// Unlike resolveGrantCapabilities, a SUBSET is fine — including the empty set,
+// which is what an operator who wants a plugin's tools but none of its
+// participation grants. See consent.ResolveExtensions for why the two rules
+// differ.
+func resolveGrantExtensions(extensionsFlag string, pm manifest.PluginManifest) ([]string, error) {
+	extensions, err := splitFlagList("plugins grant", "extensions", extensionsFlag)
+	if err != nil {
+		return nil, err
+	}
+	return consent.ResolveExtensions("plugins grant", extensions, pm)
 }

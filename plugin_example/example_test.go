@@ -131,9 +131,10 @@ func TestExampleGuestSelfDescriptionCoversItsDeclaredTools(t *testing.T) {
 		t.Fatalf("invoke op manifest: %v", err)
 	}
 	var self struct {
-		Name     string   `json:"name"`
-		Version  string   `json:"version"`
-		Provides []string `json:"provides"`
+		Name       string   `json:"name"`
+		Version    string   `json:"version"`
+		Provides   []string `json:"provides"`
+		Extensions []string `json:"extensions"`
 	}
 	if err := json.Unmarshal(out, &self); err != nil {
 		t.Fatalf("decode self-description %q: %v", out, err)
@@ -147,6 +148,16 @@ func TestExampleGuestSelfDescriptionCoversItsDeclaredTools(t *testing.T) {
 		if !slices.Contains(self.Provides, declared.Name) {
 			t.Errorf("plugin.json declares tool %q, guest provides %v; activation would refuse this package",
 				declared.Name, self.Provides)
+		}
+	}
+	// The same cross-check for extension points, and it runs in the other
+	// direction too: a deployment may only GRANT an extension the guest says
+	// it implements, so a plugin.json that declares one the binary does not
+	// is a package whose grant activation will refuse.
+	for _, declared := range pm.Extensions {
+		if !slices.Contains(self.Extensions, declared) {
+			t.Errorf("plugin.json declares extension %q, guest implements %v; a grant naming it "+
+				"would be refused at activation", declared, self.Extensions)
 		}
 	}
 }
@@ -224,5 +235,45 @@ func TestExampleRefusesToLinkWithoutItsCapability(t *testing.T) {
 	}
 	if err := host.CheckImports(compiled, perm.Grant{}); err == nil {
 		t.Fatal("CheckImports with no capabilities granted = nil, want a refusal: the guest imports legion.log")
+	}
+}
+
+// TestExampleObserverIsNotifiedThroughTheHost drives abi.OpObserveToolResult
+// exactly as the host does for a plugin granted the observe extension: the
+// guest's observer runs, calls BACK through the log capability, and the
+// notification's answer is a well-formed body the host discards.
+//
+// The log line is the proof. The seam returns nothing by construction, so
+// "did the observer run?" can only be answered by an effect it had somewhere
+// else — which is also the shape a real observer plugin has to live with.
+func TestExampleObserverIsNotifiedThroughTheHost(t *testing.T) {
+	ctx := context.Background()
+	inst, logged := newExampleInstance(t, ctx, perm.Grant{Log: true})
+
+	observation := []byte(`{"call_id":"c1","tool":"write_file","arguments":{"path":"/tmp/x"},` +
+		`"success":true,"output":"wrote 3 bytes","error":""}`)
+	if _, err := inst.Invoke(ctx, abi.OpObserveToolResult, observation); err != nil {
+		t.Fatalf("invoke op observe: %v", err)
+	}
+
+	if !strings.Contains(logged.String(), "observed tool=write_file success=true") {
+		t.Errorf("host log = %q, want the observer's line naming the tool it was told about", logged.String())
+	}
+}
+
+// TestExampleObserverDoesNotTrapOnAnUnreadableObservation: the seam is
+// one-way, so a body the guest cannot parse has nobody to report to — and
+// trapping would take down the tool call that is merely waiting for its
+// observers to be told.
+func TestExampleObserverDoesNotTrapOnAnUnreadableObservation(t *testing.T) {
+	ctx := context.Background()
+	inst, _ := newExampleInstance(t, ctx, perm.Grant{Log: true})
+
+	if _, err := inst.Invoke(ctx, abi.OpObserveToolResult, []byte(`not json at all`)); err != nil {
+		t.Fatalf("invoke op observe with an unreadable body: %v, want an answer rather than a trap", err)
+	}
+	// The instance is still usable: a trap would have poisoned it.
+	if _, err := inst.Invoke(ctx, abi.OpManifest, nil); err != nil {
+		t.Fatalf("invoke op manifest after a bad observation: %v", err)
 	}
 }
