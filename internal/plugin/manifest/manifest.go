@@ -182,6 +182,33 @@ type PluginManifest struct {
 	// a self-loop to the dependency graph that pollutes the cycle
 	// detection a later phase performs on it.
 	Requires []string `json:"requires"`
+
+	// ProvidesServices names the CAPABILITIES this plugin can act as — an
+	// "issue-tracker", a "calendar" — rather than the tools it contributes.
+	// A consumer binds to one of these names instead of to somebody's
+	// specific tool name, so swapping the implementation does not mean
+	// editing every consumer (see specs/2026-08-29-plugin-service-seam-design.md).
+	//
+	// Claiming a name is FIRST COME, FIRST SERVED, and a name is held by
+	// exactly one plugin: a second plugin claiming a name already held fails
+	// to activate, naming the holder. It neither steps aside silently (which
+	// would leave "who provides this?" unanswerable while both report loaded)
+	// nor takes over silently (which is the risk that ruled out letting a
+	// plugin displace another's capability by being installed).
+	//
+	// Contract-declared optional: an absent key means this plugin takes no
+	// part in the service seam.
+	ProvidesServices []string `json:"provides_services,omitempty"`
+
+	// RequiresServices names the capabilities this plugin needs somebody to
+	// provide. It feeds the same dependency convergence Requires does: no
+	// provider means this plugin is SUSPENDED, not unloaded, and a provider
+	// arriving later resumes it.
+	//
+	// Service names and tool names are two namespaces: a service may be named
+	// like a tool without conflicting, because the model never sees service
+	// names and nothing dispatches through them.
+	RequiresServices []string `json:"requires_services,omitempty"`
 }
 
 // Limits is the resource envelope a plugin asks for. MaxMemoryPages and
@@ -536,6 +563,15 @@ func validatePlugin(pm PluginManifest) error {
 		}
 		seenTools[tool.Name] = struct{}{}
 	}
+	if err := validateServiceNames(pm.Name, "provides_services", pm.ProvidesServices); err != nil {
+		return err
+	}
+	if err := validateServiceNames(pm.Name, "requires_services", pm.RequiresServices); err != nil {
+		return err
+	}
+	if err := validateNoSelfService(pm.Name, pm.ProvidesServices, pm.RequiresServices); err != nil {
+		return err
+	}
 	if err := validateRequires(pm.Name, pm.Requires, seenTools); err != nil {
 		return err
 	}
@@ -563,6 +599,42 @@ func validateRequires(name string, requires []string, contributedTools map[strin
 			return fmt.Errorf("parse plugin manifest %q: requires %q, which this plugin already contributes "+
 				"itself in tools; a plugin cannot require its own tool (it would always trivially resolve while "+
 				"adding a self-loop that pollutes cycle detection)", name, r)
+		}
+	}
+	return nil
+}
+
+// validateServiceNames rejects a service list that is not fit to feed the
+// dependency graph: an empty entry (named by index, since an empty string has
+// no name to point at) or a name claimed twice.
+func validateServiceNames(pluginName, field string, services []string) error {
+	seen := make(map[string]struct{}, len(services))
+	for i, service := range services {
+		if strings.TrimSpace(service) == "" {
+			return fmt.Errorf("parse plugin manifest %q: %s[%d] is empty", pluginName, field, i)
+		}
+		if _, dup := seen[service]; dup {
+			return fmt.Errorf("parse plugin manifest %q: %s %q claimed twice", pluginName, field, service)
+		}
+		seen[service] = struct{}{}
+	}
+	return nil
+}
+
+// validateNoSelfService rejects a plugin that requires a service it provides
+// itself — the same rule Requires has for tools, for the same reason: it
+// always trivially resolves while adding a self-loop that pollutes the cycle
+// detection the dependency graph performs.
+func validateNoSelfService(pluginName string, provides, requires []string) error {
+	provided := make(map[string]struct{}, len(provides))
+	for _, service := range provides {
+		provided[service] = struct{}{}
+	}
+	for _, service := range requires {
+		if _, self := provided[service]; self {
+			return fmt.Errorf("parse plugin manifest %q: requires_services %q, which this plugin provides "+
+				"itself; a plugin cannot require its own service (it would always trivially resolve while "+
+				"adding a self-loop that pollutes cycle detection)", pluginName, service)
 		}
 	}
 	return nil
