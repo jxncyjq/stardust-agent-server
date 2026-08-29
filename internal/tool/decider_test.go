@@ -291,3 +291,141 @@ func TestDecideOwnedRevokesWithTheOwner(t *testing.T) {
 		t.Errorf("Execute after disposal = %v, want nil: disposing the owner takes it off the seam", err)
 	}
 }
+
+// The third answer, ask, is the one a decider cannot deliver by itself: the
+// suspend happens at the round boundary, in the ToolGate. What the registry
+// owes is the fail-closed half — an ask reaching dispatch may only pass on a
+// decision somebody already made.
+
+func askingDecider(reason string) Decider {
+	return DeciderFunc(func(context.Context, domain.ToolCall) Verdict {
+		return Verdict{Decision: DecisionAsk, Reason: reason}
+	})
+}
+
+// TestAnAskWithNoArbiterRefusesTheCall: a deployment with no approval
+// machinery cannot honour "ask a human", and the safe reading of an
+// unanswerable question is no. Degrading it to allow would let a plugin's
+// most cautious answer become its most permissive one.
+func TestAnAskWithNoArbiterRefusesTheCall(t *testing.T) {
+	t.Parallel()
+
+	ran := false
+	registry := decidingRegistry(t, NewStaticPolicy(DecisionAllow), &ran)
+	registry.AddDecider("plugin:demo", askingDecider("a human should look at this"))
+
+	_, err := registry.Execute(context.Background(), developer(), demoCall())
+	if !errors.Is(err, ErrPermissionDenied) {
+		t.Fatalf("Execute = %v, want a refusal", err)
+	}
+	if !strings.Contains(err.Error(), "a human should look at this") {
+		t.Errorf("error = %v, want it to carry the reason the plugin gave", err)
+	}
+	if !strings.Contains(err.Error(), "审批") && !strings.Contains(err.Error(), "approval") {
+		t.Errorf("error = %v, want it to say an approval was required", err)
+	}
+	if ran {
+		t.Error("the handler ran for a call that required approval nobody could grant")
+	}
+}
+
+func TestAnApprovedAskLetsTheCallThrough(t *testing.T) {
+	t.Parallel()
+
+	ran := false
+	registry := decidingRegistry(t, NewStaticPolicy(DecisionAllow), &ran)
+	registry.AddDecider("plugin:demo", askingDecider("look at this"))
+	registry.SetAskArbiter(AskArbiterFunc(func(context.Context, domain.ToolCall) (bool, error) {
+		return true, nil
+	}))
+
+	if _, err := registry.Execute(context.Background(), developer(), demoCall()); err != nil {
+		t.Fatalf("Execute with an approved ask = %v, want nil", err)
+	}
+	if !ran {
+		t.Error("the handler did not run for an approved call")
+	}
+}
+
+func TestAnUnapprovedOrFailedAskRefusesTheCall(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		approved bool
+		err      error
+	}{
+		{name: "not approved", approved: false},
+		{name: "arbiter failed", err: errors.New("ticket store unreadable")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ran := false
+			registry := decidingRegistry(t, NewStaticPolicy(DecisionAllow), &ran)
+			registry.AddDecider("plugin:demo", askingDecider("look at this"))
+			registry.SetAskArbiter(AskArbiterFunc(func(context.Context, domain.ToolCall) (bool, error) {
+				return tc.approved, tc.err
+			}))
+
+			if _, err := registry.Execute(context.Background(), developer(), demoCall()); !errors.Is(err, ErrPermissionDenied) {
+				t.Fatalf("Execute = %v, want a refusal", err)
+			}
+			if ran {
+				t.Error("the handler ran without an approval")
+			}
+		})
+	}
+}
+
+// TestDenyBeatsAskWhicheverOrderTheyWereAdded: the composition rule is
+// strictest-wins across three values now, and a deny must never be softened
+// into "well, ask somebody" by another plugin's milder answer.
+func TestDenyBeatsAskWhicheverOrderTheyWereAdded(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name  string
+		order []Decider
+	}{
+		{name: "ask first", order: []Decider{askingDecider("look"), denyingDecider("no")}},
+		{name: "deny first", order: []Decider{denyingDecider("no"), askingDecider("look")}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			registry := decidingRegistry(t, NewStaticPolicy(DecisionAllow), nil)
+			for _, decider := range tc.order {
+				registry.AddDecider("plugin:demo", decider)
+			}
+			// An arbiter that approves everything: if the deny were softened
+			// into an ask, this call would go through.
+			registry.SetAskArbiter(AskArbiterFunc(func(context.Context, domain.ToolCall) (bool, error) {
+				return true, nil
+			}))
+
+			_, err := registry.Execute(context.Background(), developer(), demoCall())
+			if !errors.Is(err, ErrPermissionDenied) {
+				t.Fatalf("Execute = %v, want the deny to stand", err)
+			}
+			if !strings.Contains(err.Error(), "no") {
+				t.Errorf("error = %v, want the denying plugin's reason", err)
+			}
+		})
+	}
+}
+
+// TestConsultDecidersIsExportedForTheRoundBoundary: the ToolGate asks the same
+// deciders one round earlier, to decide whether to suspend. It must reach them
+// through the registry rather than keeping its own list, or the two would
+// disagree about who is registered.
+func TestConsultDecidersIsExportedForTheRoundBoundary(t *testing.T) {
+	t.Parallel()
+
+	registry := decidingRegistry(t, NewStaticPolicy(DecisionAllow), nil)
+	registry.AddDecider("plugin:demo", askingDecider("look at this"))
+
+	label, verdict := registry.ConsultDeciders(context.Background(), demoCall())
+	if verdict.Decision != DecisionAsk || verdict.Reason != "look at this" {
+		t.Errorf("verdict = %+v, want the ask and its reason", verdict)
+	}
+	if label != "plugin:demo" {
+		t.Errorf("label = %q, want the registrant that asked", label)
+	}
+}

@@ -2,6 +2,7 @@ package tool
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/stardust/legion-agent/internal/domain"
@@ -43,6 +44,38 @@ const (
 type Verdict struct {
 	Decision Decision
 	Reason   string
+}
+
+// AskArbiter answers whether a call a decider wants approved has ALREADY been
+// approved by a human.
+//
+// It never waits for one. The waiting happens a layer above, at the round
+// boundary, where a suspend persists a checkpoint and ends the run; blocking
+// here instead would replace that model with one where a pending approval
+// lives only in a goroutine and dies with the process.
+//
+// A nil arbiter is a deployment with no approval machinery at all, and an ask
+// is then a refusal (see resolveVerdict): degrading it to allow would turn a
+// plugin's most cautious answer into its most permissive one.
+type AskArbiter interface {
+	Approved(ctx context.Context, call domain.ToolCall) (bool, error)
+}
+
+// AskArbiterFunc adapts a plain function to AskArbiter.
+type AskArbiterFunc func(ctx context.Context, call domain.ToolCall) (bool, error)
+
+// Approved implements AskArbiter.
+func (f AskArbiterFunc) Approved(ctx context.Context, call domain.ToolCall) (bool, error) {
+	return f(ctx, call)
+}
+
+// SetAskArbiter installs the arbiter consulted when a decider answers ask. It
+// is assembly-time wiring: set once, where the approval store is available,
+// never per call.
+func (r *Registry) SetAskArbiter(arbiter AskArbiter) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.askArbiter = arbiter
 }
 
 // Decider is consulted BEFORE a tool call is dispatched and may refuse it.
@@ -143,17 +176,23 @@ func DecideOwned(
 // most agent calls travel through one. A decider that saw only direct calls
 // would be a refusal an agent could evade by holding a narrower view.
 //
-// It SHORT-CIRCUITS on the first refusal. With allow and deny the outcome is
-// order-independent either way — deny is strictest — and spending the
-// caller's remaining budget asking the rest for an answer that cannot change
-// anything would be paid for by the call being refused. The consequence,
-// worth stating because it is visible in the error text: the refusal names
-// the first decider that objected, not every one that would have.
+// The composition rule is STRICTEST WINS across three answers — deny > ask >
+// allow — and it is order-independent. Only a DENY short-circuits, being the
+// strictest there is; an ask does not end the loop, because a later deny must
+// still be able to beat it. Softening a deny into "well, ask somebody"
+// because another plugin answered more mildly is exactly the widening this
+// seam does not allow.
+//
+// The consequence, worth stating because it is visible in the error text: the
+// refusal names the first decider that gave the winning answer, not every one
+// that would have.
 //
 // The decider slice is COPIED under the lock and the deciders are called with
 // the lock released, so a decider that registers or revokes during its own
 // consultation (a plugin unloading itself) completes instead of deadlocking.
 func (r *Registry) consultDeciders(ctx context.Context, descriptor Descriptor, call domain.ToolCall) (string, Verdict) {
+	strictest := Verdict{Decision: DecisionAllow}
+	strictestLabel := ""
 	for registry := r; registry != nil; registry = registry.parent {
 		registry.mu.RLock()
 		snapshot := make([]*registeredDecider, len(registry.deciders))
@@ -162,15 +201,76 @@ func (r *Registry) consultDeciders(ctx context.Context, descriptor Descriptor, c
 
 		for _, entry := range snapshot {
 			verdict := decideWithBudget(ctx, descriptor, entry.decider, call)
-			if verdict.Decision == DecisionDeny {
-				if verdict.Reason == "" {
-					verdict.Reason = "no reason given"
-				}
+			if verdict.Decision != DecisionAllow && verdict.Reason == "" {
+				verdict.Reason = "no reason given"
+			}
+			switch verdict.Decision {
+			case DecisionDeny:
 				return entry.label, verdict
+			case DecisionAsk:
+				if strictest.Decision == DecisionAllow {
+					strictest, strictestLabel = verdict, entry.label
+				}
 			}
 		}
 	}
-	return "", Verdict{Decision: DecisionAllow}
+	return strictestLabel, strictest
+}
+
+// ConsultDeciders asks the registered deciders about a call WITHOUT executing
+// it, and reports the strictest answer with the label of whoever gave it.
+//
+// It exists for the round boundary: the ToolGate has to know one round early
+// whether a plugin wants this call approved, so it can open a ticket and
+// suspend. Reaching the deciders THROUGH the registry — rather than the gate
+// keeping a list of its own — is what stops the two from disagreeing about
+// who is even registered.
+//
+// A decider is therefore consulted twice per call in a gated run (once here,
+// once inside Execute), which makes a side-effect-free decider a contract
+// rather than a courtesy. The two consultations answer different questions:
+// this one asks "must a human see this?", Execute's asks "may this run now?".
+//
+// An unknown tool yields a zero Descriptor, whose zero Timeout means the
+// consultation gets the default budget. Nothing else here reads the
+// descriptor, and refusing to consult would make a call the gate cannot
+// resolve invisible to the plugins that were granted a say over it.
+func (r *Registry) ConsultDeciders(ctx context.Context, call domain.ToolCall) (string, Verdict) {
+	_, descriptor, _ := r.resolve(call.Name)
+	return r.consultDeciders(ctx, descriptor, call)
+}
+
+// resolveVerdict turns a non-allow verdict into the error Execute returns, or
+// nil when the call may proceed after all.
+//
+// This is where ask becomes fail-closed. Every path that is not an
+// already-granted approval ends in a refusal: no arbiter (a deployment with
+// no approval machinery), an arbiter that says no, and an arbiter that could
+// not tell. The last one matters most — "I could not read the ticket store"
+// must never read as "go ahead".
+func (r *Registry) resolveVerdict(ctx context.Context, label string, verdict Verdict, call domain.ToolCall) error {
+	if verdict.Decision == DecisionDeny {
+		return fmt.Errorf("%w: %s refused this call: %s", ErrPermissionDenied, label, verdict.Reason)
+	}
+
+	r.mu.RLock()
+	arbiter := r.askArbiter
+	r.mu.RUnlock()
+
+	if arbiter == nil {
+		return fmt.Errorf("%w: %s requires human approval for this call (%s), and this deployment has no "+
+			"approval channel that could grant it", ErrPermissionDenied, label, verdict.Reason)
+	}
+	approved, err := arbiter.Approved(ctx, call)
+	if err != nil {
+		return fmt.Errorf("%w: %s requires human approval for this call (%s), and whether it was approved "+
+			"could not be read: %w", ErrPermissionDenied, label, verdict.Reason, err)
+	}
+	if !approved {
+		return fmt.Errorf("%w: %s requires human approval for this call (%s), which has not been granted",
+			ErrPermissionDenied, label, verdict.Reason)
+	}
+	return nil
 }
 
 // decideWithBudget runs one consultation under its own deadline.

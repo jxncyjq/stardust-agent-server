@@ -27,6 +27,11 @@ type Decision string
 const (
 	DecisionAllow Decision = "allow"
 	DecisionDeny  Decision = "deny"
+	// DecisionAsk requires a human to approve this call before it runs. Only a
+	// Decider produces it (see decider.go): the host's own Policy answers allow
+	// or deny, and the Sensitive-tool approval it drives is decided a layer
+	// above, at the round boundary.
+	DecisionAsk Decision = "ask"
 )
 
 type Policy interface {
@@ -83,6 +88,10 @@ type Registry struct {
 	// the opposite kind of seam: an observer cannot change anything, and a
 	// decider exists precisely to.
 	deciders []*registeredDecider
+	// askArbiter answers, at dispatch time, whether a call a decider wants
+	// approved HAS been approved. It is nil in a deployment with no approval
+	// machinery, and an ask is then a refusal — see resolveVerdict.
+	askArbiter AskArbiter
 }
 
 func NewRegistry(policy Policy, enforcer PermissionEnforcer, guards Guardrails) *Registry {
@@ -308,9 +317,10 @@ func (r *Registry) Execute(ctx context.Context, agent domain.Agent, call domain.
 	// Deciders come AFTER the host's own enforcer and policy, and that order is
 	// the enforcement: a call the host refused is never shown to a decider, so
 	// no decider can widen one. They may only add refusals.
-	if label, verdict := r.consultDeciders(ctx, descriptor, call); verdict.Decision == DecisionDeny {
-		return domain.ToolResult{}, fmt.Errorf("%w: %s refused this call: %s",
-			ErrPermissionDenied, label, verdict.Reason)
+	if label, verdict := r.consultDeciders(ctx, descriptor, call); verdict.Decision != DecisionAllow {
+		if err := r.resolveVerdict(ctx, label, verdict, call); err != nil {
+			return domain.ToolResult{}, err
+		}
 	}
 	if r.guards != nil {
 		if err := r.guards.Before(ctx, call); err != nil {
