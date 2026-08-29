@@ -125,8 +125,8 @@ func TestGoGuestSelfDescribesFromItsRegistry(t *testing.T) {
 	// The same property for the observe seam: what the guest says it
 	// implements comes from Observe, not from a literal an author keeps in
 	// sync by hand. The host refuses a grant naming an extension absent here.
-	if !slices.Equal(self.Extensions, []string{"observe", "decide"}) {
-		t.Errorf("extensions = %v, want [observe decide] (from what was registered)", self.Extensions)
+	if !slices.Equal(self.Extensions, []string{"observe", "decide", "prompt"}) {
+		t.Errorf("extensions = %v, want [observe decide prompt] (from what was registered)", self.Extensions)
 	}
 }
 
@@ -399,5 +399,27 @@ func TestGoGuestDeciderRefusesARequestItCannotRead(t *testing.T) {
 	}
 	if !strings.Contains(string(out), `"decision":"deny"`) {
 		t.Errorf("answer = %s, want a deny", out)
+	}
+}
+
+// TestGoGuestAnswersItsPromptSegment drives op 4 as the host does at
+// activation. The host refuses to mount a plugin whose segment it cannot
+// read, so "the guest answers a decodable document" is not a nicety here.
+func TestGoGuestAnswersItsPromptSegment(t *testing.T) {
+	ctx := context.Background()
+	inst, _ := newGuestInstance(t, ctx, perm.Grant{Log: true})
+
+	out, err := inst.Invoke(ctx, abi.OpPromptSegment, nil)
+	if err != nil {
+		t.Fatalf("invoke op prompt segment: %v", err)
+	}
+	var answer struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(out, &answer); err != nil {
+		t.Fatalf("decode prompt segment %q: %v", out, err)
+	}
+	if !strings.Contains(answer.Text, "prefer the name the user gave") {
+		t.Errorf("text = %q, want the registered segment", answer.Text)
 	}
 }

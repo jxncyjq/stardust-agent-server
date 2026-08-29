@@ -23,6 +23,10 @@ var registry = struct {
 	// nil for the ordinary plugin, which contributes tools and refuses
 	// nothing.
 	decider Decider
+	// prompt is the ONE system-prompt segment provider Prompt may register
+	// (see promptsegment.go). It is nil for the ordinary plugin, which says
+	// nothing in the system prompt.
+	prompt PromptProvider
 }{tools: map[string]Handler{}}
 
 // Serve records this plugin's identity and its tools. Call it exactly once,

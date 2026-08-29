@@ -28,7 +28,12 @@ declare_plugin!(
     // 之前问这里，回答只能让结果更严（放行不是授权——宿主自己的权限与策略在
     // 插件被问到之前就已经放行了）。答不出来（超时/trap/坏文档）= 拒绝，并计入
     // 本插件健康度。
-    decide = decide_call
+    decide = decide_call,
+    // prompt 是第三个扩展点，也是唯一一个「不是调用」的：宿主在**激活时问一次**，
+    // 答案在本插件挂着期间进每一次系统提示词。它待在提示词的稳定前缀里，所以
+    // 每次挂载/卸载会让前缀缓存失效一次——这是自觉的取舍，换来的是不必每个任务
+    // 重发同一段。
+    prompt = prompt_segment
 );
 
 /// hello_echo 读入参 `name`，经 `log` 能力回调宿主写一行日志，再把问候语作为
@@ -82,4 +87,13 @@ fn decide_call(request: &ToolDecisionRequest) -> ToolDecision {
         return ToolDecision::ask("reviewed_tool is looked at by a human first");
     }
     ToolDecision::allow()
+}
+
+/// prompt_segment 返回本插件贡献给系统提示词的那段文字。
+///
+/// 三件事：①它被宿主用围栏包起来（点名本插件 + 注明不可信），模型据此分辨哪句
+/// 话来自宿主、哪句来自一个被装上的插件；②它有长度上限（单插件 2048 rune），
+/// 超出会被截断并留痕；③它**每次推理都在**，所以短不是风格偏好。
+fn prompt_segment() -> String {
+    String::from("When greeting someone, use the exact name the caller gave; do not shorten it.")
 }

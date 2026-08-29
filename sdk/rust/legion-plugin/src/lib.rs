@@ -91,6 +91,14 @@ fn string_list(items: &[&str]) -> String {
     list
 }
 
+/// prompt_segment_json 渲染 op 4 的答案。
+///
+/// 由 [`declare_plugin!`] 调用，作者不需要碰。文本会被转义——宿主严格解码，一个
+/// 没转义的换行会让整段作废，而作废的形式是**拒绝挂载这个插件**。
+pub fn prompt_segment_json(text: &str) -> String {
+    format!("{{\"text\":\"{}\"}}", json::escape(text))
+}
+
 /// declare_plugin 生成一个插件的全部 ABI 面：四个导出与 op 分发。
 ///
 /// ```ignore
@@ -108,32 +116,56 @@ fn string_list(items: &[&str]) -> String {
 /// 起这个 ABI 版本没有的东西时，得到的是答案而不是一个死掉的模块。
 #[macro_export]
 macro_rules! declare_plugin {
-    // 四条入口，对应两个可选 seam 的四种组合。它们只做一件事：把「有没有」翻译
-    // 成 @build 里的重复语法，真正的展开只有一份。
+    // 三个可选 seam（observe / decide / prompt）全省略时的入口。
     (name = $name:expr, version = $version:expr,
      tools = [$(($tool:expr, $handler:expr)),* $(,)?] $(,)?) => {
         $crate::declare_plugin!(@build name = $name, version = $version,
-            tools = [$(($tool, $handler)),*], observe = [], decide = []);
+            tools = [$(($tool, $handler)),*], observe = [], decide = [], prompt = []);
     };
+    // 其余入口按 observe → decide → prompt 的固定顺序书写：固定顺序换来的是入口
+    // 数量线性而不是阶乘，而真正的展开只有 @build 一份。
     (name = $name:expr, version = $version:expr,
      tools = [$(($tool:expr, $handler:expr)),* $(,)?], observe = $observer:expr $(,)?) => {
         $crate::declare_plugin!(@build name = $name, version = $version,
-            tools = [$(($tool, $handler)),*], observe = [$observer], decide = []);
+            tools = [$(($tool, $handler)),*], observe = [$observer], decide = [], prompt = []);
     };
     (name = $name:expr, version = $version:expr,
      tools = [$(($tool:expr, $handler:expr)),* $(,)?], decide = $decider:expr $(,)?) => {
         $crate::declare_plugin!(@build name = $name, version = $version,
-            tools = [$(($tool, $handler)),*], observe = [], decide = [$decider]);
+            tools = [$(($tool, $handler)),*], observe = [], decide = [$decider], prompt = []);
+    };
+    (name = $name:expr, version = $version:expr,
+     tools = [$(($tool:expr, $handler:expr)),* $(,)?], prompt = $prompt:expr $(,)?) => {
+        $crate::declare_plugin!(@build name = $name, version = $version,
+            tools = [$(($tool, $handler)),*], observe = [], decide = [], prompt = [$prompt]);
     };
     (name = $name:expr, version = $version:expr,
      tools = [$(($tool:expr, $handler:expr)),* $(,)?],
      observe = $observer:expr, decide = $decider:expr $(,)?) => {
         $crate::declare_plugin!(@build name = $name, version = $version,
-            tools = [$(($tool, $handler)),*], observe = [$observer], decide = [$decider]);
+            tools = [$(($tool, $handler)),*], observe = [$observer], decide = [$decider], prompt = []);
+    };
+    (name = $name:expr, version = $version:expr,
+     tools = [$(($tool:expr, $handler:expr)),* $(,)?],
+     observe = $observer:expr, prompt = $prompt:expr $(,)?) => {
+        $crate::declare_plugin!(@build name = $name, version = $version,
+            tools = [$(($tool, $handler)),*], observe = [$observer], decide = [], prompt = [$prompt]);
+    };
+    (name = $name:expr, version = $version:expr,
+     tools = [$(($tool:expr, $handler:expr)),* $(,)?],
+     decide = $decider:expr, prompt = $prompt:expr $(,)?) => {
+        $crate::declare_plugin!(@build name = $name, version = $version,
+            tools = [$(($tool, $handler)),*], observe = [], decide = [$decider], prompt = [$prompt]);
+    };
+    (name = $name:expr, version = $version:expr,
+     tools = [$(($tool:expr, $handler:expr)),* $(,)?],
+     observe = $observer:expr, decide = $decider:expr, prompt = $prompt:expr $(,)?) => {
+        $crate::declare_plugin!(@build name = $name, version = $version,
+            tools = [$(($tool, $handler)),*], observe = [$observer], decide = [$decider], prompt = [$prompt]);
     };
     (@build name = $name:expr, version = $version:expr,
      tools = [$(($tool:expr, $handler:expr)),*],
-     observe = [$($observer:expr)?], decide = [$($decider:expr)?]) => {
+     observe = [$($observer:expr)?], decide = [$($decider:expr)?], prompt = [$($prompt:expr)?]) => {
         /// 宿主用 `WithStartFunctions("_initialize")` 实例化：guest 是 WASI
         /// reactor（没有 `_start`）。
         #[no_mangle]
@@ -155,13 +187,13 @@ macro_rules! declare_plugin {
                 // abi.OpManifest
                 0 => {
                     let provides: &[&str] = &[$($tool),*];
-                    // extensions 与 provides 同源：写了 `observe = ...` 才有
-                    // "observe"，写了 `decide = ...` 才有 "decide"。宿主会拿部署
-                    // 侧的 grant.extensions 与这份自述交叉校验，所以一个「授权了
-                    // 但没实现」的组合会在激活期被拒绝，而不是每次调用都白跑。
+                    // extensions 与 provides 同源：写了哪个 seam 才有哪个名字。
+                    // 宿主拿部署侧的 grant.extensions 与这份自述交叉校验，所以
+                    // 「授权了但没实现」在激活期被拒，而不是悄悄什么都不发生。
                     let extensions: &[&str] = &[
                         $($crate::declare_plugin!(@name_of observe, $observer),)?
                         $($crate::declare_plugin!(@name_of decide, $decider),)?
+                        $($crate::declare_plugin!(@name_of prompt, $prompt),)?
                     ];
                     $crate::abi::write_out(
                         $crate::manifest_json($name, $version, provides, extensions).as_bytes())
@@ -225,6 +257,16 @@ macro_rules! declare_plugin {
                         $crate::abi::write_out(decision.to_json().as_bytes())
                     }
                 )?
+                // abi.OpPromptSegment —— 宿主在**激活时问一次**，答案在插件挂着
+                // 期间一直用。所以这个函数可以读插件自己的配置，但不要试图每次
+                // 说不一样的话：这段文字待在提示词的稳定前缀里。
+                $(
+                    4 => {
+                        let provider: fn() -> ::std::string::String = $prompt;
+                        $crate::abi::write_out(
+                            $crate::prompt_segment_json(&provider()).as_bytes())
+                    }
+                )?
                 _ => $crate::abi::write_out(br#"{"error":"unsupported op"}"#),
             }
         }
@@ -233,6 +275,7 @@ macro_rules! declare_plugin {
     // 有对应函数时展开这一项，函数本身被丢弃。
     (@name_of observe, $observer:expr) => { "observe" };
     (@name_of decide, $decider:expr) => { "decide" };
+    (@name_of prompt, $prompt:expr) => { "prompt" };
 }
 
 #[cfg(test)]
@@ -256,6 +299,16 @@ mod tests {
 
     /// 一个注册了观察者的插件必须**说出来**：宿主拿这份自述与部署侧的
     /// grant.extensions 交叉校验，缺了它，一个正确的授权反而会被拒。
+    #[test]
+    fn prompt_segment_json_escapes_the_text() {
+        let json = prompt_segment_json("say \"hi\"\nnow");
+        assert!(json.contains(r#"say \"hi\"\nnow"#), "got {json}");
+        assert!(
+            !json.contains('\n'),
+            "a raw newline would make the host refuse to mount the plugin: {json}"
+        );
+    }
+
     #[test]
     fn manifest_names_the_extensions_it_implements() {
         let json = manifest_json("p", "1", &["only"], &["observe"]);

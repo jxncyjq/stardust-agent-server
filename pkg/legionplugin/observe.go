@@ -115,6 +115,9 @@ func registeredExtensions() []string {
 	if registry.decider != nil {
 		extensions = append(extensions, extensionDecide)
 	}
+	if registry.prompt != nil {
+		extensions = append(extensions, extensionPrompt)
+	}
 	return extensions
 }
 
