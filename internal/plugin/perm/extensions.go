@@ -26,6 +26,15 @@ const (
 	// has produced a result. It can change nothing: its answer is discarded
 	// and its failures count only against its own health.
 	ExtensionObserve Extension = "observe"
+
+	// ExtensionDecide lets a plugin be consulted BEFORE a tool call is
+	// dispatched, to answer allow or deny.
+	//
+	// It can only TIGHTEN. The host's own enforcer and policy run first, and a
+	// call they refused is never shown to a plugin at all — so there is no
+	// position from which a plugin could turn a refusal into a permission. A
+	// plugin's "allow" means "I do not object", never "I authorize".
+	ExtensionDecide Extension = "decide"
 )
 
 // knownExtensions is the complete set of extension names this host
@@ -36,7 +45,7 @@ const (
 // would otherwise believe it is being consulted while nothing ever calls it,
 // which is the worst of the three possible outcomes (working, refused,
 // silently inert).
-var knownExtensions = []Extension{ExtensionObserve}
+var knownExtensions = []Extension{ExtensionObserve, ExtensionDecide}
 
 // Extensions is the set of extension points a plugin has actually been
 // granted, as the host consults them.
@@ -47,18 +56,23 @@ var knownExtensions = []Extension{ExtensionObserve}
 type Extensions struct {
 	// Observe is ExtensionObserve.
 	Observe bool
+	// Decide is ExtensionDecide.
+	Decide bool
 }
 
 // Any reports whether any extension point at all was granted. It is what the
 // caller checks before doing work that only matters to a plugin that
 // participates in the host's machinery.
-func (e Extensions) Any() bool { return e.Observe }
+func (e Extensions) Any() bool { return e.Observe || e.Decide }
 
 // Names renders the granted extensions, sorted, for errors and diagnostics.
 func (e Extensions) Names() []string {
 	var names []string
 	if e.Observe {
 		names = append(names, string(ExtensionObserve))
+	}
+	if e.Decide {
+		names = append(names, string(ExtensionDecide))
 	}
 	sort.Strings(names)
 	return names
@@ -87,6 +101,8 @@ func ParseExtensions(names []string) (Extensions, error) {
 		switch name {
 		case ExtensionObserve:
 			parsed.Observe = true
+		case ExtensionDecide:
+			parsed.Decide = true
 		default:
 			return Extensions{}, fmt.Errorf("unknown extension %q; supported: %s",
 				name, strings.Join(knownExtensionNames(), ", "))
@@ -104,7 +120,10 @@ func ParseExtensions(names []string) (Extensions, error) {
 // deployment must be able to say; making the grant an exact match of the
 // declaration would delete it.
 func (e Extensions) Intersect(other Extensions) Extensions {
-	return Extensions{Observe: e.Observe && other.Observe}
+	return Extensions{
+		Observe: e.Observe && other.Observe,
+		Decide:  e.Decide && other.Decide,
+	}
 }
 
 func knownExtensionNames() []string {

@@ -10,7 +10,9 @@
 //!
 //! 完整的能力表、边界与取舍见 `sdk/rust/legion-plugin/README.md`。
 
-use legion_plugin::{declare_plugin, log_info, ToolCall, ToolObservation, ToolResult};
+use legion_plugin::{
+    declare_plugin, log_info, ToolCall, ToolDecision, ToolDecisionRequest, ToolObservation, ToolResult,
+};
 
 declare_plugin!(
     name = "legion-hello",
@@ -21,7 +23,12 @@ declare_plugin!(
     // `agent plugins grant --extensions observe`。少了最后一步，宿主根本不会
     // 注册观察者（未授权 = 不存在的注册，不是运行期检查）；少了中间那步，激活
     // 期的交叉校验会拒绝这次授权。
-    observe = log_observation
+    observe = log_observation,
+    // decide 是第二个扩展点，也是第一个**答案有后果**的：宿主在派发任何工具
+    // 之前问这里，回答只能让结果更严（放行不是授权——宿主自己的权限与策略在
+    // 插件被问到之前就已经放行了）。答不出来（超时/trap/坏文档）= 拒绝，并计入
+    // 本插件健康度。
+    decide = decide_call
 );
 
 /// hello_echo 读入参 `name`，经 `log` 能力回调宿主写一行日志，再把问候语作为
@@ -55,4 +62,19 @@ fn log_observation(observation: &ToolObservation) {
         "observed tool={} success={}",
         observation.tool, observation.success
     ));
+}
+
+/// decide_call 是决策者：宿主在派发**任意**工具之前问它一次。
+///
+/// 这里只拦一个虚构的工具名，好让示例的测试能把放行与拒绝两条路都跑到。真正的
+/// 守门插件还会看参数（路径、主机、金额……）。
+///
+/// 三条不能忘的事：①**放行不是授权**，只是「我不反对」；②它必须快——上限是
+/// `min(工具超时/4, 200ms)`，而工具还没开始跑；③**答不出来就是拒绝**，宿主
+/// fail-closed，并把这次失败计进本插件的健康度（连续失败足够多次会被卸载）。
+fn decide_call(request: &ToolDecisionRequest) -> ToolDecision {
+    if request.tool == "forbidden_tool" {
+        return ToolDecision::deny("forbidden_tool is refused by legion-hello");
+    }
+    ToolDecision::allow()
 }

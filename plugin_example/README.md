@@ -88,7 +88,7 @@ JSON 写不了注释，这里给一份把**所有**字段都摆出来的骨架�
   "abi": 1,                        // 必须是 1
   "sha256": "<plugin.wasm 的 64 位十六进制摘要>",   // build.sh 负责填
   "capabilities": ["log"],         // 只写真正 import 了的：log/config/kv/http/fs/tool
-  "extensions": ["observe"],       // 可选：本插件实现了哪些宿主扩展点（宿主调插件的方向）
+  "extensions": ["observe", "decide"], // 可选：本插件实现了哪些宿主扩展点（宿主调插件的方向）
                                    // 授权可以只取子集；授权了而 guest 没实现 = 激活期拒绝
   "limits": {
     "timeout_ms": 5000,            // 单次进插件调用的超时
@@ -165,7 +165,7 @@ plugin_example/scripts/publish.sh my.key
 echo '{ "plugins": [] }' > plugins.json
 
 agent plugins install <tarball 的 URL> --digest sha256:<tarball 摘要> --config agent.json
-agent plugins grant legion-hello --capabilities log --extensions observe --config agent.json
+agent plugins grant legion-hello --capabilities log --extensions observe,decide --config agent.json
 agent serve --config agent.json
 ```
 
@@ -187,7 +187,8 @@ curl -s http://127.0.0.1:8080/v1/plugins
 {"plugins":[{"name":"legion-hello","version":"0.1.0","state":"loaded",
   "tools":["hello_echo"],"declared_capabilities":["log"],
   "declared_unresolved":false,"granted_capabilities":["log"],
-  "declared_extensions":["observe"],"granted_extensions":["observe"]}]}
+  "declared_extensions":["observe","decide"],
+  "granted_extensions":["observe","decide"]}]}
 ```
 
 `state:"loaded"` + `tools` 里有 `hello_echo` = 模型的工具清单里已经有它了。让
@@ -203,7 +204,7 @@ curl -s http://127.0.0.1:8080/v1/plugins
 go test ./plugin_example/...
 ```
 
-六个测试用**真实的 wazero 宿主**跑这个包，钉住六件事：
+八个测试用**真实的 wazero 宿主**跑这个包，钉住八件事：
 
 | 测试 | 钉住什么 |
 |---|---|
@@ -213,6 +214,8 @@ go test ./plugin_example/...
 | `TestExampleRefusesToLinkWithoutItsCapability` | 能力是**链接期**事实：不授 `log`，模块根本链接不上，不是调用时返回 DENIED |
 | `TestExampleObserverIsNotifiedThroughTheHost` | 扩展点闭环：宿主发 op 2 → guest 的观察者跑 → 它经 `log` 写下看到了什么。这个 seam 单向，只能靠它留下的痕迹证明它跑过 |
 | `TestExampleObserverDoesNotTrapOnAnUnreadableObservation` | 读不懂的观察文档不能 trap：无人可报，而 trap 会连累那个正等着观察者被通知完的调用方 |
+| `TestExampleDeciderAnswersBothWays` | 决策点两条路都走通：宿主 fail-closed，所以「只会拒绝」的决策者与坏掉的决策者长得一模一样 |
+| `TestExampleDeciderRefusesARequestItCannotRead` | 读不懂的**问题**不能变成放行 |
 
 ## 从这份示例改成你自己的插件
 

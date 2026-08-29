@@ -113,6 +113,15 @@ func contributeTools(
 			newPluginObserver(spec.Deps, guest)))
 	}
 
+	// The decide extension, on the same terms — and it is the seam where "not
+	// granted means not registered" stops being a nicety: a registered decider
+	// can REFUSE the agent's tool calls, so a plugin that was never granted it
+	// must not be reachable from the dispatch path at all.
+	if spec.Extensions.Decide {
+		keep(tool.DecideOwned(ledger, owner, spec.Registry, "plugin:"+spec.Name,
+			newPluginDecider(spec.Deps, guest)))
+	}
+
 	for _, descriptor := range spec.Tools {
 		handler := pluginToolHandler(spec.Name, spec.Deps, descriptor.Name, guest, spec.Deps.OnFault)
 		keep(tool.RegisterOwned(ledger, owner, spec.Registry, descriptor, handler))

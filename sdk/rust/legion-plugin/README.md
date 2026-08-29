@@ -94,6 +94,34 @@ fn log_observation(o: &ToolObservation) {
 - **看到的是任意工具**，不只是本插件的。
 - **每次 200ms**，跑在调用方的线程上；超时或 trap 计入本插件健康度。
 
+### 决策点：在派发前否决一次调用
+
+`decide` 是第二个扩展点，也是第一个**答案有后果**的。宏里再多一行：
+
+```rust
+declare_plugin!(
+    name = "legion-gatekeeper",
+    version = "0.1.0",
+    tools = [("status", status)],
+    observe = log_observation,   // 可选，可单独出现
+    decide = decide_call         // 可选，可单独出现
+);
+
+fn decide_call(request: &ToolDecisionRequest) -> ToolDecision {
+    if request.tool == "write_file" && frozen() {
+        return ToolDecision::deny("writes are frozen during the incident");
+    }
+    ToolDecision::allow()
+}
+```
+
+四条边界：
+
+- **只能收紧。** 宿主自己的权限与策略先跑；它们拒掉的调用根本不会问到插件。`allow()` 是「我不反对」，不是授权。
+- **答不出来就是拒绝**（fail-closed）：超时、trap、答出宿主解不了的东西都会拒掉那次调用并计入健康度。SDK 连「读不懂这次请求」也答 `deny` 并说明理由——宿主对读不懂的答案本就 fail-closed，说清理由只是让运维看得懂。
+- **上限 `min(工具超时/4, 200ms)`**，比观察点更紧：工具还没开始跑。
+- 没写 `decide = ...` 时宏**不生成** op 3 那条分支，op 0 的 `extensions` 里也没有它。
+
 ## 两条硬规矩
 
 - **工具失败返回 `ToolResult::fail`，不要 panic。** panic 会 trap 整个模块，代价是实例状态、同实例的在途调用，而且计入插件健康度（连续故障到阈值会被自动卸载）。

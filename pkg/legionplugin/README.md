@@ -82,6 +82,26 @@ func init() {
 - **看到的是任意工具**，不只是本插件的。
 - **每次 200ms**，跑在调用方的 goroutine 上；超时或 trap 计入本插件健康度。贵的活儿留到自己的下一次工具调用里做。
 
+### 决策点：在派发前否决一次调用
+
+`decide` 是第二个扩展点，也是第一个**答案有后果**的：
+
+```go
+legionplugin.Decide(func(req legionplugin.ToolDecisionRequest) legionplugin.ToolDecision {
+	if req.Tool == "write_file" && frozen() {
+		return legionplugin.Deny("writes are frozen during the incident")
+	}
+	return legionplugin.Allow()
+})
+```
+
+四条边界：
+
+- **只能收紧。** 宿主自己的权限与策略先跑；它们拒掉的调用根本不会问到插件。`Allow()` 是「我不反对」，不是授权。
+- **答不出来就是拒绝**（fail-closed）：超时、trap、答出宿主解不了的东西，都会拒掉那次调用并计入本插件健康度。这不是苛刻——fail-open 会让「安全控制」变成「把插件搞崩就能关掉的安全控制」；代价则因为 G1 到阈值自动卸载而**有界**。
+- **`ToolDecision` 的零值不是合法回答**：忘了返回会得到一个宿主解不了的文档（于是拒绝），而不是意外的放行。
+- **上限 `min(工具超时/4, 200ms)`**，比观察点更紧：工具还没开始跑。
+
 ## 两条硬规矩
 
 - **工具失败返回 `Fail`，不要 panic。** panic 会 trap 整个模块，代价是实例状态、同实例的在途调用，并计入插件健康度（连续故障到阈值会被自动卸载）。
@@ -106,4 +126,4 @@ func init() {
 
 ## 示例与测试
 
-`testdata/hello` 是一个完整的最小插件；`guest_test.go` 会把它**构建出来**（不提交产物：3 MB，而且会在 SDK 改动时立刻过期）并用真实 wazero 宿主跑通八件事：自述来自注册表（含 `extensions`）、闭环带 log 回调、缺参数是失败结果而非 trap、未授权即链接失败、GC 守卫确实在按住缓冲区、200 次调用后没有泄漏、op 2 真的到达注册的观察者、以及未知 op 有答案而不是 trap。
+`testdata/hello` 是一个完整的最小插件；`guest_test.go` 会把它**构建出来**（不提交产物：3 MB，而且会在 SDK 改动时立刻过期）并用真实 wazero 宿主跑通十件事：自述来自注册表（含 `extensions`）、闭环带 log 回调、缺参数是失败结果而非 trap、未授权即链接失败、GC 守卫确实在按住缓冲区、200 次调用后没有泄漏、op 2 真的到达注册的观察者、未知 op 有答案而不是 trap，以及决策点放行/拒绝两条路都真的走通。

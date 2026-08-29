@@ -77,6 +77,12 @@ type Registry struct {
 	// called — see notifyObservers for why holding the lock across a
 	// notification would deadlock a plugin that unloads itself.
 	observers []*registeredObserver
+	// deciders are consulted BEFORE dispatch and may refuse a call. They live
+	// beside observers, under the same lock and with the same copy-then-call
+	// discipline, because they have the same reentrancy hazard — but they are
+	// the opposite kind of seam: an observer cannot change anything, and a
+	// decider exists precisely to.
+	deciders []*registeredDecider
 }
 
 func NewRegistry(policy Policy, enforcer PermissionEnforcer, guards Guardrails) *Registry {
@@ -298,6 +304,13 @@ func (r *Registry) Execute(ctx context.Context, agent domain.Agent, call domain.
 	}
 	if r.policy != nil && r.policy.Decide(agent, call) == DecisionDeny {
 		return domain.ToolResult{}, ErrPermissionDenied
+	}
+	// Deciders come AFTER the host's own enforcer and policy, and that order is
+	// the enforcement: a call the host refused is never shown to a decider, so
+	// no decider can widen one. They may only add refusals.
+	if label, verdict := r.consultDeciders(ctx, descriptor, call); verdict.Decision == DecisionDeny {
+		return domain.ToolResult{}, fmt.Errorf("%w: %s refused this call: %s",
+			ErrPermissionDenied, label, verdict.Reason)
 	}
 	if r.guards != nil {
 		if err := r.guards.Before(ctx, call); err != nil {

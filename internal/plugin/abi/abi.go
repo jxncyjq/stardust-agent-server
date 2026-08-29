@@ -51,6 +51,18 @@ const (
 	// unknown op answers with a small error body by convention, and the host
 	// discards that like any other answer.
 	OpObserveToolResult int32 = 2
+
+	// OpDecideToolCall is the host asking a guest whether a tool call may be
+	// dispatched. The body is a JSON call (host.guestToolDecisionRequest, the
+	// same shape as OpCallTool's) and the answer is
+	// {"decision":"allow"|"deny","reason":…}.
+	//
+	// Unlike OpObserveToolResult the answer MATTERS, and the failure mode is
+	// therefore the opposite one: an answer the host cannot read is a
+	// REFUSAL, not a shrug (see host.pluginDecider for the fail-closed
+	// argument). A guest that does not implement this op must not be granted
+	// the decide extension — activation cross-checks exactly that.
+	OpDecideToolCall int32 = 3
 )
 
 // PackResult encodes a pointer and length into the i64 return value of

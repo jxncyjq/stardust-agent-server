@@ -142,3 +142,37 @@ func extensionEntry(granted []string) Entry {
 // touching descriptors; AssembleSpec returns host.Spec whose Tools are
 // tool.Descriptor values.
 var _ = tool.Descriptor{}
+
+// TestAssembleSpecRefusesAnUndeclaredExtensionPerSeam is the regression the
+// SECOND extension makes possible: a same-set check that compares only one
+// seam would let a deployment grant "decide" to a plugin that asked for
+// "observe" — the plugin would come up with the power to refuse tool calls
+// that it never declared it wanted.
+func TestAssembleSpecRefusesAnUndeclaredExtensionPerSeam(t *testing.T) {
+	pm := extensionManifest(t, []string{"observe"})
+	entry := extensionEntry([]string{"decide"})
+
+	_, err := AssembleSpec(pm, entry, Limits{TimeoutMs: 1000, MaxMemoryPages: 8, MaxInstances: 1})
+	if err == nil {
+		t.Fatal("AssembleSpec granting decide to a plugin that declared only observe = nil error, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "decide") {
+		t.Errorf("error = %v, want it to name the extension that was not declared", err)
+	}
+}
+
+func TestAssembleSpecCarriesADeclaredAndGrantedDecide(t *testing.T) {
+	pm := extensionManifest(t, []string{"observe", "decide"})
+	entry := extensionEntry([]string{"decide"})
+
+	spec, err := AssembleSpec(pm, entry, Limits{TimeoutMs: 1000, MaxMemoryPages: 8, MaxInstances: 1})
+	if err != nil {
+		t.Fatalf("AssembleSpec: %v", err)
+	}
+	if !spec.Extensions.Decide {
+		t.Error("Extensions.Decide = false, want true: both sides named it")
+	}
+	if spec.Extensions.Observe {
+		t.Error("Extensions.Observe = true, but the deployment granted only decide")
+	}
+}

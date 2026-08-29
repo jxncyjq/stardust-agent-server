@@ -141,6 +141,88 @@ impl ToolObservation {
     }
 }
 
+/// ToolDecisionRequest 是宿主在**派发之前**问的那次调用：只有调用，没有结果，
+/// 因为还什么都没跑。这就是它与 [`ToolObservation`] 的全部区别。
+///
+/// 被授予 `decide` 扩展点的插件会被问到 agent 跑的**任意**工具，不只是自己的。
+pub struct ToolDecisionRequest {
+    pub call_id: String,
+    pub tool: String,
+    pub arguments: BTreeMap<String, String>,
+}
+
+impl ToolDecisionRequest {
+    /// parse 读一次 `abi::OP_DECIDE_TOOL_CALL` 的请求体。
+    ///
+    /// 与 [`ToolCall::parse`] 同规则：缺 `tool` 是错误而不是空名字。
+    pub fn parse(body: &[u8]) -> Result<ToolDecisionRequest, json::ParseError> {
+        let object = json::parse(body)?;
+        let tool = object
+            .strings
+            .get("tool")
+            .filter(|value| !value.is_empty())
+            .ok_or(json::ParseError::MissingField("tool"))?
+            .clone();
+        Ok(ToolDecisionRequest {
+            call_id: object.strings.get("call_id").cloned().unwrap_or_default(),
+            tool,
+            arguments: object.arguments,
+        })
+    }
+
+    /// argument 取一个参数，缺失或为空时返回 `None`（同 [`ToolCall::argument`]）。
+    pub fn argument(&self, name: &str) -> Option<&str> {
+        self.arguments
+            .get(name)
+            .map(String::as_str)
+            .filter(|value| !value.is_empty())
+    }
+}
+
+/// ToolDecision 是插件的回答：放行或拒绝，外加理由。
+///
+/// 用 [`ToolDecision::allow`] / [`ToolDecision::deny`] 构造。**放行不是授权**：
+/// 宿主自己的权限与策略在插件被问到之前就已经放行了这次调用，插件只能把结果
+/// 变严，不能变松。
+pub struct ToolDecision {
+    decision: &'static str,
+    reason: String,
+}
+
+impl ToolDecision {
+    /// allow 表示「我不反对」。
+    pub fn allow() -> ToolDecision {
+        ToolDecision {
+            decision: "allow",
+            reason: String::new(),
+        }
+    }
+
+    /// deny 拒绝这次调用。reason 会原样到达模型与运维，要说清哪里不对。
+    pub fn deny(reason: impl Into<String>) -> ToolDecision {
+        ToolDecision {
+            decision: "deny",
+            reason: reason.into(),
+        }
+    }
+
+    /// to_json 渲染宿主严格解码的那份文档。
+    pub fn to_json(&self) -> String {
+        format!(
+            "{{\"decision\":\"{}\",\"reason\":\"{}\"}}",
+            self.decision,
+            json::escape(&self.reason)
+        )
+    }
+}
+
+/// Decider 是决策者的实现：拿到一次**尚未派发**的调用，回答放行或拒绝。
+///
+/// 它必须比观察者更快：宿主给每次征询的上限是 `min(工具超时/4, 200ms)`，而工具
+/// 还没开始跑——这里花的每一毫秒都加在那次调用上。而且**失败不是免费的**：超时、
+/// trap、答出宿主解不了的东西，都会**拒绝**那次调用并计入本插件的健康度。
+pub type Decider = fn(&ToolDecisionRequest) -> ToolDecision;
+
 /// Observer 是观察者的实现：拿到一次已完成调用，**什么也不返回**。
 ///
 /// 没有返回值是契约本身，不是省略。另外它必须**快**：它跑在别人的工具调用里，
@@ -244,6 +326,52 @@ mod observation_tests {
         assert_eq!(
             ToolObservation::parse(br#"{"success":true}"#).err(),
             Some(json::ParseError::MissingField("tool"))
+        );
+    }
+}
+
+#[cfg(test)]
+mod decision_tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_decision_request() {
+        let request = ToolDecisionRequest::parse(
+            br#"{"call_id":"c1","tool":"write_file","arguments":{"path":"/tmp/x"}}"#,
+        )
+        .expect("a well-formed request must parse");
+        assert_eq!(request.call_id, "c1");
+        assert_eq!(request.tool, "write_file");
+        assert_eq!(request.argument("path"), Some("/tmp/x"));
+    }
+
+    #[test]
+    fn a_request_without_a_tool_is_an_error() {
+        assert_eq!(
+            ToolDecisionRequest::parse(br#"{"call_id":"c1"}"#).err(),
+            Some(json::ParseError::MissingField("tool"))
+        );
+    }
+
+    #[test]
+    fn renders_allow_and_deny_in_the_hosts_vocabulary() {
+        assert_eq!(
+            ToolDecision::allow().to_json(),
+            r#"{"decision":"allow","reason":""}"#
+        );
+        assert_eq!(
+            ToolDecision::deny("writes are frozen").to_json(),
+            r#"{"decision":"deny","reason":"writes are frozen"}"#
+        );
+    }
+
+    #[test]
+    fn escapes_the_reason_so_the_host_can_decode_it() {
+        let json = ToolDecision::deny("say \"no\"\nnow").to_json();
+        assert!(json.contains(r#"say \"no\"\nnow"#), "got {json}");
+        assert!(
+            !json.contains('\n'),
+            "a raw newline would break the strict decode: {json}"
         );
     }
 }
