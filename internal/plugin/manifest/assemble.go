@@ -496,4 +496,12 @@ func reconcileExtensions(pluginName string, declared, granted []string) (perm.Ex
 	return intersection, nil
 }
 
-func sameExtensions(a, b perm.Extensions) bool { return a.Observe == b.Observe }
+// sameExtensions compares two grants SEAM BY SEAM.
+//
+// Every seam must be listed here. Comparing a subset of them (or comparing
+// Any()) would let a deployment grant an extension the plugin never declared:
+// the intersection would drop it, this check would not notice, and the plugin
+// would come up holding a power it did not ask for.
+func sameExtensions(a, b perm.Extensions) bool {
+	return a.Observe == b.Observe && a.Decide == b.Decide
+}
