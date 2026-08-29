@@ -436,6 +436,10 @@ type instance struct {
 	// collide inside the graph.
 	providesServices []string
 	requiresServices []string
+	// serviceCapabilities maps a provided service's capability names to this
+	// plugin's own tools (see manifest.PluginManifest.ServiceCapabilities). It
+	// is what ResolveService answers from.
+	serviceCapabilities map[string]map[string]string
 	// requires is the plugin's declared dependency on other plugins' tools
 	// (manifest.PluginManifest.Requires), which is what the dependency graph is
 	// built from. It is part of the fingerprint, so an operator who edits it
@@ -1181,6 +1185,11 @@ func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string)
 		}
 	}
 	deps.OnSuccess = func(_ context.Context, _ string) { l.recordSuccess(name) }
+	// Named-service resolution belongs to the mount for the same reason:
+	// providers come and go while the process runs, so the answer is looked up
+	// per call against THIS loader's current instances, never captured when a
+	// consumer was activated.
+	deps.Services = l
 
 	spec.Deps = deps
 	spec.Registry = deps.Tools
@@ -1242,17 +1251,18 @@ func (l *Loader) activate(ctx context.Context, plan *convergePlan) error {
 	}
 
 	inst := &instance{
-		name:             entry.Name,
-		version:          plan.pm.Version,
-		owner:            owner,
-		spec:             plan.spec,
-		fingerprint:      plan.digest,
-		sha256:           plan.pm.SHA256,
-		tools:            toolNames(plan.spec.Tools),
-		plugin:           plugin,
-		requires:         append([]string(nil), plan.pm.Requires...),
-		providesServices: append([]string(nil), plan.pm.ProvidesServices...),
-		requiresServices: append([]string(nil), plan.pm.RequiresServices...),
+		name:                entry.Name,
+		version:             plan.pm.Version,
+		owner:               owner,
+		spec:                plan.spec,
+		fingerprint:         plan.digest,
+		sha256:              plan.pm.SHA256,
+		tools:               toolNames(plan.spec.Tools),
+		plugin:              plugin,
+		requires:            append([]string(nil), plan.pm.Requires...),
+		providesServices:    append([]string(nil), plan.pm.ProvidesServices...),
+		requiresServices:    append([]string(nil), plan.pm.RequiresServices...),
+		serviceCapabilities: plan.pm.ServiceCapabilities,
 	}
 	if plan.unloadErr != nil {
 		// The replacement came up, but its predecessor did not go down cleanly:
@@ -1799,4 +1809,40 @@ func formatActivationFailedMessage(name, version, step string, rolledBack int, r
 	return fmt.Sprintf("plugin=%s version=%s step=%s rolled_back=%d restored=%s error=%s",
 		name, version, step, rolledBack, restored,
 		strings.ReplaceAll(err.Error(), "\n", "; "))
+}
+
+// ResolveService implements host.ServiceResolver: it answers which tool is the
+// named capability of whoever provides the service RIGHT NOW.
+//
+// Two refusals, both naming what was asked for, because a consumer that
+// receives "tool not found" for a service reference goes looking for the wrong
+// thing:
+//
+//   - nobody provides the service (or its provider is suspended, so it is not
+//     contributing anything at the moment);
+//   - the provider holds the service but exposes no such capability.
+//
+// A suspended provider is deliberately not resolvable: its tools are withdrawn
+// from the registry, so resolving to one would hand the caller a name that is
+// about to fail as unknown — and the consumer of a suspended provider is
+// normally suspended itself (see suspend.go), which is the state that says so.
+func (l *Loader) ResolveService(service, capability string) (string, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	for name, inst := range l.instances {
+		if !containsName(inst.providesServices, service) {
+			continue
+		}
+		if inst.plugin.Suspended() {
+			return "", fmt.Errorf("service %q is provided by plugin %q, which is suspended", service, name)
+		}
+		toolName, ok := inst.serviceCapabilities[service][capability]
+		if !ok {
+			return "", fmt.Errorf("plugin %q provides service %q but exposes no capability %q",
+				name, service, capability)
+		}
+		return toolName, nil
+	}
+	return "", fmt.Errorf("no mounted plugin provides service %q", service)
 }

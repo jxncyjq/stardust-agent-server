@@ -200,3 +200,139 @@ func TestAServiceConsumerCascadesWhenItsProviderIsSuspended(t *testing.T) {
 	h.wantState(svcConsumerName, StateSuspended, "service:"+issueTracker)
 	wantStrings(t, "registry with the whole chain down", h.toolNames(), nil)
 }
+
+// The resolver is what turns "service:issue-tracker/search" into whoever's
+// tool is behind it right now. Its answers change as plugins mount, suspend
+// and unload — which is why it is asked per call rather than captured when a
+// consumer was activated.
+
+// writeServiceProviderPkg writes a provider that also maps capabilities onto
+// its own tool.
+func (h *harness) writeServiceProviderPkg(dir, name, toolName, service, capability string) manifest.Entry {
+	h.t.Helper()
+
+	writePackage(h.t, filepath.Join(h.root, dir), pkg{
+		wasm:                patchIdentity(h.t, name, toolName),
+		name:                name,
+		version:             "0.1.0",
+		tools:               []string{toolName},
+		providesServices:    []string{service},
+		serviceCapabilities: map[string]map[string]string{service: {capability: toolName}},
+	})
+	return entryFor(name, dir, nil, toolName)
+}
+
+func TestResolveServiceAnswersWithTheCurrentProvidersTool(t *testing.T) {
+	h := newHarness(t)
+	provider := h.writeServiceProviderPkg("svcprov", svcProviderName, svcProviderTool, issueTracker, "search")
+
+	h.apply(provider)
+
+	got, err := h.loader.ResolveService(issueTracker, "search")
+	if err != nil {
+		t.Fatalf("ResolveService: %v", err)
+	}
+	if got != svcProviderTool {
+		t.Errorf("ResolveService = %q, want %q", got, svcProviderTool)
+	}
+}
+
+// TestResolveServiceFollowsAProviderSwap is the point of the whole seam: the
+// same service name, a different plugin behind it, and nothing on the consumer
+// side changed.
+func TestResolveServiceFollowsAProviderSwap(t *testing.T) {
+	h := newHarness(t)
+	first := h.writeServiceProviderPkg("svcprov", svcProviderName, svcProviderTool, issueTracker, "search")
+	second := h.writeServiceProviderPkg("svcrival", svcRivalName, svcRivalTool, issueTracker, "search")
+
+	h.apply(first)
+	got, err := h.loader.ResolveService(issueTracker, "search")
+	if err != nil || got != svcProviderTool {
+		t.Fatalf("ResolveService before the swap = (%q, %v), want %q", got, err, svcProviderTool)
+	}
+
+	// The deployment drops the first provider and declares the second.
+	h.apply(second)
+
+	got, err = h.loader.ResolveService(issueTracker, "search")
+	if err != nil {
+		t.Fatalf("ResolveService after the swap: %v", err)
+	}
+	if got != svcRivalTool {
+		t.Errorf("ResolveService = %q, want the new provider's tool %q", got, svcRivalTool)
+	}
+}
+
+func TestResolveServiceRefusesWhatItCannotAnswer(t *testing.T) {
+	h := newHarness(t)
+	provider := h.writeServiceProviderPkg("svcprov", svcProviderName, svcProviderTool, issueTracker, "search")
+	h.apply(provider)
+
+	if _, err := h.loader.ResolveService("calendar", "list"); err == nil {
+		t.Error("ResolveService for an unprovided service = nil error, want a refusal")
+	}
+	_, err := h.loader.ResolveService(issueTracker, "comment")
+	if err == nil {
+		t.Fatal("ResolveService for an unexposed capability = nil error, want a refusal")
+	}
+	for _, want := range []string{svcProviderName, "comment"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %v, want it to name %q", err, want)
+		}
+	}
+}
+
+// TestResolveServiceRefusesASuspendedProvider: a suspended plugin's tools are
+// withdrawn from the registry, so resolving to one would hand back a name that
+// is about to fail as unknown.
+func TestResolveServiceRefusesASuspendedProvider(t *testing.T) {
+	h := newHarness(t)
+	writePackage(t, filepath.Join(h.root, "svcprov"), pkg{
+		wasm:                patchIdentity(t, svcProviderName, svcProviderTool),
+		name:                svcProviderName,
+		version:             "0.1.0",
+		tools:               []string{svcProviderTool},
+		requires:            []string{"absent_tool"},
+		providesServices:    []string{issueTracker},
+		serviceCapabilities: map[string]map[string]string{issueTracker: {"search": svcProviderTool}},
+	})
+	provider := entryFor(svcProviderName, "svcprov", nil, svcProviderTool)
+
+	h.apply(provider)
+	h.wantState(svcProviderName, StateSuspended, "absent_tool")
+
+	_, err := h.loader.ResolveService(issueTracker, "search")
+	if err == nil {
+		t.Fatal("ResolveService with a suspended provider = nil error, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "suspended") {
+		t.Errorf("error = %v, want it to say the provider is suspended", err)
+	}
+}
+
+// TestAMountedPluginCanResolveServicesThroughItsDeps is the wiring test: the
+// Loader implementing host.ServiceResolver proves nothing if no mounted plugin
+// is handed it. Without this, a guest's "service:x/y" call_tool would be told
+// this deployment has no service resolver — while the loader sitting right
+// there knew the answer.
+func TestAMountedPluginCanResolveServicesThroughItsDeps(t *testing.T) {
+	h := newHarness(t)
+	provider := h.writeServiceProviderPkg("svcprov", svcProviderName, svcProviderTool, issueTracker, "search")
+
+	h.apply(provider)
+
+	inst := h.loader.instances[svcProviderName]
+	if inst == nil {
+		t.Fatalf("no instance for %q", svcProviderName)
+	}
+	if inst.spec.Deps.Services == nil {
+		t.Fatal("the mounted plugin's Deps carries no service resolver; its call_tool could never use a service name")
+	}
+	got, err := inst.spec.Deps.Services.ResolveService(issueTracker, "search")
+	if err != nil {
+		t.Fatalf("ResolveService through Deps: %v", err)
+	}
+	if got != svcProviderTool {
+		t.Errorf("ResolveService through Deps = %q, want %q", got, svcProviderTool)
+	}
+}

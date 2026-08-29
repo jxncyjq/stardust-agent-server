@@ -164,6 +164,15 @@ type Deps struct {
 	// deployment that believes it installed instructions the model never
 	// sees.
 	PromptSegments *prompt.Segments
+
+	// Services resolves "service:<name>/<capability>" targets a guest passes to
+	// call_tool into the tool of whoever currently provides that service.
+	//
+	// Contract-declared optional: a host with no plugin deployment (or one
+	// built before named services existed) has none, and a guest that asks for
+	// a service target there is told so — never silently handed the literal
+	// name to look up as a tool.
+	Services ServiceResolver
 }
 
 // BuildHostModule instantiates the `legion` host module (abi.HostModuleName)
