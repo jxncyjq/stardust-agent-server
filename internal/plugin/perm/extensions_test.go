@@ -41,3 +41,22 @@ func TestExtensionsIntersectIsPerSeam(t *testing.T) {
 		t.Error("Intersect dropped Decide, which both sides named")
 	}
 }
+
+func TestParseExtensionsAcceptsPrompt(t *testing.T) {
+	parsed, err := ParseExtensions([]string{"prompt"})
+	if err != nil {
+		t.Fatalf("ParseExtensions([prompt]) error = %v, want nil", err)
+	}
+	if !parsed.Prompt || parsed.Observe || parsed.Decide {
+		t.Errorf("ParseExtensions([prompt]) = %+v, want only Prompt", parsed)
+	}
+}
+
+// TestExtensionsNamesReportsAllThreeSeams also guards the sorted, stable order
+// the rendered prompt depends on downstream.
+func TestExtensionsNamesReportsAllThreeSeams(t *testing.T) {
+	names := Extensions{Observe: true, Decide: true, Prompt: true}.Names()
+	if len(names) != 3 || names[0] != "decide" || names[1] != "observe" || names[2] != "prompt" {
+		t.Errorf("Names() = %v, want [decide observe prompt]", names)
+	}
+}

@@ -503,5 +503,5 @@ func reconcileExtensions(pluginName string, declared, granted []string) (perm.Ex
 // the intersection would drop it, this check would not notice, and the plugin
 // would come up holding a power it did not ask for.
 func sameExtensions(a, b perm.Extensions) bool {
-	return a.Observe == b.Observe && a.Decide == b.Decide
+	return a.Observe == b.Observe && a.Decide == b.Decide && a.Prompt == b.Prompt
 }
