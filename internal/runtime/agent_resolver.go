@@ -63,6 +63,14 @@ type AgentRuntimeResolverConfig struct {
 	//
 	// Nil is a deployment with no plugin prompt segments, and costs nothing.
 	PluginSegments *prompt.Segments
+
+	// PluginTools is the registry mounted plugins contribute their tools to.
+	// Every per-agent registry INHERITS from it, which is what puts a plugin's
+	// tools in the model's reach and what makes the plugin's observe/decide
+	// seams see an agent's own tool calls (both walk the parent chain).
+	//
+	// Nil is a deployment with no plugins.
+	PluginTools *tool.Registry
 	// Logger reports conditions that are tolerated but worth surfacing, such as
 	// a configured skills root that does not exist. Nil disables that reporting
 	// (tests, embedded use); it never changes what the resolver builds.
@@ -109,6 +117,7 @@ type AgentRuntimeResolver struct {
 	checkpoints       *sessionstate.Store
 	toolGate          ToolGate
 	pluginSegments    *prompt.Segments
+	pluginTools       *tool.Registry
 	logger            *slog.Logger
 	skillUsage        SkillUsageRecorder
 	conversationTurns ConversationTurnLister
@@ -136,6 +145,7 @@ func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolv
 		checkpoints:       cfg.Checkpoints,
 		toolGate:          cfg.ToolGate,
 		pluginSegments:    cfg.PluginSegments,
+		pluginTools:       cfg.PluginTools,
 		logger:            cfg.Logger,
 		skillUsage:        cfg.SkillUsage,
 		conversationTurns: cfg.ConversationTurns,
@@ -277,7 +287,8 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 	toolRoot := agentToolRoot(r.rootConfig, agentCfg, task)
 	tools := tool.NewFileReadWriteWorkspaceRegistry(toolRoot, r.audit,
 		tool.WithAgentsInjection(r.rootConfig.ContextFiles.MaxFileChars, r.resolveHomeDir(ctx)),
-		tool.WithProjectRoot(toolRoot))
+		tool.WithProjectRoot(toolRoot),
+		tool.WithPluginTools(r.pluginTools))
 	// A plugin granted the decide extension may answer "ask", and the ticket
 	// that answers it is read at DISPATCH time, in this registry. The gate that
 	// opens those tickets is the only thing that can read them back, so it is
