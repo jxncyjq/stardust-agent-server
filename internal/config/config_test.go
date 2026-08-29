@@ -90,6 +90,10 @@ func TestLoadAppliesEnvironmentOverrides(t *testing.T) {
 	t.Setenv("LEGION_AGENT_TUI_SHOW_PROMPT", "0")
 	t.Setenv("LEGION_AGENT_TUI_SHOW_THINKING", "false")
 
+	// Isolate the default config location: this test is about the env
+	// overlay, not about whatever config the developer has in ~/.stardust.
+	t.Setenv("STARDUST_HOME", t.TempDir())
+
 	cfg, err := Load(context.Background(), Options{})
 	if err != nil {
 		t.Fatalf("Load(defaults with env) error = %v, want nil", err)
@@ -227,7 +231,10 @@ func TestLoadSessionConfig(t *testing.T) {
 }
 
 func TestDefaultSessionCacheConfig(t *testing.T) {
-	t.Parallel()
+	// Not parallel: it points STARDUST_HOME at an empty directory, and a test
+	// that reads "no config file" must not depend on whether the developer
+	// running it happens to have ~/.stardust/agent.json.
+	t.Setenv("STARDUST_HOME", t.TempDir())
 
 	cfg, err := Load(context.Background(), Options{})
 	if err != nil {
@@ -368,6 +375,10 @@ func TestLoadTasksEnvOverrides(t *testing.T) {
 	t.Setenv("LEGION_AGENT_TASKS_MAX_INDEX_LINES", "250")
 	t.Setenv("LEGION_AGENT_TASKS_MAX_TASK_LINES", "80")
 	t.Setenv("LEGION_AGENT_TASKS_MAX_MESSAGE_CHARS", "180")
+
+	// Isolate the default config location: this test is about the env
+	// overlay, not about whatever config the developer has in ~/.stardust.
+	t.Setenv("STARDUST_HOME", t.TempDir())
 
 	cfg, err := Load(context.Background(), Options{})
 	if err != nil {
@@ -924,5 +935,118 @@ func TestLoadRejectsANonPositiveHealthThreshold(t *testing.T) {
 	if _, err := Load(context.Background(), Options{Path: path}); err == nil {
 		t.Fatal("Load with max_consecutive_faults=0 error = nil, want a refusal: " +
 			"0 is not 'never unload', it is an unstated policy")
+	}
+}
+
+// The tests below pin the default configuration location: ~/.stardust/agent.json
+// (or $STARDUST_HOME/agent.json). Before it existed, a command run without
+// --config read NO file at all — it ran on built-in defaults, which is the
+// state an operator least expects when they have a config sitting in the
+// conventional place.
+//
+// They set STARDUST_HOME rather than HOME: reading the developer's real
+// ~/.stardust would make the suite depend on the machine it runs on.
+
+func TestLoadReadsTheDefaultConfigWhenNoPathIsGiven(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("STARDUST_HOME", dir)
+	path := filepath.Join(dir, "agent.json")
+	if err := os.WriteFile(path, []byte(`{"maas":{"base_url":"https://from-default-dir.example"}}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", path, err)
+	}
+
+	cfg, err := Load(context.Background(), Options{})
+	if err != nil {
+		t.Fatalf("Load with no path error = %v, want nil", err)
+	}
+	if cfg.Maas.BaseURL != "https://from-default-dir.example" {
+		t.Errorf("Maas.BaseURL = %q, want the value from %s", cfg.Maas.BaseURL, path)
+	}
+}
+
+func TestLoadWithNoDefaultConfigStillRunsOnBuiltInDefaults(t *testing.T) {
+	// An installation before its first config file is a supported state, not an
+	// error: this is what every fresh machine looks like.
+	t.Setenv("STARDUST_HOME", t.TempDir())
+
+	cfg, err := Load(context.Background(), Options{})
+	if err != nil {
+		t.Fatalf("Load with no default config error = %v, want nil: running without a config file is supported", err)
+	}
+	if cfg.Storage.Driver != defaultConfig().Storage.Driver {
+		t.Errorf("Storage.Driver = %q, want the built-in default %q",
+			cfg.Storage.Driver, defaultConfig().Storage.Driver)
+	}
+}
+
+func TestLoadPrefersAnExplicitPathOverTheDefault(t *testing.T) {
+	defaultDir := t.TempDir()
+	t.Setenv("STARDUST_HOME", defaultDir)
+	if err := os.WriteFile(filepath.Join(defaultDir, "agent.json"),
+		[]byte(`{"maas":{"base_url":"https://default.example"}}`), 0o600); err != nil {
+		t.Fatalf("WriteFile error = %v, want nil", err)
+	}
+	explicit := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(explicit,
+		[]byte(`{"maas":{"base_url":"https://explicit.example"}}`), 0o600); err != nil {
+		t.Fatalf("WriteFile error = %v, want nil", err)
+	}
+
+	cfg, err := Load(context.Background(), Options{Path: explicit})
+	if err != nil {
+		t.Fatalf("Load(%q) error = %v, want nil", explicit, err)
+	}
+	if cfg.Maas.BaseURL != "https://explicit.example" {
+		t.Errorf("Maas.BaseURL = %q, want the explicitly named file to win", cfg.Maas.BaseURL)
+	}
+}
+
+func TestLoadRefusesABrokenDefaultConfigInsteadOfIgnoringIt(t *testing.T) {
+	// The one thing the default location must NOT do: fall back to built-in
+	// defaults when the file it found is broken. That would run a deployment on
+	// settings nobody wrote, with the operator's real config sitting unread.
+	dir := t.TempDir()
+	t.Setenv("STARDUST_HOME", dir)
+	if err := os.WriteFile(filepath.Join(dir, "agent.json"), []byte(`{not json`), 0o600); err != nil {
+		t.Fatalf("WriteFile error = %v, want nil", err)
+	}
+
+	if _, err := Load(context.Background(), Options{}); err == nil {
+		t.Fatal("Load with an undecodable default config error = nil, want a refusal")
+	}
+}
+
+func TestDefaultConfigPathHonoursTheHomeOverride(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("STARDUST_HOME", dir)
+
+	path, err := DefaultConfigPath()
+	if err != nil {
+		t.Fatalf("DefaultConfigPath() error = %v, want nil", err)
+	}
+	if want := filepath.Join(dir, "agent.json"); path != want {
+		t.Errorf("DefaultConfigPath() = %q, want %q", path, want)
+	}
+}
+
+func TestDefaultConfigPathIfPresentIsEmptyWhenNothingIsThere(t *testing.T) {
+	t.Setenv("STARDUST_HOME", t.TempDir())
+
+	if got := DefaultConfigPathIfPresent(); got != "" {
+		t.Errorf("DefaultConfigPathIfPresent() = %q, want \"\" when no file exists", got)
+	}
+}
+
+func TestDefaultConfigPathIfPresentIgnoresADirectoryOfThatName(t *testing.T) {
+	// A directory called agent.json is not a config file, and reporting it as
+	// one would turn a confusing mistake into an unreadable error later.
+	dir := t.TempDir()
+	t.Setenv("STARDUST_HOME", dir)
+	if err := os.MkdirAll(filepath.Join(dir, "agent.json"), 0o755); err != nil {
+		t.Fatalf("MkdirAll error = %v, want nil", err)
+	}
+
+	if got := DefaultConfigPathIfPresent(); got != "" {
+		t.Errorf("DefaultConfigPathIfPresent() = %q, want \"\" for a directory", got)
 	}
 }
