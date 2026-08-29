@@ -35,6 +35,17 @@ const (
 	// position from which a plugin could turn a refusal into a permission. A
 	// plugin's "allow" means "I do not object", never "I authorize".
 	ExtensionDecide Extension = "decide"
+
+	// ExtensionPrompt lets a plugin contribute a block of text to the system
+	// prompt.
+	//
+	// It is the only extension whose effect is not a call at all: the host
+	// asks for the text ONCE, at activation, and renders it into every
+	// prompt until the plugin is unloaded. That makes it a deployment-level
+	// fact rather than a per-call one — and it puts UNTRUSTED TEXT in front
+	// of the model, which is why the rendering fences it with boundary
+	// markers naming the plugin.
+	ExtensionPrompt Extension = "prompt"
 )
 
 // knownExtensions is the complete set of extension names this host
@@ -45,7 +56,7 @@ const (
 // would otherwise believe it is being consulted while nothing ever calls it,
 // which is the worst of the three possible outcomes (working, refused,
 // silently inert).
-var knownExtensions = []Extension{ExtensionObserve, ExtensionDecide}
+var knownExtensions = []Extension{ExtensionObserve, ExtensionDecide, ExtensionPrompt}
 
 // Extensions is the set of extension points a plugin has actually been
 // granted, as the host consults them.
@@ -58,12 +69,14 @@ type Extensions struct {
 	Observe bool
 	// Decide is ExtensionDecide.
 	Decide bool
+	// Prompt is ExtensionPrompt.
+	Prompt bool
 }
 
 // Any reports whether any extension point at all was granted. It is what the
 // caller checks before doing work that only matters to a plugin that
 // participates in the host's machinery.
-func (e Extensions) Any() bool { return e.Observe || e.Decide }
+func (e Extensions) Any() bool { return e.Observe || e.Decide || e.Prompt }
 
 // Names renders the granted extensions, sorted, for errors and diagnostics.
 func (e Extensions) Names() []string {
@@ -73,6 +86,9 @@ func (e Extensions) Names() []string {
 	}
 	if e.Decide {
 		names = append(names, string(ExtensionDecide))
+	}
+	if e.Prompt {
+		names = append(names, string(ExtensionPrompt))
 	}
 	sort.Strings(names)
 	return names
@@ -103,6 +119,8 @@ func ParseExtensions(names []string) (Extensions, error) {
 			parsed.Observe = true
 		case ExtensionDecide:
 			parsed.Decide = true
+		case ExtensionPrompt:
+			parsed.Prompt = true
 		default:
 			return Extensions{}, fmt.Errorf("unknown extension %q; supported: %s",
 				name, strings.Join(knownExtensionNames(), ", "))
@@ -123,6 +141,7 @@ func (e Extensions) Intersect(other Extensions) Extensions {
 	return Extensions{
 		Observe: e.Observe && other.Observe,
 		Decide:  e.Decide && other.Decide,
+		Prompt:  e.Prompt && other.Prompt,
 	}
 }
 

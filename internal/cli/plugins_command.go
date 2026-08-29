@@ -30,6 +30,7 @@ import (
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
 	"github.com/stardust/legion-agent/internal/plugin/sign"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/prompt"
 	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
 )
@@ -110,6 +111,11 @@ type pluginHostDeps struct {
 	// be the same gate the runtimes running this serve's tasks were built with;
 	// a gate of its own would wait for a boundary nobody is standing at.
 	Gate *taskgate.TaskGate
+
+	// PromptSegments is where a plugin granted the "prompt" extension files
+	// its block of system-prompt text. It MUST be the same store the context
+	// builders read, or a mounted plugin's text would reach nobody.
+	PromptSegments *prompt.Segments
 }
 
 // assemblePlugins builds this process's plugin loader from cfg.Plugins,
@@ -343,14 +349,15 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 				pluginConfig = json.RawMessage(`{}`)
 			}
 			return host.Deps{
-				PluginName: name,
-				Logger:     logger.With("component", "plugin", "plugin", name),
-				Config:     pluginConfig,
-				HTTP:       httpClient,
-				FS:         guard,
-				Events:     deps.Events,
-				Tools:      registry,
-				Agent:      identity,
+				PluginName:     name,
+				PromptSegments: deps.PromptSegments,
+				Logger:         logger.With("component", "plugin", "plugin", name),
+				Config:         pluginConfig,
+				HTTP:           httpClient,
+				FS:             guard,
+				Events:         deps.Events,
+				Tools:          registry,
+				Agent:          identity,
 			}
 		},
 		Events: deps.Events,

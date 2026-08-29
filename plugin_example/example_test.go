@@ -332,3 +332,29 @@ func TestExampleDeciderRefusesARequestItCannotRead(t *testing.T) {
 		t.Errorf("answer = %s, want a deny", out)
 	}
 }
+
+// TestExamplePromptSegmentIsReadableByTheHost drives abi.OpPromptSegment as
+// activation does. The host REFUSES TO MOUNT a plugin whose segment it cannot
+// decode, so "the answer is a well-formed document" is the difference between
+// this package mounting and not.
+func TestExamplePromptSegmentIsReadableByTheHost(t *testing.T) {
+	ctx := context.Background()
+	inst, _ := newExampleInstance(t, ctx, perm.Grant{Log: true})
+
+	out, err := inst.Invoke(ctx, abi.OpPromptSegment, nil)
+	if err != nil {
+		t.Fatalf("invoke op prompt segment: %v", err)
+	}
+	var answer struct {
+		Text string `json:"text"`
+	}
+	if err := json.Unmarshal(out, &answer); err != nil {
+		t.Fatalf("decode prompt segment %q: %v", out, err)
+	}
+	if !strings.Contains(answer.Text, "use the exact name the caller gave") {
+		t.Errorf("text = %q, want the segment this plugin declares", answer.Text)
+	}
+	if got := len([]rune(answer.Text)); got > 2048 {
+		t.Errorf("segment is %d runes; the host truncates past 2048, and this one is paid for on every inference", got)
+	}
+}

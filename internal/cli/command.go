@@ -37,6 +37,7 @@ import (
 	"github.com/stardust/legion-agent/internal/observability"
 	"github.com/stardust/legion-agent/internal/plugin/sign"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/prompt"
 	"github.com/stardust/legion-agent/internal/quality"
 	agentruntime "github.com/stardust/legion-agent/internal/runtime"
 	"github.com/stardust/legion-agent/internal/server"
@@ -2329,11 +2330,16 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	if pluginApp == nil {
 		pluginApp = app.New()
 	}
+	// One store for the whole process: the plugin host writes into it at
+	// activation, and every context builder below reads it per build, so a
+	// plugin mounted later still reaches the prompt.
+	pluginPromptSegments := prompt.NewSegments(logger)
 	if err := assemblePlugins(ctx, pluginApp, cfg, pluginHostDeps{
-		Audit:  auditLog,
-		Events: workflowEvents,
-		Logger: logger,
-		Gate:   taskGate,
+		Audit:          auditLog,
+		Events:         workflowEvents,
+		Logger:         logger,
+		Gate:           taskGate,
+		PromptSegments: pluginPromptSegments,
 	}); err != nil {
 		// Nothing is mounted on this path: assemblePlugins only returns an error
 		// before it converges anything, so there is no plugin state to unwind.
@@ -2494,6 +2500,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		MaasFactory:       maasFactoryFromConfig(cfg.Maas),
 		Checkpoints:       checkpointStore,
 		ToolGate:          manualGate,
+		PluginSegments:    pluginPromptSegments,
 		Logger:            logger,
 		SkillUsage:        skillUsage,
 		ConversationTurns: conversationTurns,
@@ -2532,7 +2539,8 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	defaultCore := cognitive.NewCore(cognitive.NewContextCompressor(cognitive.DefaultContextCompressorConfig(defaultMaas))).
 		WithContextFiles(defaultContext).
 		WithMemory(episodicMemory).
-		WithCapabilityMemory(capabilityStore)
+		WithCapabilityMemory(capabilityStore).
+		WithPluginSegments(pluginPromptSegments)
 	// capabilitySkills is the skill half of the default runtime's capability
 	// catalog. It is set only when a skills root is present; the runtime builds
 	// the tool half per task from the per-task registry. WithSkills is retained

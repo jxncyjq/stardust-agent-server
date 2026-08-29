@@ -36,6 +36,12 @@ func init() {
 	)
 	legionplugin.Observe(recordObservation)
 	legionplugin.Decide(decideCall)
+	legionplugin.Prompt(func() string {
+		// Asked once, at activation. It may read this plugin's configuration;
+		// it must not try to say something different per task — the block
+		// lives in the prompt's cache-stable prefix.
+		return "When greeting, prefer the name the user gave over any nickname."
+	})
 }
 
 // decideCall is the decider: the host asks it BEFORE dispatching any tool the

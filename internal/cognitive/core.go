@@ -8,6 +8,7 @@ import (
 	"github.com/stardust/legion-agent/internal/capability"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/memory"
+	"github.com/stardust/legion-agent/internal/prompt"
 	"github.com/stardust/legion-agent/internal/skill"
 )
 
@@ -79,6 +80,7 @@ type Core struct {
 	catalog          *capability.Catalog
 	capabilityMemory CapabilityMemoryProvider
 	contextFiles     string
+	pluginSegments   *prompt.Segments
 }
 
 func NewCore(compressor Compressor) *Core {
@@ -123,6 +125,18 @@ func (c *Core) WithCapabilityMemory(capabilityMemory CapabilityMemoryProvider) *
 	return c
 }
 
+// WithPluginSegments attaches the blocks mounted plugins contribute to the
+// system prompt (internal/prompt).
+//
+// The store is read on every build rather than captured once, because plugins
+// mount and unload while the process runs — and the rendered text is a
+// deployment-level fact between those events, which is what makes it eligible
+// for the cache-stable prefix at all.
+func (c *Core) WithPluginSegments(segments *prompt.Segments) *Core {
+	c.pluginSegments = segments
+	return c
+}
+
 func (c *Core) WithContextFiles(contextFiles string) *Core {
 	c.contextFiles = strings.TrimSpace(contextFiles)
 	return c
@@ -163,6 +177,18 @@ func (c *Core) BuildContext(ctx context.Context, req Request) (BuiltContext, err
 	// nothing task-specific may appear before the boundary or the cache misses. ---
 	add("catalog", catalogBlock)
 	add("durable_memory", durableBlock)
+	// Plugin-contributed text goes in the STABLE prefix: it is the same for
+	// every task until a plugin is mounted or unloaded (see internal/prompt).
+	// The cost of that placement is one cache invalidation per mount, which is
+	// the trade the G4 spec made deliberately — the alternative is re-sending
+	// the same block with every task, forever.
+	//
+	// It is rendered as its own named block so prompt growth stays
+	// attributable: "the prompt grew by 2 KB" should be answerable with "this
+	// plugin did it".
+	if c.pluginSegments != nil {
+		add("plugin_prompt", c.pluginSegments.Render())
+	}
 	if c.contextFiles != "" {
 		add("context_files", "Runtime context files:\n"+c.contextFiles+"\n")
 	}

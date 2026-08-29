@@ -8,9 +8,11 @@ import (
 	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/agentregistry"
 	"github.com/stardust/legion-agent/internal/approval"
+	"github.com/stardust/legion-agent/internal/cognitive"
 	"github.com/stardust/legion-agent/internal/config"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/manualgate"
+	"github.com/stardust/legion-agent/internal/prompt"
 	"github.com/stardust/legion-agent/internal/taskgate"
 	"github.com/stardust/legion-agent/internal/tool"
 )
@@ -189,5 +191,56 @@ func TestResolverGivesEachAgentRegistryTheAskArbiter(t *testing.T) {
 	}
 	if strings.Contains(execErr.Error(), "no approval channel") {
 		t.Errorf("error = %v; the registry has no arbiter, so a granted approval could never be honoured", execErr)
+	}
+}
+
+// TestResolverGivesEachAgentTheSharedPromptSegments: a plugin mounted after
+// serve started must still reach every agent's prompt. That works only if the
+// resolver hands each context builder the SAME store the plugin host writes
+// to, rather than a snapshot of its contents.
+func TestResolverGivesEachAgentTheSharedPromptSegments(t *testing.T) {
+	t.Parallel()
+
+	segments := prompt.NewSegments(nil)
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+		Gate: taskgate.NewTaskGate(),
+		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
+			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep"},
+		}),
+		RootConfig: config.Config{
+			ContextFiles: config.ContextFilesConfig{Root: t.TempDir()},
+			Runtime:      config.RuntimeConfig{MaxToolRounds: 1},
+		},
+		Audit:          adapter.NewMemoryAuditLog(),
+		Events:         adapter.NewMemoryEventBus(),
+		PluginSegments: segments,
+		MaasFactory: func(string) (MaasRunnerFactoryResult, error) {
+			return MaasRunnerFactoryResult{Client: &resolverCaptureMaas{response: "ok"}}, nil
+		},
+	})
+
+	_, runner, ok, err := resolver.ResolveTaskRunner(context.Background(), domain.Task{
+		ID: "task-1", AgentID: "researcher",
+	})
+	if err != nil || !ok {
+		t.Fatalf("ResolveTaskRunner = (%v, %t), want a runner", err, ok)
+	}
+	rt, isRuntime := runner.(*Runtime)
+	if !isRuntime {
+		t.Fatalf("runner type = %T, want *Runtime", runner)
+	}
+
+	// Mounted AFTER the runtime was built, exactly as a `plugins reload` does.
+	segments.Add("legion-jira", "Prefer ticket links.")
+
+	built, err := rt.contextBuilder.BuildContext(context.Background(), cognitive.Request{
+		Agent: domain.Agent{ID: "a1", Role: "researcher"},
+		Task:  domain.Task{ID: "task-1", Input: "go"},
+	})
+	if err != nil {
+		t.Fatalf("BuildContext: %v", err)
+	}
+	if !strings.Contains(built.Prompt, "Prefer ticket links.") {
+		t.Errorf("prompt = %q, want the segment a plugin added after wiring", built.Prompt)
 	}
 }

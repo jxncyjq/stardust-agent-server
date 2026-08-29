@@ -837,7 +837,9 @@ func Activate(ctx context.Context, ledger *lifecycle.Ledger, owner lifecycle.Own
 	// owns rolls back everything above it — including the tools registered
 	// before the failing one. It files under the contribution owner, which is
 	// what lets Plugin.Suspend withdraw exactly this much and nothing else.
-	contributeTools(ledger, toolsOwner, spec, instances, keep)
+	if err := contributeAll(ctx, ledger, toolsOwner, spec, instances, keep); err != nil {
+		return nil, fmt.Errorf("activate plugin %q: %w", spec.Name, err)
+	}
 
 	committed = true
 	return plugin, nil

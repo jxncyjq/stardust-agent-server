@@ -176,3 +176,20 @@ func TestAssembleSpecCarriesADeclaredAndGrantedDecide(t *testing.T) {
 		t.Error("Extensions.Observe = true, but the deployment granted only decide")
 	}
 }
+
+// TestAssembleSpecRefusesAnUndeclaredPrompt is the same per-seam guard the
+// decide extension needed: a same-set check that forgets one seam lets a
+// deployment grant a power the plugin never asked for — here, a block of
+// untrusted text in the system prompt.
+func TestAssembleSpecRefusesAnUndeclaredPrompt(t *testing.T) {
+	pm := extensionManifest(t, []string{"observe"})
+	entry := extensionEntry([]string{"prompt"})
+
+	_, err := AssembleSpec(pm, entry, Limits{TimeoutMs: 1000, MaxMemoryPages: 8, MaxInstances: 1})
+	if err == nil {
+		t.Fatal("AssembleSpec granting an undeclared prompt = nil error, want a refusal")
+	}
+	if !strings.Contains(err.Error(), "prompt") {
+		t.Errorf("error = %v, want it to name the extension", err)
+	}
+}
