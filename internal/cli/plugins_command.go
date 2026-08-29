@@ -116,6 +116,17 @@ type pluginHostDeps struct {
 	// its block of system-prompt text. It MUST be the same store the context
 	// builders read, or a mounted plugin's text would reach nobody.
 	PromptSegments *prompt.Segments
+
+	// PluginTools is the registry plugins contribute their tools (and their
+	// observe/decide seams) to. It MUST be the same registry the task
+	// registries inherit from (tool.WithPluginTools), or the model would
+	// never see a plugin's tools and the extension points would never be
+	// consulted for an agent's own calls.
+	//
+	// Nil means "build a private one": the `agent plugins` commands assemble a
+	// loader to read state without ever running a task, and a registry nobody
+	// inherits from is the correct shape there.
+	PluginTools *tool.Registry
 }
 
 // assemblePlugins builds this process's plugin loader from cfg.Plugins,
@@ -299,7 +310,10 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 	if err != nil {
 		return nil, fmt.Errorf("resolve plugin workspace root %q: %w", toolRoot, err)
 	}
-	registry := tool.NewFileReadWriteWorkspaceRegistry(toolRoot, deps.Audit, tool.WithProjectRoot(toolRoot))
+	registry := deps.PluginTools
+	if registry == nil {
+		registry = tool.NewFileReadWriteWorkspaceRegistry(toolRoot, deps.Audit, tool.WithProjectRoot(toolRoot))
+	}
 	guard := port.NewWorkspacePathGuard(absRoot)
 	// One client for every plugin, bounded by the deployment's own per-call
 	// timeout: an outbound request may not outlive the call that made it.

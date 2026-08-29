@@ -179,6 +179,47 @@ type workspaceRegistryOptions struct {
 	// the time a registry is returned from NewWorkspaceRegistry /
 	// NewFileReadWriteWorkspaceRegistry — see those constructors.
 	readHistory *readHistory
+	// pluginTools is the process-wide registry mounted plugins contribute to.
+	// When set, this registry INHERITS from it (see Registry.InheritFrom) and
+	// its permission enforcer learns to admit whatever the plugins registered.
+	pluginTools *Registry
+}
+
+// WithPluginTools makes the built registry reach the tools mounted plugins
+// contribute, so the model can call them.
+//
+// Two halves, and both are needed: the registry inherits from plugins (name
+// resolution and the catalog), and its permission enforcer takes plugins as a
+// dynamic source of admissible tool names (a plugin's name appears at run time
+// and can never be in the compile-time whitelist). With only the first, every
+// plugin tool would resolve and then be refused.
+//
+// What it does NOT change: the built registry keeps its own execution policy,
+// guardrails and audit log, so a plugin's tool runs under this task's rules.
+// A plugin tool declaring a high or critical risk level is still refused by
+// the execution policy, exactly as a builtin one would be.
+func WithPluginTools(plugins *Registry) WorkspaceRegistryOption {
+	return func(o *workspaceRegistryOptions) { o.pluginTools = plugins }
+}
+
+// applyPluginTools wires both halves of WithPluginTools, or does nothing when
+// no plugin registry was supplied.
+//
+// It PANICS on an enforcer it does not recognise rather than skipping the
+// dynamic source: skipping would produce a registry where every plugin tool
+// resolves and is then refused — a deployment that looks wired and works for
+// nothing.
+func applyPluginTools(registry *Registry, plugins *Registry) {
+	if plugins == nil {
+		return
+	}
+	registry.InheritFrom(plugins)
+	batch, ok := registry.enforcer.(BatchRolePermissionEnforcer)
+	if !ok {
+		panic(fmt.Sprintf("tool: WithPluginTools: enforcer is %T, which has no dynamic tool source; "+
+			"every plugin tool would resolve and then be refused", registry.enforcer))
+	}
+	registry.enforcer = batch.WithDynamicTools(plugins.HasTool)
 }
 
 // injectedAgentsSet tracks which non-resident agents.md files have already
@@ -405,6 +446,7 @@ func NewWorkspaceRegistry(root string, audit port.AuditLog, opts ...WorkspaceReg
 	}
 	registerReadOnlyDescriptors(registry, absRoot, guard, options)
 	registerWriteFileDescriptor(registry, absRoot, guard, options)
+	applyPluginTools(registry, options.pluginTools)
 	return registry
 }
 
@@ -554,6 +596,7 @@ func NewFileReadWriteWorkspaceRegistry(root string, audit port.AuditLog, opts ..
 	}
 	registerReadOnlyDescriptors(registry, absRoot, guard, options)
 	registerWriteFileDescriptor(registry, absRoot, guard, options)
+	applyPluginTools(registry, options.pluginTools)
 	return registry
 }
 

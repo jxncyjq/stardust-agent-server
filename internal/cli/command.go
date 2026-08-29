@@ -2334,12 +2334,20 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// activation, and every context builder below reads it per build, so a
 	// plugin mounted later still reaches the prompt.
 	pluginPromptSegments := prompt.NewSegments(logger)
+	// The one registry plugins contribute to, and the one every task registry
+	// inherits from below. Without this shared instance a plugin's tools would
+	// live where no model can see them — which is exactly what they did until
+	// this was wired.
+	pluginToolRoot := cfg.ContextFiles.Root
+	pluginTools := tool.NewFileReadWriteWorkspaceRegistry(pluginToolRoot, auditLog,
+		tool.WithProjectRoot(pluginToolRoot))
 	if err := assemblePlugins(ctx, pluginApp, cfg, pluginHostDeps{
 		Audit:          auditLog,
 		Events:         workflowEvents,
 		Logger:         logger,
 		Gate:           taskGate,
 		PromptSegments: pluginPromptSegments,
+		PluginTools:    pluginTools,
 	}); err != nil {
 		// Nothing is mounted on this path: assemblePlugins only returns an error
 		// before it converges anything, so there is no plugin state to unwind.
@@ -2501,6 +2509,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		Checkpoints:       checkpointStore,
 		ToolGate:          manualGate,
 		PluginSegments:    pluginPromptSegments,
+		PluginTools:       pluginTools,
 		Logger:            logger,
 		SkillUsage:        skillUsage,
 		ConversationTurns: conversationTurns,
