@@ -5,6 +5,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // These tests cover the two operations that make the cache something other
@@ -176,5 +177,89 @@ func TestCacheRemoveRefusesAMalformedDigest(t *testing.T) {
 	requireHas(t, c, digest, true)
 	if _, err := os.Stat(root); err != nil {
 		t.Errorf("stat cache root after malformed removals: %v, want it intact", err)
+	}
+}
+
+func TestRemoveStaleStagingLeavesFreshDirectoriesAlone(t *testing.T) {
+	// A staging directory that was created moments ago belongs to a download in
+	// progress. Deleting it would corrupt a fetch that is about to succeed.
+	c, root := newTestCache(t)
+	fresh := filepath.Join(root, "sha256", ".unpack-fresh")
+	if err := os.MkdirAll(fresh, 0o700); err != nil {
+		t.Fatalf("create staging dir: %v", err)
+	}
+
+	removed, err := c.RemoveStaleStaging(time.Hour, false)
+	if err != nil {
+		t.Fatalf("RemoveStaleStaging: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Errorf("removed %v, want nothing: the directory is younger than the cutoff", removed)
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("stat %s: %v, want it untouched", fresh, err)
+	}
+}
+
+func TestRemoveStaleStagingRemovesAbandonedDirectories(t *testing.T) {
+	c, root := newTestCache(t)
+	stale := filepath.Join(root, "sha256", ".unpack-stale")
+	if err := os.MkdirAll(stale, 0o700); err != nil {
+		t.Fatalf("create staging dir: %v", err)
+	}
+	past := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(stale, past, past); err != nil {
+		t.Fatalf("age the staging dir: %v", err)
+	}
+
+	removed, err := c.RemoveStaleStaging(time.Hour, false)
+	if err != nil {
+		t.Fatalf("RemoveStaleStaging: %v", err)
+	}
+	if len(removed) != 1 || removed[0] != ".unpack-stale" {
+		t.Fatalf("removed %v, want [.unpack-stale]", removed)
+	}
+	if _, err := os.Stat(stale); !os.IsNotExist(err) {
+		t.Errorf("stat %s: %v, want it gone", stale, err)
+	}
+}
+
+func TestRemoveStaleStagingDryRunDeletesNothing(t *testing.T) {
+	c, root := newTestCache(t)
+	stale := filepath.Join(root, "sha256", ".unpack-stale")
+	if err := os.MkdirAll(stale, 0o700); err != nil {
+		t.Fatalf("create staging dir: %v", err)
+	}
+	past := time.Now().Add(-2 * time.Hour)
+	if err := os.Chtimes(stale, past, past); err != nil {
+		t.Fatalf("age the staging dir: %v", err)
+	}
+
+	removed, err := c.RemoveStaleStaging(time.Hour, true)
+	if err != nil {
+		t.Fatalf("RemoveStaleStaging(dryRun): %v", err)
+	}
+	if len(removed) != 1 {
+		t.Fatalf("dry run reported %v, want the one stale directory", removed)
+	}
+	if _, err := os.Stat(stale); err != nil {
+		t.Errorf("dry run deleted %s: %v", stale, err)
+	}
+}
+
+// TestRemoveStaleStagingRefusesANonPositiveAge: "older than zero" is every
+// directory, including the one being written right now.
+func TestRemoveStaleStagingRefusesANonPositiveAge(t *testing.T) {
+	c, root := newTestCache(t)
+	fresh := filepath.Join(root, "sha256", ".unpack-fresh")
+	if err := os.MkdirAll(fresh, 0o700); err != nil {
+		t.Fatalf("create staging dir: %v", err)
+	}
+
+	if _, err := c.RemoveStaleStaging(0, false); err == nil {
+		t.Error("RemoveStaleStaging(0) = nil error, want a refusal")
+	}
+	if _, err := os.Stat(fresh); err != nil {
+		t.Errorf("stat %s: %v, want it untouched", fresh, err)
 	}
 }

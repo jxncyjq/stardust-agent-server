@@ -674,7 +674,10 @@ func refusePluginDeploymentChanged(cmdContext, manifestPath string, snapshot []b
 //     All three are REGISTRATIONS or authorization decisions on
 //     disk, not a start: nothing any of them does reaches a running process
 //     until `agent plugins reload`, which is the only reason they are not
-//     grouped with status and reload instead.
+//     grouped with status and reload instead. cache belongs to this group too:
+//     it reads the plugins config and works on the cache directory, and
+//     nothing it removes reaches a running process until the next reload
+//     re-fetches it.
 func newPluginsCommand(application *app.App, out io.Writer) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "plugins",
@@ -687,6 +690,7 @@ func newPluginsCommand(application *app.App, out io.Writer) *cobra.Command {
 	cmd.AddCommand(newPluginsDenyCommand(out))
 	cmd.AddCommand(newPluginsKeygenCommand(out))
 	cmd.AddCommand(newPluginsSignCommand(out))
+	cmd.AddCommand(newPluginsCacheCommand(out))
 	return cmd
 }
 

@@ -694,3 +694,52 @@ func directorySize(dir string) (int64, error) {
 	}
 	return total, nil
 }
+
+// RemoveStaleStaging deletes ".unpack-*" staging directories older than
+// minAge, returning the names it removed (or, with dryRun, would remove).
+//
+// These are what an interrupted unpack leaves behind: Put stages a package in
+// one and renames it into place, so a crash, a killed process or a failed
+// verification between those two steps abandons the directory. Nothing ever
+// looks at them again, and nothing else deletes them.
+//
+// minAge is the whole safety argument. A staging directory belonging to a
+// download happening RIGHT NOW is indistinguishable from an abandoned one —
+// both are a temp-named directory with no entry beside it — so age is the only
+// way to tell them apart. A non-positive minAge is refused rather than treated
+// as "remove everything", which would delete a download in progress.
+func (c *Cache) RemoveStaleStaging(minAge time.Duration, dryRun bool) (removed []string, err error) {
+	if minAge <= 0 {
+		return nil, fmt.Errorf("remove stale staging directories: minAge is %s; it must be positive, "+
+			"or a download in progress would be deleted along with the abandoned ones", minAge)
+	}
+	shard := filepath.Join(c.root, digestAlgorithmDirName)
+	dirEntries, err := os.ReadDir(shard)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read cache directory %s: %w", shard, err)
+	}
+
+	cutoff := time.Now().Add(-minAge)
+	for _, dirEntry := range dirEntries {
+		if !dirEntry.IsDir() || !strings.HasPrefix(dirEntry.Name(), tempUnpackDirPrefix) {
+			continue
+		}
+		info, err := dirEntry.Info()
+		if err != nil {
+			return removed, fmt.Errorf("stat staging directory %s: %w", dirEntry.Name(), err)
+		}
+		if info.ModTime().After(cutoff) {
+			continue
+		}
+		if !dryRun {
+			if rmErr := os.RemoveAll(filepath.Join(shard, dirEntry.Name())); rmErr != nil {
+				return removed, fmt.Errorf("remove staging directory %s: %w", dirEntry.Name(), rmErr)
+			}
+		}
+		removed = append(removed, dirEntry.Name())
+	}
+	return removed, nil
+}
