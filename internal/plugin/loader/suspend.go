@@ -82,10 +82,21 @@ func (l *Loader) convergeDependencies(ctx context.Context) error {
 	providerOf := make(map[string]string)
 	for _, name := range names {
 		inst := l.mounted(name)
-		entries = append(entries, depNode{Name: name, Provides: inst.tools, Requires: inst.requires})
+		// Services join the same graph under a prefix, so one convergence
+		// decides both kinds of dependency and the cycle detection sees the
+		// edges services add. The prefix is what keeps the two namespaces
+		// apart inside the graph: a service may legitimately be named like a
+		// tool (nothing dispatches through service names).
+		provides := append(append([]string(nil), inst.tools...), serviceNames(inst.providesServices)...)
+		requires := append(append([]string(nil), inst.requires...), serviceNames(inst.requiresServices)...)
+		entries = append(entries, depNode{Name: name, Provides: provides, Requires: requires})
 		for _, toolName := range inst.tools {
 			provided[toolName] = true
 			providerOf[toolName] = name
+		}
+		for _, service := range serviceNames(inst.providesServices) {
+			provided[service] = true
+			providerOf[service] = name
 		}
 	}
 
@@ -211,7 +222,12 @@ func (l *Loader) externalToolNames(names []string, provided map[string]bool) map
 // for an operator — it is what Status reports in SuspendedBy — and not part of
 // the decision itself.
 func unresolvedRequires(inst *instance, states map[string]depState, providerOf map[string]string, external map[string]bool) (unresolved []string, cascaded bool) {
-	for _, required := range inst.requires {
+	// Tools and services are diagnosed together, and services keep their
+	// "service:" prefix here: an operator reading SuspendedBy has to be able
+	// to tell "the tool jira_search is missing" from "nothing provides the
+	// issue-tracker service".
+	required := append(append([]string(nil), inst.requires...), serviceNames(inst.requiresServices)...)
+	for _, required := range required {
 		if external[required] {
 			continue
 		}
@@ -380,4 +396,42 @@ func formatSuspendedMessage(inst *instance, unresolved []string, cascaded bool, 
 func formatResumedMessage(inst *instance) string {
 	return fmt.Sprintf("plugin=%s version=%s tools=[%s]",
 		inst.name, inst.version, strings.Join(inst.tools, " "))
+}
+
+// servicePrefix qualifies a service name inside the dependency graph, keeping
+// it from ever colliding with a tool name. It leaks into an operator-visible
+// place on purpose: a suspended plugin's SuspendedBy reads "service:calendar",
+// which says both what is missing and what KIND of thing it is.
+const servicePrefix = "service:"
+
+// serviceNames qualifies every name in services for the dependency graph.
+func serviceNames(services []string) []string {
+	if len(services) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(services))
+	for _, service := range services {
+		out = append(out, servicePrefix+service)
+	}
+	return out
+}
+
+// serviceHeldBy reports which mounted plugin already provides one of services,
+// and which service that is. It skips claimant itself, so re-applying an
+// unchanged deployment does not make a plugin collide with its own previous
+// mount.
+func (l *Loader) serviceHeldBy(claimant string, services []string) (holder, service string) {
+	for _, wanted := range services {
+		for name, inst := range l.instances {
+			if name == claimant {
+				continue
+			}
+			for _, held := range inst.providesServices {
+				if held == wanted {
+					return name, wanted
+				}
+			}
+		}
+	}
+	return "", ""
 }

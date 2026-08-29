@@ -125,6 +125,13 @@ type pkg struct {
 	// convergence reads (see suspend_test.go); an empty one is the ordinary
 	// case of a plugin that depends on nothing.
 	requires []string
+
+	// providesServices / requiresServices are the plugin's own named-service
+	// declarations: the capabilities it can act as, and the ones it needs
+	// somebody to provide. Empty in every fixture that predates them, which is
+	// also what pins the unchanged path.
+	providesServices []string
+	requiresServices []string
 }
 
 // writePackage writes a plugin package (plugin.json + plugin.wasm) into dir,
@@ -149,16 +156,18 @@ func writePackage(t *testing.T, dir string, p pkg) {
 		})
 	}
 	pm := manifest.PluginManifest{
-		Name:         p.name,
-		Version:      p.version,
-		ABI:          1,
-		SHA256:       hex.EncodeToString(sum[:]),
-		Capabilities: p.capabilities,
-		Limits:       manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
-		Filesystem:   manifest.Filesystem{AllowedPaths: p.allowedPaths},
-		Tools:        decls,
-		Requires:     p.requires,
-		ConfigSchema: p.configSchema,
+		Name:             p.name,
+		Version:          p.version,
+		ABI:              1,
+		SHA256:           hex.EncodeToString(sum[:]),
+		Capabilities:     p.capabilities,
+		Limits:           manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
+		Filesystem:       manifest.Filesystem{AllowedPaths: p.allowedPaths},
+		Tools:            decls,
+		Requires:         p.requires,
+		ConfigSchema:     p.configSchema,
+		ProvidesServices: p.providesServices,
+		RequiresServices: p.requiresServices,
 	}
 	data, err := json.Marshal(pm)
 	if err != nil {
