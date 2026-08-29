@@ -176,6 +176,58 @@ func (f *filter) admits(name string) bool {
 	return true
 }
 
+// InheritFrom makes r fall back to source for tools r does not register
+// itself, so the model reaches what plugins contribute without any of them
+// having to know which task registries exist.
+//
+// It is NOT what Subset/Without build. Those are VIEWS: they share the
+// parent's policy, enforcer, guardrails and audit log, because a delegated
+// scope is the same deployment seen through a narrower window. Inheritance is
+// the opposite direction — r keeps ITS OWN policy, guardrails and audit log,
+// and a plugin's tool therefore runs under the task's rules rather than
+// bringing the plugin registry's along with it.
+//
+// Three consequences worth stating, because each is a decision:
+//
+//   - The link is a REFERENCE. A plugin unloaded at run time disappears from
+//     every task registry at once; nothing has to be rebuilt or notified.
+//   - r's OWN registrations shadow inherited ones of the same name (see
+//     resolve). A plugin cannot silently replace write_file.
+//   - The plugin registry's observers and deciders are consulted for calls
+//     made here, because notifyObservers and consultDeciders walk the parent
+//     chain. That is what makes the G4 extension points reach an agent's own
+//     tool calls at all.
+//
+// Passing nil is a no-op: a deployment with no plugins inherits nothing.
+// Calling it twice, or on a registry that is already a view, PANICS — a
+// registry with two parents has no defined resolution order, and finding that
+// out at run time would mean a tool call resolving to whichever parent the
+// implementation happened to consult first.
+func (r *Registry) InheritFrom(source *Registry) {
+	if source == nil {
+		return
+	}
+	if r.parent != nil {
+		panic("tool: InheritFrom: this registry already has a parent; a registry with two parents has no " +
+			"defined resolution order")
+	}
+	r.parent = source
+}
+
+// HasTool reports whether this registry itself registers name (inherited ones
+// do not count).
+//
+// It exists for the permission enforcer's dynamic source: a plugin's tool name
+// is known only at run time, so it can never be in a compile-time whitelist,
+// and "did the plugin registry contribute this?" is the question that replaces
+// looking it up in one.
+func (r *Registry) HasTool(name string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	_, ok := r.handlers[name]
+	return ok
+}
+
 // Subset returns a VIEW over this registry exposing only the named tools plus
 // whatever the view registers itself. It shares this registry's policy,
 // enforcer, guardrails, audit log and sanitizer. Names with no matching handler
