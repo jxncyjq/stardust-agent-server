@@ -982,6 +982,14 @@ func pluginToolProviders(statuses []loader.InstanceStatus) map[string]string {
 		for _, toolName := range st.Tools {
 			providerOf[toolName] = st.Name
 		}
+		// Services are indexed under the same prefixed name SuspendedBy uses,
+		// so a consumer blocked on a capability whose provider is itself
+		// suspended reads as a CASCADE ("svc-prov is suspended") rather than
+		// as "nobody provides it", which would send the operator looking for a
+		// plugin to install that is already installed.
+		for _, service := range st.ProvidesServices {
+			providerOf["service:"+service] = st.Name
+		}
 	}
 	return providerOf
 }

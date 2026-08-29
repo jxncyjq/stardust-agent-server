@@ -160,3 +160,43 @@ func TestAServiceCycleIsReported(t *testing.T) {
 		}
 	}
 }
+
+// TestStatusReportsTheServicesAPluginProvidesAndNeeds: when a service chain
+// does not come up, the two questions an operator has are "which capability is
+// this plugin holding" and "which is it waiting for". A row that omitted them
+// would send them to read plugin.json on disk.
+func TestStatusReportsTheServicesAPluginProvidesAndNeeds(t *testing.T) {
+	h := newHarness(t)
+	consumer := h.writeServicePkg("svccons", svcConsumerName, svcConsumerTool, nil, []string{issueTracker})
+	provider := h.writeServicePkg("svcprov", svcProviderName, svcProviderTool, []string{issueTracker}, nil)
+
+	h.apply(consumer, provider)
+
+	wantStrings(t, "provider ProvidesServices", h.statusOf(svcProviderName).ProvidesServices, []string{issueTracker})
+	wantStrings(t, "consumer RequiresServices", h.statusOf(svcConsumerName).RequiresServices, []string{issueTracker})
+}
+
+// TestAServiceConsumerCascadesWhenItsProviderIsSuspended: the provider is
+// mounted but suspended (its own tool dependency is missing), so the consumer
+// is suspended too — and the diagnosis has to point one hop up the chain
+// rather than at a missing installation.
+func TestAServiceConsumerCascadesWhenItsProviderIsSuspended(t *testing.T) {
+	h := newHarness(t)
+	// The provider itself needs a tool nobody has.
+	writePackage(t, filepath.Join(h.root, "svcprov"), pkg{
+		wasm:             patchIdentity(t, svcProviderName, svcProviderTool),
+		name:             svcProviderName,
+		version:          "0.1.0",
+		tools:            []string{svcProviderTool},
+		requires:         []string{"absent_tool"},
+		providesServices: []string{issueTracker},
+	})
+	provider := entryFor(svcProviderName, "svcprov", nil, svcProviderTool)
+	consumer := h.writeServicePkg("svccons", svcConsumerName, svcConsumerTool, nil, []string{issueTracker})
+
+	h.apply(provider, consumer)
+
+	h.wantState(svcProviderName, StateSuspended, "absent_tool")
+	h.wantState(svcConsumerName, StateSuspended, "service:"+issueTracker)
+	wantStrings(t, "registry with the whole chain down", h.toolNames(), nil)
+}

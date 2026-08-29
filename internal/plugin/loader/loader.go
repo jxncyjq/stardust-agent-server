@@ -375,9 +375,20 @@ type InstanceStatus struct {
 	// now.
 	Tools []string
 
-	// SuspendedBy names the tools this plugin requires that nothing resolves,
-	// which is WHY it is suspended. It is empty for every other state.
+	// SuspendedBy names what this plugin requires that nothing resolves,
+	// which is WHY it is suspended: tool names as they are, and services
+	// under their "service:" prefix so the two are distinguishable. It is
+	// empty for every other state.
 	SuspendedBy []string
+
+	// ProvidesServices and RequiresServices are the plugin's named-service
+	// declarations. They are reported for every state, including suspended:
+	// "which capability is this plugin waiting for" and "which capability is
+	// it holding" are exactly the questions an operator has when a service
+	// chain does not come up, and a row that omitted them would send them to
+	// read plugin.json on disk instead.
+	ProvidesServices []string
+	RequiresServices []string
 
 	// LastError is the most recent failure involving this entry, empty if
 	// there has not been one. It is populated for a StateLoaded entry too: see
@@ -1017,12 +1028,14 @@ func (l *Loader) Status() []InstanceStatus {
 			suspendedBy = append([]string(nil), inst.suspendedBy...)
 		}
 		out = append(out, InstanceStatus{
-			Name:        inst.name,
-			Version:     inst.version,
-			State:       state,
-			Tools:       append([]string(nil), inst.tools...),
-			SuspendedBy: suspendedBy,
-			LastError:   inst.lastError,
+			Name:             inst.name,
+			Version:          inst.version,
+			State:            state,
+			Tools:            append([]string(nil), inst.tools...),
+			SuspendedBy:      suspendedBy,
+			ProvidesServices: append([]string(nil), inst.providesServices...),
+			RequiresServices: append([]string(nil), inst.requiresServices...),
+			LastError:        inst.lastError,
 		})
 	}
 	for name, f := range l.failures {
