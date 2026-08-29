@@ -76,5 +76,10 @@ fn decide_call(request: &ToolDecisionRequest) -> ToolDecision {
     if request.tool == "forbidden_tool" {
         return ToolDecision::deny("forbidden_tool is refused by legion-hello");
     }
+    if request.tool == "reviewed_tool" {
+        // ask 不是拒绝：宿主会挂起这一轮、开一张点名本插件与这条理由的审批票，
+        // 人批了再继续。没有审批通道的部署里它按拒绝处理。
+        return ToolDecision::ask("reviewed_tool is looked at by a human first");
+    }
     ToolDecision::allow()
 }

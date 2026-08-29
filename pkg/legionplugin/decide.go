@@ -37,6 +37,20 @@ func Deny(reason string) ToolDecision {
 	return ToolDecision{decision: decisionDeny, reason: reason}
 }
 
+// Ask requires a human to approve the call before it runs.
+//
+// It is not a refusal and not a delay this plugin controls: the host suspends
+// the task at the round boundary, files an approval request naming THIS plugin
+// and this reason, and resumes once a person answers. If the deployment has no
+// approval channel at all, an ask is refused — a question nobody can be asked
+// is not a question that gets answered yes.
+//
+// reason is what the person deciding will read. "policy" is not a reason;
+// "writes are frozen during the incident" is.
+func Ask(reason string) ToolDecision {
+	return ToolDecision{decision: decisionAsk, reason: reason}
+}
+
 // Decider is consulted before a tool call runs.
 //
 // It must be FAST — faster than an observer. The host bounds each
@@ -129,6 +143,7 @@ func mustEncodeDecision(decision ToolDecision) []byte {
 const (
 	decisionAllow = "allow"
 	decisionDeny  = "deny"
+	decisionAsk   = "ask"
 )
 
 // extensionDecide is the wire name of the decision seam, mirroring

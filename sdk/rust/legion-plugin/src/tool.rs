@@ -206,6 +206,21 @@ impl ToolDecision {
         }
     }
 
+    /// ask 要求**人工审批**之后这次调用才能跑。
+    ///
+    /// 它既不是拒绝，也不是本插件能控制的等待：宿主会在 round 边界挂起该任务，
+    /// 开一张点名**本插件**与这条理由的审批票，人答了再恢复。部署里没有审批通道
+    /// 时，ask 按拒绝处理——没人可问的问题不会自己变成「同意」。
+    ///
+    /// reason 是审批的人要读的那句话。「policy」不是理由，
+    /// 「writes are frozen during the incident」才是。
+    pub fn ask(reason: impl Into<String>) -> ToolDecision {
+        ToolDecision {
+            decision: "ask",
+            reason: reason.into(),
+        }
+    }
+
     /// to_json 渲染宿主严格解码的那份文档。
     pub fn to_json(&self) -> String {
         format!(
@@ -350,6 +365,14 @@ mod decision_tests {
         assert_eq!(
             ToolDecisionRequest::parse(br#"{"call_id":"c1"}"#).err(),
             Some(json::ParseError::MissingField("tool"))
+        );
+    }
+
+    #[test]
+    fn renders_ask_in_the_hosts_vocabulary() {
+        assert_eq!(
+            ToolDecision::ask("a human should look").to_json(),
+            r#"{"decision":"ask","reason":"a human should look"}"#
         );
     }
 
