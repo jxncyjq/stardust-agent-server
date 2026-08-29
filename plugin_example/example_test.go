@@ -293,6 +293,7 @@ func TestExampleDeciderAnswersBothWays(t *testing.T) {
 	}{
 		{name: "allows an ordinary tool", request: `{"call_id":"c1","tool":"read_file"}`, wantDecision: "allow"},
 		{name: "refuses the one it guards", request: `{"call_id":"c2","tool":"forbidden_tool"}`, wantDecision: "deny"},
+		{name: "asks for the one under review", request: `{"call_id":"c3","tool":"reviewed_tool"}`, wantDecision: "ask"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			out, err := inst.Invoke(ctx, abi.OpDecideToolCall, []byte(tc.request))
@@ -309,7 +310,7 @@ func TestExampleDeciderAnswersBothWays(t *testing.T) {
 			if answer.Decision != tc.wantDecision {
 				t.Errorf("decision = %q, want %q", answer.Decision, tc.wantDecision)
 			}
-			if tc.wantDecision == "deny" && answer.Reason == "" {
+			if tc.wantDecision != "allow" && answer.Reason == "" {
 				t.Error("a deny with no reason leaves the operator nothing to act on")
 			}
 		})

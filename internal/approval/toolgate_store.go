@@ -49,7 +49,29 @@ type ToolApproval struct {
 	// workspace root, so approvals for a working_dir-scoped session live
 	// alongside that directory.
 	WorkingDir string `json:"working_dir,omitempty"`
+	// RequestedBy names who wants this call approved: RequestedByHost for the
+	// host's own Sensitive-tool rule, or "plugin:<name>" for a plugin granted
+	// the decide extension.
+	//
+	// It exists because "a human is being asked to approve write_file" stopped
+	// being enough to act on the moment a second source could raise a ticket:
+	// an operator has to know whether the deployment's own rule or some
+	// installed plugin objected, and one queue with two sources is the design
+	// (two parallel suspend mechanisms is the outcome being avoided).
+	//
+	// A ticket written before this field existed decodes as empty and is read
+	// as RequestedByHost — see Get. Every such ticket WAS the host's.
+	RequestedBy string `json:"requested_by,omitempty"`
+	// Reason is what the requester said, verbatim, and reaches the approval
+	// UI. The host's Sensitive rule gives none (the tool's own sensitivity is
+	// the whole reason); a plugin's ask carries the plugin's words.
+	Reason string `json:"reason,omitempty"`
 }
+
+// RequestedByHost is the ToolApproval.RequestedBy of a ticket the host's own
+// Sensitive-tool rule opened. It is also what an unattributed ticket reads as:
+// every ticket written before provenance was recorded came from that rule.
+const RequestedByHost = "host:sensitive"
 
 // ToolGateStore persists ToolApproval tickets under a session directory tree:
 // <base>/session/<sessionKey>/approvals/<ticketID>.json, where base is
@@ -126,6 +148,9 @@ func (s *ToolGateStore) Open(rec ToolApproval) (ToolApproval, error) {
 	if ok {
 		return existing, nil
 	}
+	if rec.RequestedBy == "" {
+		rec.RequestedBy = RequestedByHost
+	}
 	now := time.Now()
 	rec.TicketID = ticketID
 	rec.Status = ApprovalPending
@@ -161,6 +186,13 @@ func (s *ToolGateStore) getLocked(sessionKey, ticketID, workingDir string) (Tool
 	var rec ToolApproval
 	if err := json.Unmarshal(data, &rec); err != nil {
 		return ToolApproval{}, false, fmt.Errorf("decode approval %q: %w", path, err)
+	}
+	if rec.RequestedBy == "" {
+		// A ticket written before provenance was recorded. Every one of them
+		// came from the host's own Sensitive rule — reading them as "unknown"
+		// would put a question mark on the one source that was never in
+		// question.
+		rec.RequestedBy = RequestedByHost
 	}
 	return rec, true, nil
 }

@@ -122,6 +122,14 @@ fn decide_call(request: &ToolDecisionRequest) -> ToolDecision {
 - **上限 `min(工具超时/4, 200ms)`**，比观察点更紧：工具还没开始跑。
 - 没写 `decide = ...` 时宏**不生成** op 3 那条分支，op 0 的 `extensions` 里也没有它。
 
+`ToolDecision::ask(reason)` 是第三种答案：不是拒绝，而是**要人批**。宿主在 round 边界挂起任务、开一张点名本插件与这条理由的票，人批了再从检查点继续；没有审批通道的部署按拒绝处理。它**不看模式**——Auto 模式下同样会停下来等人。
+
+```rust
+if request.tool == "deploy" {
+    return ToolDecision::ask("deploys are reviewed by a human");
+}
+```
+
 ## 两条硬规矩
 
 - **工具失败返回 `ToolResult::fail`，不要 panic。** panic 会 trap 整个模块，代价是实例状态、同实例的在途调用，而且计入插件健康度（连续故障到阈值会被自动卸载）。

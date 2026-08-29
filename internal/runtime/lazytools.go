@@ -2,10 +2,8 @@ package runtime
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -74,47 +72,12 @@ func isMetaTool(name string) bool {
 	return name == metaToolCallTool || name == metaToolLoadCapabilities
 }
 
-// parseCallToolArguments decodes the arguments_json string of a call_tool meta
-// call into the flat string map the tool registry expects. Non-string scalar
-// values are coerced to their string form because the input-schema validator
-// only accepts string/number/bool. It returns a fail-loud error (surfaced back
-// to the model, not a Go error that aborts the task) when the JSON is missing,
-// malformed, or not a JSON object.
+// parseCallToolArguments forwards to tool.ParseCallToolArguments, which owns
+// the decoding now that the approval gate reads it too (see
+// tool.UnwrapLazyCall). It stays as a name in this package because that is how
+// this file's own tests address it.
 func parseCallToolArguments(argumentsJSON string) (map[string]string, error) {
-	trimmed := strings.TrimSpace(argumentsJSON)
-	if trimmed == "" {
-		return map[string]string{}, nil
-	}
-	var raw map[string]any
-	if err := json.Unmarshal([]byte(trimmed), &raw); err != nil {
-		return nil, fmt.Errorf("arguments_json is not a valid JSON object: %v", err)
-	}
-	args := make(map[string]string, len(raw))
-	for key, value := range raw {
-		args[key] = stringifyArgument(value)
-	}
-	return args, nil
-}
-
-// stringifyArgument coerces a decoded JSON scalar into the string form the tool
-// schema validator expects. Nested objects/arrays are re-encoded as JSON.
-func stringifyArgument(value any) string {
-	switch v := value.(type) {
-	case string:
-		return v
-	case bool:
-		return strconv.FormatBool(v)
-	case float64:
-		return strconv.FormatFloat(v, 'f', -1, 64)
-	case nil:
-		return ""
-	default:
-		encoded, err := json.Marshal(v)
-		if err != nil {
-			return fmt.Sprintf("%v", v)
-		}
-		return string(encoded)
-	}
+	return tool.ParseCallToolArguments(argumentsJSON)
 }
 
 // dispatchToolCall routes one model tool call. Under the lazy protocol the meta
@@ -147,6 +110,15 @@ func (r *Runtime) dispatchToolCall(ctx context.Context, agent domain.Agent, task
 	ctx = tool.WithLoopBudget(ctx, st.toolNameGuard)
 	ctx = tool.WithUserTask(ctx, task.Input)
 	ctx = tool.WithChatSession(ctx, task.SessionID)
+	// Which run this call belongs to, so that whoever answers "did a human
+	// approve this?" at dispatch time can find the ticket the round boundary
+	// opened. Without it a plugin's ask can never be satisfied: the arbiter
+	// has no task to look a ticket up under and every call is refused.
+	ctx = tool.WithApprovalScope(ctx, tool.ApprovalScope{
+		SessionKey: sessionKeyForTask(task),
+		TaskID:     task.ID,
+		WorkingDir: task.WorkingDir,
+	})
 	// A delegated sub-run's calls land in the same audit trail as its parent's.
 	// Marking them by depth is what lets a forensic pass over a time window tell
 	// the two apart; depth 0 is the agent's own work and keeps the default.
@@ -249,22 +221,20 @@ func splitNames(raw string) []string {
 // real tool, publishing the inner tool's request/result/executed events so the
 // event stream reflects which real tool actually ran.
 func (r *Runtime) dispatchCallTool(ctx context.Context, agent domain.Agent, task domain.Task, call domain.ToolCall, tools *tool.Registry) (domain.ToolResult, error) {
-	toolName := strings.TrimSpace(call.Arguments["tool_name"])
-	if toolName == "" {
-		return domain.ToolResult{CallID: call.ID, Success: false, Error: "call_tool requires a non-empty tool_name"}, nil
+	if isMetaTool(strings.TrimSpace(call.Arguments["tool_name"])) {
+		return domain.ToolResult{CallID: call.ID, Success: false, Error: fmt.Sprintf(
+			"tool_name %q is a meta tool and cannot be called via call_tool",
+			strings.TrimSpace(call.Arguments["tool_name"]))}, nil
 	}
-	if isMetaTool(toolName) {
-		return domain.ToolResult{CallID: call.ID, Success: false, Error: fmt.Sprintf("tool_name %q is a meta tool and cannot be called via call_tool", toolName)}, nil
-	}
-	args, err := parseCallToolArguments(call.Arguments["arguments_json"])
+	// The unwrapping lives in internal/tool because the approval gate needs the
+	// same answer one round earlier (which call will the registry actually
+	// see?). Two implementations of it would drift, and the symptom would be an
+	// approval ticket keyed to a call that never arrives.
+	realCall, _, err := tool.UnwrapLazyCall(call)
 	if err != nil {
 		return domain.ToolResult{CallID: call.ID, Success: false, Error: err.Error()}, nil
 	}
-	realCall := domain.ToolCall{
-		ID:        call.ID + ":" + toolName,
-		Name:      toolName,
-		Arguments: args,
-	}
+	toolName := realCall.Name
 	if err := r.events.Publish(ctx, domain.RuntimeEvent{
 		Type:      "tool_call_requested",
 		TaskID:    task.ID,

@@ -28,7 +28,10 @@ type guestToolDecisionRequest struct {
 // guestToolDecision is the guest's answer.
 //
 // Decision carries the same vocabulary the host's own policy uses ("allow" /
-// "deny"), so the two compose without a translation table that could drift.
+// "deny" / "ask"), so the two compose without a translation table that could
+// drift. "ask" means a human must approve the call before it runs; the
+// suspend that makes that possible happens a layer above, at the round
+// boundary (see internal/manualgate).
 // Reason reaches the model and the operator in the refusal, which is why a
 // deny with no reason is completed with a placeholder rather than passed on
 // as an empty string.
@@ -152,17 +155,22 @@ func decodeToolDecision(body []byte) (tool.Verdict, error) {
 			quoteForError(body))
 	}
 
-	switch tool.Decision(answer.Decision) {
+	switch decision := tool.Decision(answer.Decision); decision {
 	case tool.DecisionAllow:
 		return tool.Verdict{Decision: tool.DecisionAllow, Reason: answer.Reason}, nil
-	case tool.DecisionDeny:
+	case tool.DecisionDeny, tool.DecisionAsk:
+		// A reason is what the operator reads — in the refusal for a deny, and
+		// in the approval request for an ask. "It said no" and "somebody
+		// should look at this", with no further word, are the two answers
+		// nobody downstream can act on, so an empty one is completed rather
+		// than passed on.
 		reason := answer.Reason
 		if reason == "" {
 			reason = "no reason given"
 		}
-		return tool.Verdict{Decision: tool.DecisionDeny, Reason: reason}, nil
+		return tool.Verdict{Decision: decision, Reason: reason}, nil
 	default:
-		return tool.Verdict{}, fmt.Errorf("decode decision %s: unknown decision %q; this ABI understands %q and %q",
-			quoteForError(body), answer.Decision, tool.DecisionAllow, tool.DecisionDeny)
+		return tool.Verdict{}, fmt.Errorf("decode decision %s: unknown decision %q; this ABI understands %q, %q and %q",
+			quoteForError(body), answer.Decision, tool.DecisionAllow, tool.DecisionDeny, tool.DecisionAsk)
 	}
 }

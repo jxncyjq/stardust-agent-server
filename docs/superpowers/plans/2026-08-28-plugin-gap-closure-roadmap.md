@@ -2,7 +2,7 @@
 
 **日期**：2026-08-28
 **上游依据**：设计文档 `docs/design/architecture/legion-plugin-system.md`（docs 仓）§6.9 / §8 / §9；与 dsh Cordis 的逐项比对（2026-08-28）
-**当前基线**：P0 / P0.5 / P1 / P2-A4a / P2-A4b / P3-A5a / P3-A5b / P3-A5c / GUI 同意流 **全部已交付并合入 master**；`plugin_example/` 与参考手册已交付。本路线图的 **G1 / G2 / G3 / G5 / G6 / G7 已交付并合入 master**；**G4 拆成 a-d 四步，G4a（只读观察点）与 G4b（决策点 deny）已交付**，G4c/G4d 待做（见下）
+**当前基线**：P0 / P0.5 / P1 / P2-A4a / P2-A4b / P3-A5a / P3-A5b / P3-A5c / GUI 同意流 **全部已交付并合入 master**；`plugin_example/` 与参考手册已交付。本路线图的 **G1 / G2 / G3 / G5 / G6 / G7 已交付并合入 master**；**G4 拆成 a-d 四步，G4a/G4b/G4c 已交付**，G4d（提示词段）待做（见下）
 
 这份文档只做一件事：把「与 Cordis 比对后确认还缺的东西」排成可执行的期次。**每一期开工时另写自己的 TDD 实施计划**（仓内惯例，见 `plans/2026-08-2x-*.md`），本文件只定范围、顺序、验收与边界。
 

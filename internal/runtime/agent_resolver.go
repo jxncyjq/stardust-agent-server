@@ -265,6 +265,14 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 	tools := tool.NewFileReadWriteWorkspaceRegistry(toolRoot, r.audit,
 		tool.WithAgentsInjection(r.rootConfig.ContextFiles.MaxFileChars, r.resolveHomeDir(ctx)),
 		tool.WithProjectRoot(toolRoot))
+	// A plugin granted the decide extension may answer "ask", and the ticket
+	// that answers it is read at DISPATCH time, in this registry. The gate that
+	// opens those tickets is the only thing that can read them back, so it is
+	// installed here as the arbiter — a registry without one refuses every ask,
+	// including the ones a human already approved.
+	if arbiter, ok := r.toolGate.(tool.AskArbiter); ok {
+		tools.SetAskArbiter(arbiter)
+	}
 	tool.RegisterTaskLedgerTools(tools, r.taskLedger)
 	tool.RegisterAgentMessageTools(tools, r.messageStore)
 	tool.RegisterWebTools(tools, webToolOptions(r.rootConfig.Web))

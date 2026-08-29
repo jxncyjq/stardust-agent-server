@@ -47,6 +47,9 @@ func decideCall(request legionplugin.ToolDecisionRequest) legionplugin.ToolDecis
 	if request.Tool == "forbidden_tool" {
 		return legionplugin.Deny("forbidden_tool is refused by legion-hello-go")
 	}
+	if request.Tool == "reviewed_tool" {
+		return legionplugin.Ask("reviewed_tool is looked at by a human first")
+	}
 	return legionplugin.Allow()
 }
 

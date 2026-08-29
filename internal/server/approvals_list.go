@@ -41,6 +41,12 @@ func (s *HTTPServer) handleListApprovals(w http.ResponseWriter, r *http.Request)
 			"tool_name":    t.ToolName,
 			"tool_call_id": t.ToolCallID,
 			"arguments":    sanitizeStringMap(t.Arguments),
+			// Who wants this approved, and why. Once a plugin can raise a
+			// ticket, "approve write_file?" is not a question anybody can
+			// answer well: the two sources call for different judgement, and
+			// the plugin's own reason is the whole of what it knows.
+			"requested_by": t.RequestedBy,
+			"reason":       t.Reason,
 			"status":       string(t.Status),
 			"created_at":   t.CreatedAt,
 		})

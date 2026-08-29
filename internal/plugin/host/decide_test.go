@@ -214,3 +214,43 @@ func TestContributeToolsRegistersTheDeciderOnlyWhenGranted(t *testing.T) {
 		})
 	}
 }
+
+// TestPluginDeciderPassesAnAskThrough: "ask" is the third answer, and the host
+// must recognise it as a decision rather than as a malformed one — an ABI
+// error here would turn "a human should look at this" into a fault against
+// the plugin.
+func TestPluginDeciderPassesAnAskThrough(t *testing.T) {
+	guest := guestCallerFunc(func(context.Context, int32, []byte) ([]byte, error) {
+		return []byte(`{"decision":"ask","reason":"writes during an incident are reviewed"}`), nil
+	})
+	faults := 0
+	decider := newPluginDecider(decideDeps(adapter.NewMemoryEventBus(),
+		func(context.Context, string, string, string) { faults++ }), guest)
+
+	verdict := decider.Decide(context.Background(), domain.ToolCall{ID: "c1", Name: "write_file"})
+
+	if verdict.Decision != tool.DecisionAsk {
+		t.Errorf("verdict = %+v, want ask", verdict)
+	}
+	if verdict.Reason != "writes during an incident are reviewed" {
+		t.Errorf("reason = %q, want the plugin's own words: it reaches the person deciding", verdict.Reason)
+	}
+	if faults != 0 {
+		t.Errorf("an ask produced %d faults, want 0: asking is the plugin working", faults)
+	}
+}
+
+// TestAnAskWithNoReasonStillCarriesOne: the reason reaches the approval UI. A
+// request to approve something, with no stated why, is the one form nobody
+// can act on.
+func TestAnAskWithNoReasonStillCarriesOne(t *testing.T) {
+	guest := guestCallerFunc(func(context.Context, int32, []byte) ([]byte, error) {
+		return []byte(`{"decision":"ask"}`), nil
+	})
+	decider := newPluginDecider(decideDeps(adapter.NewMemoryEventBus(), nil), guest)
+
+	verdict := decider.Decide(context.Background(), domain.ToolCall{ID: "c1", Name: "write_file"})
+	if verdict.Decision != tool.DecisionAsk || verdict.Reason == "" {
+		t.Errorf("verdict = %+v, want an ask carrying some reason", verdict)
+	}
+}
