@@ -206,6 +206,15 @@ type Spec struct {
 	// rather than letting wazero's raw link error out (see CheckImports).
 	Grant perm.Grant
 
+	// Extensions is the set of host-side seams this plugin may be consulted
+	// at, already reconciled (declared ∩ granted) by manifest.AssembleSpec.
+	//
+	// An ungranted extension is not a runtime check: Activate simply does not
+	// register the plugin at that seam, so nothing in the host has anything to
+	// call. That is the same shape as an ungranted capability being absent
+	// from the host module rather than refusing at call time.
+	Extensions perm.Extensions
+
 	// Deps carries what the granted capabilities need. Its PluginName is
 	// derived from Name: leave it empty, or set it to the same value.
 	Deps Deps

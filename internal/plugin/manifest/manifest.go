@@ -35,6 +35,8 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+
+	"github.com/stardust/legion-agent/internal/plugin/perm"
 )
 
 // pluginABIVersion is the only ABI version ParsePlugin currently accepts.
@@ -142,6 +144,20 @@ type PluginManifest struct {
 	// would otherwise be written as the literal null, which ParsePlugin would
 	// then have to read as "a schema that declares nothing", i.e. an error.
 	ConfigSchema json.RawMessage `json:"config_schema,omitempty"`
+
+	// Extensions names the host-side seams this plugin wants to be consulted
+	// at (perm.Extension). It is the OTHER DIRECTION from Capabilities:
+	// a capability gates the guest calling the host and is enforced at link
+	// time, while an extension gates the HOST CALLING THE GUEST, which no
+	// import list can express — enforcement is that the host never registers
+	// the plugin at that seam.
+	//
+	// Declaring is not receiving: the deployment grants extensions separately
+	// (GrantDecl.Extensions), and AssembleSpec passes on only the
+	// intersection. Absent means "this plugin participates in nothing beyond
+	// contributing tools", which is what every plugin written before this
+	// field existed says.
+	Extensions []string `json:"extensions,omitempty"`
 
 	// Requires lists the names of tools this plugin calls through
 	// call_tool: external dependencies on tools other plugins contribute.
@@ -396,6 +412,16 @@ type GrantDecl struct {
 	Capabilities []string `json:"capabilities"`
 	AllowedHosts []string `json:"allowed_hosts"`
 	AllowedPaths []string `json:"allowed_paths"`
+
+	// Extensions are the host-side seams this deployment lets the plugin be
+	// consulted at, and it is a SUBSET of what the plugin declared — unlike
+	// Capabilities, which must match the declaration exactly.
+	//
+	// The difference is deliberate and load-bearing: a partial capability
+	// grant produces an entry that can never load, while "you may observe,
+	// but you may not decide" is a sentence a deployment must be able to say.
+	// Do not "simplify" these two into one rule.
+	Extensions []string `json:"extensions,omitempty"`
 }
 
 // ToolAccept is one tool a deployment accepts from a plugin. Name selects
@@ -469,6 +495,13 @@ func validatePlugin(pm PluginManifest) error {
 	if pm.Limits.MaxInstances < 1 {
 		return fmt.Errorf("parse plugin manifest %q: limits.max_instances is %d, want >= 1",
 			pm.Name, pm.Limits.MaxInstances)
+	}
+	if len(pm.Extensions) > 0 {
+		// Parsed for its rules only (unknown name, repeat); the value is
+		// reconciled against the deployment's grant in AssembleSpec.
+		if _, err := perm.ParseExtensions(pm.Extensions); err != nil {
+			return fmt.Errorf("parse plugin manifest %q: extensions: %w", pm.Name, err)
+		}
 	}
 	if hasConfigSchema(pm.ConfigSchema) {
 		// The schema is the PLUGIN AUTHOR's declaration, so a broken one is

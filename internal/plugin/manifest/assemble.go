@@ -245,6 +245,10 @@ func AssembleSpec(pm PluginManifest, entry Entry, deployLimits Limits) (host.Spe
 	if err != nil {
 		return host.Spec{}, err
 	}
+	extensions, err := reconcileExtensions(pm.Name, pm.Extensions, entry.Grant.Extensions)
+	if err != nil {
+		return host.Spec{}, err
+	}
 	grant.AllowedHosts = intersectPreserveOrder(pm.Network.AllowedHosts, entry.Grant.AllowedHosts, true)
 	grant.AllowedPaths = intersectPreserveOrder(pm.Filesystem.AllowedPaths, entry.Grant.AllowedPaths, false)
 
@@ -333,6 +337,7 @@ func AssembleSpec(pm PluginManifest, entry Entry, deployLimits Limits) (host.Spe
 		Name:         pm.Name,
 		Tools:        specTools,
 		Grant:        grant,
+		Extensions:   extensions,
 		MaxInstances: maxInstances,
 		MemoryPages:  memoryPages,
 	}, nil
@@ -462,3 +467,33 @@ func intersectPreserveOrder(declared, granted []string, caseInsensitive bool) []
 	}
 	return result
 }
+
+// reconcileExtensions turns the plugin's declared extension points and the
+// deployment's granted ones into the set the host will actually consult.
+//
+// Unlike capabilities, the grant may be a strict SUBSET of the declaration:
+// "you may observe, but you may not decide" is a sentence a deployment must be
+// able to say, and requiring equality would delete it. What is refused is the
+// other direction — granting an extension the plugin never declared — for the
+// same reason an undeclared capability is refused: handing a plugin something
+// it did not ask for is a configuration error, not generosity.
+func reconcileExtensions(pluginName string, declared, granted []string) (perm.Extensions, error) {
+	declaredSet, err := perm.ParseExtensions(declared)
+	if err != nil {
+		return perm.Extensions{}, fmt.Errorf("plugin %q: extensions: %w", pluginName, err)
+	}
+	grantedSet, err := perm.ParseExtensions(granted)
+	if err != nil {
+		return perm.Extensions{}, fmt.Errorf("plugin %q: granted extensions: %w", pluginName, err)
+	}
+	intersection := declaredSet.Intersect(grantedSet)
+	if grantedSet.Any() && !sameExtensions(intersection, grantedSet) {
+		return perm.Extensions{}, fmt.Errorf(
+			"plugin %q: the deployment grants extensions %v, but the plugin only declares %v in "+
+				"plugin.json; granting an extension the plugin never asked for is a config error",
+			pluginName, grantedSet.Names(), declaredSet.Names())
+	}
+	return intersection, nil
+}
+
+func sameExtensions(a, b perm.Extensions) bool { return a.Observe == b.Observe }
