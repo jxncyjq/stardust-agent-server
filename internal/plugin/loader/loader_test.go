@@ -115,6 +115,11 @@ type pkg struct {
 	// or the capability set.
 	allowedPaths []string
 
+	// configSchema is the plugin's declared config_schema, if any. Left empty
+	// by every fixture that predates it, which is also what pins the
+	// backward-compatible path.
+	configSchema json.RawMessage
+
 	// requires is the plugin's own "requires" declaration: the tool names it
 	// calls into through call_tool. It is what the Loader's dependency
 	// convergence reads (see suspend_test.go); an empty one is the ordinary
@@ -153,6 +158,7 @@ func writePackage(t *testing.T, dir string, p pkg) {
 		Filesystem:   manifest.Filesystem{AllowedPaths: p.allowedPaths},
 		Tools:        decls,
 		Requires:     p.requires,
+		ConfigSchema: p.configSchema,
 	}
 	data, err := json.Marshal(pm)
 	if err != nil {

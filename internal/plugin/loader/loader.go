@@ -148,6 +148,7 @@ const (
 	stepLoadPackage  = "load-package"
 	stepIdentity     = "identity"
 	stepAssembleSpec = "assemble-spec"
+	stepConfigSchema = "config-schema"
 	stepDependencies = "dependencies"
 	stepFingerprint  = "fingerprint"
 	stepToolNames    = "tool-names"
@@ -1073,6 +1074,22 @@ func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string)
 	spec, err := manifest.AssembleSpec(pm, entry, l.deployLimits)
 	if err != nil {
 		return nil, l.fail(ctx, entry.Name, pm.Version, stepAssembleSpec, err, nil)
+	}
+
+	// The shape of the configuration is the PLUGIN's declaration (plugin.json's
+	// config_schema) and the values are the DEPLOYMENT's, so this is the first
+	// point where both are in hand.
+	//
+	// It runs before the host dependencies are built and long before the guest
+	// is entered, on purpose: an entry whose config is wrong should not get as
+	// far as owning resources, and the guest is the worst possible place to
+	// discover it — a plugin's error reporting is one flat string, while here
+	// the failure names the field.
+	//
+	// A plugin that declares no schema passes through untouched (see
+	// manifest.ValidateEntryConfig), which is every plugin written so far.
+	if err := manifest.ValidateEntryConfig(pm, entry.Config); err != nil {
+		return nil, l.fail(ctx, entry.Name, pm.Version, stepConfigSchema, err, nil)
 	}
 	spec.Wasm = wasm
 
