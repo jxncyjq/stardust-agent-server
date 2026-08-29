@@ -375,9 +375,20 @@ type InstanceStatus struct {
 	// now.
 	Tools []string
 
-	// SuspendedBy names the tools this plugin requires that nothing resolves,
-	// which is WHY it is suspended. It is empty for every other state.
+	// SuspendedBy names what this plugin requires that nothing resolves,
+	// which is WHY it is suspended: tool names as they are, and services
+	// under their "service:" prefix so the two are distinguishable. It is
+	// empty for every other state.
 	SuspendedBy []string
+
+	// ProvidesServices and RequiresServices are the plugin's named-service
+	// declarations. They are reported for every state, including suspended:
+	// "which capability is this plugin waiting for" and "which capability is
+	// it holding" are exactly the questions an operator has when a service
+	// chain does not come up, and a row that omitted them would send them to
+	// read plugin.json on disk instead.
+	ProvidesServices []string
+	RequiresServices []string
 
 	// LastError is the most recent failure involving this entry, empty if
 	// there has not been one. It is populated for a StateLoaded entry too: see
@@ -419,6 +430,12 @@ type instance struct {
 	// Every path that puts an instance into l.instances sets it.
 	plugin *host.Plugin
 
+	// providesServices / requiresServices are the plugin's named-service
+	// declarations. They feed the SAME dependency convergence requires does
+	// (see suspend.go), under a "service:" prefix so the two namespaces cannot
+	// collide inside the graph.
+	providesServices []string
+	requiresServices []string
 	// requires is the plugin's declared dependency on other plugins' tools
 	// (manifest.PluginManifest.Requires), which is what the dependency graph is
 	// built from. It is part of the fingerprint, so an operator who edits it
@@ -1011,12 +1028,14 @@ func (l *Loader) Status() []InstanceStatus {
 			suspendedBy = append([]string(nil), inst.suspendedBy...)
 		}
 		out = append(out, InstanceStatus{
-			Name:        inst.name,
-			Version:     inst.version,
-			State:       state,
-			Tools:       append([]string(nil), inst.tools...),
-			SuspendedBy: suspendedBy,
-			LastError:   inst.lastError,
+			Name:             inst.name,
+			Version:          inst.version,
+			State:            state,
+			Tools:            append([]string(nil), inst.tools...),
+			SuspendedBy:      suspendedBy,
+			ProvidesServices: append([]string(nil), inst.providesServices...),
+			RequiresServices: append([]string(nil), inst.requiresServices...),
+			LastError:        inst.lastError,
 		})
 	}
 	for name, f := range l.failures {
@@ -1200,6 +1219,21 @@ func (l *Loader) activate(ctx context.Context, plan *convergePlan) error {
 		return l.fail(ctx, entry.Name, plan.pm.Version, stepToolNames, clash, plan)
 	}
 
+	// A service name is held by exactly one plugin, first come first served
+	// (see specs/2026-08-29-plugin-service-seam-design.md, decisions B and C).
+	// The second claimant fails here rather than stepping aside or taking
+	// over: either of those would leave "who provides this capability?"
+	// unanswerable while both plugins report themselves healthy.
+	//
+	// "First" is the order the deployment declared, because that is what Apply
+	// walks — not the order mounting happens to finish in, which would let the
+	// same deployment hand a service to different plugins on two starts.
+	if holder, service := l.serviceHeldBy(entry.Name, plan.pm.ProvidesServices); holder != "" {
+		clash := fmt.Errorf("plugin %q claims service %q, which plugin %q already provides; a service has "+
+			"exactly one provider, and the first to claim it keeps it", entry.Name, service, holder)
+		return l.fail(ctx, entry.Name, plan.pm.Version, stepToolNames, clash, plan)
+	}
+
 	owner := ownerFor(plan.pm.Name, plan.pm.Version)
 	plugin, err := host.Activate(ctx, l.ledger, owner, plan.spec)
 	if err != nil {
@@ -1208,15 +1242,17 @@ func (l *Loader) activate(ctx context.Context, plan *convergePlan) error {
 	}
 
 	inst := &instance{
-		name:        entry.Name,
-		version:     plan.pm.Version,
-		owner:       owner,
-		spec:        plan.spec,
-		fingerprint: plan.digest,
-		sha256:      plan.pm.SHA256,
-		tools:       toolNames(plan.spec.Tools),
-		plugin:      plugin,
-		requires:    append([]string(nil), plan.pm.Requires...),
+		name:             entry.Name,
+		version:          plan.pm.Version,
+		owner:            owner,
+		spec:             plan.spec,
+		fingerprint:      plan.digest,
+		sha256:           plan.pm.SHA256,
+		tools:            toolNames(plan.spec.Tools),
+		plugin:           plugin,
+		requires:         append([]string(nil), plan.pm.Requires...),
+		providesServices: append([]string(nil), plan.pm.ProvidesServices...),
+		requiresServices: append([]string(nil), plan.pm.RequiresServices...),
 	}
 	if plan.unloadErr != nil {
 		// The replacement came up, but its predecessor did not go down cleanly:
