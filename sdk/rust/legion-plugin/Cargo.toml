@@ -1,0 +1,25 @@
+[package]
+name = "legion-plugin"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Guest SDK for Legion Agent WASM plugins (ABI v1)"
+
+[lib]
+crate-type = ["rlib"]
+
+# 每个 feature 对应一个宿主能力，默认全关。打开一个 feature 就是让最终模块多
+# import 一个 host 函数，而 import 一个部署没有授权的函数会让模块在**实例化**
+# 时失败（能力是链接期事实）。所以 feature 必须与 plugin.json 的 capabilities
+# 以及部署侧 grant 的三方一致——SDK 把这件事变成一次显式选择，而不是一行容易
+# 忘记删掉的 extern 声明。
+[features]
+default = []
+config-capability = []
+kv-capability = []
+http-capability = []
+fs-capability = []
+tool-capability = []
+
+# 零依赖是硬约束：插件包要能在离线环境里构建（cargo build --offline），而 SDK
+# 是每个插件都要带上的东西。JSON 因此是自带的最小实现，见 src/json.rs。

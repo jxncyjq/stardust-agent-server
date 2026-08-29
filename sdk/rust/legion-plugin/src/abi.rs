@@ -1,42 +1,40 @@
 //! ABI 的机械部分：宿主与 guest 之间怎么交换字节。
 //!
+//! 这一层作者不需要读。`declare_plugin!` 生成的四个导出会调到这里，本模块只
+//! 负责分配、归还与指针打包。
+//!
 //! 这一层与插件做什么无关，写你自己的插件时几乎可以原样照抄；真正要改的是
 //! `tools.rs`。四个导出（外加线性内存）是宿主的硬要求，缺一个就拒绝实例化：
 //!
 //! | 导出 | 签名 | 谁调用 |
 //! |---|---|---|
-//! | `plugin_alloc` | `(i32) -> i32` | 宿主：写入参前、host 函数写返回体前 |
-//! | `plugin_free` | `(i32, i32)` | 宿主：调用结束后归还入参内存 |
-//! | `plugin_invoke` | `(i32, i32, i32) -> i64` | 宿主：唯一入口（见 lib.rs） |
-//! | `_initialize` | `()` | 宿主：实例化时（WASI reactor，没有 `_start`） |
-//! | `memory` | — | 由 `wasm32-wasip1` 目标自动导出 |
 
-use std::alloc::{alloc, dealloc, Layout};
+use std::alloc::{alloc as sys_alloc, dealloc as sys_dealloc, Layout};
 
 /// plugin_alloc 是宿主预留 guest 内存的唯一方式：既用于它即将写入的请求体，
 /// 也用于 host 函数交还的响应体。
 ///
 /// 返回 0 表示分配不了。宿主会把它当成错误报告出来，而不是拿 0 当地址用。
-#[no_mangle]
-pub extern "C" fn plugin_alloc(size: i32) -> i32 {
+/// alloc 是 `plugin_alloc` 导出的实现体。
+pub fn alloc(size: i32) -> i32 {
     if size <= 0 {
         return 0;
     }
     match Layout::from_size_align(size as usize, 1) {
-        Ok(layout) => unsafe { alloc(layout) as i32 },
+        Ok(layout) => unsafe { sys_alloc(layout) as i32 },
         Err(_) => 0,
     }
 }
 
 /// plugin_free 归还 plugin_alloc 预留的内存。宿主为它写过的每一个请求体都会
 /// 调用一次，**包括那次调用失败的情况**。
-#[no_mangle]
-pub extern "C" fn plugin_free(ptr: i32, size: i32) {
+/// free 是 `plugin_free` 导出的实现体。
+pub fn free(ptr: i32, size: i32) {
     if ptr <= 0 || size <= 0 {
         return;
     }
     if let Ok(layout) = Layout::from_size_align(size as usize, 1) {
-        unsafe { dealloc(ptr as *mut u8, layout) }
+        unsafe { sys_dealloc(ptr as *mut u8, layout) }
     }
 }
 
@@ -45,7 +43,7 @@ pub extern "C" fn plugin_free(ptr: i32, size: i32) {
 ///
 /// 分配失败时返回 0（等价于 ptr=0,len=0），宿主把它读作空响应体。
 pub fn write_out(body: &[u8]) -> i64 {
-    let ptr = plugin_alloc(body.len() as i32);
+    let ptr = alloc(body.len() as i32);
     if ptr == 0 {
         return 0;
     }
@@ -89,6 +87,6 @@ pub unsafe fn take_host_body(packed: i64) -> Vec<u8> {
         return Vec::new();
     }
     let owned = std::slice::from_raw_parts(ptr as *const u8, len as usize).to_vec();
-    plugin_free(ptr, len);
+    free(ptr, len);
     owned
 }

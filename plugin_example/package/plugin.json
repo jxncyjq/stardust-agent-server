@@ -2,7 +2,7 @@
   "name": "legion-hello",
   "version": "0.1.0",
   "abi": 1,
-  "sha256": "cd3e8e36f5108048ac69e9f80c55ae0d4f413ea4b5c4c43158d9dba6609f6c36",
+  "sha256": "e5c94f98ff5baa90312a5dc35d711ea3765b8d84d3661c713a06c0eaa4a033c1",
   "capabilities": ["log"],
   "limits": {
     "timeout_ms": 5000,

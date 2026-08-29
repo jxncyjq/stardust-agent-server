@@ -13,37 +13,33 @@
 ## 目录
 
 ```
-guest/                Rust guest 源码（无第三方依赖，可 --offline 构建）
-  Cargo.toml          crate-type=cdylib；每个宿主能力一个 feature，默认全关
-  src/lib.rs          自述 MANIFEST、plugin_invoke 入口、op 分发
-  src/tools.rs        工具实现与按名分发 —— 写自己的插件主要改这里
-  src/host.rs         七个 host 函数的声明与安全包装（六个用 feature 关着）
-  src/abi.rs          alloc / free / 打包解包 —— 基本可原样照抄
-  src/json.rs         EXAMPLE-ONLY 的手搓 JSON，真插件换成 serde_json
+guest/                Rust guest 源码，依赖 sdk/rust/legion-plugin
+  Cargo.toml          crate-type=cdylib；能力 feature 透传给 SDK
+  src/lib.rs          declare_plugin! + 工具实现 —— 整个插件就这一个文件
 package/              插件包目录：plugin.json + plugin.wasm（均已提交）
 scripts/build.sh      构建 wasm 并按其摘要重新渲染 plugin.json
 scripts/publish.sh    用你自己的私钥签名，打成 dist/legion-hello.tar.gz
 example_test.go       用真实 wazero 宿主跑这个包（`go test ./plugin_example/...`）
 ```
 
-分成五个文件不是为了好看：一个插件里**要改的**（`tools.rs`）、**按需接的**
-（`host.rs`）、**照抄的**（`abi.rs`）和**该换掉的**（`json.rs`）是四类东西，
-混在一个 `lib.rs` 里看不出哪块该动。
+**一个文件**：ABI 的四个导出、op 分发、内存管理、指针打包与 JSON 全在
+`sdk/rust/legion-plugin` 里，示例只剩 `declare_plugin!` 与一个工具函数。想看
+底层合同长什么样，读 SDK 的 `src/abi.rs`；写插件不需要。
 
 ## 完整结构与刻意留空的槽位
 
-这个示例只开了 `log` 一个能力，但**七个 host 函数的通路都已经写好**，其余六个
-用 Cargo feature 关着（`src/host.rs`），每个槽位的注释里写明了请求 / 响应形状
-与打开它的代价：
+这个示例只开了 `log` 一个能力，但**七个 host 函数的通路 SDK 里都已经写好**，
+其余六个用 Cargo feature 关着（`sdk/rust/legion-plugin/src/host.rs`），每个槽位
+的注释里写明了请求 / 响应形状与打开它的代价：
 
-| 能力 | feature | 通路（src/host.rs） | 打开后还要做什么 |
+| 能力 | feature | 通路（SDK 的 `host` 模块） | 打开后还要做什么 |
 |---|---|---|---|
 | `log` | 默认开 | `log_info` | — |
-| `config` | `config-capability` | `config()` | plugin.json 的 `capabilities` 加 `config` |
-| `kv` | `kv-capability` | `kv_read` / `kv_write` | 同上加 `kv` |
-| `http` | `http-capability` | `http()` | 加 `http`，**并声明 `network.allowed_hosts`** |
-| `fs` | `fs-capability` | `read()` | 加 `fs`，**并声明 `filesystem.allowed_paths`** |
-| `tool` | `tool-capability` | `invoke_tool()` | 加 `tool`；依赖别家工具还要写 `requires` |
+| `config` | `config-capability` | `host::config()` | plugin.json 的 `capabilities` 加 `config` |
+| `kv` | `kv-capability` | `host::kv_read` / `host::kv_write` | 同上加 `kv` |
+| `http` | `http-capability` | `host::http()` | 加 `http`，**并声明 `network.allowed_hosts`** |
+| `fs` | `fs-capability` | `host::read()` | 加 `fs`，**并声明 `filesystem.allowed_paths`** |
+| `tool` | `tool-capability` | `host::invoke_tool()` | 加 `tool`；依赖别家工具还要写 `requires` |
 
 **为什么默认关着**：能力是**链接期**事实。宿主只为已授权的能力注册 host 函数，
 所以 import 一个部署没授权的函数，模块会在**实例化**时失败——guest 根本没机会
@@ -52,16 +48,33 @@ example_test.go       用真实 wazero 宿主跑这个包（`go test ./plugin_ex
 
 ```bash
 # 三处联动，缺一处就装不上：
-# 1) 构建时打开 feature
+# 1) 构建时打开 feature（示例 crate 的 feature 透传给 SDK）
 cargo build --release --target wasm32-wasip1 --features kv-capability
 # 2) scripts/build.sh 里内联的 plugin.json：capabilities 加上 "kv"
 # 3) 部署侧：agent plugins grant <name> --capabilities log,kv
 ```
 
-`tools.rs` 的 `dispatch` 里还留了**第二个工具的位置**：一段完整注释掉的
-`fetch_title` 实现，演示怎么用 `http` 通路、以及怎么区分正常响应与错误信封
-（`{"code":"DENIED"|…}`）——把 `DENIED` 当成空 body 继续跑，就是在替越权的调用
-打掩护。
+加第二个工具是两处：`declare_plugin!` 的 `tools = [...]` 里加一项、
+`scripts/build.sh` 内联的 `plugin.json` 的 `tools` 里加一条。**op 0 的
+`provides` 不用管**——SDK 从 `tools` 列表推导，这正是它消灭掉的第三处联动。
+
+用 `http` 通路的工具长这样（打开 `http-capability`、并在 plugin.json 里同时
+声明 `capabilities:["log","http"]` 与 `network.allowed_hosts` 之后）：
+
+```rust
+fn fetch_title(call: &ToolCall) -> ToolResult {
+    let Some(url) = call.argument("url") else {
+        return ToolResult::fail("missing required argument: url");
+    };
+    let response = legion_plugin::host::http(&format!(
+        "{{\"method\":\"GET\",\"url\":\"{}\"}}", url
+    ));
+    // 响应要么是 {"status":…,"body":…}，要么是错误信封
+    // {"code":"DENIED"|"INVALID_REQUEST"|"HOST_ERROR","message":…}。两者都要判：
+    // 把 DENIED 当成空 body 继续跑，就是在替越权的调用打掩护。
+    ToolResult::ok(String::from_utf8_lossy(&response))
+}
+```
 
 ### 完整的 plugin.json 骨架
 
@@ -196,16 +209,17 @@ go test ./plugin_example/...
 
 ## 从这份示例改成你自己的插件
 
-1. **写工具**：在 `guest/src/tools.rs` 里加实现，并在 `dispatch` 的 match 里加
-   分支。加一个工具是**三处联动**：`tools.rs` 的分支、`lib.rs` 里 `MANIFEST` 的
-   `provides`、`scripts/build.sh` 内联 `plugin.json` 的 `tools`。少改第二处，
-   激活期的交叉校验会拒绝挂载；少改第三处，宿主根本不会注册这个工具。
-2. **接能力**：需要 `log` 以外的能力时，打开 `guest/Cargo.toml` 对应的 feature，
-   同时把能力名写进 `plugin.json` 的 `capabilities`，部署侧 `grant` 也要带上。
-   `capabilities` **只写真正 import 了的**：多写一个是白拿权限，少写一个则模块
-   直接链接失败。
-3. **换掉 JSON**：`guest/src/json.rs` 整个是 `EXAMPLE-ONLY`，真插件请用
-   `serde_json` 解析成结构体，解析失败**返回失败的 ToolResult**，不要 panic——
+1. **写工具**：在 `guest/src/lib.rs` 里加一个 `fn(&ToolCall) -> ToolResult`，并
+   把它加进 `declare_plugin!` 的 `tools = [...]`。加一个工具是**两处联动**：这里
+   与 `scripts/build.sh` 内联 `plugin.json` 的 `tools`（宿主据后者注册）。op 0 的
+   `provides` 由 SDK 推导，不用管。
+2. **接能力**：需要 `log` 以外的能力时，打开 `guest/Cargo.toml` 对应的 feature
+   （它透传给 SDK），同时把能力名写进 `plugin.json` 的 `capabilities`，部署侧
+   `grant` 也要带上。`capabilities` **只写真正用到的**：多写一个是白拿权限，少
+   写一个则模块直接链接失败。
+3. **要复杂 JSON 就自己加 serde**：SDK 只解析宿主实际发来的那一种形状
+   （`arguments` 是字符串到字符串）。工具内部要处理嵌套结构时，在**你自己的**
+   crate 里加 `serde_json`，解析失败**返回失败的 ToolResult**，不要 panic——
    panic 会带走整个 wasm 模块，而失败结果只是模型能读懂的一个答案。
 4. **别忘了白名单**：用 `http` / `fs` 时要在 `plugin.json` 里同时声明
    `network.allowed_hosts` / `filesystem.allowed_paths`，否则 `grant` 会直接拒绝
