@@ -4,6 +4,7 @@ package browser
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -170,5 +171,52 @@ func TestInjectInputAppliesModifiers(t *testing.T) {
 	})
 	if got := boxValue(); got != "a" {
 		t.Errorf("input value = %q after a plain keydown, want %q", got, "a")
+	}
+}
+
+// TestTheBrowsersTrafficGoesThroughTheEgressProxy 是「代理确实在路径上」的真机
+// 证据。单测能证明代理本身按策略放行/拒绝，证明不了 Chromium 真的在用它——而
+// --proxy-server 拼错、被平台参数覆盖、或被 Chromium 对回环的默认绕过跳过，都是
+// 静默失效：页面照常打开，SSRF 防护形同虚设。
+//
+// 计数发生在代理的拨号上：页面加载出来了、而代理一次也没被拨过，就说明浏览器绕过
+// 了它。
+//
+// 一条如实记录：本想用「回环目标 + 去掉 --proxy-bypass-list=<-loopback> 应当变红」
+// 来同时钉住那个参数，但变异实测**没有变红**——这个 Chromium 版本在显式
+// --proxy-server 下并没有绕过回环。参数仍然保留（Chromium 的文档行为是绕过 localhost，
+// 且各版本不一），但**它的效果不在本测试的覆盖范围内**，别把这条测试的绿当成它的证据。
+func TestTheBrowsersTrafficGoesThroughTheEgressProxy(t *testing.T) {
+	var served atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		served.Add(1)
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><body><h1>through the proxy</h1></body></html>`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	rt, err := NewRuntime(RuntimeConfig{Headless: true, AllowPrivateHosts: true, BinPath: systemChromeForTest()})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	defer rt.Close(context.Background(), CloseReq{})
+
+	proxied := 0
+	rt.mgr.egress.dial = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		proxied++
+		var d net.Dialer
+		return d.DialContext(ctx, network, addr)
+	}
+
+	if _, err := rt.Open(context.Background(), OpenReq{URL: srv.URL}); err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	if proxied == 0 {
+		t.Error("the page loaded without a single dial through the egress proxy: the browser is not using it")
+	}
+	if served.Load() == 0 {
+		t.Error("the fixture server was never reached; the navigation did not happen at all")
 	}
 }

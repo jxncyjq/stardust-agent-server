@@ -2532,6 +2532,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 			SnapshotTTL:           time.Duration(cfg.Browser.SnapshotTTLHours) * time.Hour,
 			SnapshotArchiveDir:    cfg.Browser.SnapshotArchiveDir,
 			Extractor:             adapter.NewMaasSnapshotExtractor(defaultMaas),
+			Logger:                logger,
 		}
 		if repo, ok := taskStore.(*storage.SQLiteRepository); ok {
 			runtimeCfg.Store = newSQLiteBrowserStore(repo)

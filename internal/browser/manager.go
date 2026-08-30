@@ -2,6 +2,7 @@ package browser
 
 import (
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 
@@ -28,6 +29,14 @@ type ManagerConfig struct {
 	Headless bool
 	BinPath  string // 空则经 PAL 分发优先级定位（config > 内置 > 系统 > go-rod 下载）
 
+	// AllowPrivateHosts 透传给出口代理：它决定「哪些地址可以连」，不决定是否走代理。
+	// 浏览器的全部流量在任何情况下都经过代理，因为钉住拨号（解析一次、连那一次的
+	// 结果）是防 DNS rebinding 的机制本身，与放不放行私网无关。
+	AllowPrivateHosts bool
+
+	// Logger 供出口代理记录拒绝。nil 时丢弃。
+	Logger *slog.Logger
+
 	// BundledChromiumPath 指向随 App 打包的内置固定版 Chromium（4C 打包时填）；
 	// 默认空，此时分发优先级退到系统探测再退到 go-rod 自动下载。
 	BundledChromiumPath string
@@ -40,6 +49,9 @@ type Manager struct {
 	browser  *rod.Browser // 一条 CDP 连接 = 一个 Chromium 进程
 	pal      PlatformAdapter
 	seq      int
+	// egress 是这个 Chromium 的唯一出网口（见 egressproxy.go）。它随进程一起起、
+	// 一起关：代理先死会让浏览器的每个请求都连不上，进程先死则代理无人可服务。
+	egress *egressProxy
 }
 
 // NewManager 拉起一个 Chromium 进程并连接。Chromium 可执行文件经 PAL 按分发
@@ -69,17 +81,34 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 		l = l.Bin(binPath)
 	}
 
+	// 出口代理必须在启动参数定下来之前就位：它的端口是随机的，而 --proxy-server
+	// 只在进程启动时读一次。
+	egress, err := startEgressProxy(egressProxyConfig{
+		AllowPrivateHosts: cfg.AllowPrivateHosts,
+		Logger:            cfg.Logger,
+	})
+	if err != nil {
+		return nil, err
+	}
+	l = l.Set(flags.Flag("proxy-server"), egress.URL())
+	// 默认情况下 Chromium 会绕过代理直连 localhost/127.0.0.1——那恰好是 SSRF 最想
+	// 去的地方。"<-loopback>" 是 Chromium 的显式写法：把回环也交给代理，由代理按
+	// 策略决定放不放行。
+	l = l.Set(flags.Flag("proxy-bypass-list"), "<-loopback>")
+
 	controlURL, err := l.Launch()
 	if err != nil {
+		_ = egress.Close()
 		return nil, fmt.Errorf("launch chromium: %w", err)
 	}
 	b := rod.New().ControlURL(controlURL)
 	if err := b.Connect(); err != nil {
+		_ = egress.Close()
 		return nil, fmt.Errorf("connect chromium: %w", err)
 	}
 	// TODO(phase6): Reap/健康检查阶段用 m.pal.KillProcess(pid, false) 终止僵死
 	// Chromium 进程（配合 Job Object / 信号），本 Phase 仅 launcher.Cleanup() 清临时目录。
-	return &Manager{launcher: l, browser: b, pal: pal}, nil
+	return &Manager{launcher: l, browser: b, pal: pal, egress: egress}, nil
 }
 
 // AcquireContext 开一个隔离 incognito Context。本 Phase 不复用、不排队。
@@ -122,5 +151,11 @@ func (m *Manager) Close() {
 	}
 	if m.launcher != nil {
 		m.launcher.Cleanup()
+	}
+	// 代理最后关：浏览器进程还在往外发请求时抽掉出口，只会得到一串连不上的错误。
+	if m.egress != nil {
+		if err := m.egress.Close(); err != nil {
+			m.egress.logger.Warn("close browser egress proxy", "component", "browser", "error", err)
+		}
 	}
 }

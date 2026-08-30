@@ -34,6 +34,11 @@ type RuntimeConfig struct {
 	SnapshotRuneThreshold int               // 渲染文本超此 rune 数触发降级；<=0 关闭降级
 	SnapshotTTL           time.Duration     // 落盘全文保留时长；<=0 不清理
 	SnapshotArchiveDir    string            // 相对工具根的落盘子目录；空=默认
+
+	// Logger 目前只交给出口代理，用来记录被拒的出网请求。一次被策略挡下的导航在
+	// 页面上只是一条 403，运维要能在日志里看到它挡的是什么地址——否则「这个站点
+	// 打不开」就成了一个查不动的问题。nil 时丢弃。
+	Logger *slog.Logger
 }
 
 // Runtime 是 RuntimeAPI 的 go-rod 实现。
@@ -57,7 +62,12 @@ var _ RuntimeAPI = (*Runtime)(nil)
 
 // NewRuntime 拉起底层 Manager（Chromium 进程）并返回 go-rod 运行时。
 func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
-	mgr, err := NewManager(ManagerConfig{Headless: cfg.Headless, BinPath: cfg.BinPath})
+	mgr, err := NewManager(ManagerConfig{
+		Headless:          cfg.Headless,
+		BinPath:           cfg.BinPath,
+		AllowPrivateHosts: cfg.AllowPrivateHosts,
+		Logger:            cfg.Logger,
+	})
 	if err != nil {
 		return nil, err
 	}
