@@ -4,9 +4,11 @@ package browser
 
 import (
 	"context"
+	"errors"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -218,5 +220,24 @@ func TestTheBrowsersTrafficGoesThroughTheEgressProxy(t *testing.T) {
 	}
 	if served.Load() == 0 {
 		t.Error("the fixture server was never reached; the navigation did not happen at all")
+	}
+}
+
+// TestTheRealBrowserProcessIsConfined 是「隔离确实套在了真的 Chromium 上」的证据。
+// 单测只能证明按 pid 收束这件事本身成立；接线错了（拿错 pid、忘了调用、被 launcher
+// 的启动顺序绕过）在单测里全是绿的。
+func TestTheRealBrowserProcessIsConfined(t *testing.T) {
+	rt, err := NewRuntime(RuntimeConfig{Headless: true, AllowPrivateHosts: true, BinPath: systemChromeForTest()})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	defer rt.Close(context.Background(), CloseReq{})
+
+	if _, err := NewPlatformAdapter().ConfineProcess(os.Getpid()); errors.Is(err, ErrConfinementUnsupported) {
+		t.Skipf("no outer confinement on this platform")
+	}
+	if rt.mgr.confinement == nil {
+		t.Error("the browser process was launched without a confinement; a crash of this agent leaves " +
+			"Chromium processes behind")
 	}
 }

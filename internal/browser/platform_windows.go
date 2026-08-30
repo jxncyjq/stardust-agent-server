@@ -5,7 +5,6 @@ package browser
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -82,10 +81,6 @@ func (windowsAdapter) SafeDelete(path string) error {
 		time.Sleep(50 * time.Millisecond) // 等占用句柄释放
 	}
 	return fmt.Errorf("safe delete %q after retries: %w", path, lastErr)
-}
-
-func (windowsAdapter) WrapWithSandbox(cmd *exec.Cmd) *exec.Cmd {
-	return cmd // 占位：Phase 5 接 AppContainer + Job Object
 }
 
 func fileExists(p string) bool {

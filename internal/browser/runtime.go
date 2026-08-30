@@ -35,9 +35,12 @@ type RuntimeConfig struct {
 	SnapshotTTL           time.Duration     // 落盘全文保留时长；<=0 不清理
 	SnapshotArchiveDir    string            // 相对工具根的落盘子目录；空=默认
 
-	// Logger 目前只交给出口代理，用来记录被拒的出网请求。一次被策略挡下的导航在
-	// 页面上只是一条 403，运维要能在日志里看到它挡的是什么地址——否则「这个站点
-	// 打不开」就成了一个查不动的问题。nil 时丢弃。
+	// RequireSandbox：这台机器上没有外层隔离时宁可不启动浏览器（见 ManagerConfig）。
+	RequireSandbox bool
+
+	// Logger 记录沙箱与出网两类决定。一次被出网策略挡下的导航在页面上只是一条
+	// 403，运维要能在日志里看到它挡的是什么地址——否则「这个站点打不开」就成了
+	// 一个查不动的问题。nil 时丢弃。
 	Logger *slog.Logger
 }
 
@@ -66,6 +69,7 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 		Headless:          cfg.Headless,
 		BinPath:           cfg.BinPath,
 		AllowPrivateHosts: cfg.AllowPrivateHosts,
+		RequireSandbox:    cfg.RequireSandbox,
 		Logger:            cfg.Logger,
 	})
 	if err != nil {

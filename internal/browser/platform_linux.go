@@ -4,6 +4,7 @@ package browser
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -77,4 +78,14 @@ func (linuxAdapter) SafeDelete(path string) error {
 	return nil
 }
 
-func (linuxAdapter) WrapWithSandbox(cmd *exec.Cmd) *exec.Cmd { return cmd } // 占位：Phase 5 namespaces+seccomp
+// ConfineProcess 在 Linux 上目前**没有实现**，明说而不是静默放行。
+//
+// 真正的外层隔离（user namespace + seccomp）必须在**创建进程时**建立，而 Chromium
+// 的进程是 go-rod 的 launcher 起的，这里只拿得到一个 pid——对一个已经跑起来的进程
+// 补 namespace 是做不到的。把它做出来要先把启动路径收回自管（Phase 6 进程池），
+// 那时它属于「怎么起这个进程」，而不是「起来之后补一层」。
+//
+// 在此之前，Linux 上的边界是 Chromium 自己的渲染沙箱加部署侧的容器；本函数返回
+// ErrConfinementUnsupported，让部署自己决定是照常跑还是拒绝启动
+// （browser.require_sandbox）。
+func (linuxAdapter) ConfineProcess(int) (io.Closer, error) { return nil, ErrConfinementUnsupported }
