@@ -32,6 +32,10 @@ func (f *fakeStreamer) SetTakeover(sessionID string, enabled bool) error { retur
 func (f *fakeStreamer) InjectInput(sessionID string, events []browser.InputEvent) error {
 	return nil
 }
+func (f *fakeStreamer) NavigateTakeover(string, browser.NavigateReq) error { return nil }
+func (f *fakeStreamer) SessionInfo(id string) (browser.SessionInfo, error) {
+	return browser.SessionInfo{SessionID: id}, nil
+}
 func (f *fakeStreamer) SetViewport(sessionID string, width, height int) error { return nil }
 
 func TestBrowserStreamWritesSSEEvents(t *testing.T) {

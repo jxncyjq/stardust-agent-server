@@ -304,6 +304,10 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleBrowserTakeover(rec, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/browser/sessions/") && strings.HasSuffix(r.URL.Path, "/viewport"):
 		s.handleBrowserViewport(rec, r)
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/browser/sessions/") && strings.HasSuffix(r.URL.Path, "/info"):
+		s.handleBrowserSessionInfo(rec, r)
+	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/browser/sessions/") && strings.HasSuffix(r.URL.Path, "/navigate"):
+		s.handleBrowserNavigate(rec, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/browser/sessions/") && strings.HasSuffix(r.URL.Path, "/input"):
 		s.handleBrowserInput(rec, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/approvals":

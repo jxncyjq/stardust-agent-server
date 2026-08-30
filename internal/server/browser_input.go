@@ -85,6 +85,57 @@ type inputRequest struct {
 	Events []browser.InputEvent `json:"events"`
 }
 
+// handleBrowserNavigate 是人工导航：地址栏、后退/前进/刷新。
+//
+// 它存在是因为浏览器视图此前只是一个能点击的录像——用户想回上一页都得让 Agent
+// 去做。校验（接管中、URL 策略、动作白名单）全在 runtime 里，这里只做搬运，免得
+// 两处各写一份策略然后慢慢分叉。
+func (s *HTTPServer) handleBrowserNavigate(w http.ResponseWriter, r *http.Request) {
+	if s.browser == nil {
+		writeError(w, http.StatusServiceUnavailable, "browser runtime is unavailable")
+		return
+	}
+	id, _, ok := parseBrowserActionID(r.URL.Path)
+	if !ok {
+		writeError(w, http.StatusNotFound, "bad browser navigate path")
+		return
+	}
+	var req browser.NavigateReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid navigate request")
+		return
+	}
+	if err := s.browser.NavigateTakeover(id, req); err != nil {
+		writeBrowserError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"session_id": id, "url": req.URL, "action": req.Action})
+}
+
+// handleBrowserSessionInfo 回一个会话的当前状态：地址、接管标志、页面是否还在。
+//
+// 地址栏据它渲染。此前没有任何地方能回答「现在在哪」——观测事件里没有 URL，会话
+// 状态也没有出口，于是界面只能显示一个 session id。
+func (s *HTTPServer) handleBrowserSessionInfo(w http.ResponseWriter, r *http.Request) {
+	if s.browser == nil {
+		writeError(w, http.StatusServiceUnavailable, "browser runtime is unavailable")
+		return
+	}
+	// parseBrowserActionID（按最后一段切）而不是 parseBrowserSessionID（后者只认
+	// /stream 后缀）：这里的最后一段是 /info。
+	id, _, ok := parseBrowserActionID(r.URL.Path)
+	if !ok {
+		writeError(w, http.StatusNotFound, "bad browser session path")
+		return
+	}
+	info, err := s.browser.SessionInfo(id)
+	if err != nil {
+		writeBrowserError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
 type viewportRequest struct {
 	Width  int `json:"width"`
 	Height int `json:"height"`
