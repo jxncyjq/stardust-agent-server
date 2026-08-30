@@ -272,6 +272,13 @@ type BrowserConfig struct {
 	Enabled  bool   `json:"enabled"`
 	Headless bool   `json:"headless"`
 	BinPath  string `json:"bin_path"` // 可选：指向系统 Chrome/Edge，绕过 go-rod 自动下载
+
+	// RequireSandbox：没有外层隔离就**不启动浏览器**。
+	//
+	// 默认 false，因为目前只有 Windows 有实现（Job Object：kill-on-close + 内存
+	// 上限），Linux/macOS 上打开它等于关掉浏览器功能。打开它的部署换来的是「要么
+	// 被收束、要么明确失败」，而不是「以为自己被收束」。
+	RequireSandbox bool `json:"require_sandbox"`
 	// SessionTTLSeconds 是浏览器会话的空闲回收阈值（秒）。0 = 不回收（reaper 关闭）。
 	SessionTTLSeconds int `json:"session_ttl_seconds"`
 	// ReapIntervalSeconds 是 reaper 后台扫描间隔（秒）。0 = 默认 60s。
