@@ -187,7 +187,9 @@ func (p *egressProxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	}
 	upstream, err := p.dial(r.Context(), "tcp", addr)
 	if err != nil {
-		p.refuse(w, r.Host, fmt.Errorf("connect upstream: %w", err))
+		// 502 而不是 403：连不上与被策略拒绝是两回事，而 403 会让人去查策略。
+		// 真机排查时我就在这上面绕了一圈——错误里写着 Forbidden，实际是拨号失败。
+		p.unreachable(w, r.Host, err)
 		return
 	}
 	defer func() { _ = upstream.Close() }()
@@ -198,7 +200,16 @@ func (p *egressProxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 		p.refuse(w, r.Host, errors.New("this server cannot hijack connections"))
 		return
 	}
-	client, _, err := hijacker.Hijack()
+	// 接管连接时**必须**接着用 Hijack 给的那个 bufio.ReadWriter 读，而不是裸 net.Conn。
+	//
+	// 客户端常常不等 200 就把 TLS ClientHello 跟在 CONNECT 后面一起发出来，那几个
+	// 字节此刻已经躺在 net/http 的 bufio.Reader 里。从裸连接读，就再也拿不到它们：
+	// 隧道少了握手的开头，对端一直等，最后 "unexpected EOF"——真实网络上的跨协议
+	// 重定向那一跳实测到的正是这个。
+	//
+	// 也别去 Peek 一份「先补发」：Peek **不消费**缓冲，紧接着的 io.Copy 会把同一段
+	// 字节再发一遍。我第一版就是这么写的，8KB 的早发数据一下就把重复暴露出来了。
+	client, buffered, err := hijacker.Hijack()
 	if err != nil {
 		p.logger.Warn("hijack proxy connection", "component", "browser", "error", err)
 		return
@@ -207,10 +218,43 @@ func (p *egressProxy) serveConnect(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.WriteString(client, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		return
 	}
+	// 两个方向都拷完才收工，而不是「谁先结束就拆」：一端读完不代表另一端已经把该发
+	// 的发完，先拆会把还在路上的字节截掉。各自结束时半关闭，好让对端看到 EOF。
 	done := make(chan struct{}, 2)
-	go func() { _, _ = io.Copy(upstream, client); done <- struct{}{} }()
-	go func() { _, _ = io.Copy(client, upstream); done <- struct{}{} }()
+	go func() {
+		_, _ = io.Copy(upstream, buffered)
+		halfClose(upstream)
+		done <- struct{}{}
+	}()
+	go func() {
+		_, _ = io.Copy(client, upstream)
+		halfClose(client)
+		done <- struct{}{}
+	}()
 	<-done
+	<-done
+}
+
+// halfClose 关掉写方向（TCP 的 FIN），让对端读到 EOF 而不是被整条连接的关闭截断。
+// 不支持半关闭的连接类型（测试里的假连接）退回整体关闭。
+func halfClose(conn net.Conn) {
+	if closer, ok := conn.(interface{ CloseWrite() error }); ok {
+		_ = closer.CloseWrite()
+		return
+	}
+	_ = conn.Close()
+}
+
+// unreachable 回 502：目标是允许的，只是这一刻连不上（DNS 通了、TCP 没通）。
+//
+// 与 refuse 的 403 分开，是因为两者的下一步完全不同：403 去看策略与配置，502 去看
+// 网络与对端。把后者说成前者，会把人送去查一个根本没问题的地方。
+func (p *egressProxy) unreachable(w http.ResponseWriter, target string, err error) {
+	p.logger.Warn("browser egress could not reach the target",
+		"component", "browser", "target", target, "error", err)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(http.StatusBadGateway)
+	_, _ = io.WriteString(w, "the agent browser could not reach "+target+": "+err.Error()+"\n")
 }
 
 // serveForward 处理明文 http：同样先校验、再钉住地址转发一次。
@@ -243,7 +287,8 @@ func (p *egressProxy) serveForward(w http.ResponseWriter, r *http.Request) {
 	outbound.RequestURI = ""
 	resp, err := transport.RoundTrip(outbound)
 	if err != nil {
-		p.refuse(w, r.URL.Host, fmt.Errorf("forward request: %w", err))
+		// 同上：转发失败是连不上，不是策略拒绝。
+		p.unreachable(w, r.URL.Host, err)
 		return
 	}
 	defer func() { _ = resp.Body.Close() }()

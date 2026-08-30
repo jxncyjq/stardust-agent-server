@@ -185,10 +185,12 @@ func TestInjectInputAppliesModifiers(t *testing.T) {
 // 计数发生在代理的拨号上：页面加载出来了、而代理一次也没被拨过，就说明浏览器绕过
 // 了它。
 //
-// 一条如实记录：本想用「回环目标 + 去掉 --proxy-bypass-list=<-loopback> 应当变红」
-// 来同时钉住那个参数，但变异实测**没有变红**——这个 Chromium 版本在显式
-// --proxy-server 下并没有绕过回环。参数仍然保留（Chromium 的文档行为是绕过 localhost，
-// 且各版本不一），但**它的效果不在本测试的覆盖范围内**，别把这条测试的绿当成它的证据。
+// 这条测试**不**覆盖 --proxy-bypass-list=<-loopback>（它的目标是公网地址）；那个参数
+// 由 TestLoopbackIsNotExemptFromTheEgressPolicy 钉住。
+//
+// 早先这里写过一句「那个参数的效果测不出来」，依据是一次变异没有变红——**那个结论
+// 是错的**，错在当时的代理放行一切、于是「绕没绕过代理」在结果上看不出差别。换成
+// 「让代理拒绝回环，再看那台服务器有没有被碰到」之后，删掉该参数立刻变红。
 func TestTheBrowsersTrafficGoesThroughTheEgressProxy(t *testing.T) {
 	var served atomic.Int32
 	mux := http.NewServeMux()
@@ -362,5 +364,53 @@ func TestTheBrowserRunsInsideTheOuterSandbox(t *testing.T) {
 	launchedAs := chromium.launched.cmd.Path
 	if !strings.HasSuffix(launchedAs, "/bwrap") {
 		t.Errorf("the browser was launched as %q, not through bwrap: the sandbox is not on the path", launchedAs)
+	}
+}
+
+// TestLoopbackIsNotExemptFromTheEgressPolicy 补上 --proxy-bypass-list=<-loopback>
+// 的**效果**覆盖。
+//
+// 此前只有那个参数本身，没有任何东西守着它：变异实测（删掉它）不红，因为这个
+// Chromium 版本在显式 --proxy-server 下本来就不绕回环。而各版本行为不一，Chromium
+// 的文档行为是**绕过** localhost——一旦某个版本恢复那个默认，回环就整段脱离出口
+// 策略，而 127.0.0.1 恰恰是 SSRF 最想去的地方，且没有任何症状。
+//
+// 所以断言的是结果而不是参数：让代理拒绝私网、让 runtime 放行（两者的开关在这个
+// 测试里被故意拆开），然后导航到一个回环上的服务器。走代理 → 看到代理的拒绝页，
+// 且那台服务器一次都没被碰过；绕过代理 → 服务器会被碰到，测试红。
+func TestLoopbackIsNotExemptFromTheEgressPolicy(t *testing.T) {
+	var reached atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		reached.Add(1)
+		_, _ = w.Write([]byte("<html><body>the fixture server was reached</body></html>"))
+	}))
+	defer srv.Close()
+
+	// runtime 放行私网（否则 checkURL 会在导航之前就拒掉，测不到代理这一层）。
+	rt, err := NewRuntime(RuntimeConfig{Headless: true, AllowPrivateHosts: true, BinPath: systemChromeForTest()})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	defer rt.Close(context.Background(), CloseReq{})
+
+	// 代理这一层收紧：现在「回环该不该连」只由出口策略回答。
+	rt.mgr.egress.allowPrivateHosts = false
+
+	obs, err := rt.Open(context.Background(), OpenReq{URL: srv.URL})
+	if err != nil {
+		// 导航失败也是一种「被挡住」，同样满足这条性质——只要服务器没被碰到。
+		if reached.Load() != 0 {
+			t.Fatalf("open failed (%v) yet the loopback server was reached", err)
+		}
+		return
+	}
+	if reached.Load() != 0 {
+		t.Errorf("the loopback server was reached %d time(s): the browser bypassed the egress proxy, and "+
+			"127.0.0.1 is exactly where an SSRF wants to go", reached.Load())
+	}
+	// 不断言拒绝页的**文字**：代理回的是 text/plain 403，a11y 树上未必有可读文本
+	// （实测就是空的）。要钉的是「那台服务器没被碰到」，以及页面上没有它的内容。
+	if strings.Contains(obs.Observation.Text, "the fixture server was reached") {
+		t.Errorf("the page shows the loopback server's content: %q", obs.Observation.Text)
 	}
 }
