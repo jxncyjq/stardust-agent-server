@@ -2148,6 +2148,33 @@ func resolveHomeDir(logger *slog.Logger) string {
 	return homeDir
 }
 
+// browserRuntimeConfig 把 browser 配置块映射成运行时配置。
+//
+// 它被抽出来只为一件事：**这段映射能被直接测**。少接一个字段不会让任何东西报错——
+// 浏览器照常起来，那个开关只是永远是零值。allow_private_hosts 就正是这么在代码里
+// 存在了很久却没有配置键（字段在、没人喂），而「配了没生效」与「没配」在运行时长得
+// 一模一样。
+//
+// Extractor / Logger / Store 不在这里：它们来自装配期的依赖，不是配置。
+func browserRuntimeConfig(cfg config.BrowserConfig) browser.RuntimeConfig {
+	return browser.RuntimeConfig{
+		Headless:                cfg.Headless,
+		BinPath:                 cfg.BinPath,
+		SessionTTL:              time.Duration(cfg.SessionTTLSeconds) * time.Second,
+		ReapInterval:            time.Duration(cfg.ReapIntervalSeconds) * time.Second,
+		MaxElements:             cfg.MaxElements,
+		SnapshotRuneThreshold:   cfg.SnapshotRuneThreshold,
+		SnapshotTTL:             time.Duration(cfg.SnapshotTTLHours) * time.Hour,
+		SnapshotArchiveDir:      cfg.SnapshotArchiveDir,
+		AllowPrivateHosts:       cfg.AllowPrivateHosts,
+		RequireSandbox:          cfg.RequireSandbox,
+		MinFreeMemoryBytes:      cfg.MinFreeMemoryMB << 20,
+		MaxProcesses:            cfg.MaxProcesses,
+		MaxContextsPerProcess:   cfg.MaxContextsPerProcess,
+		ProcessMemoryLimitBytes: cfg.ProcessMemoryLimitMB << 20,
+	}
+}
+
 // webToolOptions maps the web config block onto the tool package options.
 func webToolOptions(cfg config.WebToolConfig) tool.WebToolOptions {
 	return tool.WebToolOptions{
@@ -2529,25 +2556,21 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		// Phase 3: 会话持久化。TTL/间隔以秒配置，此处转 time.Duration。当后端是
 		// SQLite 时注入一个把 browser_sessions 表桥到端口的适配器，让登录态跨进程
 		// 重启存活；非 SQLite 驱动拿不到 repo，Store 保持 nil（纯内存，Phase 1/2 行为）。
-		runtimeCfg := browser.RuntimeConfig{
-			Headless:                cfg.Browser.Headless,
-			BinPath:                 cfg.Browser.BinPath,
-			SessionTTL:              time.Duration(cfg.Browser.SessionTTLSeconds) * time.Second,
-			ReapInterval:            time.Duration(cfg.Browser.ReapIntervalSeconds) * time.Second,
-			MaxElements:             cfg.Browser.MaxElements,
-			SnapshotRuneThreshold:   cfg.Browser.SnapshotRuneThreshold,
-			SnapshotTTL:             time.Duration(cfg.Browser.SnapshotTTLHours) * time.Hour,
-			SnapshotArchiveDir:      cfg.Browser.SnapshotArchiveDir,
-			Extractor:               adapter.NewMaasSnapshotExtractor(defaultMaas),
-			RequireSandbox:          cfg.Browser.RequireSandbox,
-			MinFreeMemoryBytes:      cfg.Browser.MinFreeMemoryMB << 20,
-			MaxProcesses:            cfg.Browser.MaxProcesses,
-			MaxContextsPerProcess:   cfg.Browser.MaxContextsPerProcess,
-			ProcessMemoryLimitBytes: cfg.Browser.ProcessMemoryLimitMB << 20,
-			Logger:                  logger,
-		}
+		runtimeCfg := browserRuntimeConfig(cfg.Browser)
+		runtimeCfg.Extractor = adapter.NewMaasSnapshotExtractor(defaultMaas)
+		runtimeCfg.Logger = logger
 		if repo, ok := taskStore.(*storage.SQLiteRepository); ok {
 			runtimeCfg.Store = newSQLiteBrowserStore(repo)
+		}
+		if cfg.Browser.AllowPrivateHosts {
+			// 只在打开时记：一条永远出现的告警等于没有告警。
+			logger.Warn("the agent's browser may reach the private network",
+				"component", "browser",
+				"setting", "browser.allow_private_hosts",
+				"consequence", "pages the model chooses can reach loopback, RFC1918 addresses and cloud "+
+					"metadata endpoints from this machine",
+				"still_enforced", "every request is still resolved once, checked, and dialled at the checked "+
+					"address by the egress proxy")
 		}
 		brt, err := browser.NewRuntime(runtimeCfg)
 		if err != nil {
