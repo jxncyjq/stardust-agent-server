@@ -1,0 +1,25 @@
+name: Sandbox Probe
+
+# 手动触发的**探针**，不进常规 CI：它回答的是「这个平台上这层沙箱做不做得成」，
+# 而不是「代码有没有坏」。上一次在 Linux 上把 bubblewrap 一路写完才发现 runner
+# 起不来，返工四轮；这次先花一次 CI 把事实问清楚。
+on:
+  workflow_dispatch:
+
+jobs:
+  macos-probe:
+    name: macOS sandbox-exec + orphan probe
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - uses: browser-actions/setup-chrome@v1
+        id: chrome
+      - name: Probe
+        env:
+          CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        # -v 是重点：探针的产出是日志里那张表，不是退出码。
+        run: go test -tags sandboxprobe ./internal/browser/ -run TestProbe -v -count=1 -timeout 15m
