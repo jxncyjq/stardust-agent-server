@@ -39,7 +39,13 @@ type ManualToolGate struct {
 // signal them back — a notification fault must never abort suspend/resume.
 type ApprovalEventSink interface {
 	// ApprovalPending fires once per newly opened pending ticket.
-	ApprovalPending(ctx context.Context, taskID, ticketID, tool string, args map[string]string)
+	//
+	// requestedBy and reason travel with it because the notification is what a
+	// UI renders the ticket FROM: a card that has to fetch the provenance
+	// separately shows the wrong source until it does, and a real-machine
+	// walkthrough found exactly that — a plugin's ask rendered as "the
+	// deployment's own sensitive-tool rule".
+	ApprovalPending(ctx context.Context, taskID, ticketID, tool string, args map[string]string, requestedBy, reason string)
 	// ApprovalResolved fires once a ticket is approved or denied (decision is
 	// "approved" or "denied").
 	ApprovalResolved(ctx context.Context, taskID, ticketID, decision string)
@@ -120,7 +126,7 @@ func (g *ManualToolGate) ShouldSuspend(ctx context.Context, task domain.Task, ca
 			return false, fmt.Errorf("open approval for task %s call %s: %w", task.ID, call.ID, err)
 		}
 		if !found && g.sink != nil {
-			g.sink.ApprovalPending(ctx, task.ID, ticketID, name, call.Arguments)
+			g.sink.ApprovalPending(ctx, task.ID, ticketID, name, call.Arguments, approval.RequestedByHost, "")
 		}
 		needApproval = true
 	}

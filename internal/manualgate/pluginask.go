@@ -84,7 +84,7 @@ func (g *ManualToolGate) suspendForPluginAsks(
 			return false, fmt.Errorf("open plugin approval for task %s call %s: %w", task.ID, target.ID, err)
 		}
 		if !found && g.sink != nil {
-			g.sink.ApprovalPending(ctx, task.ID, ticketID, target.Name, target.Arguments)
+			g.sink.ApprovalPending(ctx, task.ID, ticketID, target.Name, target.Arguments, label, verdict.Reason)
 		}
 		needApproval = true
 	}

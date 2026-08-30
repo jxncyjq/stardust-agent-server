@@ -33,10 +33,19 @@ func newPlatformApprovalSink(platform *observability.EventBus, logger *slog.Logg
 // ApprovalPending publishes an approval_pending envelope. arguments are carried
 // as-is; the SSE write boundary (sanitizeEventData) recursively truncates large
 // values and strips sensitive sub-keys before they leave the process.
-func (s *platformApprovalSink) ApprovalPending(ctx context.Context, taskID, ticketID, tool string, args map[string]string) {
+func (s *platformApprovalSink) ApprovalPending(ctx context.Context, taskID, ticketID, tool string, args map[string]string, requestedBy, reason string) {
 	data := map[string]any{"task_id": taskID, "ticket_id": ticketID, "tool": tool}
 	if args != nil {
 		data["arguments"] = args
+	}
+	// Who wants this approved travels WITH the notification: it is what the
+	// approval card renders from, and a card that has to look the provenance up
+	// separately shows the wrong source until it does.
+	if requestedBy != "" {
+		data["requested_by"] = requestedBy
+	}
+	if reason != "" {
+		data["reason"] = reason
 	}
 	s.publish(ctx, "approval_pending", taskID, ticketID, data)
 }

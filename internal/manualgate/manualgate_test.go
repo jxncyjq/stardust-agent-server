@@ -34,10 +34,15 @@ func manualTask() domain.Task {
 type spyApprovalSink struct {
 	pending  []string // ticketIDs
 	resolved []string // ticketID:decision
+	// provenance records the "requestedBy|reason" of each pending
+	// notification: the approval card renders from this event, so what it
+	// carries is what the operator sees.
+	provenance []string
 }
 
-func (s *spyApprovalSink) ApprovalPending(_ context.Context, _, ticketID, _ string, _ map[string]string) {
+func (s *spyApprovalSink) ApprovalPending(_ context.Context, _, ticketID, _ string, _ map[string]string, requestedBy, reason string) {
 	s.pending = append(s.pending, ticketID)
+	s.provenance = append(s.provenance, requestedBy+"|"+reason)
 }
 
 func (s *spyApprovalSink) ApprovalResolved(_ context.Context, _, ticketID, decision string) {
