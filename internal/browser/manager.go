@@ -235,8 +235,12 @@ func (m *Manager) Close() {
 	}
 	// 进程是我们起的，就由我们送走：browser.Close() 关的是 CDP 连接，Chromium 未必
 	// 因此退出（尤其是已经卡住的那种）。Kill 之后 Wait，避免留下僵尸。
+	//
+	// 走 PAL 而不是 cmd.Process.Kill()：Chromium 是多进程的，杀主进程带不走
+	// renderer/GPU。PAL 在 unix 上按**进程组**杀（组由 PrepareCommand 的 Setpgid
+	// 建立），在 Windows 上由 Job Object 兜住整棵树。
 	if m.launched != nil && m.launched.cmd.Process != nil {
-		if err := m.launched.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+		if err := m.pal.KillProcess(m.launched.PID(), false); err != nil && !errors.Is(err, os.ErrProcessDone) {
 			m.logger.Warn("kill browser process", "component", "browser",
 				"pid", m.launched.PID(), "error", err)
 		}

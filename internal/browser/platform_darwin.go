@@ -3,6 +3,7 @@
 package browser
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -33,14 +34,20 @@ func (darwinAdapter) DefaultLaunchArgs() []string {
 	return []string{"--disable-gpu", "--no-first-run", "--no-default-browser-check"}
 }
 
+// KillProcess 杀一个进程连同它的整个进程组（见 linux 侧同名方法的说明）。
 func (darwinAdapter) KillProcess(pid int, graceful bool) error {
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return fmt.Errorf("find process %d: %w", pid, err)
-	}
 	sig := syscall.SIGKILL
 	if graceful {
 		sig = syscall.SIGTERM
+	}
+	if err := syscall.Kill(-pid, sig); err == nil {
+		return nil
+	} else if !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("signal %v to process group %d: %w", sig, pid, err)
+	}
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("find process %d: %w", pid, err)
 	}
 	if err := p.Signal(sig); err != nil {
 		return fmt.Errorf("signal %v to %d: %w", sig, pid, err)
@@ -70,11 +77,19 @@ func (darwinAdapter) SafeDelete(path string) error {
 // App Sandbox 与 sandbox-exec 都是**创建进程时**的事（前者靠 entitlements 与签名，
 // 后者靠 sandbox-exec 包住命令行），而这里只拿得到一个已经在跑的 pid。与 Linux 同
 // 理，它要等启动路径收回自管之后才谈得上。
-// PrepareCommand 在 macOS 上目前原样返回。
+// PrepareCommand 在 macOS 上建进程组（Setpgid），使关闭时能把 Chromium 连同它
+// fork 出来的 renderer/GPU 一起杀掉——杀主进程带不走它们，那正是孤儿的来源。
 //
-// sandbox-exec 的位置就是这里（用一份 profile 包住命令行）。与 Linux 同理：没有
-// 真机验证之前不写，写了也只是一个没人跑过的分支。
-func (darwinAdapter) PrepareCommand(cmd *exec.Cmd) *exec.Cmd { return cmd }
+// 没有 Pdeathsig：那是 Linux 特有的。macOS 上「agent 崩了浏览器也得走」目前只靠
+// Close 路径，agent 被 SIGKILL 时仍会留下进程——这条缺口写在这里，等 sandbox-exec
+// （它的位置也是这里）一并处理。
+func (darwinAdapter) PrepareCommand(cmd *exec.Cmd) *exec.Cmd {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
+	return cmd
+}
 
 func (darwinAdapter) ConfineProcess(int) (io.Closer, error) { return nil, ErrConfinementUnsupported }
 

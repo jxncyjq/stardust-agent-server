@@ -193,3 +193,35 @@ func TestCloseKillsTheProcessEvenWithoutConfinement(t *testing.T) {
 		t.Errorf("process state = %v, want an exited process", state)
 	}
 }
+
+// TestClosingKillsTheWholeBrowserProcessGroup 钉的是「杀主进程带不走它的孩子」这件
+// 事——那正是孤儿进程的来源：Chromium 每个标签页、GPU、网络服务都是独立进程。
+//
+// 用一个自己 fork 的替身而不是真 Chromium：这条性质属于**关闭路径**，与浏览器是谁
+// 无关，而真机测试在 Windows 上会被 Job Object 抢先满足，看不出 Kill 这一步。
+func TestClosingKillsTheWholeBrowserProcessGroup(t *testing.T) {
+	t.Parallel()
+
+	pal := NewPlatformAdapter()
+	parent := sleeperCommand(t)
+	parent = pal.PrepareCommand(parent)
+	if err := parent.Start(); err != nil {
+		t.Fatalf("start the stand-in process: %v", err)
+	}
+	manager := &Manager{
+		launched: &launchedBrowser{cmd: parent},
+		pal:      pal,
+		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+
+	manager.Close()
+
+	state := parent.ProcessState
+	if state == nil {
+		_ = parent.Process.Kill()
+		t.Fatal("Close returned without reaping the process")
+	}
+	if !state.Exited() {
+		t.Errorf("process state = %v, want an exited process", state)
+	}
+}
