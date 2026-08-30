@@ -30,9 +30,21 @@ jobs:
           cache-dependency-path: go.sum
       - name: Setup Chrome
         uses: browser-actions/setup-chrome@v1
+      # Linux 上浏览器**必须**跑在 bubblewrap 里（缺了就拒绝启动，见
+      # internal/browser/sandbox_bwrap.go）。runner 默认两样都不满足：镜像里没有
+      # bwrap，而 Ubuntu 24.04 起未特权 user namespace 被 AppArmor 挡掉（探针实测
+      # 报 "setting up uid map: Permission denied"）。两条都补上，CI 才是在跑生产
+      # 那条路径，而不是绕过它。
+      - name: Setup the Linux browser sandbox
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bubblewrap
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          bwrap --ro-bind / / --unshare-user -- /bin/true
       - name: Cross-compile check
         run: go build ./internal/browser/...
       - name: Browser unit tests
         run: go test ./internal/browser/ ./internal/server/
       - name: Browser chromium e2e
-        run: go test -tags chromium ./internal/browser/ ./internal/server/ -run "TestE2E|TestRuntime|TestScreencast|TestRebuild|TestCaptureRestore|TestBrowserStreamE2E|TestManager" -count=1
+        run: go test -tags chromium ./internal/browser/ ./internal/server/ -run "TestE2E|TestRuntime|TestScreencast|TestRebuild|TestCaptureRestore|TestBrowserStreamE2E|TestManager|TestTheBrowserRunsInsideTheOuterSandbox" -count=1

@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -97,9 +98,9 @@ type recordingPAL struct {
 	prepared bool
 }
 
-func (p *recordingPAL) PrepareCommand(cmd *exec.Cmd) *exec.Cmd {
+func (p *recordingPAL) PrepareCommand(cmd *exec.Cmd) (*exec.Cmd, error) {
 	p.prepared = true
-	return cmd
+	return cmd, nil
 }
 
 // blockingReader 阻塞到 ctx 结束，然后报错——模拟一个不说话的浏览器。
@@ -108,6 +109,39 @@ type blockingReader struct{ ctx context.Context }
 func (r blockingReader) Read([]byte) (int, error) {
 	<-r.ctx.Done()
 	return 0, r.ctx.Err()
+}
+
+// sleeperWithProfile 返回一个「长得像浏览器」的替身进程：活得够久，并且带着
+// --user-data-dir。
+//
+// 带那个参数不是装样子：Linux 的 PrepareCommand 会把命令包进 bwrap，而 bwrap 需要
+// 知道**哪个目录必须可写**，它是从命令行里读的（见 userDataDirFromArgs）。不带就会
+// 被正当地拒绝——CI 的 ubuntu 那条就是这么红的。
+func sleeperWithProfile(t *testing.T) *exec.Cmd {
+	t.Helper()
+
+	dir := t.TempDir()
+	if runtime.GOOS == "windows" {
+		// Windows 的 PrepareCommand 不读参数（隔离是事后加的 Job Object），所以
+		// 这里不必也不能给 ping 塞一个它不认的参数。
+		return exec.Command("cmd", "/c", "ping", "-n", "30", "127.0.0.1")
+	}
+	// sh -c 'sleep 30' 之后的参数是 $0/$1，对被执行的脚本无害。
+	return exec.Command("/bin/sh", "-c", "sleep 30", "sleeper", "--user-data-dir="+dir)
+}
+
+// prepareOrSkip 让 PAL 准备这个命令；平台要求外层沙箱而这台机器上没有时跳过。
+//
+// 跳过而不是失败：这条测试断言的是**关闭路径**，而在一台没有 bwrap 的 Linux 上
+// 根本不存在可断言的浏览器进程——那是那台机器的部署状态，不是这段代码的回归。
+func prepareOrSkip(t *testing.T, pal PlatformAdapter, cmd *exec.Cmd) *exec.Cmd {
+	t.Helper()
+
+	prepared, err := pal.PrepareCommand(cmd)
+	if err != nil {
+		t.Skipf("this platform cannot prepare a browser command here: %v", err)
+	}
+	return prepared
 }
 
 // helperCommandPath 返回一个存在、能跑、且不会宣告 DevTools 地址的可执行文件。
@@ -168,7 +202,7 @@ func TestTheBrowsersOutputKeepsBeingRead(t *testing.T) {
 func TestCloseKillsTheProcessEvenWithoutConfinement(t *testing.T) {
 	t.Parallel()
 
-	sleeper := sleeperCommand(t)
+	sleeper := sleeperWithProfile(t)
 	if err := sleeper.Start(); err != nil {
 		t.Fatalf("start the stand-in process: %v", err)
 	}
@@ -213,8 +247,7 @@ func TestClosingKillsTheWholeBrowserProcessGroup(t *testing.T) {
 	t.Parallel()
 
 	pal := NewPlatformAdapter()
-	parent := sleeperCommand(t)
-	parent = pal.PrepareCommand(parent)
+	parent := prepareOrSkip(t, pal, sleeperWithProfile(t))
 	if err := parent.Start(); err != nil {
 		t.Fatalf("start the stand-in process: %v", err)
 	}
@@ -227,4 +260,48 @@ func TestClosingKillsTheWholeBrowserProcessGroup(t *testing.T) {
 	instance.Close()
 
 	assertReaped(t, parent)
+}
+
+// TestATimedOutLaunchStillReportsWhatTheBrowserSaid：超时那条路上如果把已经读到的
+// 行丢掉，运维看到的就只有一句 deadline exceeded——而 Chromium 早已把原因写在
+// stderr 上。自管启动的全部理由之一就是别再丢这些话，却在超时这一支上漏过一次
+// （CI 上 bwrap 里的浏览器起不来时，那条错误什么也没说）。
+func TestATimedOutLaunchStillReportsWhatTheBrowserSaid(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	// 说了几句话、然后再不说话也不结束——正是「浏览器卡住了」的样子。
+	stderr := io.MultiReader(
+		strings.NewReader("[FATAL:zygote_host_impl_linux.cc(90)] No usable sandbox!\n"),
+		blockingReader{ctx: ctx},
+	)
+	_, err := readDevToolsURL(ctx, stderr, nil)
+	if err == nil {
+		t.Fatal("a launch that never announced an address succeeded")
+	}
+	if !strings.Contains(err.Error(), "No usable sandbox") {
+		t.Errorf("error = %v, want it to carry what the browser printed before it stalled", err)
+	}
+}
+
+// TestALaunchThatDiesImmediatelyFailsImmediately：进程秒退却等满整个启动超时，是
+// 两件事叠出来的——父进程手里还留着 stderr 管道的写端，于是子进程死了读端也不 EOF。
+// CI 上 bwrap 立刻失败、而调用方干等 45 秒，就是这个。
+func TestALaunchThatDiesImmediatelyFailsImmediately(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	started := time.Now()
+	_, err := launchChromium(ctx, launchSpec{Bin: helperCommandPath(t), Args: []string{"version"}})
+	if err == nil {
+		t.Fatal("a process that never announces a DevTools address was accepted as a browser")
+	}
+	if elapsed := time.Since(started); elapsed > 10*time.Second {
+		t.Errorf("took %s to notice the process had exited; the caller waited for the whole launch timeout "+
+			"instead of for the process", elapsed)
+	}
 }

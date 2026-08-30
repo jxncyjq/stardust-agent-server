@@ -45,7 +45,11 @@ type PlatformAdapter interface {
 	// 它此前存在过（叫 WrapWithSandbox）却**没有调用方**——Chromium 的进程是
 	// go-rod 的 launcher 起的，那个 Cmd 从来不存在。现在启动收回自管，它才真正
 	// 处在路径上。
-	PrepareCommand(cmd *exec.Cmd) *exec.Cmd
+	//
+	// 返回 error 是策略要求的：Linux 上外层沙箱**不是尽力而为**，bwrap 缺失或不可用
+	// 就拒绝起浏览器。一个「以为自己被沙箱包着、实际没有」的部署，比一个起不来的
+	// 部署危险得多。
+	PrepareCommand(cmd *exec.Cmd) (*exec.Cmd, error)
 
 	// ConfineProcess 把一个**已经起来的**进程放进本平台的外层隔离里，返回释放它的
 	// Closer。它与 PrepareCommand 是两个时刻：Windows 的 Job Object 只能事后按 pid

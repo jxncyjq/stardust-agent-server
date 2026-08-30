@@ -51,7 +51,7 @@ func (windowsAdapter) KillProcess(pid int, graceful bool) error {
 // PrepareCommand 在 Windows 上原样返回：这个平台的隔离是**事后**加的
 // （Job Object，见 confine_windows.go）；AppContainer 需要在创建进程时指定安全能力，
 // 属于还没做的那一半。
-func (windowsAdapter) PrepareCommand(cmd *exec.Cmd) *exec.Cmd { return cmd }
+func (windowsAdapter) PrepareCommand(cmd *exec.Cmd) (*exec.Cmd, error) { return cmd, nil }
 
 func (windowsAdapter) AppDataDir() string {
 	base := os.Getenv("LOCALAPPDATA")

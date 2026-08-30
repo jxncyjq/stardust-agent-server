@@ -7,6 +7,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -184,6 +185,15 @@ func startChromiumInstance(cfg ManagerConfig, pal PlatformAdapter, egressURL str
 	// 「连到了别人的浏览器」，比连不上更难查。
 	l = l.Set(flags.RemoteDebuggingPort, "0")
 	userDataDir := l.Get(flags.UserDataDir)
+	// 把 Crashpad 的落点显式钉在 profile 里。
+	//
+	// 不设它时，Chromium 从 $HOME 推一个崩溃数据库路径；在只读根的沙箱里那条路推
+	// 不出可写目录，chrome_crashpad_handler 拿到空的 --database 直接 CHECK 失败
+	// （"--database is required"），浏览器**启动即崩**。profile 是沙箱里唯一可写的
+	// 地方，也是这些文件本来就该待的地方。
+	if userDataDir != "" {
+		l = l.Set(flags.Flag("crash-dumps-dir"), filepath.Join(userDataDir, "crashpad"))
+	}
 	launchCtx, cancelLaunch := context.WithTimeout(context.Background(), chromiumStartTimeout)
 	defer cancelLaunch()
 	launched, err := launchChromium(launchCtx, launchSpec{
