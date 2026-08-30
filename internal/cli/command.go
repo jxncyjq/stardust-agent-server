@@ -2156,7 +2156,21 @@ func resolveHomeDir(logger *slog.Logger) string {
 // 一模一样。
 //
 // Extractor / Logger / Store 不在这里：它们来自装配期的依赖，不是配置。
-func browserRuntimeConfig(cfg config.BrowserConfig) browser.RuntimeConfig {
+// 告警在这里而不是在调用点：这个函数是 browser 配置通往运行时的**唯一**入口，
+// 于是「开着私网放行却没留痕」这件事没有别的路径可以绕过去。放在调用点则要么得让
+// 测试真起一个浏览器（那正是 agent-ci 在没有 bwrap 的 runner 上连红四次的原因），
+// 要么就没人守着。
+func browserRuntimeConfig(cfg config.BrowserConfig, logger *slog.Logger) browser.RuntimeConfig {
+	if cfg.AllowPrivateHosts && logger != nil {
+		// 只在打开时记：一条永远出现的告警等于没有告警。
+		logger.Warn("the agent's browser may reach the private network",
+			"component", "browser",
+			"setting", "browser.allow_private_hosts",
+			"consequence", "pages the model chooses can reach loopback, RFC1918 addresses and cloud "+
+				"metadata endpoints from this machine",
+			"still_enforced", "every request is still resolved once, checked, and dialled at the checked "+
+				"address by the egress proxy")
+	}
 	return browser.RuntimeConfig{
 		Headless:                cfg.Headless,
 		BinPath:                 cfg.BinPath,
@@ -2556,21 +2570,11 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		// Phase 3: 会话持久化。TTL/间隔以秒配置，此处转 time.Duration。当后端是
 		// SQLite 时注入一个把 browser_sessions 表桥到端口的适配器，让登录态跨进程
 		// 重启存活；非 SQLite 驱动拿不到 repo，Store 保持 nil（纯内存，Phase 1/2 行为）。
-		runtimeCfg := browserRuntimeConfig(cfg.Browser)
+		runtimeCfg := browserRuntimeConfig(cfg.Browser, logger)
 		runtimeCfg.Extractor = adapter.NewMaasSnapshotExtractor(defaultMaas)
 		runtimeCfg.Logger = logger
 		if repo, ok := taskStore.(*storage.SQLiteRepository); ok {
 			runtimeCfg.Store = newSQLiteBrowserStore(repo)
-		}
-		if cfg.Browser.AllowPrivateHosts {
-			// 只在打开时记：一条永远出现的告警等于没有告警。
-			logger.Warn("the agent's browser may reach the private network",
-				"component", "browser",
-				"setting", "browser.allow_private_hosts",
-				"consequence", "pages the model chooses can reach loopback, RFC1918 addresses and cloud "+
-					"metadata endpoints from this machine",
-				"still_enforced", "every request is still resolved once, checked, and dialled at the checked "+
-					"address by the egress proxy")
 		}
 		brt, err := browser.NewRuntime(runtimeCfg)
 		if err != nil {
