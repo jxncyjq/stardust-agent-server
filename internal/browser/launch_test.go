@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -110,6 +111,39 @@ func (r blockingReader) Read([]byte) (int, error) {
 	return 0, r.ctx.Err()
 }
 
+// sleeperWithProfile 返回一个「长得像浏览器」的替身进程：活得够久，并且带着
+// --user-data-dir。
+//
+// 带那个参数不是装样子：Linux 的 PrepareCommand 会把命令包进 bwrap，而 bwrap 需要
+// 知道**哪个目录必须可写**，它是从命令行里读的（见 userDataDirFromArgs）。不带就会
+// 被正当地拒绝——CI 的 ubuntu 那条就是这么红的。
+func sleeperWithProfile(t *testing.T) *exec.Cmd {
+	t.Helper()
+
+	dir := t.TempDir()
+	if runtime.GOOS == "windows" {
+		// Windows 的 PrepareCommand 不读参数（隔离是事后加的 Job Object），所以
+		// 这里不必也不能给 ping 塞一个它不认的参数。
+		return exec.Command("cmd", "/c", "ping", "-n", "30", "127.0.0.1")
+	}
+	// sh -c 'sleep 30' 之后的参数是 $0/$1，对被执行的脚本无害。
+	return exec.Command("/bin/sh", "-c", "sleep 30", "sleeper", "--user-data-dir="+dir)
+}
+
+// prepareOrSkip 让 PAL 准备这个命令；平台要求外层沙箱而这台机器上没有时跳过。
+//
+// 跳过而不是失败：这条测试断言的是**关闭路径**，而在一台没有 bwrap 的 Linux 上
+// 根本不存在可断言的浏览器进程——那是那台机器的部署状态，不是这段代码的回归。
+func prepareOrSkip(t *testing.T, pal PlatformAdapter, cmd *exec.Cmd) *exec.Cmd {
+	t.Helper()
+
+	prepared, err := pal.PrepareCommand(cmd)
+	if err != nil {
+		t.Skipf("this platform cannot prepare a browser command here: %v", err)
+	}
+	return prepared
+}
+
 // helperCommandPath 返回一个存在、能跑、且不会宣告 DevTools 地址的可执行文件。
 func helperCommandPath(t *testing.T) string {
 	t.Helper()
@@ -168,7 +202,7 @@ func TestTheBrowsersOutputKeepsBeingRead(t *testing.T) {
 func TestCloseKillsTheProcessEvenWithoutConfinement(t *testing.T) {
 	t.Parallel()
 
-	sleeper := sleeperCommand(t)
+	sleeper := sleeperWithProfile(t)
 	if err := sleeper.Start(); err != nil {
 		t.Fatalf("start the stand-in process: %v", err)
 	}
@@ -213,11 +247,7 @@ func TestClosingKillsTheWholeBrowserProcessGroup(t *testing.T) {
 	t.Parallel()
 
 	pal := NewPlatformAdapter()
-	parent := sleeperCommand(t)
-	parent, err := pal.PrepareCommand(parent)
-	if err != nil {
-		t.Fatalf("PrepareCommand: %v", err)
-	}
+	parent := prepareOrSkip(t, pal, sleeperWithProfile(t))
 	if err := parent.Start(); err != nil {
 		t.Fatalf("start the stand-in process: %v", err)
 	}
