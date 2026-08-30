@@ -120,11 +120,7 @@ func launchChromium(ctx context.Context, spec launchSpec) (*launchedBrowser, err
 	}
 
 	browser := &launchedBrowser{cmd: cmd}
-	var startupLines []string
-	url, err := readDevToolsURL(ctx, stderr, &startupLines)
-	for _, line := range startupLines {
-		browser.appendOutput(line)
-	}
+	url, err := readDevToolsURL(ctx, stderr, browser)
 	if err != nil {
 		// 起来了但没宣告地址 = 一个我们连不上、又还在跑的进程。杀掉它，否则每
 		// 一次失败的启动都在机器上留一个。
@@ -147,29 +143,31 @@ func launchChromium(ctx context.Context, spec launchSpec) (*launchedBrowser, err
 // 的排查方向完全不同。
 //
 // recent 非 nil 时把最近几行留在那里，供调用方在别处引用。
-func readDevToolsURL(ctx context.Context, stderr io.Reader, recent *[]string) (string, error) {
+func readDevToolsURL(ctx context.Context, stderr io.Reader, sink *launchedBrowser) (string, error) {
+	if sink == nil {
+		sink = &launchedBrowser{}
+	}
 	type result struct {
-		url   string
-		lines []string
-		err   error
+		url string
+		err error
 	}
 	done := make(chan result, 1)
 
 	go func() {
-		var lines []string
 		scanner := bufio.NewScanner(stderr)
 		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 		for scanner.Scan() {
 			line := scanner.Text()
-			lines = append(lines, line)
-			if len(lines) > maxRememberedOutputLines {
-				lines = lines[1:]
-			}
+			// 边读边存，而不是攒到最后再一起交出去：**超时那条路上读到的行归谁**，
+			// 决定了运维能不能看见浏览器说了什么。此前超时只回一句 deadline
+			// exceeded，而 Chromium 早已把原因写在 stderr 上——那正是自管启动要修的
+			// 东西，却在超时这一支上又漏了一次。
+			sink.appendOutput(line)
 			if !strings.Contains(line, "DevTools listening on") {
 				continue
 			}
 			if match := devToolsLine.FindString(line); match != "" {
-				done <- result{url: match, lines: lines}
+				done <- result{url: match}
 				return
 			}
 		}
@@ -177,20 +175,22 @@ func readDevToolsURL(ctx context.Context, stderr io.Reader, recent *[]string) (s
 		if err == nil {
 			err = fmt.Errorf("the browser exited without announcing a DevTools address")
 		}
-		done <- result{lines: lines, err: err}
+		done <- result{err: err}
 	}()
 
 	select {
 	case r := <-done:
-		if recent != nil {
-			*recent = r.lines
-		}
 		if r.err != nil {
 			return "", fmt.Errorf("read the browser's startup output: %w; it said:\n%s",
-				r.err, strings.Join(r.lines, "\n"))
+				r.err, strings.Join(sink.RecentOutput(), "\n"))
 		}
 		return r.url, nil
 	case <-ctx.Done():
-		return "", fmt.Errorf("waiting for the browser to announce its DevTools address: %w", ctx.Err())
+		said := strings.Join(sink.RecentOutput(), "\n")
+		if said == "" {
+			said = "(it printed nothing at all)"
+		}
+		return "", fmt.Errorf("waiting for the browser to announce its DevTools address: %w; it said:\n%s",
+			ctx.Err(), said)
 	}
 }

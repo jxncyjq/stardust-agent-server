@@ -261,3 +261,27 @@ func TestClosingKillsTheWholeBrowserProcessGroup(t *testing.T) {
 
 	assertReaped(t, parent)
 }
+
+// TestATimedOutLaunchStillReportsWhatTheBrowserSaid：超时那条路上如果把已经读到的
+// 行丢掉，运维看到的就只有一句 deadline exceeded——而 Chromium 早已把原因写在
+// stderr 上。自管启动的全部理由之一就是别再丢这些话，却在超时这一支上漏过一次
+// （CI 上 bwrap 里的浏览器起不来时，那条错误什么也没说）。
+func TestATimedOutLaunchStillReportsWhatTheBrowserSaid(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	// 说了几句话、然后再不说话也不结束——正是「浏览器卡住了」的样子。
+	stderr := io.MultiReader(
+		strings.NewReader("[FATAL:zygote_host_impl_linux.cc(90)] No usable sandbox!\n"),
+		blockingReader{ctx: ctx},
+	)
+	_, err := readDevToolsURL(ctx, stderr, nil)
+	if err == nil {
+		t.Fatal("a launch that never announced an address succeeded")
+	}
+	if !strings.Contains(err.Error(), "No usable sandbox") {
+		t.Errorf("error = %v, want it to carry what the browser printed before it stalled", err)
+	}
+}
