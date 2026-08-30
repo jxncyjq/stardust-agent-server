@@ -65,6 +65,9 @@ type probeProfile struct {
 	sbpl func(userDataDir string) string
 	// extraArgs 是这个变体额外要带的浏览器参数。
 	extraArgs []string
+	// expectItToStart 说明这个变体**应该**能起来。对照组填 false：它红是预期结果，
+	// 不该让整个探针变红——那样下一个人会以为环境坏了。
+	expectItToStart bool
 }
 
 // probeProfiles 是要试的几条路。形状照着 Linux 那份 bwrap profile：**整盘只读、
@@ -118,7 +121,8 @@ func userTempAllowRules() string {
 var probeProfiles = []probeProfile{
 	{
 		// 出货的那一份：见 seatbeltProfile。
-		name: "shipped",
+		name:            "shipped",
+		expectItToStart: true,
 		sbpl: func(dir string) string {
 			profile, err := seatbeltProfile(seatbeltSpec{
 				UserDataDir: dir, TempDir: os.TempDir(), OnlyLoopbackEgress: true,
@@ -132,8 +136,9 @@ var probeProfiles = []probeProfile{
 	{
 		// 对照：只放 profile 目录，不放本用户的 T/C。**预期起不来**——Chromium 不认
 		// TMPDIR 的重定向，这一条留在这里是为了下次有人想收紧时能立刻看到代价。
-		name: "profile-dir-only (expected to fail)",
-		sbpl: writeConfinedSBPL,
+		name:            "profile-dir-only",
+		sbpl:            writeConfinedSBPL,
+		expectItToStart: false,
 	},
 }
 
@@ -325,4 +330,41 @@ func TestProbeAWatchdogReapsTheOrphan(t *testing.T) {
 		_ = fakeBrowser.Process.Kill()
 		t.Fatalf("the watchdog did not reap pid %d within 10s", browserPID)
 	}
+}
+
+// TestProbeTheProductionWrapperStartsTheBrowser 走**生产那条路**：PrepareCommand
+// 自己去拼 sandbox-exec 的命令行。
+//
+// 上面那些变体证明的是 profile 本身对不对；这条证明的是**接线**对不对。两者会分开
+// 坏：出货 profile 在探针里通过的同一次 CI 上，e2e 里的浏览器仍然起不来——那说明
+// 差异不在 profile，在包装。
+func TestProbeTheProductionWrapperStartsTheBrowser(t *testing.T) {
+	chrome := chromePathForProbe(t)
+
+	userDataDir := filepath.Join(t.TempDir(), "user-data")
+	cmd := exec.Command(chrome,
+		"--headless=new", "--remote-debugging-port=0",
+		"--user-data-dir="+userDataDir,
+		"--no-first-run", "--no-default-browser-check", "--disable-gpu", "about:blank")
+
+	pal := newPlatformAdapter()
+	wrapped, err := pal.PrepareCommand(cmd)
+	if err != nil {
+		t.Fatalf("PrepareCommand: %v", err)
+	}
+	t.Logf("wrapped as: %s %v", wrapped.Path, wrapped.Args[:3])
+
+	ctx, cancel := context.WithTimeout(context.Background(), probeLaunchTimeout)
+	defer cancel()
+	browser, err := launchChromium(ctx, launchSpec{Bin: wrapped.Path, Args: wrapped.Args[1:], PAL: pal})
+	if err != nil {
+		if profile, readErr := os.ReadFile(filepath.Join(userDataDir, "seatbelt.sb")); readErr == nil {
+			t.Logf("the profile the wrapper generated:\n%s", profile)
+		} else {
+			t.Logf("(no profile at %s: %v)", filepath.Join(userDataDir, "seatbelt.sb"), readErr)
+		}
+		t.Fatalf("the production wrapper could not start the browser: %v", err)
+	}
+	defer func() { _ = browser.cmd.Process.Kill(); _ = browser.Wait() }()
+	t.Logf("devtools at %s", browser.controlURL)
 }
