@@ -165,7 +165,12 @@ func TestProbeChromeUnderSandboxExec(t *testing.T) {
 				PAL:  newPlatformAdapter(),
 			})
 			if err != nil {
-				t.Fatalf("chrome did not come up under %s: %v", profile.name, err)
+				// 浏览器一个字都没说就退出，那句话在**内核**那边：sandbox 的拒绝
+				// 记在统一日志里，不在进程的 stderr 上。不去捞它，就只能靠猜。
+				t.Logf("chrome did not come up under %s: %v", profile.name, err)
+				t.Logf("kernel said:\n%s", sandboxDenials(t))
+				t.Fail()
+				return
 			}
 			defer func() {
 				_ = browser.cmd.Process.Kill()
@@ -174,6 +179,22 @@ func TestProbeChromeUnderSandboxExec(t *testing.T) {
 			t.Logf("%s: devtools at %s (pid %d)", profile.name, browser.controlURL, browser.PID())
 		})
 	}
+}
+
+// sandboxDenials 从统一日志里捞最近的 sandbox 拒绝记录。
+func sandboxDenials(t *testing.T) string {
+	t.Helper()
+
+	out, err := exec.Command("log", "show", "--last", "2m", "--style", "compact",
+		"--predicate", `eventMessage CONTAINS "Sandbox" AND eventMessage CONTAINS "deny"`).CombinedOutput()
+	if err != nil {
+		return fmt.Sprintf("(could not read the unified log: %v)", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(out)), "\n")
+	if len(lines) > 40 {
+		lines = lines[len(lines)-40:]
+	}
+	return strings.Join(lines, "\n")
 }
 
 // TestProbeWritesOutsideTheProfileAreDenied：上面那条只证明它**起得来**。这条问的
