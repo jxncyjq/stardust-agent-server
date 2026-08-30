@@ -68,6 +68,8 @@
 
 证据是行为而不是字段：铸没铸 token 说明不了什么，一个中间件没装好的构建照样能让「`Token != ""`」通过。两侧的测试都打真的 HTTP——server 侧「无 token → 401、带 token → 不是 401」，GUI 侧走 `postJSON`（**写**路径，不带自己的 header，完全依赖传输层；`apiGet` 自己设 header，用读路径测等于什么都没测）。变异验证：去掉 `opts.LoopbackHardening` 那一项，未加固的 serve 对无 token 的 `GET /v1/sessions` 回 **200**——这就是缺陷本身的取证。
 
+**真机复核（2026-08-30，同一套 mock 部署，配置里没有 `loopback_hardening` 键）**：GUI 起的 serve 端口 1819，无 token 的 `GET /v1/sessions` 回 **401**，带 handshake.json 里的 token 回 200；GUI 窗口本身照常——会话列表、`plugin/loaded` 事件流（SSE 带 token）、发消息新建会话（写路径）、审批卡片、点批准后 `tool_executed read_file` → `tool_result` → `task_completed`、气泡显示 done。加固打开而 GUI 没有任何一处被锁在外面。
+
 **一个已知后果**：文件卡片的「复制链接」复制出的 `http://127.0.0.1:<port>/v1/files?...` 在外部浏览器里现在是 401。这正是加固要堵的洞（一个无鉴权的本地文件服务在对整台机器发工作区文件），但对用户是个功能回退。把 token 拼进剪贴板不是解法。留待产品决定：或改成「导出到某处」，或在卡片上说明该链接仅应用内有效。
 
 ### 一次自我纠正（值得记）
