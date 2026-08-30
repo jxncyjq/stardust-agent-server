@@ -23,6 +23,10 @@ type BrowserStreamer interface {
 	InjectInput(sessionID string, events []browser.InputEvent) error
 	// SetViewport 把会话视口设为 width×height CSS px，使帧填满 GUI 面板。
 	SetViewport(sessionID string, width, height int) error
+	// NavigateTakeover 是人工导航（地址栏/后退/前进/刷新），只在接管中允许。
+	NavigateTakeover(sessionID string, req browser.NavigateReq) error
+	// SessionInfo 是「现在在哪、谁在开车」，地址栏与接管开关据它渲染。
+	SessionInfo(sessionID string) (browser.SessionInfo, error)
 }
 
 // parseBrowserSessionID 从 /v1/browser/sessions/{id}/stream 抽 id。

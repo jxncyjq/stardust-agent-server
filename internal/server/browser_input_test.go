@@ -18,6 +18,9 @@ type fakeBrowser struct {
 		enabled bool
 	}
 	takeoverErr error
+	navigated   []browser.NavigateReq
+	navigateErr error
+	infoErr     error
 	injected    [][]browser.InputEvent
 	injectErr   error
 	viewport    struct {
@@ -49,6 +52,19 @@ func (f *fakeBrowser) InjectInput(id string, events []browser.InputEvent) error 
 	}
 	f.injected = append(f.injected, events)
 	return nil
+}
+func (f *fakeBrowser) NavigateTakeover(id string, req browser.NavigateReq) error {
+	if f.navigateErr != nil {
+		return f.navigateErr
+	}
+	f.navigated = append(f.navigated, req)
+	return nil
+}
+func (f *fakeBrowser) SessionInfo(id string) (browser.SessionInfo, error) {
+	if f.infoErr != nil {
+		return browser.SessionInfo{}, f.infoErr
+	}
+	return browser.SessionInfo{SessionID: id, URL: "https://example.com/", Takeover: true, HasPage: true}, nil
 }
 func (f *fakeBrowser) SetViewport(id string, width, height int) error {
 	if f.viewportErr != nil {
@@ -262,5 +278,57 @@ func TestAnErrorWithNoSemanticCodeIsNotSilentlyCalledABadRequest(t *testing.T) {
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500 for an uncoded error: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// 人工导航的策略全在 runtime 里，handler 只做搬运——所以这里钉的是搬运本身：
+// 请求真的到了 runtime，错误真的按语义码映射回状态码。
+func TestNavigateReachesTheRuntime(t *testing.T) {
+	fb := &fakeBrowser{}
+	srv := newBrowserTestServer(fb)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/browser/sessions/sess-1/navigate",
+		bytes.NewBufferString(`{"url":"https://example.com/"}`))
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("navigate status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if len(fb.navigated) != 1 || fb.navigated[0].URL != "https://example.com/" {
+		t.Errorf("navigated = %+v, want the url the caller sent", fb.navigated)
+	}
+}
+
+func TestNavigateOutsideTakeoverIsAConflict(t *testing.T) {
+	fb := &fakeBrowser{navigateErr: browser.NewBrowserError(browser.CodeTakeoverRequired, "not under takeover")}
+	srv := newBrowserTestServer(fb)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/browser/sessions/sess-1/navigate",
+		bytes.NewBufferString(`{"action":"reload"}`))
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Errorf("status = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+}
+
+// 地址栏读的就是这个端点：它答错，界面就在显示别人的地址。
+func TestSessionInfoIsServed(t *testing.T) {
+	srv := newBrowserTestServer(&fakeBrowser{})
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/browser/sessions/sess-1/info", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("info status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	var info browser.SessionInfo
+	if err := json.Unmarshal(rec.Body.Bytes(), &info); err != nil {
+		t.Fatalf("decode info: %v", err)
+	}
+	if info.URL != "https://example.com/" || !info.Takeover {
+		t.Errorf("info = %+v, want the runtime's answer carried through verbatim", info)
 	}
 }
