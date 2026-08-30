@@ -246,3 +246,44 @@ func openTicket(t *testing.T, store *approval.ToolGateStore) {
 		t.Fatalf("Open: %v", err)
 	}
 }
+
+// TestThePendingNotificationCarriesWhoAskedAndWhy: the approval card is
+// rendered FROM this event. A real-machine walkthrough found a plugin's ask
+// displayed as "the deployment's own sensitive-tool rule" because the event
+// carried neither field and the UI fell back to the host.
+func TestThePendingNotificationCarriesWhoAskedAndWhy(t *testing.T) {
+	store := approval.NewToolGateStore(t.TempDir())
+	sink := &spyApprovalSink{}
+	gate := New(store, WithApprovalSink(sink))
+	tools := askingRegistry(t, "reads are reviewed during the incident")
+	task := domain.Task{ID: "task-1", SessionID: "s1", Mode: domain.ModeAuto}
+
+	if _, err := gate.ShouldSuspend(context.Background(), task,
+		[]domain.ToolCall{{ID: "call-1", Name: "read_file"}}, tools); err != nil {
+		t.Fatalf("ShouldSuspend: %v", err)
+	}
+
+	if len(sink.provenance) != 1 {
+		t.Fatalf("provenance = %v, want one entry", sink.provenance)
+	}
+	if sink.provenance[0] != "plugin:legion-gatekeeper|reads are reviewed during the incident" {
+		t.Errorf("provenance = %q, want the plugin and its reason", sink.provenance[0])
+	}
+}
+
+// TestAHostSensitiveNotificationSaysItIsTheHosts: the other source has to be
+// stated too, or the card would have to guess.
+func TestAHostSensitiveNotificationSaysItIsTheHosts(t *testing.T) {
+	store := approval.NewToolGateStore(t.TempDir())
+	sink := &spyApprovalSink{}
+	gate := New(store, WithApprovalSink(sink))
+
+	if _, err := gate.ShouldSuspend(context.Background(), manualTask(),
+		[]domain.ToolCall{{ID: "call-2", Name: "write_file"}}, gateRegistry()); err != nil {
+		t.Fatalf("ShouldSuspend: %v", err)
+	}
+
+	if len(sink.provenance) != 1 || sink.provenance[0] != approval.RequestedByHost+"|" {
+		t.Errorf("provenance = %v, want [%s|]", sink.provenance, approval.RequestedByHost)
+	}
+}
