@@ -144,40 +144,49 @@ func shippedProfileFor(dir string) string {
 	return profile
 }
 
+// denyOnlyUnderHome 是反过来的写法：**不列可写，只列不可写**。
+//
+// 正向名单（只有这几处可写）在 Google Chrome 上一条都过不去——连整个 ~/Library
+// 放开都不行，说明它要写的地方在别处，而把「别处」列全既列不出也守不住。
+//
+// 反向名单守的是这层沙箱真正要守的东西：一个被攻破的浏览器不该能改**用户自己的
+// 文件**（文档、配置、ssh 密钥、别的 app 的数据）。系统里那些晦涩路径它写就写了，
+// 那些地方本来就有系统自己的权限在管。
+func denyOnlyUnderHome(dir string) string {
+	home := os.Getenv("HOME")
+	profile := dir
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		profile = resolved
+	}
+	return fmt.Sprintf(`(version 1)
+(allow default)
+(deny file-write* (subpath %q))
+(allow file-write* (subpath %q))
+`, home, profile)
+}
+
 var probeProfiles = []probeProfile{
 	{
-		// 出货的那一份：见 seatbeltProfile。
+		// 分清是「sandbox-exec 本身容不下 Google Chrome」还是「写限制容不下」。
+		// 这一条什么都不限，只是包了一层。它红了，整条路就断了。
+		name:            "no-restrictions-at-all",
+		expectItToStart: true,
+		sbpl:            func(string) string { return "(version 1)\n(allow default)\n" },
+	},
+	{
+		// 出货的那一份（正向名单）：见 seatbeltProfile。
 		name:            "shipped",
 		expectItToStart: true,
 		sbpl:            shippedProfileFor,
 	},
 	{
-		// 二分：Google Chrome（不是 Chromium）额外要写 ~/Library/Caches 吗？
-		name:            "shipped+library-caches",
+		// 反向名单：只挡 HOME，profile 目录开个口子。
+		name:            "deny-writes-under-home",
 		expectItToStart: true,
-		sbpl: func(dir string) string {
-			return shippedProfileFor(dir) + homeSubpaths("Library/Caches")
-		},
+		sbpl:            denyOnlyUnderHome,
 	},
 	{
-		// 二分：~/Library/Application Support？
-		name:            "shipped+application-support",
-		expectItToStart: true,
-		sbpl: func(dir string) string {
-			return shippedProfileFor(dir) + homeSubpaths("Library/Application Support")
-		},
-	},
-	{
-		// 二分：整个 ~/Library（最宽的一档，用来确认需求确实在 HOME 底下）。
-		name:            "shipped+whole-library",
-		expectItToStart: true,
-		sbpl: func(dir string) string {
-			return shippedProfileFor(dir) + homeSubpaths("Library")
-		},
-	},
-	{
-		// 对照：只放 profile 目录，不放本用户的 T/C。**预期起不来**——Chromium 不认
-		// TMPDIR 的重定向，这一条留在这里是为了下次有人想收紧时能立刻看到代价。
+		// 对照：只放 profile 目录。**预期起不来**。
 		name:            "profile-dir-only",
 		sbpl:            writeConfinedSBPL,
 		expectItToStart: false,
