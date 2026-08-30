@@ -97,6 +97,24 @@ func writeConfinedSBPL(dir string) string {
 `, dir)
 }
 
+// userTempAllowRules 放行本用户自己的临时与缓存目录。
+//
+// macOS 把它们放在 /private/var/folders/<xx>/<yyy>/{T,C}/：T 是 $TMPDIR，C 是缓存。
+// 它们**按用户**分，不按 app 分，所以这仍然比只放 profile 目录宽；但比放行整个
+// /private/var/folders 窄得多——后者还含着别的用户与系统自己的那些。
+func userTempAllowRules() string {
+	tmp := os.Getenv("TMPDIR")
+	if resolved, err := filepath.EvalSymlinks(tmp); err == nil {
+		tmp = resolved
+	}
+	tmp = strings.TrimSuffix(tmp, string(os.PathSeparator))
+	cache := filepath.Join(filepath.Dir(tmp), "C")
+	return fmt.Sprintf(`(allow file-write*
+  (subpath %q)
+  (subpath %q))
+`, tmp, cache)
+}
+
 var probeProfiles = []probeProfile{
 	{
 		name: "write-confined",
@@ -117,6 +135,24 @@ var probeProfiles = []probeProfile{
 			return writeConfinedSBPL(dir) + `(allow file-write*
   (subpath "/private/var/folders")
   (subpath "/private/tmp"))
+`
+		},
+	},
+	{
+		// 再收一档：只放**本用户自己**的临时与缓存目录（$TMPDIR 与它旁边的 C），
+		// 而不是 /private/var/folders 整片——后者还含着别的用户与系统自己的那些。
+		name: "write-confined+own-temp-only",
+		sbpl: func(dir string) string {
+			return writeConfinedSBPL(dir) + userTempAllowRules()
+		},
+	},
+	{
+		// 网络那条要重测：它此前建在「起不来」的那个基座上，红了说明不了任何事。
+		name: "own-temp+no-network-to-outside",
+		sbpl: func(dir string) string {
+			return writeConfinedSBPL(dir) + userTempAllowRules() + `(deny network-outbound)
+(allow network-outbound (remote ip "localhost:*"))
+(allow network-outbound (literal "/private/var/run/mDNSResponder"))
 `
 		},
 	},
