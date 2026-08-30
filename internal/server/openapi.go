@@ -77,6 +77,24 @@ func BuildOpenAPISpec() OpenAPISpec {
 			"/v1/plugins/{name}/resolve": {Post: openAPIOperation("resolvePlugin", "Fetch and verify a plugin's package to see what it declares, without authorizing it", true, "422")},
 			"/v1/events":                 {Get: openAPIOperation("subscribeEvents", "Subscribe platform events", true)},
 			"/v1/files":                  {Get: openAPIOperation("getFile", "Stream a generated file from a session's working directory", true)},
+			"/v1/tasks/{id}/interrupt":   {Post: openAPIOperation("interruptTask", "Interrupt a running task", true)},
+			// 凭证轮换：409 是这个端点特有的一条，声明出来才让客户端知道它存在——
+			// 本机开放部署没有可轮换的凭证，那不是错误也不是重试能解决的事。
+			"/v1/auth/rotate": {Post: openAPIOperation("rotateToken", "Revoke the current bearer token and mint a replacement", true, "409")},
+			// 浏览器的六个端点此前一条都不在契约里：GUI 走 Wails 绑定不受影响，而按
+			// OpenAPI 生成客户端的人拿不到它们，只能手写。
+			"/v1/browser/sessions/{id}/stream": {Get: openAPIOperation("streamBrowserSession",
+				"Subscribe a browser session's screencast frames and status events (SSE)", true)},
+			"/v1/browser/sessions/{id}/info": {Get: openAPIOperation("getBrowserSession",
+				"Where the browser is, whether a human has taken over, and whether the page still exists", true)},
+			"/v1/browser/sessions/{id}/takeover": {Post: openAPIOperation("setBrowserTakeover",
+				"Hand the session to a human, or give it back to the agent", true)},
+			"/v1/browser/sessions/{id}/input": {Post: openAPIOperation("injectBrowserInput",
+				"Inject mouse/keyboard events into a session under human takeover", true, "409")},
+			"/v1/browser/sessions/{id}/navigate": {Post: openAPIOperation("navigateBrowserSession",
+				"Navigate by hand (address, back, forward, reload) in a session under takeover", true, "409")},
+			"/v1/browser/sessions/{id}/viewport": {Post: openAPIOperation("setBrowserViewport",
+				"Set the session viewport so screencast frames match the viewer's aspect", true)},
 		},
 		Components: OpenAPIComponents{
 			Schemas: map[string]any{
@@ -159,6 +177,11 @@ func errorResponse(status string) map[string]any {
 		"400": "Bad request",
 		"401": "Unauthorized",
 		"403": "Forbidden",
+		"404": "Not found",
+		// 409 是「东西在，但现在的状态做不了这件事」：会话没有进入接管、没有可轮换
+		// 的凭证、页面已被回收。与 400 分开是因为补救动作不同——改状态再来，而不是
+		// 改请求。
+		"409": "Conflict: the resource exists but is in the wrong state for this call",
 		"422": "Unprocessable entity",
 		"500": "Internal server error",
 	}
