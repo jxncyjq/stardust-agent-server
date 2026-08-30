@@ -47,4 +47,4 @@ jobs:
       - name: Browser unit tests
         run: go test ./internal/browser/ ./internal/server/
       - name: Browser chromium e2e
-        run: go test -tags chromium ./internal/browser/ ./internal/server/ -run "TestE2E|TestRuntime|TestScreencast|TestRebuild|TestCaptureRestore|TestBrowserStreamE2E|TestManager" -count=1
+        run: go test -tags chromium ./internal/browser/ ./internal/server/ -run "TestE2E|TestRuntime|TestScreencast|TestRebuild|TestCaptureRestore|TestBrowserStreamE2E|TestManager|TestTheBrowserRunsInsideTheOuterSandbox" -count=1

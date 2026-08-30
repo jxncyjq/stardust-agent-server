@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -337,5 +338,29 @@ func TestTwoSessionsSpillIntoASecondBrowserProcess(t *testing.T) {
 		if _, err := rt.Read(context.Background(), ReadReq{SessionID: id}); err != nil {
 			t.Errorf("read session %s: %v", id, err)
 		}
+	}
+}
+
+// TestTheBrowserRunsInsideTheOuterSandbox 是「沙箱确实在路径上」的真机证据。
+//
+// profile 里的那些参数测试只能证明**拼得对**；接线错了（PrepareCommand 没被调用、
+// 或者返回了没包过的命令）在那些测试里全是绿的，而浏览器照常打开——一层不存在的
+// 隔离，没有任何症状。
+//
+// 判据是进程树：包过之后，我们启动的那个进程是 bwrap，Chromium 在它下面。
+func TestTheBrowserRunsInsideTheOuterSandbox(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("the outer sandbox is bubblewrap, which is Linux-only")
+	}
+	rt, err := NewRuntime(RuntimeConfig{Headless: true, AllowPrivateHosts: true, BinPath: systemChromeForTest()})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	defer rt.Close(context.Background(), CloseReq{})
+
+	chromium := firstChromium(t, rt)
+	launchedAs := chromium.launched.cmd.Path
+	if !strings.HasSuffix(launchedAs, "/bwrap") {
+		t.Errorf("the browser was launched as %q, not through bwrap: the sandbox is not on the path", launchedAs)
 	}
 }
