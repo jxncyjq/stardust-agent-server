@@ -117,64 +117,23 @@ func userTempAllowRules() string {
 
 var probeProfiles = []probeProfile{
 	{
-		name: "write-confined",
+		// 出货的那一份：见 seatbeltProfile。
+		name: "shipped",
+		sbpl: func(dir string) string {
+			profile, err := seatbeltProfile(seatbeltSpec{
+				UserDataDir: dir, TempDir: os.TempDir(), OnlyLoopbackEgress: true,
+			})
+			if err != nil {
+				panic(err)
+			}
+			return profile
+		},
+	},
+	{
+		// 对照：只放 profile 目录，不放本用户的 T/C。**预期起不来**——Chromium 不认
+		// TMPDIR 的重定向，这一条留在这里是为了下次有人想收紧时能立刻看到代价。
+		name: "profile-dir-only (expected to fail)",
 		sbpl: writeConfinedSBPL,
-	},
-	{
-		name: "write-confined+no-chrome-sandbox",
-		sbpl: writeConfinedSBPL,
-		// Chrome 自己的沙箱套在 sandbox-exec 里是不是还能起来，是这次要问的核心
-		// 问题之一：能，就白得两层；不能，就得像 Linux 那样明确取舍。
-		extraArgs: []string{"--no-sandbox"},
-	},
-	{
-		// 二分：把临时目录整片放回来。过了，说明 TMPDIR 那一手没起作用（Chromium
-		// 未必认这个环境变量），需求在 /private/var/folders 里。
-		name: "write-confined+system-temp",
-		sbpl: func(dir string) string {
-			return writeConfinedSBPL(dir) + `(allow file-write*
-  (subpath "/private/var/folders")
-  (subpath "/private/tmp"))
-`
-		},
-	},
-	{
-		// 再收一档：只放**本用户自己**的临时与缓存目录（$TMPDIR 与它旁边的 C），
-		// 而不是 /private/var/folders 整片——后者还含着别的用户与系统自己的那些。
-		name: "write-confined+own-temp-only",
-		sbpl: func(dir string) string {
-			return writeConfinedSBPL(dir) + userTempAllowRules()
-		},
-	},
-	{
-		// 网络那条要重测：它此前建在「起不来」的那个基座上，红了说明不了任何事。
-		name: "own-temp+no-network-to-outside",
-		sbpl: func(dir string) string {
-			return writeConfinedSBPL(dir) + userTempAllowRules() + `(deny network-outbound)
-(allow network-outbound (remote ip "localhost:*"))
-(allow network-outbound (literal "/private/var/run/mDNSResponder"))
-`
-		},
-	},
-	{
-		// 二分：把用户库目录放回来（缓存、Application Support、偏好设置）。
-		name: "write-confined+user-library",
-		sbpl: func(dir string) string {
-			return writeConfinedSBPL(dir) + fmt.Sprintf(`(allow file-write*
-  (subpath %q))
-`, filepath.Join(os.Getenv("HOME"), "Library"))
-		},
-	},
-	{
-		name: "write-confined+no-network-to-outside",
-		sbpl: func(dir string) string {
-			// 出网口是本机回环上的代理（见 egressproxy.go）。若能只放行回环、
-			// 掐掉直连外网，那这层沙箱就顺带把 SSRF 的最后一道缝也焊死了。
-			return writeConfinedSBPL(dir) + `(deny network-outbound)
-(allow network-outbound (remote ip "localhost:*"))
-(allow network-outbound (literal "/private/var/run/mDNSResponder"))
-`
-		},
 	},
 }
 
@@ -235,60 +194,6 @@ func TestProbeChromeUnderSandboxExec(t *testing.T) {
 			t.Logf("%s: devtools at %s (pid %d)", profile.name, browser.controlURL, browser.PID())
 		})
 	}
-}
-
-// TestProbeWhatChromeActuallyNeedsToWrite 用 SBPL 自带的 trace：让内核把这个进程
-// **实际用到**的操作写成一份 profile。
-//
-// 这比猜路径可靠得多，也比翻统一日志可靠——上一轮发现 deny 默认不上报，加了
-// (with report) 之后 runner 上依然捞不到（`log show` 在 CI 上拿不到内核那条流）。
-// trace 不依赖日志系统。
-func TestProbeWhatChromeActuallyNeedsToWrite(t *testing.T) {
-	chrome := chromePathForProbe(t)
-
-	dir := t.TempDir()
-	userDataDir := filepath.Join(dir, "profile")
-	if err := os.MkdirAll(userDataDir, 0o700); err != nil {
-		t.Fatalf("mkdir profile: %v", err)
-	}
-	tracePath := filepath.Join(dir, "trace.sb")
-	profilePath := filepath.Join(dir, "profile.sb")
-	profile := fmt.Sprintf("(version 1)\n(allow default)\n(trace %q)\n", tracePath)
-	if err := os.WriteFile(profilePath, []byte(profile), 0o600); err != nil {
-		t.Fatalf("write sbpl: %v", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), probeLaunchTimeout)
-	defer cancel()
-	browser, err := launchChromium(ctx, launchSpec{
-		Bin: "/usr/bin/sandbox-exec",
-		Args: []string{"-f", profilePath, chrome,
-			"--headless=new", "--remote-debugging-port=0",
-			"--user-data-dir=" + userDataDir,
-			"--no-first-run", "--no-default-browser-check", "--disable-gpu", "about:blank"},
-		PAL: newPlatformAdapter(),
-	})
-	if err != nil {
-		t.Fatalf("chrome did not come up even with everything allowed: %v", err)
-	}
-	time.Sleep(2 * time.Second) // 让它把启动阶段真正跑完
-	_ = browser.cmd.Process.Kill()
-	_ = browser.Wait()
-
-	data, err := os.ReadFile(tracePath)
-	if err != nil {
-		t.Fatalf("read the trace: %v", err)
-	}
-	all := strings.Split(string(data), "\n")
-	var writes []string
-	for _, line := range all {
-		if strings.Contains(line, "file-write") || strings.Contains(line, "subpath") ||
-			strings.Contains(line, "literal") {
-			writes = append(writes, strings.TrimSpace(line))
-		}
-	}
-	t.Logf("the trace has %d lines; the write-related ones:\n%s",
-		len(all), strings.Join(writes, "\n"))
 }
 
 // sandboxDenials 从统一日志里捞最近的 sandbox 拒绝记录。
