@@ -88,7 +88,7 @@ func writeConfinedSBPL(dir string) string {
 	}
 	return fmt.Sprintf(`(version 1)
 (allow default)
-(deny file-write*)
+(deny file-write* (with report))
 (allow file-write*
   (subpath %q)
   (literal "/dev/null")
@@ -185,8 +185,10 @@ func TestProbeChromeUnderSandboxExec(t *testing.T) {
 func sandboxDenials(t *testing.T) string {
 	t.Helper()
 
+	// 只要我们这个进程的：不过滤的话，日志里全是系统守护进程自己的拒绝记录，
+	// 而 SBPL 的 deny **默认不上报**——要 (with report) 才会出现在这里。
 	out, err := exec.Command("log", "show", "--last", "2m", "--style", "compact",
-		"--predicate", `eventMessage CONTAINS "Sandbox" AND eventMessage CONTAINS "deny"`).CombinedOutput()
+		"--predicate", `eventMessage CONTAINS "deny" AND (eventMessage CONTAINS "Chromium" OR eventMessage CONTAINS "sandbox-exec" OR eventMessage CONTAINS "Google Chrome")`).CombinedOutput()
 	if err != nil {
 		return fmt.Sprintf("(could not read the unified log: %v)", err)
 	}
