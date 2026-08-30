@@ -1935,6 +1935,11 @@ type ServeResult struct {
 	// BaseURL is the address the service actually listens on (including the
 	// randomly assigned port), for in-process consumers and the handshake.
 	BaseURL string
+	// Tokens is the live credential holder. Token above is the value at
+	// assembly time; an in-process consumer that outlives a rotation has to
+	// read Tokens.Current() instead, or it will keep presenting a credential
+	// the server has already burned.
+	Tokens *server.TokenStore
 }
 
 // buildDefaultRunnerConfig assembles the agentruntime.Config template for the
@@ -2284,6 +2289,8 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		}
 		adminToken = tok
 	}
+
+	tokens := server.NewTokenStore(adminToken)
 
 	taskStore, workflowStore, sessionStore, readiness, closeStore, err := serviceStores(ctx, cfg)
 	if err != nil {
@@ -2809,17 +2816,22 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	}
 
 	httpServer := server.NewHTTPServer(server.Config{
-		Tasks:               httpTasks,
-		Agents:              registry,
-		Workflows:           workflowStore,
-		WorkflowEngine:      workflowEngine,
-		WorkflowEvents:      workflowEvents,
-		PlatformEvents:      platformEvents,
-		Browser:             browserStream,
-		Readiness:           readiness,
-		WorkspaceRoot:       workspaceRoot,
-		FileBaseURL:         cfg.Server.FileBaseURL,
-		AdminToken:          adminToken,
+		Tasks:          httpTasks,
+		Agents:         registry,
+		Workflows:      workflowStore,
+		WorkflowEngine: workflowEngine,
+		WorkflowEvents: workflowEvents,
+		PlatformEvents: platformEvents,
+		Browser:        browserStream,
+		Readiness:      readiness,
+		WorkspaceRoot:  workspaceRoot,
+		FileBaseURL:    cfg.Server.FileBaseURL,
+		AdminToken:     adminToken,
+		// tokens 让运维能在不重启进程的前提下作废凭证，并把这件事**告诉正挂着的
+		// 长连接**（SSE 只在建立时鉴权一次，否则一条被吊销的流会继续送事件）。
+		// 没有 token 的部署也建一个：它的 Valid 永远 false 而 Changed 永不触发，
+		// 与这个字段出现之前的行为一致，省掉一处 nil 分支。
+		Tokens:              tokens,
 		PublicHealthEnabled: cfg.Server.PublicHealthEnabled,
 		RequireIdentity:     cfg.Server.RequireIdentity,
 		RequestIDHeader:     cfg.Server.RequestIDHeader,
@@ -2913,6 +2925,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		// "" when hardening is off or an explicit AdminToken path leaves it
 		// unset, which correctly signals "no token needed" to the consumer.
 		Token:   adminToken,
+		Tokens:  tokens,
 		BaseURL: baseURL,
 		// Close drains in-flight task goroutines before releasing storage.
 		// Service.Start only returns once the background scheduler (and thus

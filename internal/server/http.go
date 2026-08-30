@@ -109,7 +109,13 @@ type Config struct {
 	// Browser is the per-session browser stream source backing the SSE endpoint
 	// /v1/browser/sessions/{id}/stream. It is optional: when nil the endpoint
 	// reports 503. Satisfied by *browser.Runtime (Subscribe + ReplaySince).
-	Browser      BrowserStreamer
+	Browser BrowserStreamer
+	// Tokens 是当前有效凭证的持有者，也是长连接得知凭证被吊销的唯一途径。
+	//
+	// nil 表示这个部署不轮换凭证：鉴权退回 AdminToken 的静态比较，行为与这个字段
+	// 出现之前完全一致。装配期（cli）在铸了 loopback token 或配了 AdminToken 时才
+	// 建一个。
+	Tokens       *TokenStore
 	Audit        port.AuditLog
 	QualityEvals QualityEvalStore
 	Sessions     SessionStore
@@ -182,6 +188,7 @@ type HTTPServer struct {
 	taskInterrupter     TaskInterrupter
 	readiness           ReadinessChecker
 	adminToken          string
+	tokens              *TokenStore
 	publicHealthEnabled bool
 	policy              security.Policy
 	requestIDHeader     string
@@ -239,6 +246,7 @@ func NewHTTPServer(cfg Config) *HTTPServer {
 		taskInterrupter:     cfg.TaskInterrupter,
 		readiness:           cfg.Readiness,
 		adminToken:          cfg.AdminToken,
+		tokens:              cfg.Tokens,
 		publicHealthEnabled: cfg.PublicHealthEnabled,
 		policy:              security.NewPolicy(cfg.RequireIdentity),
 		requestIDHeader:     requestIDHeader,
@@ -316,6 +324,8 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleResolvePlugin(rec, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/files":
 		s.handleServeFile(rec, r)
+	case r.Method == http.MethodPost && r.URL.Path == "/v1/auth/rotate":
+		s.handleRotateToken(rec, r)
 	case r.Method == http.MethodPost && r.URL.Path == "/v1/sessions":
 		s.handleCreateSession(rec, r)
 	case r.Method == http.MethodGet && r.URL.Path == "/v1/sessions":
@@ -374,7 +384,28 @@ func (s *HTTPServer) authorized(r *http.Request) bool {
 	if r.Method == http.MethodGet && r.URL.Path == "/openapi.json" {
 		return true
 	}
+	presented := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	// 有 TokenStore 就以它为准：静态的 adminToken 是这个部署**启动时**的凭证，
+	// 轮换之后它已经不是当前那个了，继续拿它比较等于让被吊销的 token 一直有效。
+	if s.tokens != nil {
+		return s.tokens.Valid(presented)
+	}
 	return r.Header.Get("Authorization") == "Bearer "+s.adminToken
+}
+
+// handleRotateToken 让运维在不重启进程的前提下作废当前凭证。
+//
+// 重启也能换 token，但会把正在跑的任务一起打断——于是「我的 token 泄露了」这件事
+// 的代价变成了「所有人的工作中断」，结果就是没人愿意轮换。
+func (s *HTTPServer) handleRotateToken(w http.ResponseWriter, r *http.Request) {
+	if s.tokens == nil || !s.tokens.RotateAllowed() {
+		// 409 而不是 404/501：端点在，只是这个部署没有可轮换的凭证（本机开放
+		// serve）。把它说成「没有这个端点」会让运维以为版本不对。
+		writeError(w, http.StatusConflict, "this deployment has no bearer token to rotate")
+		return
+	}
+	next := s.tokens.Rotate()
+	writeJSON(w, http.StatusOK, map[string]any{"token": next})
 }
 
 // handleCreateSession creates a new agent session for two-level grouping. The

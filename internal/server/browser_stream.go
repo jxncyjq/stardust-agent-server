@@ -81,6 +81,10 @@ func (s *HTTPServer) handleBrowserStream(w http.ResponseWriter, r *http.Request)
 		flush()
 	}
 
+	// 这一代凭证的失效信号，在进入循环前取一次。screencast 是本服务里活得最久的
+	// 一条流（一个接管中的会话可以挂几个小时），它继续送帧就等于被吊销的凭证仍在
+	// 看着用户的屏幕。
+	revoked := s.tokens.Changed()
 	for {
 		select {
 		case ev, ok := <-ch:
@@ -91,6 +95,9 @@ func (s *HTTPServer) handleBrowserStream(w http.ResponseWriter, r *http.Request)
 				return
 			}
 			flush()
+		case <-revoked:
+			writeReauth(w)
+			return
 		case <-r.Context().Done():
 			return
 		}
