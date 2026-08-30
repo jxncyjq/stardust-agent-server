@@ -273,6 +273,19 @@ type BrowserConfig struct {
 	Headless bool   `json:"headless"`
 	BinPath  string `json:"bin_path"` // 可选：指向系统 Chrome/Edge，绕过 go-rod 自动下载
 
+	// AllowPrivateHosts 允许**内置浏览器**访问回环与私网地址。
+	//
+	// 默认 false：Agent 会打开模型选定的任意 URL，而一台开发机或服务器上的
+	// 127.0.0.1 / 10.x / 169.254.169.254（云元数据）是它最不该去的地方。
+	//
+	// 打开它的正当理由只有一个：让 Agent 访问**你自己的**内网服务（staging、内网
+	// 文档站）。代价是把「Agent 可以打内网」这件事变成真的，所以启动时会记一条
+	// WARN——事后翻日志的人要看得见它开着。
+	//
+	// 注意它只放宽「哪些地址可以连」：出口代理仍在路径上，仍然解析一次、校验那一次、
+	// 拨号到刚校验过的那个 IP（见 internal/browser/egressproxy.go）。
+	AllowPrivateHosts bool `json:"allow_private_hosts"`
+
 	// RequireSandbox：没有外层隔离就**不启动浏览器**。
 	//
 	// 默认 false，因为目前只有 Windows 有实现（Job Object：kill-on-close + 内存
