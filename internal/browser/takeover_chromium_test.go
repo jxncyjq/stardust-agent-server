@@ -241,3 +241,38 @@ func TestTheRealBrowserProcessIsConfined(t *testing.T) {
 			"Chromium processes behind")
 	}
 }
+
+// TestClosingTheRuntimeLeavesNoBrowserBehind 是自管启动之后必须自己扛起来的那件
+// 事：进程是我们起的，就得由我们送走。
+//
+// go-rod 的 launcher 曾经用 leakless 做这件事；绕过它之后，如果 Close 只关 CDP
+// 连接，Chromium 会留在机器上——每跑一次任务留一个，直到用户自己去清。
+func TestClosingTheRuntimeLeavesNoBrowserBehind(t *testing.T) {
+	rt, err := NewRuntime(RuntimeConfig{Headless: true, AllowPrivateHosts: true, BinPath: systemChromeForTest()})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	pid := rt.mgr.launched.PID()
+	if pid == 0 {
+		t.Fatal("no browser pid; the runtime did not launch a process of its own")
+	}
+
+	if err := rt.Close(context.Background(), CloseReq{}); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// 看 ProcessState 而不是 Signal(0)：Windows 上 os.Process.Signal 对任何信号都
+	// 返回错误，用它探活等于写一条永远绿的断言。ProcessState 非 nil 意味着 Close
+	// 真的等到了这个进程结束。
+	//
+	// 这条测试在 Windows 上由 Job Object 的 kill-on-close 满足（变异实测：把 Close
+	// 里的 Kill 删掉它照样绿）。Kill 本身的作用在没有收束的平台上，由
+	// TestCloseKillsTheProcessEvenWithoutConfinement 单独钉。
+	state := rt.mgr.launched.cmd.ProcessState
+	if state == nil {
+		t.Fatalf("browser process %d was never reaped; Close left it running", pid)
+	}
+	if !state.Exited() {
+		t.Errorf("browser process %d state = %v, want an exited process", pid, state)
+	}
+}

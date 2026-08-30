@@ -85,4 +85,12 @@ func (linuxAdapter) SafeDelete(path string) error {
 // 在此之前，Linux 上的边界是 Chromium 自己的渲染沙箱加部署侧的容器；本函数返回
 // ErrConfinementUnsupported，让部署自己决定是照常跑还是拒绝启动
 // （browser.require_sandbox）。
+// PrepareCommand 在 Linux 上目前原样返回。
+//
+// 启动路径已经收回自管，所以 namespaces+seccomp 现在**有地方可放**了——它就该放在
+// 这里（unshare/bwrap 包住命令行，或 SysProcAttr 的 Cloneflags）。之所以还没做：
+// 需要在真 Linux 上验证「沙箱起得来、Chromium 仍能跑」，这台开发机验不了，靠 CI
+// 矩阵单独排一次。
+func (linuxAdapter) PrepareCommand(cmd *exec.Cmd) *exec.Cmd { return cmd }
+
 func (linuxAdapter) ConfineProcess(int) (io.Closer, error) { return nil, ErrConfinementUnsupported }
