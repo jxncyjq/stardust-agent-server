@@ -50,9 +50,6 @@ func (linuxAdapter) KillProcess(pid int, graceful bool) error {
 	return nil
 }
 
-func (linuxAdapter) SampleProcessMemory(pid int) uint64 { return 0 } // 占位：Phase 6 读 /proc/<pid>/status
-func (linuxAdapter) AvailableSystemMemory() uint64      { return 0 } // 占位：Phase 8 读 /proc/meminfo
-
 func (linuxAdapter) AppDataDir() string {
 	base := os.Getenv("XDG_DATA_HOME")
 	if base == "" {

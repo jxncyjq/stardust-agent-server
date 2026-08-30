@@ -21,9 +21,13 @@ type PlatformAdapter interface {
 	DefaultLaunchArgs() []string              // 平台相关启动参数
 	KillProcess(pid int, graceful bool) error // 信号 vs TerminateProcess
 
-	// 资源（本期 best-effort 占位，Phase 6/8 精化）
-	SampleProcessMemory(pid int) uint64
-	AvailableSystemMemory() uint64
+	// 资源
+	//
+	// 两者都返回 error 而不是「取不到就 0」：0 是一个**看起来正常的数字**，健康
+	// 检查读到它会认为浏览器没占内存，于是「内存水位超阈就回收」这条策略永远不
+	// 触发——一个失控的页面可以一直涨到把机器拖垮，而监控上是一条平的 0。
+	SampleProcessMemory(pid int) (uint64, error)
+	AvailableSystemMemory() (uint64, error)
 
 	// 文件系统
 	AppDataDir() string // XDG / ~/Library / %LOCALAPPDATA%

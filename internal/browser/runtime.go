@@ -3,6 +3,7 @@ package browser
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/url"
@@ -38,9 +39,15 @@ type RuntimeConfig struct {
 	// RequireSandbox：这台机器上没有外层隔离时宁可不启动浏览器（见 ManagerConfig）。
 	RequireSandbox bool
 
-	// Logger 记录沙箱与出网两类决定。一次被出网策略挡下的导航在页面上只是一条
-	// 403，运维要能在日志里看到它挡的是什么地址——否则「这个站点打不开」就成了
-	// 一个查不动的问题。nil 时丢弃。
+	// MinFreeMemoryBytes 是**新建**浏览器会话的可用内存下限；<=0 关闭这条策略。
+	//
+	// 只挡新建：已经开着的会话继续可用——把用户正在看的页面掐掉，比多占一点内存
+	// 更糟；复用同一个 chat session 的也照旧。
+	MinFreeMemoryBytes uint64
+
+	// Logger 记录沙箱、出网与内存三类决定。一次被出网策略挡下的导航在页面上只是
+	// 一条 403，运维要能在日志里看到它挡的是什么地址——否则「这个站点打不开」就
+	// 成了一个查不动的问题。nil 时丢弃。
 	Logger *slog.Logger
 }
 
@@ -59,6 +66,52 @@ type Runtime struct {
 	// reaperCancel 取消后台 TTL reaper goroutine 的 ctx；全量 Close（SessionID=="" 分支）时调用。
 	// struct-literal 构造的测试为 nil，Close 全量分支对 nil 安全。
 	reaperCancel context.CancelFunc
+	// availableMemory 读整机可用物理内存。它是一个字段而不是直接调 PAL，因为
+	// 「内存不够时拒绝新建」这条策略无法靠真实机器复现：要么这台机器真的没内存
+	// （测试环境不可控），要么这条分支永远测不到。
+	availableMemory func() (uint64, error)
+}
+
+// admitNewSession 决定现在能不能再开一个浏览器会话。
+//
+// 三条：没配下限就一律放行；读不到内存**不拦**（一个读不出的仪表不该变成一次停摆，
+// 这是安全余量而不是授权检查）；低于下限就带 RESOURCE_EXHAUSTED 拒绝——让 Agent
+// 能把它与「页面坏了」分开，前者该稍后再试，后者该换个做法。
+func (r *Runtime) admitNewSession() error {
+	if r.cfg.MinFreeMemoryBytes == 0 {
+		return nil
+	}
+	read := r.availableMemory
+	if read == nil {
+		// mgr 为 nil 的只有 struct-literal 构造的测试，而它们会自己注入 read。
+		if r.mgr == nil {
+			return nil
+		}
+		read = r.mgr.pal.AvailableSystemMemory
+	}
+	available, err := read()
+	if err != nil {
+		r.logger().Warn("cannot read available memory before opening a browser session",
+			"component", "browser",
+			"error", err,
+			"consequence", "the memory floor is not enforced for this session")
+		return nil
+	}
+	if available >= r.cfg.MinFreeMemoryBytes {
+		return nil
+	}
+	return NewBrowserError(CodeResourceExhausted, fmt.Sprintf(
+		"only %d bytes of memory are available and this deployment requires %d before opening a new browser session",
+		available, r.cfg.MinFreeMemoryBytes))
+}
+
+// logger 返回配置的 logger，没有配就返回一个丢弃一切的。struct-literal 构造的测试
+// 走的是后者。
+func (r *Runtime) logger() *slog.Logger {
+	if r.cfg.Logger != nil {
+		return r.cfg.Logger
+	}
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
 var _ RuntimeAPI = (*Runtime)(nil)
@@ -324,10 +377,16 @@ func (r *Runtime) Open(ctx context.Context, req OpenReq) (OpenObservation, error
 		if s, ok := r.sessions.FindByChatSession(req.ChatSessionID); ok {
 			sess = s
 		} else {
+			if err := r.admitNewSession(); err != nil {
+				return OpenObservation{}, err
+			}
 			sess = r.sessions.Create(req.TaskID)
 			r.sessions.BindChat(sess.ID, req.ChatSessionID)
 		}
 	default:
+		if err := r.admitNewSession(); err != nil {
+			return OpenObservation{}, err
+		}
 		sess = r.sessions.Create(req.TaskID)
 	}
 	// 接管门控（在会话解析之后）：接管中的会话拒绝 Agent 的写动作——包括经 ChatSessionID

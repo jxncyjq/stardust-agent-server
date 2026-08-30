@@ -47,9 +47,6 @@ func (windowsAdapter) KillProcess(pid int, graceful bool) error {
 	return nil
 }
 
-func (windowsAdapter) SampleProcessMemory(pid int) uint64 { return 0 } // 占位：Phase 6 用 PSAPI
-func (windowsAdapter) AvailableSystemMemory() uint64      { return 0 } // 占位：Phase 8
-
 func (windowsAdapter) AppDataDir() string {
 	base := os.Getenv("LOCALAPPDATA")
 	if base == "" {
