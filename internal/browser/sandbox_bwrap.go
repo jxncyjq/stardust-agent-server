@@ -85,7 +85,20 @@ func bubblewrapArgs(spec bubblewrapSpec, command []string) ([]string, error) {
 		}
 		args = append(args, "--bind", abs, abs)
 	}
+	// 给沙箱里的浏览器一个**可写的 HOME**，并把它指进 profile。
+	//
+	// Chromium 有一串路径是从 HOME/XDG 推出来的，而不是从 --user-data-dir：崩溃
+	// 数据库就是其中之一（PlatformCrashpadInitialization 走 DIR_CRASH_DUMPS →
+	// $HOME/.config/...）。只读根下那条路推不出可写目录，chrome_crashpad_handler
+	// 拿到空的 --database 直接 CHECK 失败，浏览器启动即崩——CI 上正是如此，而且
+	// --crash-dumps-dir 治不了它（那个开关不喂给这条路径）。
+	//
+	// 与其一个个去猜哪些开关能改哪条路径，不如把 HOME 本身换成可写的那个目录：
+	// 任何从 HOME 推出来的东西（dconf、fontconfig 缓存……）都跟着落进 profile。
 	args = append(args,
+		"--setenv", "HOME", userDataDir,
+		"--setenv", "XDG_CONFIG_HOME", filepath.Join(userDataDir, ".config"),
+		"--setenv", "XDG_CACHE_HOME", filepath.Join(userDataDir, ".cache"),
 		"--unshare-user",
 		"--unshare-ipc",
 		"--unshare-pid",

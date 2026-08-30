@@ -48,6 +48,30 @@ func TestTheSandboxMakesTheFilesystemReadOnlyExceptTheProfile(t *testing.T) {
 	}
 }
 
+// TestTheSandboxGivesTheBrowserAWritableHome：Chromium 有一串路径是从 HOME/XDG
+// 推出来的而不是从 --user-data-dir，崩溃数据库就是其中之一。只读根下那条路推不出
+// 可写目录，浏览器启动即崩（CI 实测），而 --crash-dumps-dir 治不了它。
+func TestTheSandboxGivesTheBrowserAWritableHome(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		t.Fatalf("abs: %v", err)
+	}
+	joined := strings.Join(wrapForTest(t, bubblewrapSpec{UserDataDir: dir}), " ")
+
+	if !strings.Contains(joined, "--setenv HOME "+abs) {
+		t.Errorf("HOME does not point at the writable profile: %s", joined)
+	}
+	for _, xdg := range []string{"XDG_CONFIG_HOME", "XDG_CACHE_HOME"} {
+		if !strings.Contains(joined, "--setenv "+xdg+" "+abs) {
+			t.Errorf("%s is not inside the writable profile; whatever Chromium derives from it lands on a "+
+				"read-only path", xdg)
+		}
+	}
+}
+
 func TestTheSandboxDropsEveryNamespaceExceptTheNetwork(t *testing.T) {
 	t.Parallel()
 
