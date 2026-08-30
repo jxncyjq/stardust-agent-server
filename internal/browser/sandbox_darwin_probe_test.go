@@ -70,38 +70,34 @@ type probeProfile struct {
 // probeProfiles 是要试的几条路。形状照着 Linux 那份 bwrap profile：**整盘只读、
 // 只有自己的 profile 目录可写**——真正要防的是写，读系统字体/证书/共享库一一列举
 // 既列不全也会随版本漂移。
+// writeConfinedSBPL 是收紧之后的那份：**只有 profile 目录可写**。
+//
+// 第一版把 /private/tmp 与 /private/var/folders 整片放行，而 macOS 上每个 app 的
+// 临时目录都在后者底下——探针实测「profile 之外的写」照样成功，那层沙箱什么都没挡。
+// 一个看着像沙箱、实际不挡事的东西比没有更糟，因为它让人以为有。
+//
+// 浏览器仍然需要一个临时目录，所以把 TMPDIR 指进 profile 里自己那一个（见探针里的
+// Env），于是这两片都可以从可写列表里去掉。
+func writeConfinedSBPL(dir string) string {
+	return fmt.Sprintf(`(version 1)
+(allow default)
+(deny file-write*)
+(allow file-write*
+  (subpath %q)
+  (literal "/dev/null")
+  (literal "/dev/dtracehelper")
+  (regex #"^/dev/tty"))
+`, dir)
+}
+
 var probeProfiles = []probeProfile{
 	{
 		name: "write-confined",
-		sbpl: func(dir string) string {
-			return fmt.Sprintf(`(version 1)
-(allow default)
-(deny file-write*)
-(allow file-write*
-  (subpath %q)
-  (subpath "/private/tmp")
-  (subpath "/private/var/folders")
-  (literal "/dev/null")
-  (literal "/dev/dtracehelper")
-  (regex #"^/dev/tty"))
-`, dir)
-		},
+		sbpl: writeConfinedSBPL,
 	},
 	{
 		name: "write-confined+no-chrome-sandbox",
-		sbpl: func(dir string) string {
-			return fmt.Sprintf(`(version 1)
-(allow default)
-(deny file-write*)
-(allow file-write*
-  (subpath %q)
-  (subpath "/private/tmp")
-  (subpath "/private/var/folders")
-  (literal "/dev/null")
-  (literal "/dev/dtracehelper")
-  (regex #"^/dev/tty"))
-`, dir)
-		},
+		sbpl: writeConfinedSBPL,
 		// Chrome 自己的沙箱套在 sandbox-exec 里是不是还能起来，是这次要问的核心
 		// 问题之一：能，就白得两层；不能，就得像 Linux 那样明确取舍。
 		extraArgs: []string{"--no-sandbox"},
@@ -111,20 +107,10 @@ var probeProfiles = []probeProfile{
 		sbpl: func(dir string) string {
 			// 出网口是本机回环上的代理（见 egressproxy.go）。若能只放行回环、
 			// 掐掉直连外网，那这层沙箱就顺带把 SSRF 的最后一道缝也焊死了。
-			return fmt.Sprintf(`(version 1)
-(allow default)
-(deny file-write*)
-(allow file-write*
-  (subpath %q)
-  (subpath "/private/tmp")
-  (subpath "/private/var/folders")
-  (literal "/dev/null")
-  (literal "/dev/dtracehelper")
-  (regex #"^/dev/tty"))
-(deny network-outbound)
+			return writeConfinedSBPL(dir) + `(deny network-outbound)
 (allow network-outbound (remote ip "localhost:*"))
 (allow network-outbound (literal "/private/var/run/mDNSResponder"))
-`, dir)
+`
 		},
 	},
 }
@@ -159,9 +145,16 @@ func TestProbeChromeUnderSandboxExec(t *testing.T) {
 			ctx, cancel := context.WithTimeout(context.Background(), probeLaunchTimeout)
 			defer cancel()
 
+			// TMPDIR 指进 profile：不这么做就得整片放行 /private/var/folders，
+			// 而那正是上一轮探针发现的那个大洞。
+			tmp := filepath.Join(userDataDir, "tmp")
+			if err := os.MkdirAll(tmp, 0o700); err != nil {
+				t.Fatalf("mkdir tmp: %v", err)
+			}
 			browser, err := launchChromium(ctx, launchSpec{
 				Bin:  "/usr/bin/sandbox-exec",
 				Args: args,
+				Env:  append(os.Environ(), "TMPDIR="+tmp),
 				PAL:  newPlatformAdapter(),
 			})
 			if err != nil {
@@ -186,11 +179,15 @@ func TestProbeWritesOutsideTheProfileAreDenied(t *testing.T) {
 		t.Fatalf("mkdir profile: %v", err)
 	}
 	profilePath := filepath.Join(dir, "profile.sb")
-	if err := os.WriteFile(profilePath, []byte(probeProfiles[0].sbpl(userDataDir)), 0o600); err != nil {
+	if err := os.WriteFile(profilePath, []byte(writeConfinedSBPL(userDataDir)), 0o600); err != nil {
 		t.Fatalf("write sbpl: %v", err)
 	}
 
-	outside := filepath.Join(dir, "outside.txt")
+	// 上一版把「外面」选在 t.TempDir() 里，而那是 /private/var/folders/... ——
+	// 恰好落在当时的可写列表里。于是探针报了绿，测的却是自己挖的那个洞。
+	// 现在选 HOME 下的一个路径：那才是「被攻破的浏览器最想写的地方」。
+	outside := filepath.Join(os.Getenv("HOME"), ".stardust-sandbox-probe")
+	defer func() { _ = os.Remove(outside) }()
 	out, err := exec.Command("/usr/bin/sandbox-exec", "-f", profilePath,
 		"/bin/sh", "-c", "echo pwned > "+outside).CombinedOutput()
 	if err == nil {
