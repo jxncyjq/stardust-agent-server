@@ -2,10 +2,7 @@ package cli
 
 import (
 	"bytes"
-	"context"
-	"io"
 	"log/slog"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -19,65 +16,43 @@ import (
 //
 // 现在给它一个键。默认仍是 false（SSRF 基础拦截是对的），但**打开它必须留痕**：
 // 这是一台机器上「Agent 可以打内网」的开关，运维在事后翻日志时要看得见它开着。
+//
+// 这些测试**不起浏览器**。上一版走的是完整的 BuildServeService，于是它在没有 bwrap
+// 的 runner 上必然失败（Linux 侧的策略是「缺了就拒绝启动」）——agent-ci 因此连红四
+// 次，而我每次只看了 Browser Matrix。配置的告警与映射不需要一个真的 Chromium 来证明。
 
-func privateHostsConfig(t *testing.T, browserBlock string) string {
-	t.Helper()
-
-	dir := t.TempDir()
-	path := dir + "/agent.json"
-	body := `{"storage": {"driver": "memory"}, "context_files": {"root": ` +
-		jsonString(dir) + `}, "browser": {` + browserBlock + `}}`
-	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-	return path
-}
-
-// buildWithLogger 起一个 serve 并把日志收进 buf，供断言那条 WARN。
-func buildWithLogger(t *testing.T, configPath string) *bytes.Buffer {
+func warningsFor(t *testing.T, cfg config.BrowserConfig) string {
 	t.Helper()
 
 	buf := &bytes.Buffer{}
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	result, err := BuildServeService(ctx, ServeOptions{
-		ConfigPath: configPath,
-		Addr:       "127.0.0.1:0",
-		Logger:     slog.New(slog.NewTextHandler(buf, nil)),
-	})
-	if err != nil {
-		t.Fatalf("BuildServeService: %v", err)
-	}
-	t.Cleanup(result.Close)
-	return buf
+	browserRuntimeConfig(cfg, slog.New(slog.NewTextHandler(buf, nil)))
+	return buf.String()
 }
 
 func TestAllowingPrivateHostsIsRecordedAtStartup(t *testing.T) {
-	// browser.enabled 必须为 true，否则浏览器运行时根本不装配，这条 WARN 也就无从
-	// 谈起——那也是对的：没有浏览器就没有这个风险。
-	logs := buildWithLogger(t, privateHostsConfig(t, `"enabled": true, "allow_private_hosts": true`))
+	t.Parallel()
 
-	text := logs.String()
-	if !strings.Contains(text, "allow_private_hosts") {
-		t.Errorf("startup logs never mention the switch:\n%s", text)
+	logs := warningsFor(t, config.BrowserConfig{Enabled: true, AllowPrivateHosts: true})
+
+	if !strings.Contains(logs, "allow_private_hosts") {
+		t.Errorf("startup logs never mention the switch:\n%s", logs)
 	}
-	if !strings.Contains(text, "WARN") {
-		t.Errorf("allowing the agent's browser onto the private network was not logged as a warning:\n%s", text)
+	if !strings.Contains(logs, "WARN") {
+		t.Errorf("allowing the agent's browser onto the private network was not logged as a warning:\n%s", logs)
 	}
 }
 
 // TestTheDefaultStaysClosedAndQuiet：默认不放行，也不该每次启动都喊一句——一条永远
 // 出现的告警等于没有告警。
 func TestTheDefaultStaysClosedAndQuiet(t *testing.T) {
-	logs := buildWithLogger(t, privateHostsConfig(t, `"enabled": true`))
+	t.Parallel()
 
-	if strings.Contains(logs.String(), "allow_private_hosts") {
-		t.Errorf("the default configuration warned about a switch nobody turned on:\n%s", logs.String())
+	logs := warningsFor(t, config.BrowserConfig{Enabled: true})
+
+	if strings.Contains(logs, "allow_private_hosts") {
+		t.Errorf("the default configuration warned about a switch nobody turned on:\n%s", logs)
 	}
 }
-
-var _ = io.Discard
 
 // TestEveryBrowserConfigKeyReachesTheRuntime 补上一条**只测日志测不到**的东西。
 //
@@ -102,7 +77,7 @@ func TestEveryBrowserConfigKeyReachesTheRuntime(t *testing.T) {
 		MaxProcesses:          3,
 		MaxContextsPerProcess: 4,
 		ProcessMemoryLimitMB:  2048,
-	})
+	}, nil)
 
 	checks := []struct {
 		name string
