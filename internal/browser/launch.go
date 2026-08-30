@@ -24,7 +24,11 @@ var devToolsLine = regexp.MustCompile(`ws://[^\s]+`)
 // 存在的理由是一次真实的排查体验：go-rod 的 launcher 把 stderr 吃掉，启动失败时
 // 运维只看到「launch chromium: context deadline exceeded」，而 Chromium 其实已经把
 // 原因写得很清楚（缺库、沙箱起不来、用户目录被别的进程占着）。
-const maxRememberedOutputLines = 20
+//
+// 60 行而不是 20：Chromium 崩溃时先打一行 CHECK 失败、再打二三十行调用栈，20 行的
+// 窗口只留下栈尾——**那句唯一有用的话正好被挤掉**。CI 上排查沙箱内启动失败时就是
+// 这样看了一轮什么也没看到。
+const maxRememberedOutputLines = 60
 
 // launchSpec 是起一个 Chromium 需要的全部东西。
 type launchSpec struct {

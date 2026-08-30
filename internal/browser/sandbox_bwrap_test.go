@@ -41,6 +41,11 @@ func TestTheSandboxMakesTheFilesystemReadOnlyExceptTheProfile(t *testing.T) {
 	if !strings.Contains(joined, "--tmpfs /tmp") {
 		t.Error("/tmp is shared with the host; the browser's shared-memory and lock files leak both ways")
 	}
+	// /dev/shm 不是可选项：--dev 给的最小 devtmpfs 里没有它，而 Chromium 的
+	// Crashpad 初始化就要用——缺了它浏览器启动即崩，且崩得没有一句有用的错误。
+	if !strings.Contains(joined, "--tmpfs /dev/shm") {
+		t.Error("/dev/shm is missing; Chromium crashes during Crashpad initialization with no useful error")
+	}
 }
 
 func TestTheSandboxDropsEveryNamespaceExceptTheNetwork(t *testing.T) {

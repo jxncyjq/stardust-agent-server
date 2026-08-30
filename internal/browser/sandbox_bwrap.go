@@ -66,6 +66,11 @@ func bubblewrapArgs(spec bubblewrapSpec, command []string) ([]string, error) {
 	args := []string{
 		"--ro-bind", "/", "/",
 		"--dev", "/dev",
+		// /dev/shm 必须存在且可写：--dev 给的是一套最小 devtmpfs，里面没有它，而
+		// Chromium 的 Crashpad 在初始化时就要用（CI 上的症状是启动即崩在
+		// PlatformCrashpadInitialization，一行有用的错误都没有）。
+		// --disable-dev-shm-usage 只让渲染器少用它，不代表可以没有。
+		"--tmpfs", "/dev/shm",
 		"--proc", "/proc",
 		"--tmpfs", "/tmp",
 		"--bind", userDataDir, userDataDir,
