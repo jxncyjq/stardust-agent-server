@@ -109,7 +109,11 @@ func launchChromium(ctx context.Context, spec launchSpec) (*launchedBrowser, err
 		return nil, fmt.Errorf("pipe chromium stderr: %w", err)
 	}
 	if spec.PAL != nil {
-		cmd = spec.PAL.PrepareCommand(cmd)
+		prepared, err := spec.PAL.PrepareCommand(cmd)
+		if err != nil {
+			return nil, err
+		}
+		cmd = prepared
 	}
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("start chromium %s: %w", spec.Bin, err)

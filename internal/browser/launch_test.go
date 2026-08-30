@@ -97,9 +97,9 @@ type recordingPAL struct {
 	prepared bool
 }
 
-func (p *recordingPAL) PrepareCommand(cmd *exec.Cmd) *exec.Cmd {
+func (p *recordingPAL) PrepareCommand(cmd *exec.Cmd) (*exec.Cmd, error) {
 	p.prepared = true
-	return cmd
+	return cmd, nil
 }
 
 // blockingReader 阻塞到 ctx 结束，然后报错——模拟一个不说话的浏览器。
@@ -214,7 +214,10 @@ func TestClosingKillsTheWholeBrowserProcessGroup(t *testing.T) {
 
 	pal := NewPlatformAdapter()
 	parent := sleeperCommand(t)
-	parent = pal.PrepareCommand(parent)
+	parent, err := pal.PrepareCommand(parent)
+	if err != nil {
+		t.Fatalf("PrepareCommand: %v", err)
+	}
 	if err := parent.Start(); err != nil {
 		t.Fatalf("start the stand-in process: %v", err)
 	}

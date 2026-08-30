@@ -83,12 +83,12 @@ func (darwinAdapter) SafeDelete(path string) error {
 // 没有 Pdeathsig：那是 Linux 特有的。macOS 上「agent 崩了浏览器也得走」目前只靠
 // Close 路径，agent 被 SIGKILL 时仍会留下进程——这条缺口写在这里，等 sandbox-exec
 // （它的位置也是这里）一并处理。
-func (darwinAdapter) PrepareCommand(cmd *exec.Cmd) *exec.Cmd {
+func (darwinAdapter) PrepareCommand(cmd *exec.Cmd) (*exec.Cmd, error) {
 	if cmd.SysProcAttr == nil {
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.Setpgid = true
-	return cmd
+	return cmd, nil
 }
 
 func (darwinAdapter) ConfineProcess(int) (io.Closer, error) { return nil, ErrConfinementUnsupported }

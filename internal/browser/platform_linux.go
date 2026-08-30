@@ -109,13 +109,54 @@ func (linuxAdapter) SafeDelete(path string) error {
 // 之类的外部程序，要么需要 user namespace（CI runner 上常常没有——Chromium 自己的
 // zygote 沙箱就是因此在那里崩过，见 DefaultLaunchArgs 的 --no-sandbox）。选哪条路
 // 是一次要单独做的决定，不该混在这次「别留孤儿」里悄悄带过。
-func (linuxAdapter) PrepareCommand(cmd *exec.Cmd) *exec.Cmd {
-	if cmd.SysProcAttr == nil {
-		cmd.SysProcAttr = &syscall.SysProcAttr{}
+func (a linuxAdapter) PrepareCommand(cmd *exec.Cmd) (*exec.Cmd, error) {
+	wrapped, err := a.wrapWithBubblewrap(cmd)
+	if err != nil {
+		return nil, err
 	}
-	cmd.SysProcAttr.Setpgid = true
-	cmd.SysProcAttr.Pdeathsig = syscall.SIGKILL
-	return cmd
+	if wrapped.SysProcAttr == nil {
+		wrapped.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	wrapped.SysProcAttr.Setpgid = true
+	wrapped.SysProcAttr.Pdeathsig = syscall.SIGKILL
+	return wrapped, nil
+}
+
+// wrapWithBubblewrap 把命令包进 bwrap。
+//
+// **缺了就拒绝启动**，这是这条策略的全部要点：一个「以为自己被沙箱包着、实际没有」
+// 的部署，比一个起不来的部署危险得多。所以这里不做任何「找不到就照常跑」的回退，
+// 而是带着「装什么、以及 Ubuntu 24.04 还要放开哪个 sysctl」的说明失败。
+//
+// 探测是**真去建一个 user namespace**，不是看文件在不在：Ubuntu 24.04 起未特权
+// user namespace 被 AppArmor 默认挡掉，bwrap 装着却会在 "setting up uid map:
+// Permission denied" 上失败——那必须在启动浏览器之前就说清楚。
+func (a linuxAdapter) wrapWithBubblewrap(cmd *exec.Cmd) (*exec.Cmd, error) {
+	bwrap, err := lookBubblewrap()
+	if err != nil {
+		return nil, bubblewrapUnavailableError(err, "")
+	}
+	probe := exec.Command(bwrap, bubblewrapProbeArgs()...)
+	if output, err := probe.CombinedOutput(); err != nil {
+		return nil, bubblewrapUnavailableError(err, string(output))
+	}
+
+	userDataDir := userDataDirFromArgs(cmd.Args)
+	args, err := bubblewrapArgs(bubblewrapSpec{UserDataDir: userDataDir}, cmd.Args)
+	if err != nil {
+		return nil, err
+	}
+
+	// 换掉可执行文件与参数，其余（stderr 管道、环境、工作目录）原样留着：调用方
+	// 已经在这个 Cmd 上接好了它要的东西。
+	wrapped := exec.Command(bwrap, args...)
+	wrapped.Env = cmd.Env
+	wrapped.Dir = cmd.Dir
+	wrapped.Stdin = cmd.Stdin
+	wrapped.Stdout = cmd.Stdout
+	wrapped.Stderr = cmd.Stderr
+	wrapped.ExtraFiles = cmd.ExtraFiles
+	return wrapped, nil
 }
 
 func (linuxAdapter) ConfineProcess(int) (io.Closer, error) { return nil, ErrConfinementUnsupported }
