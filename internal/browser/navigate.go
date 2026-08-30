@@ -2,6 +2,8 @@ package browser
 
 import (
 	"fmt"
+	"sort"
+	"time"
 
 	"github.com/go-rod/rod"
 )
@@ -104,6 +106,13 @@ type SessionInfo struct {
 	// HasPage 表示物理页还在不在。false 不是错误：会话被 TTL 回收后是懒态，下一次
 	// 动作会重建它。界面据此显示「已休眠」而不是把它当成断线。
 	HasPage bool `json:"has_page"`
+	// ChatSessionID 是这个浏览器会话绑定的对话（空=未绑定）。标签条据它只显示
+	// 当前对话的会话。
+	ChatSessionID string `json:"chat_session_id,omitempty"`
+
+	// createdAt 只用来排序，不出现在 JSON 里：标签的顺序要稳定，但「什么时候建的」
+	// 不是前端要显示的东西，把它放进契约只会多一个将来要维护的字段。
+	createdAt time.Time
 }
 
 // SessionInfo 返回一个会话的当前状态。
@@ -118,4 +127,48 @@ func (r *Runtime) SessionInfo(sessionID string) (SessionInfo, error) {
 		info.HasPage = sess.ActivePage != nil && sess.ActivePage.page != nil
 	})
 	return info, nil
+}
+
+// ListSessions 回答「现在有哪些浏览器会话」，可按 chat session 过滤。
+//
+// 它是标签式切换的前提：浏览器视图此前只认 SSE 报的最后一个会话，而一个对话里
+// Agent 完全可能开过好几个（查完 A 站再查 B 站）——除了最后那个，其余都没有入口，
+// 用户看不见也回不去。
+//
+// chatSessionID 为空表示不过滤。按对话过滤是常态：视图跟着当前对话走，把别的对话
+// 的会话摆进标签条只会让人点进一个与眼前工作无关的页面。
+func (r *Runtime) ListSessions(chatSessionID string) []SessionInfo {
+	sessions := r.sessions.Snapshot()
+	infos := make([]SessionInfo, 0, len(sessions))
+	for _, sess := range sessions {
+		var (
+			info    SessionInfo
+			chatID  string
+			created time.Time
+		)
+		info.SessionID = sess.ID
+		info.Takeover = r.takeoverOf(sess)
+		sess.WithLock(func() {
+			info.URL = sess.ActiveURL
+			info.HasPage = sess.ActivePage != nil && sess.ActivePage.page != nil
+			chatID = sess.ChatSessionID
+			created = sess.CreatedAt
+		})
+		if chatSessionID != "" && chatID != chatSessionID {
+			continue
+		}
+		info.ChatSessionID = chatID
+		info.createdAt = created
+		infos = append(infos, info)
+	}
+	// 最早的排在前面：标签的顺序必须**稳定**，否则每次刷新标签都在跳，用户点到的
+	// 不是上一秒看到的那个。Snapshot 走的是 map，顺序本身没有意义。
+	sort.Slice(infos, func(i, j int) bool {
+		if infos[i].createdAt.Equal(infos[j].createdAt) {
+			// 同一纳秒创建（测试里很容易撞上）时按 id 兜住顺序，仍然是稳定的。
+			return infos[i].SessionID < infos[j].SessionID
+		}
+		return infos[i].createdAt.Before(infos[j].createdAt)
+	})
+	return infos
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/stardust/legion-agent/internal/browser"
@@ -21,6 +22,8 @@ type fakeBrowser struct {
 	navigated   []browser.NavigateReq
 	navigateErr error
 	infoErr     error
+	sessions    []browser.SessionInfo
+	listedFor   string
 	injected    [][]browser.InputEvent
 	injectErr   error
 	viewport    struct {
@@ -59,6 +62,10 @@ func (f *fakeBrowser) NavigateTakeover(id string, req browser.NavigateReq) error
 	}
 	f.navigated = append(f.navigated, req)
 	return nil
+}
+func (f *fakeBrowser) ListSessions(chatSessionID string) []browser.SessionInfo {
+	f.listedFor = chatSessionID
+	return f.sessions
 }
 func (f *fakeBrowser) SessionInfo(id string) (browser.SessionInfo, error) {
 	if f.infoErr != nil {
@@ -330,5 +337,47 @@ func TestSessionInfoIsServed(t *testing.T) {
 	}
 	if info.URL != "https://example.com/" || !info.Takeover {
 		t.Errorf("info = %+v, want the runtime's answer carried through verbatim", info)
+	}
+}
+
+// 标签条读的就是这个端点。两条断言：会话原样带出来，以及**过滤条件真的传下去了**
+// ——把别的对话的会话摆进标签条，用户点进去的是一个与眼前工作无关的页面。
+func TestBrowserSessionsAreListedForOneConversation(t *testing.T) {
+	fb := &fakeBrowser{sessions: []browser.SessionInfo{
+		{SessionID: "sess-1", URL: "https://a.example/", ChatSessionID: "chat-A"},
+		{SessionID: "sess-2", URL: "https://b.example/", ChatSessionID: "chat-A"},
+	}}
+	srv := newBrowserTestServer(fb)
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/browser/sessions?chat_session_id=chat-A", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: %s", rec.Code, rec.Body.String())
+	}
+	if fb.listedFor != "chat-A" {
+		t.Errorf("runtime was asked for %q, want the conversation the caller named", fb.listedFor)
+	}
+	var payload struct {
+		Sessions []browser.SessionInfo `json:"sessions"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(payload.Sessions) != 2 || payload.Sessions[0].SessionID != "sess-1" {
+		t.Errorf("sessions = %+v, want both carried through in order", payload.Sessions)
+	}
+}
+
+// TestNoBrowserSessionsIsAnEmptyListNotNull：一个会话都没有是**最常见**的正常状态
+// （Agent 还没浏览过任何东西），而前端 map 一个 null 会炸。
+func TestNoBrowserSessionsIsAnEmptyListNotNull(t *testing.T) {
+	srv := newBrowserTestServer(&fakeBrowser{})
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/browser/sessions", nil))
+
+	if !strings.Contains(rec.Body.String(), `"sessions":[]`) {
+		t.Errorf("body = %s, want an empty array", rec.Body.String())
 	}
 }
