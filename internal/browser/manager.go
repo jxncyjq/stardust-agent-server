@@ -174,6 +174,9 @@ func startChromiumInstance(cfg ManagerConfig, pal PlatformAdapter, egressURL str
 	// 默认情况下 Chromium 会绕过代理直连 localhost/127.0.0.1——那恰好是 SSRF 最想
 	// 去的地方。"<-loopback>" 是 Chromium 的显式写法：把回环也交给代理，由代理按
 	// 策略决定放不放行。
+	//
+	// 这不是预防性的：删掉这一行，TestLoopbackIsNotExemptFromTheEgressPolicy 会红
+	// ——那台回环上的服务器真的会被直连到。
 	l = l.Set(flags.Flag("proxy-bypass-list"), "<-loopback>")
 
 	// 自己起进程，而不是 l.Launch()：go-rod 的 launcher 在内部 exec，我们只拿得到

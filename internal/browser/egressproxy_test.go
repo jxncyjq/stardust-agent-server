@@ -1,6 +1,7 @@
 package browser
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // SSRF 防护此前只在 browser_open 那一刻查一次：解析主机名 → 看 IP 是不是私网 →
@@ -232,4 +234,100 @@ func startRedirectServer(t *testing.T, location string) string {
 	}))
 	t.Cleanup(srv.Close)
 	return strings.TrimPrefix(srv.URL, "http://")
+}
+
+// TestTheTunnelForwardsBytesSentBeforeTheHandshakeReply 是那个真机 bug 的回归测试。
+//
+// 客户端常常不等 200 就把 CONNECT 之后的第一批字节（TLS ClientHello）一起发出来，
+// 那几个字节此刻躺在 net/http 的 bufio.Reader 里。旧实现只拿 Hijack 的 net.Conn、
+// 丢掉那个缓冲，于是隧道少了握手的开头：对端一直等，客户端最后报 "unexpected EOF"。
+//
+// 本地测试碰不到它，因为 Go 的 http.Transport 总是先等 200 再发——所以这里手写
+// CONNECT，并**在同一次写入里**把后续字节跟上，正是浏览器与 curl 的做法。
+func TestTheTunnelForwardsBytesSentBeforeTheHandshakeReply(t *testing.T) {
+	t.Parallel()
+
+	// 一个回显服务器：把收到的字节原样送回，好断言「开头那几个字节没丢」。
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		_, _ = io.Copy(conn, conn)
+	}()
+
+	p := startTestProxy(t, true, &fakeDNS{answers: [][]net.IP{{net.ParseIP("127.0.0.1")}}},
+		&recordingDialer{upstream: listener.Addr().String()})
+
+	conn, err := net.Dial("tcp", p.Addr())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer func() { _ = conn.Close() }()
+
+	// CONNECT 与「握手的第一批字节」一次写出去，中间不等回应。
+	//
+	// 早发数据取 8KB 而不是十几个字节：net/http 读请求头时一次从 socket 读一大块，
+	// 小载荷未必落进它的 bufio 缓冲（第一版测试就是这样——两个变异都不红，因为那些
+	// 字节其实还留在 socket 里，怎么改都能拿到）。8KB 保证有一部分**一定**在缓冲里，
+	// 于是「丢掉缓冲」这件事才真的可观测。
+	early := strings.Repeat("EARLY", 1638) // 8190 bytes
+	request := "CONNECT tunnel.example:443 HTTP/1.1\r\nHost: tunnel.example:443\r\n\r\n" + early
+	if _, err := io.WriteString(conn, request); err != nil {
+		t.Fatalf("write CONNECT: %v", err)
+	}
+
+	reader := bufio.NewReader(conn)
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("read status line: %v", err)
+	}
+	if !strings.Contains(statusLine, "200") {
+		t.Fatalf("CONNECT answered %q, want 200", strings.TrimSpace(statusLine))
+	}
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatalf("read headers: %v", err)
+		}
+		if strings.TrimSpace(line) == "" {
+			break
+		}
+	}
+
+	if err := conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	echoed := make([]byte, len(early))
+	if _, err := io.ReadFull(reader, echoed); err != nil {
+		t.Fatalf("the bytes sent before the 200 never reached the upstream: %v", err)
+	}
+	if string(echoed) != early {
+		t.Errorf("echoed %q, want %q", echoed, early)
+	}
+}
+
+// TestAnUnreachableTargetIsNotReportedAsARefusal：连不上与被策略拒绝是两回事。
+// 说成 403 会把人送去查一个根本没问题的策略——真机排查时我就在这上面绕了一圈。
+func TestAnUnreachableTargetIsNotReportedAsARefusal(t *testing.T) {
+	t.Parallel()
+
+	p := startTestProxy(t, false, &fakeDNS{answers: [][]net.IP{{net.ParseIP("203.0.113.10")}}}, nil)
+	p.dial = func(context.Context, string, string) (net.Conn, error) {
+		return nil, errors.New("dial tcp 203.0.113.10:80: i/o timeout")
+	}
+
+	status, body := getThroughProxy(t, p, "http://reachable-policy-wise.example/")
+	if status != http.StatusBadGateway {
+		t.Errorf("status = %d, want 502: the target was allowed, it just could not be reached", status)
+	}
+	if strings.Contains(body, "blocked by the agent browser egress policy") {
+		t.Errorf("body = %q, want it to say the target was unreachable, not that policy refused it", body)
+	}
 }
