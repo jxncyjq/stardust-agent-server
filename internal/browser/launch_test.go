@@ -172,13 +172,15 @@ func TestCloseKillsTheProcessEvenWithoutConfinement(t *testing.T) {
 	if err := sleeper.Start(); err != nil {
 		t.Fatalf("start the stand-in process: %v", err)
 	}
-	manager := &Manager{
+	// 直接构造一个**进程实例**而不是整个 Manager：这条性质属于「一个进程怎么被
+	// 送走」，与池、与出口代理都无关。
+	instance := &chromiumInstance{
 		launched: &launchedBrowser{cmd: sleeper},
 		pal:      NewPlatformAdapter(),
 		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 
-	manager.Close()
+	instance.Close()
 
 	assertReaped(t, sleeper)
 }
@@ -216,13 +218,13 @@ func TestClosingKillsTheWholeBrowserProcessGroup(t *testing.T) {
 	if err := parent.Start(); err != nil {
 		t.Fatalf("start the stand-in process: %v", err)
 	}
-	manager := &Manager{
+	instance := &chromiumInstance{
 		launched: &launchedBrowser{cmd: parent},
 		pal:      pal,
 		logger:   slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 
-	manager.Close()
+	instance.Close()
 
 	assertReaped(t, parent)
 }

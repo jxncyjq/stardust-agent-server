@@ -2530,18 +2530,21 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		// SQLite 时注入一个把 browser_sessions 表桥到端口的适配器，让登录态跨进程
 		// 重启存活；非 SQLite 驱动拿不到 repo，Store 保持 nil（纯内存，Phase 1/2 行为）。
 		runtimeCfg := browser.RuntimeConfig{
-			Headless:              cfg.Browser.Headless,
-			BinPath:               cfg.Browser.BinPath,
-			SessionTTL:            time.Duration(cfg.Browser.SessionTTLSeconds) * time.Second,
-			ReapInterval:          time.Duration(cfg.Browser.ReapIntervalSeconds) * time.Second,
-			MaxElements:           cfg.Browser.MaxElements,
-			SnapshotRuneThreshold: cfg.Browser.SnapshotRuneThreshold,
-			SnapshotTTL:           time.Duration(cfg.Browser.SnapshotTTLHours) * time.Hour,
-			SnapshotArchiveDir:    cfg.Browser.SnapshotArchiveDir,
-			Extractor:             adapter.NewMaasSnapshotExtractor(defaultMaas),
-			RequireSandbox:        cfg.Browser.RequireSandbox,
-			MinFreeMemoryBytes:    cfg.Browser.MinFreeMemoryMB << 20,
-			Logger:                logger,
+			Headless:                cfg.Browser.Headless,
+			BinPath:                 cfg.Browser.BinPath,
+			SessionTTL:              time.Duration(cfg.Browser.SessionTTLSeconds) * time.Second,
+			ReapInterval:            time.Duration(cfg.Browser.ReapIntervalSeconds) * time.Second,
+			MaxElements:             cfg.Browser.MaxElements,
+			SnapshotRuneThreshold:   cfg.Browser.SnapshotRuneThreshold,
+			SnapshotTTL:             time.Duration(cfg.Browser.SnapshotTTLHours) * time.Hour,
+			SnapshotArchiveDir:      cfg.Browser.SnapshotArchiveDir,
+			Extractor:               adapter.NewMaasSnapshotExtractor(defaultMaas),
+			RequireSandbox:          cfg.Browser.RequireSandbox,
+			MinFreeMemoryBytes:      cfg.Browser.MinFreeMemoryMB << 20,
+			MaxProcesses:            cfg.Browser.MaxProcesses,
+			MaxContextsPerProcess:   cfg.Browser.MaxContextsPerProcess,
+			ProcessMemoryLimitBytes: cfg.Browser.ProcessMemoryLimitMB << 20,
+			Logger:                  logger,
 		}
 		if repo, ok := taskStore.(*storage.SQLiteRepository); ok {
 			runtimeCfg.Store = newSQLiteBrowserStore(repo)

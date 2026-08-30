@@ -280,6 +280,22 @@ type BrowserConfig struct {
 	// 被收束、要么明确失败」，而不是「以为自己被收束」。
 	RequireSandbox bool `json:"require_sandbox"`
 
+	// MaxProcesses 是同时存在的浏览器进程数上限（0 = 1，即进程池出现之前的形状）。
+	//
+	// 一个进程里的会话共命运：一个页面把渲染进程搞崩、或把内存吃光，同进程的别的
+	// 会话一起完蛋。调大它是在用内存换隔离。
+	MaxProcesses int `json:"max_processes"`
+
+	// MaxContextsPerProcess 是一个浏览器进程上并存的会话数上限（0 = 8）。
+	MaxContextsPerProcess int `json:"max_contexts_per_process"`
+
+	// ProcessMemoryLimitMB 是单个浏览器进程的内存上限（MiB）：超过它的**空闲**
+	// 进程会被换掉。0 = 这个部署不做这件事。
+	//
+	// 只换空闲的：回收一个正在被人看着的浏览器，用户看到的是页面凭空消失、接管
+	// 中断、登录态没了。
+	ProcessMemoryLimitMB uint64 `json:"process_memory_limit_mb"`
+
 	// MinFreeMemoryMB 是**新建**浏览器会话前要求的可用物理内存下限（MiB）；
 	// 0 关闭这条策略。
 	//
