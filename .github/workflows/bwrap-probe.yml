@@ -1,0 +1,12 @@
+name: bwrap probe
+on: workflow_dispatch
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - run: which bwrap || echo "NO BWRAP"
+      - run: sudo apt-get update -qq && sudo apt-get install -y -qq bubblewrap
+      - run: bwrap --version
+      - run: bwrap --ro-bind / / --dev /dev --proc /proc --unshare-pid --die-with-parent -- /bin/echo "bwrap works" || echo "BWRAP FAILED rc=$?"
+      - run: cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo "(no unprivileged_userns_clone knob)"
+      - run: sysctl kernel.apparmor_restrict_unprivileged_userns 2>/dev/null || echo "(no apparmor knob)"
