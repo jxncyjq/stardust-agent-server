@@ -110,6 +110,26 @@ var probeProfiles = []probeProfile{
 		extraArgs: []string{"--no-sandbox"},
 	},
 	{
+		// 二分：把临时目录整片放回来。过了，说明 TMPDIR 那一手没起作用（Chromium
+		// 未必认这个环境变量），需求在 /private/var/folders 里。
+		name: "write-confined+system-temp",
+		sbpl: func(dir string) string {
+			return writeConfinedSBPL(dir) + `(allow file-write*
+  (subpath "/private/var/folders")
+  (subpath "/private/tmp"))
+`
+		},
+	},
+	{
+		// 二分：把用户库目录放回来（缓存、Application Support、偏好设置）。
+		name: "write-confined+user-library",
+		sbpl: func(dir string) string {
+			return writeConfinedSBPL(dir) + fmt.Sprintf(`(allow file-write*
+  (subpath %q))
+`, filepath.Join(os.Getenv("HOME"), "Library"))
+		},
+	},
+	{
 		name: "write-confined+no-network-to-outside",
 		sbpl: func(dir string) string {
 			// 出网口是本机回环上的代理（见 egressproxy.go）。若能只放行回环、
@@ -179,6 +199,60 @@ func TestProbeChromeUnderSandboxExec(t *testing.T) {
 			t.Logf("%s: devtools at %s (pid %d)", profile.name, browser.controlURL, browser.PID())
 		})
 	}
+}
+
+// TestProbeWhatChromeActuallyNeedsToWrite 用 SBPL 自带的 trace：让内核把这个进程
+// **实际用到**的操作写成一份 profile。
+//
+// 这比猜路径可靠得多，也比翻统一日志可靠——上一轮发现 deny 默认不上报，加了
+// (with report) 之后 runner 上依然捞不到（`log show` 在 CI 上拿不到内核那条流）。
+// trace 不依赖日志系统。
+func TestProbeWhatChromeActuallyNeedsToWrite(t *testing.T) {
+	chrome := chromePathForProbe(t)
+
+	dir := t.TempDir()
+	userDataDir := filepath.Join(dir, "profile")
+	if err := os.MkdirAll(userDataDir, 0o700); err != nil {
+		t.Fatalf("mkdir profile: %v", err)
+	}
+	tracePath := filepath.Join(dir, "trace.sb")
+	profilePath := filepath.Join(dir, "profile.sb")
+	profile := fmt.Sprintf("(version 1)\n(allow default)\n(trace %q)\n", tracePath)
+	if err := os.WriteFile(profilePath, []byte(profile), 0o600); err != nil {
+		t.Fatalf("write sbpl: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), probeLaunchTimeout)
+	defer cancel()
+	browser, err := launchChromium(ctx, launchSpec{
+		Bin: "/usr/bin/sandbox-exec",
+		Args: []string{"-f", profilePath, chrome,
+			"--headless=new", "--remote-debugging-port=0",
+			"--user-data-dir=" + userDataDir,
+			"--no-first-run", "--no-default-browser-check", "--disable-gpu", "about:blank"},
+		PAL: newPlatformAdapter(),
+	})
+	if err != nil {
+		t.Fatalf("chrome did not come up even with everything allowed: %v", err)
+	}
+	time.Sleep(2 * time.Second) // 让它把启动阶段真正跑完
+	_ = browser.cmd.Process.Kill()
+	_ = browser.Wait()
+
+	data, err := os.ReadFile(tracePath)
+	if err != nil {
+		t.Fatalf("read the trace: %v", err)
+	}
+	all := strings.Split(string(data), "\n")
+	var writes []string
+	for _, line := range all {
+		if strings.Contains(line, "file-write") || strings.Contains(line, "subpath") ||
+			strings.Contains(line, "literal") {
+			writes = append(writes, strings.TrimSpace(line))
+		}
+	}
+	t.Logf("the trace has %d lines; the write-related ones:\n%s",
+		len(all), strings.Join(writes, "\n"))
 }
 
 // sandboxDenials 从统一日志里捞最近的 sandbox 拒绝记录。
