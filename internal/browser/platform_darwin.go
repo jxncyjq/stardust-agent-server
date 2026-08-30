@@ -72,61 +72,26 @@ func (darwinAdapter) SafeDelete(path string) error {
 	return nil
 }
 
-// PrepareCommand 在 macOS 上做两件事：把命令包进 sandbox-exec，并建进程组。
+// PrepareCommand 在 macOS 上只建进程组：让 Chromium 与它 fork 出的 renderer/GPU 同属
+// 一个组，关闭时能按组一次杀干净——杀主进程带不走它们，那正是孤儿的来源。
 //
-// **缺了 sandbox-exec 就拒绝启动**，与 Linux 侧缺 bwrap 同一条策略：一个以为自己被
-// 沙箱包着、实际没有的部署，比一个起不来的部署危险得多。sandbox-exec 随 macOS 发，
-// 缺了它说明这台机器不正常。
+// **这里没有外层沙箱，而且不是没做，是做不成。** sandbox-exec（Seatbelt）是 macOS 上
+// 唯一不需要签名与 entitlements 就能包住任意子进程的东西，真机探针的结论是：
+// Chromium（开源构建）能跑在里面，**Google Chrome 不能**——连一份「什么都不限、只是
+// 包了一层」的 profile 都起不来，浏览器一个字都不说就退出。而 Google Chrome 正是绝
+// 大多数 macOS 机器上唯一装着的那个浏览器。
 //
-// Setpgid 让 Chromium 与它 fork 出的 renderer/GPU 同属一个进程组，关闭时能按组一次
-// 杀干净——杀主进程带不走它们，那正是孤儿的来源。
+// 于是这里的选择只有两种：要么按 Linux 那条策略「缺沙箱就拒绝启动」，那等于让内置
+// 浏览器在 macOS 上直接不可用；要么诚实地说这台机器上没有外层沙箱。选后者，并且
+// **不假装有**——ConfineProcess 提供的是孤儿保护，不是隔离，两者写清楚，别混为一谈。
 //
-// 没有 Pdeathsig（Linux 特有），所以「agent 被 SIGKILL 之后浏览器还活着」这条缺口
-// 由 ConfineProcess 起的看门狗补，见那里。
-func (a darwinAdapter) PrepareCommand(cmd *exec.Cmd) (*exec.Cmd, error) {
-	wrapped, err := a.wrapWithSeatbelt(cmd)
-	if err != nil {
-		return nil, err
+// 没有 Pdeathsig（Linux 特有），孤儿那条缺口由 ConfineProcess 起的看门狗补。
+func (darwinAdapter) PrepareCommand(cmd *exec.Cmd) (*exec.Cmd, error) {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
-	if wrapped.SysProcAttr == nil {
-		wrapped.SysProcAttr = &syscall.SysProcAttr{}
-	}
-	wrapped.SysProcAttr.Setpgid = true
-	return wrapped, nil
-}
-
-// wrapWithSeatbelt 把命令包进 sandbox-exec。
-func (darwinAdapter) wrapWithSeatbelt(cmd *exec.Cmd) (*exec.Cmd, error) {
-	if _, err := os.Stat(seatbeltBinary); err != nil {
-		return nil, seatbeltUnavailableError(err)
-	}
-	userDataDir := userDataDirFromArgs(cmd.Args)
-	profile, err := seatbeltProfile(seatbeltSpec{
-		UserDataDir: userDataDir,
-		TempDir:     os.TempDir(),
-		// 出网只留回环：浏览器的全部流量本就经本机的出口代理，这层把「绕过代理
-		// 直连」也堵死。真机探针确认这么关之后浏览器照常起来。
-		OnlyLoopbackEgress: true,
-	})
-	if err != nil {
-		return nil, err
-	}
-	// profile 写进 user-data-dir：它与浏览器同生共死，清理路径已经在管这个目录。
-	// 放 /tmp 反而要再管一份生命周期。
-	profilePath := filepath.Join(userDataDir, "seatbelt.sb")
-	if err := os.WriteFile(profilePath, []byte(profile), 0o600); err != nil {
-		return nil, fmt.Errorf("write the sandbox profile %q: %w", profilePath, err)
-	}
-
-	args := append([]string{"-f", profilePath}, cmd.Args...)
-	wrapped := exec.Command(seatbeltBinary, args...)
-	wrapped.Env = cmd.Env
-	wrapped.Dir = cmd.Dir
-	wrapped.Stdin = cmd.Stdin
-	wrapped.Stdout = cmd.Stdout
-	wrapped.Stderr = cmd.Stderr
-	wrapped.ExtraFiles = cmd.ExtraFiles
-	return wrapped, nil
+	cmd.SysProcAttr.Setpgid = true
+	return cmd, nil
 }
 
 // ConfineProcess 在 macOS 上补的是**孤儿**那条缺口，不是隔离——隔离在

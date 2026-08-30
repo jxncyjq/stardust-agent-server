@@ -43,17 +43,6 @@ func chromePathForProbe(t *testing.T) string {
 	return ""
 }
 
-// homeSubpaths 拼一条放行 HOME 底下若干目录的规则，供二分用。
-func homeSubpaths(dirs ...string) string {
-	var b strings.Builder
-	b.WriteString("(allow file-write*\n")
-	for _, dir := range dirs {
-		fmt.Fprintf(&b, "  (subpath %q)\n", filepath.Join(os.Getenv("HOME"), dir))
-	}
-	b.WriteString(")\n")
-	return b.String()
-}
-
 // TestProbeSandboxExecExists：`sandbox-exec` 在 Apple 的文档里被标了 deprecated
 // 很多年，却仍然随系统发。它在不在，决定后面所有事。
 func TestProbeSandboxExecExists(t *testing.T) {
@@ -73,123 +62,26 @@ func TestProbeSandboxExecExists(t *testing.T) {
 	}
 }
 
-// probeProfile 是一个候选 profile：名字 + SBPL 文本（%s 处填可写目录）。
+// probeProfile 是一个候选 profile。
 type probeProfile struct {
 	name string
-	// sbpl 收到一个 profile 目录，返回完整的 SBPL 文本。
 	sbpl func(userDataDir string) string
-	// extraArgs 是这个变体额外要带的浏览器参数。
-	extraArgs []string
-	// expectItToStart 说明这个变体**应该**能起来。对照组填 false：它红是预期结果，
-	// 不该让整个探针变红——那样下一个人会以为环境坏了。
+	// expectItToStart 说明这个变体**应该**能起来。
 	expectItToStart bool
 }
 
-// probeProfiles 是要试的几条路。形状照着 Linux 那份 bwrap profile：**整盘只读、
-// 只有自己的 profile 目录可写**——真正要防的是写，读系统字体/证书/共享库一一列举
-// 既列不全也会随版本漂移。
-// writeConfinedSBPL 是收紧之后的那份：**只有 profile 目录可写**。
+// 结论（八轮探针，2026-08-30）：**Google Chrome 跑不进 sandbox-exec**，而 macOS 上
+// 绝大多数机器只装着它。下面第一条就是判据——一份「什么都不限、只是包了一层」的
+// profile：Chromium（开源构建）在它下面起得来，Google Chrome 起不来，浏览器一个字都
+// 不说就退出。既然连不限制都不行，收紧到什么程度都无从谈起。
 //
-// 第一版把 /private/tmp 与 /private/var/folders 整片放行，而 macOS 上每个 app 的
-// 临时目录都在后者底下——探针实测「profile 之外的写」照样成功，那层沙箱什么都没挡。
-// 一个看着像沙箱、实际不挡事的东西比没有更糟，因为它让人以为有。
-//
-// 浏览器仍然需要一个临时目录，所以把 TMPDIR 指进 profile 里自己那一个（见探针里的
-// Env），于是这两片都可以从可写列表里去掉。
-func writeConfinedSBPL(dir string) string {
-	// **必须是解析过符号链接的真实路径**：macOS 上 /tmp 与 /var 都是指向 /private/…
-	// 的软链，而 SBPL 的 subpath 按解析后的路径匹配。写 /var/folders/xx 进 profile，
-	// 内核看到的却是 /private/var/folders/xx——两边对不上，于是**连自己的 profile
-	// 目录都写不了**，浏览器一个字都说不出来就退出。第二轮探针正是死在这里。
-	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
-		dir = resolved
-	}
-	return fmt.Sprintf(`(version 1)
-(allow default)
-(deny file-write*)
-(allow file-write*
-  (subpath %q)
-  (literal "/dev/null")
-  (literal "/dev/dtracehelper")
-  (regex #"^/dev/tty"))
-`, dir)
-}
-
-// userTempAllowRules 放行本用户自己的临时与缓存目录。
-//
-// macOS 把它们放在 /private/var/folders/<xx>/<yyy>/{T,C}/：T 是 $TMPDIR，C 是缓存。
-// 它们**按用户**分，不按 app 分，所以这仍然比只放 profile 目录宽；但比放行整个
-// /private/var/folders 窄得多——后者还含着别的用户与系统自己的那些。
-func userTempAllowRules() string {
-	tmp := os.Getenv("TMPDIR")
-	if resolved, err := filepath.EvalSymlinks(tmp); err == nil {
-		tmp = resolved
-	}
-	tmp = strings.TrimSuffix(tmp, string(os.PathSeparator))
-	cache := filepath.Join(filepath.Dir(tmp), "C")
-	return fmt.Sprintf(`(allow file-write*
-  (subpath %q)
-  (subpath %q))
-`, tmp, cache)
-}
-
-// shippedProfileFor 是出货的那一份（见 seatbeltProfile）。
-func shippedProfileFor(dir string) string {
-	profile, err := seatbeltProfile(seatbeltSpec{
-		UserDataDir: dir, TempDir: os.TempDir(), OnlyLoopbackEgress: true,
-	})
-	if err != nil {
-		panic(err)
-	}
-	return profile
-}
-
-// denyOnlyUnderHome 是反过来的写法：**不列可写，只列不可写**。
-//
-// 正向名单（只有这几处可写）在 Google Chrome 上一条都过不去——连整个 ~/Library
-// 放开都不行，说明它要写的地方在别处，而把「别处」列全既列不出也守不住。
-//
-// 反向名单守的是这层沙箱真正要守的东西：一个被攻破的浏览器不该能改**用户自己的
-// 文件**（文档、配置、ssh 密钥、别的 app 的数据）。系统里那些晦涩路径它写就写了，
-// 那些地方本来就有系统自己的权限在管。
-func denyOnlyUnderHome(dir string) string {
-	home := os.Getenv("HOME")
-	profile := dir
-	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
-		profile = resolved
-	}
-	return fmt.Sprintf(`(version 1)
-(allow default)
-(deny file-write* (subpath %q))
-(allow file-write* (subpath %q))
-`, home, profile)
-}
-
+// 这些留在仓库里是为了：下一次有人想在 macOS 上加外层沙箱时，先跑一遍这个，而不是
+// 从头再猜一遍。
 var probeProfiles = []probeProfile{
 	{
-		// 分清是「sandbox-exec 本身容不下 Google Chrome」还是「写限制容不下」。
-		// 这一条什么都不限，只是包了一层。它红了，整条路就断了。
 		name:            "no-restrictions-at-all",
 		expectItToStart: true,
 		sbpl:            func(string) string { return "(version 1)\n(allow default)\n" },
-	},
-	{
-		// 出货的那一份（正向名单）：见 seatbeltProfile。
-		name:            "shipped",
-		expectItToStart: true,
-		sbpl:            shippedProfileFor,
-	},
-	{
-		// 反向名单：只挡 HOME，profile 目录开个口子。
-		name:            "deny-writes-under-home",
-		expectItToStart: true,
-		sbpl:            denyOnlyUnderHome,
-	},
-	{
-		// 对照：只放 profile 目录。**预期起不来**。
-		name:            "profile-dir-only",
-		sbpl:            writeConfinedSBPL,
-		expectItToStart: false,
 	},
 }
 
@@ -211,7 +103,6 @@ func TestProbeChromeUnderSandboxExec(t *testing.T) {
 			}
 
 			args := []string{"-f", profilePath, chrome}
-			args = append(args, profile.extraArgs...)
 			args = append(args,
 				"--headless=new",
 				"--remote-debugging-port=0",
@@ -271,43 +162,6 @@ func sandboxDenials(t *testing.T) string {
 		lines = lines[len(lines)-40:]
 	}
 	return strings.Join(lines, "\n")
-}
-
-// TestProbeWritesOutsideTheProfileAreDenied：上面那条只证明它**起得来**。这条问的
-// 是这层沙箱到底挡不挡事——一个包着却什么都不挡的沙箱，比没有更糟，因为它会让人
-// 以为有。
-func TestProbeWritesOutsideTheProfileAreDenied(t *testing.T) {
-	dir := t.TempDir()
-	userDataDir := filepath.Join(dir, "profile")
-	if err := os.MkdirAll(userDataDir, 0o700); err != nil {
-		t.Fatalf("mkdir profile: %v", err)
-	}
-	profilePath := filepath.Join(dir, "profile.sb")
-	if err := os.WriteFile(profilePath, []byte(writeConfinedSBPL(userDataDir)), 0o600); err != nil {
-		t.Fatalf("write sbpl: %v", err)
-	}
-
-	// 上一版把「外面」选在 t.TempDir() 里，而那是 /private/var/folders/... ——
-	// 恰好落在当时的可写列表里。于是探针报了绿，测的却是自己挖的那个洞。
-	// 现在选 HOME 下的一个路径：那才是「被攻破的浏览器最想写的地方」。
-	outside := filepath.Join(os.Getenv("HOME"), ".stardust-sandbox-probe")
-	defer func() { _ = os.Remove(outside) }()
-	out, err := exec.Command("/usr/bin/sandbox-exec", "-f", profilePath, //nolint:gosec
-		"/bin/sh", "-c", "echo pwned > "+outside).CombinedOutput()
-	if err == nil {
-		t.Fatalf("a write outside the profile succeeded: the sandbox confines nothing\n%s", out)
-	}
-	t.Logf("write outside the profile was denied as expected: %v (%s)", err, strings.TrimSpace(string(out)))
-
-	resolvedUserDataDir, err := filepath.EvalSymlinks(userDataDir)
-	if err != nil {
-		t.Fatalf("resolve %s: %v", userDataDir, err)
-	}
-	inside := filepath.Join(resolvedUserDataDir, "inside.txt")
-	if out, err := exec.Command("/usr/bin/sandbox-exec", "-f", profilePath,
-		"/bin/sh", "-c", "echo ok > "+inside).CombinedOutput(); err != nil {
-		t.Fatalf("a write inside the profile was denied, so the browser cannot run: %v\n%s", err, out)
-	}
 }
 
 // TestProbeAnOrphanSurvivesTheParentBeingKilled 是 D4 的那条缺口，先把它**证明出来**
@@ -381,100 +235,4 @@ func TestProbeAWatchdogReapsTheOrphan(t *testing.T) {
 		_ = fakeBrowser.Process.Kill()
 		t.Fatalf("the watchdog did not reap pid %d within 10s", browserPID)
 	}
-}
-
-// TestProbeTheProductionWrapperStartsTheBrowser 走**生产那条路**：PrepareCommand
-// 自己去拼 sandbox-exec 的命令行。
-//
-// 上面那些变体证明的是 profile 本身对不对；这条证明的是**接线**对不对。两者会分开
-// 坏：出货 profile 在探针里通过的同一次 CI 上，e2e 里的浏览器仍然起不来——那说明
-// 差异不在 profile，在包装。
-func TestProbeTheProductionWrapperStartsTheBrowser(t *testing.T) {
-	chrome := chromePathForProbe(t)
-
-	userDataDir := filepath.Join(t.TempDir(), "user-data")
-	cmd := exec.Command(chrome,
-		"--headless=new", "--remote-debugging-port=0",
-		"--user-data-dir="+userDataDir,
-		"--no-first-run", "--no-default-browser-check", "--disable-gpu", "about:blank")
-
-	pal := newPlatformAdapter()
-	wrapped, err := pal.PrepareCommand(cmd)
-	if err != nil {
-		t.Fatalf("PrepareCommand: %v", err)
-	}
-	t.Logf("wrapped as: %s %v", wrapped.Path, wrapped.Args[:3])
-
-	ctx, cancel := context.WithTimeout(context.Background(), probeLaunchTimeout)
-	defer cancel()
-	browser, err := launchChromium(ctx, launchSpec{Bin: wrapped.Path, Args: wrapped.Args[1:], PAL: pal})
-	if err != nil {
-		if profile, readErr := os.ReadFile(filepath.Join(userDataDir, "seatbelt.sb")); readErr == nil {
-			t.Logf("the profile the wrapper generated:\n%s", profile)
-		} else {
-			t.Logf("(no profile at %s: %v)", filepath.Join(userDataDir, "seatbelt.sb"), readErr)
-		}
-		t.Fatalf("the production wrapper could not start the browser: %v", err)
-	}
-	defer func() { _ = browser.cmd.Process.Kill(); _ = browser.Wait() }()
-	t.Logf("devtools at %s", browser.controlURL)
-}
-
-// TestProbeTheManagerStartsTheBrowser 把差异逼到最后一段：**manager 自己拼的那组参数**。
-//
-// 上一条证明了包装（PrepareCommand）没问题，出货 profile 也通过了探针；而 e2e 里的
-// 浏览器仍然起不来。剩下唯一不同的就是 manager 经 go-rod launcher 拼出来的参数。
-// 失败时把参数与生成的 profile 都打出来——上一次在 Linux 上就是靠这两样才看清
-// Crashpad 的事。
-func TestProbeTheManagerStartsTheBrowser(t *testing.T) {
-	chrome := chromePathForProbe(t)
-
-	mgr, err := NewManager(ManagerConfig{Headless: true, BinPath: chrome})
-	if err != nil {
-		t.Logf("NewManager failed: %v", err)
-		dumpProbeArtifacts(t)
-		t.FailNow()
-	}
-	defer mgr.Close()
-	t.Logf("the manager started the browser")
-}
-
-// dumpProbeArtifacts 把 $TMPDIR/rod 底下最近那个 profile 目录里的 seatbelt.sb 打出来。
-func dumpProbeArtifacts(t *testing.T) {
-	t.Helper()
-
-	root := filepath.Join(os.TempDir(), "rod", "user-data")
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		t.Logf("(no rod user-data at %s: %v)", root, err)
-		return
-	}
-	for _, entry := range entries {
-		path := filepath.Join(root, entry.Name(), "seatbelt.sb")
-		data, err := os.ReadFile(path)
-		if err != nil {
-			continue
-		}
-		t.Logf("profile at %s:\n%s", path, data)
-	}
-}
-
-// TestProbeTheDownloadedBrowserStartsToo 照 **e2e 的配置**再探一次：BinPath 留空。
-//
-// e2e 里的 systemChromeForTest() 走 PAL.ResolveChromiumPath()，而 runner 上
-// setup-chrome 把浏览器装在 hostedtoolcache 而不是 /Applications——于是它返回空，
-// 分发退到 go-rod 自己下载的那一个。此前每一条探针都用 CHROME_PATH 指的那个，
-// 因此全都绿，而 e2e 全都红：**探针一直没探到真正在跑的那个浏览器**。
-func TestProbeTheDownloadedBrowserStartsToo(t *testing.T) {
-	t.Logf("ResolveChromiumPath() = %q (empty means the download path is used)",
-		newPlatformAdapter().ResolveChromiumPath())
-
-	mgr, err := NewManager(ManagerConfig{Headless: true})
-	if err != nil {
-		t.Logf("NewManager with the downloaded browser failed: %v", err)
-		dumpProbeArtifacts(t)
-		t.FailNow()
-	}
-	defer mgr.Close()
-	t.Logf("the downloaded browser started")
 }

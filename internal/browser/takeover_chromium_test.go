@@ -357,8 +357,6 @@ func TestTheBrowserRunsInsideTheOuterSandbox(t *testing.T) {
 	switch runtime.GOOS {
 	case "linux":
 		wrapper = "/bwrap"
-	case "darwin":
-		wrapper = "/sandbox-exec"
 	default:
 		t.Skip("this platform has no outer sandbox for the browser process")
 	}
