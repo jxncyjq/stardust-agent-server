@@ -25,18 +25,33 @@ import (
 
 const probeLaunchTimeout = 45 * time.Second
 
-// chromePathForProbe 找这台机器上的浏览器：setup-chrome 会设 CHROME_PATH。
+// chromePathForProbe 找**生产会用的那个**浏览器。
+//
+// 顺序与 PAL 一致（先 /Applications，再 CHROME_PATH），而不是反过来：此前反过来，
+// 于是探针一直在探 setup-chrome 装的 Chromium，而 e2e 跑的是 /Applications 里的
+// Google Chrome——探针全绿、e2e 全红，差的就是这个。两个浏览器要写的地方并不一样。
 func chromePathForProbe(t *testing.T) string {
 	t.Helper()
 
-	if p := strings.TrimSpace(os.Getenv("CHROME_PATH")); p != "" {
+	if p := newPlatformAdapter().ResolveChromiumPath(); p != "" {
 		return p
 	}
-	if p := newPlatformAdapter().ResolveChromiumPath(); p != "" {
+	if p := strings.TrimSpace(os.Getenv("CHROME_PATH")); p != "" {
 		return p
 	}
 	t.Skip("no chromium on this machine (set CHROME_PATH)")
 	return ""
+}
+
+// homeSubpaths 拼一条放行 HOME 底下若干目录的规则，供二分用。
+func homeSubpaths(dirs ...string) string {
+	var b strings.Builder
+	b.WriteString("(allow file-write*\n")
+	for _, dir := range dirs {
+		fmt.Fprintf(&b, "  (subpath %q)\n", filepath.Join(os.Getenv("HOME"), dir))
+	}
+	b.WriteString(")\n")
+	return b.String()
 }
 
 // TestProbeSandboxExecExists：`sandbox-exec` 在 Apple 的文档里被标了 deprecated
@@ -118,19 +133,46 @@ func userTempAllowRules() string {
 `, tmp, cache)
 }
 
+// shippedProfileFor 是出货的那一份（见 seatbeltProfile）。
+func shippedProfileFor(dir string) string {
+	profile, err := seatbeltProfile(seatbeltSpec{
+		UserDataDir: dir, TempDir: os.TempDir(), OnlyLoopbackEgress: true,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return profile
+}
+
 var probeProfiles = []probeProfile{
 	{
 		// 出货的那一份：见 seatbeltProfile。
 		name:            "shipped",
 		expectItToStart: true,
+		sbpl:            shippedProfileFor,
+	},
+	{
+		// 二分：Google Chrome（不是 Chromium）额外要写 ~/Library/Caches 吗？
+		name:            "shipped+library-caches",
+		expectItToStart: true,
 		sbpl: func(dir string) string {
-			profile, err := seatbeltProfile(seatbeltSpec{
-				UserDataDir: dir, TempDir: os.TempDir(), OnlyLoopbackEgress: true,
-			})
-			if err != nil {
-				panic(err)
-			}
-			return profile
+			return shippedProfileFor(dir) + homeSubpaths("Library/Caches")
+		},
+	},
+	{
+		// 二分：~/Library/Application Support？
+		name:            "shipped+application-support",
+		expectItToStart: true,
+		sbpl: func(dir string) string {
+			return shippedProfileFor(dir) + homeSubpaths("Library/Application Support")
+		},
+	},
+	{
+		// 二分：整个 ~/Library（最宽的一档，用来确认需求确实在 HOME 底下）。
+		name:            "shipped+whole-library",
+		expectItToStart: true,
+		sbpl: func(dir string) string {
+			return shippedProfileFor(dir) + homeSubpaths("Library")
 		},
 	},
 	{
