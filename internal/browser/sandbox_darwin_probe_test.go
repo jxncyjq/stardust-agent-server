@@ -368,3 +368,42 @@ func TestProbeTheProductionWrapperStartsTheBrowser(t *testing.T) {
 	defer func() { _ = browser.cmd.Process.Kill(); _ = browser.Wait() }()
 	t.Logf("devtools at %s", browser.controlURL)
 }
+
+// TestProbeTheManagerStartsTheBrowser 把差异逼到最后一段：**manager 自己拼的那组参数**。
+//
+// 上一条证明了包装（PrepareCommand）没问题，出货 profile 也通过了探针；而 e2e 里的
+// 浏览器仍然起不来。剩下唯一不同的就是 manager 经 go-rod launcher 拼出来的参数。
+// 失败时把参数与生成的 profile 都打出来——上一次在 Linux 上就是靠这两样才看清
+// Crashpad 的事。
+func TestProbeTheManagerStartsTheBrowser(t *testing.T) {
+	chrome := chromePathForProbe(t)
+
+	mgr, err := NewManager(ManagerConfig{Headless: true, BinPath: chrome})
+	if err != nil {
+		t.Logf("NewManager failed: %v", err)
+		dumpProbeArtifacts(t)
+		t.FailNow()
+	}
+	defer mgr.Close()
+	t.Logf("the manager started the browser")
+}
+
+// dumpProbeArtifacts 把 $TMPDIR/rod 底下最近那个 profile 目录里的 seatbelt.sb 打出来。
+func dumpProbeArtifacts(t *testing.T) {
+	t.Helper()
+
+	root := filepath.Join(os.TempDir(), "rod", "user-data")
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Logf("(no rod user-data at %s: %v)", root, err)
+		return
+	}
+	for _, entry := range entries {
+		path := filepath.Join(root, entry.Name(), "seatbelt.sb")
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		t.Logf("profile at %s:\n%s", path, data)
+	}
+}
