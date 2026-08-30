@@ -39,6 +39,12 @@ type RuntimeConfig struct {
 	// RequireSandbox：这台机器上没有外层隔离时宁可不启动浏览器（见 ManagerConfig）。
 	RequireSandbox bool
 
+	// MaxProcesses / MaxContextsPerProcess / ProcessMemoryLimitBytes 透传给进程池
+	// （见 poolConfig）。默认等价于池出现之前的形状：一个进程。
+	MaxProcesses            int
+	MaxContextsPerProcess   int
+	ProcessMemoryLimitBytes uint64
+
 	// MinFreeMemoryBytes 是**新建**浏览器会话的可用内存下限；<=0 关闭这条策略。
 	//
 	// 只挡新建：已经开着的会话继续可用——把用户正在看的页面掐掉，比多占一点内存
@@ -119,11 +125,14 @@ var _ RuntimeAPI = (*Runtime)(nil)
 // NewRuntime 拉起底层 Manager（Chromium 进程）并返回 go-rod 运行时。
 func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 	mgr, err := NewManager(ManagerConfig{
-		Headless:          cfg.Headless,
-		BinPath:           cfg.BinPath,
-		AllowPrivateHosts: cfg.AllowPrivateHosts,
-		RequireSandbox:    cfg.RequireSandbox,
-		Logger:            cfg.Logger,
+		Headless:                cfg.Headless,
+		BinPath:                 cfg.BinPath,
+		AllowPrivateHosts:       cfg.AllowPrivateHosts,
+		RequireSandbox:          cfg.RequireSandbox,
+		Logger:                  cfg.Logger,
+		MaxProcesses:            cfg.MaxProcesses,
+		MaxContextsPerProcess:   cfg.MaxContextsPerProcess,
+		ProcessMemoryLimitBytes: cfg.ProcessMemoryLimitBytes,
 	})
 	if err != nil {
 		return nil, err

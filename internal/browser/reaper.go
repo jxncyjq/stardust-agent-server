@@ -131,6 +131,12 @@ func (r *Runtime) startReaper(ctx context.Context) {
 				if reaped := r.reapIdle(t); len(reaped) > 0 {
 					slog.Info("browser: reaped idle sessions", "count", len(reaped), "sessions", reaped)
 				}
+				// 会话回收之后**才**做进程健康检查：刚被回收的会话释放了它的
+				// context，于是一个撑大的进程可能正好在这一刻变成空闲的，可以换掉。
+				// 反过来先查再回收，那个进程要多活一个周期。
+				if r.mgr != nil {
+					r.mgr.RecycleBloated()
+				}
 			}
 		}
 	}()

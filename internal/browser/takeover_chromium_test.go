@@ -236,7 +236,7 @@ func TestTheRealBrowserProcessIsConfined(t *testing.T) {
 	if _, err := NewPlatformAdapter().ConfineProcess(os.Getpid()); errors.Is(err, ErrConfinementUnsupported) {
 		t.Skipf("no outer confinement on this platform")
 	}
-	if rt.mgr.confinement == nil {
+	if firstChromium(t, rt).confinement == nil {
 		t.Error("the browser process was launched without a confinement; a crash of this agent leaves " +
 			"Chromium processes behind")
 	}
@@ -252,7 +252,10 @@ func TestClosingTheRuntimeLeavesNoBrowserBehind(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRuntime: %v", err)
 	}
-	pid := rt.mgr.launched.PID()
+	// 先把这个进程抓在手里：Close 会把池清空，之后再去池里找它就找不到了（而
+	// 「找不到」与「它已经被送走」是两件事，混为一谈会让这条断言变成空的）。
+	chromium := firstChromium(t, rt)
+	pid := chromium.launched.PID()
 	if pid == 0 {
 		t.Fatal("no browser pid; the runtime did not launch a process of its own")
 	}
@@ -268,11 +271,71 @@ func TestClosingTheRuntimeLeavesNoBrowserBehind(t *testing.T) {
 	// 这条测试在 Windows 上由 Job Object 的 kill-on-close 满足（变异实测：把 Close
 	// 里的 Kill 删掉它照样绿）。Kill 本身的作用在没有收束的平台上，由
 	// TestCloseKillsTheProcessEvenWithoutConfinement 单独钉。
-	state := rt.mgr.launched.cmd.ProcessState
-	if state == nil {
+	if chromium.launched.cmd.ProcessState == nil {
 		t.Fatalf("browser process %d was never reaped; Close left it running", pid)
 	}
-	if !state.Exited() {
-		t.Errorf("browser process %d state = %v, want an exited process", pid, state)
+}
+
+// firstChromium 取出运行时池里的第一个真 Chromium 进程。真机测试要看的是那个进程
+// 本身（收束、pid、退出状态），而池的其余部分（复用、扩容、回收）在 pool_test.go
+// 里用假成员测——那些分支在真机上几乎不可能稳定复现。
+func firstChromium(t *testing.T, rt *Runtime) *chromiumInstance {
+	t.Helper()
+
+	inst := rt.mgr.pool.firstInstance()
+	if inst == nil {
+		t.Fatal("the runtime has no browser process")
+	}
+	chromium, ok := inst.(*chromiumInstance)
+	if !ok {
+		t.Fatalf("pool instance is %T, want a real chromium process", inst)
+	}
+	return chromium
+}
+
+// TestTwoSessionsSpillIntoASecondBrowserProcess 是池在真机上的证据：把每进程的
+// 会话数压到 1，第二个会话就必须落到**另一个真的 Chromium 进程**上，而且两个会话
+// 都还能用。
+//
+// 池的其余分支（复用、拒绝、回收）在 pool_test.go 里用假成员测——那些在真机上要么
+// 造不出（内存撑大），要么会把测试变成对时序的赌博。
+func TestTwoSessionsSpillIntoASecondBrowserProcess(t *testing.T) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		_, _ = w.Write([]byte(`<html><body><h1>pooled</h1></body></html>`))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	rt, err := NewRuntime(RuntimeConfig{
+		Headless: true, AllowPrivateHosts: true, BinPath: systemChromeForTest(),
+		MaxProcesses: 2, MaxContextsPerProcess: 1,
+	})
+	if err != nil {
+		t.Fatalf("NewRuntime: %v", err)
+	}
+	defer rt.Close(context.Background(), CloseReq{})
+
+	first, err := rt.Open(context.Background(), OpenReq{URL: srv.URL})
+	if err != nil {
+		t.Fatalf("open first session: %v", err)
+	}
+	second, err := rt.Open(context.Background(), OpenReq{URL: srv.URL})
+	if err != nil {
+		t.Fatalf("open second session: %v", err)
+	}
+	if first.SessionID == second.SessionID {
+		t.Fatal("the two opens landed in one session; this test is not exercising the pool")
+	}
+	if got := rt.mgr.Processes(); got != 2 {
+		t.Errorf("browser processes = %d, want 2: the second session should have spilled into a new one", got)
+	}
+
+	// 两个会话都还能用——扩容不是「起了个进程」就算数，落在新进程上的那个也得能读。
+	for _, id := range []string{first.SessionID, second.SessionID} {
+		if _, err := rt.Read(context.Background(), ReadReq{SessionID: id}); err != nil {
+			t.Errorf("read session %s: %v", id, err)
+		}
 	}
 }

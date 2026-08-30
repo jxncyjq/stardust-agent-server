@@ -3,6 +3,7 @@
 package browser
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -35,14 +36,25 @@ func (linuxAdapter) DefaultLaunchArgs() []string {
 	}
 }
 
+// KillProcess 杀一个进程**连同它的整个进程组**。
+//
+// 按组而不是按 pid：Chromium 是多进程的，杀主进程带不走 renderer/GPU——那正是孤儿
+// 进程的来源。进程组由 PrepareCommand 的 Setpgid 建立；没有组（别处起的进程）时
+// 退回按 pid，并且这不是兜底：负号 pid 在没有该组时返回 ESRCH，那种情况下按 pid
+// 杀才是正确答案。
 func (linuxAdapter) KillProcess(pid int, graceful bool) error {
-	p, err := os.FindProcess(pid)
-	if err != nil {
-		return fmt.Errorf("find process %d: %w", pid, err)
-	}
 	sig := syscall.SIGKILL
 	if graceful {
 		sig = syscall.SIGTERM
+	}
+	if err := syscall.Kill(-pid, sig); err == nil {
+		return nil
+	} else if !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("signal %v to process group %d: %w", sig, pid, err)
+	}
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return fmt.Errorf("find process %d: %w", pid, err)
 	}
 	if err := p.Signal(sig); err != nil {
 		return fmt.Errorf("signal %v to %d: %w", sig, pid, err)
@@ -85,12 +97,25 @@ func (linuxAdapter) SafeDelete(path string) error {
 // 在此之前，Linux 上的边界是 Chromium 自己的渲染沙箱加部署侧的容器；本函数返回
 // ErrConfinementUnsupported，让部署自己决定是照常跑还是拒绝启动
 // （browser.require_sandbox）。
-// PrepareCommand 在 Linux 上目前原样返回。
+// PrepareCommand 在 Linux 上做两件**不需要任何特权**的事：
 //
-// 启动路径已经收回自管，所以 namespaces+seccomp 现在**有地方可放**了——它就该放在
-// 这里（unshare/bwrap 包住命令行，或 SysProcAttr 的 Cloneflags）。之所以还没做：
-// 需要在真 Linux 上验证「沙箱起得来、Chromium 仍能跑」，这台开发机验不了，靠 CI
-// 矩阵单独排一次。
-func (linuxAdapter) PrepareCommand(cmd *exec.Cmd) *exec.Cmd { return cmd }
+//  1. Pdeathsig=SIGKILL —— agent 进程一死，内核立刻杀掉这个 Chromium。这是 Windows
+//     那个 Job Object 的 kill-on-close 在 Linux 上的对应物：崩溃、被 kill -9、被
+//     容器停掉，都不会在机器上留下一串浏览器进程。
+//  2. Setpgid —— 让 Chromium 与它 fork 出来的 renderer/GPU 进程同属一个进程组，
+//     于是关闭时可以按组一次杀干净。杀主进程带不走它们（这正是孤儿的来源）。
+//
+// 它**不是**外层沙箱。namespaces+seccomp 的位置也在这里，但那要么依赖 bubblewrap
+// 之类的外部程序，要么需要 user namespace（CI runner 上常常没有——Chromium 自己的
+// zygote 沙箱就是因此在那里崩过，见 DefaultLaunchArgs 的 --no-sandbox）。选哪条路
+// 是一次要单独做的决定，不该混在这次「别留孤儿」里悄悄带过。
+func (linuxAdapter) PrepareCommand(cmd *exec.Cmd) *exec.Cmd {
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.Setpgid = true
+	cmd.SysProcAttr.Pdeathsig = syscall.SIGKILL
+	return cmd
+}
 
 func (linuxAdapter) ConfineProcess(int) (io.Closer, error) { return nil, ErrConfinementUnsupported }
