@@ -1909,6 +1909,17 @@ type ServeOptions struct {
 	// serves running at once — the second attachment is refused by name, because
 	// the first serve's plugins are still mounted under a loader it still owns.
 	App *app.App
+	// LoopbackHardening asks this assembly to mint a one-time bearer token
+	// (unless the operator configured an AdminToken) so only the embedder that
+	// receives it can reach the serve.
+	//
+	// It exists because the same thing used to be INFERRED from an empty Addr,
+	// and the inference was wrong for its only real caller: the Wails GUI asks
+	// for "127.0.0.1:0" explicitly -- it wants a random loopback port and says
+	// so -- so it was read as an ordinary local serve and hardened nothing. An
+	// embedder that wants the token now says that too, rather than encoding it
+	// in the absence of an unrelated field.
+	LoopbackHardening bool
 }
 
 // ServeResult holds the running service and a cleanup function.
@@ -2247,15 +2258,24 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		guiDefaultAddr = true
 	}
 
-	// App/GUI loopback hardening: when the server runs in GUI mode (no addr
-	// configured, so it defaulted to a random loopback port) or when hardening is
-	// explicitly requested via config, and no AdminToken is set, mint a one-time
-	// bearer token per startup so a local frontend can auto-connect without a
-	// pre-shared secret. An explicitly configured AdminToken is always respected.
-	// Auto-hardening is deliberately scoped to the GUI-defaulted loopback bind
-	// (not any loopback --addr) so an explicit `serve --addr 127.0.0.1:port`
-	// keeps its existing open local-serve behavior unless LoopbackHardening is on.
-	loopbackHardening := cfg.Server.LoopbackHardening || (guiDefaultAddr && isLoopbackAddr(addr))
+	// Loopback hardening: mint a one-time bearer token per startup so a local
+	// frontend can auto-connect without a pre-shared secret, and nothing else
+	// on the machine can connect at all. An explicitly configured AdminToken is
+	// always respected instead.
+	//
+	// Three ways in, and the option is the one that matters: an EMBEDDER asking
+	// for it (opts), an operator configuring it (cfg), or a serve that was
+	// handed no address whatsoever and defaulted to a random loopback port. The
+	// last one used to be the only automatic path and was written as "this must
+	// be the GUI" -- but the GUI passes its address explicitly, so that reading
+	// hardened every process except the one it was for. It is kept only for
+	// callers that really do pass nothing.
+	//
+	// Deliberately still NOT any loopback --addr: an explicit
+	// `serve --addr 127.0.0.1:port` keeps its open local-serve behaviour, since
+	// its existing clients hold no token.
+	loopbackHardening := cfg.Server.LoopbackHardening || opts.LoopbackHardening ||
+		(guiDefaultAddr && isLoopbackAddr(addr))
 	adminToken := cfg.Server.AdminToken
 	if loopbackHardening && adminToken == "" {
 		tok, err := server.GenerateLoopbackToken()

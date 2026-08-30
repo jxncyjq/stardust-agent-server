@@ -56,9 +56,19 @@
 2. **审批卡片把插件的票显示成宿主的**：卡片是从 SSE `approval_pending` 事件渲染的，而那个事件不带 `requested_by`/`reason`；前端按契约把缺失的来源读作宿主。`GET /v1/approvals` 早就带这两个字段（G4c 加的）——**同一份数据两条通路，只补了一条**，单测与接口全绿，错的只有屏幕上那张卡片。
 3. **挂起等待审批被当成任务结束**：`TERMINAL_STATUSES` 含 `suspended`，气泡冻结在「任务状态: suspended，暂无结果」；人批准、工具执行、任务 done，屏幕再也不动。对用户就是「批准之后什么也没发生」。
 
-### 一个发现（未改，需要产品决定）
+### 第四个缺陷：加固在它唯一的目标场景里从未生效（已修）
 
-**自动 loopback hardening 在 GUI 场景永远不触发**：`serve` 只在 `addr == ""` 时判定为 GUI 模式并铸 token，而 GUI 显式传 `127.0.0.1:0`。也就是说这条加固在它唯一的目标场景里没生效——今天 GUI 起的 serve 不要求任何 token。缺陷 1 因此是**休眠**的：任何部署一旦打开 `server.loopback_hardening` 或配了 `admin_token`，GUI 立刻整个写不动。要不要让 GUI 的默认形态真的进入 hardening，是一个安全姿态的决定，不该顺手改。
+**自动 loopback hardening 在 GUI 场景永远不触发**：`serve` 只在 `addr == ""` 时判定为「这是嵌入方」并铸 token，而 GUI 显式传 `127.0.0.1:0`——它要一个随机 loopback 端口，并且说了出来。于是这条加固在它唯一的目标场景里没生效：**每一个出厂的 GUI 都在跑一个谁都不问的 agent**，机器上任何进程都能列会话、经 `/v1/files` 读工作区、提交任务。缺陷 1（写路径不带 token）也因此是休眠的——它只在别人手动打开 `loopback_hardening` 时才炸。
+
+修法是**让嵌入方明说，而不是从一个无关字段的缺席里去猜**：
+
+- `ServeOptions.LoopbackHardening`（`serve.Options` 是它的别名，GUI 拿得到），与 `cfg.Server.LoopbackHardening` 并列；`addr == ""` 这条自动路径保留，但只服务真的什么都没传的调用方。
+- `ServeManager.Start` 传 `LoopbackHardening: true`。
+- 仍然**不**对任意 loopback `--addr` 自动加固：`serve --addr 127.0.0.1:8080` 的既有客户端手里没有 token，替他们决定就是把他们踢下线。
+
+证据是行为而不是字段：铸没铸 token 说明不了什么，一个中间件没装好的构建照样能让「`Token != ""`」通过。两侧的测试都打真的 HTTP——server 侧「无 token → 401、带 token → 不是 401」，GUI 侧走 `postJSON`（**写**路径，不带自己的 header，完全依赖传输层；`apiGet` 自己设 header，用读路径测等于什么都没测）。变异验证：去掉 `opts.LoopbackHardening` 那一项，未加固的 serve 对无 token 的 `GET /v1/sessions` 回 **200**——这就是缺陷本身的取证。
+
+**一个已知后果**：文件卡片的「复制链接」复制出的 `http://127.0.0.1:<port>/v1/files?...` 在外部浏览器里现在是 401。这正是加固要堵的洞（一个无鉴权的本地文件服务在对整台机器发工作区文件），但对用户是个功能回退。把 token 拼进剪贴板不是解法。留待产品决定：或改成「导出到某处」，或在卡片上说明该链接仅应用内有效。
 
 ### 一次自我纠正（值得记）
 
