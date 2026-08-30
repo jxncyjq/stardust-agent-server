@@ -2540,6 +2540,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 			SnapshotArchiveDir:    cfg.Browser.SnapshotArchiveDir,
 			Extractor:             adapter.NewMaasSnapshotExtractor(defaultMaas),
 			RequireSandbox:        cfg.Browser.RequireSandbox,
+			MinFreeMemoryBytes:    cfg.Browser.MinFreeMemoryMB << 20,
 			Logger:                logger,
 		}
 		if repo, ok := taskStore.(*storage.SQLiteRepository); ok {

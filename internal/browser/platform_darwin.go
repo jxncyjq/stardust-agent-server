@@ -47,9 +47,6 @@ func (darwinAdapter) KillProcess(pid int, graceful bool) error {
 	return nil
 }
 
-func (darwinAdapter) SampleProcessMemory(pid int) uint64 { return 0 } // 占位：Phase 6 task_info/ps
-func (darwinAdapter) AvailableSystemMemory() uint64      { return 0 } // 占位：Phase 8
-
 func (darwinAdapter) AppDataDir() string {
 	return filepath.Join(os.Getenv("HOME"), "Library", "Application Support", "stardust", "browser")
 }

@@ -29,6 +29,12 @@ const (
 	// 动作恰好相同，但一个是「你打错了」，另一个是「它超时了」，排查方向相反。
 	CodeSessionNotFound Code = "SESSION_NOT_FOUND"
 
+	// CodeResourceExhausted 是「这台机器现在开不下一个新的浏览器会话」。
+	//
+	// 与「页面坏了」分开是因为补救动作完全不同：Agent 收到它应当稍后再试或改用
+	// 不开浏览器的办法，而不是重读页面或换一个 URL。
+	CodeResourceExhausted Code = "RESOURCE_EXHAUSTED"
+
 	// CodeTakeoverRequired 是「这个会话**没有**在接管，先进接管再注入」。
 	//
 	// 它与 CodeTakeover 互为反面，而此前两种状态共用后者一个码：注入被拒时回的

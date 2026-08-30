@@ -279,6 +279,13 @@ type BrowserConfig struct {
 	// 上限），Linux/macOS 上打开它等于关掉浏览器功能。打开它的部署换来的是「要么
 	// 被收束、要么明确失败」，而不是「以为自己被收束」。
 	RequireSandbox bool `json:"require_sandbox"`
+
+	// MinFreeMemoryMB 是**新建**浏览器会话前要求的可用物理内存下限（MiB）；
+	// 0 关闭这条策略。
+	//
+	// 只挡新建：已经开着的会话继续可用——把用户正在看的页面掐掉，比多占一点内存
+	// 更糟。读不到内存时不拦（安全余量不该变成一次停摆），但会记 Warn。
+	MinFreeMemoryMB uint64 `json:"min_free_memory_mb"`
 	// SessionTTLSeconds 是浏览器会话的空闲回收阈值（秒）。0 = 不回收（reaper 关闭）。
 	SessionTTLSeconds int `json:"session_ttl_seconds"`
 	// ReapIntervalSeconds 是 reaper 后台扫描间隔（秒）。0 = 默认 60s。
