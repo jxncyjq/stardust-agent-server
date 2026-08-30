@@ -39,7 +39,7 @@ Cordis 是**进程内 TS 插件内核**——dsh 的一切（shell / llm / sessi
 | **G6 缓存治理** | eviction API + 不可信包落缓存后的清理 | 无 | 1-2 天 | 否 |
 | **G7 密钥吊销** | keyring 吊销列表 + 装配期与 reload 期校验 | 无 | 3-4 天 | 否 |
 | **D1 服务接缝** | 命名服务：按能力名依赖而不是按工具名。**已决策**（做命名服务 / 先到先得 / 唯一提供者），**D1a + D1b 已交付** | G4a 的授权面 | 中 | 已拍板 |
-| **待决策 D2** | scope 遮蔽 / restriction（per-agent 同名工具替换） | — | 中 | **是** |
+| ~~**待决策 D2**~~ | scope 遮蔽 / restriction（per-agent 同名工具替换） | — | — | **已决策：不做**（2026-08-30，见 `specs/2026-08-30-plugin-scope-shadowing-design.md`）。变体用不同名字表达，靠 `disabled_tools` 分发 |
 
 ---
 
@@ -161,9 +161,11 @@ Cordis 的三角色契约（Service Definition / Provider / Consumer）让「换
 
 要不要做，取决于一个产品问题：**是否允许第三方插件成为宿主能力的实现方**（例如让插件提供 `ctx.web` 的一种实现）。允许则需要一整套「谁能替换什么」的授权模型，安全含义远大于工具贡献。**在回答这个问题之前不要动手。**
 
-### 待决策 D2：scope 遮蔽 / restriction
+### D2：scope 遮蔽 / restriction —— **已决策：不做**（2026-08-30）
 
-Legion 今天有 per-agent `disabled_tools`（禁用清单），但没有 Cordis 的「同名工具在某 agent 内被替换」。要不要做，取决于是否需要 per-agent 的工具变体与人格化。技术上不难，难在语义：遮蔽会让「模型看到的工具」与「清单里的工具」不再一一对应，排查成本上升。
+Legion 今天有 per-agent `disabled_tools`（禁用清单），但没有 Cordis 的「同名工具在某 agent 内被替换」。**决定不做**：per-agent 变体继续用不同的**名字**表达，靠 `disabled_tools` 分发。
+
+理由与重开条件写在 `specs/2026-08-30-plugin-scope-shadowing-design.md` §6，一句话版本：一一对应（模型看到的名字 = 实际会跑的东西）在排查时的价值，高于提示词里少一个近义工具；而覆盖表与 G4 拒绝过的「不可见的换掉的东西」是同一形状。
 
 ---
 
