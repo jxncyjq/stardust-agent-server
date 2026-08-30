@@ -32,8 +32,15 @@ func (s *HTTPServer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	eventType := r.URL.Query().Get("type")
 	events, cancel := s.platformEvents.Subscribe(r.Context())
 	defer cancel()
+	// 这一代凭证的失效信号，在进入循环前取一次：取到之后发生的轮换会关闭它。
+	revoked := s.tokens.Changed()
 	for {
 		select {
+		case <-revoked:
+			// 先说明再断开：直接断开在客户端看来与掉线没有区别，它会带着已经作废
+			// 的 token 无限重试。
+			writeReauth(w)
+			return
 		case event, ok := <-events:
 			if !ok {
 				return
