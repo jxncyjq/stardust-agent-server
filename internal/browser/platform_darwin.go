@@ -149,25 +149,35 @@ func (darwinAdapter) ConfineProcess(pid int) (io.Closer, error) {
 	if err := watchdog.Start(); err != nil {
 		return nil, fmt.Errorf("start the orphan watchdog for pid %d: %w", pid, err)
 	}
-	return &darwinWatchdog{cmd: watchdog}, nil
+	return &darwinWatchdog{cmd: watchdog, pid: pid}, nil
 }
 
-// darwinWatchdog 关掉那个看门狗。正常关闭时浏览器已经被我们自己收掉了，看门狗留着
-// 只会白等一个不会来的事件。
-type darwinWatchdog struct{ cmd *exec.Cmd }
+// darwinWatchdog 是那个浏览器进程的隔离句柄。
+//
+// Close 遵守与 Windows Job Object **相同的契约：关掉隔离，进程跟着走**。看门狗只覆盖
+// 「agent 被 SIGKILL」那条路径；正常关闭走的是这里，所以这里必须自己动手——否则同一个
+// 接口在两个平台上意味着两件事，调用方无从写对（共用的那条隔离测试正是这么红的）。
+type darwinWatchdog struct {
+	cmd *exec.Cmd
+	pid int
+}
 
 func (w *darwinWatchdog) Close() error {
-	if w.cmd.Process == nil {
-		return nil
+	var errs []error
+	// 先杀被隔离的那个进程组（负号 = 整组）：Chromium 是多进程的，杀主进程带不走
+	// renderer/GPU。已经没了（ESRCH）是正常的——正常关闭路径可能刚收过它。
+	if err := syscall.Kill(-w.pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		errs = append(errs, fmt.Errorf("kill the confined process group %d: %w", w.pid, err))
 	}
-	if err := w.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		return fmt.Errorf("stop the orphan watchdog: %w", err)
+	if w.cmd.Process != nil {
+		if err := w.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			errs = append(errs, fmt.Errorf("stop the orphan watchdog: %w", err))
+		}
+		if _, err := w.cmd.Process.Wait(); err != nil && !errors.Is(err, syscall.ECHILD) {
+			errs = append(errs, fmt.Errorf("reap the orphan watchdog: %w", err))
+		}
 	}
-	_, err := w.cmd.Process.Wait()
-	if err != nil && !errors.Is(err, syscall.ECHILD) {
-		return fmt.Errorf("reap the orphan watchdog: %w", err)
-	}
-	return nil
+	return errors.Join(errs...)
 }
 
 func fileExistsDarwin(p string) bool {
