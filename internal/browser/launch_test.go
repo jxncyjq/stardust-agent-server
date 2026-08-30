@@ -285,3 +285,23 @@ func TestATimedOutLaunchStillReportsWhatTheBrowserSaid(t *testing.T) {
 		t.Errorf("error = %v, want it to carry what the browser printed before it stalled", err)
 	}
 }
+
+// TestALaunchThatDiesImmediatelyFailsImmediately：进程秒退却等满整个启动超时，是
+// 两件事叠出来的——父进程手里还留着 stderr 管道的写端，于是子进程死了读端也不 EOF。
+// CI 上 bwrap 立刻失败、而调用方干等 45 秒，就是这个。
+func TestALaunchThatDiesImmediatelyFailsImmediately(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	started := time.Now()
+	_, err := launchChromium(ctx, launchSpec{Bin: helperCommandPath(t), Args: []string{"version"}})
+	if err == nil {
+		t.Fatal("a process that never announces a DevTools address was accepted as a browser")
+	}
+	if elapsed := time.Since(started); elapsed > 10*time.Second {
+		t.Errorf("took %s to notice the process had exited; the caller waited for the whole launch timeout "+
+			"instead of for the process", elapsed)
+	}
+}

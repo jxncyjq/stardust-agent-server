@@ -2,6 +2,7 @@ package browser
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -53,6 +54,13 @@ func bubblewrapArgs(spec bubblewrapSpec, command []string) ([]string, error) {
 	userDataDir, err := filepath.Abs(spec.UserDataDir)
 	if err != nil {
 		return nil, fmt.Errorf("resolve the browser user data dir %q: %w", spec.UserDataDir, err)
+	}
+	// 先把目录建出来：bwrap 绑定的**源路径必须已经存在**，而 go-rod 的 launcher 只是
+	// 挑一个路径，真正创建它的是 Chromium 自己——于是在沙箱里那一步永远轮不到。
+	// 症状是 "bwrap: Can't find source path ...: No such file or directory"，而浏览器
+	// 一个字都没来得及说。
+	if err := os.MkdirAll(userDataDir, 0o700); err != nil {
+		return nil, fmt.Errorf("create the browser user data dir %q: %w", userDataDir, err)
 	}
 
 	args := []string{

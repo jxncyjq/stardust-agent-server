@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -104,23 +105,42 @@ func (b *launchedBrowser) Wait() error {
 // 采样、由进程池决定生死。
 func launchChromium(ctx context.Context, spec launchSpec) (*launchedBrowser, error) {
 	cmd := exec.Command(spec.Bin, spec.Args...)
-	stderr, err := cmd.StderrPipe()
+	// 自己开管道，而不是 cmd.StderrPipe()：那个管道的写端由 os/exec 在 Wait 里关，
+	// 而我们在 Wait 之前就要读。父进程手里留着一个写端，子进程死了读端也不会 EOF
+	// ——于是「浏览器秒退」会表现成「等满整个启动超时」。CI 上 bwrap 立刻失败、
+	// 而我们干等 45 秒，就是这个。
+	reader, writer, err := os.Pipe()
 	if err != nil {
 		return nil, fmt.Errorf("pipe chromium stderr: %w", err)
 	}
+	// 读端的归属：成功时交给 drainOutput 那个 goroutine（它一直读到进程结束），
+	// 失败时由这里关掉。不能用一个无条件的 defer——那会在成功路径上把 drainer 脚下
+	// 的管道抽走，而症状是浏览器跑着跑着无声地卡住（见 output 字段的注释）。
+	closeReader := true
+	defer func() {
+		if closeReader {
+			_ = reader.Close()
+		}
+	}()
+	cmd.Stderr = writer
 	if spec.PAL != nil {
 		prepared, err := spec.PAL.PrepareCommand(cmd)
 		if err != nil {
+			_ = writer.Close()
 			return nil, err
 		}
 		cmd = prepared
 	}
 	if err := cmd.Start(); err != nil {
+		_ = writer.Close()
 		return nil, fmt.Errorf("start chromium %s: %w", spec.Bin, err)
 	}
+	// 父进程立刻放掉写端：只有当**子进程**手里那一份也没了（它退出了），读端才会
+	// EOF。留着它就是上面说的那个 45 秒。
+	_ = writer.Close()
 
 	browser := &launchedBrowser{cmd: cmd}
-	url, err := readDevToolsURL(ctx, stderr, browser)
+	url, err := readDevToolsURL(ctx, reader, browser)
 	if err != nil {
 		// 起来了但没宣告地址 = 一个我们连不上、又还在跑的进程。杀掉它，否则每
 		// 一次失败的启动都在机器上留一个。
@@ -132,7 +152,12 @@ func launchChromium(ctx context.Context, spec launchSpec) (*launchedBrowser, err
 	}
 	browser.controlURL = url
 	// 接着读：宣告完地址就撒手不管，Chromium 会在几十 KB 之后卡在写 stderr 上。
-	go browser.drainOutput(stderr)
+	// 读端从这里起归 drainer 所有（它读到进程结束、管道 EOF 为止）。
+	closeReader = false
+	go func() {
+		defer func() { _ = reader.Close() }()
+		browser.drainOutput(reader)
+	}()
 	return browser, nil
 }
 
