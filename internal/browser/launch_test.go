@@ -180,17 +180,25 @@ func TestCloseKillsTheProcessEvenWithoutConfinement(t *testing.T) {
 
 	manager.Close()
 
-	// 判活不能用 Signal(0)：Windows 上 os.Process.Signal 对任何信号都返回错误，
-	// 于是那种写法在这台机器上恒为「已经死了」——一条永远绿的断言。改看
-	// ProcessState：Close 里 Kill 之后会 Wait，进程真的结束了它才非 nil。
-	state := sleeper.ProcessState
-	if state == nil {
-		_ = sleeper.Process.Kill()
+	assertReaped(t, sleeper)
+}
+
+// assertReaped 断言这个进程已经结束、且已经被收尸。
+//
+// 只看 ProcessState 是否非 nil，**不问它是怎么死的**：Close 用的是 SIGKILL/
+// TerminateProcess，而 unix 上被信号杀死的进程 ProcessState.Exited() 是 **false**
+// （它是被信号终止的，不是自己退出的），Windows 上则是 true。第一版按 Exited()
+// 断言，于是本机绿、CI 的 ubuntu 与 macos 两条全红——正是这个矩阵存在的理由。
+//
+// 也不能用 Signal(0) 探活：Windows 上 os.Process.Signal 对任何信号都返回错误，
+// 那样写等于一条永远绿的断言。
+func assertReaped(t *testing.T, cmd *exec.Cmd) {
+	t.Helper()
+
+	if cmd.ProcessState == nil {
+		_ = cmd.Process.Kill()
 		t.Fatal("Close returned without reaping the process: on a platform without confinement " +
 			"the browser would be left running")
-	}
-	if !state.Exited() {
-		t.Errorf("process state = %v, want an exited process", state)
 	}
 }
 
@@ -216,12 +224,5 @@ func TestClosingKillsTheWholeBrowserProcessGroup(t *testing.T) {
 
 	manager.Close()
 
-	state := parent.ProcessState
-	if state == nil {
-		_ = parent.Process.Kill()
-		t.Fatal("Close returned without reaping the process")
-	}
-	if !state.Exited() {
-		t.Errorf("process state = %v, want an exited process", state)
-	}
+	assertReaped(t, parent)
 }

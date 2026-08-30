@@ -268,11 +268,7 @@ func TestClosingTheRuntimeLeavesNoBrowserBehind(t *testing.T) {
 	// 这条测试在 Windows 上由 Job Object 的 kill-on-close 满足（变异实测：把 Close
 	// 里的 Kill 删掉它照样绿）。Kill 本身的作用在没有收束的平台上，由
 	// TestCloseKillsTheProcessEvenWithoutConfinement 单独钉。
-	state := rt.mgr.launched.cmd.ProcessState
-	if state == nil {
+	if rt.mgr.launched.cmd.ProcessState == nil {
 		t.Fatalf("browser process %d was never reaped; Close left it running", pid)
-	}
-	if !state.Exited() {
-		t.Errorf("browser process %d state = %v, want an exited process", pid, state)
 	}
 }
