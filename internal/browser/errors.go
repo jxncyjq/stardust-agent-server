@@ -14,6 +14,27 @@ const (
 	CodeProtocolBlocked    Code = "PROTOCOL_BLOCKED"       // 危险协议被拦（file://、chrome://、data:）
 	CodePrivateHostBlocked Code = "PRIVATE_HOST_BLOCKED"   // 私网地址被 SSRF 拦截
 	CodeTakeover           Code = "SESSION_UNDER_TAKEOVER" // 会话被人工接管，Agent 写动作暂挡
+
+	// CodeInvalidInput 是「这次**请求**写错了」，与页面上有什么无关：空批次、
+	// 越界坐标、认不出的键名、越界视口。
+	//
+	// 它存在是因为这些错误此前一律回 ELEMENT_NOT_FOUND，也就是在建议调用方
+	// 「重新 read 一次页面」——照做是白做，页面没有任何问题。重试同一个请求也
+	// 永远不会成功，改请求才会。
+	CodeInvalidInput Code = "INVALID_INPUT"
+
+	// CodeSessionNotFound 是「这个 id 没有对应的会话」，与 CodeContextEvicted
+	// 分开：后者的意思是「你**曾经**有的那个会话，它的浏览器上下文被回收了，
+	// 重建一个」，对一个从未存在过的 id 说这句话是在编造一段历史。两者的补救
+	// 动作恰好相同，但一个是「你打错了」，另一个是「它超时了」，排查方向相反。
+	CodeSessionNotFound Code = "SESSION_NOT_FOUND"
+
+	// CodeTakeoverRequired 是「这个会话**没有**在接管，先进接管再注入」。
+	//
+	// 它与 CodeTakeover 互为反面，而此前两种状态共用后者一个码：注入被拒时回的
+	// 是 SESSION_UNDER_TAKEOVER——字面意思正是它拒绝的理由的反面，只能靠后面的
+	// 散文分辨。
+	CodeTakeoverRequired Code = "TAKEOVER_REQUIRED"
 )
 
 // BrowserError 携带语义码，供工具层映射到 domain.ToolResult.Error。

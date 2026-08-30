@@ -27,6 +27,56 @@ func parseBrowserActionID(path string) (id, action string, ok bool) {
 	return id, action, true
 }
 
+// writeBrowserError answers a browser runtime error with the status its
+// SEMANTIC CODE implies, and nothing else decides it.
+//
+// Each handler used to pick a status by hand, and they disagreed: the same
+// "unknown session" was 404 from takeover and 400 from input and viewport, so a
+// client had to write three checks for one condition — and at least two of the
+// three were wrong on the other endpoints. Deriving it here means adding a code
+// is one edit, not four, and forgetting one endpoint is no longer possible.
+func writeBrowserError(w http.ResponseWriter, err error) {
+	var be *browser.BrowserError
+	if !errors.As(err, &be) {
+		// No semantic code is a gap in OUR wiring, not the caller's mistake:
+		// answering 400 would blame them for something they cannot fix, and
+		// hide it from every dashboard that watches 5xx.
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeError(w, httpStatusForBrowserCode(be.Code), err.Error())
+}
+
+// httpStatusForBrowserCode maps one semantic code onto the status that carries
+// the same advice.
+//
+//   - 400: the request itself is wrong; retrying it unchanged can never work.
+//   - 403: the deployment refuses this target, whatever the caller does.
+//   - 404: there is no such session.
+//   - 409: the session exists but is in the wrong state for this call — its
+//     page is gone, or takeover is (not) on. The same request works once the
+//     state changes.
+//   - 500: everything else, including a code added without a mapping. It is
+//     deliberately noisy rather than a plausible-looking 400.
+func httpStatusForBrowserCode(code browser.Code) int {
+	switch code {
+	case browser.CodeInvalidInput:
+		return http.StatusBadRequest
+	case browser.CodeProtocolBlocked, browser.CodePrivateHostBlocked:
+		return http.StatusForbidden
+	case browser.CodeSessionNotFound:
+		return http.StatusNotFound
+	case browser.CodeContextEvicted, browser.CodeTakeover, browser.CodeTakeoverRequired,
+		browser.CodeElementNotFound:
+		// ELEMENT_NOT_FOUND belongs here rather than with the malformed
+		// requests: the request was well-formed, the page moved underneath it.
+		// Re-reading and asking again is exactly what 409 tells a client.
+		return http.StatusConflict
+	default:
+		return http.StatusInternalServerError
+	}
+}
+
 type takeoverRequest struct {
 	Enabled bool `json:"enabled"`
 }
@@ -58,7 +108,7 @@ func (s *HTTPServer) handleBrowserViewport(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if err := s.browser.SetViewport(id, req.Width, req.Height); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeBrowserError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"session_id": id, "width": req.Width, "height": req.Height})
@@ -81,7 +131,7 @@ func (s *HTTPServer) handleBrowserTakeover(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if err := s.browser.SetTakeover(id, req.Enabled); err != nil {
-		writeError(w, http.StatusNotFound, err.Error())
+		writeBrowserError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"session_id": id, "takeover": req.Enabled})
@@ -104,15 +154,7 @@ func (s *HTTPServer) handleBrowserInput(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := s.browser.InjectInput(id, req.Events); err != nil {
-		// 未接管即注入 → InjectInput 返回 *browser.BrowserError{Code: CodeTakeover}；
-		// 用 errors.As 而非字符串匹配做判别，健壮穿透错误链，映射 409（须先进接管）。
-		// 其它（校验失败/无活跃页）→ 400。
-		var be *browser.BrowserError
-		if errors.As(err, &be) && be.Code == browser.CodeTakeover {
-			writeError(w, http.StatusConflict, err.Error())
-			return
-		}
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeBrowserError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"session_id": id, "injected": len(req.Events)})
