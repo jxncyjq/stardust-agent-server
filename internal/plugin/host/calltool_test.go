@@ -565,3 +565,66 @@ func TestCallToolFromInsideOpManifestIsDeniedForNoBudget(t *testing.T) {
 		t.Errorf("published %d denial events, want exactly 1: %v", len(denied), denied)
 	}
 }
+
+// TestCallToolResolvesAServiceTargetToTheProvidersTool is the WIRING test: the
+// resolution helper having its own tests proves nothing if call_tool never
+// calls it. Everything downstream must see the resolved tool — the shared
+// budget above all, since a service name counted separately would be a channel
+// around the task's allowance.
+func TestCallToolResolvesAServiceTargetToTheProvidersTool(t *testing.T) {
+	env := newTestEnv(t)
+	env.deps.Services = resolverFunc(func(service, capability string) (string, error) {
+		if service != "echo-service" || capability != "say" {
+			return "", fmt.Errorf("unexpected %q/%q", service, capability)
+		}
+		return "echo_tool", nil
+	})
+	inst := newHostcallInstance(t, fullGrant(), env.deps)
+	budget := newFakeBudget(30)
+
+	out, err := inst.Invoke(budgetedCtx(budget), opCallCallTool, callToolBody(t, callToolRequest{
+		CallID:    "call-1",
+		Tool:      "service:echo-service/say",
+		Arguments: map[string]string{"text": "hi"},
+	}))
+	if err != nil {
+		t.Fatalf("Invoke(call_tool): %v", err)
+	}
+	var result domain.ToolResult
+	if err := json.Unmarshal(out, &result); err != nil {
+		t.Fatalf("decode call_tool response %s: %v", out, err)
+	}
+	if !result.Success || result.Output != "echo:hi" {
+		t.Fatalf("call_tool response = %s, want the provider's tool to have run", out)
+	}
+	if got := budget.names(); len(got) != 1 || got[0] != "echo_tool" {
+		t.Errorf("shared budget recorded %v, want the RESOLVED name [echo_tool]", got)
+	}
+}
+
+// TestCallToolRefusesAnUnresolvableServiceWithoutSpendingBudget: a name that
+// resolves to nothing never reached a tool, so it must not cost the task's
+// allowance — and the answer has to say it was a SERVICE that could not be
+// resolved, not that some tool was missing.
+func TestCallToolRefusesAnUnresolvableServiceWithoutSpendingBudget(t *testing.T) {
+	env := newTestEnv(t)
+	env.deps.Services = resolverFunc(func(string, string) (string, error) {
+		return "", fmt.Errorf("no mounted plugin provides service %q", "echo-service")
+	})
+	inst := newHostcallInstance(t, fullGrant(), env.deps)
+	budget := newFakeBudget(30)
+
+	out, err := inst.Invoke(budgetedCtx(budget), opCallCallTool, callToolBody(t, callToolRequest{
+		CallID: "call-1",
+		Tool:   "service:echo-service/say",
+	}))
+	if err != nil {
+		t.Fatalf("Invoke(call_tool): %v", err)
+	}
+	if !strings.Contains(string(out), "no mounted plugin provides service") {
+		t.Errorf("response = %s, want the resolver's own reason", out)
+	}
+	if got := budget.names(); len(got) != 0 {
+		t.Errorf("shared budget recorded %v for a call that never reached a tool, want nothing", got)
+	}
+}

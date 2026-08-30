@@ -199,3 +199,28 @@ pub fn invoke_tool(request: &str) -> Vec<u8> {
     let b = request.as_bytes();
     unsafe { crate::abi::take_host_body(call_tool(b.as_ptr() as i32, b.len() as i32)) }
 }
+
+/// invoke_service 按**能力名**调用当前提供者，而不是写死某个插件的工具名：
+/// `invoke_service("issue-tracker", "search", r#"{"q":"bug"}"#)` 发出的
+/// `tool` 是 `service:issue-tracker/search`，宿主解析到此刻提供该服务的插件的
+/// 工具。换提供者不用改这里。
+///
+/// 与 [`invoke_tool`] 的边界完全相同（深度上限 3、与模型共用 per-task 预算），
+/// 因为解析之后走的就是同一条路。
+///
+/// 依赖某个服务时，`plugin.json` 里要用 `requires_services` 列出它——没有提供者
+/// 时本插件会 `suspended`（不是卸载），提供者到场即恢复。
+///
+/// `arguments_json` 传 `"{}"` 表示无参数。它被原样嵌进请求体，所以必须是一个
+/// 合法的 JSON 对象；这里不代为拼装，是为了不在 guest 侧多养一个 JSON 编码器。
+#[cfg(feature = "tool-capability")]
+#[allow(dead_code)]
+pub fn invoke_service(service: &str, capability: &str, arguments_json: &str) -> Vec<u8> {
+    let request = format!(
+        "{{\"tool\":\"service:{}/{}\",\"arguments\":{}}}",
+        crate::json::escape(service),
+        crate::json::escape(capability),
+        arguments_json,
+    );
+    invoke_tool(&request)
+}

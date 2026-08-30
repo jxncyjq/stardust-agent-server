@@ -571,9 +571,18 @@ func (h hostCalls) callTool(ctx context.Context, m api.Module, ptr, length uint3
 	if req.Tool == "" {
 		return h.writeError(ctx, m, CodeInvalidRequest, "call_tool: tool must not be empty")
 	}
+	// A "service:<name>/<capability>" target is resolved to the tool of
+	// whoever provides that service right now; a plain tool name passes
+	// through. Resolution happens BEFORE the counters so everything
+	// downstream — the shared budget, the registry, the audit trail — sees the
+	// tool that actually runs, not the name it was reached through.
+	toolName, err := resolveServiceTarget(h.deps, req.Tool)
+	if err != nil {
+		return h.writeError(ctx, m, CodeInvalidRequest, fmt.Sprintf("call_tool: %v", err))
+	}
 	call := domain.ToolCall{
 		ID:        req.CallID,
-		Name:      req.Tool,
+		Name:      toolName,
 		Arguments: req.Arguments,
 	}
 	// The name the counters use is the tool actually reached, not the wrapper it

@@ -209,6 +209,22 @@ type PluginManifest struct {
 	// like a tool without conflicting, because the model never sees service
 	// names and nothing dispatches through them.
 	RequiresServices []string `json:"requires_services,omitempty"`
+
+	// ServiceCapabilities maps each provided service to the CAPABILITY names
+	// consumers call, and each of those to one of this plugin's own tools:
+	//
+	//	"service_capabilities": {"issue-tracker": {"search": "jira_search"}}
+	//
+	// Capability names are deliberately not tool names. If they had to match,
+	// swapping providers would mean making two plugins agree on a tool name —
+	// exactly the coupling named services exist to remove. A consumer calls
+	// "service:issue-tracker/search" and never learns whose tool ran.
+	//
+	// Contract-declared optional: a provider may claim a service name without
+	// exposing anything callable yet (D1a's convergence only cares about who
+	// holds the name). What is NOT optional is that whatever it does map holds
+	// up — see validateServiceCapabilities.
+	ServiceCapabilities map[string]map[string]string `json:"service_capabilities,omitempty"`
 }
 
 // Limits is the resource envelope a plugin asks for. MaxMemoryPages and
@@ -572,6 +588,9 @@ func validatePlugin(pm PluginManifest) error {
 	if err := validateNoSelfService(pm.Name, pm.ProvidesServices, pm.RequiresServices); err != nil {
 		return err
 	}
+	if err := validateServiceCapabilities(pm.Name, pm.ProvidesServices, pm.ServiceCapabilities, seenTools); err != nil {
+		return err
+	}
 	if err := validateRequires(pm.Name, pm.Requires, seenTools); err != nil {
 		return err
 	}
@@ -635,6 +654,48 @@ func validateNoSelfService(pluginName string, provides, requires []string) error
 			return fmt.Errorf("parse plugin manifest %q: requires_services %q, which this plugin provides "+
 				"itself; a plugin cannot require its own service (it would always trivially resolve while "+
 				"adding a self-loop that pollutes cycle detection)", pluginName, service)
+		}
+	}
+	return nil
+}
+
+// validateServiceCapabilities checks a provider's capability map against the
+// two things it can contradict: the services this plugin actually provides,
+// and the tools it actually contributes.
+//
+// Mapping a capability onto SOMEBODY ELSE'S tool is refused rather than
+// resolved later, because it is a plugin making a promise on another plugin's
+// behalf: the tool could be withdrawn, renamed, or never mounted, and the
+// consumer would learn about it as an unrelated "tool not found" at call time.
+func validateServiceCapabilities(
+	pluginName string,
+	provides []string,
+	capabilities map[string]map[string]string,
+	contributedTools map[string]struct{},
+) error {
+	provided := make(map[string]struct{}, len(provides))
+	for _, service := range provides {
+		provided[service] = struct{}{}
+	}
+	for service, caps := range capabilities {
+		if _, ok := provided[service]; !ok {
+			return fmt.Errorf("parse plugin manifest %q: service_capabilities names service %q, which this "+
+				"plugin does not provide (provides_services: %v)", pluginName, service, provides)
+		}
+		for capability, toolName := range caps {
+			if strings.TrimSpace(capability) == "" {
+				return fmt.Errorf("parse plugin manifest %q: service %q has an empty capability name",
+					pluginName, service)
+			}
+			if strings.TrimSpace(toolName) == "" {
+				return fmt.Errorf("parse plugin manifest %q: service %q capability %q maps to an empty tool name",
+					pluginName, service, capability)
+			}
+			if _, ok := contributedTools[toolName]; !ok {
+				return fmt.Errorf("parse plugin manifest %q: service %q capability %q maps to tool %q, which "+
+					"this plugin does not contribute; a plugin cannot promise another plugin's tool on its "+
+					"behalf", pluginName, service, capability, toolName)
+			}
 		}
 	}
 	return nil

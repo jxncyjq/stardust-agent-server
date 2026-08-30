@@ -132,6 +132,10 @@ type pkg struct {
 	// also what pins the unchanged path.
 	providesServices []string
 	requiresServices []string
+
+	// serviceCapabilities maps a provided service's capability names onto this
+	// fixture's own tools, which is what the resolver answers from.
+	serviceCapabilities map[string]map[string]string
 }
 
 // writePackage writes a plugin package (plugin.json + plugin.wasm) into dir,
@@ -156,18 +160,19 @@ func writePackage(t *testing.T, dir string, p pkg) {
 		})
 	}
 	pm := manifest.PluginManifest{
-		Name:             p.name,
-		Version:          p.version,
-		ABI:              1,
-		SHA256:           hex.EncodeToString(sum[:]),
-		Capabilities:     p.capabilities,
-		Limits:           manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
-		Filesystem:       manifest.Filesystem{AllowedPaths: p.allowedPaths},
-		Tools:            decls,
-		Requires:         p.requires,
-		ConfigSchema:     p.configSchema,
-		ProvidesServices: p.providesServices,
-		RequiresServices: p.requiresServices,
+		Name:                p.name,
+		Version:             p.version,
+		ABI:                 1,
+		SHA256:              hex.EncodeToString(sum[:]),
+		Capabilities:        p.capabilities,
+		Limits:              manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
+		Filesystem:          manifest.Filesystem{AllowedPaths: p.allowedPaths},
+		Tools:               decls,
+		Requires:            p.requires,
+		ConfigSchema:        p.configSchema,
+		ProvidesServices:    p.providesServices,
+		RequiresServices:    p.requiresServices,
+		ServiceCapabilities: p.serviceCapabilities,
 	}
 	data, err := json.Marshal(pm)
 	if err != nil {

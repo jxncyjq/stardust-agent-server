@@ -149,6 +149,26 @@ fn prompt_segment() -> String {
 
 四条边界：**只问一次**（可以读配置，但别每次说不一样的话——它待在稳定前缀里）；**带围栏**（`--- plugin "<名字>" (untrusted…) ---`）；**有上限**（单插件 2048 rune、合计 8192 rune，超长截断留痕）；**答不出来 = 插件挂不上**（空字符串则是合法的「没话说」）。
 
+### 按服务名调用别的插件
+
+写死别人的工具名，换一个提供者就得改自己的代码。命名服务是这层间接：
+
+```rust
+// plugin.json: "requires_services": ["issue-tracker"]
+let raw = host::invoke_service("issue-tracker", "search", r#"{"q":"bug"}"#);
+```
+
+宿主把它解析到**此刻**提供 `issue-tracker` 的插件的工具。边界与 `invoke_tool` 完全相同（深度上限 3、与模型共用 per-task 预算），因为解析之后走的就是同一条路。没有提供者时本插件是 `suspended`（不是卸载），提供者到场即恢复。
+
+反过来，要当提供者就声明映射：
+
+```jsonc
+"provides_services": ["issue-tracker"],
+"service_capabilities": { "issue-tracker": { "search": "jira_search" } }
+```
+
+能力名与工具名刻意分开；映射只能指向**自己贡献的**工具。
+
 ## 两条硬规矩
 
 - **工具失败返回 `ToolResult::fail`，不要 panic。** panic 会 trap 整个模块，代价是实例状态、同实例的在途调用，而且计入插件健康度（连续故障到阈值会被自动卸载）。
