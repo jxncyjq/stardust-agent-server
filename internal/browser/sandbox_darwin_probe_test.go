@@ -407,3 +407,23 @@ func dumpProbeArtifacts(t *testing.T) {
 		t.Logf("profile at %s:\n%s", path, data)
 	}
 }
+
+// TestProbeTheDownloadedBrowserStartsToo 照 **e2e 的配置**再探一次：BinPath 留空。
+//
+// e2e 里的 systemChromeForTest() 走 PAL.ResolveChromiumPath()，而 runner 上
+// setup-chrome 把浏览器装在 hostedtoolcache 而不是 /Applications——于是它返回空，
+// 分发退到 go-rod 自己下载的那一个。此前每一条探针都用 CHROME_PATH 指的那个，
+// 因此全都绿，而 e2e 全都红：**探针一直没探到真正在跑的那个浏览器**。
+func TestProbeTheDownloadedBrowserStartsToo(t *testing.T) {
+	t.Logf("ResolveChromiumPath() = %q (empty means the download path is used)",
+		newPlatformAdapter().ResolveChromiumPath())
+
+	mgr, err := NewManager(ManagerConfig{Headless: true})
+	if err != nil {
+		t.Logf("NewManager with the downloaded browser failed: %v", err)
+		dumpProbeArtifacts(t)
+		t.FailNow()
+	}
+	defer mgr.Close()
+	t.Logf("the downloaded browser started")
+}
