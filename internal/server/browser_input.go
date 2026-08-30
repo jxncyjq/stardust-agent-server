@@ -136,6 +136,25 @@ func (s *HTTPServer) handleBrowserSessionInfo(w http.ResponseWriter, r *http.Req
 	writeJSON(w, http.StatusOK, info)
 }
 
+// handleBrowserSessions 列出当前的浏览器会话，供界面渲染标签条。
+//
+// ?chat_session_id= 按对话过滤。不过滤是默认，因为运维（curl）想看的是全部；而
+// 界面总是带上它——视图跟着当前对话走，把别的对话的会话摆进标签条只会让人点进一个
+// 与眼前工作无关的页面。
+func (s *HTTPServer) handleBrowserSessions(w http.ResponseWriter, r *http.Request) {
+	if s.browser == nil {
+		writeError(w, http.StatusServiceUnavailable, "browser runtime is unavailable")
+		return
+	}
+	sessions := s.browser.ListSessions(strings.TrimSpace(r.URL.Query().Get("chat_session_id")))
+	// 空列表要回 [] 而不是 null：前端 map 一个 null 会炸，而「一个会话都没有」是
+	// 最常见的正常状态（Agent 还没浏览过任何东西）。
+	if sessions == nil {
+		sessions = []browser.SessionInfo{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"sessions": sessions})
+}
+
 type viewportRequest struct {
 	Width  int `json:"width"`
 	Height int `json:"height"`

@@ -83,6 +83,8 @@ func BuildOpenAPISpec() OpenAPISpec {
 			"/v1/auth/rotate": {Post: openAPIOperation("rotateToken", "Revoke the current bearer token and mint a replacement", true, "409")},
 			// 浏览器的六个端点此前一条都不在契约里：GUI 走 Wails 绑定不受影响，而按
 			// OpenAPI 生成客户端的人拿不到它们，只能手写。
+			"/v1/browser/sessions": {Get: openAPIOperation("listBrowserSessions",
+				"List the browser sessions, optionally filtered to one conversation", true)},
 			"/v1/browser/sessions/{id}/stream": {Get: openAPIOperation("streamBrowserSession",
 				"Subscribe a browser session's screencast frames and status events (SSE)", true)},
 			"/v1/browser/sessions/{id}/info": {Get: openAPIOperation("getBrowserSession",

@@ -27,6 +27,9 @@ type BrowserStreamer interface {
 	NavigateTakeover(sessionID string, req browser.NavigateReq) error
 	// SessionInfo 是「现在在哪、谁在开车」，地址栏与接管开关据它渲染。
 	SessionInfo(sessionID string) (browser.SessionInfo, error)
+	// ListSessions 是「现在有哪些浏览器会话」，标签条据它渲染；chatSessionID 为空
+	// 表示不按对话过滤。
+	ListSessions(chatSessionID string) []browser.SessionInfo
 }
 
 // parseBrowserSessionID 从 /v1/browser/sessions/{id}/stream 抽 id。

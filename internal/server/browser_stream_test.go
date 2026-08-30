@@ -33,6 +33,7 @@ func (f *fakeStreamer) InjectInput(sessionID string, events []browser.InputEvent
 	return nil
 }
 func (f *fakeStreamer) NavigateTakeover(string, browser.NavigateReq) error { return nil }
+func (f *fakeStreamer) ListSessions(string) []browser.SessionInfo          { return nil }
 func (f *fakeStreamer) SessionInfo(id string) (browser.SessionInfo, error) {
 	return browser.SessionInfo{SessionID: id}, nil
 }

@@ -124,3 +124,83 @@ func TestSessionInfoRefusesAnUnknownSession(t *testing.T) {
 		t.Errorf("code = %s, want %s", got, CodeSessionNotFound)
 	}
 }
+
+// 浏览器视图现在只认一个会话——SSE 说哪个就是哪个。可一个对话里 Agent 完全可能
+// 开过好几个（查完 A 站再查 B 站），而**除了最后那个，其余都没有入口**：用户看不到
+// 它们，也回不去。
+//
+// 标签式切换要先有「有哪些」这个答案。
+func TestListingAnswersWhichBrowserSessionsExist(t *testing.T) {
+	t.Parallel()
+
+	rt := newRuntimeWithNoSessions(t)
+	first := rt.sessions.Create("task-1")
+	rt.sessions.BindChat(first.ID, "chat-A")
+	first.WithLock(func() { first.ActiveURL = "https://a.example/" })
+	second := rt.sessions.Create("task-2")
+	rt.sessions.BindChat(second.ID, "chat-A")
+	second.WithLock(func() { second.ActiveURL = "https://b.example/" })
+	other := rt.sessions.Create("task-3")
+	rt.sessions.BindChat(other.ID, "chat-B")
+
+	all := rt.ListSessions("")
+	if len(all) != 3 {
+		t.Fatalf("listed %d sessions, want all 3", len(all))
+	}
+
+	// 按对话过滤：浏览器视图跟着当前对话走，把别的对话的会话摆进标签条只会让人
+	// 点进一个跟眼前工作无关的页面。
+	mine := rt.ListSessions("chat-A")
+	if len(mine) != 2 {
+		t.Fatalf("listed %d sessions for chat-A, want 2", len(mine))
+	}
+	for _, info := range mine {
+		if info.SessionID == other.ID {
+			t.Error("a session bound to another conversation leaked into this one's list")
+		}
+	}
+}
+
+// TestListingIsOrderedOldestFirst：标签的顺序要**稳定**，否则每次刷新标签都在跳，
+// 用户点的位置和上一秒不是同一个东西。按创建时间是唯一与用户心里的顺序一致的排法。
+func TestListingIsOrderedOldestFirst(t *testing.T) {
+	t.Parallel()
+
+	rt := newRuntimeWithNoSessions(t)
+	first := rt.sessions.Create("task-1")
+	second := rt.sessions.Create("task-2")
+	third := rt.sessions.Create("task-3")
+
+	got := rt.ListSessions("")
+	if len(got) != 3 {
+		t.Fatalf("listed %d sessions, want 3", len(got))
+	}
+	want := []string{first.ID, second.ID, third.ID}
+	for i, info := range got {
+		if info.SessionID != want[i] {
+			t.Errorf("position %d = %s, want %s (oldest first)", i, info.SessionID, want[i])
+		}
+	}
+}
+
+func TestListingCarriesWhatATabNeedsToRender(t *testing.T) {
+	t.Parallel()
+
+	rt := newRuntimeWithNoSessions(t)
+	sess := rt.sessions.Create("task-1")
+	sess.WithLock(func() { sess.ActiveURL = "https://example.com/page" })
+	if err := rt.SetTakeover(sess.ID, true); err != nil {
+		t.Fatalf("SetTakeover: %v", err)
+	}
+
+	got := rt.ListSessions("")
+	if len(got) != 1 {
+		t.Fatalf("listed %d sessions, want 1", len(got))
+	}
+	if got[0].URL != "https://example.com/page" {
+		t.Errorf("URL = %q, want the page the tab is on", got[0].URL)
+	}
+	if !got[0].Takeover {
+		t.Error("Takeover = false; the tab cannot show who is driving")
+	}
+}
