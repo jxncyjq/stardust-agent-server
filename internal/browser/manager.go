@@ -139,7 +139,9 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 		_ = egress.Close()
 		return nil, err
 	}
-	pool.adopt(first)
+	if err := pool.adopt(first); err != nil {
+		return nil, err
+	}
 	return manager, nil
 }
 

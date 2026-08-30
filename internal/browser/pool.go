@@ -1,6 +1,7 @@
 package browser
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -57,7 +58,10 @@ type browserPool struct {
 	owners map[*BrowserContext]poolInstance
 	// newInstance 是造一个新进程的工厂。测试替换它以避开 Chromium。
 	newInstance func() (poolInstance, error)
-	logger      *slog.Logger
+	// closed 记住这个池已经关过了。关闭与获取会同时发生（serve 退出、GUI 关窗时正有
+	// 任务在开会话），而关闭之后再起的那个进程**不属于任何池**：没人再会去关它。
+	closed bool
+	logger *slog.Logger
 }
 
 // newBrowserPool 建一个空池（第一个进程在第一次 Acquire 时才起）。
@@ -84,10 +88,19 @@ func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Disca
 // 再少，进程数（与冷启动）涨得太快。
 const defaultMaxContextsPerProcess = 8
 
+// errPoolClosed 是「池已经关了，别再起进程」。
+//
+// 不给它语义码：这不是「资源不够、稍后再试」，而是这个进程正在退出，重试没有意义。
+var errPoolClosed = errors.New("browser pool is closed")
+
 // Acquire 拿一个 context：先找有空位的进程，都满了再开一个新的。
 func (p *browserPool) Acquire() (*BrowserContext, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
+	if p.closed {
+		return nil, errPoolClosed
+	}
 
 	for _, inst := range p.instances {
 		if inst.Contexts() < p.cfg.MaxContextsPerProcess {
@@ -182,6 +195,7 @@ func (p *browserPool) RecycleBloated() {
 // Close 关掉池里的全部进程。
 func (p *browserPool) Close() {
 	p.mu.Lock()
+	p.closed = true
 	instances := p.instances
 	p.instances = nil
 	p.owners = map[*BrowserContext]poolInstance{}
@@ -196,10 +210,17 @@ func (p *browserPool) Close() {
 //
 // 它存在是因为第一个进程在装配期就起（见 NewManager 的理由），而那时池还不该
 // 自己去起——否则「装配失败」与「第一次用时失败」的错误路径会各写一遍。
-func (p *browserPool) adopt(inst poolInstance) {
+func (p *browserPool) adopt(inst poolInstance) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	if p.closed {
+		// 交给一个已经关掉的池，等于把这个进程丢在机器上。收下再关掉是唯一不漏的
+		// 做法，但仍然报错：装配与关闭撞在一起说明调用顺序有问题。
+		inst.Close()
+		return fmt.Errorf("adopt %s: %w", inst.String(), errPoolClosed)
+	}
 	p.instances = append(p.instances, inst)
+	return nil
 }
 
 // firstInstance 返回池里的第一个进程；空池返回 nil。真机测试用它去看那个真的
