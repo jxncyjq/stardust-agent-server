@@ -164,10 +164,16 @@ type darwinWatchdog struct {
 
 func (w *darwinWatchdog) Close() error {
 	var errs []error
-	// 先杀被隔离的那个进程组（负号 = 整组）：Chromium 是多进程的，杀主进程带不走
+	// 先按**进程组**杀（负号 = 整组）：Chromium 是多进程的，杀主进程带不走
 	// renderer/GPU。已经没了（ESRCH）是正常的——正常关闭路径可能刚收过它。
 	if err := syscall.Kill(-w.pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
 		errs = append(errs, fmt.Errorf("kill the confined process group %d: %w", w.pid, err))
+	}
+	// 再按 pid 杀一次。进程组那一发只在**这个进程是组长**时命中，而那要 Setpgid——
+	// PrepareCommand 会设，别处起的进程不会。少了这一发，一个不是组长的进程会被
+	// 悄悄放过：ESRCH 被当成「已经没了」，实际它还好好活着。
+	if err := syscall.Kill(w.pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		errs = append(errs, fmt.Errorf("kill the confined process %d: %w", w.pid, err))
 	}
 	if w.cmd.Process != nil {
 		if err := w.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
