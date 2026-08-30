@@ -88,7 +88,7 @@ func writeConfinedSBPL(dir string) string {
 	}
 	return fmt.Sprintf(`(version 1)
 (allow default)
-(deny file-write* (with report))
+(deny file-write*)
 (allow file-write*
   (subpath %q)
   (literal "/dev/null")
@@ -259,8 +259,11 @@ func TestProbeWhatChromeActuallyNeedsToWrite(t *testing.T) {
 func sandboxDenials(t *testing.T) string {
 	t.Helper()
 
-	// 只要我们这个进程的：不过滤的话，日志里全是系统守护进程自己的拒绝记录，
-	// 而 SBPL 的 deny **默认不上报**——要 (with report) 才会出现在这里。
+	// 只要我们这个进程的：不过滤的话，日志里全是系统守护进程自己的拒绝记录。
+	//
+	// 试过给 deny 加 (with report) 让它上报——sandbox-exec 直接拒绝那份 profile
+	// （"report modifier does not apply to deny action"），而那次的症状是**所有变体
+	// 一起红**，看上去像 Chrome 起不来，实际是 profile 根本没编译过。
 	out, err := exec.Command("log", "show", "--last", "2m", "--style", "compact",
 		"--predicate", `eventMessage CONTAINS "deny" AND (eventMessage CONTAINS "Chromium" OR eventMessage CONTAINS "sandbox-exec" OR eventMessage CONTAINS "Google Chrome")`).CombinedOutput()
 	if err != nil {
