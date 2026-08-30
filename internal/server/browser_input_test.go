@@ -381,3 +381,42 @@ func TestNoBrowserSessionsIsAnEmptyListNotNull(t *testing.T) {
 		t.Errorf("body = %s, want an empty array", rec.Body.String())
 	}
 }
+
+// TestAPartialInjectionTellsTheClientHowFarItGot：一批注入半途失败时，前面几条**已经
+// 发生了**，撤不回来。客户端唯一能做的判断是「哪些已经生效」——重发整批会把它们再做
+// 一遍（又点一次「提交」）。
+//
+// 这个数必须是**字段**。上一版它只在错误句子里，客户端要拿到就得去解析措辞，等于把
+// 一个会影响副作用的判断建在字符串格式上。
+func TestAPartialInjectionTellsTheClientHowFarItGot(t *testing.T) {
+	fb := &fakeBrowser{injectErr: browser.NewBrowserErrorWrap(
+		browser.CodeContextEvicted, "inject batch",
+		&browser.PartialInjection{Applied: 2, Total: 5, Failed: "click", Err: errors.New("page gone")},
+	)}
+	s := NewHTTPServer(Config{Browser: fb})
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/browser/sessions/sess-1/input",
+		bytes.NewReader([]byte(`{"events":[{"type":"click","x":0.5,"y":0.5}]}`)))
+	rec := httptest.NewRecorder()
+	s.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409 (the code the wrapped browser error carries); body=%s",
+			rec.Code, rec.Body.String())
+	}
+	var body struct {
+		Error    string `json:"error"`
+		Injected *int   `json:"injected"`
+		Total    *int   `json:"total"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body %s: %v", rec.Body.String(), err)
+	}
+	if body.Injected == nil || *body.Injected != 2 {
+		t.Errorf("injected = %v, want 2: the client cannot tell which events already happened",
+			body.Injected)
+	}
+	if body.Total == nil || *body.Total != 5 {
+		t.Errorf("total = %v, want 5", body.Total)
+	}
+}

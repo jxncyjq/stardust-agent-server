@@ -837,10 +837,8 @@ func (r *Runtime) InjectInput(sessionID string, events []InputEvent) error {
 	// inputMu 只挡并发注入，不碰会话锁，故不阻塞 observe/reaper。
 	sess.inputMu.Lock()
 	defer sess.inputMu.Unlock()
-	for i, ev := range events {
-		if err := injectOne(page, ev, vw, vh); err != nil {
-			return NewBrowserErrorWrap(CodeContextEvicted, fmt.Sprintf("inject event %d (%s)", i, ev.Type), err)
-		}
+	if err := injectBatch(pageTarget{page}, events, vw, vh); err != nil {
+		return NewBrowserErrorWrap(CodeContextEvicted, "inject batch", err)
 	}
 	r.touch(sess) // 人工也算活跃：刷新 LastUsedAt，避免接管中会话被 reaper 回收
 	return nil
@@ -893,12 +891,12 @@ func viewportSize(page *rod.Page) (float64, float64, error) {
 }
 
 // injectOne 把一条归一化事件 × 视口 px 后派发到 go-rod。鼠标类先 MoveTo 定位再动作。
-func injectOne(page *rod.Page, ev InputEvent, vw, vh float64) (err error) {
+func injectOne(target inputTarget, ev InputEvent, vw, vh float64) (err error) {
 	// 修饰键在本条事件前按下、本条事件后释放，**出错路径也释放**：一次失败的注入不
 	// 该把浏览器留在 Ctrl 按住的状态里给下一位使用者。go-rod 的 Keyboard 记着当前
 	// 按下的键，鼠标与键盘事件都据此算出 CDP 的 modifiers 位掩码，所以按下之后
 	// ctrl+click、shift+wheel 与 ctrl+c 走的是同一条路。
-	release, err := holdModifiers(page, ev.Modifiers)
+	release, err := holdModifiers(target, ev.Modifiers)
 	if err != nil {
 		return err
 	}
@@ -911,41 +909,41 @@ func injectOne(page *rod.Page, ev InputEvent, vw, vh float64) (err error) {
 	px := proto.Point{X: ev.X * vw, Y: ev.Y * vh}
 	switch ev.Type {
 	case "mousemove":
-		return page.Mouse.MoveTo(px)
+		return target.MoveMouse(px)
 	case "mousedown":
-		if err := page.Mouse.MoveTo(px); err != nil {
+		if err := target.MoveMouse(px); err != nil {
 			return err
 		}
-		return page.Mouse.Down(mouseButton(ev.Button), 1)
+		return target.MouseDown(mouseButton(ev.Button))
 	case "mouseup":
-		if err := page.Mouse.MoveTo(px); err != nil {
+		if err := target.MoveMouse(px); err != nil {
 			return err
 		}
-		return page.Mouse.Up(mouseButton(ev.Button), 1)
+		return target.MouseUp(mouseButton(ev.Button))
 	case "click":
-		if err := page.Mouse.MoveTo(px); err != nil {
+		if err := target.MoveMouse(px); err != nil {
 			return err
 		}
-		return page.Mouse.Click(mouseButton(ev.Button), 1)
+		return target.Click(mouseButton(ev.Button))
 	case "wheel":
-		if err := page.Mouse.MoveTo(px); err != nil {
+		if err := target.MoveMouse(px); err != nil {
 			return err
 		}
-		return page.Mouse.Scroll(ev.DeltaX, ev.DeltaY, 1)
+		return target.Scroll(ev.DeltaX, ev.DeltaY)
 	case "keydown":
 		k, err := keyToInputKey(ev.Key)
 		if err != nil {
 			return err
 		}
-		return page.Keyboard.Press(k)
+		return target.KeyDown(k)
 	case "keyup":
 		k, err := keyToInputKey(ev.Key)
 		if err != nil {
 			return err
 		}
-		return page.Keyboard.Release(k)
+		return target.KeyUp(k)
 	case "char":
-		return page.InsertText(ev.Text)
+		return target.InsertText(ev.Text)
 	default:
 		// validateInputEvents 已挡掉未知类型；到这里属编程错误。
 		return fmt.Errorf("unhandled input type %q", ev.Type)
@@ -960,7 +958,7 @@ func injectOne(page *rod.Page, ev InputEvent, vw, vh float64) (err error) {
 //
 // 名字在这里必定合法（validateModifiers 在整批注入之前就跑过），所以解析失败属编程
 // 错误，照样返回而不是猜一个键。
-func holdModifiers(page *rod.Page, names []string) (func() error, error) {
+func holdModifiers(target inputTarget, names []string) (func() error, error) {
 	if len(names) == 0 {
 		return func() error { return nil }, nil
 	}
@@ -968,7 +966,7 @@ func holdModifiers(page *rod.Page, names []string) (func() error, error) {
 	release := func() error {
 		var firstErr error
 		for i := len(held) - 1; i >= 0; i-- {
-			if err := page.Keyboard.Release(held[i]); err != nil && firstErr == nil {
+			if err := target.KeyUp(held[i]); err != nil && firstErr == nil {
 				firstErr = fmt.Errorf("release modifier: %w", err)
 			}
 		}
@@ -981,7 +979,7 @@ func holdModifiers(page *rod.Page, names []string) (func() error, error) {
 			_ = release()
 			return nil, err
 		}
-		if err := page.Keyboard.Press(k); err != nil {
+		if err := target.KeyDown(k); err != nil {
 			_ = release()
 			return nil, fmt.Errorf("press modifier %q: %w", name, err)
 		}

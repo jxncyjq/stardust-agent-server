@@ -224,8 +224,30 @@ func (s *HTTPServer) handleBrowserInput(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if err := s.browser.InjectInput(id, req.Events); err != nil {
-		writeBrowserError(w, err)
+		writeInjectError(w, err)
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"session_id": id, "injected": len(req.Events)})
+}
+
+// writeInjectError 在普通的浏览器错误之外，带上「这批做到了第几条」。
+//
+// 半途失败的一批没有回滚可言——已经发生的点击与输入撤不回来——所以客户端唯一能做的
+// 判断是「哪些已经生效」。让它去解析错误句子，等于把这个判断建在措辞上。
+func writeInjectError(w http.ResponseWriter, err error) {
+	var partial *browser.PartialInjection
+	if !errors.As(err, &partial) {
+		writeBrowserError(w, err)
+		return
+	}
+	status := http.StatusInternalServerError
+	var be *browser.BrowserError
+	if errors.As(err, &be) {
+		status = httpStatusForBrowserCode(be.Code)
+	}
+	writeJSON(w, status, map[string]any{
+		"error":    err.Error(),
+		"injected": partial.Applied,
+		"total":    partial.Total,
+	})
 }
