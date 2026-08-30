@@ -79,6 +79,13 @@ type probeProfile struct {
 // 浏览器仍然需要一个临时目录，所以把 TMPDIR 指进 profile 里自己那一个（见探针里的
 // Env），于是这两片都可以从可写列表里去掉。
 func writeConfinedSBPL(dir string) string {
+	// **必须是解析过符号链接的真实路径**：macOS 上 /tmp 与 /var 都是指向 /private/…
+	// 的软链，而 SBPL 的 subpath 按解析后的路径匹配。写 /var/folders/xx 进 profile，
+	// 内核看到的却是 /private/var/folders/xx——两边对不上，于是**连自己的 profile
+	// 目录都写不了**，浏览器一个字都说不出来就退出。第二轮探针正是死在这里。
+	if resolved, err := filepath.EvalSymlinks(dir); err == nil {
+		dir = resolved
+	}
 	return fmt.Sprintf(`(version 1)
 (allow default)
 (deny file-write*)
@@ -188,14 +195,18 @@ func TestProbeWritesOutsideTheProfileAreDenied(t *testing.T) {
 	// 现在选 HOME 下的一个路径：那才是「被攻破的浏览器最想写的地方」。
 	outside := filepath.Join(os.Getenv("HOME"), ".stardust-sandbox-probe")
 	defer func() { _ = os.Remove(outside) }()
-	out, err := exec.Command("/usr/bin/sandbox-exec", "-f", profilePath,
+	out, err := exec.Command("/usr/bin/sandbox-exec", "-f", profilePath, //nolint:gosec
 		"/bin/sh", "-c", "echo pwned > "+outside).CombinedOutput()
 	if err == nil {
 		t.Fatalf("a write outside the profile succeeded: the sandbox confines nothing\n%s", out)
 	}
 	t.Logf("write outside the profile was denied as expected: %v (%s)", err, strings.TrimSpace(string(out)))
 
-	inside := filepath.Join(userDataDir, "inside.txt")
+	resolvedUserDataDir, err := filepath.EvalSymlinks(userDataDir)
+	if err != nil {
+		t.Fatalf("resolve %s: %v", userDataDir, err)
+	}
+	inside := filepath.Join(resolvedUserDataDir, "inside.txt")
 	if out, err := exec.Command("/usr/bin/sandbox-exec", "-f", profilePath,
 		"/bin/sh", "-c", "echo ok > "+inside).CombinedOutput(); err != nil {
 		t.Fatalf("a write inside the profile was denied, so the browser cannot run: %v\n%s", err, out)
