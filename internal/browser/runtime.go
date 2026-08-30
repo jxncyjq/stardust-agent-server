@@ -135,7 +135,7 @@ func (r *Runtime) lifecycleMu(sessionID string) *sync.Mutex {
 func (r *Runtime) Subscribe(sessionID string) (<-chan StreamEvent, func(), error) {
 	sess, ok := r.sessions.Get(sessionID)
 	if !ok {
-		return nil, nil, NewBrowserError(CodeContextEvicted, "unknown session "+sessionID)
+		return nil, nil, NewBrowserError(CodeSessionNotFound, "unknown session "+sessionID)
 	}
 	hub := r.hubs.get(sessionID)
 	lm := r.lifecycleMu(sessionID)
@@ -301,7 +301,7 @@ func (r *Runtime) Open(ctx context.Context, req OpenReq) (OpenObservation, error
 	case req.SessionID != "":
 		s, ok := r.sessions.Get(req.SessionID)
 		if !ok {
-			return OpenObservation{}, NewBrowserError(CodeContextEvicted, "unknown session "+req.SessionID)
+			return OpenObservation{}, NewBrowserError(CodeSessionNotFound, "unknown session "+req.SessionID)
 		}
 		sess = s
 	case req.ChatSessionID != "":
@@ -526,7 +526,7 @@ func (r *Runtime) Close(ctx context.Context, req CloseReq) error {
 			}
 			return nil
 		}
-		return NewBrowserError(CodeContextEvicted, "unknown session "+req.SessionID)
+		return NewBrowserError(CodeSessionNotFound, "unknown session "+req.SessionID)
 	}
 	// 全量关闭：先停后台 reaper（避免它在进程 Close 后仍访问已释放的 Manager）。
 	if r.reaperCancel != nil {
@@ -556,7 +556,7 @@ func (r *Runtime) Close(ctx context.Context, req CloseReq) error {
 func (r *Runtime) activePage(sessionID string) (*Session, *rod.Page, error) {
 	sess, ok := r.sessions.Get(sessionID)
 	if !ok {
-		return nil, nil, NewBrowserError(CodeContextEvicted, "unknown session "+sessionID)
+		return nil, nil, NewBrowserError(CodeSessionNotFound, "unknown session "+sessionID)
 	}
 	var page *rod.Page
 	var err error
@@ -710,7 +710,7 @@ func (r *Runtime) checkURL(raw string) error {
 func (r *Runtime) SetTakeover(sessionID string, enabled bool) error {
 	sess, ok := r.sessions.Get(sessionID)
 	if !ok {
-		return NewBrowserError(CodeContextEvicted, "unknown session "+sessionID)
+		return NewBrowserError(CodeSessionNotFound, "unknown session "+sessionID)
 	}
 	sess.WithLock(func() { sess.takeover = enabled })
 	return nil
@@ -736,14 +736,15 @@ func (r *Runtime) takeoverOf(sess *Session) bool {
 // 下一次 go-rod 调用因 Context/页已释放而 fail-loud 报错（错误被包装上报，不会静默）。
 func (r *Runtime) InjectInput(sessionID string, events []InputEvent) error {
 	if err := validateInputEvents(events); err != nil {
-		return NewBrowserErrorWrap(CodeElementNotFound, "invalid input batch", err)
+		return NewBrowserErrorWrap(CodeInvalidInput, "invalid input batch", err)
 	}
 	sess, page, err := r.activePage(sessionID)
 	if err != nil {
 		return err
 	}
 	if !r.takeoverOf(sess) {
-		return NewBrowserError(CodeTakeover, "session "+sessionID+" not under takeover; enable takeover before injecting")
+		return NewBrowserError(CodeTakeoverRequired,
+			"session "+sessionID+" is not under takeover; enable takeover before injecting")
 	}
 	vw, vh, err := viewportSize(page)
 	if err != nil {
@@ -756,7 +757,7 @@ func (r *Runtime) InjectInput(sessionID string, events []InputEvent) error {
 	defer sess.inputMu.Unlock()
 	for i, ev := range events {
 		if err := injectOne(page, ev, vw, vh); err != nil {
-			return NewBrowserErrorWrap(CodeElementNotFound, fmt.Sprintf("inject event %d (%s)", i, ev.Type), err)
+			return NewBrowserErrorWrap(CodeContextEvicted, fmt.Sprintf("inject event %d (%s)", i, ev.Type), err)
 		}
 	}
 	r.touch(sess) // 人工也算活跃：刷新 LastUsedAt，避免接管中会话被 reaper 回收
@@ -776,7 +777,7 @@ const (
 // 若 screencast 正在运行则重启一次，让下一帧立即反映新尺寸。
 func (r *Runtime) SetViewport(sessionID string, width, height int) error {
 	if width < minViewportPx || width > maxViewportPx || height < minViewportPx || height > maxViewportPx {
-		return NewBrowserError(CodeElementNotFound, fmt.Sprintf("viewport %dx%d out of range [%d,%d]", width, height, minViewportPx, maxViewportPx))
+		return NewBrowserError(CodeInvalidInput, fmt.Sprintf("viewport %dx%d out of range [%d,%d]", width, height, minViewportPx, maxViewportPx))
 	}
 	// activePage 拿一次会话锁返回活跃页（同 InjectInput）。绝不能改回 sess.WithLock(pageOf)：
 	// pageOf 内部自己拿会话锁，再套一层 WithLock 会重入死锁（Go 互斥锁不可重入）。

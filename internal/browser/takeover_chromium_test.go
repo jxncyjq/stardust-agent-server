@@ -81,9 +81,11 @@ func TestInjectInputRequiresTakeover(t *testing.T) {
 		t.Fatalf("open: %v", err)
 	}
 	err = rt.InjectInput(obs.SessionID, []InputEvent{{Type: "mousemove", X: 0.5, Y: 0.5}})
+	// TAKEOVER_REQUIRED，不是 SESSION_UNDER_TAKEOVER：后者说的是「会话正被人接管」，
+	// 正是这里拒绝的理由的**反面**。
 	var be *BrowserError
-	if !asBrowserError(err, &be) || be.Code != CodeTakeover {
-		t.Fatalf("inject without takeover should error CodeTakeover, got %v", err)
+	if !asBrowserError(err, &be) || be.Code != CodeTakeoverRequired {
+		t.Fatalf("inject without takeover should error CodeTakeoverRequired, got %v", err)
 	}
 }
 

@@ -1,7 +1,8 @@
 # 三项遗留的真机验证（2026-08-30）
 
 **状态**：三项全部跑完。**签名 + 远程源**与**提示词段排序/预算**按设计工作，无缺陷；
-**浏览器接管的修饰键与错误码**验出四个真问题，全部**未修**（改的是对外契约，先记录再决定）。
+**浏览器接管的修饰键与错误码**验出四个真问题，**四个已全部修完并合入**：
+3.1 修饰键（server #111 / GUI #34 / docs #24），3.2–3.4 错误码语义（见文末「修复记录」）。
 
 夹具与命令在 scratchpad 的 `verify2/`（提示词段）、`verify3/`（签名+远程）、`verify4/`（接管）下，
 模型是本地 mockmodel（按请求内容作答，不按调用次数）。
@@ -123,3 +124,42 @@ POST /sess-1/input（takeover 关）
 - 提示词段：排序、单段截断、总预算、前缀稳定四条全部与设计一致。
 - 浏览器接管：**功能通、契约缺**。3.1 是用户能直接撞上的（Ctrl+C 变成输入 c），3.2–3.4 是接口语义债。
   四条都需要改对外契约，未擅自动手。
+
+---
+
+## 修复记录（2026-08-30）
+
+### 3.1 修饰键（已合）
+
+`InputEvent.Modifiers`（ctrl|shift|alt|meta）随**每一条**事件走：注入前按下、注入后（含出错路径）释放，
+不做跨请求的按下状态——注入是一串互不相干的 HTTP 请求，丢一条 keyup 就把浏览器永久留在 Ctrl 按住的状态里。
+`char` 只接受 shift（它是 InsertText，收下 ctrl 等于把复制变成输入一个 c）；把修饰键当键发仍拒，但错误改成
+指路。真机与 `-tags chromium` 双重证据：ctrl+c 到达页面且输入框仍为空。
+
+### 3.2–3.4 错误码语义（已修）
+
+三个问题同源：这套码是**给调用方的建议**，却被当成通用错误码用。
+
+- 新增 `INVALID_INPUT`：空批次、越界坐标、认不出的键名、越界视口。此前一律 `ELEMENT_NOT_FOUND`——
+  在建议「重新 read 页面」，而页面没有任何问题，重试同一个请求也永远不会成功。
+- 新增 `SESSION_NOT_FOUND`，与 `CONTEXT_EVICTED` 分开：后者是「你**曾经**有的那个会话，上下文被回收了」，
+  对一个从未存在过的 id 说这句话是在编造历史。两者补救动作相同，但排查方向相反。
+- 新增 `TAKEOVER_REQUIRED`：注入被拒是因为**没有**在接管。此前回的是 `SESSION_UNDER_TAKEOVER`——
+  字面意思正是拒绝理由的反面，同一个码承担两个互斥含义。
+- HTTP 状态码不再由每个 handler 各挑一个，而是由**语义码**推出（`httpStatusForBrowserCode`）：
+  400 请求本身错 / 403 部署拒绝这个目标 / 404 没有这个会话 / 409 会话在错误的状态（页面没了、接管开关不对、
+  ref 失效）/ 500 没有语义码的错误（那是我们接线的缺口，不是调用方的错，回 400 会让调用方背锅并躲开 5xx 看板）。
+
+真机复核（同一套部署）：
+
+| 请求 | 之前 | 现在 |
+|---|---|---|
+| 未接管时注入（页面活着） | 409 `SESSION_UNDER_TAKEOVER` | 409 `TAKEOVER_REQUIRED: ... is not under takeover` |
+| 会话不存在（takeover / input / viewport） | 404 / 400 / 400，均 `CONTEXT_EVICTED` | **三者一致 404** `SESSION_NOT_FOUND` |
+| 会话在但页面没了 | 400 `CONTEXT_EVICTED` | 409 `CONTEXT_EVICTED` |
+| 空批次 / 越界坐标 / 越界视口 | 400 `ELEMENT_NOT_FOUND` | 400 `INVALID_INPUT` |
+| 把修饰键当键发 | 400 `ELEMENT_NOT_FOUND: unsupported key` | 400 `INVALID_INPUT: ... put "ctrl" in this event's "modifiers"` |
+| ctrl+c / ctrl+click（接管中） | 400（不可能表达） | 200 |
+
+变异验证两处：把 `SESSION_NOT_FOUND` 映射改回 400 → 三端点一致性测试红；把校验失败的码改回
+`ELEMENT_NOT_FOUND` → 语义测试红。

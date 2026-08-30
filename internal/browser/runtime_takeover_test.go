@@ -74,9 +74,11 @@ func TestSetTakeoverUnknownSession(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for unknown session")
 	}
+	// SESSION_NOT_FOUND，不是 CONTEXT_EVICTED：后者的意思是「你曾经有的那个会话，
+	// 它的上下文被回收了」，对一个从未存在过的 id 说这句话是在编造一段历史。
 	var be *BrowserError
-	if !asBrowserError(err, &be) || be.Code != CodeContextEvicted {
-		t.Fatalf("want CONTEXT_EVICTED, got %v", err)
+	if !asBrowserError(err, &be) || be.Code != CodeSessionNotFound {
+		t.Fatalf("want SESSION_NOT_FOUND, got %v", err)
 	}
 }
 
