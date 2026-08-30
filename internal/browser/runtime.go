@@ -810,7 +810,21 @@ func viewportSize(page *rod.Page) (float64, float64, error) {
 }
 
 // injectOne 把一条归一化事件 × 视口 px 后派发到 go-rod。鼠标类先 MoveTo 定位再动作。
-func injectOne(page *rod.Page, ev InputEvent, vw, vh float64) error {
+func injectOne(page *rod.Page, ev InputEvent, vw, vh float64) (err error) {
+	// 修饰键在本条事件前按下、本条事件后释放，**出错路径也释放**：一次失败的注入不
+	// 该把浏览器留在 Ctrl 按住的状态里给下一位使用者。go-rod 的 Keyboard 记着当前
+	// 按下的键，鼠标与键盘事件都据此算出 CDP 的 modifiers 位掩码，所以按下之后
+	// ctrl+click、shift+wheel 与 ctrl+c 走的是同一条路。
+	release, err := holdModifiers(page, ev.Modifiers)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if rerr := release(); rerr != nil && err == nil {
+			err = rerr
+		}
+	}()
+
 	px := proto.Point{X: ev.X * vw, Y: ev.Y * vh}
 	switch ev.Type {
 	case "mousemove":
@@ -853,6 +867,44 @@ func injectOne(page *rod.Page, ev InputEvent, vw, vh float64) error {
 		// validateInputEvents 已挡掉未知类型；到这里属编程错误。
 		return fmt.Errorf("unhandled input type %q", ev.Type)
 	}
+}
+
+// holdModifiers 按下这条事件声明的修饰键，返回释放它们的函数。
+//
+// 释放按相反顺序，且**每一个都试着释放**：其中一个失败不该让其余的留在按下状态，
+// 那正是「键盘坏了」的来源。返回的是第一个错误，其余记不了也不吞——它们本就是同一
+// 次失败的不同表现。
+//
+// 名字在这里必定合法（validateModifiers 在整批注入之前就跑过），所以解析失败属编程
+// 错误，照样返回而不是猜一个键。
+func holdModifiers(page *rod.Page, names []string) (func() error, error) {
+	if len(names) == 0 {
+		return func() error { return nil }, nil
+	}
+	held := make([]input.Key, 0, len(names))
+	release := func() error {
+		var firstErr error
+		for i := len(held) - 1; i >= 0; i-- {
+			if err := page.Keyboard.Release(held[i]); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("release modifier: %w", err)
+			}
+		}
+		held = held[:0]
+		return firstErr
+	}
+	for _, name := range names {
+		k, err := modifierToInputKey(name)
+		if err != nil {
+			_ = release()
+			return nil, err
+		}
+		if err := page.Keyboard.Press(k); err != nil {
+			_ = release()
+			return nil, fmt.Errorf("press modifier %q: %w", name, err)
+		}
+		held = append(held, k)
+	}
+	return release, nil
 }
 
 // mouseButton 把事件 button 名映射到 go-rod 常量；空/未知回落 left（validate 已挡未知非空值）。
