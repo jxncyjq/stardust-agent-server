@@ -3,6 +3,7 @@ package browser
 import (
 	"errors"
 	"io"
+	"os/exec"
 )
 
 // ErrConfinementUnsupported 表示这个平台目前没有外层沙箱实现。
@@ -37,10 +38,18 @@ type PlatformAdapter interface {
 
 	// 隔离
 	//
+	// PrepareCommand 在进程**创建之前**改写它的启动方式：Linux 的
+	// namespaces/seccomp、macOS 的 sandbox-exec 都只能在这一刻建立，事后按 pid 补
+	// 不上。返回的 Cmd 就是接下来会被 Start 的那个（平台可以原样返回）。
+	//
+	// 它此前存在过（叫 WrapWithSandbox）却**没有调用方**——Chromium 的进程是
+	// go-rod 的 launcher 起的，那个 Cmd 从来不存在。现在启动收回自管，它才真正
+	// 处在路径上。
+	PrepareCommand(cmd *exec.Cmd) *exec.Cmd
+
 	// ConfineProcess 把一个**已经起来的**进程放进本平台的外层隔离里，返回释放它的
-	// Closer。按 pid 而不是按 exec.Cmd，是因为 Chromium 的进程是 go-rod 的 launcher
-	// 自己起的：此前那个接 *exec.Cmd 的 WrapWithSandbox 从来没有调用方，三个平台
-	// 把它实现完，浏览器照样一点约束都没有。
+	// Closer。它与 PrepareCommand 是两个时刻：Windows 的 Job Object 只能事后按 pid
+	// 加入（AssignProcessToJobObject），而 namespaces 只能事前。
 	//
 	// 平台没有实现时返回 ErrConfinementUnsupported，绝不假装成功。
 	ConfineProcess(pid int) (io.Closer, error)

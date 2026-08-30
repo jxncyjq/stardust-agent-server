@@ -1,12 +1,15 @@
 package browser
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-rod/rod"
 	"github.com/go-rod/rod/lib/launcher"
@@ -66,7 +69,18 @@ type Manager struct {
 	// 此前 agent 崩一次就在机器上留下一串孤儿，直到用户自己去任务管理器里清。
 	confinement io.Closer
 	logger      *slog.Logger
+	// launched 是我们自己起的那个进程。留着它是为了能关掉它：launcher 现在只负责
+	// 拼参数，进程的生死由这里管。
+	launched *launchedBrowser
+	// userDataDir 是 launcher 替我们挑的临时用户目录。自管启动之后它的清理也归我们：
+	// launcher.Cleanup() 会等一个**只有 Launch() 才会关**的 channel，不再调用它。
+	userDataDir string
 }
+
+// chromiumStartTimeout 是等 Chromium 宣告 DevTools 地址的上限。冷启动（首次解压、
+// 杀毒软件扫描）可以慢到十几秒，而超过这个数基本意味着它根本起不来——那时带着
+// 浏览器自己写的 stderr 报错，比继续等有用。
+const chromiumStartTimeout = 45 * time.Second
 
 // NewManager 拉起一个 Chromium 进程并连接。Chromium 可执行文件经 PAL 按分发
 // 优先级定位（config BinPath > 内置捆绑 > 系统 Chrome/Edge > go-rod 自动下载），
@@ -110,13 +124,30 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	// 策略决定放不放行。
 	l = l.Set(flags.Flag("proxy-bypass-list"), "<-loopback>")
 
-	controlURL, err := l.Launch()
+	// 自己起进程，而不是 l.Launch()：go-rod 的 launcher 在内部 exec，我们只拿得到
+	// 一个 pid，于是「进程创建时」这个时刻——外层沙箱唯一能建立的时刻、进程池唯一
+	// 能决定起几个的时刻——根本不在我们手上。launcher 仍然用来拼参数（那套 flag
+	// 处理没有必要重写）。
+	//
+	// 端口给 0 让系统分配：固定端口在同机跑两个 agent 时会撞，而撞上的表现是
+	// 「连到了别人的浏览器」，比连不上更难查。
+	l = l.Set(flags.RemoteDebuggingPort, "0")
+	userDataDir := l.Get(flags.UserDataDir)
+	launchCtx, cancelLaunch := context.WithTimeout(context.Background(), chromiumStartTimeout)
+	defer cancelLaunch()
+	launched, err := launchChromium(launchCtx, launchSpec{
+		Bin:  binPath,
+		Args: l.FormatArgs(),
+		PAL:  pal,
+	})
 	if err != nil {
 		_ = egress.Close()
 		return nil, fmt.Errorf("launch chromium: %w", err)
 	}
-	b := rod.New().ControlURL(controlURL)
+	b := rod.New().ControlURL(launched.controlURL)
 	if err := b.Connect(); err != nil {
+		_ = launched.cmd.Process.Kill()
+		_ = launched.Wait()
 		_ = egress.Close()
 		return nil, fmt.Errorf("connect chromium: %w", err)
 	}
@@ -128,7 +159,7 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	// 收束**已经起来的**进程。此前的 WrapWithSandbox 接一个 *exec.Cmd，而 Chromium
 	// 的进程是 go-rod 的 launcher 自己起的——那个 Cmd 从来不存在，于是三个平台把它
 	// 实现完，浏览器照样一点约束都没有。按 pid 才有调用方。
-	confinement, confineErr := pal.ConfineProcess(l.PID())
+	confinement, confineErr := pal.ConfineProcess(launched.PID())
 	switch {
 	case confineErr == nil:
 		logger.Info("browser process confined", "component", "browser", "pid", l.PID())
@@ -140,7 +171,7 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 		}
 		logger.Warn("browser process is not confined",
 			"component", "browser",
-			"pid", l.PID(),
+			"pid", launched.PID(),
 			"reason", confineErr.Error(),
 			"consequence", "the browser has no outer isolation, and a crash of this agent can leave "+
 				"Chromium processes behind")
@@ -154,6 +185,8 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 	// Chromium 进程（配合上面的 Job Object / 信号）。
 	return &Manager{
 		launcher:    l,
+		launched:    launched,
+		userDataDir: userDataDir,
 		browser:     b,
 		pal:         pal,
 		egress:      egress,
@@ -200,8 +233,25 @@ func (m *Manager) Close() {
 	if m.browser != nil {
 		_ = m.browser.Close()
 	}
-	if m.launcher != nil {
-		m.launcher.Cleanup()
+	// 进程是我们起的，就由我们送走：browser.Close() 关的是 CDP 连接，Chromium 未必
+	// 因此退出（尤其是已经卡住的那种）。Kill 之后 Wait，避免留下僵尸。
+	if m.launched != nil && m.launched.cmd.Process != nil {
+		if err := m.launched.cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
+			m.logger.Warn("kill browser process", "component", "browser",
+				"pid", m.launched.PID(), "error", err)
+		}
+		_ = m.launched.Wait()
+	}
+	// 绝不调用 m.launcher.Cleanup()：它等的是一个只有 launcher.Launch() 才会关闭的
+	// channel（那个 goroutine 由 Launch 建立），而我们自己起进程之后它永远等不到，
+	// Close 就永远返回不了。这不是理论——它挂住了整个 chromium 测试套件。
+	//
+	// 目录由我们清：SafeDelete 是给 Windows 的（文件常被刚退出的进程按着，要重试）。
+	if m.userDataDir != "" {
+		if err := m.pal.SafeDelete(m.userDataDir); err != nil {
+			m.logger.Warn("remove browser user data dir", "component", "browser",
+				"dir", m.userDataDir, "error", err)
+		}
 	}
 	// 隔离在浏览器之后、代理之前关：关它会杀掉 job 里剩下的一切，那是「正常关不
 	// 干净时」的兜底，而不是常规路径。
