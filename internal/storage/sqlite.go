@@ -45,7 +45,9 @@ var ErrAgentSessionNotFound = errors.New("agent session not found")
 // backing Lane B episodic memory.
 // Version 8 added the browser_sessions table persisting agent browser session
 // login state (cookies) across process restarts for the Phase 3 browser feature.
-const CurrentSchemaVersion = 8
+// Version 9 added the session_events table, the append-only per-session event log
+// that later phases project into conversation transcripts.
+const CurrentSchemaVersion = 9
 
 type WorkflowState struct {
 	Definition workflow.Definition `json:"definition"`
@@ -83,6 +85,13 @@ func OpenSQLite(ctx context.Context, path string) (*SQLiteRepository, error) {
 	// serializes every access so concurrent writers queue instead of colliding on
 	// the file lock and returning SQLITE_BUSY. Reads here are infrequent and cheap,
 	// so the lost read parallelism is an acceptable trade for contention-free writes.
+	//
+	// Widening this pool is not a local change: session_events.go relies on a
+	// per-session write lock for seq contiguity, and that lock is only redundant
+	// because this cap already serializes every write. Verified: with
+	// MaxOpenConns=4, deleting that lock makes TestConcurrentAppendsKeepTheLogContiguous
+	// fail 5/5. Read the "invariant protection layers" note on sessionWriteLocks
+	// before changing this number.
 	db.SetMaxOpenConns(1)
 	repo := &SQLiteRepository{db: db}
 	if err := db.PingContext(ctx); err != nil {
