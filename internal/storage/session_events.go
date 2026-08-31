@@ -42,6 +42,11 @@ const maxSessionEventDataBytes = 64 << 10
 // 一旦放宽连接池（实测 MaxOpenConns=4），同一变异（删掉这把锁）会 5/5 稳定失败，
 // 证实锁是 seq 连续性在多连接配置下的唯一防线。因此保留之，并**不要因为「现在删掉
 // 测试还绿」就把它删了**——那只反映了当前配置的特殊性，不代表锁本身逻辑冗余或不必要。
+//
+// 【已知上界】locks 只增不减：上界 = 本进程见过的会话数，每个条目是一个
+// sync.Mutex（几十字节 + 一个 map 槽位）。正确的清理需要引用计数或 TTL，两者
+// 都得先解决「锁被持有时不能删」的竞态，现在做等于在没有真实会话基数的情况下
+// 猜。触发条件：P2 把发射点接上、有了真实的会话基数之后，再评估是否需要清理。
 type sessionWriteLocks struct {
 	mu    sync.Mutex
 	locks map[string]*sync.Mutex
@@ -68,6 +73,25 @@ func (s *sessionWriteLocks) get(sessionID string) *sync.Mutex {
 //
 // 空批次是合法的无操作（懒物化：没有事件的会话不在表里留痕）。
 func (r *SQLiteRepository) Append(ctx context.Context, sessionID string, events []domain.SessionEvent) error {
+	if len(events) == 0 {
+		return nil
+	}
+	lock := r.sessionEventLocks.get(sessionID)
+	lock.Lock()
+	defer lock.Unlock()
+	return r.appendLocked(ctx, sessionID, events)
+}
+
+// appendLocked 是 Append 的锁内主体。**调用方必须已持有该会话的写锁**。
+//
+// 拆出这一层是为了 Load：它的「读 → 规划恢复 → 追加」是一个读-改-写，三步必须
+// 在同一把锁下完成，否则两个并发的 Load 会各自读到同一份未收尾日志、各自去追加
+// （见 Load 的注释）。Load 不能改调 Append——那会在已持锁时再取同一把锁，直接
+// 死锁。
+//
+// 校验整体留在锁内：Load 合成出来的事件也要走完与外部写入完全相同的六道校验，
+// 少一道就等于给恢复路径开了一个绕过写侧不变量的后门。
+func (r *SQLiteRepository) appendLocked(ctx context.Context, sessionID string, events []domain.SessionEvent) error {
 	if len(events) == 0 {
 		return nil
 	}
@@ -99,10 +123,6 @@ func (r *SQLiteRepository) Append(ctx context.Context, sessionID string, events 
 				sessionID, i, event.Seq, events[i-1].Seq+1, i-1, events[i-1].Seq)
 		}
 	}
-
-	lock := r.sessionEventLocks.get(sessionID)
-	lock.Lock()
-	defer lock.Unlock()
 
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -255,7 +275,24 @@ type unansweredCall struct {
 // 与之对应的 tool 消息。
 //
 // 幂等：已经平衡的日志原样返回，不追加任何东西。
+//
+// **调用契约：只可对「确定没有活跃写入者」的会话调用**——进程启动时的崩溃恢复，
+// 或一个已经结束的会话。存储层看得见的只有事件本身，而「崩掉的半个 turn」与
+// 「正在跑、还没收尾的 turn」在数据上完全等价，本层没有任何办法区分。对一个活着
+// 的会话调 Load，会往那个进行中的 turn 里注入 tool/result{is_error}、step/end 与
+// turn/end{interrupted}，把它强行收成中断。这条约束 P1 修不掉，已按 spec §4.3.1
+// 的先例写进 spec 交给 P2 的实现者。
+//
+// 读-规划-追加三步在同一把 per-session 写锁下完成（spec §4.4「同会话写入经同一条
+// 串行链」）。锁外做这个读-改-写的后果不是数据损坏——Append 的首条对齐会拦住——
+// 而是两个并发 Load 里后到的那个拿到一句指向 Append 写入语义、与真实原因（另一个
+// Load 抢先完成了恢复）毫无关系的错误，排查成本极高。
 func (r *SQLiteRepository) Load(ctx context.Context, sessionID string) ([]domain.SessionEvent, error) {
+	lock := r.sessionEventLocks.get(sessionID)
+	lock.Lock()
+	defer lock.Unlock()
+
+	// ReadFrom 不取这把锁（它是纯读路径），所以这里不会重入。
 	events, err := r.ReadFrom(ctx, sessionID, 0)
 	if err != nil {
 		return nil, err
@@ -268,11 +305,17 @@ func (r *SQLiteRepository) Load(ctx context.Context, sessionID string) ([]domain
 		return events, nil
 	}
 
-	synthesized, err := synthesizeClosers(plan, int64(len(events)), lastTimeOf(events))
+	// 走到这里 events 必非空：空日志的 plan 三项全空，上面已经返回。
+	// next-seq 用最后一条的 Seq+1 而不是 len(events)：两者只在「从 0 起稠密连续」
+	// 时相等，那个前提由 ReadFrom(0) 的两道断裂检测保证，但那层耦合只在读者脑子里。
+	// 时间戳同理直接取最后一条真实事件的时间——补出来的事件描述的是那一刻发生的
+	// 中断，不是「现在」。
+	last := events[len(events)-1]
+	synthesized, err := synthesizeClosers(plan, last.Seq+1, last.Time)
 	if err != nil {
 		return nil, fmt.Errorf("recover session %q: %w", sessionID, err)
 	}
-	if err := r.Append(ctx, sessionID, synthesized); err != nil {
+	if err := r.appendLocked(ctx, sessionID, synthesized); err != nil {
 		return nil, fmt.Errorf("persist recovery for session %q: %w", sessionID, err)
 	}
 	return append(events, synthesized...), nil
@@ -422,15 +465,6 @@ func synthesizeClosers(plan recoveryPlan, nextSeq int64, at time.Time) ([]domain
 		out = append(out, domain.SessionEvent{Seq: seq, Type: domain.SessionEventTurnEnd, Time: at, Data: data})
 	}
 	return out, nil
-}
-
-// lastTimeOf 用最后一条真实事件的时间给补出来的事件打时间戳：它们描述的是
-// 那一刻发生的中断，而不是「现在」。空日志不会走到恢复路径。
-func lastTimeOf(events []domain.SessionEvent) time.Time {
-	if len(events) == 0 {
-		return time.UnixMilli(0)
-	}
-	return events[len(events)-1].Time
 }
 
 // intField 从事件载荷里取一个必填的数值字段。

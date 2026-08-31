@@ -899,3 +899,55 @@ func TestReadFromRefusesInvalidJSONInTheTable(t *testing.T) {
 		t.Errorf("错误没带出是哪个会话的哪一条：%v", err)
 	}
 }
+
+// concurrentLoaders 是并发 Load 测试里同时打开同一个会话的 goroutine 数。
+const concurrentLoaders = 4
+
+// 并发 Load 同一个未收尾会话：全部成功，且恢复只被补一次（spec §4.4）。
+//
+// Load 是一个「读 → 规划恢复 → 追加」的读-改-写。三步不在同一把 per-session 锁下
+// 时，两个并发的 Load 会读到同一份未收尾日志、各自去追加：数据不会坏（Append 的
+// 首条对齐会拦住），但后到的那个拿到的是一句
+// "first seq is N but the log continues at M; the log is append-only ..."
+// ——指向 Append 的写入语义，与真实原因（另一个 Load 抢先完成了恢复）毫无关系。
+// P2 一旦把 Load 接进会话打开路径，这就是一个偶发的、排查成本极高的「会话打不开」。
+//
+// 断言两件事：一是**全部 Load 都成功**（不能有人被自己人挤掉），二是最终库里的
+// 条数恰好等于「补一次」的结果（不能补两次，也不能因为都失败而一条没补）。
+// 条数直接查表（countEvents），不经由被测的 Load 返回值。
+func TestConcurrentLoadsRecoverExactlyOnce(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+	// 崩在一个未答的工具调用上：恢复要补 tool/result + step/end + turn/end 三条。
+	if err := repo.Append(ctx, "c1", []domain.SessionEvent{
+		ev(0, domain.SessionEventTurnStart),
+		ev(1, domain.SessionEventStepStart),
+		toolCall(2, "call-1"),
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	const wantAfterRecovery = 3 + 3
+
+	errs := make([]error, concurrentLoaders)
+	var wg sync.WaitGroup
+	for i := 0; i < concurrentLoaders; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = repo.Load(ctx, "c1")
+		}(i)
+	}
+	wg.Wait()
+
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("并发 Load[%d] 失败：%v\n"+
+				"——一次完全正当的并发打开不该失败，而且这条错误指向的是 Append 的写入语义，"+
+				"与真实原因（另一个 Load 抢先完成了恢复）毫无关系", i, err)
+		}
+	}
+	if got := countEvents(t, repo, "c1"); got != wantAfterRecovery {
+		t.Fatalf("最终库里 %d 条，want %d：恢复被补了不止一次（或一次都没补）",
+			got, wantAfterRecovery)
+	}
+}

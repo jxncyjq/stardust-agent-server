@@ -24,5 +24,11 @@ type SessionEventStore interface {
 	ReadFrom(ctx context.Context, sessionID string, fromSeq int64) ([]domain.SessionEvent, error)
 
 	// Load 返回该会话的全部事件，必要时先补出崩溃恢复的关闭事件并落盘。
+	//
+	// **只可对「确定没有活跃写入者」的会话调用**——进程启动时的崩溃恢复，或一个
+	// 已经结束的会话。实现看得见的只有事件本身，而「崩掉的半个 turn」与「正在跑、
+	// 还没收尾的 turn」在数据上完全等价，这一层没有任何办法区分：对一个活着的会话
+	// 调 Load，会把那个进行中的 turn 强行收成 interrupted。判断「会话是否在跑」的
+	// 信息只存在于调用方（P2 的会话生命周期）手里，所以这条约束由调用方保证。
 	Load(ctx context.Context, sessionID string) ([]domain.SessionEvent, error)
 }
