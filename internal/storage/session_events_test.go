@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -696,4 +697,77 @@ func isErrorOf(t *testing.T, e domain.SessionEvent) bool {
 		t.Fatalf("unmarshal is_error from %s: %v", e.Type, err)
 	}
 	return payload.IsError
+}
+
+// maxConcurrentAppendRetries 是每个 writer goroutine 在抢号失败后重试的次数
+// 上限。这是一条字面上界，不是「重试到 Append 成功为止」——本仓有过一次
+// fork-bomb 事故，教训是任何循环都不能把被测功能本身当唯一终止条件。8 个
+// writer、每个 5 条，最坏情况下一个 writer 要在其余 7 个都抢先的情况下让出
+// 号位，50 次给了远超所需的余量；真撞到上限只可能是锁失效导致的活锁或死循环，
+// 那正是这条测试要抓的情况之一，所以撞到就 Errorf 而不是 Fatalf 更久。
+const maxConcurrentAppendRetries = 50
+
+// 同会话并发写：seq 必须仍然连续、无重复（spec §4.4）。
+//
+// 这条守的是那把 per-session 锁（sessionWriteLocks，见 session_events.go）。
+// 没有它，两个写入方会读到同一个 next-seq——一个成功、一个撞主键失败，而
+// 失败的那次带走的是真实发生过的一段历史。
+//
+// 每个 goroutine 自己重试：调用方本来就不知道别人在写，它拿到「日志已经走到
+// 第 N 条」的错误后重读再写才是正常用法。这里要断言的是**结果**：最终的日志
+// 连续、条数正确、无重复。重试循环带字面上界（maxConcurrentAppendRetries），
+// 不依赖 Append 最终成功来终止。
+func TestConcurrentAppendsKeepTheLogContiguous(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+
+	const writers = 8
+	const perWriter = 5
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < perWriter; j++ {
+				succeeded := false
+				for attempt := 0; attempt < maxConcurrentAppendRetries; attempt++ {
+					existing, err := repo.ReadFrom(ctx, "s1", 0)
+					if err != nil {
+						t.Errorf("ReadFrom: %v", err)
+						return
+					}
+					err = repo.Append(ctx, "s1", []domain.SessionEvent{
+						ev(int64(len(existing)), domain.SessionEventStepStart),
+					})
+					if err == nil {
+						succeeded = true
+						break
+					}
+					if !strings.Contains(err.Error(), "the log continues at") {
+						t.Errorf("并发写失败的原因不是抢号：%v", err)
+						return
+					}
+				}
+				if !succeeded {
+					t.Errorf("writer 在 %d 次重试内都没能抢到号位：这不该发生，"+
+						"要么锁失效导致活锁，要么并发度远超预期", maxConcurrentAppendRetries)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	events, err := repo.ReadFrom(ctx, "s1", 0)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if len(events) != writers*perWriter {
+		t.Fatalf("最终 %d 条，want %d：有写入被静默丢掉了", len(events), writers*perWriter)
+	}
+	for i, e := range events {
+		if e.Seq != int64(i) {
+			t.Fatalf("第 %d 条的 seq 是 %d：日志不连续", i, e.Seq)
+		}
+	}
 }
