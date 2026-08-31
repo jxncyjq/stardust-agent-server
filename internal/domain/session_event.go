@@ -12,15 +12,25 @@ import (
 // 而把它当作「可以跳过的一行」会让重建出的历史悄悄缺一段。
 type SessionEventType string
 
+// SessionEventTurnStart 常量及其他事件类型常量定义会话事件日志中每个事件的类型标识。
+// 见 spec §4.1 了解每个事件的生命周期与事件顺序。
 const (
-	SessionEventTurnStart        SessionEventType = "turn/start"
-	SessionEventUserMessage      SessionEventType = "user/message"
-	SessionEventStepStart        SessionEventType = "step/start"
+	// SessionEventTurnStart 记录收到一条用户输入时开启一个轮次。
+	SessionEventTurnStart SessionEventType = "turn/start"
+	// SessionEventUserMessage 记录用户那条消息本身。
+	SessionEventUserMessage SessionEventType = "user/message"
+	// SessionEventStepStart 记录准备发一次模型请求时一步的开始。
+	SessionEventStepStart SessionEventType = "step/start"
+	// SessionEventAssistantMessage 记录模型响应装配完成（含 usage）。
 	SessionEventAssistantMessage SessionEventType = "assistant/message"
-	SessionEventToolCall         SessionEventType = "tool/call"
-	SessionEventToolResult       SessionEventType = "tool/result"
-	SessionEventStepEnd          SessionEventType = "step/end"
-	SessionEventTurnEnd          SessionEventType = "turn/end"
+	// SessionEventToolCall 记录一次工具调用被派发之前。
+	SessionEventToolCall SessionEventType = "tool/call"
+	// SessionEventToolResult 记录工具返回（含预览与 spill 定位符）。
+	SessionEventToolResult SessionEventType = "tool/result"
+	// SessionEventStepEnd 记录一步结束（含失败与取消）。
+	SessionEventStepEnd SessionEventType = "step/end"
+	// SessionEventTurnEnd 记录轮次结束。
+	SessionEventTurnEnd SessionEventType = "turn/end"
 )
 
 // knownSessionEventTypes 是上面那组常量的集合形式，供 ValidateSessionEventType 查。
@@ -35,22 +45,30 @@ var knownSessionEventTypes = map[SessionEventType]struct{}{
 	SessionEventTurnEnd:          {},
 }
 
-// step/end 的 reason 闭集（spec §4.1）。
-const (
-	StepEndReasonCompleted = "completed"
-	StepEndReasonFailed    = "failed"
-	StepEndReasonCancelled = "cancelled"
-	StepEndReasonMaxTokens = "max_tokens"
-)
+// StepEndReasonCompleted 标记一步成功完成（spec §4.1）。
+const StepEndReasonCompleted = "completed"
 
-// turn/end 的 reason 闭集（spec §4.1）。interrupted 只由崩溃恢复补出，
-// 正常路径不得使用它——它是「这段历史不是自己结束的」这个事实的唯一记号。
-const (
-	TurnEndReasonCompleted   = "completed"
-	TurnEndReasonFailed      = "failed"
-	TurnEndReasonCancelled   = "cancelled"
-	TurnEndReasonInterrupted = "interrupted"
-)
+// StepEndReasonFailed 标记一步执行失败（spec §4.1）。
+const StepEndReasonFailed = "failed"
+
+// StepEndReasonCancelled 标记一步被取消（spec §4.1）。
+const StepEndReasonCancelled = "cancelled"
+
+// StepEndReasonMaxTokens 标记一步因达到 token 上限而结束（spec §4.1）。
+const StepEndReasonMaxTokens = "max_tokens"
+
+// TurnEndReasonCompleted 标记一个轮次成功完成（spec §4.1）。
+const TurnEndReasonCompleted = "completed"
+
+// TurnEndReasonFailed 标记一个轮次执行失败（spec §4.1）。
+const TurnEndReasonFailed = "failed"
+
+// TurnEndReasonCancelled 标记一个轮次被取消（spec §4.1）。
+const TurnEndReasonCancelled = "cancelled"
+
+// TurnEndReasonInterrupted 标记一个轮次因外部中断（如崩溃恢复）而结束。
+// 仅由崩溃恢复补出，正常路径不得使用它——它是「这段历史不是自己结束的」的唯一记号（spec §4.1）。
+const TurnEndReasonInterrupted = "interrupted"
 
 // SessionEvent 是会话事件日志里的一行。
 //
