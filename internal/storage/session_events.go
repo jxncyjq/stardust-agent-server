@@ -9,7 +9,14 @@ import (
 	"time"
 
 	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/port"
 )
+
+// 编译期保证 SQLiteRepository 满足端口契约。
+//
+// 这一行的作用是让「方法签名改了但端口没改」在**编译时**就停下来，而不是等到
+// 装配时才发现某个实现悄悄不再满足接口。
+var _ port.SessionEventStore = (*SQLiteRepository)(nil)
 
 // maxSessionEventDataBytes 是单个事件载荷的上限。
 //
