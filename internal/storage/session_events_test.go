@@ -781,18 +781,23 @@ func TestConcurrentAppendsKeepTheLogContiguous(t *testing.T) {
 	}
 }
 
-// 同一个 call_id 在一条会话里出现两次必须当场报错（CLAUDE.md §0）。
+// 同一个 call_id 同时存在两条都没等到结果的 tool/call 必须当场报错（CLAUDE.md §0）。
 //
 // 屏障 2 是「先记录 tool/call 再进工具体」，所以刷盘成功、进工具体前崩溃再重试
-// 派发，日志里就会出现两条同 call_id 的 tool/call。此前 planRecovery 的 pending
-// 以 id 为键只留一份、order 却记两次，恢复会补出**两条 call_id 相同**的
+// 派发，日志里就会出现两条同 call_id 的 tool/call、且都没有 tool/result。此时
+// pending 以 id 为键只留一份、order 却记两次，恢复会补出**两条 call_id 相同**的
 // tool/result——而 spec §4.3.1 给 P3 的硬约束正是「按 call_id 配对」：一个
 // tool_use 对上两条 tool 消息，provider 直接 400，报错却指向 provider 参数，
 // 没人会想到根因在很久以前的一次崩溃恢复里。
 //
+// 这条测试的两次出现**都没有 tool/result**：这是唯一真的会触发合成冲突的
+// 形状（spec §4.3.1 第 4 条：同一 step 内未被应答的 tool/call 不得复用
+// call_id）。若两次出现各自都有自己的 tool/result（一条完全平衡的日志），
+// 复用同一个 call_id 是允许的——见 TestLoadLeavesABalancedLogWithAReusedCallIDAlone。
+//
 // 断言「报错」而不是「去重」：默默去重只是把「日志与真实发生的事不符」藏起来，
 // 上游发重复事件这件事本身仍然没人知道。
-func TestLoadRefusesADuplicateCallID(t *testing.T) {
+func TestLoadRefusesTwoUnansweredCallsWithTheSameCallID(t *testing.T) {
 	ctx := context.Background()
 	repo := newEventRepo(t)
 	if err := repo.Append(ctx, "s1", []domain.SessionEvent{
@@ -806,7 +811,7 @@ func TestLoadRefusesADuplicateCallID(t *testing.T) {
 
 	_, err := repo.Load(ctx, "s1")
 	if err == nil {
-		t.Fatal("重复的 call_id 被恢复流程接受了：会补出两条同 call_id 的 tool/result")
+		t.Fatal("两条都未被应答的同 call_id 调用被恢复流程接受了：会补出两条同 call_id 的 tool/result")
 	}
 	if !strings.Contains(err.Error(), `"same"`) {
 		t.Errorf("错误没指名是哪个 call_id：%v", err)
@@ -818,6 +823,70 @@ func TestLoadRefusesADuplicateCallID(t *testing.T) {
 	// 报错的会话不该被写进任何东西：恢复要么整体成立，要么什么都不留。
 	if got := countEvents(t, repo, "s1"); got != 4 {
 		t.Errorf("报错后表里有 %d 条，want 4：恢复不该在校验失败时写入", got)
+	}
+}
+
+// C-1（final-review-2.md）：重复 call_id 的检查此前是**整会话范围**的——只要
+// 两个 turn 复用了同一个 call_id，哪怕每次都各自有自己的 tool/result、日志
+// 完全平衡、没有任何未答调用，Load 也会当场报错，一条事件都返回不了。
+//
+// provider 的 tool call id 只保证**单次响应内**唯一，跨一整条长会话唯一并
+// 不是所有 provider/本地模型都保证（按序号生成 call_1、tooluse_0 的实现是
+// 存在的）。这条测试还原的正是那种健康日志：两个 turn 各自完整地 call →
+// result，只是复用了同一个 call_id 字符串。
+//
+// spec §4.3.1 第 4 条把这条约束交给了 P2（发射点）：只有「同一个 step 内
+// 未被应答的 tool/call」不得复用 call_id；已应答的调用天然不参与恢复合成，
+// 跨 turn/step 复用无害，Load 必须放行且保持幂等。
+func TestLoadLeavesABalancedLogWithAReusedCallIDAlone(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+	balanced := []domain.SessionEvent{
+		// turn 0：call_1 派发并应答。
+		ev(0, domain.SessionEventTurnStart),
+		ev(1, domain.SessionEventStepStart),
+		toolCall(2, "call_1"),
+		toolResult(3, "call_1"),
+		stepEnd(4, domain.StepEndReasonCompleted),
+		turnEnd(5, domain.TurnEndReasonCompleted),
+		// turn 1：同一个 call_id 再次派发并应答——provider 只保证单响应内唯一，
+		// 这种复用真实存在且无害。
+		ev(6, domain.SessionEventTurnStart),
+		ev(7, domain.SessionEventStepStart),
+		toolCall(8, "call_1"),
+		toolResult(9, "call_1"),
+		stepEnd(10, domain.StepEndReasonCompleted),
+		turnEnd(11, domain.TurnEndReasonCompleted),
+	}
+	if err := repo.Append(ctx, "s1", balanced); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	first, err := repo.Load(ctx, "s1")
+	if err != nil {
+		t.Fatalf("Load: %v（一条完全平衡、没有任何未答调用的日志不该因为跨 turn 复用 "+
+			"call_id 就打不开）", err)
+	}
+	if len(first) != len(balanced) {
+		t.Fatalf("Load 改动了一条本来就平衡的日志：返回 %d 条, want %d", len(first), len(balanced))
+	}
+	for i, e := range first {
+		if e.Seq != balanced[i].Seq || e.Type != balanced[i].Type {
+			t.Errorf("第 %d 条 = (seq=%d type=%s), want (seq=%d type=%s)：Load 不该改写健康日志",
+				i, e.Seq, e.Type, balanced[i].Seq, balanced[i].Type)
+		}
+	}
+
+	// 幂等：再读一次不该追加任何东西。
+	second, err := repo.Load(ctx, "s1")
+	if err != nil {
+		t.Fatalf("second Load: %v", err)
+	}
+	if len(second) != len(balanced) {
+		t.Errorf("第二次 Load 返回 %d 条, want %d：Load 不是幂等的", len(second), len(balanced))
+	}
+	if got := countEvents(t, repo, "s1"); got != len(balanced) {
+		t.Errorf("表里有 %d 条，want %d：健康日志不该被 Load 追加任何东西", got, len(balanced))
 	}
 }
 

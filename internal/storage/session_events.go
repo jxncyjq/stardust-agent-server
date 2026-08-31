@@ -330,14 +330,27 @@ func (r *SQLiteRepository) Load(ctx context.Context, sessionID string) ([]domain
 // spec §4.1 里是必填的，取不到说明这条日志本身有问题，不是「缺省当默认值」
 // 能糊弄过去的情况，所以一路把 error 上报，不吞。
 //
-// 同样地，日志本身的结构异常（同一个 call_id 出现两次、没有 start 的 end）
-// 也一律报错而不是就地纠正：它们说明上游发事件出了问题，静默修正只会把
-// 问题挪到更远的地方（见下方各处注释）。
+// 同样地，日志本身的结构异常（没有 start 的 end）也一律报错而不是就地纠正：
+// 它们说明上游发事件出了问题，静默修正只会把问题挪到更远的地方（见下方注释）。
+//
+// call_id 重复的检查范围是**会被合成结果的那些未答调用**，不是整条会话
+// （spec §4.3.1 第 4 条）：provider 的 tool call id 只保证单次响应内唯一，
+// 一条完全平衡的长会话（每次调用都有自己的 tool/result）跨 turn 复用同一个
+// call_id 是允许的、也是常见的（按序号生成 id 的 provider/本地模型不保证
+// 跨会话唯一）——已应答的调用不进 pending，天然不参与恢复合成，重复无害。
+// 只有当同一个 call_id 同时存在两个（或更多）都没等到结果的 tool/call 时，
+// 恢复才会真的补出两条同 call_id 的 tool/result，那才是需要拦下的冲突；
+// 见下方 openCount 的用法与收尾处的判定。
 func planRecovery(events []domain.SessionEvent) (recoveryPlan, error) {
 	var plan recoveryPlan
 	pending := map[string]unansweredCall{}
-	// seenCalls 记下每个 call_id 第一次出现的 seq，用来在重复时报出「哪两条」。
-	seenCalls := map[string]int64{}
+	// openCount 记下每个 call_id 当前还有多少条 tool/call 没等到 tool/result。
+	// 冲突判定用的是这个「最终仍未清零」的计数，不是「出现过两次」——见函数级
+	// 注释与收尾处的判定。
+	openCount := map[string]int{}
+	// callSeqs 记下每个 call_id 每次以 tool/call 出现的 seq，只用于真的冲突时
+	// 把「哪几条」指给排查的人看，不参与冲突判定本身。
+	callSeqs := map[string][]int64{}
 	var order []string
 	turnOpen, stepOpen := false, false
 
@@ -384,19 +397,6 @@ func planRecovery(events []domain.SessionEvent) (recoveryPlan, error) {
 			if err != nil {
 				return recoveryPlan{}, fmt.Errorf("event %d (%s): %w", event.Seq, event.Type, err)
 			}
-			// 同一会话里 call_id 必须唯一。重复说明上游发事件出了问题，而后果
-			// 落在下一期：pending 以 id 为键只留一份、order 却记两次，恢复会补出
-			// 两条同 call_id 的 tool/result；spec §4.3.1 给 P3 的硬约束是「按
-			// call_id 配对」，一个 tool_use 对上两条 tool 消息，provider 直接 400。
-			// 默默去重同样不行——那只是把「日志与真实发生的事不符」藏起来。
-			if first, dup := seenCalls[id]; dup {
-				return recoveryPlan{}, fmt.Errorf("event %d (%s): call_id %q already appeared at "+
-					"event %d; call ids must be unique within a session, otherwise recovery would "+
-					"synthesize two tool results carrying the same call_id and the rebuilt "+
-					"transcript could never be paired up by call_id",
-					event.Seq, event.Type, id, first)
-			}
-			seenCalls[id] = event.Seq
 			turn, err := intField(event.Data, "turn")
 			if err != nil {
 				return recoveryPlan{}, fmt.Errorf("event %d (%s): %w", event.Seq, event.Type, err)
@@ -405,6 +405,8 @@ func planRecovery(events []domain.SessionEvent) (recoveryPlan, error) {
 			if err != nil {
 				return recoveryPlan{}, fmt.Errorf("event %d (%s): %w", event.Seq, event.Type, err)
 			}
+			callSeqs[id] = append(callSeqs[id], event.Seq)
+			openCount[id]++
 			pending[id] = unansweredCall{callID: id, turn: turn, step: step}
 			order = append(order, id)
 		case domain.SessionEventToolResult:
@@ -413,12 +415,37 @@ func planRecovery(events []domain.SessionEvent) (recoveryPlan, error) {
 				return recoveryPlan{}, fmt.Errorf("event %d (%s): %w", event.Seq, event.Type, err)
 			}
 			delete(pending, id)
+			if openCount[id] > 0 {
+				openCount[id]--
+			}
 		}
 	}
+
+	// 收尾这一步才判定冲突，而不是收集阶段见到第二次 tool/call 就报——判的是
+	// 「最终会被合成结果的那些未答调用」，不是「整条会话里出现过的 call_id」
+	// （spec §4.3.1 第 4 条）。emitted 去重：同一个 id 即便在 order 里因为
+	// 「答了又被同 id 再次调用」出现多次，只要它最终没有两个同时未答的实例，
+	// 就只该合成一条 tool/result。
+	emitted := map[string]bool{}
 	for _, id := range order {
-		if call, ok := pending[id]; ok {
-			plan.unansweredCalls = append(plan.unansweredCalls, call)
+		if emitted[id] {
+			continue
 		}
+		call, ok := pending[id]
+		if !ok {
+			continue
+		}
+		if openCount[id] >= 2 {
+			seqs := callSeqs[id]
+			return recoveryPlan{}, fmt.Errorf("event %d (%s): call_id %q has %d unanswered tool/call "+
+				"events still outstanding (first at event %d, most recent at event %d); an unanswered "+
+				"tool/call must not reuse a call_id, otherwise recovery would synthesize two tool "+
+				"results carrying the same call_id and the rebuilt transcript could never be paired "+
+				"up by call_id (a call_id that was already answered may be reused safely)",
+				seqs[len(seqs)-1], domain.SessionEventToolCall, id, openCount[id], seqs[0], seqs[len(seqs)-1])
+		}
+		plan.unansweredCalls = append(plan.unansweredCalls, call)
+		emitted[id] = true
 	}
 	plan.needStepEnd = stepOpen
 	plan.needTurnEnd = turnOpen
