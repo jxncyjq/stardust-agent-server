@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -564,6 +565,101 @@ func turnEnd(seq int64, reason string) domain.SessionEvent {
 	return domain.SessionEvent{Seq: seq, Type: domain.SessionEventTurnEnd, Time: time.UnixMilli(1), Data: data}
 }
 
+// TestLoadSynthesizesToolResultsInOriginalCallOrderAndMarksThemAsErrors 同时守两条
+// 复审用变异实证过、套件却照样全绿的缺口：
+//
+// I1（顺序）：planRecovery 内部用一个 order 切片记录未答调用的原始出现顺序，
+// 产出合成事件时按它遍历。如果有人把它「简化」成直接遍历 pending 这个
+// map（Go 的 map 遍历顺序是随机的），补出来的 tool/result 的 call_id
+// 顺序就会在每次运行之间漂移——同一份损坏日志两次打开，重建出的 seq
+// 顺序不一样。此前唯一的 Load 恢复测试（TestLoadClosesAnInterruptedTurnIntoAValidTranscript）
+// 只有一个未答调用，天然测不出顺序问题。
+//
+// 用 5 个未答调用（a、c、d、f、g，中间夹两个已应答的 b、e）而不是最小
+// 的 3 个：实测过直接遍历 pending map 的坏实现并不是「完全随机排列」——
+// 未答调用挤在同一个 8 槽单桶里，物理相对顺序是固定的，range 只是随机
+// 挑一个起点做循环旋转。3 个元素时只有 3 种旋转，坏实现「凑巧」转回
+// 原始顺序的概率高达 1/3，单次跑测试会偶发绿；5 个元素也只是把概率
+// 降到 1/5，同样不够可靠——这是「断言够强但单次试验的统计功效不够」
+// 的坑，光靠加多未答调用数量收益是线性的，不划算。
+//
+// 真正压下去的办法是在**同一次测试运行内**独立重复多次：每次
+// planRecovery 调用都会为 pending 建一个全新的 map 实例，坏实现每次
+// range 到的随机起点相互独立。下面循环 8 个相互独立的会话，全部要求
+// 命中原始顺序——好实现（按 order 遍历）次次必中；坏实现（按 map
+// 遍历）全部 8 次都凑巧转回原点的概率只有 (1/5)^8 ≈ 2.6e-6，比只加大
+// 未答调用数量或者只加大外层 `go test -count` 次数都更可靠。断言本身
+// 仍然是**完整序列**逐位比对，而不是集合相等——集合相等在 map 遍历
+// 乱序时依然成立，只有逐位比对才能在实现改坏时报错。
+//
+// I2（is_error）：is_error 是下游唯一能识别「这条结果是补出来的、工具
+// 其实没返回」的记号。如果它被写成 false，模型在会话恢复时会把
+// 「工具没跑完」误当成一次正常返回继续推理，人查日志时也分不出哪些
+// 结果是真的、哪些是补的。这里对每一条合成出来的 tool/result 都要
+// 断言 is_error == true。
+func TestLoadSynthesizesToolResultsInOriginalCallOrderAndMarksThemAsErrors(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+	wantOrder := []string{"a", "c", "d", "f", "g"}
+
+	const trials = 8
+	for trial := 0; trial < trials; trial++ {
+		sessionID := fmt.Sprintf("s-order-%d", trial)
+		// 未答：a, c, d, f, g（按这个顺序出现）；已答：b（夹在 a、c 之间）、
+		// e（夹在 d、f 之间）。每个 trial 用独立的 session_id，触发一次
+		// 全新的 planRecovery / pending map 实例。
+		if err := repo.Append(ctx, sessionID, []domain.SessionEvent{
+			ev(0, domain.SessionEventTurnStart),
+			ev(1, domain.SessionEventStepStart),
+			toolCall(2, "a"),
+			toolCall(3, "b"),
+			toolResult(4, "b"),
+			toolCall(5, "c"),
+			toolCall(6, "d"),
+			toolCall(7, "e"),
+			toolResult(8, "e"),
+			toolCall(9, "f"),
+			toolCall(10, "g"),
+		}); err != nil {
+			t.Fatalf("trial %d: Append: %v", trial, err)
+		}
+
+		events, err := repo.Load(ctx, sessionID)
+		if err != nil {
+			t.Fatalf("trial %d: Load: %v", trial, err)
+		}
+
+		// 只看 Append 写入的 11 条（seq 0..10）之后新出现的 tool/result：
+		// 那些才是 Load 合成出来的，b、e 的真实结果不该混进来。
+		var synthesized []domain.SessionEvent
+		for _, e := range events {
+			if e.Seq >= 11 && e.Type == domain.SessionEventToolResult {
+				synthesized = append(synthesized, e)
+			}
+		}
+
+		// I1：顺序必须恰好等于未答调用在原始日志里出现的顺序 —— a, c, d, f, g。
+		// 逐位比对而不是拿去建 set：把实现换成遍历 pending map 之后，集合
+		// 依然是 {a,c,d,f,g}，只有顺序会变，只有这种逐位比较才抓得住。
+		if len(synthesized) != len(wantOrder) {
+			t.Fatalf("trial %d: 合成了 %d 条 tool/result，want %d 条（call_id 应为 %v）",
+				trial, len(synthesized), len(wantOrder), wantOrder)
+		}
+		for i, e := range synthesized {
+			if got := callIDOf(t, e); got != wantOrder[i] {
+				t.Errorf("trial %d: 合成结果第 %d 条 call_id = %q, want %q："+
+					"顺序必须与原始 tool/call 出现顺序一致，否则同一份损坏日志两次恢复会产生"+
+					"不同的 seq 顺序，轨迹在两次打开之间漂移", trial, i, got, wantOrder[i])
+			}
+			// I2：见函数级注释。
+			if !isErrorOf(t, e) {
+				t.Errorf("trial %d: 合成结果 call_id=%q 的 is_error = false, want true："+
+					"下游会把「工具没跑完」误当成一次正常返回继续推理", trial, callIDOf(t, e))
+			}
+		}
+	}
+}
+
 // callIDOf 从事件载荷里取 call_id，取不到就当场 Fatal——这是测试断言的一部分，
 // 不是被测代码的行为。
 func callIDOf(t *testing.T, e domain.SessionEvent) string {
@@ -587,4 +683,17 @@ func reasonOf(t *testing.T, e domain.SessionEvent) string {
 		t.Fatalf("unmarshal reason from %s: %v", e.Type, err)
 	}
 	return payload.Reason
+}
+
+// isErrorOf 从事件载荷里取 is_error，取不到就当场 Fatal——同 callIDOf/reasonOf
+// 的不吞错理由：这是测试断言的一部分，不是被测代码的行为。
+func isErrorOf(t *testing.T, e domain.SessionEvent) bool {
+	t.Helper()
+	var payload struct {
+		IsError bool `json:"is_error"`
+	}
+	if err := json.Unmarshal(e.Data, &payload); err != nil {
+		t.Fatalf("unmarshal is_error from %s: %v", e.Type, err)
+	}
+	return payload.IsError
 }
