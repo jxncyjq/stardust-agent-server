@@ -878,7 +878,51 @@ type pluginStatusRow struct {
 	// or both (a row that is out of the manifest AND failed carries the reason
 	// followed by its own error=). Empty when a loaded entry has nothing to
 	// explain.
+	//
+	// The label is a TERMINAL affordance: it names the class and it is what an
+	// operator greps for in `agent plugins status` output. It is NOT part of
+	// the explanation, which is why Message exists.
 	Detail string
+
+	// Message is the same explanation with no label -- the plain sentence.
+	//
+	// It exists because this row feeds two audiences: the terminal, which wants
+	// the label, and the HTTP API (server.PluginView.Detail/DeclaredError),
+	// which feeds a GUI that renders the text as a sentence to a person. The
+	// API used to send Detail verbatim, so a plugin whose signature was not
+	// trusted reached the plugin panel as `error=load plugin package "C:\..."`
+	// -- a logfmt fragment on screen, with a leading `error=` that means
+	// nothing to the reader (V1 real-machine verification found this).
+	//
+	// Two fields rather than stripping the label at the boundary: rows that
+	// carry two labelled parts (a reason plus a waiting_on= or error=) cannot
+	// be un-labelled by trimming a prefix, and the class is not lost -- the API
+	// already carries it in State.
+	Message string
+}
+
+// setDetail records one labelled explanation on the row, in both forms.
+func (r *pluginStatusRow) setDetail(label, text string) {
+	r.Detail = detailFor(label, text)
+	r.Message = strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+}
+
+// appendDetail adds a second labelled part (a row can be both "no longer in the
+// manifest" AND failed). The plain form is joined the same way, without labels.
+func (r *pluginStatusRow) appendDetail(label, text string) {
+	part := detailFor(label, text)
+	if part == "" {
+		return
+	}
+	if r.Detail != "" {
+		r.Detail += "  "
+	}
+	r.Detail += part
+	plain := strings.Join(strings.Fields(strings.TrimSpace(text)), " ")
+	if r.Message != "" {
+		r.Message += "  "
+	}
+	r.Message += plain
 }
 
 // mergePluginStatus joins the deployment manifest on disk with what the loader
@@ -906,7 +950,7 @@ func mergePluginStatus(deployment manifest.Deployment, statuses []loader.Instanc
 		row := pluginStatusRow{Name: entry.Name, Version: st.Version, State: st.State, Tools: st.Tools}
 		switch {
 		case known && st.State == loader.StateFailed:
-			row.Detail = detailFor("error", st.LastError)
+			row.setDetail("error", st.LastError)
 		case known && st.State == loader.StateSuspended:
 			// Checked before the disabled-but-known case below, the same way
 			// StateFailed already is: "status" re-reads the manifest from disk on
@@ -915,13 +959,13 @@ func mergePluginStatus(deployment manifest.Deployment, statuses []loader.Instanc
 			// "enabled": false in the manifest is fully reachable. Its waiting_on=
 			// explanation must not be replaced by the disabled reason below —
 			// that is the entire reason SuspendedBy exists.
-			row.Detail = suspendedRowDetail(st, providerOf, byName)
+			row.setSuspendedDetail(st, providerOf, byName)
 		case known && !entry.Enabled:
 			// Mounted, but the file says it should not be. The manifest changed
 			// under a running deployment and nobody has reloaded yet.
-			row.Detail = detailFor("reason", `the manifest now sets "enabled": false; run "agent plugins reload" to unmount it`)
+			row.setDetail("reason", `the manifest now sets "enabled": false; run "agent plugins reload" to unmount it`)
 		case known:
-			row.Detail = detailFor("error", st.LastError)
+			row.setDetail("error", st.LastError)
 		case !entry.Enabled && !entry.GrantStated:
 			// Not mounted, disabled, AND nobody has ever recorded a grant
 			// decision for it (no "grant" block was ever present — see
@@ -935,14 +979,14 @@ func mergePluginStatus(deployment manifest.Deployment, statuses []loader.Instanc
 			// pluginStateUnauthorized's own doc comment for why that wider
 			// claim is not always true, and why this state is still the
 			// right one to report anyway).
-			row.Detail = detailFor("reason", `plugins.json records no grant block for this entry, so it has `+
+			row.setDetail("reason", `plugins.json records no grant block for this entry, so it has `+
 				`never been authorized here; run "agent plugins grant" to authorize it`)
 		case !entry.Enabled:
 			row.State = pluginStateDisabled
-			row.Detail = detailFor("reason", `the manifest entry sets "enabled": false`)
+			row.setDetail("reason", `the manifest entry sets "enabled": false`)
 		default:
 			row.State = pluginStatePending
-			row.Detail = detailFor("reason", `enabled in the manifest but not converged; run "agent plugins reload"`)
+			row.setDetail("reason", `enabled in the manifest but not converged; run "agent plugins reload"`)
 		}
 		rows = append(rows, row)
 	}
@@ -951,17 +995,13 @@ func mergePluginStatus(deployment manifest.Deployment, statuses []loader.Instanc
 			continue
 		}
 		row := pluginStatusRow{Name: st.Name, Version: st.Version, State: st.State, Tools: st.Tools}
-		row.Detail = detailFor("reason", `no longer in the manifest; run "agent plugins reload" to unmount it`)
+		row.setDetail("reason", `no longer in the manifest; run "agent plugins reload" to unmount it`)
 		// The entry's own failure keeps its own "error=" label instead of being
 		// folded into the reason: a failure buried mid-sentence under the wrong
 		// label is a failure nobody greps for. A suspension's waiting_on= gets
 		// the same treatment, for the same reason.
-		if waiting := suspendedWaitingOn(st.SuspendedBy, providerOf, byName); waiting != "" {
-			row.Detail += "  " + waiting
-		}
-		if failure := detailFor("error", st.LastError); failure != "" {
-			row.Detail += "  " + failure
-		}
+		row.appendDetail("waiting_on", suspendedWaitingOn(st.SuspendedBy, providerOf, byName))
+		row.appendDetail("error", st.LastError)
 		rows = append(rows, row)
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Name < rows[j].Name })
@@ -998,15 +1038,9 @@ func pluginToolProviders(statuses []loader.InstanceStatus) map[string]string {
 // followed by its own error= if the suspension itself carries one (see
 // TestApplyReportsAResumeWhoseToolNameWasTaken in internal/plugin/loader for
 // the case where SuspendedBy is empty and the error is the whole story).
-func suspendedRowDetail(st loader.InstanceStatus, providerOf map[string]string, byName map[string]loader.InstanceStatus) string {
-	detail := suspendedWaitingOn(st.SuspendedBy, providerOf, byName)
-	if errDetail := detailFor("error", st.LastError); errDetail != "" {
-		if detail != "" {
-			detail += "  "
-		}
-		detail += errDetail
-	}
-	return detail
+func (r *pluginStatusRow) setSuspendedDetail(st loader.InstanceStatus, providerOf map[string]string, byName map[string]loader.InstanceStatus) {
+	r.appendDetail("waiting_on", suspendedWaitingOn(st.SuspendedBy, providerOf, byName))
+	r.appendDetail("error", st.LastError)
 }
 
 // suspendedWaitingOn renders a StateSuspended row's SuspendedBy as the row's
@@ -1041,7 +1075,7 @@ func suspendedWaitingOn(suspendedBy []string, providerOf map[string]string, byNa
 		}
 		parts = append(parts, fmt.Sprintf("%s(cascade: %s is %s)", toolName, provider, byName[provider].State))
 	}
-	return "waiting_on=" + strings.Join(parts, " ")
+	return strings.Join(parts, " ")
 }
 
 // pluginRowVersion is the version column's text: an entry that failed before

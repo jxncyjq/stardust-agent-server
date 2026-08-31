@@ -175,8 +175,11 @@ func (s *PluginConsentService) List(ctx context.Context) ([]server.PluginView, e
 			Name:    row.Name,
 			Version: row.Version,
 			State:   row.State,
-			Detail:  row.Detail,
-			Tools:   row.Tools,
+			// Message，不是 Detail：Detail 带着 `agent plugins status` 的 logfmt
+			// 标签（error= / reason= / waiting_on=），那是终端的呈现，不该出现在
+			// 送给人看的界面上（V1 真机验证抓到的）。类别没有丢——它在 State 里。
+			Detail: row.Message,
+			Tools:  row.Tools,
 		}
 		entry, entryErr := consent.FindEntry(deployment, row.Name)
 		if entryErr != nil {
@@ -219,7 +222,7 @@ func (s *PluginConsentService) List(ctx context.Context) ([]server.PluginView, e
 			// 就说明它已经试过了。V1 真机验证抓到的就是这个。
 			if reason == server.DeclaredUnresolvedNotCached && row.State == loader.StateFailed && row.Detail != "" {
 				view.DeclaredUnresolvedReason = server.DeclaredUnresolvedLoadFailed
-				view.DeclaredError = row.Detail
+				view.DeclaredError = row.Message
 			}
 			views = append(views, view)
 			continue
@@ -688,7 +691,7 @@ func (s *PluginConsentService) applyAndReport(ctx context.Context, pluginLoader 
 		if row.Name != name {
 			continue
 		}
-		view.Version, view.State, view.Detail, view.Tools = row.Version, row.State, row.Detail, row.Tools
+		view.Version, view.State, view.Detail, view.Tools = row.Version, row.State, row.Message, row.Tools
 		return server.ConsentResult{View: view, ConvergenceDetail: convergenceDetail}, nil
 	}
 	// mergePluginStatus emits exactly one row per dep.Plugins entry (see its

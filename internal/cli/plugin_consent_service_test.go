@@ -1662,4 +1662,124 @@ func TestListDoesNotCallAnUntrustedPackageMerelyUncached(t *testing.T) {
 		t.Error("DeclaredError is empty: the row says the declaration is unresolved but not why, " +
 			"so the panel has nothing to show beyond a generic note")
 	}
+	// 这段文字是要显示给人的，不能带 `agent plugins status` 的 logfmt 标签。
+	// 三个写点各写各的，所以每个都得有断言——只守住其中一个，另外两个照样能把
+	// `error=…` 送到屏幕上（实测：只加一条断言时，另两处的变异都不红）。
+	for _, label := range []string{"error=", "reason=", "waiting_on="} {
+		if strings.HasPrefix(got.DeclaredError, label) {
+			t.Errorf("declared_error 以 %q 开头：logfmt 标签跑到了给人看的字段上\n%s", label, got.DeclaredError)
+		}
+	}
+}
+
+// pluginStatusRow.Detail 是给 `agent plugins status` 用的**带标签**字符串
+// （error= / reason= / waiting_on=，终端里可 grep 出一类）。那是正当的 CLI 呈现。
+//
+// 问题是同一个字段被 HTTP 直接当作给人看的说明送出去：V1 真机验证里，一个签名不被
+// 信任的包在 GET /v1/plugins 的 detail 与 declared_error 里都是
+// `error=load plugin package "C:\..."：…`——GUI 的插件面板把它当句子渲染，于是一个
+// logfmt 片段出现在用户眼前，前面那个 `error=` 谁都不知道是什么。
+//
+// 两边要的本来就不是同一件东西：终端要标签（分类 + 可 grep），API 要原话（类别已经
+// 在 state 字段里）。所以是两个字段，不是把标签在出口剥掉——剥字符串会在
+// waiting_on= 与 reason= 拼在一起的那种行上出错。
+
+func TestTheAPIDoesNotShipLogfmtLabelsToPeople(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.writeSignatureConfig(30_000, signaturePolicy{requireSignature: boolPtr(false)})
+	// 装一个**本地**包然后把 wasm 弄坏：加载器会带着一个真实的失败说明报 failed，
+	// 而那正是会被送到界面上的那段文字。
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "staging", enabled: true,
+		capabilities: []string{"log"}, tools: []string{testEchoTool},
+	})
+	if err := os.WriteFile(filepath.Join(f.root, "staging", "plugin.wasm"), []byte("not wasm"), 0o644); err != nil {
+		t.Fatalf("corrupt the module: %v", err)
+	}
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
+		func() *sign.Keyring { return nil }, f.resolveFixtureRemote(), testConsentLogger())
+	views, err := svc.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v, want nil", err)
+	}
+	if len(views) != 1 {
+		t.Fatalf("len(views) = %d, want 1", len(views))
+	}
+	got := views[0]
+
+	for _, field := range []struct {
+		name  string
+		value string
+	}{{"detail", got.Detail}, {"declared_error", got.DeclaredError}} {
+		if field.value == "" {
+			continue
+		}
+		for _, label := range []string{"error=", "reason=", "waiting_on="} {
+			if strings.HasPrefix(field.value, label) {
+				t.Errorf("%s 以 %q 开头：这是 `agent plugins status` 的 logfmt 标签，"+
+					"而这个字段是要显示给人的。\n%s = %s", field.name, label, field.name, field.value)
+			}
+		}
+	}
+	// 剥掉标签不能把话也剥掉：失败原因本身必须还在。
+	if got.State == "failed" && got.Detail == "" {
+		t.Error("state=failed 但 detail 是空的：界面上只剩一个「失败」，没有任何可查的东西")
+	}
+}
+
+// TestTheCLIKeepsItsLabels 是上面那条的边界：终端那边**要**标签，它是分类也是
+// grep 的抓手。把标签一并去掉会让 `agent plugins status` 退回到「一行字，说不清是
+// 失败还是被禁用」。
+func TestTheCLIKeepsItsLabels(t *testing.T) {
+	t.Parallel()
+
+	rows := mergePluginStatus(
+		manifest.Deployment{Plugins: []manifest.Entry{{Name: "p", Source: "staging", Enabled: true}}},
+		[]loader.InstanceStatus{{Name: "p", Version: "1.0.0", State: loader.StateFailed, LastError: "boom"}},
+	)
+	if len(rows) != 1 {
+		t.Fatalf("len(rows) = %d, want 1", len(rows))
+	}
+	if !strings.HasPrefix(rows[0].Detail, "error=") {
+		t.Errorf("CLI 行的 Detail = %q，want 以 error= 开头", rows[0].Detail)
+	}
+}
+
+// TestGrantsResponseCarriesNoLogfmtLabelsEither 是第三个写点：Grant/Deny 回的那个
+// view 也带 State/Detail，而它同样直接进 GUI。
+//
+// 单独一条，是因为 List 的断言守不住它——变异实测：只改 Grant 那一行，List 的两条
+// 测试全绿。
+func TestGrantsResponseCarriesNoLogfmtLabelsEither(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.writeSignatureConfig(30_000, signaturePolicy{requireSignature: boolPtr(false)})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "staging", enabled: true,
+		capabilities: []string{"log"}, tools: []string{testEchoTool},
+	})
+	if err := os.WriteFile(filepath.Join(f.root, "staging", "plugin.wasm"), []byte("not wasm"), 0o644); err != nil {
+		t.Fatalf("corrupt the module: %v", err)
+	}
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
+		func() *sign.Keyring { return nil }, f.resolveFixtureRemote(), testConsentLogger())
+	result, err := svc.Deny(context.Background(), testEchoPlugin)
+	if err != nil {
+		t.Fatalf("Deny() error = %v, want nil", err)
+	}
+	for _, label := range []string{"error=", "reason=", "waiting_on="} {
+		if strings.HasPrefix(result.View.Detail, label) {
+			t.Errorf("Deny 回的 detail 以 %q 开头：logfmt 标签跑到了给人看的字段上\n%s",
+				label, result.View.Detail)
+		}
+	}
 }
