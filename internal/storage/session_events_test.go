@@ -780,3 +780,122 @@ func TestConcurrentAppendsKeepTheLogContiguous(t *testing.T) {
 		}
 	}
 }
+
+// 同一个 call_id 在一条会话里出现两次必须当场报错（CLAUDE.md §0）。
+//
+// 屏障 2 是「先记录 tool/call 再进工具体」，所以刷盘成功、进工具体前崩溃再重试
+// 派发，日志里就会出现两条同 call_id 的 tool/call。此前 planRecovery 的 pending
+// 以 id 为键只留一份、order 却记两次，恢复会补出**两条 call_id 相同**的
+// tool/result——而 spec §4.3.1 给 P3 的硬约束正是「按 call_id 配对」：一个
+// tool_use 对上两条 tool 消息，provider 直接 400，报错却指向 provider 参数，
+// 没人会想到根因在很久以前的一次崩溃恢复里。
+//
+// 断言「报错」而不是「去重」：默默去重只是把「日志与真实发生的事不符」藏起来，
+// 上游发重复事件这件事本身仍然没人知道。
+func TestLoadRefusesADuplicateCallID(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+	if err := repo.Append(ctx, "s1", []domain.SessionEvent{
+		ev(0, domain.SessionEventTurnStart),
+		ev(1, domain.SessionEventStepStart),
+		toolCall(2, "same"),
+		toolCall(3, "same"),
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	_, err := repo.Load(ctx, "s1")
+	if err == nil {
+		t.Fatal("重复的 call_id 被恢复流程接受了：会补出两条同 call_id 的 tool/result")
+	}
+	if !strings.Contains(err.Error(), `"same"`) {
+		t.Errorf("错误没指名是哪个 call_id：%v", err)
+	}
+	// 两次出现的 seq 都要给出来，否则拿着错误也不知道去日志里看哪两条。
+	if !strings.Contains(err.Error(), "event 3") || !strings.Contains(err.Error(), "event 2") {
+		t.Errorf("错误没同时给出重复的两条 seq（2 与 3）：%v", err)
+	}
+	// 报错的会话不该被写进任何东西：恢复要么整体成立，要么什么都不留。
+	if got := countEvents(t, repo, "s1"); got != 4 {
+		t.Errorf("报错后表里有 %d 条，want 4：恢复不该在校验失败时写入", got)
+	}
+}
+
+// 没有配对 start 的 end 事件是损坏，不是「已经收尾」。
+//
+// 无条件 turnOpen = false 会把一条缺了 turn/start 的日志（P2 漏发一个发射点就
+// 会这样）判成「已收尾」，Load 一条都不补，静默把损坏当正常。
+func TestLoadRefusesAnEndWithoutItsStart(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+	// 只有 turn/end，没有 turn/start。
+	if err := repo.Append(ctx, "s1", []domain.SessionEvent{
+		turnEnd(0, domain.TurnEndReasonCompleted),
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	_, err := repo.Load(ctx, "s1")
+	if err == nil {
+		t.Fatal("缺了 turn/start 的日志被当成「已收尾」放过了")
+	}
+	if !strings.Contains(err.Error(), "turn/start") {
+		t.Errorf("错误没说明缺的是什么：%v", err)
+	}
+	if !strings.Contains(err.Error(), "event 0") {
+		t.Errorf("错误没指出是哪一条：%v", err)
+	}
+}
+
+// 读路径的类型闭集校验必须真的会报错（CLAUDE.md「测试」一节：fail-loud 分支须有
+// 测试断言「确实返回 error」）。
+//
+// 写侧的 Append 校验只管住**本进程本版本**的写入；decodeSessionEvent 这道守的是
+// 另一件事：库被旧/新版本或外部写坏。所以这里必须绕过 Append 直接 INSERT——
+// 经由 Append 根本构造不出这个输入，那样测的还是写侧那道。
+func TestReadFromRefusesAnUnknownEventTypeInTheTable(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+	if _, err := repo.db.ExecContext(ctx, `
+		INSERT INTO session_events (session_id, seq, type, time, data)
+		VALUES (?, ?, ?, ?, ?)
+	`, "s1", 0, "tool/telepathy", 1, `{}`); err != nil {
+		t.Fatalf("绕过 Append 写入未知类型: %v", err)
+	}
+
+	_, err := repo.ReadFrom(ctx, "s1", 0)
+	if err == nil {
+		t.Fatal("表里的未知事件类型被读成了合法事件：重建出的历史会缺一段而没人知道")
+	}
+	if !strings.Contains(err.Error(), "tool/telepathy") {
+		t.Errorf("错误没指名类型：%v", err)
+	}
+	if !strings.Contains(err.Error(), `"s1"`) || !strings.Contains(err.Error(), "0") {
+		t.Errorf("错误没带出是哪个会话的哪一条：%v", err)
+	}
+}
+
+// 读路径的 JSON 校验同上：库里的一段非法 JSON 必须读成错误，而不是一个
+// Data 无法解析的「合法」事件——后者会在 planRecovery 或 P3 投影里以完全
+// 无关的形式炸开。
+func TestReadFromRefusesInvalidJSONInTheTable(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+	if _, err := repo.db.ExecContext(ctx, `
+		INSERT INTO session_events (session_id, seq, type, time, data)
+		VALUES (?, ?, ?, ?, ?)
+	`, "s1", 0, string(domain.SessionEventTurnStart), 1, `{not valid json`); err != nil {
+		t.Fatalf("绕过 Append 写入非法 JSON: %v", err)
+	}
+
+	_, err := repo.ReadFrom(ctx, "s1", 0)
+	if err == nil {
+		t.Fatal("表里的非法 JSON 被读成了合法事件")
+	}
+	if !strings.Contains(err.Error(), "JSON") {
+		t.Errorf("错误没提到 JSON：%v", err)
+	}
+	if !strings.Contains(err.Error(), `"s1"`) || !strings.Contains(err.Error(), "turn/start") {
+		t.Errorf("错误没带出是哪个会话的哪一条：%v", err)
+	}
+}

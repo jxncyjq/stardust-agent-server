@@ -72,8 +72,11 @@ func (r *SQLiteRepository) Append(ctx context.Context, sessionID string, events 
 		return nil
 	}
 	for i, event := range events {
+		// 带上 seq 与批内下标：同一个循环里其余三条校验都指得出「哪一条」，
+		// 只有这条不指，拿到错误的人得自己回去数是批里的第几个。
 		if err := domain.ValidateSessionEventType(event.Type); err != nil {
-			return fmt.Errorf("append session events for %q: %w", sessionID, err)
+			return fmt.Errorf("append session events for %q: event %d (batch element %d): %w",
+				sessionID, event.Seq, i, err)
 		}
 		if len(event.Data) > maxSessionEventDataBytes {
 			return fmt.Errorf("append session events for %q: event %d (%s) carries %d bytes, "+
@@ -283,9 +286,15 @@ func (r *SQLiteRepository) Load(ctx context.Context, sessionID string) ([]domain
 // 每个字段读取都可能失败（intField/stringField 返回 error）：这些字段在
 // spec §4.1 里是必填的，取不到说明这条日志本身有问题，不是「缺省当默认值」
 // 能糊弄过去的情况，所以一路把 error 上报，不吞。
+//
+// 同样地，日志本身的结构异常（同一个 call_id 出现两次、没有 start 的 end）
+// 也一律报错而不是就地纠正：它们说明上游发事件出了问题，静默修正只会把
+// 问题挪到更远的地方（见下方各处注释）。
 func planRecovery(events []domain.SessionEvent) (recoveryPlan, error) {
 	var plan recoveryPlan
 	pending := map[string]unansweredCall{}
+	// seenCalls 记下每个 call_id 第一次出现的 seq，用来在重复时报出「哪两条」。
+	seenCalls := map[string]int64{}
 	var order []string
 	turnOpen, stepOpen := false, false
 
@@ -299,6 +308,14 @@ func planRecovery(events []domain.SessionEvent) (recoveryPlan, error) {
 			}
 			plan.turnNumber = turn
 		case domain.SessionEventTurnEnd:
+			// 没有 turn/start 的 turn/end 是损坏（P2 漏发一个发射点就长这样）。
+			// 无条件置 false 会把这样一条日志判成「已收尾」而一条都不补——
+			// 把损坏当正常，正是 CLAUDE.md §0 禁的「非预期状态被吞」。
+			if !turnOpen {
+				return recoveryPlan{}, fmt.Errorf("event %d (%s): turn/end without a matching "+
+					"turn/start; the log does not describe one well-formed turn sequence",
+					event.Seq, event.Type)
+			}
 			turnOpen = false
 		case domain.SessionEventStepStart:
 			stepOpen = true
@@ -312,12 +329,31 @@ func planRecovery(events []domain.SessionEvent) (recoveryPlan, error) {
 			}
 			plan.stepTurn, plan.stepStep = turn, step
 		case domain.SessionEventStepEnd:
+			// 同 turn/end：没有配对 step/start 的 step/end 是损坏，不是「已收尾」。
+			if !stepOpen {
+				return recoveryPlan{}, fmt.Errorf("event %d (%s): step/end without a matching "+
+					"step/start; the log does not describe one well-formed step sequence",
+					event.Seq, event.Type)
+			}
 			stepOpen = false
 		case domain.SessionEventToolCall:
 			id, err := stringField(event.Data, "call_id")
 			if err != nil {
 				return recoveryPlan{}, fmt.Errorf("event %d (%s): %w", event.Seq, event.Type, err)
 			}
+			// 同一会话里 call_id 必须唯一。重复说明上游发事件出了问题，而后果
+			// 落在下一期：pending 以 id 为键只留一份、order 却记两次，恢复会补出
+			// 两条同 call_id 的 tool/result；spec §4.3.1 给 P3 的硬约束是「按
+			// call_id 配对」，一个 tool_use 对上两条 tool 消息，provider 直接 400。
+			// 默默去重同样不行——那只是把「日志与真实发生的事不符」藏起来。
+			if first, dup := seenCalls[id]; dup {
+				return recoveryPlan{}, fmt.Errorf("event %d (%s): call_id %q already appeared at "+
+					"event %d; call ids must be unique within a session, otherwise recovery would "+
+					"synthesize two tool results carrying the same call_id and the rebuilt "+
+					"transcript could never be paired up by call_id",
+					event.Seq, event.Type, id, first)
+			}
+			seenCalls[id] = event.Seq
 			turn, err := intField(event.Data, "turn")
 			if err != nil {
 				return recoveryPlan{}, fmt.Errorf("event %d (%s): %w", event.Seq, event.Type, err)
