@@ -208,6 +208,19 @@ func (s *PluginConsentService) List(ctx context.Context) ([]server.PluginView, e
 		if !resolved {
 			view.DeclaredUnresolved = true
 			view.DeclaredUnresolvedReason = reason
+			// 缓存里没有，未必等于「取一下就有」。加载器可能刚刚就取过、并且拒了
+			// ——签名不被信任、摘要对不上、归档缺文件。那种包永远进不了缓存，于是
+			// 「缓存里有没有」这个问法每次都答 not_cached，而 not_cached 在契约里
+			// 的意思是「包取得到、什么都没出错、取一下就好」，GUI 的插件面板正是
+			// 只在这个原因上给「获取」按钮。运维于是拿到一个按下去重新下载、再次
+			// 被拒、永远如此的按钮——那正是那个面板要避免的谎。
+			//
+			// 加载器对这一条的失败说明就是「取一次能不能解决」的答案：它有说明，
+			// 就说明它已经试过了。V1 真机验证抓到的就是这个。
+			if reason == server.DeclaredUnresolvedNotCached && row.State == loader.StateFailed && row.Detail != "" {
+				view.DeclaredUnresolvedReason = server.DeclaredUnresolvedLoadFailed
+				view.DeclaredError = row.Detail
+			}
 			views = append(views, view)
 			continue
 		}
