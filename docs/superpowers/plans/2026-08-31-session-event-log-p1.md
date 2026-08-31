@@ -664,7 +664,11 @@ func decodeSessionEvent(sessionID string, seq int64, typ string, millis int64, d
 - [ ] **Step 4: 跑测试确认它绿**
 
 Run: `go test ./internal/storage/ -run "Append|NoEventsLeavesNoTrace|OversizedPayload|SessionEventsTable" -count=1 -v`
-Expected: 全 PASS。注意 `TestAFailedBatchLeavesNothingBehind` 用到 Task 4 的 `ReadFrom`，本任务里整个包会编译不过——**按计划先把那一条测试写进文件但用 `t.Skip("waits for ReadFrom in Task 4")` 占位**，Task 4 实现 `ReadFrom` 后删掉那行 Skip 并真正跑它。本步跑：`go test ./internal/storage/ -run "RefusesASeq|NoEventsLeavesNoTrace|OversizedPayload|UnknownEventType|SessionEventsTable" -count=1 -v`
+Expected: 全 PASS。注意 `TestAFailedBatchLeavesNothingBehind` 本想用 Task 4 的 `ReadFrom` 来验「表里什么都没留下」，而本任务里 `ReadFrom` 还不存在，整个测试包会编译不过。
+
+**不要用 `t.Skip("waits for ReadFrom in Task 4")` 占位**：`t.Skip` 是运行期的，挡不住编译期类型检查——测试函数体里引用一个不存在的方法，整个包照样编译失败，那一条 Skip 一次也执行不到。
+
+实际做法：把这条测试改成**直接 `SELECT COUNT(*)` 查表**（`repo.db.QueryRowContext(...)`），本任务里就能真正跑起来。这样更准：它验的是表的真实状态，而不是经由一个正在开发中的方法去看——被测方法自己有 bug 时，前者照样报错，后者可能一起错成「看上去对」。本步跑：`go test ./internal/storage/ -run "RefusesASeq|NoEventsLeavesNoTrace|OversizedPayload|UnknownEventType|SessionEventsTable|FailedBatch" -count=1 -v`
 
 - [ ] **Step 5: 变异验证（三条）**
 
@@ -881,7 +885,7 @@ func (r *SQLiteRepository) ReadFrom(ctx context.Context, sessionID string, fromS
 - [ ] **Step 4: 跑测试确认它绿**
 
 Run: `go test ./internal/storage/ -run "ReadFrom|HoleInTheMiddle|Append|FailedBatch|NoEventsLeavesNoTrace|OversizedPayload" -count=1 -v`
-Expected: 全 PASS。**先删掉 Task 3 里给 `TestAFailedBatchLeavesNothingBehind` 加的那行 `t.Skip`**，否则它会以 SKIP 混过去——一条永远 skip 的测试等于没有测试。
+Expected: 全 PASS。`TestAFailedBatchLeavesNothingBehind` 在 Task 3 里已经用直接 `SELECT COUNT(*)` 查表跑通了（见 Task 3 Step 4），本任务不需要为它做任何改动——**尤其不要把它改成经由刚写好的 `ReadFrom` 去验**：一条断言「失败的批次什么都没留下」的测试，用被测层自己去看表，会在 `ReadFrom` 也出错时一起错成「看上去对」。
 
 - [ ] **Step 5: 变异验证（两条）**
 
