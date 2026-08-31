@@ -847,6 +847,33 @@ func TestLoadRefusesAnEndWithoutItsStart(t *testing.T) {
 	}
 }
 
+// step/end 那一侧同样要有测试。
+//
+// 两个分支是对称的、判断形状也一样，但「有实现没测试」正是本次复审抓出来的
+// I-2 的形态——只测一半等于给另一半留了一个删掉也不会红的分支。
+func TestLoadRefusesAStepEndWithoutItsStart(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+	// 有 turn/start，但 step/end 没有对应的 step/start。
+	if err := repo.Append(ctx, "s1", []domain.SessionEvent{
+		ev(0, domain.SessionEventTurnStart),
+		stepEnd(1, domain.StepEndReasonCompleted),
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	_, err := repo.Load(ctx, "s1")
+	if err == nil {
+		t.Fatal("缺了 step/start 的日志被当成「该 step 已收尾」放过了")
+	}
+	if !strings.Contains(err.Error(), "step/start") {
+		t.Errorf("错误没说明缺的是什么：%v", err)
+	}
+	if !strings.Contains(err.Error(), "event 1") {
+		t.Errorf("错误没指出是哪一条：%v", err)
+	}
+}
+
 // 读路径的类型闭集校验必须真的会报错（CLAUDE.md「测试」一节：fail-loud 分支须有
 // 测试断言「确实返回 error」）。
 //
