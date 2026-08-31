@@ -1588,3 +1588,78 @@ func TestPluginConsentServiceListSurfacesExtensionsSeparately(t *testing.T) {
 			views[0].GrantedExtensions)
 	}
 }
+
+// TestListDoesNotCallAnUntrustedPackageMerelyUncached 来自 V1 真机验证。
+//
+// 真机上把一个由**不受信任的密钥**签名的包挂上去（require_signature: true），
+// `GET /v1/plugins` 回的是：
+//
+//	state = failed
+//	detail = ... 「key id "attacker" is not in the keyring」
+//	declared_unresolved_reason = "not_cached"
+//
+// 最后一行是错的，而且是会误导人的那种错。`not_cached` 在契约里的意思是**「包取得到、
+// 什么都没出错、取一下就好」**，而 GUI 的插件面板**只在这个原因上给「获取」按钮**
+// （见 PluginsPage.tsx 里那段注释：一个按不动的按钮正是这个面板要避免的谎）。于是
+// 运维看到的是「远程包尚未缓存」加一个按钮，按下去重新下载、再次被拒，永远如此——
+// 而真相是供应链信任失败，按钮救不了。
+//
+// 分类逻辑问的是「缓存里有没有」，而被拒的包当然不在缓存里。要问的是**「取一次能不能
+// 解决」**：加载器刚刚就取过、并且拒了。
+func TestListDoesNotCallAnUntrustedPackageMerelyUncached(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	_, keyringPath := f.newKeyring("keyring.json")
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	// 用一把从未登记的钥匙签：keyring 里那把是另一个公钥。
+	f.signPackageWithAnyKey("staging")
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	t.Cleanup(srv.Close)
+
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(true)},
+		fmt.Sprintf("\"cache\": %s", jsonString(cacheDir)),
+		`"allow_insecure_sources": true`)
+	// enabled: true —— 加载器会真的去取，取回来之后因为签名不被信任而拒掉。
+	// 这正是真机上的形状，也是与既有「从没取过」用例的分界。
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: srv.URL + "/echo.tgz", enabled: true,
+		capabilities: []string{"log"}, tools: []string{testEchoTool}, digest: digest,
+	})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	cfg, err := config.Load(context.Background(), config.Options{Path: f.configPath})
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
+	keyring, _, err := resolvePluginKeyring(cfg.Plugins)
+	if err != nil {
+		t.Fatalf("resolvePluginKeyring: %v", err)
+	}
+	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
+		func() *sign.Keyring { return keyring }, f.resolveFixtureRemote(), testConsentLogger())
+
+	views, err := svc.List(context.Background())
+	if err != nil {
+		t.Fatalf("List() error = %v, want nil", err)
+	}
+	if len(views) != 1 {
+		t.Fatalf("len(views) = %d, want 1: %+v", len(views), views)
+	}
+	got := views[0]
+
+	if got.DeclaredUnresolvedReason == server.DeclaredUnresolvedNotCached {
+		t.Errorf("DeclaredUnresolvedReason = %q for a package the loader fetched and REFUSED as untrusted.\n"+
+			"That reason means \"obtainable, nothing went wrong, a fetch may fix it\", and the plugin panel "+
+			"offers its fetch button on that reason and no other — so the operator gets a button that "+
+			"re-downloads and is refused again, forever.\nstate = %q\ndetail = %s",
+			got.DeclaredUnresolvedReason, got.State, got.Detail)
+	}
+	if got.DeclaredError == "" {
+		t.Error("DeclaredError is empty: the row says the declaration is unresolved but not why, " +
+			"so the panel has nothing to show beyond a generic note")
+	}
+}

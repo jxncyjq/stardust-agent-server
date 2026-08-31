@@ -77,3 +77,55 @@
 ### 一次自我纠正（值得记）
 
 走查中途看到「票在 4-5 秒内自动变成 approved」，一度当成后端自动批准的重大缺陷。用**对照实验**（GUI 窗口开着但不做任何交互 + curl 发任务）确认：票稳定保持 `pending`、任务保持 `suspended`。真相是**我自己用固定坐标点击发送按钮，而审批卡片出现后布局上移，那个坐标落在了「批准」上**。教训有两条：界面走查里点击一律用元素引用而不是坐标；把「疑似产品缺陷」写进报告之前，先做一次能把自己排除掉的对照实验。
+
+---
+
+## 七、V1：签名与远程源的真机路径（2026-08-31）
+
+此前这两样**只有测试证据**：真机跑的是本地目录源 + `require_signature: false`。这次全程走远程 HTTP 源 + 强制签名。
+
+### 怎么搭的（可复现）
+
+`agent plugins keygen` 造两把钥匙（`release-2026` 进 keyring，`attacker` 不进）→ `agent plugins sign` 签 `plugin_example/package` → 打成 tar.gz → `python -m http.server` 当源站（`allow_insecure_sources: true`，它只放宽**协议**，摘要与签名照查）→ `agent plugins install <url> --digest sha256:…` → `grant` → `serve` → `GET /v1/plugins`。
+
+### 正路与八条负向对照
+
+| # | 情形 | 结果 |
+|---|---|---|
+| 0 | 正路：远程取回 + 签名可信 | `state: loaded` |
+| A | 用不在 keyring 的钥匙签 | 拒：`key id "attacker" is not in the keyring (trusted ids: [release-2026])` |
+| B | 归档里没有 plugin.sig | 拒：`archive is missing required file "plugin.sig"`（**布局层**先挡，轮不到签名策略） |
+| C | 源站换成篡改过的字节、摘要不变 | **load**——见下 |
+| C2 | 同上，但先清空缓存 | 拒：`digest mismatch: expected … actual …` |
+| D | 撤销唯一的可信密钥 | serve **拒绝启动**：信任集为空 + 强制签名 = 拒绝一切插件 |
+| D2 | 撤销该密钥，但信任集里还有别的 | 拒：`key "release-2026" was revoked at …`（**对已缓存的包同样生效**） |
+| E | 改 plugin.json（加一条能力）并**同步更新摘要** | 拒：`signature does not verify against key "release-2026"` |
+| F | 换掉 plugin.wasm，plugin.json 与签名不动 | 拒：`sha256 mismatch: plugin.json declares … actually hashes to …` |
+| G2 | 不写 `require_signature`、也不配 keyring | serve 拒绝启动，并说明「要么配 keyring，要么显式写 false」 |
+| G3 | 显式 `require_signature: false` | load（记录在案的退出方式） |
+| H | 不写 `allow_insecure_sources`，源是 http:// | serve 拒绝启动，并指名那条明文源 |
+
+E 与 F 合起来才是签名层的价值所在：摘要是**自证**的（能改 plugin.json 的人也能改它自己的校验和），签名把「字节与清单相符」和「字节来自我们信任的人」拆成两件必须都成立的事。F 说明这条链没有断在中间——签名盖住清单，清单钉住 wasm，两头都有人查。
+
+**C 那一条差点骗过我。** 它 load 了，看上去像「摘要根本没查」。清掉缓存重跑（C2）才看清：按内容寻址的缓存**命中就不会再下载**，篡改过的字节压根没被取过。缓存是对的，我的对照是错的——如果就此收工，会写下一条完全相反的结论。顺带得到一条运维事实：**源站事后被攻破，改不了已经缓存的东西**。
+
+### 抓到一个真缺陷（已修）
+
+被拒的包在 `GET /v1/plugins` 里报的是：
+
+```
+state = failed
+detail = … key id "attacker" is not in the keyring …
+declared_unresolved_reason = "not_cached"
+```
+
+最后一行是错的，而且是会误导人的那种。`not_cached` 在契约里的意思是**「包取得到、什么都没出错、取一下就好」**，GUI 的插件面板正是**只在这个原因上**给「获取」按钮（`PluginsPage.tsx` 自己的注释：一个按不动的按钮，正是这个面板要避免的谎）。于是运维看到「远程包尚未缓存」+ 一个按钮，按下去重新下载、再次被拒，永远如此——而真相是供应链信任失败。
+
+根因是分类逻辑问错了问题：它问「缓存里有没有」，而被拒的包当然进不了缓存。要问的是**「取一次能不能解决」**——加载器刚刚就取过、并且拒了。修法：缓存未命中时，若加载器对这一条留了失败说明，报 `load_failed` 并把说明放进 `declared_error`（面板对这个原因显示「人话 + 折叠错误链」，且不给按钮）。真机复验：同一个包现在报 `load_failed` + 信任失败原因。
+
+两个变异验红：撤掉修复 → 真机症状复现；去掉「看加载器状态」这个条件 → 真·未缓存那条既有用例红（边界没被推过头）。
+
+### 仍未验的
+
+- GUI 插件面板本身这次没有走查（本轮全程 HTTP API）；面板的渲染分支由既有前端测试守着，但「屏幕上确实不给按钮」还没有人眼看过。
+- `detail` / `declared_error` 的文本以 `error=` 开头（logfmt 片段漏进了给人看的字段）。面板已把错误链折叠，所以不影响可用性，记在这里备查。
