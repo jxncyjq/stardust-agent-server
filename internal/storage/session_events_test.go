@@ -99,7 +99,6 @@ func TestAppendRefusesASeqThatDoesNotContinueTheLog(t *testing.T) {
 // 半批写入留下的是一个「seq 连续但内容缺了后半段」的日志——它读得出来、也验得过，
 // 却与真实发生的事不符。那种损坏比读不出来更难发现。
 func TestAFailedBatchLeavesNothingBehind(t *testing.T) {
-	t.Skip("waits for ReadFrom in Task 4")
 	ctx := context.Background()
 	repo := newEventRepo(t)
 
@@ -112,12 +111,13 @@ func TestAFailedBatchLeavesNothingBehind(t *testing.T) {
 		t.Fatal("批内重复 seq 被接受了")
 	}
 
-	got, err := repo.ReadFrom(ctx, "s1", 0)
-	if err != nil {
-		t.Fatalf("ReadFrom: %v", err)
+	var remaining int
+	if err := repo.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM session_events WHERE session_id = ?`, "s1").Scan(&remaining); err != nil {
+		t.Fatalf("count rows: %v", err)
 	}
-	if len(got) != 0 {
-		t.Errorf("回滚之后还剩 %d 条事件：半批写入留下的日志读得出来却与真实发生的事不符", len(got))
+	if remaining != 0 {
+		t.Errorf("回滚之后还剩 %d 条事件：半批写入留下的日志读得出来却与真实发生的事不符", remaining)
 	}
 }
 
