@@ -21,13 +21,19 @@ func newEventRepo(t *testing.T) *SQLiteRepository {
 	return repo
 }
 
-// ev 造一个最小的合法事件；载荷内容与这些测试无关。
+// ev 造一个最小的合法事件。
+//
+// 载荷带 turn/step 两个字段（都是 0）而不是空对象：Load 的崩溃恢复
+// （planRecovery）会从每一条 turn/start 取 "turn"、每一条 step/start 取
+// "turn"/"step"，取不到就 fail-loud 报错（不允许编造零值接着跑）。多数任务
+// 1-4 的测试只看 seq/type/count，不检查载荷内容，所以这两个多出来的字段
+// 对它们无影响；但任务 5 的 Load 测试复用同一个 ev()，载荷就必须是真实字段。
 func ev(seq int64, typ domain.SessionEventType) domain.SessionEvent {
 	return domain.SessionEvent{
 		Seq:  seq,
 		Type: typ,
 		Time: time.UnixMilli(1_700_000_000_000 + seq),
-		Data: []byte(`{}`),
+		Data: []byte(`{"turn":0,"step":0}`),
 	}
 }
 
@@ -415,4 +421,170 @@ func toolCall(seq int64, callID string) domain.SessionEvent {
 		panic(err)
 	}
 	return domain.SessionEvent{Seq: seq, Type: domain.SessionEventToolCall, Time: time.UnixMilli(1), Data: data}
+}
+
+// 崩溃恢复：半个 turn 要被补成合法的 provider transcript（spec §4.3 不变量 2）。
+//
+// 判据不是「补了几条」，而是**每个 tool/call 都有与之 call_id 对应的 tool/result**，
+// 且 turn 以 interrupted 收尾。少了任何一条，重建出的消息数组发给模型就是非法的。
+func TestLoadClosesAnInterruptedTurnIntoAValidTranscript(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+	// 崩在两个工具调用之间：call-1 有结果，call-2 没有。
+	if err := repo.Append(ctx, "s1", []domain.SessionEvent{
+		ev(0, domain.SessionEventTurnStart),
+		ev(1, domain.SessionEventStepStart),
+		toolCall(2, "call-1"),
+		toolResult(3, "call-1"),
+		toolCall(4, "call-2"),
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	events, err := repo.Load(ctx, "s1")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+
+	answered := map[string]bool{}
+	for _, e := range events {
+		switch e.Type {
+		case domain.SessionEventToolCall:
+			// 记名但不覆盖已有的 true：自赋值（answered[x] = answered[x]）会被
+			// go vet 判为错误，而这个仓要求 vet 全绿。
+			if _, seen := answered[callIDOf(t, e)]; !seen {
+				answered[callIDOf(t, e)] = false
+			}
+		case domain.SessionEventToolResult:
+			answered[callIDOf(t, e)] = true
+		}
+	}
+	for callID, ok := range answered {
+		if !ok {
+			t.Errorf("call %q 没有对应的 tool/result：这样重建出的消息数组发给模型是非法的", callID)
+		}
+	}
+
+	last := events[len(events)-1]
+	if last.Type != domain.SessionEventTurnEnd {
+		t.Fatalf("最后一条是 %s，want turn/end", last.Type)
+	}
+	if reason := reasonOf(t, last); reason != domain.TurnEndReasonInterrupted {
+		t.Errorf("turn/end 的 reason = %q, want %q——这是「这段历史不是自己结束的」的唯一记号",
+			reason, domain.TurnEndReasonInterrupted)
+	}
+}
+
+// 恢复要落盘：下一次 Append 从补齐后的 seq continue，而不是又撞回半个 turn。
+func TestLoadPersistsTheRecoveryItSynthesized(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+	if err := repo.Append(ctx, "s1", []domain.SessionEvent{
+		ev(0, domain.SessionEventTurnStart),
+		ev(1, domain.SessionEventStepStart),
+		toolCall(2, "call-1"),
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	recovered, err := repo.Load(ctx, "s1")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	// 再读一次：补出来的事件必须在库里，而不只是在返回值里。
+	again, err := repo.ReadFrom(ctx, "s1", 0)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if len(again) != len(recovered) {
+		t.Fatalf("库里有 %d 条，Load 返回了 %d 条：恢复没有落盘，下次打开还会再补一次",
+			len(again), len(recovered))
+	}
+	// 且下一批能接着写。
+	next := int64(len(again))
+	if err := repo.Append(ctx, "s1", []domain.SessionEvent{ev(next, domain.SessionEventTurnStart)}); err != nil {
+		t.Errorf("恢复之后接着写失败：%v", err)
+	}
+}
+
+// 已经收尾的日志不该被动：Load 是幂等的，读两次不会越补越长。
+func TestLoadLeavesABalancedLogAlone(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+	if err := repo.Append(ctx, "s1", []domain.SessionEvent{
+		ev(0, domain.SessionEventTurnStart),
+		ev(1, domain.SessionEventStepStart),
+		toolCall(2, "call-1"),
+		toolResult(3, "call-1"),
+		stepEnd(4, domain.StepEndReasonCompleted),
+		turnEnd(5, domain.TurnEndReasonCompleted),
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	first, err := repo.Load(ctx, "s1")
+	if err != nil {
+		t.Fatalf("first Load: %v", err)
+	}
+	second, err := repo.Load(ctx, "s1")
+	if err != nil {
+		t.Fatalf("second Load: %v", err)
+	}
+	if len(first) != 6 || len(second) != 6 {
+		t.Errorf("Load 改了一个本来就平衡的日志：%d then %d, want 6", len(first), len(second))
+	}
+}
+
+// toolResult 造一条带 call_id 的 tool/result 事件。
+func toolResult(seq int64, callID string) domain.SessionEvent {
+	data, err := json.Marshal(map[string]any{
+		"turn": 0, "step": 0, "call_id": callID, "preview": "ok", "is_error": false, "duration_ms": 1,
+	})
+	if err != nil {
+		panic(err)
+	}
+	return domain.SessionEvent{Seq: seq, Type: domain.SessionEventToolResult, Time: time.UnixMilli(1), Data: data}
+}
+
+// stepEnd 造一条 step/end 事件。
+func stepEnd(seq int64, reason string) domain.SessionEvent {
+	data, err := json.Marshal(map[string]any{"turn": 0, "step": 0, "reason": reason})
+	if err != nil {
+		panic(err)
+	}
+	return domain.SessionEvent{Seq: seq, Type: domain.SessionEventStepEnd, Time: time.UnixMilli(1), Data: data}
+}
+
+// turnEnd 造一条 turn/end 事件。
+func turnEnd(seq int64, reason string) domain.SessionEvent {
+	data, err := json.Marshal(map[string]any{"turn": 0, "reason": reason})
+	if err != nil {
+		panic(err)
+	}
+	return domain.SessionEvent{Seq: seq, Type: domain.SessionEventTurnEnd, Time: time.UnixMilli(1), Data: data}
+}
+
+// callIDOf 从事件载荷里取 call_id，取不到就当场 Fatal——这是测试断言的一部分，
+// 不是被测代码的行为。
+func callIDOf(t *testing.T, e domain.SessionEvent) string {
+	t.Helper()
+	var payload struct {
+		CallID string `json:"call_id"`
+	}
+	if err := json.Unmarshal(e.Data, &payload); err != nil {
+		t.Fatalf("unmarshal call_id from %s: %v", e.Type, err)
+	}
+	return payload.CallID
+}
+
+// reasonOf 从事件载荷里取 reason，取不到就当场 Fatal。
+func reasonOf(t *testing.T, e domain.SessionEvent) string {
+	t.Helper()
+	var payload struct {
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(e.Data, &payload); err != nil {
+		t.Fatalf("unmarshal reason from %s: %v", e.Type, err)
+	}
+	return payload.Reason
 }

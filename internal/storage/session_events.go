@@ -210,3 +210,204 @@ func (r *SQLiteRepository) ReadFrom(ctx context.Context, sessionID string, fromS
 	}
 	return events, nil
 }
+
+// recoveryPlan 是一个未收尾日志需要补上的事件（尚未分配 seq）。
+type recoveryPlan struct {
+	unansweredCalls []unansweredCall
+	needStepEnd     bool
+	stepTurn        int
+	stepStep        int
+	needTurnEnd     bool
+	turnNumber      int
+}
+
+// unansweredCall 是一个发出去、却没有结果的工具调用。
+type unansweredCall struct {
+	callID string
+	turn   int
+	step   int
+}
+
+// Load 返回该会话的全部事件，必要时先把崩溃留下的半个 turn 补成合法的
+// provider transcript 并落盘（spec §4.3 不变量 2）。
+//
+// **为什么补而不是截断**：截掉半个 turn 会丢掉真实发生过的事——那些工具是真的
+// 执行了、副作用是真的产生了。补的做法保留它们，只是把「没等到结果」这件事
+// 记成一条 is_error 的结果，让重建出的消息数组仍然合法：每个 tool_call 都有
+// 与之对应的 tool 消息。
+//
+// 幂等：已经平衡的日志原样返回，不追加任何东西。
+func (r *SQLiteRepository) Load(ctx context.Context, sessionID string) ([]domain.SessionEvent, error) {
+	events, err := r.ReadFrom(ctx, sessionID, 0)
+	if err != nil {
+		return nil, err
+	}
+	plan, err := planRecovery(events)
+	if err != nil {
+		return nil, fmt.Errorf("recover session %q: %w", sessionID, err)
+	}
+	if len(plan.unansweredCalls) == 0 && !plan.needStepEnd && !plan.needTurnEnd {
+		return events, nil
+	}
+
+	synthesized, err := synthesizeClosers(plan, int64(len(events)), lastTimeOf(events))
+	if err != nil {
+		return nil, fmt.Errorf("recover session %q: %w", sessionID, err)
+	}
+	if err := r.Append(ctx, sessionID, synthesized); err != nil {
+		return nil, fmt.Errorf("persist recovery for session %q: %w", sessionID, err)
+	}
+	return append(events, synthesized...), nil
+}
+
+// planRecovery 判断一个日志缺什么收尾事件。
+//
+// 判据只看事件本身：有 turn/start 而没有对应的 turn/end 就是没收尾；
+// tool/call 没有同 call_id 的 tool/result 就是没答。
+//
+// 每个字段读取都可能失败（intField/stringField 返回 error）：这些字段在
+// spec §4.1 里是必填的，取不到说明这条日志本身有问题，不是「缺省当默认值」
+// 能糊弄过去的情况，所以一路把 error 上报，不吞。
+func planRecovery(events []domain.SessionEvent) (recoveryPlan, error) {
+	var plan recoveryPlan
+	pending := map[string]unansweredCall{}
+	var order []string
+	turnOpen, stepOpen := false, false
+
+	for _, event := range events {
+		switch event.Type {
+		case domain.SessionEventTurnStart:
+			turnOpen = true
+			turn, err := intField(event.Data, "turn")
+			if err != nil {
+				return recoveryPlan{}, fmt.Errorf("event %d (%s): %w", event.Seq, event.Type, err)
+			}
+			plan.turnNumber = turn
+		case domain.SessionEventTurnEnd:
+			turnOpen = false
+		case domain.SessionEventStepStart:
+			stepOpen = true
+			turn, err := intField(event.Data, "turn")
+			if err != nil {
+				return recoveryPlan{}, fmt.Errorf("event %d (%s): %w", event.Seq, event.Type, err)
+			}
+			step, err := intField(event.Data, "step")
+			if err != nil {
+				return recoveryPlan{}, fmt.Errorf("event %d (%s): %w", event.Seq, event.Type, err)
+			}
+			plan.stepTurn, plan.stepStep = turn, step
+		case domain.SessionEventStepEnd:
+			stepOpen = false
+		case domain.SessionEventToolCall:
+			id, err := stringField(event.Data, "call_id")
+			if err != nil {
+				return recoveryPlan{}, fmt.Errorf("event %d (%s): %w", event.Seq, event.Type, err)
+			}
+			turn, err := intField(event.Data, "turn")
+			if err != nil {
+				return recoveryPlan{}, fmt.Errorf("event %d (%s): %w", event.Seq, event.Type, err)
+			}
+			step, err := intField(event.Data, "step")
+			if err != nil {
+				return recoveryPlan{}, fmt.Errorf("event %d (%s): %w", event.Seq, event.Type, err)
+			}
+			pending[id] = unansweredCall{callID: id, turn: turn, step: step}
+			order = append(order, id)
+		case domain.SessionEventToolResult:
+			id, err := stringField(event.Data, "call_id")
+			if err != nil {
+				return recoveryPlan{}, fmt.Errorf("event %d (%s): %w", event.Seq, event.Type, err)
+			}
+			delete(pending, id)
+		}
+	}
+	for _, id := range order {
+		if call, ok := pending[id]; ok {
+			plan.unansweredCalls = append(plan.unansweredCalls, call)
+		}
+	}
+	plan.needStepEnd = stepOpen
+	plan.needTurnEnd = turnOpen
+	return plan, nil
+}
+
+// synthesizeClosers 按 spec §4.3 不变量 2 的顺序造出补齐事件：
+// 每个未答调用一条 is_error 的 tool/result，然后 step/end，最后 turn/end{interrupted}。
+func synthesizeClosers(plan recoveryPlan, nextSeq int64, at time.Time) ([]domain.SessionEvent, error) {
+	var out []domain.SessionEvent
+	seq := nextSeq
+	for _, call := range plan.unansweredCalls {
+		data, err := json.Marshal(map[string]any{
+			"turn": call.turn, "step": call.step, "call_id": call.callID,
+			"preview":     "the agent stopped before this tool returned; its result was never recorded",
+			"is_error":    true,
+			"duration_ms": 0,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("marshal synthetic tool result for %q: %w", call.callID, err)
+		}
+		out = append(out, domain.SessionEvent{
+			Seq: seq, Type: domain.SessionEventToolResult, Time: at, Data: data,
+		})
+		seq++
+	}
+	if plan.needStepEnd {
+		data, err := json.Marshal(map[string]any{
+			"turn": plan.stepTurn, "step": plan.stepStep, "reason": domain.StepEndReasonCancelled,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("marshal synthetic step end: %w", err)
+		}
+		out = append(out, domain.SessionEvent{Seq: seq, Type: domain.SessionEventStepEnd, Time: at, Data: data})
+		seq++
+	}
+	if plan.needTurnEnd {
+		data, err := json.Marshal(map[string]any{
+			"turn": plan.turnNumber, "reason": domain.TurnEndReasonInterrupted,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("marshal synthetic turn end: %w", err)
+		}
+		out = append(out, domain.SessionEvent{Seq: seq, Type: domain.SessionEventTurnEnd, Time: at, Data: data})
+	}
+	return out, nil
+}
+
+// lastTimeOf 用最后一条真实事件的时间给补出来的事件打时间戳：它们描述的是
+// 那一刻发生的中断，而不是「现在」。空日志不会走到恢复路径。
+func lastTimeOf(events []domain.SessionEvent) time.Time {
+	if len(events) == 0 {
+		return time.UnixMilli(0)
+	}
+	return events[len(events)-1].Time
+}
+
+// intField 从事件载荷里取一个必填的数值字段。
+//
+// **不吞错**（CLAUDE.md §0）：spec §4.1 规定这些字段必填，取不到说明这条日志
+// 本身有问题。返回零值接着走，等于让恢复出的事件带着编造的 turn/step/call_id
+// ——那正是「凑个值接着跑」。所以返回 error，由 planRecovery 一路上报。
+func intField(data json.RawMessage, name string) (int, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return 0, fmt.Errorf("decode event payload for field %q: %w", name, err)
+	}
+	value, ok := payload[name].(float64)
+	if !ok {
+		return 0, fmt.Errorf("event payload has no numeric %q field", name)
+	}
+	return int(value), nil
+}
+
+// stringField 从事件载荷里取一个必填的字符串字段。同 intField 的不吞错理由。
+func stringField(data json.RawMessage, name string) (string, error) {
+	var payload map[string]any
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return "", fmt.Errorf("decode event payload for field %q: %w", name, err)
+	}
+	value, ok := payload[name].(string)
+	if !ok {
+		return "", fmt.Errorf("event payload has no string %q field", name)
+	}
+	return value, nil
+}
