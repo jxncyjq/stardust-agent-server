@@ -1701,12 +1701,14 @@ func TestSuspendedRowDetailCombinesWaitingOnAndError(t *testing.T) {
 		SuspendedBy: []string{testMissingRequiredTool},
 		LastError:   "suspend plugin: disposer failed",
 	}
-	detail := suspendedRowDetail(st, map[string]string{}, map[string]loader.InstanceStatus{})
+	var row pluginStatusRow
+	row.setSuspendedDetail(st, map[string]string{}, map[string]loader.InstanceStatus{})
+	detail := row.Detail
 	if !strings.Contains(detail, "waiting_on="+testMissingRequiredTool) {
-		t.Errorf("suspendedRowDetail() = %q, want it to still name the unresolved tool %q", detail, testMissingRequiredTool)
+		t.Errorf("row.Detail = %q, want it to still name the unresolved tool %q", detail, testMissingRequiredTool)
 	}
 	if !strings.Contains(detail, "error=suspend plugin: disposer failed") {
-		t.Errorf("suspendedRowDetail() = %q, want the suspend failure to appear alongside waiting_on=", detail)
+		t.Errorf("row.Detail = %q, want the suspend failure to appear alongside waiting_on=", detail)
 	}
 }
 
@@ -1722,13 +1724,15 @@ func TestSuspendedRowDetailFallsBackToErrorAloneWhenSuspendedByIsEmpty(t *testin
 		State:     loader.StateSuspended,
 		LastError: `register tool "echo_aux": name already taken`,
 	}
-	detail := suspendedRowDetail(st, map[string]string{}, map[string]loader.InstanceStatus{})
+	var row pluginStatusRow
+	row.setSuspendedDetail(st, map[string]string{}, map[string]loader.InstanceStatus{})
+	detail := row.Detail
 	if strings.Contains(detail, "waiting_on=") {
-		t.Errorf("suspendedRowDetail() = %q, want no waiting_on=: SuspendedBy is empty", detail)
+		t.Errorf("row.Detail = %q, want no waiting_on=: SuspendedBy is empty", detail)
 	}
 	want := `error=register tool "echo_aux": name already taken`
 	if detail != want {
-		t.Errorf("suspendedRowDetail() = %q, want %q (the error alone)", detail, want)
+		t.Errorf("row.Detail = %q, want %q (the error alone)", detail, want)
 	}
 }
 
@@ -1742,8 +1746,11 @@ func TestSuspendedWaitingOnNamesEveryUnresolvedTool(t *testing.T) {
 	byName := map[string]loader.InstanceStatus{
 		testProxyPlugin: {Name: testProxyPlugin, State: loader.StateSuspended},
 	}
+	// 标签（waiting_on=）不再由这个函数拼：它现在只产出正文，标签由 appendDetail
+	// 在渲染成一行时加上——因为同一段正文还要以**不带标签**的形式送给界面看
+	// （见 pluginStatusRow.Message）。标签本身由 setSuspendedDetail 那两条测试守着。
 	got := suspendedWaitingOn([]string{testMissingRequiredTool, testProxyTool}, providerOf, byName)
-	want := fmt.Sprintf("waiting_on=%s(no plugin provides it) %s(cascade: %s is %s)",
+	want := fmt.Sprintf("%s(no plugin provides it) %s(cascade: %s is %s)",
 		testMissingRequiredTool, testProxyTool, testProxyPlugin, loader.StateSuspended)
 	if got != want {
 		t.Errorf("suspendedWaitingOn() = %q, want %q", got, want)
