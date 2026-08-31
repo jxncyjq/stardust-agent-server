@@ -292,3 +292,41 @@ macOS 没有 Linux 的 Pdeathsig，agent 被 SIGKILL（崩溃、被系统杀、�
 ### 顺带修了一条一直没人看的红线
 
 agent-ci 从 #123 起**连红四次**，而 #124/#125/#126 都是合到红的 master 上的——我每次只看了 Browser Matrix。原因是 #123 那两条测试走完整的 `BuildServeService` 起浏览器，而 agent-ci 的 Linux runner 没有 bwrap。已修（#128）：告警挪进 `browserRuntimeConfig`，测试不再需要一个真的 Chromium。
+
+## 八、V3：三平台打包与内置 Chromium（2026-08-31）
+
+### 打包：此前从没在这台 Windows 之外跑过
+
+GUI 仓**一条 CI 都没有**。加了三平台打包工作流，第一次跑就问出两件事：
+
+1. **这个仓自己建不起来。** `go.mod` 里 `replace github.com/stardust/legion-agent => ../legionAgent` 指向一个兄弟目录的 checkout——打包必须同时拉两个仓并按那个相对路径摆好。这不是 CI 的花招，是打包的真实前提，此前只存在于一台开发机的目录结构里。
+2. **Linux 上 wails 默认要 `webkit2gtk-4.0`**，而 Ubuntu 24.04 只有 4.1。症状很晚才出现：绑定生成完、前端编译完，倒在链接那一步。修法是 `-tags webkit2_41`。
+
+Windows 与 macOS 一次就过。三平台现在都能打出包。
+
+### 内置 Chromium：那一级优先级是死的
+
+`resolveChromiumBin` 里排在「显式 bin_path」之后、「系统探测」之前的那一级——随 App 打包的固定版 Chromium——**从来没有人填过**：
+
+- `browser.RuntimeConfig` 上根本没有这个字段（只有 `ManagerConfig` 有）；
+- 于是 `NewRuntime` 构造 `ManagerConfig` 时把它整个漏掉；
+- 配置文件里也没有对应的键。
+
+三处断开，打包时把浏览器放进 App 里也没用：运行时看不见它，照旧退到系统探测或 go-rod 下载。**少接一个字段不会让任何东西报错**——浏览器照常起来，只是用的是另一个 Chromium。这与 `allow_private_hosts` 那次是同一个形状（那条 14 键断言就是为此加的，而这个字段当时连配置键都没有，所以断言覆盖不到它）。
+
+补齐的是整条链，每一跳各有一条测试守着，四个变异逐个验红：
+
+| 跳 | 守它的测试 |
+|---|---|
+| 配置键 → RuntimeConfig | 那条键覆盖断言（现在 15 键） |
+| RuntimeConfig → ChromiumDist | `TestTheBundledTierIsReachableFromTheRuntime` |
+| 宿主算路径 | `TestTheBundledBrowserIsFoundNextToTheExecutable` 等三条 |
+| 宿主 → serve.Options | `TestTheServeOptionsCarryTheBundledBrowser` |
+
+最后一跳单独立测试，是因为这个仓**已经栽过一次同形的**：加固开关在服务端做好了、宿主没说要，于是每个出货的 GUI 都跑着一个谁都能连的 serve。
+
+优先级的取舍：配置里 `bundled_chromium_path` 显式指名的**优先于**宿主算出来的——运维指名的东西不该被宿主的推断盖掉；两个都空退到系统探测。宿主只返回**确实存在**的路径，「这次安装没带浏览器」是正常形态（`wails dev`、体积敏感的分发），不报错也不告警——一条每次启动都出现的告警等于没有告警。
+
+### 仍未做的（需要拍板）
+
+**把 Chromium 真的放进安装包**这一步没有做，它不是技术问题：每平台一份约 150–200MB，涉及分发体积、许可与更新策略（谁来升级那个固定版）。链路已经通了——打包脚本把浏览器放进约定位置，它就会被用上；不放，就退到系统浏览器。这一步要产品侧决定。

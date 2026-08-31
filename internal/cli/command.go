@@ -1920,6 +1920,14 @@ type ServeOptions struct {
 	// embedder that wants the token now says that too, rather than encoding it
 	// in the absence of an unrelated field.
 	LoopbackHardening bool
+
+	// BundledChromiumPath 是**嵌入方**知道、而配置文件说不出的那件事：桌面 App 把
+	// 一个固定版 Chromium 装在自己包里，它的路径随安装位置变（.app 拖到哪里都行），
+	// 所以只有跑起来的宿主算得出来。
+	//
+	// 配置里的 browser.bundled_chromium_path **优先**：运维显式指名的东西，不该被
+	// 宿主的猜测盖掉。两个都空就退到系统探测（见 browser.resolveChromiumBin）。
+	BundledChromiumPath string
 }
 
 // ServeResult holds the running service and a cleanup function.
@@ -2156,6 +2164,17 @@ func resolveHomeDir(logger *slog.Logger) string {
 // 一模一样。
 //
 // Extractor / Logger / Store 不在这里：它们来自装配期的依赖，不是配置。
+// applyEmbedderBundle 让嵌入方补上它自己那个内置浏览器的路径，**只在配置没说时**。
+//
+// 抽成一个函数是因为这条规则（谁盖谁）在装配代码里测不到，而它错了不会有任何症状：
+// 浏览器照常起来，只是用的是另一个 Chromium。
+func applyEmbedderBundle(cfg browser.RuntimeConfig, embedderPath string) browser.RuntimeConfig {
+	if cfg.BundledChromiumPath == "" {
+		cfg.BundledChromiumPath = embedderPath
+	}
+	return cfg
+}
+
 // 告警在这里而不是在调用点：这个函数是 browser 配置通往运行时的**唯一**入口，
 // 于是「开着私网放行却没留痕」这件事没有别的路径可以绕过去。放在调用点则要么得让
 // 测试真起一个浏览器（那正是 agent-ci 在没有 bwrap 的 runner 上连红四次的原因），
@@ -2174,6 +2193,7 @@ func browserRuntimeConfig(cfg config.BrowserConfig, logger *slog.Logger) browser
 	return browser.RuntimeConfig{
 		Headless:                cfg.Headless,
 		BinPath:                 cfg.BinPath,
+		BundledChromiumPath:     cfg.BundledChromiumPath,
 		SessionTTL:              time.Duration(cfg.SessionTTLSeconds) * time.Second,
 		ReapInterval:            time.Duration(cfg.ReapIntervalSeconds) * time.Second,
 		MaxElements:             cfg.MaxElements,
@@ -2570,7 +2590,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		// Phase 3: 会话持久化。TTL/间隔以秒配置，此处转 time.Duration。当后端是
 		// SQLite 时注入一个把 browser_sessions 表桥到端口的适配器，让登录态跨进程
 		// 重启存活；非 SQLite 驱动拿不到 repo，Store 保持 nil（纯内存，Phase 1/2 行为）。
-		runtimeCfg := browserRuntimeConfig(cfg.Browser, logger)
+		runtimeCfg := applyEmbedderBundle(browserRuntimeConfig(cfg.Browser, logger), opts.BundledChromiumPath)
 		runtimeCfg.Extractor = adapter.NewMaasSnapshotExtractor(defaultMaas)
 		runtimeCfg.Logger = logger
 		if repo, ok := taskStore.(*storage.SQLiteRepository); ok {
