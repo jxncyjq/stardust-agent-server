@@ -154,6 +154,70 @@ func TestAppendRefusesAnUnknownEventType(t *testing.T) {
 	}
 }
 
+// 批内跳号必须被拒（spec §4.3 不变量 1），不能只验首条。
+//
+// 首条对上库里的 next-seq 只保证了批次的起点正确；批内后续元素若跳号，
+// 会在日志中间留一个永久空洞——ReadFrom 一旦读到这个洞就判定整条会话损坏，
+// 而这正是首条校验本想防住、却漏掉的同一类损坏。
+func TestAppendRefusesASeqGapWithinTheBatch(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+
+	// 首条 seq=0 对得上 next-seq=0；第二条本该是 1，却给了 2。
+	batch := []domain.SessionEvent{
+		ev(0, domain.SessionEventTurnStart),
+		ev(2, domain.SessionEventStepStart),
+	}
+	err := repo.Append(ctx, "s1", batch)
+	if err == nil {
+		t.Fatal("批内跳号的批次被接受了")
+	}
+	if !strings.Contains(err.Error(), "1") || !strings.Contains(err.Error(), "2") {
+		t.Errorf("错误没同时给出实际与期望的 seq：%v", err)
+	}
+	// 错误要能看出是批内第二个元素（下标 1）出的问题。
+	if !strings.Contains(err.Error(), "element 1") {
+		t.Errorf("错误没指出是批内哪一个元素：%v", err)
+	}
+
+	var remaining int
+	if err := repo.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM session_events WHERE session_id = ?`, "s1").Scan(&remaining); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if remaining != 0 {
+		t.Errorf("批内跳号被拒后表里还剩 %d 条事件：校验必须在任何 INSERT 之前完成", remaining)
+	}
+}
+
+// 非法 JSON 载荷在写入时就被拒（decodeSessionEvent 的镜像检查）：写入侧不查，
+// 一段非法 JSON 就能进库，而读路径会拒绝解码它——这条会话此后永远读不出来。
+func TestAppendRefusesInvalidJSONData(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+
+	bad := domain.SessionEvent{
+		Seq: 0, Type: domain.SessionEventTurnStart, Time: time.UnixMilli(1),
+		Data: []byte(`{not valid json`),
+	}
+	err := repo.Append(ctx, "s1", []domain.SessionEvent{bad})
+	if err == nil {
+		t.Fatal("非法 JSON 载荷被写进库了")
+	}
+	if !strings.Contains(err.Error(), "JSON") {
+		t.Errorf("错误没提到 JSON：%v", err)
+	}
+
+	var remaining int
+	if err := repo.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM session_events WHERE session_id = ?`, "s1").Scan(&remaining); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if remaining != 0 {
+		t.Errorf("非法 JSON 被拒后表里还剩 %d 条事件", remaining)
+	}
+}
+
 // 大载荷不进事件（不变量 6）：事件表的增长必须与**调用次数**成正比，
 // 而不与工具输出体积成正比。超限的输出走 spill，事件里只留预览 + 定位符。
 //

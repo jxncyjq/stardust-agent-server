@@ -56,7 +56,7 @@ func (r *SQLiteRepository) Append(ctx context.Context, sessionID string, events 
 	if len(events) == 0 {
 		return nil
 	}
-	for _, event := range events {
+	for i, event := range events {
 		if err := domain.ValidateSessionEventType(event.Type); err != nil {
 			return fmt.Errorf("append session events for %q: %w", sessionID, err)
 		}
@@ -65,6 +65,20 @@ func (r *SQLiteRepository) Append(ctx context.Context, sessionID string, events 
 				"over the %d-byte limit; large tool output belongs in spill with only a preview "+
 				"and locator in the event",
 				sessionID, event.Seq, event.Type, len(event.Data), maxSessionEventDataBytes)
+		}
+		if !json.Valid(event.Data) {
+			return fmt.Errorf("append session events for %q: event %d (%s) carries data that is not "+
+				"valid JSON; writing it would make this session unreadable forever, since the read "+
+				"path rejects malformed JSON for every event it decodes",
+				sessionID, event.Seq, event.Type)
+		}
+		// 批内连续性：只验首条对上库里的 next-seq 还不够——首条对了，批内后续元素
+		// 仍可能跳号，在日志中间留下一个永久空洞（读到它就判定整条会话损坏）。
+		if i > 0 && event.Seq != events[i-1].Seq+1 {
+			return fmt.Errorf("append session events for %q: batch element %d has seq %d, want %d "+
+				"(must follow element %d's seq %d contiguously); a gap here would leave a permanent "+
+				"hole in the log and the session could never be rebuilt into a unique history",
+				sessionID, i, event.Seq, events[i-1].Seq+1, i-1, events[i-1].Seq)
 		}
 	}
 
