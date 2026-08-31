@@ -338,6 +338,58 @@ func TestAHoleInTheMiddleIsRefused(t *testing.T) {
 	}
 }
 
+// 窗口起点本身落在洞里必须被拒（spec §4.3 不变量 3 的一个特殊情形）。
+//
+// 相邻行检查只验「已返回的行之间」，天生放过窗口起点：表里剩 {0, 2}（seq=1 被
+// 删掉），ReadFrom(s1, 1) 命中的第一行就是 seq=2，expected 的初值 -1 让这一行
+// 绕过检查，函数会返回 [{Seq:2}] 和 nil error——调用方（轨迹翻页，典型调用正是
+// ReadFrom(sessionID, 上次读到的 seq + 1)）就会把「seq=1 曾经存在又消失了」
+// 误当成「从这里开始本来就是这样」而永远无法察觉。
+func TestReadFromWithFromSeqLandingInAHoleIsRefused(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+	if err := repo.Append(ctx, "s1", []domain.SessionEvent{
+		ev(0, domain.SessionEventTurnStart),
+		ev(1, domain.SessionEventStepStart),
+		ev(2, domain.SessionEventAssistantMessage),
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	// 绕过 Append 直接制造一个洞（seq 1 被删掉），表里剩 {0, 2}。
+	if _, err := repo.db.ExecContext(ctx, `DELETE FROM session_events WHERE session_id='s1' AND seq=1`); err != nil {
+		t.Fatalf("制造断裂: %v", err)
+	}
+
+	_, err := repo.ReadFrom(ctx, "s1", 1)
+	if err == nil {
+		t.Fatal("fromSeq 落在洞里却读成功了：调用方无法察觉 seq=1 曾经存在又消失了")
+	}
+	if !strings.Contains(err.Error(), "1") || !strings.Contains(err.Error(), "2") {
+		t.Errorf("错误没同时给出请求起点与实际首条：%v", err)
+	}
+}
+
+// fail-loud 分支须有测试断言「确实返回 error」（CLAUDE.md「测试」一节）：
+// fromSeq < 0 的校验此前没有任何用例覆盖它真的会报错。
+//
+// 会话故意留空（不 Append 任何事件）：如果这里先写入事件，"seq >= -1" 的查询
+// 会命中那些事件，窗口起点校验（events[0].Seq != fromSeq）也会报错，测试就算
+// 删掉 fromSeq < 0 这条校验也照样红→绿地"通过"——那样就验不出这条校验本身是否
+// 存在。留空会话时，没有这条校验查询会直接返回空切片和 nil error，只有专门的
+// 负数校验能让这个用例报错。
+func TestReadFromRefusesANegativeFromSeq(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+
+	_, err := repo.ReadFrom(ctx, "s1", -1)
+	if err == nil {
+		t.Fatal("fromSeq 为负数却读成功了")
+	}
+	if !strings.Contains(err.Error(), "-1") {
+		t.Errorf("错误没提到非法值 -1：%v", err)
+	}
+}
+
 func seqsOf(events []domain.SessionEvent) []int64 {
 	out := make([]int64, 0, len(events))
 	for _, e := range events {

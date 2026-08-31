@@ -197,5 +197,16 @@ func (r *SQLiteRepository) ReadFrom(ctx context.Context, sessionID string, fromS
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate session events for %q: %w", sessionID, err)
 	}
+	// Append 保证这条日志从 0 开始稠密连续，所以只要有行返回，第一行的 seq 必须
+	// 恰好等于 fromSeq——差一步都说明 [fromSeq, events[0].Seq) 这段被削掉了。
+	// 上面的相邻行检查只验「已返回的行之间」，天生漏掉窗口起点本身这个洞：
+	// fromSeq 落在一个洞里时，查询直接跳到洞后面的第一行，expected 的初值 -1
+	// 会放过这一行的检查，调用方就会以为「从 fromSeq 开始就是这样」，而不知道
+	// fromSeq 到 events[0].Seq 之间曾经存在过又消失了。
+	if len(events) > 0 && events[0].Seq != fromSeq {
+		return nil, fmt.Errorf("session log for %q is broken: requested from seq %d but the first "+
+			"event actually present is seq %d; the gap in between means the log no longer "+
+			"reconstructs one history", sessionID, fromSeq, events[0].Seq)
+	}
 	return events, nil
 }
