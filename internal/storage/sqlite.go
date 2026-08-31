@@ -23,6 +23,9 @@ import (
 
 type SQLiteRepository struct {
 	db *sql.DB
+
+	// sessionEventLocks 串行化同一会话的事件追加（见 session_events.go）。
+	sessionEventLocks sessionWriteLocks
 }
 
 // ErrAgentSessionNotFound is returned by DeleteAgentSession when no session with
