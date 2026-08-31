@@ -2022,6 +2022,14 @@ var schemaStatements = []string{
 		message TEXT NOT NULL,
 		created_at TEXT NOT NULL
 	)`,
+	`CREATE TABLE IF NOT EXISTS session_events (
+		session_id TEXT NOT NULL,
+		seq INTEGER NOT NULL,
+		type TEXT NOT NULL,
+		time INTEGER NOT NULL,
+		data TEXT NOT NULL,
+		PRIMARY KEY (session_id, seq)
+	)`,
 	`CREATE TABLE IF NOT EXISTS skills (
 		id TEXT NOT NULL,
 		name TEXT NOT NULL,
