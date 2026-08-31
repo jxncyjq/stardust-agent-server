@@ -103,8 +103,10 @@ func TestAnEmptyEventTypeSaysItIsEmpty(t *testing.T) {
 
 - [ ] **Step 2: 跑测试确认它红**
 
-Run: `go test ./internal/domain/ -run SessionEvent -count=1`
+Run: `go test ./internal/domain/ -run EventType -count=1`
 Expected: FAIL，`undefined: ValidateSessionEventType`
+
+（`-run` 匹配的是**测试函数名**：三个测试都含 `EventType`。写成 `-run SessionEvent` 会一条都不跑却打印 `ok`——「no tests to run」是绿得不是地方的经典形状。）
 
 - [ ] **Step 3: 写实现**
 
@@ -195,14 +197,14 @@ func ValidateSessionEventType(typ SessionEventType) error {
 
 - [ ] **Step 4: 跑测试确认它绿**
 
-Run: `go test ./internal/domain/ -run SessionEvent -count=1 -v`
-Expected: 三条全 PASS
+Run: `go test ./internal/domain/ -run EventType -count=1 -v`
+Expected: 三条全 PASS（确认输出里真的有三行 `--- PASS`，而不是 `no tests to run`）
 
 - [ ] **Step 5: 变异验证**
 
 把 `ValidateSessionEventType` 里的 `if _, ok := ...; !ok {` 分支整段删掉（变成永远返回 nil），跑：
 
-Run: `go test ./internal/domain/ -run SessionEvent -count=1`
+Run: `go test ./internal/domain/ -run EventType -count=1`
 Expected: `TestAnUnknownEventTypeIsRefusedByName` FAIL。**恢复代码**再往下走。
 
 - [ ] **Step 6: 提交**
@@ -505,7 +507,7 @@ func ev(seq int64, typ domain.SessionEventType) domain.SessionEvent {
 
 - [ ] **Step 2: 跑测试确认它红**
 
-Run: `go test ./internal/storage/ -run "Append|NoEventsLeavesNoTrace|OversizedPayload" -count=1`
+Run: `go test ./internal/storage/ -run "Append|FailedBatch|NoEventsLeavesNoTrace|OversizedPayload" -count=1`
 Expected: FAIL，`repo.Append undefined`
 
 - [ ] **Step 3: 写实现**
@@ -662,7 +664,7 @@ func decodeSessionEvent(sessionID string, seq int64, typ string, millis int64, d
 - [ ] **Step 4: 跑测试确认它绿**
 
 Run: `go test ./internal/storage/ -run "Append|NoEventsLeavesNoTrace|OversizedPayload|SessionEventsTable" -count=1 -v`
-Expected: 全 PASS（`ReadFrom` 尚未实现，`TestAFailedBatchLeavesNothingBehind` 会因此编译不过——**先做 Task 4 再回来跑它**；本步只跑其余四条：`-run "RefusesASeq|NoEventsLeavesNoTrace|OversizedPayload|UnknownEventType|SessionEventsTable"`）
+Expected: 全 PASS。注意 `TestAFailedBatchLeavesNothingBehind` 用到 Task 4 的 `ReadFrom`，本任务里整个包会编译不过——**按计划先把那一条测试写进文件但用 `t.Skip("waits for ReadFrom in Task 4")` 占位**，Task 4 实现 `ReadFrom` 后删掉那行 Skip 并真正跑它。本步跑：`go test ./internal/storage/ -run "RefusesASeq|NoEventsLeavesNoTrace|OversizedPayload|UnknownEventType|SessionEventsTable" -count=1 -v`
 
 - [ ] **Step 5: 变异验证（三条）**
 
@@ -878,8 +880,8 @@ func (r *SQLiteRepository) ReadFrom(ctx context.Context, sessionID string, fromS
 
 - [ ] **Step 4: 跑测试确认它绿**
 
-Run: `go test ./internal/storage/ -run "ReadFrom|HoleInTheMiddle|Append|NoEventsLeavesNoTrace|OversizedPayload" -count=1 -v`
-Expected: 全 PASS（含 Task 3 里那条 `TestAFailedBatchLeavesNothingBehind`）
+Run: `go test ./internal/storage/ -run "ReadFrom|HoleInTheMiddle|Append|FailedBatch|NoEventsLeavesNoTrace|OversizedPayload" -count=1 -v`
+Expected: 全 PASS。**先删掉 Task 3 里给 `TestAFailedBatchLeavesNothingBehind` 加的那行 `t.Skip`**，否则它会以 SKIP 混过去——一条永远 skip 的测试等于没有测试。
 
 - [ ] **Step 5: 变异验证（两条）**
 
