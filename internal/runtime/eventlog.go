@@ -93,7 +93,14 @@ func (e *eventRecorder) append(typ domain.SessionEventType, payload map[string]a
 }
 
 // recordTurnStart 记一个轮次的开始，并把 step 计数归零（spec §4.1：step 每 turn 重置）。
+//
+// 先过 enabled() 再碰 e.mu：与其余六个 record* 方法共享同一条「怎么处理禁用/nil」的
+// 规则，不单独绕开 append() 的降级路径（记录器没启用时是契约允许的可选部署形态，
+// 不是错误，见 enabled() 的文档注释）。
 func (e *eventRecorder) recordTurnStart(turn int) {
+	if !e.enabled() {
+		return
+	}
 	e.mu.Lock()
 	e.turn, e.step = turn, 0
 	e.mu.Unlock()
@@ -115,6 +122,19 @@ func (e *eventRecorder) recordStepStart() {
 }
 
 // recordAssistantMessage 记模型响应（含它请求的工具调用与 token 用量）。
+//
+// tool_calls 摘要数组**故意不截断**，这是权衡过的决定，不是漏掉的截断：
+// spec §4.3.1 第 2 条要求 P3 投影按 call_id 配对，而这个数组正是配对时要用的清单。
+// 截掉其中任意一项，恢复/投影就会缺项——那是比容量风险更重的正确性缺陷，用一个
+// 换另一个不划算。content/arguments/preview 三处按 maxEventPreviewRunes 截断是因为
+// 它们是自由文本，截了不影响可配对性；tool_calls 每项只是 call_id+name，本身已经
+// 很小，风险来自「条目数」而不是「单项体积」。
+//
+// 真的超过 P1 的 64 KiB/事件硬上限（internal/storage.maxSessionEventDataBytes）时，
+// flush → Append 会整批失败并返回包装过的错误，由 Task 4 的屏障感知并阻断执行——
+// 这是 fail-loud 的正确表现，不是数据损坏（不静默丢事件、不裁剪配对信息）。
+// TestRecordAssistantMessageFlushesWithManyToolCalls 用一个远超真实单步工具调用数量
+// 的上界证明：在这个上界内，flush 确实能落盘、不会撞到那个上限。
 func (e *eventRecorder) recordAssistantMessage(content string, calls []domain.ToolCall, usage eventUsage, profile string) {
 	names := make([]map[string]any, 0, len(calls))
 	for _, c := range calls {
@@ -158,7 +178,12 @@ func (e *eventRecorder) recordToolResult(callID string, preview string, isError 
 }
 
 // recordStepEnd 记一步的结束，并把 step 计数推进一格。
+//
+// 同 recordTurnStart：先过 enabled() 再碰 e.mu，与其余六个 record* 方法一致。
 func (e *eventRecorder) recordStepEnd(reason string) {
+	if !e.enabled() {
+		return
+	}
 	e.append(domain.SessionEventStepEnd, map[string]any{
 		"turn": e.currentTurn(), "step": e.currentStep(), "reason": reason,
 	})

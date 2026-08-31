@@ -3,6 +3,8 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -10,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/storage"
 )
 
 // stubEventStore 是一个什么都不做的 store，供不关心写入结果的用例使用。
@@ -219,5 +222,58 @@ func TestAToolResultCarriesAPreviewNotTheWholeOutput(t *testing.T) {
 	}
 	if strings.Contains(preview, huge) {
 		t.Error("预览里塞进了完整输出")
+	}
+}
+
+// tool_calls 摘要数组故意不截断（见 recordAssistantMessage 的文档注释：截断会破坏
+// spec §4.3.1 第 2 条要求的「按 call_id 配对」）。这条测试用证据代替假定：在一个
+// 远超真实单步工具调用数量的上界下，事件确实能落盘，不会撞到 P1 的
+// 64 KiB/事件硬上限（internal/storage.maxSessionEventDataBytes）。
+//
+// 上界取 500 的理由：runtime.go 的 executeToolCalls 是顺序 for 循环，不是并发派发，
+// 真实模型单步返回的并行工具调用数以个位数、至多两位数计，500 远超这个量级。
+// 这里用的是真实的 SQLiteRepository（而不是不做容量校验的 captureEventStore），
+// 让 flush 真的经过 P1 的 appendLocked 校验，不是把实现重写一遍去猜一个数字。
+func TestRecordAssistantMessageFlushesWithManyToolCalls(t *testing.T) {
+	t.Parallel()
+
+	repo, err := storage.OpenSQLite(context.Background(), filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	const callCount = 500
+	calls := make([]domain.ToolCall, callCount)
+	for i := range calls {
+		calls[i] = domain.ToolCall{ID: fmt.Sprintf("call-%04d", i), Name: "read_file"}
+	}
+
+	rec := newEventRecorder(repo, domain.Task{ID: "t1", SessionID: "s1"})
+	rec.recordAssistantMessage(
+		strings.Repeat("x", maxEventPreviewRunes), // content 也顶到截断上限，模拟最坏情况
+		calls, eventUsage{Prompt: 1, Completion: 2, Cached: 3, Total: 6}, "default",
+	)
+
+	if err := rec.flush(context.Background()); err != nil {
+		t.Fatalf("flush with %d tool calls: %v", callCount, err)
+	}
+
+	events, err := repo.ReadFrom(context.Background(), "s1", 0)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if len(events) != 1 {
+		t.Fatalf("落盘事件数 = %d，want 1", len(events))
+	}
+
+	var payload struct {
+		ToolCalls []map[string]any `json:"tool_calls"`
+	}
+	if err := json.Unmarshal(events[0].Data, &payload); err != nil {
+		t.Fatalf("unmarshal 落盘事件: %v", err)
+	}
+	if len(payload.ToolCalls) != callCount {
+		t.Errorf("落盘的 tool_calls 长度 = %d，want %d：说明数组被截断了", len(payload.ToolCalls), callCount)
 	}
 }
