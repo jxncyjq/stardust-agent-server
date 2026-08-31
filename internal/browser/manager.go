@@ -101,6 +101,19 @@ type chromiumInstance struct {
 // 浏览器自己写的 stderr 报错，比继续等有用。
 const chromiumStartTimeout = 45 * time.Second
 
+// chromiumDistFor 把配置与系统探测结果拼成分发优先级的输入。
+//
+// 抽出来是因为「配置里的字段有没有真的走到解析器」这件事，在装配代码里测不到——
+// 少接一个字段不会让任何东西报错，浏览器照常起来，只是用的另一个 Chromium。
+// BundledChromiumPath 此前正是这么在两个结构体之间掉进缝里的。
+func chromiumDistFor(cfg RuntimeConfig, systemPath string) ChromiumDist {
+	return ChromiumDist{
+		ConfigBinPath: cfg.BinPath,
+		BundledPath:   cfg.BundledChromiumPath,
+		SystemPath:    systemPath,
+	}
+}
+
 // NewManager 建起浏览器的两级池，并**立即起一个进程**。
 //
 // 立即起而不是等第一次用：装配期的失败（沙箱要求得不到满足、Chromium 找不到、
@@ -150,11 +163,10 @@ func NewManager(cfg ManagerConfig) (*Manager, error) {
 // 除 PAL 外不出现任何 runtime.GOOS 分支（spec §11.2）。
 func startChromiumInstance(cfg ManagerConfig, pal PlatformAdapter, egressURL string,
 	logger *slog.Logger) (*chromiumInstance, error) {
-	binPath := resolveChromiumBin(ChromiumDist{
-		ConfigBinPath: cfg.BinPath,
-		BundledPath:   cfg.BundledChromiumPath,
-		SystemPath:    pal.ResolveChromiumPath(),
-	})
+	binPath := resolveChromiumBin(chromiumDistFor(RuntimeConfig{
+		BinPath:             cfg.BinPath,
+		BundledChromiumPath: cfg.BundledChromiumPath,
+	}, pal.ResolveChromiumPath()))
 
 	l := launcher.New()
 	// 先注入平台相关启动参数，再由 Headless 收尾，使显式 Headless 开关对

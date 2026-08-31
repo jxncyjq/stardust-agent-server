@@ -19,13 +19,21 @@ import (
 
 // RuntimeConfig 配置运行时。
 type RuntimeConfig struct {
-	Headless          bool
-	BinPath           string
-	AllowPrivateHosts bool // 仅测试放开；生产默认 false（SSRF 基础拦截）
-	MaxElements       int
-	ScreencastFPS     int           // screencast 限帧率（<=0 时 screencaster 回落到默认 8fps）
-	SessionTTL        time.Duration // 会话空闲超过此时长即回收物理 Context；<=0 关闭 TTL 回收
-	ReapInterval      time.Duration // reaper 后台扫描间隔；<=0 回落到默认 60s
+	Headless bool
+	BinPath  string
+	// BundledChromiumPath 指向随 App 一起打包的那个固定版 Chromium。
+	//
+	// 它在 resolveChromiumBin 的优先级里排在显式 BinPath 之后、系统探测之前：一个
+	// 把浏览器装进自己包里的部署，就是为了不依赖用户机器上装的是什么版本。
+	//
+	// 此前 ManagerConfig 有这个字段而 RuntimeConfig 没有，于是从配置到管理器的那一跳
+	// 把它整个漏掉了——打包时放进去也没用，运行时永远看不见（V3 抓到的）。
+	BundledChromiumPath string
+	AllowPrivateHosts   bool // 仅测试放开；生产默认 false（SSRF 基础拦截）
+	MaxElements         int
+	ScreencastFPS       int           // screencast 限帧率（<=0 时 screencaster 回落到默认 8fps）
+	SessionTTL          time.Duration // 会话空闲超过此时长即回收物理 Context；<=0 关闭 TTL 回收
+	ReapInterval        time.Duration // reaper 后台扫描间隔；<=0 回落到默认 60s
 	// Store 是可选的会话持久化端口：非 nil 时装配写穿并在启动时从盘加载已存会话
 	// （Context=nil 懒重建）；nil = 纯内存，Phase 1/2 行为不变。
 	Store BrowserSessionStore
@@ -127,6 +135,7 @@ func NewRuntime(cfg RuntimeConfig) (*Runtime, error) {
 	mgr, err := NewManager(ManagerConfig{
 		Headless:                cfg.Headless,
 		BinPath:                 cfg.BinPath,
+		BundledChromiumPath:     cfg.BundledChromiumPath,
 		AllowPrivateHosts:       cfg.AllowPrivateHosts,
 		RequireSandbox:          cfg.RequireSandbox,
 		Logger:                  cfg.Logger,

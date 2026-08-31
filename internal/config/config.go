@@ -273,6 +273,14 @@ type BrowserConfig struct {
 	Headless bool   `json:"headless"`
 	BinPath  string `json:"bin_path"` // 可选：指向系统 Chrome/Edge，绕过 go-rod 自动下载
 
+	// BundledChromiumPath 指向随安装包一起分发的那个固定版 Chromium。
+	//
+	// 它排在 bin_path 之后、系统探测之前：一个把浏览器装进自己包里的部署，正是
+	// 为了不依赖用户机器上装的是什么版本、有没有装。路径不存在时**不报错**，
+	// 退到系统探测——「这次安装没带浏览器」是一种正常形态（见
+	// browser.resolveChromiumBin），而 bin_path 那种显式指定则不做存在性检查。
+	BundledChromiumPath string `json:"bundled_chromium_path"`
+
 	// AllowPrivateHosts 允许**内置浏览器**访问回环与私网地址。
 	//
 	// 默认 false：Agent 会打开模型选定的任意 URL，而一台开发机或服务器上的

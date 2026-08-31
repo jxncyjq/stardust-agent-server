@@ -65,6 +65,7 @@ func TestEveryBrowserConfigKeyReachesTheRuntime(t *testing.T) {
 	got := browserRuntimeConfig(config.BrowserConfig{
 		Headless:              true,
 		BinPath:               "/opt/chrome",
+		BundledChromiumPath:   "/opt/app/chrome-bundled",
 		AllowPrivateHosts:     true,
 		RequireSandbox:        true,
 		SessionTTLSeconds:     900,
@@ -85,6 +86,7 @@ func TestEveryBrowserConfigKeyReachesTheRuntime(t *testing.T) {
 	}{
 		{"headless", got.Headless},
 		{"bin_path", got.BinPath == "/opt/chrome"},
+		{"bundled_chromium_path", got.BundledChromiumPath == "/opt/app/chrome-bundled"},
 		{"allow_private_hosts", got.AllowPrivateHosts},
 		{"require_sandbox", got.RequireSandbox},
 		{"session_ttl_seconds", got.SessionTTL == 900*time.Second},
@@ -102,5 +104,36 @@ func TestEveryBrowserConfigKeyReachesTheRuntime(t *testing.T) {
 		if !check.ok {
 			t.Errorf("browser.%s never reaches the runtime; it was configured and silently ignored", check.name)
 		}
+	}
+}
+
+// 桌面 App 把一个固定版 Chromium 装在自己包里，而那个路径随安装位置变（.app 拖到
+// 哪里都行）——配置文件说不出它，只有跑起来的宿主算得出来。所以 ServeOptions 上有
+// 这个入口；而运维在配置里显式指名的浏览器不该被宿主的推断盖掉。
+
+func TestTheEmbedderCanNameItsBundledBrowser(t *testing.T) {
+	t.Parallel()
+
+	got := browserRuntimeConfig(config.BrowserConfig{Enabled: true}, nil)
+	if got.BundledChromiumPath != "" {
+		t.Fatalf("BundledChromiumPath = %q from a config that names none", got.BundledChromiumPath)
+	}
+	// 装配那一跳的规则：配置为空才用宿主给的。
+	if applyEmbedderBundle(got, "/Applications/Legion.app/Contents/Resources/chrome").
+		BundledChromiumPath != "/Applications/Legion.app/Contents/Resources/chrome" {
+		t.Error("the embedder's bundled browser never reaches the runtime; " +
+			"a Chromium shipped inside the app stays invisible and the agent uses another one")
+	}
+}
+
+func TestAConfiguredBundlePathOutranksTheEmbedders(t *testing.T) {
+	t.Parallel()
+
+	got := browserRuntimeConfig(config.BrowserConfig{
+		Enabled: true, BundledChromiumPath: "/opt/pinned/chrome",
+	}, nil)
+	if applyEmbedderBundle(got, "/Applications/Legion.app/Contents/Resources/chrome").
+		BundledChromiumPath != "/opt/pinned/chrome" {
+		t.Error("the embedder's guess overwrote the browser the operator named explicitly")
 	}
 }
