@@ -717,6 +717,15 @@ const maxConcurrentAppendRetries = 50
 // 第 N 条」的错误后重读再写才是正常用法。这里要断言的是**结果**：最终的日志
 // 连续、条数正确、无重复。重试循环带字面上界（maxConcurrentAppendRetries），
 // 不依赖 Append 最终成功来终止。
+//
+// 【关于变异验证与测试敏感度】
+// 这条测试断言的是不变量——并发写之后 seq 仍连续、无重复、无丢失。在**当前生产
+// 配置**（sqlite.go 的 SetMaxOpenConns(1)）下，删掉 sessionWriteLocks 这把锁后
+// 本测试仍会通过（5/5 绿），这不代表测试无用或锁冗余，而是连接池层已经提供了
+// 底层串行化保护。要让这条测试对锁的缺失敏感，需要同时放宽连接池（实测
+// MaxOpenConns=4），之后删锁会稳定失败（5/5 红）。因此在改动连接池宽度之前，
+// **不要因为「删锁测试仍绿」就认定这条测试没用或把锁删掉**——这条测试与那把锁
+// 都是对不变量的防护，连接池只是又在下一层提供了冗余保护，不代表上层防线多余。
 func TestConcurrentAppendsKeepTheLogContiguous(t *testing.T) {
 	ctx := context.Background()
 	repo := newEventRepo(t)
