@@ -245,3 +245,122 @@ func TestAnOversizedPayloadIsRefused(t *testing.T) {
 		t.Errorf("错误没告诉写的人该走 spill：%v", err)
 	}
 }
+
+func TestReadFromReturnsOnlyTheSuffix(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+	if err := repo.Append(ctx, "s1", []domain.SessionEvent{
+		ev(0, domain.SessionEventTurnStart),
+		ev(1, domain.SessionEventUserMessage),
+		ev(2, domain.SessionEventStepStart),
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	got, err := repo.ReadFrom(ctx, "s1", 1)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if len(got) != 2 || got[0].Seq != 1 || got[1].Seq != 2 {
+		t.Fatalf("ReadFrom(1) 返回 %d 条（seq %v），want seq [1 2]", len(got), seqsOf(got))
+	}
+}
+
+// 越过末尾返回空，不是错误：轨迹的增量拉取会不断问「有没有比我这条更新的」，
+// 「暂时没有」是正常答案。
+func TestReadFromPastTheEndIsEmptyNotAnError(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+	if err := repo.Append(ctx, "s1", []domain.SessionEvent{ev(0, domain.SessionEventTurnStart)}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	got, err := repo.ReadFrom(ctx, "s1", 99)
+	if err != nil {
+		t.Fatalf("ReadFrom(99) = %v, want nil error", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("ReadFrom(99) 返回了 %d 条", len(got))
+	}
+}
+
+// ReadFrom 不改库：一次「看一眼」不该改变被看的东西。轨迹在翻页，
+// 而 Load 的崩溃恢复会写入——两者混在一起，翻页就会静默地改写历史。
+func TestReadFromDoesNotWriteAnything(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+	// 半个 turn：有 tool/call 没有 tool/result。Load 会为它补事件，ReadFrom 不该。
+	if err := repo.Append(ctx, "s1", []domain.SessionEvent{
+		ev(0, domain.SessionEventTurnStart),
+		ev(1, domain.SessionEventStepStart),
+		toolCall(2, "call-1"),
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	before := countEvents(t, repo, "s1")
+	if _, err := repo.ReadFrom(ctx, "s1", 0); err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if after := countEvents(t, repo, "s1"); after != before {
+		t.Errorf("ReadFrom 之后行数从 %d 变成 %d：它不该写任何东西", before, after)
+	}
+}
+
+// 中间断裂 = 损坏，拒绝（spec §4.3 不变量 3）。
+//
+// 静默跳过一个洞，等于把「这段历史缺了一块」变成「这段历史就是这样」——
+// 而缺掉的恰好可能是那次出问题的工具调用。
+func TestAHoleInTheMiddleIsRefused(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+	// 需要 seq 1 之后还有更高的 seq（这里是 2）：删掉 1 之后剩下 {0, 2}，
+	// 这才是「中间」真断了一截——如果只写到 seq 1 就删掉它，剩下的 {0} 和
+	// 「这个会话本来就只有一条事件」在数据上完全等价，读不出任何异常。
+	if err := repo.Append(ctx, "s1", []domain.SessionEvent{
+		ev(0, domain.SessionEventTurnStart),
+		ev(1, domain.SessionEventStepStart),
+		ev(2, domain.SessionEventAssistantMessage),
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	// 绕过 Append 直接制造一个洞（seq 1 被删掉）。真实成因是行损坏或人工干预。
+	if _, err := repo.db.ExecContext(ctx, `DELETE FROM session_events WHERE session_id='s1' AND seq=1`); err != nil {
+		t.Fatalf("制造断裂: %v", err)
+	}
+
+	_, err := repo.ReadFrom(ctx, "s1", 0)
+	if err == nil {
+		t.Fatal("seq 有洞却读成功了")
+	}
+	if !strings.Contains(err.Error(), "1") {
+		t.Errorf("错误没指出断在哪里：%v", err)
+	}
+}
+
+func seqsOf(events []domain.SessionEvent) []int64 {
+	out := make([]int64, 0, len(events))
+	for _, e := range events {
+		out = append(out, e.Seq)
+	}
+	return out
+}
+
+func countEvents(t *testing.T, repo *SQLiteRepository, sessionID string) int {
+	t.Helper()
+	var count int
+	if err := repo.db.QueryRowContext(context.Background(),
+		`SELECT COUNT(*) FROM session_events WHERE session_id = ?`, sessionID).Scan(&count); err != nil {
+		t.Fatalf("count events: %v", err)
+	}
+	return count
+}
+
+// toolCall 造一条带 call_id 的 tool/call 事件。
+func toolCall(seq int64, callID string) domain.SessionEvent {
+	data, err := json.Marshal(map[string]any{"turn": 0, "step": 0, "call_id": callID, "name": "read_file", "arguments": "{}"})
+	if err != nil {
+		panic(err)
+	}
+	return domain.SessionEvent{Seq: seq, Type: domain.SessionEventToolCall, Time: time.UnixMilli(1), Data: data}
+}

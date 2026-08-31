@@ -148,3 +148,54 @@ func decodeSessionEvent(sessionID string, seq int64, typ string, millis int64, d
 		Data: json.RawMessage(data),
 	}, nil
 }
+
+// ReadFrom 返回 seq >= fromSeq 的事件，按 seq 升序（spec §4.4）。
+//
+// **不改库**：轨迹的翻页与增量拉取走这条路，而一次「看一眼」不该改变被看的东西。
+// 崩溃恢复只发生在 Load 里。
+//
+// 返回的这段必须自身连续：中间有洞说明日志损坏，报错而不是把缺口当成「本来就这样」
+// （spec §4.3 不变量 3）。
+func (r *SQLiteRepository) ReadFrom(ctx context.Context, sessionID string, fromSeq int64) ([]domain.SessionEvent, error) {
+	if fromSeq < 0 {
+		return nil, fmt.Errorf("read session events for %q: fromSeq %d is negative", sessionID, fromSeq)
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT seq, type, time, data
+		FROM session_events
+		WHERE session_id = ? AND seq >= ?
+		ORDER BY seq
+	`, sessionID, fromSeq)
+	if err != nil {
+		return nil, fmt.Errorf("read session events for %q: %w", sessionID, err)
+	}
+	defer rows.Close()
+
+	var events []domain.SessionEvent
+	var expected int64 = -1
+	for rows.Next() {
+		var (
+			seq    int64
+			typ    string
+			millis int64
+			data   string
+		)
+		if err := rows.Scan(&seq, &typ, &millis, &data); err != nil {
+			return nil, fmt.Errorf("scan session event for %q: %w", sessionID, err)
+		}
+		if expected >= 0 && seq != expected {
+			return nil, fmt.Errorf("session log for %q is broken: seq jumps from %d to %d; "+
+				"a gap means the log no longer reconstructs one history", sessionID, expected-1, seq)
+		}
+		event, err := decodeSessionEvent(sessionID, seq, typ, millis, data)
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+		expected = seq + 1
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate session events for %q: %w", sessionID, err)
+	}
+	return events, nil
+}
