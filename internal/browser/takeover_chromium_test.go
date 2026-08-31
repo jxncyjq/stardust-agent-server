@@ -351,8 +351,14 @@ func TestTwoSessionsSpillIntoASecondBrowserProcess(t *testing.T) {
 //
 // 判据是进程树：包过之后，我们启动的那个进程是 bwrap，Chromium 在它下面。
 func TestTheBrowserRunsInsideTheOuterSandbox(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("the outer sandbox is bubblewrap, which is Linux-only")
+	// 每个平台的外层沙箱是不同的东西，但判据是同一条：我们**启动的那个进程**是包装
+	// 器，浏览器在它下面。
+	var wrapper string
+	switch runtime.GOOS {
+	case "linux":
+		wrapper = "/bwrap"
+	default:
+		t.Skip("this platform has no outer sandbox for the browser process")
 	}
 	rt, err := NewRuntime(RuntimeConfig{Headless: true, AllowPrivateHosts: true, BinPath: systemChromeForTest()})
 	if err != nil {
@@ -362,8 +368,9 @@ func TestTheBrowserRunsInsideTheOuterSandbox(t *testing.T) {
 
 	chromium := firstChromium(t, rt)
 	launchedAs := chromium.launched.cmd.Path
-	if !strings.HasSuffix(launchedAs, "/bwrap") {
-		t.Errorf("the browser was launched as %q, not through bwrap: the sandbox is not on the path", launchedAs)
+	if !strings.HasSuffix(launchedAs, wrapper) {
+		t.Errorf("the browser was launched as %q, not through %s: the sandbox is not on the path",
+			launchedAs, strings.TrimPrefix(wrapper, "/"))
 	}
 }
 

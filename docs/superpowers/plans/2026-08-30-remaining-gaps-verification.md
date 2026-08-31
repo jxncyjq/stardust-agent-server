@@ -245,3 +245,50 @@ GUI 侧不需要改：`browserPost` 已经把非 2xx 的响应体原样带进错
 ### 顺带写清一件事
 
 内存门槛（`MinFreeMemoryBytes`）是**逐次的安全余量，不是配额**：并发放行多少个由池决定，门槛本身不做在途记账。测试断言的是「低于门槛时并发一个都过不去」与「逐次读数、不缓存」，没有假装它是配额。
+
+## 七、A⑤：macOS 与 Windows 的外层沙箱（2026-08-30，结论是两个否定 + 一个交付）
+
+按 bubblewrap 那次的教训**先探再写**。这次探了十一轮，结论是：
+
+- **Windows AppContainer：做不成。**
+- **macOS sandbox-exec：对 Google Chrome 做不成**（对 Chromium 可以，但 macOS 上装着的通常是 Chrome）。
+- **macOS 孤儿缺口（D4）：补上了**，看门狗。
+
+### Windows：AppContainer 走不通（本机实测）
+
+用 `CreateAppContainerProfile` + `PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES` 真起了一次。profile 建得出、ACL 也授权了，Chrome 当场死在：
+
+```
+FATAL:crashpad_client_win.cc:323 Check failed: CreateNamedPipe: 拒绝访问 (0x5)
+```
+
+Crashpad 在**早于命令行开关处理**的阶段就要建具名管道，AppContainer 进程建不了全局命名空间里的管道。`--disable-breakpad`、`--disable-crash-reporter`、`--no-crashpad`、`--disable-features=Crashpad` 四种写法逐个试过，症状一字不变。
+
+这与 Chrome 的架构一致：它自己**用** AppContainer 关渲染进程，broker（浏览器进程）必须在外面。Windows 维持 Job Object（kill-on-close + 内存上限）。
+
+### macOS：Google Chrome 跑不进 sandbox-exec
+
+前八轮都在收紧 profile，而且一度看起来快成了：Chromium 在「整盘可读、只有 profile 与本用户 T/C 可写、出网只留回环」下起得来，写限制也确实生效。但**那八轮探的浏览器都不是生产会用的那个**——探针优先读 `CHROME_PATH`（setup-chrome 装的 Chromium），而生产走 `ResolveChromiumPath()`，runner 的 `/Applications` 里躺着 Google Chrome。于是探针全绿、e2e 全红。
+
+把探针改成用生产那个浏览器之后，判据只用了一条就到底了：**一份「什么都不限、只是包了一层」的 profile，Google Chrome 也起不来**（一个字都不说就退出）。既然不限制都不行，收紧到什么程度都无从谈起。
+
+于是选择只有两个：按 Linux 那条「缺沙箱就拒绝启动」，等于让内置浏览器在多数 macOS 机器上直接不可用；或者诚实地说这台机器上没有外层沙箱。选后者，并且**不假装有**——`ConfineProcess` 在 macOS 上提供的是孤儿保护，不是隔离，代码注释里写死了这个区别。
+
+那份已经调通的 SBPL profile 没有留在仓库里：**没有调用方的安全代码是负资产**——它会让下一个人以为 macOS 有一层沙箱。留下的是探针本身（`sandbox_darwin_probe_test.go`）与这份记录。
+
+### 交付的那一件：孤儿看门狗（D4）
+
+macOS 没有 Linux 的 Pdeathsig，agent 被 SIGKILL（崩溃、被系统杀、被强退）时我们的关闭路径根本不运行——探针实测确认子进程活了下来。补法是一个极小的看门狗：盯着 agent 自己的 pid，一没就杀浏览器的**进程组**。它不占浏览器进程的位置（pid 仍是 Chromium 的，内存采样与进程池照旧）。
+
+`Close` 遵守与 Windows Job Object **相同的契约：关掉隔离，进程跟着走**——共用的那条隔离测试就是这么红给我看的。而且要**同时按进程组和按 pid 各杀一次**：按组那一发只在进程是组长时命中（要 `Setpgid`，`PrepareCommand` 会设，别处起的进程不会），少了按 pid 那一发，非组长的进程会被 ESRCH 悄悄放过。
+
+### 这一轮里我自己写坏又改对的四处
+
+1. **第一版 profile 什么都没挡**（整片放行 `/private/var/folders`），而探针当时报绿——它挑的「外面」恰好也在那片里，测的是自己挖的洞。
+2. **「非零退出」被当成「被沙箱拒绝」**：一份编译不过的 profile 也是非零退出。那条断言因此以错误的理由绿过一轮。
+3. **`(with report)` 加在 deny 上让整份 profile 编译失败**，症状是所有变体一起红，看上去像 Chrome 起不来。
+4. **探针八轮探的不是生产用的浏览器**。这是最贵的一条：前八轮的结论全部作废。教训与「测了实现没测接线」是同一个形状——**测试环境与生产环境的差异，本身就是要先验证的东西**。
+
+### 顺带修了一条一直没人看的红线
+
+agent-ci 从 #123 起**连红四次**，而 #124/#125/#126 都是合到红的 master 上的——我每次只看了 Browser Matrix。原因是 #123 那两条测试走完整的 `BuildServeService` 起浏览器，而 agent-ci 的 Linux runner 没有 bwrap。已修（#128）：告警挪进 `browserRuntimeConfig`，测试不再需要一个真的 Chromium。

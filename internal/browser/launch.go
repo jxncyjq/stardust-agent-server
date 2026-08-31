@@ -34,6 +34,9 @@ const maxRememberedOutputLines = 60
 type launchSpec struct {
 	Bin  string
 	Args []string
+	// Env 是这个进程的环境；空表示继承本进程的。macOS 的沙箱要靠它把 TMPDIR 指进
+	// profile 目录——否则可写列表就得整片放行 /private/var/folders，那等于不设防。
+	Env []string
 	// PAL 在**进程创建之前**拿到 Cmd。外层沙箱（Linux namespaces+seccomp、
 	// macOS sandbox-exec）只能在这一刻建立——这正是把启动从 go-rod 手里收回来的
 	// 理由：此前 PAL 有这个钩子却没有调用方，因为没有一个我们自己的 Cmd。
@@ -109,6 +112,9 @@ func (b *launchedBrowser) Wait() error {
 // 采样、由进程池决定生死。
 func launchChromium(ctx context.Context, spec launchSpec) (*launchedBrowser, error) {
 	cmd := exec.Command(spec.Bin, spec.Args...)
+	if len(spec.Env) > 0 {
+		cmd.Env = spec.Env
+	}
 	// 自己开管道，而不是 cmd.StderrPipe()：那个管道的写端由 os/exec 在 Wait 里关，
 	// 而我们在 Wait 之前就要读。父进程手里留着一个写端，子进程死了读端也不会 EOF
 	// ——于是「浏览器秒退」会表现成「等满整个启动超时」。CI 上 bwrap 立刻失败、
