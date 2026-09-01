@@ -1257,7 +1257,41 @@ func (c *tuiSessionController) recordTurn(ctx context.Context, role domain.Conve
 	if err := c.appendTurnEvent(ctx, eventTurnID, role, taskID, agentID, modelProfile, content, now); err != nil {
 		return err
 	}
+	if err := c.touchCurrentSession(ctx, now); err != nil {
+		return err
+	}
 	c.invalidateCurrentSessionCache()
+	return nil
+}
+
+// touchCurrentSession 把当前会话的 updated_at 推到 now：会话收到一轮对话，就是
+// 「被用过」。
+//
+// 为什么必须在 TUI 这一层做：退役前这一步由 storage 的 AppendConversationTurn 在写
+// turn 的同一个事务里顺带做，写入方随 Task 5 删掉之后，serve/GUI 那一侧由
+// server/http.go 的 touchSessionOnSubmit 补上了，TUI 这一侧没有人补。三个消费者按
+// agent_sessions.updated_at 排序——restore_latest（Initialize 走 LatestAgentSession）、
+// ListAgentSessions（TUI 的 /sessions 列表）、storage.BrowseSessions（session_search
+// 的 browse 模式，模型直接用的工具）——不推进就一起退化成按「创建时间」排，重启后
+// TUI 恢复的是另一条会话，模型侧的历史注入静默变空。
+//
+// 为什么不做在 storage.Append 里：那等于给一个纯追加方法加一条跨表契约，而且它守不
+// 住——runtime 的 sessionKeyForTask 在任务没有 SessionID 时用 task.ID 当会话号，那种
+// 「会话号」在 agent_sessions 里根本没有行，touch 要么 0 行受影响（静默无效，违反
+// fail-loud），要么就得开特例分支。
+//
+// 落点在 appendTurnEvent 成功之后：事件写失败就不该把会话标成「刚用过」。
+// RecordExchange 一轮连调两次 recordTurn，因而 touch 两次——SaveAgentSession 是整行
+// upsert，幂等，第二次只是把 updated_at 再往前推一点。
+func (c *tuiSessionController) touchCurrentSession(ctx context.Context, now time.Time) error {
+	session, err := c.currentAgentSession(ctx)
+	if err != nil {
+		return fmt.Errorf("touch session %q after recording a turn: %w", c.currentID, err)
+	}
+	session.UpdatedAt = now
+	if err := c.store.SaveAgentSession(ctx, session); err != nil {
+		return fmt.Errorf("touch session %q after recording a turn: %w", c.currentID, err)
+	}
 	return nil
 }
 

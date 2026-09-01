@@ -1121,6 +1121,75 @@ func TestTUISessionRecentTurnsTakesTheMostRecent(t *testing.T) {
 	}
 }
 
+// restore_latest 恢复的是「最近**使用**」的会话，不是「最近**创建**」的。
+//
+// LatestAgentSession 按 agent_sessions.updated_at 排序，所以「被用过」这件事必须
+// 有人把 updated_at 推进。退役前这一步由 AppendConversationTurn 在写 turn 的同一个
+// 事务里顺带做，写入方删掉之后 TUI 这条路就没人做了：restore_latest 会静默退化成按
+// 创建时间选，重启后模型拿到的是**另一条会话**的历史（实测为 0 条），而 TUI
+// 的历史注入正是 spec §6 那五个「行为必须不变」的模型侧消费者之一。
+//
+// 这条测试的形状就是那次回归的取证探针：建 A → 建 B（更晚）→ 切回 A 真对话一轮 →
+// 新建控制器（= 重启）+ RestoreLatest → 断言恢复的是 A，且模型确实能拿到 A 的历史。
+// 两个断言缺一不可：只断言 id 会漏掉「选对了会话但读不出历史」，只断言历史条数会在
+// B 恰好也有历史时误绿。
+func TestTUIRestoreLatestFollowsTheSessionThatWasLastUsed(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo := openCLITestSQLiteRepository(t)
+	newController := func() *tuiSessionController {
+		return newTUISessionController(tuiSessionControllerConfig{
+			Store:         repo,
+			Enabled:       true,
+			CompanyID:     "cli-company",
+			AgentID:       "cli-agent",
+			ModelProfile:  "dev",
+			RecentTurns:   6,
+			MaxTurnChars:  6000,
+			RestoreLatest: true,
+		})
+	}
+
+	controller := newController()
+	sessionA, err := controller.NewSession(ctx)
+	if err != nil {
+		t.Fatalf("NewSession() A error = %v, want nil", err)
+	}
+	sessionB, err := controller.NewSession(ctx)
+	if err != nil {
+		t.Fatalf("NewSession() B error = %v, want nil", err)
+	}
+	if err := controller.SwitchSession(ctx, sessionA); err != nil {
+		t.Fatalf("SwitchSession(%q) error = %v, want nil", sessionA, err)
+	}
+	if err := controller.RecordExchange(ctx, "task-1", "cli-agent", "dev", "旧会话里的一问", "旧会话里的一答"); err != nil {
+		t.Fatalf("RecordExchange() error = %v, want nil", err)
+	}
+
+	// 重启：全新的控制器，只靠库里的状态决定恢复哪一条。
+	restarted := newController()
+	if err := restarted.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize() error = %v, want nil", err)
+	}
+	if got := restarted.CurrentSessionID(); got != sessionA {
+		t.Fatalf("restore_latest 恢复了 %q，要最近**使用**过的 %q（%q 只是创建得更晚）："+
+			"会话被用过却没推进 updated_at，restore_latest 退化成按创建时间选",
+			got, sessionA, sessionB)
+	}
+
+	turns, err := restarted.RecentTurns(ctx)
+	if err != nil {
+		t.Fatalf("RecentTurns() error = %v, want nil", err)
+	}
+	if len(turns) != 2 {
+		t.Fatalf("RecentTurns() len = %d, want 2：重启后模型侧注入的历史条数变了（%#v）", len(turns), turns)
+	}
+	if turns[0].Content != "旧会话里的一问" || turns[1].Content != "旧会话里的一答" {
+		t.Fatalf("RecentTurns() = %q, %q，要 A 会话里的那一轮对话", turns[0].Content, turns[1].Content)
+	}
+}
+
 // TestRunTUITaskAppliesSessionModeAndWorkingDir guards Task 4's runTUITask
 // wiring: the default (non-mentioned-agent) task path must read
 // SessionManager.CurrentMode/CurrentWorkingDir and forward them into
