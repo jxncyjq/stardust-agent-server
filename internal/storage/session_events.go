@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -148,10 +149,200 @@ func (r *SQLiteRepository) appendLocked(ctx context.Context, sessionID string, e
 			return fmt.Errorf("append session event %d (%s) for %q: %w", event.Seq, event.Type, sessionID, err)
 		}
 	}
+	if err := indexSessionEvents(ctx, tx, sessionID, events); err != nil {
+		return err
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("commit session events for %q: %w", sessionID, err)
 	}
 	return nil
+}
+
+// searchOwner 是一条工具类事件挂靠的对话身份。
+//
+// tool/call 与 tool/result 的载荷里**没有** task_id / agent_id（见
+// internal/runtime/eventlog.go 的 recordToolCall / recordToolResult：它们只带
+// turn/step/call_id 与文本）。可它们检索出来必须能被定位到某一行 turn 上，否则
+// discovery 搜到一次工具往返、模型却无处 scroll。身份因此从日志里**紧邻在前**的
+// 那条消息事件继承——一次工具调用属于发起它的那个任务，而同一条会话日志里一个
+// 任务的事件是连续的（会话执行锁保证一次只有一个任务在写，见 projectTurns 的
+// 「折叠不改变顺序」一节）。
+type searchOwner struct {
+	taskID  string
+	agentID string
+}
+
+// searchRow 是一条事件写进 session_events_fts 的那一行。
+//
+// 没有 role 字段：角色由 type 列在读侧推出（见 searchHitRole），一处决定、不存两份。
+type searchRow struct {
+	text    string
+	turnID  string
+	taskID  string
+	agentID string
+}
+
+// indexSessionEvents 把一批事件的可搜文本镜进 FTS5 索引。它在调用方的事务里运行，
+// 于是索引与事件一起提交；失败包装后返回而不是吞掉，事件永远不会「存进去了却搜不到」
+// ——与 indexConversationTurn 立下的规矩同一条（"a turn is never persisted without
+// being searchable"）。
+//
+// 可搜的是四类：user/assistant 的正文，以及 tool/call 的名字与参数、tool/result 的
+// 预览——最后两类正是 H1 要解决的「工具往返从不可搜」。turn/step 的边界事件没有可搜
+// 文本，跳过它们不是遗漏：它们本来就没有内容可搜。
+//
+// 工具类事件的身份按批内顺序继承：走到一条消息事件就更新 owner，走到工具事件就用
+// 当前 owner。批内还没出现过消息事件时（tool/call 落盘的屏障 2 会让它单独成批），
+// 回库里查这批之前最后一条消息事件。
+//
+// **调用方必须已经把这批事件插进 session_events**：owner 的回查按 seq 严格早于本批
+// 首条，插入顺序因此不影响结果，但事务里少了那些行就意味着索引在给一批不存在的事件
+// 建索引。
+func indexSessionEvents(ctx context.Context, tx *sql.Tx, sessionID string, events []domain.SessionEvent) error {
+	var (
+		owner      searchOwner
+		ownerKnown bool
+	)
+	for _, event := range events {
+		if event.Type == domain.SessionEventToolCall || event.Type == domain.SessionEventToolResult {
+			if !ownerKnown {
+				resolved, err := loadSearchOwner(ctx, tx, sessionID, events[0].Seq)
+				if err != nil {
+					return fmt.Errorf("index session event %d of %q for search: %w", event.Seq, sessionID, err)
+				}
+				owner, ownerKnown = resolved, true
+			}
+		}
+		row, searchable, err := searchableText(event, owner)
+		if err != nil {
+			return fmt.Errorf("index session event %d of %q for search: %w", event.Seq, sessionID, err)
+		}
+		if event.Type == domain.SessionEventUserMessage || event.Type == domain.SessionEventAssistantMessage {
+			owner, ownerKnown = searchOwner{taskID: row.taskID, agentID: row.agentID}, true
+		}
+		if !searchable {
+			continue
+		}
+		if err := indexSessionEvent(ctx, tx, sessionID, event, row); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// indexSessionEvent 写一行 FTS 索引。
+func indexSessionEvent(ctx context.Context, ex execer, sessionID string, event domain.SessionEvent, row searchRow) error {
+	if _, err := ex.ExecContext(ctx, `
+		INSERT INTO session_events_fts (
+			content, session_id, seq, type, turn_id, task_id, agent_id, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`, row.text, sessionID, event.Seq, string(event.Type),
+		row.turnID, row.taskID, row.agentID, formatTime(event.Time)); err != nil {
+		return fmt.Errorf("index session event %d of %q for search: %w", event.Seq, sessionID, err)
+	}
+	return nil
+}
+
+// searchableText 取出一条事件的可搜文本与身份字段，第二个返回值说明这一类事件是否
+// 可搜。
+//
+// owner 只被工具类事件用到（见 searchOwner）。
+//
+// 未知事件类型**报错**而不是当作不可搜跳过：Append 已经用
+// domain.ValidateSessionEventType 拦掉了这个构建不认得的类型，所以走到 default 的
+// 只可能是「domain 加了新类型、却没人在这里决定它可不可搜」——与 projectTurns 的
+// default 同一个姿态，让那次遗漏在当场停下，而不是让一类事件从此静静地搜不到。
+func searchableText(event domain.SessionEvent, owner searchOwner) (searchRow, bool, error) {
+	switch event.Type {
+	case domain.SessionEventUserMessage, domain.SessionEventAssistantMessage:
+		var payload struct {
+			TurnID  string `json:"turn_id"`
+			TaskID  string `json:"task_id"`
+			AgentID string `json:"agent_id"`
+			Content string `json:"content"`
+		}
+		if err := json.Unmarshal(event.Data, &payload); err != nil {
+			return searchRow{}, false, fmt.Errorf("decode %s payload: %w", event.Type, err)
+		}
+		return searchRow{
+			text:    payload.Content,
+			turnID:  payload.TurnID,
+			taskID:  payload.TaskID,
+			agentID: payload.AgentID,
+		}, true, nil
+
+	case domain.SessionEventToolCall:
+		var payload struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}
+		if err := json.Unmarshal(event.Data, &payload); err != nil {
+			return searchRow{}, false, fmt.Errorf("decode %s payload: %w", event.Type, err)
+		}
+		// 工具名与参数一起进正文：按工具名找（"哪次 read_file"）与按参数找
+		// （"哪次读了 kubernetes.yaml"）是同一个检索需求的两半。
+		return searchRow{
+			text:    payload.Name + " " + payload.Arguments,
+			taskID:  owner.taskID,
+			agentID: owner.agentID,
+		}, true, nil
+
+	case domain.SessionEventToolResult:
+		var payload struct {
+			Preview string `json:"preview"`
+		}
+		if err := json.Unmarshal(event.Data, &payload); err != nil {
+			return searchRow{}, false, fmt.Errorf("decode %s payload: %w", event.Type, err)
+		}
+		return searchRow{
+			text:    payload.Preview,
+			taskID:  owner.taskID,
+			agentID: owner.agentID,
+		}, true, nil
+
+	case domain.SessionEventTurnStart, domain.SessionEventTurnEnd,
+		domain.SessionEventStepStart, domain.SessionEventStepEnd:
+		return searchRow{}, false, nil
+
+	default:
+		return searchRow{}, false, fmt.Errorf("unknown event type %q has no searchability decision", event.Type)
+	}
+}
+
+// loadSearchOwner 回查 beforeSeq 之前最后一条消息事件的身份，供工具类事件继承。
+//
+// 一条会话日志里的工具往返总跟在消息事件后面（turn/start → user/message →
+// step/start → assistant/message → tool/call → tool/result），所以生产上这条查询
+// 必有结果。查不到只发生在**人工构造的**日志里（例如一条以 tool/result 开头的
+// 日志）：那种日志的工具事件本来就无从归属，投影也不会为它产出任何 turn。这里
+// 如实记下「没有身份」而不是编一个，写侧照旧接受这批事件（P1 的 Append 契约只管
+// 类型/体积/JSON/seq 四道校验，不管载荷完整性）；真正的 fail-loud 落在读侧——
+// SearchMessages 命中一行没有 task_id 的索引时会指名报错，因为那样的命中拼不出
+// 可回访的 turn 地址。
+func loadSearchOwner(ctx context.Context, tx *sql.Tx, sessionID string, beforeSeq int64) (searchOwner, error) {
+	var data string
+	err := tx.QueryRowContext(ctx, `
+		SELECT data FROM session_events
+		WHERE session_id = ? AND seq < ? AND type IN (?, ?)
+		ORDER BY seq DESC
+		LIMIT 1
+	`, sessionID, beforeSeq,
+		string(domain.SessionEventUserMessage), string(domain.SessionEventAssistantMessage),
+	).Scan(&data)
+	if errors.Is(err, sql.ErrNoRows) {
+		return searchOwner{}, nil
+	}
+	if err != nil {
+		return searchOwner{}, fmt.Errorf("read the message event owning seq %d: %w", beforeSeq, err)
+	}
+	var payload struct {
+		TaskID  string `json:"task_id"`
+		AgentID string `json:"agent_id"`
+	}
+	if err := json.Unmarshal([]byte(data), &payload); err != nil {
+		return searchOwner{}, fmt.Errorf("decode the message event owning seq %d: %w", beforeSeq, err)
+	}
+	return searchOwner{taskID: payload.TaskID, agentID: payload.AgentID}, nil
 }
 
 // nextSeqTx 在事务内读该会话的下一个 seq。

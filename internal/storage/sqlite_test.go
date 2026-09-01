@@ -824,39 +824,29 @@ func TestSQLiteSessionSearchDiscoveryScrollBrowse(t *testing.T) {
 		t.Fatalf("SaveAgentSession() error = %v, want nil", err)
 	}
 
-	// 两侧用**各自生产上真实的 id 形状**播种，不是同一组 id：
+	// 只播事件：discovery（SearchMessages → session_events_fts）与 scroll
+	// （ScrollMessages → ListConversationTurns → 投影）现在同源于事件日志
+	// （P3 Task 4 把搜索也搬了过来），退役中的 conversation_turns 一侧不再参与，
+	// 所以那段 AppendConversationTurn 播种一并删掉——留着一份没人读的种子，只会让
+	// 下一个读这条测试的人以为 discovery 还来自旧索引。
 	//
-	//   - FTS 一侧（discovery，SearchMessages 至今仍搜 conversation_turns_fts）由
-	//     serve 路径写入，id 是 "<task_id>:user" / "<task_id>:assistant"
-	//     （server/http.go 的 recordUserTurn / recordAssistantTurn）。
-	//   - 事件一侧（scroll，ScrollMessages → ListConversationTurns → 投影）的
-	//     turn_id 是 runtime 的 newTurnID 形状 "<session>:<turn>:<step>:<type>"，
-	//     与上面那组**不相等**。
-	//
-	// 两侧播同一组 id 会让一个生产上不可能成立的前置条件在测试里成立，从而掩盖
-	// discovery→scroll 的 id 空间分叉（模型拿 discovery 给的 id 回来 scroll 会
-	// anchor not found）。这条测试要能发现那种回归，靠的是投影把 ConversationTurn.ID
-	// 折叠成 "<task_id>:<role>"、与 serve 写进 FTS 的 id 重新合一。
+	// 事件载荷里的 turn_id 用 runtime 的 newTurnID 形状
+	// "<session>:<turn>:<step>:<type>"，与 discovery/scroll 两侧都必须给出的
+	// "<task_id>:<role>" **不相等**——这是生产上真实的形状差。两个 id 空间靠
+	// task_id + role 重新合一：投影这样折叠 turn.ID，SearchMessages 也这样拼命中的
+	// id。任何一侧改回去用事件自己的 turn_id，这条测试就会在 ScrollMessages 那一步
+	// anchor not found。
 	//
 	// 一个任务恰好一条 user + 一条 assistant，所以第三条消息属于 task-2。
-	ftsTurns := []domain.ConversationTurn{
-		{ID: "task-1:user", SessionID: "sess-1", TaskID: "task-1", AgentID: "researcher", Role: domain.ConversationRoleUser, Content: "如何做 token 压缩阈值", CreatedAt: time.Unix(2, 0)},
-		{ID: "task-1:assistant", SessionID: "sess-1", TaskID: "task-1", AgentID: "researcher", Role: domain.ConversationRoleAssistant, Content: "prompt cache 复用稳定前缀", CreatedAt: time.Unix(3, 0)},
-		{ID: "task-2:user", SessionID: "sess-1", TaskID: "task-2", AgentID: "researcher", Role: domain.ConversationRoleUser, Content: "delegate subtask summary", CreatedAt: time.Unix(4, 0)},
+	eventTurns := []domain.ConversationTurn{
+		{SessionID: "sess-1", TaskID: "task-1", AgentID: "researcher", Role: domain.ConversationRoleUser, Content: "如何做 token 压缩阈值", CreatedAt: time.Unix(2, 0)},
+		{SessionID: "sess-1", TaskID: "task-1", AgentID: "researcher", Role: domain.ConversationRoleAssistant, Content: "prompt cache 复用稳定前缀", CreatedAt: time.Unix(3, 0)},
+		{SessionID: "sess-1", TaskID: "task-2", AgentID: "researcher", Role: domain.ConversationRoleUser, Content: "delegate subtask summary", CreatedAt: time.Unix(4, 0)},
 	}
-	for _, turn := range ftsTurns {
-		if err := repo.AppendConversationTurn(ctx, turn); err != nil {
-			t.Fatalf("AppendConversationTurn(%q) error = %v, want nil", turn.ID, err)
-		}
+	for i := range eventTurns {
+		// appendTurnEvents 把 turn.ID 写进事件载荷的 turn_id。
+		eventTurns[i].ID = fmt.Sprintf("sess-1:%d:0:%s/message", i, eventTurns[i].Role)
 	}
-	eventTurns := make([]domain.ConversationTurn, 0, len(ftsTurns))
-	for i, turn := range ftsTurns {
-		// 夹具把 turn.ID 写进事件载荷的 turn_id，所以这里故意换成 runtime 形状：
-		// 事件 id 与 FTS id 不同，投影仍必须还原出 FTS 那一组。
-		turn.ID = fmt.Sprintf("sess-1:%d:0:%s/message", i, turn.Role)
-		eventTurns = append(eventTurns, turn)
-	}
-	// Task 4 把搜索也搬到事件之后，上面那段 AppendConversationTurn 播种就该一并删掉。
 	appendTurnEvents(t, repo, "sess-1", eventTurns...)
 
 	// discovery: FTS5 match returns the relevant turn.
@@ -913,8 +903,21 @@ func TestSQLiteBackfillConversationTurnsFTS(t *testing.T) {
 	if _, err := repo.db.ExecContext(ctx, `DELETE FROM conversation_turns_fts WHERE turn_id = ?`, "t1"); err != nil {
 		t.Fatalf("delete fts row error = %v, want nil", err)
 	}
-	if hits, err := repo.SearchMessages(ctx, "prompt", 10); err != nil || len(hits) != 0 {
-		t.Fatalf("SearchMessages before backfill = %v (err %v), want no hits", hits, err)
+	// 断言直接查 conversation_turns_fts，不再经 SearchMessages：discovery 已经改到
+	// session_events_fts 上（P3 Task 4），而这条测试的题目自始至终是**旧索引的回填**
+	// 本身。经一个不再读这张表的入口去验它，只会验出「搜不到」这个与回填无关的事实。
+	// 旧索引与本函数一并在 Task 5 退役。
+	indexed := func() int {
+		t.Helper()
+		var count int
+		if err := repo.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM conversation_turns_fts WHERE turn_id = ?`, "t1").Scan(&count); err != nil {
+			t.Fatalf("count conversation_turns_fts rows error = %v, want nil", err)
+		}
+		return count
+	}
+	if got := indexed(); got != 0 {
+		t.Fatalf("conversation_turns_fts rows before backfill = %d, want 0", got)
 	}
 
 	added, err := repo.BackfillConversationTurnsFTS(ctx)
@@ -924,9 +927,8 @@ func TestSQLiteBackfillConversationTurnsFTS(t *testing.T) {
 	if added != 1 {
 		t.Fatalf("BackfillConversationTurnsFTS() added = %d, want 1", added)
 	}
-	hits, err := repo.SearchMessages(ctx, "prompt", 10)
-	if err != nil || len(hits) != 1 || hits[0].ID != "t1" {
-		t.Fatalf("SearchMessages after backfill = %v (err %v), want t1", hits, err)
+	if got := indexed(); got != 1 {
+		t.Fatalf("conversation_turns_fts rows after backfill = %d, want 1", got)
 	}
 	// Idempotent: a second backfill adds nothing.
 	again, err := repo.BackfillConversationTurnsFTS(ctx)

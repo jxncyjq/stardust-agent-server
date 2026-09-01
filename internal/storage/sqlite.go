@@ -47,7 +47,10 @@ var ErrAgentSessionNotFound = errors.New("agent session not found")
 // login state (cookies) across process restarts for the Phase 3 browser feature.
 // Version 9 added the session_events table, the append-only per-session event log
 // that later phases project into conversation transcripts.
-const CurrentSchemaVersion = 9
+// Version 10 added the session_events_fts FTS5 virtual table, which moves
+// session_search's discovery mode off conversation_turns_fts and onto the event
+// log so tool calls and their results are searchable too.
+const CurrentSchemaVersion = 10
 
 type WorkflowState struct {
 	Definition workflow.Definition `json:"definition"`
@@ -330,6 +333,16 @@ func (r *SQLiteRepository) DeleteAgentSession(ctx context.Context, sessionID str
 		DELETE FROM session_events WHERE session_id = ?
 	`, sessionID); err != nil {
 		return fmt.Errorf("delete session events for session %q: %w", sessionID, err)
+	}
+	// The search index is part of "everything that reconstructs its
+	// conversation" too, now that discovery reads session_events_fts: leaving
+	// its rows behind would keep a deleted session's prose and tool round trips
+	// coming out of session_search, with every scroll back into them failing on
+	// a missing anchor.
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM session_events_fts WHERE session_id = ?
+	`, sessionID); err != nil {
+		return fmt.Errorf("delete session event search index for session %q: %w", sessionID, err)
 	}
 	res, err := tx.ExecContext(ctx, `
 		DELETE FROM agent_sessions WHERE id = ?
@@ -634,6 +647,25 @@ func (r *SQLiteRepository) SearchEpisodicMemory(ctx context.Context, query strin
 // full window, so trigram can never recall it — those runs are instead
 // returned as LIKE terms so the caller can OR in a substring match.
 func episodicSearchTerms(raw string) (ftsExpr string, likeTerms []string) {
+	var grams []string
+	for _, run := range letterNumberRuns(raw) {
+		chars := []rune(run)
+		if len(chars) < 3 {
+			likeTerms = append(likeTerms, run)
+			continue
+		}
+		for i := 0; i+3 <= len(chars); i++ {
+			grams = append(grams, `"`+string(chars[i:i+3])+`"`)
+		}
+	}
+	return strings.Join(grams, " OR "), likeTerms
+}
+
+// letterNumberRuns splits arbitrary text into its maximal runs of letters and
+// numbers, dropping everything else. Because a run can contain neither an FTS5
+// operator nor a LIKE wildcard, every run is safe to use as a bound parameter in
+// either kind of query. Empty or all-separator input yields no runs.
+func letterNumberRuns(raw string) []string {
 	var runs []string
 	var b strings.Builder
 	flush := func() {
@@ -650,19 +682,36 @@ func episodicSearchTerms(raw string) (ftsExpr string, likeTerms []string) {
 		}
 	}
 	flush()
+	return runs
+}
 
-	var grams []string
-	for _, run := range runs {
-		chars := []rune(run)
-		if len(chars) < 3 {
+// sessionEventSearchTerms turns arbitrary query text into an FTS5 MATCH
+// expression over session_events_fts plus the short runs that expression cannot
+// reach, which the caller ORs in as substring matches.
+//
+// It differs from episodicSearchTerms in one deliberate way: a run of 3+
+// characters becomes a single quoted *phrase* rather than an OR of its own
+// trigrams. Against a trigram-tokenized column a phrase query is exact substring
+// matching, so searching "kubernetes" returns the events that contain that word.
+// OR-ing the trigrams instead would also return everything containing "net" or
+// "ete" — acceptable for episodic recall, where over-recall only widens the pool
+// a ranker then narrows, but wrong for session_search, whose hits are shown to
+// the model as the answer.
+//
+// Runs shorter than the trigram window have no window at all, so trigram can
+// never recall them; they come back as LIKE terms (a lone two-character CJK word
+// is the common case). Empty or all-separator input yields ("", nil), which the
+// caller reports as a caller error rather than searching for nothing.
+func sessionEventSearchTerms(raw string) (ftsExpr string, likeTerms []string) {
+	var phrases []string
+	for _, run := range letterNumberRuns(raw) {
+		if len([]rune(run)) < 3 {
 			likeTerms = append(likeTerms, run)
 			continue
 		}
-		for i := 0; i+3 <= len(chars); i++ {
-			grams = append(grams, `"`+string(chars[i:i+3])+`"`)
-		}
+		phrases = append(phrases, `"`+run+`"`)
 	}
-	return strings.Join(grams, " OR "), likeTerms
+	return strings.Join(phrases, " OR "), likeTerms
 }
 
 // execer is the ExecContext subset shared by *sql.DB and *sql.Tx, so the FTS
@@ -686,10 +735,62 @@ func indexConversationTurn(ctx context.Context, ex execer, turn domain.Conversat
 	return nil
 }
 
-// SearchMessages runs an FTS5 full-text query over conversation turn content and
-// returns the best-ranked matches (discovery mode of session_search). query must
-// be a non-empty FTS5 MATCH expression; an empty query is a caller error. limit
-// <= 0 defaults to 20.
+// searchHitRole maps the event type behind a search hit to the conversation role
+// the hit is reported under.
+//
+// domain.ConversationRole has exactly two values, user and assistant — there is
+// no tool role. A tool round trip is therefore reported under the assistant that
+// made it: in a provider transcript the tool_calls live on the assistant message
+// and the results feed the assistant's next one, so the assistant turn is where
+// a reader who follows a tool hit back into the conversation actually lands.
+// Inventing a third role would mean changing the domain type and every consumer
+// of it; reporting a tool hit under an empty role would hand callers a turn with
+// no address at all (the id is derived from the role, see SearchMessages).
+//
+// An unknown type is an error, not a silently dropped hit: the index only ever
+// receives the four types searchableText declares searchable, so anything else
+// means the two sides have drifted apart.
+func searchHitRole(eventType domain.SessionEventType) (domain.ConversationRole, error) {
+	switch eventType {
+	case domain.SessionEventUserMessage:
+		return domain.ConversationRoleUser, nil
+	case domain.SessionEventAssistantMessage,
+		domain.SessionEventToolCall,
+		domain.SessionEventToolResult:
+		return domain.ConversationRoleAssistant, nil
+	default:
+		return "", fmt.Errorf("indexed event type %q has no conversation role", eventType)
+	}
+}
+
+// SearchMessages runs a full-text query over the session event log and returns
+// the matching moments as conversation turns (discovery mode of session_search).
+// Tool calls and their results are searchable alongside conversation prose (spec
+// §3 取舍 H1). query is arbitrary user text, not FTS5 syntax: its letter/number
+// runs become substring phrases (see sessionEventSearchTerms), so no caller has
+// to escape anything. An empty query, or one carrying no letter or number at
+// all, is a caller error. limit <= 0 defaults to 20.
+//
+// # What a hit is, and what turn it is reported as
+//
+// A hit is an *event*, while the return type is a turn, and the two are not one
+// to one: projectTurns folds every assistant/message of a task into a single
+// row whose content is the final answer. A hit therefore carries
+//
+//   - the id (and session/task/agent/role) of the *folded* turn that owns the
+//     event — "<task_id>:<role>", byte for byte what projectTurns produces — so
+//     the model can take a discovery hit straight back into scroll mode; and
+//   - the content and timestamp of the *matched event itself*, which for an
+//     intermediate round or a tool round trip is text no folded turn holds.
+//
+// Two events of one turn can therefore both be returned, sharing an id and
+// differing in content. That is the honest answer to "what matched": collapsing
+// them would hide one of the two moments, and reporting the folded content
+// instead would return text that does not contain the query.
+//
+// ModelProfile and the token counters are left zero: they are not in the index,
+// exactly as they were absent from conversation_turns_fts before this moved.
+// Discovery is a locator; /turns and scroll carry the full row.
 func (r *SQLiteRepository) SearchMessages(ctx context.Context, query string, limit int) ([]domain.ConversationTurn, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, fmt.Errorf("search messages: query is required")
@@ -697,32 +798,100 @@ func (r *SQLiteRepository) SearchMessages(ctx context.Context, query string, lim
 	if limit <= 0 {
 		limit = 20
 	}
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT turn_id, session_id, task_id, agent_id, role, content, created_at
-		FROM conversation_turns_fts
-		WHERE conversation_turns_fts MATCH ?
-		ORDER BY rank
-		LIMIT ?
-	`, query, limit)
+	ftsExpr, likeTerms := sessionEventSearchTerms(query)
+	if ftsExpr == "" && len(likeTerms) == 0 {
+		return nil, fmt.Errorf("search messages %q: the query has no letter or number to search for", query)
+	}
+
+	const selectHit = `
+		SELECT session_id, seq, type, task_id, agent_id, content, created_at
+		FROM session_events_fts
+	`
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if len(likeTerms) == 0 {
+		// Pure MATCH: FTS5 ranks the hits, which is the better ordering when it
+		// is available at all (rank needs a full-text constraint).
+		rows, err = r.db.QueryContext(ctx, selectHit+`
+			WHERE session_events_fts MATCH ?
+			ORDER BY rank
+			LIMIT ?
+		`, ftsExpr, limit)
+	} else {
+		// A run shorter than the trigram window (a two-character CJK word, a
+		// short acronym) has no trigram to match, so it is OR-ed in as a
+		// substring instead. The MATCH stays inside a subquery: FTS5 cannot rank
+		// a query whose rows may come from a plain LIKE, so ordering falls back
+		// to newest first. Same shape as the episodic memory search above.
+		clauses := make([]string, 0, len(likeTerms)+1)
+		args := make([]any, 0, len(likeTerms)+2)
+		if ftsExpr != "" {
+			clauses = append(clauses,
+				`rowid IN (SELECT rowid FROM session_events_fts WHERE session_events_fts MATCH ?)`)
+			args = append(args, ftsExpr)
+		}
+		for _, term := range likeTerms {
+			clauses = append(clauses, `content LIKE ?`)
+			args = append(args, "%"+term+"%")
+		}
+		args = append(args, limit)
+		rows, err = r.db.QueryContext(ctx, selectHit+`
+			WHERE `+strings.Join(clauses, " OR ")+`
+			ORDER BY created_at DESC, seq DESC
+			LIMIT ?
+		`, args...)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("search messages %q: %w", query, err)
 	}
 	defer rows.Close()
+
 	turns := make([]domain.ConversationTurn, 0)
 	for rows.Next() {
-		var turn domain.ConversationTurn
-		var role string
-		var createdAt string
-		if err := rows.Scan(&turn.ID, &turn.SessionID, &turn.TaskID, &turn.AgentID, &role, &turn.Content, &createdAt); err != nil {
+		var (
+			sessionID string
+			seq       int64
+			eventType string
+			taskID    string
+			agentID   string
+			content   string
+			createdAt string
+		)
+		if err := rows.Scan(&sessionID, &seq, &eventType, &taskID, &agentID, &content, &createdAt); err != nil {
 			return nil, fmt.Errorf("scan search result for %q: %w", query, err)
+		}
+		role, err := searchHitRole(domain.SessionEventType(eventType))
+		if err != nil {
+			return nil, fmt.Errorf("search messages %q: event %d of session %q: %w", query, seq, sessionID, err)
+		}
+		// task_id is this hit's whole address: the turn id is built from it, and
+		// without one the caller gets a hit it can never scroll back to. An
+		// empty one means the event was written by an emitter that omitted it
+		// (projectTurns refuses the same log for the same reason), so say which
+		// event rather than returning an unusable turn. agent_id is NOT checked
+		// — an empty agent_id is contractually legal (the built-in default agent
+		// is selected by submitting a task with one), see projectTurns.
+		if taskID == "" {
+			return nil, fmt.Errorf("search messages %q: event %d of session %q has no task_id, so the "+
+				"hit has no turn to point at; the emitter that wrote that event omitted a required field",
+				query, seq, sessionID)
 		}
 		parsed, err := parseTime(createdAt)
 		if err != nil {
-			return nil, fmt.Errorf("parse search result %q created_at: %w", turn.ID, err)
+			return nil, fmt.Errorf("parse search result created_at for event %d of session %q: %w",
+				seq, sessionID, err)
 		}
-		turn.Role = domain.ConversationRole(role)
-		turn.CreatedAt = parsed
-		turns = append(turns, turn)
+		turns = append(turns, domain.ConversationTurn{
+			ID:        taskID + ":" + string(role),
+			SessionID: sessionID,
+			TaskID:    taskID,
+			AgentID:   agentID,
+			Role:      role,
+			Content:   content,
+			CreatedAt: parsed,
+		})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate search results for %q: %w", query, err)
@@ -2040,6 +2209,47 @@ var schemaStatements = []string{
 		time INTEGER NOT NULL,
 		data TEXT NOT NULL,
 		PRIMARY KEY (session_id, seq)
+	)`,
+	// session_events_fts is a full-text index over the searchable text of the
+	// session event log, backing session_search's discovery mode. It replaces
+	// conversation_turns_fts as the source of that mode (spec §3 取舍 H1): the
+	// old index only ever held conversation prose, so tool calls and their
+	// results — which never reached conversation_turns at all — could not be
+	// searched. Indexing the event log makes the whole round trip searchable
+	// from one source of truth.
+	//
+	// A row is written for each of the four event types that carry searchable
+	// text (user/message, assistant/message, tool/call, tool/result) inside the
+	// same transaction as the event itself (see indexSessionEvent), so the index
+	// never drifts from the log. The boundary events (turn/step start and end)
+	// have no text and get no row.
+	//
+	// Non-content columns are UNINDEXED: stored for retrieval, not tokenized.
+	// (session_id, seq) addresses the event a row mirrors; turn_id is the
+	// message event's own id and is empty for tool/call and tool/result, whose
+	// payloads carry no turn_id (see runtime/eventlog.go recordToolCall and
+	// recordToolResult).
+	//
+	// tokenize='trigram' instead of the FTS5 default (unicode61), for the same
+	// reason as episodic_memory_fts below: unicode61 groups an unbroken run of
+	// CJK ideographs into a single opaque token, so MATCH — token equality, not
+	// substring — could never recall a query for part of a Chinese sentence.
+	// Trigram indexes every overlapping 3-character window instead, which lets
+	// sessionEventSearchTerms turn a query into substring-matching phrases.
+	//
+	// Events written before this table existed are not backfilled (spec §3
+	// 取舍 B3: no historical migration); search covers events recorded from
+	// schema version 10 on.
+	`CREATE VIRTUAL TABLE IF NOT EXISTS session_events_fts USING fts5(
+		content,
+		session_id UNINDEXED,
+		seq UNINDEXED,
+		type UNINDEXED,
+		turn_id UNINDEXED,
+		task_id UNINDEXED,
+		agent_id UNINDEXED,
+		created_at UNINDEXED,
+		tokenize = 'trigram'
 	)`,
 	`CREATE TABLE IF NOT EXISTS skills (
 		id TEXT NOT NULL,
