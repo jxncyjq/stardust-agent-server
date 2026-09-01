@@ -441,6 +441,25 @@ func (r *Runtime) Interrupt() {
 // and the turn number is never observed by anything: enabled() is false, so
 // every record* call becomes a no-op. Skipping the ReadFrom in that case is
 // not an optimisation shortcut, it is required — there is no store to read.
+//
+// Two known costs, both deliberate and both registered for Task 5 rather than
+// papered over here:
+//
+//   - This ReadFrom scans the whole session log, and the recorder's first flush
+//     scans it again to align its seq cursor: two O(n) reads per turn on a log
+//     that grows with the session. Seeding the recorder's cursor from THIS read
+//     would remove the second one, but it would also move the cursor's snapshot
+//     from "the moment we first write" to "the moment the task started",
+//     widening the window in which another writer on the same session can land
+//     an event and turn our whole batch into a hard Append failure. A slow read
+//     is a better trade than a task that fails because someone else wrote
+//     first; making it cheap needs a store-side next-turn query, which is P1's
+//     surface, not this function's.
+//   - Two tasks running concurrently on ONE session resolve the same turn
+//     number here (sessionKeyForTask does not serialise them). Nothing in P2
+//     prevents it; whether the scheduler can produce it is a Task 5 question.
+//     The consequence is two turns sharing a number, not lost or interleaved
+//     events — the store still assigns seq under its own per-session lock.
 func (r *Runtime) newTaskRecorder(ctx context.Context, task domain.Task) (*eventRecorder, int, error) {
 	rec := newEventRecorder(r.sessionEvents, task)
 	if r.sessionEvents == nil {
@@ -646,6 +665,16 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 			// -- same "record before acting" guarantee barrier 2 gives a fresh
 			// call, just applied to calls resumed from disk instead of ones
 			// just generated.
+			//
+			// The response is therefore recorded twice across the log: once in
+			// the turn that suspended (which closed as "cancelled", see the
+			// suspend branch in runToolLoop) and once here, opening the turn
+			// that acts on it. That is deliberate and not a duplicate-write
+			// bug: each turn must be readable on its own, and a turn whose
+			// first act is dispatching tool calls with no assistant message
+			// above them would be unreadable. The user/message recorded at the
+			// top of RunTask repeats for the same reason -- the resumed turn is
+			// still answering it.
 			rec.recordStepStart()
 			rec.recordAssistantMessage(st.resp.Text, st.resp.ToolCalls, eventUsage{
 				Prompt: st.promptTokens, Completion: st.completionTokens,
@@ -718,6 +747,26 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 	// call rather than because it ran out of rounds; the two need different
 	// closing instructions.
 	loopCut := false
+	// stepOpen tracks whether a step is currently open -- a step/start with no
+	// step/end yet. On entry one always is: whoever produced st.resp (RunTask's
+	// initial generateStep, the resumed step, or an earlier iteration's
+	// trailing generateStep) opened it and left the closing to this function.
+	// The loop body clears it when it closes the round's step and each
+	// successful generate*Step sets it again, so the closing points below can
+	// tell "there is still an open step to close" from "the body already closed
+	// it".
+	//
+	// Without it the two breaks below (per-tool cap, repeat-abort) fall into
+	// the budget-exhausted branch with st.resp.ToolCalls still non-empty and
+	// emit a second step/end for a step that was closed one line earlier: a
+	// step/end with no matching step/start, and -- since recordStepEnd advances
+	// the step counter -- the next step's number stolen too. Both guards are
+	// live production paths (they are the two brakes added after the 152-round
+	// run of 2026-07-23), so that imbalance is not a corner case.
+	//
+	// Paths that return immediately do not bother updating it; it only has to
+	// be right where control flows onward.
+	stepOpen := true
 	for st.round < r.maxToolRounds && len(st.resp.ToolCalls) > 0 {
 		suspend, err := r.checkSuspend(ctx, task, st)
 		if err != nil {
@@ -733,16 +782,28 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		}
 		if suspend {
 			// Suspension is a normal pause, not a failure: the checkpoint (just
-			// written by checkSuspend) holds everything needed to resume,
-			// including this step's still-open response. Deliberately leave the
-			// step and the turn open rather than closing them -- resuming opens
-			// a fresh turn (newTaskRecorder resolves the next turn number from
-			// what is already on disk), and this turn's story simply continues
-			// there instead of closing here. What MUST happen is flushing
-			// whatever is already buffered (this step's step/start +
-			// assistant/message), so it is not lost with this *eventRecorder
-			// when RunTask returns -- fail loud if that flush itself fails,
-			// since an un-flushed step/start silently vanishes forever.
+			// written by checkSuspend) holds everything needed to resume.
+			//
+			// The step and the turn nevertheless close HERE, because nobody
+			// else ever will: resuming opens a FRESH turn (newTaskRecorder
+			// resolves the next turn number from what is already on disk) and
+			// re-records the response it resumes from, so this turn is finished
+			// as far as the log is concerned. Leaving it open would leave a
+			// turn that no crash ever happened to, which a later Load would
+			// reconstruct as "interrupted" -- the reason reserved for a process
+			// that really did die mid-turn, and precisely the marker P3 is
+			// promised never to see from a normal run.
+			//
+			// "cancelled" rather than "completed" or "failed": this turn
+			// neither finished its work nor failed at it, it was stopped part
+			// way pending a human decision. Of the four reasons spec §4.1
+			// defines that is the only honest one.
+			rec.recordStepEnd(domain.StepEndReasonCancelled)
+			rec.recordTurnEnd(domain.TurnEndReasonCancelled)
+			// Flushing is mandatory: everything buffered by this turn (its
+			// step/start, assistant/message and the two closing events above)
+			// dies with this *eventRecorder when RunTask returns. Fail loud --
+			// an un-flushed turn silently vanishes forever.
 			if err := rec.flush(ctx); err != nil {
 				return domain.TaskRun{}, fmt.Errorf("flush session events before suspend for task %s: %w", task.ID, err)
 			}
@@ -821,6 +882,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// all three paths share this one closing point so the step is never
 		// left open regardless of which one the guards below choose.
 		rec.recordStepEnd(domain.StepEndReasonCompleted)
+		stepOpen = false
 		if err := rec.barrier(ctx, "before next step"); err != nil {
 			r.closeTurnOnError(ctx, task, rec, err)
 			return domain.TaskRun{}, err
@@ -832,6 +894,12 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 				Message:   fmt.Sprintf("工具 %s 调用次数达上限(%d)，已停止工具循环", capHit, toolLoopCap),
 				CreatedAt: time.Now(),
 			}); err != nil {
+				// Like every other error return in this function: the turn was
+				// opened here and nothing else will ever close it, so it closes
+				// here. Leaving it open would hand P3 a turn that a later Load
+				// reconstructs as "interrupted" -- the one reason reserved for a
+				// process that really did die mid-turn.
+				r.closeTurnOnError(ctx, task, rec, err)
 				return domain.TaskRun{}, fmt.Errorf("publish tool loop cap event: %w", err)
 			}
 			r.logger.Warn("tool loop broken: per-tool call cap reached",
@@ -852,6 +920,10 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 				Message:   "同一工具调用重复过多，已停止工具循环",
 				CreatedAt: time.Now(),
 			}); err != nil {
+				// Same as the cap branch above: close the turn this function
+				// opened rather than leaving it to be reconstructed as
+				// "interrupted".
+				r.closeTurnOnError(ctx, task, rec, err)
 				return domain.TaskRun{}, fmt.Errorf("publish tool loop broken event: %w", err)
 			}
 			r.logger.Warn("tool loop broken: identical call repeated",
@@ -865,10 +937,13 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		}
 		st.resp, err = r.generateStep(ctx, rec, requestID, task.ID, st.convo, st.tools)
 		if err != nil {
+			// generateStep closes the step it opened on its own error path, so
+			// there is nothing open left here -- only the turn to close.
 			r.closeTurnOnError(ctx, task, rec, err)
 			r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInferenceError)
 			return domain.TaskRun{}, fmt.Errorf("generate inference after tools: %w", err)
 		}
+		stepOpen = true
 		st.promptTokens += st.resp.PromptTokens
 		st.completionTokens += st.resp.CompletionTokens
 		st.cachedTokens += st.resp.CachedTokens
@@ -887,19 +962,29 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		}
 	}
 	if len(st.resp.ToolCalls) > 0 {
-		// Tool-round budget exhausted, or loopCut broke out of the loop above:
-		// either way st.resp is the response from the loop's last trailing
-		// generateStep (or, on the very first round, RunTask's initial
-		// generateStep), still open -- the loop exited before a new iteration
-		// could execute these calls. They are being deliberately abandoned
-		// (never dispatched, so no orphaned tool/call -- spec invariant 1 only
-		// requires an answer for calls actually recorded), so this step closes
-		// as "cancelled" rather than "completed": the tool loop stopped it, not
-		// a normal finish.
-		rec.recordStepEnd(domain.StepEndReasonCancelled)
-		if err := rec.barrier(ctx, "before next step"); err != nil {
-			r.closeTurnOnError(ctx, task, rec, err)
-			return domain.TaskRun{}, err
+		// Two different situations reach here with pending calls, and only one
+		// of them has a step to close.
+		//
+		// Round budget exhausted: st.resp came from the loop's last trailing
+		// generateStep and its step is still open (stepOpen), but the loop
+		// exited before any iteration could execute those calls. They are
+		// deliberately abandoned -- never dispatched, so no orphaned tool/call:
+		// spec §4.3.1 rule 1 only promises an answer for calls actually
+		// recorded. That step closes as "cancelled" rather than "completed":
+		// the tool loop stopped it, it did not finish.
+		//
+		// loopCut/capHit break: st.resp's calls WERE dispatched (they are the
+		// round the body just executed, tool/call+tool/result and all) and the
+		// body already closed that step as "completed". Nothing is open, so
+		// nothing is closed here -- emitting a step/end anyway is exactly the
+		// unmatched end this branch used to produce.
+		if stepOpen {
+			rec.recordStepEnd(domain.StepEndReasonCancelled)
+			stepOpen = false
+			if err := rec.barrier(ctx, "before next step"); err != nil {
+				r.closeTurnOnError(ctx, task, rec, err)
+				return domain.TaskRun{}, err
+			}
 		}
 		// Rather than hard-failing the whole task (which discards every tool
 		// result gathered so far and surfaces as "任务执行失败" to the user),
@@ -914,10 +999,12 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		st.convo.appendUser(closing)
 		final, err := r.generateFinalStep(ctx, rec, requestID, task.ID, st.convo)
 		if err != nil {
+			// Like generateStep, it closes its own step on the error path.
 			r.closeTurnOnError(ctx, task, rec, err)
 			r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInferenceError)
 			return domain.TaskRun{}, fmt.Errorf("generate final answer after tool budget exhausted: %w", err)
 		}
+		stepOpen = true
 		st.promptTokens += final.PromptTokens
 		st.completionTokens += final.CompletionTokens
 		st.cachedTokens += final.CachedTokens
@@ -925,9 +1012,13 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		st.resp = final
 	}
 	// Whatever step is currently open at this point -- the loop's normal-exit
-	// trailing response (no more tool calls requested), or the closing
+	// trailing response (no more tool calls requested), the step this function
+	// was entered with when the model asked for no tools at all, or the closing
 	// generateFinalStep answer just above -- is this turn's last step. Close
-	// it before the turn itself closes.
+	// it before the turn itself closes. One is always open here: every one of
+	// those three paths sets stepOpen, and the only path that clears it without
+	// opening another (the loop-cut break) is routed through generateFinalStep
+	// by the branch above, which opens one again.
 	rec.recordStepEnd(domain.StepEndReasonCompleted)
 	if err := rec.barrier(ctx, "before next step"); err != nil {
 		r.closeTurnOnError(ctx, task, rec, err)
@@ -1237,6 +1328,66 @@ func (r *Runtime) inferenceTools(tools *tool.Registry) []port.InferenceTool {
 	return out
 }
 
+// disambiguateCallIDs resolves the call_id each of this round's calls is
+// recorded, dispatched and answered under, one per call in order.
+//
+// Two things make the model's own ids unusable as-is. A provider may omit tool
+// call ids entirely, in which case the adapter fills the id in with the
+// FUNCTION NAME (see adapter.openAIToolCalls) -- so a round that calls
+// read_file twice in parallel arrives as two calls both carrying "read_file".
+// A provider that does send ids only promises they are unique within one
+// response. Either way spec §4.3.1 rule 4 is violated the moment the second
+// tool/call is recorded while the first is still unanswered: the two are then
+// indistinguishable to anything pairing results to calls by id.
+//
+// Only ids that actually collide within this round are rewritten, and only from
+// their second occurrence onward. When the provider supplies real ids -- the
+// common case -- every id passes through untouched, so the id semantics this
+// repo shares with its providers are unchanged; the rewrite is confined to the
+// rounds that would otherwise be ambiguous.
+func disambiguateCallIDs(calls []domain.ToolCall, taskID string) []string {
+	base := make([]string, len(calls))
+	// Every id this round arrived with, including the ones not yet assigned: a
+	// suffixed id must not land on a later call's own id either.
+	arrived := make(map[string]bool, len(calls))
+	for i, call := range calls {
+		id := call.ID
+		if id == "" {
+			// The provider gave nothing at all, not even a function name to
+			// degrade to. Name it after the task and tool so the event still
+			// says what was called; collisions from this are handled below like
+			// any other.
+			id = taskID + ":" + call.Name
+		}
+		base[i] = id
+		arrived[id] = true
+	}
+	ids := make([]string, len(calls))
+	used := make(map[string]bool, len(calls))
+	for i, id := range base {
+		if used[id] {
+			// At most len(calls) ids are used and len(calls) arrived, so one of
+			// the first 2*len(calls)+1 suffixes is always free. Exhausting them
+			// is arithmetically impossible, not a runtime condition to recover
+			// from.
+			free := false
+			for n := 2; n <= 2*len(calls)+2; n++ {
+				candidate := fmt.Sprintf("%s#%d", id, n)
+				if !used[candidate] && !arrived[candidate] {
+					id, free = candidate, true
+					break
+				}
+			}
+			if !free {
+				panic(fmt.Sprintf("runtime: no free call id for %q among %d calls", id, len(calls)))
+			}
+		}
+		used[id] = true
+		ids[i] = id
+	}
+	return ids
+}
+
 // executeToolCalls runs the current round's tool calls and returns their
 // results. It takes the mutable *loopState so a dispatched load_capabilities can
 // pin definitions into st.loaded and the caller sees the write when it composes
@@ -1247,11 +1398,23 @@ func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task
 		return nil, fmt.Errorf("tool registry unavailable")
 	}
 	calls := st.resp.ToolCalls
+	// spec §4.3.1 rule 4: within one step, two unanswered tool/call events must
+	// not share a call_id -- the projection pairs a result to its call by that
+	// id alone (rule 2), so two live calls under one id make the pair
+	// ambiguous. The ids the model hands us do not guarantee it (see
+	// disambiguateCallIDs), so this round settles them once, here, before the
+	// first of them is recorded or dispatched.
+	ids := disambiguateCallIDs(calls, task.ID)
 	results := make([]domain.ToolResult, 0, len(calls))
-	for _, call := range calls {
-		if call.ID == "" {
-			call.ID = task.ID + ":" + call.Name
-		}
+	for i := range calls {
+		// Written back into st.resp rather than kept in a local: everything
+		// downstream identifies this round's calls by this id and all of them
+		// must agree with the tool/call recorded below. The assistant message
+		// already appended to the exchange holds THIS slice (appendAssistant
+		// stores it by reference, so the provider sees the same ids), and
+		// appendToolResults pairs results to calls by it.
+		calls[i].ID = ids[i]
+		call := calls[i]
 		if err := r.events.Publish(ctx, domain.RuntimeEvent{
 			Type:      "tool_call_requested",
 			TaskID:    task.ID,
@@ -1270,6 +1433,18 @@ func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task
 		// is ever reached.
 		st.events.recordToolCall(call)
 		if err := st.events.barrier(ctx, "before tool dispatch"); err != nil {
+			// Fail-closed means this call is NOT dispatched, so the tool/call
+			// just buffered describes something that never happened. flush
+			// deliberately keeps its buffer when Append fails (so a retry loses
+			// nothing), and this run flushes once more on its way out while
+			// closing the turn -- a TRANSIENT failure (a full disk that got
+			// freed, a lock timeout) would therefore persist this call after
+			// all: orphaned forever, since no result can follow a dispatch that
+			// never ran, and recovery would synthesize a result for a call that
+			// never happened. Recording more than what happened is worse than
+			// recording less (spec §4.3.1 rule 1 guards the opposite direction),
+			// so take it back before returning.
+			st.events.dropBufferedToolCall(call.ID)
 			return nil, fmt.Errorf("session event barrier before dispatching call %s for task %s: %w", call.ID, task.ID, err)
 		}
 		dispatchStart := time.Now()
@@ -1297,6 +1472,15 @@ func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task
 			results = append(results, domain.ToolResult{CallID: call.ID, Success: false, Error: err.Error()})
 			continue
 		}
+		// One id for this call, everywhere: the tool/call above was recorded
+		// under call.ID, so the tool/result below and the answer the model is
+		// shown must carry the same one or the by-call_id pairing (spec §4.3.1
+		// rule 2) silently comes apart -- and after disambiguateCallIDs the
+		// handler's own copy is not necessarily the id this round settled on.
+		// Every handler today does write call.ID into its result (dispatchCallTool
+		// even re-tags on their behalf), but that is convention; this line makes
+		// it mechanism, so one forgetful new handler cannot break the pairing.
+		result.CallID = call.ID
 		results = append(results, result)
 		// A successful dispatch still may have Success=false (a tool that ran
 		// and reported its own failure, or the ToolGate's "denied by human
@@ -1306,7 +1490,7 @@ func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task
 		if !result.Success {
 			preview = result.Error
 		}
-		st.events.recordToolResult(result.CallID, preview, !result.Success, dispatchDur)
+		st.events.recordToolResult(call.ID, preview, !result.Success, dispatchDur)
 		if call.Name == "write_file" {
 			raw, ok := call.Arguments["path"]
 			if !ok || strings.TrimSpace(raw) == "" {

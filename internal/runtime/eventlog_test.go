@@ -69,27 +69,57 @@ func TestNoStoreMeansNoRecording(t *testing.T) {
 }
 
 // captureEventStore 记下被 Append 的事件，供断言序列与载荷。
+//
+// 事件同时按会话号分桶（bySession）：只看扁平的 events 无法回答「这条事件写进了哪条
+// 会话日志」，而 D-A（没有 SessionID 就用 task.ID 当会话号）与 D-B（委派子任务写自己
+// 的日志）恰恰只有这一个可观测面。之前这个夹具把 Append 的 sessionID 直接丢掉，于是
+// 任何用它的测试在结构上就不可能断言 D-A/D-B —— 给子任务塞一个父会话号，测试照样绿。
 type captureEventStore struct {
-	mu     sync.Mutex
-	events []domain.SessionEvent
-	err    error // 非 nil 时 Append 失败，供屏障测试用
+	mu        sync.Mutex
+	events    []domain.SessionEvent
+	bySession map[string][]domain.SessionEvent
+	err       error // 非 nil 时 Append 失败，供屏障测试用
 }
 
-func (c *captureEventStore) Append(_ context.Context, _ string, events []domain.SessionEvent) error {
+func (c *captureEventStore) Append(_ context.Context, sessionID string, events []domain.SessionEvent) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.err != nil {
 		return c.err
 	}
 	c.events = append(c.events, events...)
+	if c.bySession == nil {
+		c.bySession = make(map[string][]domain.SessionEvent)
+	}
+	c.bySession[sessionID] = append(c.bySession[sessionID], events...)
 	return nil
 }
 
-func (c *captureEventStore) ReadFrom(context.Context, string, int64) ([]domain.SessionEvent, error) {
-	return nil, nil
+// ReadFrom 真的按会话回放已落盘的事件（seq >= from）。
+//
+// 恒返回 nil 的版本让 newTaskRecorder 解出的 turn 永远是 0：「turn 号 = 已有事件里
+// 最大 turn + 1」这段逻辑（spec §4.1 的单调性）一行都执行不到。回放真实内容才让它
+// 可被断言。
+func (c *captureEventStore) ReadFrom(_ context.Context, sessionID string, from int64) ([]domain.SessionEvent, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []domain.SessionEvent
+	for _, e := range c.bySession[sessionID] {
+		if e.Seq >= from {
+			out = append(out, e)
+		}
+	}
+	return out, nil
 }
 func (c *captureEventStore) Load(context.Context, string) ([]domain.SessionEvent, error) {
 	return nil, nil
+}
+
+// eventsFor 返回写进某条会话日志的事件。
+func (c *captureEventStore) eventsFor(sessionID string) []domain.SessionEvent {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]domain.SessionEvent(nil), c.bySession[sessionID]...)
 }
 
 func (c *captureEventStore) types() []domain.SessionEventType {

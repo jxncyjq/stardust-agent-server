@@ -651,6 +651,13 @@ func openAIToolCalls(calls []openAIChatToolCall) ([]domain.ToolCall, error) {
 			}
 		}
 		out = append(out, domain.ToolCall{
+			// NOT a unique id. When the provider omits the tool call id this
+			// degrades to the function NAME, so a response asking for the same
+			// tool twice in parallel yields two calls carrying the identical
+			// id. Uniqueness within a round is established downstream, by
+			// runtime.disambiguateCallIDs, which is where the id is settled
+			// before anything records or dispatches it; nothing may treat what
+			// comes out of here as already unique.
 			ID:        firstNonEmpty(call.ID, call.Function.Name),
 			Name:      call.Function.Name,
 			Arguments: args,

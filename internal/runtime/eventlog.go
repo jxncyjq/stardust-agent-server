@@ -188,6 +188,42 @@ func (e *eventRecorder) recordToolCall(call domain.ToolCall) {
 	})
 }
 
+// dropBufferedToolCall 把缓冲末尾那条 tool/call 撤回——只给屏障 2 落盘失败用。
+//
+// 屏障 2 失败意味着这次调用**没有被派发**，工具体一次也没跑。但 flush 在 Append
+// 失败时按设计保留缓冲（让重试不丢事件），于是这条从未发生的调用会被本次执行后续
+// 任何一次 flush（收尾的 closeTurnOnError 就有一次）写进日志，成为永远等不到
+// tool/result 的孤儿；恢复逻辑还会为它补一条合成结果。spec §4.3.1 第 1 条守的是
+// 「记录过的调用必须有结果」，而这里是它的反面——记了一次根本没发生的调用，比漏记
+// 结果更糟。撤回是唯一正确的收场。
+//
+// 只撤缓冲末尾那一条，且必须真的是同一个 call_id 的 tool/call：不是的话说明调用点
+// 与这里的假设已经对不上（编程错误），panic 而不是猜着删——删错一条就是静默丢事件。
+func (e *eventRecorder) dropBufferedToolCall(callID string) {
+	if !e.enabled() {
+		return
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.pending) == 0 {
+		panic(fmt.Sprintf("runtime: drop buffered tool/call %s: nothing is buffered", callID))
+	}
+	last := e.pending[len(e.pending)-1]
+	if last.Type != domain.SessionEventToolCall {
+		panic(fmt.Sprintf("runtime: drop buffered tool/call %s: the last buffered event is %s", callID, last.Type))
+	}
+	var payload struct {
+		CallID string `json:"call_id"`
+	}
+	if err := json.Unmarshal(last.Data, &payload); err != nil {
+		panic(fmt.Sprintf("runtime: drop buffered tool/call %s: decode buffered payload: %v", callID, err))
+	}
+	if payload.CallID != callID {
+		panic(fmt.Sprintf("runtime: drop buffered tool/call %s: the last buffered tool/call is %s", callID, payload.CallID))
+	}
+	e.pending = e.pending[:len(e.pending)-1]
+}
+
 // recordToolResult 记一次工具调用的结果。
 //
 // **每条记录过的 tool/call 都必须有它**（spec §4.3.1 第 1 条）：工具失败、取消、被
