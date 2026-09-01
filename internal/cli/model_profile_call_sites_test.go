@@ -90,6 +90,62 @@ func assistantMessageModelProfiles(t *testing.T, events []domain.SessionEvent) [
 	return out
 }
 
+// TestBuildTUITaskRunConfigCarriesModelProfileIntoTheSessionEventLog 守调用点③：
+// newTUICommand 的 StreamingRunner 闭包把 runModelProfile(cfg.Maas, maasProfile,
+// maasURL) 的结果塞进 tuiTaskRunConfig.ModelProfile 那一行（原 command.go:269）。
+//
+// 这行代码原来锁在 tea.Program.Run() 才会跑的闭包体内，任何自动化测试都够不着
+// （见 final-fix-2-report.md §3）：newTUICommand 没有暴露 tea.WithInput，bubbletea
+// 在 stdin 非终端时会去打开真实控制台设备读键盘输入，测试进程既没有这样的设备，
+// 也不该去抢一个。本次把闭包体里组装 tuiTaskRunConfig 的那部分抽成纯函数
+// buildTUITaskRunConfig（无渲染依赖，newTUICommand 现在直接调用它），这样就可以像
+// buildDefaultRunnerConfig 的 TestBuildDefaultRunnerConfigWiresSkillUsage、以及
+// browser 那条先例 TestEveryBrowserConfigKeyReachesTheRuntime 一样，直接调用它、
+// 把结果喂给 runTUITask，断言真正落进 assistant/message 载荷的 model_profile ——
+// 而不是断言「代码里有那一行」。
+//
+// 根配置的 DefaultProfile 与显式传入的档位刻意留空，只靠 cfg.Maas.DefaultProfile
+// 解析，这样如果这行被改错/删掉（回归成传空串或传别的值），落进日志的
+// model_profile 会跟这里断言的 "tui-explicit-profile" 对不上。
+func TestBuildTUITaskRunConfigCarriesModelProfileIntoTheSessionEventLog(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Config{
+		Maas: config.MaasConfig{
+			DefaultProfile: "tui-explicit-profile",
+			Profiles: map[string]config.MaasProfile{
+				"tui-explicit-profile": {BaseURL: "http://example.invalid", Model: "deepseek-reasoner"},
+			},
+		},
+		Runtime: config.RuntimeConfig{MaxToolRounds: 1},
+	}
+	store := &cliCaptureSessionEventStore{}
+	maas := &cliCaptureMaas{response: "已完成"}
+
+	runCfg := buildTUITaskRunConfig(
+		cfg, nil, "介绍一下这个运行时", maas, "", "", "",
+		nil, nil, nil, nil, nil, nil, nil, nil, nil,
+		store,
+	)
+
+	result, err := runTUITask(context.Background(), app.New(), runCfg)
+	if err != nil {
+		t.Fatalf("runTUITask() error = %v, want nil", err)
+	}
+
+	profiles := assistantMessageModelProfiles(t, store.eventsFor(result.TaskID))
+	if len(profiles) == 0 {
+		t.Fatal("这次运行一条 assistant/message 都没写：断言的前提不成立")
+	}
+	for _, got := range profiles {
+		if got != "tui-explicit-profile" {
+			t.Errorf("assistant/message 的 model_profile = %q, want %q："+
+				"buildTUITaskRunConfig 没有把 runModelProfile(cfg.Maas, maasProfile, maasURL) "+
+				"的结果塞进 tuiTaskRunConfig.ModelProfile", got, "tui-explicit-profile")
+		}
+	}
+}
+
 // TestRunTUITaskCarriesItsModelProfileIntoTheSessionEventLog 守调用点④：runTUITask
 // 把 cfg.ModelProfile 原样转发进 app.RunTaskOptions.ModelProfile（command.go:582，
 // 「与上面 maasClientFromConfig 选客户端同源的档位名」那一行）。

@@ -259,25 +259,12 @@ func newTUICommand(application *app.App, out io.Writer) *cobra.Command {
 				return err
 			}
 			runner := func(ctx context.Context, prompt string, emit func(domain.RuntimeEvent)) (app.DemoResult, error) {
-				return runTUITask(ctx, application, tuiTaskRunConfig{
-					Config:               cfg,
-					Registry:             registry,
-					Prompt:               prompt,
-					DefaultMaas:          maas,
-					DefaultContextPrefix: contextPrefix,
-					DefaultModelProfile:  firstNonEmpty(maasProfile, cfg.Maas.DefaultProfile),
-					ModelProfile:         runModelProfile(cfg.Maas, maasProfile, maasURL),
-					Events:               persistent.events,
-					Audit:                persistent.audit,
-					TaskSink:             persistent.taskSink,
-					TaskLedger:           taskLedger,
-					MessageStore:         persistent.messageStore,
-					Emit:                 emit,
-					Session:              session,
-					ToolGate:             approvalGate,
-					Checkpoints:          checkpointStore,
-					SessionEvents:        persistent.sessionEvents,
-				})
+				return runTUITask(ctx, application, buildTUITaskRunConfig(
+					cfg, registry, prompt, maas, contextPrefix, maasProfile, maasURL,
+					persistent.events, persistent.audit, persistent.taskSink, taskLedger,
+					persistent.messageStore, emit, session, approvalGate, checkpointStore,
+					persistent.sessionEvents,
+				))
 			}
 			colorProfile := parseTUIColorProfile(cfg.TUI.ColorProfile)
 			renderer := lipgloss.NewRenderer(out, termenv.WithProfile(colorProfile))
@@ -325,6 +312,59 @@ func newTUICommand(application *app.App, out io.Writer) *cobra.Command {
 	cmd.Flags().StringVar(&maasProfile, "maas-profile", "", "MaaS profile name")
 	cmd.Flags().BoolVar(&noContextFiles, "no-context-files", false, "disable AGENTS/SOUL/TOOLS/USER/MEMORY context file loading")
 	return cmd
+}
+
+// buildTUITaskRunConfig assembles the tuiTaskRunConfig for one `agent tui`
+// task run. It is the exact struct literal newTUICommand's StreamingRunner
+// closure used to build inline, pulled out unchanged so it can be exercised
+// by a test without going through tea.Program.Run() — that closure only ever
+// runs when the interactive TUI processes a real keypress, and
+// newTUICommand never wires a test-controllable tea.WithInput, so nothing
+// short of a real TTY session could previously reach this assembly (see
+// final-fix-2-report.md §3). Zero behavior change from the pre-extraction
+// closure body.
+func buildTUITaskRunConfig(
+	cfg config.Config,
+	registry *agentregistry.Registry,
+	prompt string,
+	defaultMaas port.MaasInferenceClient,
+	defaultContextPrefix string,
+	maasProfile string,
+	maasURL string,
+	events port.EventBus,
+	audit port.AuditLog,
+	taskSink app.TaskSink,
+	taskLedger *taskledger.Ledger,
+	messageStore tool.AgentMessageStore,
+	emit func(domain.RuntimeEvent),
+	session *tuiSessionController,
+	toolGate agentruntime.ToolGate,
+	checkpoints *sessionstate.Store,
+	sessionEvents port.SessionEventStore,
+) tuiTaskRunConfig {
+	return tuiTaskRunConfig{
+		Config:               cfg,
+		Registry:             registry,
+		Prompt:               prompt,
+		DefaultMaas:          defaultMaas,
+		DefaultContextPrefix: defaultContextPrefix,
+		DefaultModelProfile:  firstNonEmpty(maasProfile, cfg.Maas.DefaultProfile),
+		// 与 newTUICommand 里选 MaaS 客户端（maasClientFromConfig）同源的档位名，
+		// 归一化于 runModelProfile。这是本次抽取要让测试守住的那一行——参见
+		// model_profile_call_sites_test.go 的
+		// TestBuildTUITaskRunConfigCarriesModelProfileIntoTheSessionEventLog。
+		ModelProfile:  runModelProfile(cfg.Maas, maasProfile, maasURL),
+		Events:        events,
+		Audit:         audit,
+		TaskSink:      taskSink,
+		TaskLedger:    taskLedger,
+		MessageStore:  messageStore,
+		Emit:          emit,
+		Session:       session,
+		ToolGate:      toolGate,
+		Checkpoints:   checkpoints,
+		SessionEvents: sessionEvents,
+	}
 }
 
 func newCommandTaskID(prefix string) string {
