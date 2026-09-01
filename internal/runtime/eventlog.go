@@ -57,6 +57,19 @@ type eventRecorder struct {
 	seqKnown bool
 	turn     int
 	step     int
+	// issuedTurnIDs 记录这次执行里 newTurnID 已经发放过的 (turn, step, type) 坐标。
+	// 只在 enabled() 时使用（懒初始化），理由见 newTurnID 里对 enabled() 分支的
+	// 说明。与 pending/nextSeq/turn/step 用同一把 e.mu 保护，不新造锁。
+	issuedTurnIDs map[turnIDCoordinate]bool
+}
+
+// turnIDCoordinate 是 newTurnID 用来判断一个坐标是否已经发放过的键，分量与
+// newTurnID 派生 ID 字符串时用的分量一一对应——session 已经是这个 eventRecorder
+// 唯一固定的一份，不需要再放进键里。
+type turnIDCoordinate struct {
+	turn int
+	step int
+	typ  domain.SessionEventType
 }
 
 // newEventRecorder 建一次任务执行的记录器。
@@ -239,8 +252,54 @@ func (e *eventRecorder) recordAssistantMessage(content string, calls []domain.To
 //
 // 同一条事件被投影多少次，它落盘时的 turn、step、类型都不变，因此这个 ID 在多次
 // 投影之间保持一致——这正是 ScrollMessages 定位锚点所需要的全部保证。
+//
+// # 这个派生方式为什么站得住脚，以及它现在只靠什么撑着
+//
+// 「(session, turn, step, type) 唯一」不是类型系统保证的，它是一条**隐式控制流
+// 不变量**：本文件之外——RunTask/runToolLoop（runtime.go）——必须保证同一
+// (turn, step) 在一次执行里最多被一次 recordAssistantMessage（或一次
+// recordUserMessage）用到。今天这条不变量成立，论证见 P3 Task 1 复审
+// （.superpowers/sdd/task-1-review.md I-1）：resume 分支手工记一次之后，
+// runToolLoop 在决定是否继续循环之前先 recordStepEnd 把 step 推进，循环内两处
+// 提前 break 也都在 recordStepEnd 之后才发生，所以不会有两次 recordAssistantMessage
+// 落在同一个 (turn, step) 上。
+//
+// 但这条不变量**只被走查验证过**，不被 newTurnID 的签名或类型强制。下面的运行期
+// 断言就是补这个洞：newTurnID 每发放一个坐标就记下来，同一坐标被要第二次时立刻
+// panic，而不是安静地返回同一个字符串——那样的话，两行本应各自独立的事件会在
+// 投影时用同一个 turn_id 互相覆盖，不会有任何测试或运行时信号提示这件事，正是
+// spec 反复强调的「不报错、只是悄悄少东西」的失败形态。它守的不变量正是上一段
+// 说的那条：谁在将来改动 runToolLoop（例如把 resume 分支的「手工记一次 + 继续走
+// 循环」改成别的形态，或者在循环内加一条新的 recordAssistantMessage 调用点）
+// 一旦破坏了它，第一次真的撞车就会在这里响亮地炸出来，而不是被投影悄悄吞掉。
+//
+// 只在 e.enabled()（配了 store）时才记坐标、才检查撞车：没配 store 时这条 ID
+// 从不会被真正落盘或投影，根本不存在「两行事件互相覆盖」这回事——大量测试与
+// 无 store 部署会反复用同样的 (turn, step) 构造 disabled recorder，那不是撞车，
+// 是这个可选部署形态的正常使用。在这个分支上加检查，等于把「没有 store」这个
+// 契约允许的可选状态错当成错误状态去 fail-loud，违反的是同一条铁律的另一半。
 func (e *eventRecorder) newTurnID(typ domain.SessionEventType) string {
-	return fmt.Sprintf("%s:%d:%d:%s", e.session, e.currentTurn(), e.currentStep(), typ)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	turn, step := e.turn, e.step
+	id := fmt.Sprintf("%s:%d:%d:%s", e.session, turn, step, typ)
+	if !e.enabled() {
+		return id
+	}
+	coord := turnIDCoordinate{turn: turn, step: step, typ: typ}
+	if e.issuedTurnIDs == nil {
+		e.issuedTurnIDs = make(map[turnIDCoordinate]bool)
+	}
+	if e.issuedTurnIDs[coord] {
+		panic(fmt.Sprintf(
+			"runtime: turn_id coordinate (session=%q, turn=%d, step=%d, type=%s) issued twice in one execution: "+
+				"two %s events were recorded for the same (turn, step); newTurnID's uniqueness guarantee assumes "+
+				"this never happens (see its doc comment) — the two rows would collide on the same turn_id and "+
+				"silently overwrite each other in projection",
+			e.session, turn, step, typ, typ))
+	}
+	e.issuedTurnIDs[coord] = true
+	return id
 }
 
 // recordToolCall 记一次工具调用**被派发之前**的事实（spec §5 屏障 2 的前提）。

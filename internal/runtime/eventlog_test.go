@@ -473,6 +473,56 @@ func TestConversationContentIsStoredWhole(t *testing.T) {
 	}
 }
 
+// newTurnID 的唯一性论证（见其文档注释）依赖一条隐式控制流不变量：同一
+// (turn, step) 在一次执行里最多被一次 recordAssistantMessage 用到。今天没有
+// 代码路径违反它，但类型系统不拦这件事——这条测试断言的不是"这个场景该被禁止"
+// （那是 runtime.go 的事），而是"如果它真的发生了，运行期断言确实会响亮地炸出来"，
+// 即 P3 Task 1 复审 I-1 要求补的守卫确实在生效。
+func TestDuplicateTurnIDCoordinatePanics(t *testing.T) {
+	t.Parallel()
+
+	store := &captureEventStore{}
+	rec := newEventRecorder(store, domain.Task{ID: "task-7", SessionID: "sess-1", AgentID: "agent-a"})
+	rec.recordTurnStart(0)
+	rec.recordStepStart()
+	rec.recordAssistantMessage("第一条", nil, eventUsage{}, "fast", nil)
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("同一 (turn, step) 上记第二条 assistant/message 没有 panic：turn_id 会静默撞车，两行事件会在投影时互相覆盖")
+		}
+		msg, ok := r.(string)
+		if !ok {
+			t.Fatalf("panic 值不是字符串: %v (%T)", r, r)
+		}
+		for _, want := range []string{"turn=0", "step=0", string(domain.SessionEventAssistantMessage)} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("panic 信息 = %q，缺少 %q：排查的人要能立刻从 panic 信息定位到撞车的坐标", msg, want)
+			}
+		}
+	}()
+	// 同一 turn/step 上第二次记 assistant/message：今天没有任何调用点这样做，
+	// 这里是直接调用 record* 方法模拟"控制流不变量被破坏"的场景，不是复现
+	// runtime.go 里的真实路径。
+	rec.recordAssistantMessage("第二条（撞车）", nil, eventUsage{}, "fast", nil)
+}
+
+// 禁用（没配 store）时 newTurnID 不追踪坐标、也不检查撞车：这条 ID 从不会被真正
+// 落盘或投影，复用坐标不构成任何风险——大量测试与无 store 部署本就会用同样的
+// (turn, step) 反复构造 disabled recorder。在这个分支上加检查，等于把"没有
+// store"这个契约允许的可选部署形态错当成错误状态去 fail-loud，是新断言必须
+// 避免的行为改变。
+func TestDisabledRecorderDoesNotTrackTurnIDCoordinates(t *testing.T) {
+	t.Parallel()
+
+	rec := newEventRecorder(nil, domain.Task{ID: "t1"})
+	rec.recordTurnStart(0)
+	rec.recordStepStart()
+	rec.recordAssistantMessage("第一条", nil, eventUsage{}, "fast", nil)
+	rec.recordAssistantMessage("第二条", nil, eventUsage{}, "fast", nil) // 不应 panic
+}
+
 // payloadOfType 取出指定类型的第一条事件的载荷。找不到就 Fatal——
 // 「没有这条事件」和「这条事件字段不对」是两种不同的失败，不要混在一起报。
 func payloadOfType(t *testing.T, events []domain.SessionEvent, typ domain.SessionEventType) map[string]any {
