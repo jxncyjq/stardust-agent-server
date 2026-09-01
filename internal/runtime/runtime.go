@@ -1253,6 +1253,15 @@ func (r *Runtime) generateStep(ctx context.Context, rec *eventRecorder, requestI
 	if err != nil {
 		return port.InferenceResponse{}, err
 	}
+	// Settle this round's call_ids before anything downstream sees them: the
+	// manual-gate ticket, the checkpoint, and the assistant/message manifest
+	// recorded just below must all agree with what executeToolCalls later
+	// records and dispatches under. See disambiguateCallIDs's doc comment for
+	// why this cannot wait until dispatch time.
+	ids := disambiguateCallIDs(resp.ToolCalls, taskID)
+	for i := range resp.ToolCalls {
+		resp.ToolCalls[i].ID = ids[i]
+	}
 	rec.recordAssistantMessage(resp.Text, resp.ToolCalls, eventUsage{
 		Prompt: resp.PromptTokens, Completion: resp.CompletionTokens,
 		Cached: resp.CachedTokens, Total: resp.TotalTokens,
@@ -1277,6 +1286,14 @@ func (r *Runtime) generateFinalStep(ctx context.Context, rec *eventRecorder, req
 	resp, err = r.generateNoTools(ctx, requestID, taskID, convo)
 	if err != nil {
 		return port.InferenceResponse{}, err
+	}
+	// Same settling as generateStep, applied here too: no tools are offered on
+	// this closing request, but nothing stops a provider from echoing tool_calls
+	// anyway, and recordAssistantMessage below is the same manifest N-I2 was
+	// about -- it must not carry pre-disambiguation ids either.
+	ids := disambiguateCallIDs(resp.ToolCalls, taskID)
+	for i := range resp.ToolCalls {
+		resp.ToolCalls[i].ID = ids[i]
 	}
 	rec.recordAssistantMessage(resp.Text, resp.ToolCalls, eventUsage{
 		Prompt: resp.PromptTokens, Completion: resp.CompletionTokens,
@@ -1345,6 +1362,19 @@ func (r *Runtime) inferenceTools(tools *tool.Registry) []port.InferenceTool {
 // common case -- every id passes through untouched, so the id semantics this
 // repo shares with its providers are unchanged; the rewrite is confined to the
 // rounds that would otherwise be ambiguous.
+//
+// Callers run this the moment st.resp is produced -- generateStep and
+// generateFinalStep call it on their own response before recordAssistantMessage
+// -- not later inside executeToolCalls. Settling it that early, rather than at
+// dispatch time, matters because checkSuspend's ManualToolGate opens its
+// approval ticket under call.ID BEFORE executeToolCalls ever runs (round gate,
+// not dispatch gate): a round with two colliding ids that disambiguated only at
+// dispatch time would open both tickets under the same pre-disambiguation id,
+// and the second dispatch's post-disambiguation id could never find its ticket
+// (fail-loud "undecided sensitive call", forever). Settling ids here instead
+// means the ticket, the checkpoint's PendingCalls, assistant/message's
+// tool_calls manifest, tool/call, tool/result and the answer fed back to the
+// model all agree on the same one set, from the moment the round exists.
 func disambiguateCallIDs(calls []domain.ToolCall, taskID string) []string {
 	base := make([]string, len(calls))
 	// Every id this round arrived with, including the ones not yet assigned: a
@@ -1401,19 +1431,17 @@ func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task
 	// spec §4.3.1 rule 4: within one step, two unanswered tool/call events must
 	// not share a call_id -- the projection pairs a result to its call by that
 	// id alone (rule 2), so two live calls under one id make the pair
-	// ambiguous. The ids the model hands us do not guarantee it (see
-	// disambiguateCallIDs), so this round settles them once, here, before the
-	// first of them is recorded or dispatched.
-	ids := disambiguateCallIDs(calls, task.ID)
+	// ambiguous. disambiguateCallIDs already settled that by the time this
+	// runs: generateStep/generateFinalStep call it on st.resp the moment it is
+	// produced, before checkSuspend's manual-gate ticket, the checkpoint, and
+	// assistant/message's tool_calls manifest ever see it (see
+	// disambiguateCallIDs's doc comment for why dispatch time is too late).
+	// This loop therefore only has to trust the ids calls already carries, not
+	// settle them itself -- and must not: settling them twice for the same
+	// round would disagree with the ticket/checkpoint/manifest already written
+	// under the first settlement.
 	results := make([]domain.ToolResult, 0, len(calls))
 	for i := range calls {
-		// Written back into st.resp rather than kept in a local: everything
-		// downstream identifies this round's calls by this id and all of them
-		// must agree with the tool/call recorded below. The assistant message
-		// already appended to the exchange holds THIS slice (appendAssistant
-		// stores it by reference, so the provider sees the same ids), and
-		// appendToolResults pairs results to calls by it.
-		calls[i].ID = ids[i]
 		call := calls[i]
 		if err := r.events.Publish(ctx, domain.RuntimeEvent{
 			Type:      "tool_call_requested",
