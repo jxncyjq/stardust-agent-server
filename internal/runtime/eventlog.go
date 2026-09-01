@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -179,6 +180,11 @@ func (e *eventRecorder) recordTurnStart(turn int) {
 // defaultMaxTurnChars = 6000 字符（session_turns.go），截到 maxEventPreviewRunes
 // = 2000 会让历史对话缩到 1/3。超长单条消息撞 P1 的 64 KiB/条上限时 flush → Append
 // 会 fail-loud 报错——那是正确行为，这里不为它兜底。
+//
+// content 由 userMessageContent 渲染：带附件的任务在正文尾部多一行
+// "[附图 N 张]" 标记，图片本身（base64 data URI）从不进日志。这条标注在
+// conversation_turns 退役前由 server/http.go 的 recordUserTurn 写，现在只能在这里
+// 产出——事件日志是唯一真相源（spec §3 取舍 A2）。
 //
 // task_id 供投影滤掉任务自己的 user turn（session_turns.go 用 turn.TaskID ==
 // task.ID），同时是投影折叠这一行 turn 的键与它 id 的词干；自 Task 4 起它还是
@@ -512,4 +518,28 @@ func truncateRunes(s string, limit int) string {
 	}
 	suffix := fmt.Sprintf("\n…[truncated: %d of %d runes shown]", kept, total)
 	return string(runes[:kept]) + suffix
+}
+
+// userMessageContent renders the text a user/message event stores for a task.
+//
+// Base64 image data is deliberately never written into the event log (it would
+// bloat the sqlite log by megabytes per attachment, and spec §4.3 不变量 6 caps
+// event growth at call count, not payload size). Instead, when the task carried
+// images, a "[附图 N 张]" marker is appended so replayed history — the GUI's
+// /turns, the model's own recent-turns window — shows that images were attached
+// without re-embedding them.
+//
+// This lived in internal/server (userTurnContent) until P3 Task 5 retired
+// conversation_turns. The server wrote it at submit time; the event log is now
+// the single source of truth (spec §3 取舍 A2), so the annotation has to be
+// produced where the user/message event is produced or it is lost outright.
+func userMessageContent(input string, imageCount int) string {
+	if imageCount <= 0 {
+		return input
+	}
+	marker := fmt.Sprintf("[附图 %d 张]", imageCount)
+	if strings.TrimSpace(input) == "" {
+		return marker
+	}
+	return input + "\n" + marker
 }

@@ -1013,14 +1013,14 @@ func TestRunTUITaskInjectsAndPersistsSessionTurns(t *testing.T) {
 	}
 }
 
-// recordTurn 的两步写入（事件日志 + conversation_turns 行）不在同一个事务里
-// （P3 复审 I-3）。窗口消不掉——Task 5 删掉 turn 行的写入方才会消失——但顺序
-// 决定了中间失败留下的残留有多重：先写事件，事件失败时**什么都没落盘**，FTS 里
-// 就不会留下一条投影不出来的孤儿索引（那种孤儿会被 discovery 搜到、再被 scroll
-// 用 "anchor not found" 硬顶回去）。
+// recordTurn 现在只写一处：会话事件日志（Task 5 删掉了 conversation_turns 那一行的
+// 写入方，spec §3 取舍 A2）。事件与它的 FTS 索引在同一个事务里提交
+// （storage.indexSessionEvent），所以事件写失败时**什么都不该落盘**——尤其不该留下
+// 一条投影不出来的孤儿索引：那种孤儿会被 discovery 搜到、再被 scroll 用
+// "anchor not found" 硬顶回去。
 //
-// 这条测试让事件写入失败，断言两件事：错误确实往上抛（不是静默吞掉），以及
-// conversation_turns / FTS 一侧一个字都没写。
+// 这条测试让事件写入失败，断言两件事：错误确实往上抛（不是静默吞掉），以及检索一侧
+// 一个字都没写。
 func TestTUISessionRecordTurnLeavesNoSearchableOrphanWhenTheEventWriteFails(t *testing.T) {
 	t.Parallel()
 
@@ -2630,10 +2630,6 @@ func (s *countingConversationStore) LatestAgentSession(ctx context.Context, comp
 
 func (s *countingConversationStore) ListAgentSessions(ctx context.Context, companyID string, agentID string) ([]domain.AgentSession, error) {
 	return s.delegate.ListAgentSessions(ctx, companyID, agentID)
-}
-
-func (s *countingConversationStore) AppendConversationTurn(ctx context.Context, turn domain.ConversationTurn) error {
-	return s.delegate.AppendConversationTurn(ctx, turn)
 }
 
 func (s *countingConversationStore) ListConversationTurns(ctx context.Context, sessionID string, limit int) ([]domain.ConversationTurn, error) {

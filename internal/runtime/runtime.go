@@ -660,7 +660,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		return domain.TaskRun{}, fmt.Errorf("run task %s: %w", task.ID, err)
 	}
 	rec.recordTurnStart(turn)
-	rec.recordUserMessage(task.Input)
+	rec.recordUserMessage(userMessageContent(task.Input, len(task.Images)))
 
 	// Resume path: a persisted checkpoint means this task previously suspended.
 	// Rebuild loop state from disk and re-enter the loop with the pending calls,

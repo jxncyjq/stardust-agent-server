@@ -126,71 +126,12 @@ func containsEmptyArrayField(body []byte, field string) bool {
 	return strings.Contains(string(body), `"`+field+`":[]`)
 }
 
-// TestHTTPServerCompletedTaskPersistsGeneratedFilesOnAssistantTurn guards that
-// the relative GeneratedFiles paths (not the linked DTOs) are what land on the
-// persisted assistant conversation turn, since the turn is replayed later and
-// links must be rebuilt fresh from fileURL rather than baked in at write time.
-func TestHTTPServerCompletedTaskPersistsGeneratedFilesOnAssistantTurn(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	repo, dbPath := openServerTestRepoWithPath(t)
-	scheduler := task.NewScheduler()
-	events := adapter.NewMemoryEventBus()
-	srv := NewHTTPServer(Config{Tasks: scheduler, Sessions: repo, WorkflowEvents: events})
-
-	session := domain.AgentSession{
-		ID:        "session-gf-turn-1",
-		CompanyID: "default-company",
-		AgentID:   "default-agent",
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-	if err := repo.SaveAgentSession(ctx, session); err != nil {
-		t.Fatalf("SaveAgentSession error = %v, want nil", err)
-	}
-	if err := scheduler.Add(ctx, domain.Task{
-		ID:        "task-gf-turn-1",
-		CompanyID: "default-company",
-		AgentID:   "default-agent",
-		SessionID: "session-gf-turn-1",
-		Status:    domain.TaskDone,
-		Input:     "写文件",
-	}); err != nil {
-		t.Fatalf("scheduler.Add error = %v, want nil", err)
-	}
-	if err := events.Publish(ctx, domain.RuntimeEvent{
-		Type:           "task_completed",
-		TaskID:         "task-gf-turn-1",
-		Message:        "写好了",
-		GeneratedFiles: []string{"docs/a.md", "out/b.csv"},
-	}); err != nil {
-		t.Fatalf("events.Publish error = %v, want nil", err)
-	}
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/v1/tasks/task-gf-turn-1/result", nil)
-	srv.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET result status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
-	}
-
-	// 直接查表：这条测试量的是结果端点**写进 conversation_turns 那一行**的
-	// GeneratedFiles 形状（相对路径而非链接 DTO）。Task 3 之后 ListConversationTurns
-	// 读的是事件日志，而这里没有 runtime 去发事件，用它断言只会量到空。
-	turns := conversationTurnRows(t, dbPath, "session-gf-turn-1")
-	var assistant *domain.ConversationTurn
-	for i := range turns {
-		if turns[i].Role == domain.ConversationRoleAssistant {
-			assistant = &turns[i]
-		}
-	}
-	if assistant == nil {
-		t.Fatalf("turns = %#v, want an assistant turn", turns)
-	}
-	if len(assistant.GeneratedFiles) != 2 || assistant.GeneratedFiles[0] != "docs/a.md" || assistant.GeneratedFiles[1] != "out/b.csv" {
-		t.Fatalf("assistant turn GeneratedFiles = %#v, want [docs/a.md out/b.csv]", assistant.GeneratedFiles)
-	}
-}
+// 「结果端点把相对路径写进 assistant turn」那条测试随写入方一起删除：
+// conversation_turns 退役后（spec §3 取舍 A2）端点不写任何东西，GeneratedFiles 从
+// assistant/message 事件的 generated_files 载荷经 storage.projectTurns 取并集还原
+// ——那条不变量由 storage 包的 TestAToolLoopTaskProjectsToOneAssistantTurn 与
+// TestASuspendedAndResumedTaskStillProjectsToOneTurnPerRole 守着。下面这条测试守的
+// 是另一端：/turns 出口把相对路径渲染成链接 DTO。
 
 // TestHTTPServerSessionTurnsIncludeGeneratedFilesWithLinks guards that the
 // history-turns endpoint (GET /v1/sessions/{id}/turns), consumed directly by

@@ -628,62 +628,6 @@ func TestSQLiteColumnMigrationsAreIdempotent(t *testing.T) {
 	}
 }
 
-func TestSQLiteAppendConversationTurnIfAbsentIsExactlyOnce(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	repo := openTestSQLiteRepository(t)
-	createdAt := time.Date(2026, 6, 27, 9, 0, 0, 0, time.UTC)
-	session := domain.AgentSession{
-		ID:        "session-once",
-		CompanyID: "company-1",
-		AgentID:   "agent-1",
-		Project:   "项目",
-		Title:     "once",
-		CreatedAt: createdAt,
-		UpdatedAt: createdAt,
-	}
-	if err := repo.SaveAgentSession(ctx, session); err != nil {
-		t.Fatalf("SaveAgentSession error = %v, want nil", err)
-	}
-	turn := domain.ConversationTurn{
-		ID:        "task-x:assistant",
-		SessionID: session.ID,
-		TaskID:    "task-x",
-		AgentID:   "agent-1",
-		Role:      domain.ConversationRoleAssistant,
-		Content:   "真实回答",
-		CreatedAt: createdAt.Add(time.Second),
-	}
-	inserted, err := repo.AppendConversationTurnIfAbsent(ctx, turn)
-	if err != nil {
-		t.Fatalf("AppendConversationTurnIfAbsent() first error = %v, want nil", err)
-	}
-	if !inserted {
-		t.Fatalf("AppendConversationTurnIfAbsent() first inserted = false, want true")
-	}
-	inserted, err = repo.AppendConversationTurnIfAbsent(ctx, turn)
-	if err != nil {
-		t.Fatalf("AppendConversationTurnIfAbsent() second error = %v, want nil", err)
-	}
-	if inserted {
-		t.Fatalf("AppendConversationTurnIfAbsent() second inserted = true, want false")
-	}
-	// 计数直接查 conversation_turns 表，不走 ListConversationTurns：这条测试的主题是
-	// **写入方**的幂等（同一个 turn id 提交两次只落一行），而 Task 3 之后
-	// ListConversationTurns 读的是事件日志，根本看不见这张表——用它计数只会数出 0，
-	// 那是在量错的东西，不是在量这个不变量。这张表与它的写入方在 Task 5 一起退役，
-	// 这条测试届时随之删除。
-	var rows int
-	if err := repo.db.QueryRowContext(ctx,
-		`SELECT COUNT(*) FROM conversation_turns WHERE session_id = ?`, session.ID,
-	).Scan(&rows); err != nil {
-		t.Fatalf("count conversation_turns error = %v, want nil", err)
-	}
-	if rows != 1 {
-		t.Fatalf("conversation_turns rows = %d, want exactly 1", rows)
-	}
-}
-
 func TestSQLiteRepositoryPersistsSessionArchivedFlag(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -885,55 +829,6 @@ func TestSQLiteSessionSearchDiscoveryScrollBrowse(t *testing.T) {
 	}
 	if len(sessions) != 1 || sessions[0].ID != "sess-1" {
 		t.Fatalf("BrowseSessions() = %+v, want sess-1", sessions)
-	}
-}
-
-func TestSQLiteBackfillConversationTurnsFTS(t *testing.T) {
-	ctx := context.Background()
-	repo := openTestSQLiteRepository(t)
-
-	turn := domain.ConversationTurn{
-		ID: "t1", SessionID: "s1", TaskID: "task-1", AgentID: "a1",
-		Role: domain.ConversationRoleUser, Content: "prompt cache 稳定前缀", CreatedAt: time.Unix(2, 0),
-	}
-	if err := repo.AppendConversationTurn(ctx, turn); err != nil {
-		t.Fatalf("AppendConversationTurn() error = %v, want nil", err)
-	}
-	// Simulate a pre-v4 row: drop it from the FTS index but keep the source row.
-	if _, err := repo.db.ExecContext(ctx, `DELETE FROM conversation_turns_fts WHERE turn_id = ?`, "t1"); err != nil {
-		t.Fatalf("delete fts row error = %v, want nil", err)
-	}
-	// 断言直接查 conversation_turns_fts，不再经 SearchMessages：discovery 已经改到
-	// session_events_fts 上（P3 Task 4），而这条测试的题目自始至终是**旧索引的回填**
-	// 本身。经一个不再读这张表的入口去验它，只会验出「搜不到」这个与回填无关的事实。
-	// 旧索引与本函数一并在 Task 5 退役。
-	indexed := func() int {
-		t.Helper()
-		var count int
-		if err := repo.db.QueryRowContext(ctx,
-			`SELECT COUNT(*) FROM conversation_turns_fts WHERE turn_id = ?`, "t1").Scan(&count); err != nil {
-			t.Fatalf("count conversation_turns_fts rows error = %v, want nil", err)
-		}
-		return count
-	}
-	if got := indexed(); got != 0 {
-		t.Fatalf("conversation_turns_fts rows before backfill = %d, want 0", got)
-	}
-
-	added, err := repo.BackfillConversationTurnsFTS(ctx)
-	if err != nil {
-		t.Fatalf("BackfillConversationTurnsFTS() error = %v, want nil", err)
-	}
-	if added != 1 {
-		t.Fatalf("BackfillConversationTurnsFTS() added = %d, want 1", added)
-	}
-	if got := indexed(); got != 1 {
-		t.Fatalf("conversation_turns_fts rows after backfill = %d, want 1", got)
-	}
-	// Idempotent: a second backfill adds nothing.
-	again, err := repo.BackfillConversationTurnsFTS(ctx)
-	if err != nil || again != 0 {
-		t.Fatalf("second BackfillConversationTurnsFTS() = %d (err %v), want 0", again, err)
 	}
 }
 

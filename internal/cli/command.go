@@ -1027,7 +1027,6 @@ type conversationStore interface {
 	SaveAgentSession(context.Context, domain.AgentSession) error
 	LatestAgentSession(context.Context, string, string) (domain.AgentSession, bool, error)
 	ListAgentSessions(context.Context, string, string) ([]domain.AgentSession, error)
-	AppendConversationTurn(context.Context, domain.ConversationTurn) error
 	ListConversationTurns(context.Context, string, int) ([]domain.ConversationTurn, error)
 	// Append/ReadFrom 是 TUI 会话把每轮对话写进事件日志用的（见 recordTurn）。
 	// 声明成两个方法而不是内嵌 port.SessionEventStore：这条路不调 Load，而
@@ -1241,46 +1240,21 @@ func (c *tuiSessionController) recordTurn(ctx context.Context, role domain.Conve
 		}
 	}
 	now := time.Now()
-	// 两个不同的标识，别把它们合成一个：
+	// eventTurnID 标识**事件日志里的那一条事件**（P4 轨迹按它定位；Task 4 的检索
+	// **不**按它定位，storage.SearchMessages 连这一列都不 SELECT），与 runtime 的
+	// newTurnID 同一角色，因此逐条唯一。
 	//
-	//   - rowID 是 conversation_turns 那一行（连同它的 FTS 索引）的 id。它必须与
-	//     投影出来的 ConversationTurn.ID 逐字相同——Task 4 之后 discovery 搜的是
-	//     session_events_fts，命中后把事件的 task_id 与 role 拼成同一个形状，
-	//     scroll 走投影；三处 ID 空间一旦分叉，模型拿 discovery 给的 id 回来
-	//     scroll 必然 anchor not found。投影按 (task_id, role) 折叠成
-	//     "<task_id>:<role>"（storage.projectTurns），serve 路径写的也是这个形状
-	//     （server/http.go 的 recordUserTurn / recordAssistantTurn），TUI 这里跟上。
-	//     taskID 每次 runTUITask 现取（newCommandTaskID），所以同一条会话里两次
-	//     交换不会撞 id；真撞上是主键冲突，会响亮地失败而不是悄悄覆盖。
-	//   - eventTurnID 标识**事件日志里的那一条事件**（P4 轨迹按它定位；Task 4 的
-	//     检索**不**按它定位，storage.SearchMessages 连这一列都不 SELECT），与
-	//     runtime 的 newTurnID 同一角色，因此仍然逐条唯一。
-	rowID := taskID + ":" + string(role)
+	// 它不是这一轮对话在读侧的 id：投影按 (task_id, role) 折叠成 "<task_id>:<role>"
+	// （storage.projectTurns），discovery 命中一条事件后也把它的 task_id 与 role 拼
+	// 成同一个形状（storage.SearchMessages），两个 ID 空间因此相等，模型拿 discovery
+	// 给的 id 回来 scroll 才落得到锚点。taskID 每次 runTUITask 现取
+	// （newCommandTaskID），所以同一条会话里两次交换折不到一起。
+	//
+	// Task 5 之前这里还要再写一行 conversation_turns（连同它的 FTS 索引），两步不在
+	// 同一个事务里，中间失败会留下半截状态。那一行连同它的写入方已经退役，事件日志
+	// 是唯一真相源（spec §3 取舍 A2），这个窗口随之消失。
 	eventTurnID := fmt.Sprintf("%s:%s:%d", c.currentID, role, now.UTC().UnixNano())
-	// 先写事件、再写 turn 行，这个顺序是刻意的。两步不在同一个事务里（P3 复审
-	// I-3），中间失败必然留下半截状态，但两个方向的半截不一样重：
-	//
-	//   - 先写 turn 行、事件失败 → FTS 里多了一条**投影不出来**的索引。
-	//     search_session 的 discovery 能搜到它，模型拿这个 id 回来 scroll 就撞
-	//     "anchor not found" —— 一次硬报错。
-	//   - 先写事件、turn 行失败 → 事件日志（读路径的唯一真相源）是完整的，只是
-	//     这一条暂时搜不到。历史读得出来、scroll 也照常工作，只是检索少一条。
-	//
-	// 两步都会 fail-loud 地把 error 抛给调用方（runTUITask 直接中止），所以这里
-	// 选的是「哪一种残留更轻」。Task 5 删掉 turn 行的写入方之后，这个窗口一起消失。
 	if err := c.appendTurnEvent(ctx, eventTurnID, role, taskID, agentID, modelProfile, content, now); err != nil {
-		return err
-	}
-	if err := c.store.AppendConversationTurn(ctx, domain.ConversationTurn{
-		ID:           rowID,
-		SessionID:    c.currentID,
-		TaskID:       taskID,
-		AgentID:      firstNonEmpty(agentID, c.agentID),
-		ModelProfile: firstNonEmpty(modelProfile, c.modelProfile),
-		Role:         role,
-		Content:      truncateSessionTurn(content, c.maxTurnChars),
-		CreatedAt:    now,
-	}); err != nil {
 		return err
 	}
 	c.invalidateCurrentSessionCache()
@@ -1295,9 +1269,9 @@ func (c *tuiSessionController) recordTurn(ctx context.Context, role domain.Conve
 // eventRecorder 写出来的日志因此挂在另一个会话下。这里不写，TUI 的
 // 「Recent conversation:」注入会读到空历史，而且是静默失效，不报任何错。
 //
-// 为什么与上面的 AppendConversationTurn 并存不算双真相源：读路径已经只认事件，而
-// Task 4 把 search_session 的 discovery 也搬到了 session_events_fts，那一行连最后
-// 一个消费者也没有了，Task 5 连同写入方与 conversation_turns_fts 一起删。
+// 这是 TUI 这条路唯一的写入方：Task 4 把 search_session 的 discovery 也搬到了
+// session_events_fts 之后，conversation_turns 那一行连最后一个消费者也没有了，
+// Task 5 已经连同它的写入方与 conversation_turns_fts 一起删掉。
 //
 // 正文按 Task 1 的决定**存全文**，不套 truncateSessionTurn：截断是读侧
 // （RecentTurns / RecentTurnsForTask）按各自的 MaxTurnChars 做的事，写侧先砍一刀会
@@ -1317,8 +1291,11 @@ func (c *tuiSessionController) appendTurnEvent(
 	if strings.TrimSpace(taskID) == "" {
 		return fmt.Errorf("append session turn event for %q: task id is required", c.currentID)
 	}
-	// agent_id 同理：projectTurns 对 user/assistant 两侧都做非空校验，缺了整条会话
-	// 读不出来。在这里拦下，错误就指向写入的这一刻。
+	// agent_id 在投影那一侧是契约允许为空的可选（内置默认 agent 就是用空 agent_id
+	// 选中的，见 storage.projectTurns 的注释），所以这条检查**不是**投影的要求。
+	// 它是 TUI 这条路自己的不变量：c.agentID 由 newTUISessionController 兜成
+	// "cli-agent"，永远非空，真的取到空串意味着控制器没按契约装配起来——那是编程
+	// 错误，在写入的这一刻拦下比让它写进日志更容易定位。
 	resolvedAgentID := firstNonEmpty(agentID, c.agentID)
 	if resolvedAgentID == "" {
 		return fmt.Errorf("append session turn event for %q: agent id is required", c.currentID)

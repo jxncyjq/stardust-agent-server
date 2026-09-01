@@ -60,7 +60,6 @@ type SessionStore interface {
 	GetAgentSession(ctx context.Context, sessionID string) (domain.AgentSession, bool, error)
 	SaveAgentSession(ctx context.Context, session domain.AgentSession) error
 	DeleteAgentSession(ctx context.Context, sessionID string) error
-	AppendConversationTurnIfAbsent(ctx context.Context, turn domain.ConversationTurn) (bool, error)
 }
 
 type MessageStore interface {
@@ -1089,13 +1088,15 @@ func (s *HTTPServer) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 		CreatedAt:  now,
 		Images:     req.Images,
 	}
-	// Record the user turn before the task is enqueued so the conversation
-	// history exists even if the runtime never produces an answer. session_id is
-	// an optional field (a one-off task may carry none), but when it is present
-	// the session must exist — a missing session is a client error, not a state
-	// we silently paper over.
+	// Float the session to the top of the session list before the task is
+	// enqueued. The user prompt itself is no longer written here: the session
+	// event log is the single source of truth for conversation content (spec §3
+	// 取舍 A2) and the runtime records the user/message event when it runs the
+	// task. session_id is an optional field (a one-off task may carry none), but
+	// when it is present the session must exist — a missing session is a client
+	// error, not a state we silently paper over.
 	if haveSession {
-		if err := s.recordUserTurn(r.Context(), w, task, session); err != nil {
+		if err := s.touchSessionOnSubmit(r.Context(), w, task, session); err != nil {
 			return
 		}
 	}
@@ -1110,46 +1111,20 @@ func (s *HTTPServer) handleCreateTask(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, task)
 }
 
-// userTurnContent renders the persisted text for a user turn. Base64 image data
-// is deliberately not stored in conversation_turns (it would bloat sqlite);
-// instead, when the task carried images, a "[附图 N 张]" marker is appended so the
-// replayed history shows that images were attached without re-embedding them.
-func userTurnContent(input string, imageCount int) string {
-	if imageCount <= 0 {
-		return input
-	}
-	marker := fmt.Sprintf("[附图 %d 张]", imageCount)
-	if strings.TrimSpace(input) == "" {
-		return marker
-	}
-	return input + "\n" + marker
-}
-
-// recordUserTurn persists the user prompt as a conversation turn and refreshes
-// the owning session's updated_at. The session must already be loaded by the
-// caller (handleCreateTask resolves it once, to derive the task's mode, and
-// passes it here rather than querying it a second time). It writes a 5xx
-// response and returns a non-nil error when the write fails, so the caller
-// aborts loudly instead of enqueuing a task whose history was lost. The turn
-// id is deterministic ("<taskID>:user") so a retried submission cannot
-// duplicate it.
-func (s *HTTPServer) recordUserTurn(ctx context.Context, w http.ResponseWriter, task domain.Task, session domain.AgentSession) error {
-	turn := domain.ConversationTurn{
-		ID:        task.ID + ":user",
-		SessionID: task.SessionID,
-		TaskID:    task.ID,
-		AgentID:   task.AgentID,
-		Role:      domain.ConversationRoleUser,
-		Content:   userTurnContent(task.Input, len(task.Images)),
-		CreatedAt: task.CreatedAt,
-	}
-	if _, err := s.sessions.AppendConversationTurnIfAbsent(ctx, turn); err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("record user turn: %v", err))
-		return err
-	}
-	// Refresh the session's updated_at even when the turn already existed (a
-	// resubmission), so the session sorts to the top of the list. Preserve the
-	// existing project/title/created_at by re-saving the loaded session.
+// touchSessionOnSubmit refreshes the owning session's updated_at when a task is
+// submitted into it, so the session sorts to the top of the session list. The
+// session must already be loaded by the caller (handleCreateTask resolves it
+// once, to derive the task's mode, and passes it here rather than querying it a
+// second time); the existing project/title/created_at are preserved by
+// re-saving that loaded session. It writes a 5xx response and returns a non-nil
+// error when the write fails, so the caller aborts loudly instead of enqueuing a
+// task whose session bookkeeping was lost.
+//
+// It no longer writes the prompt anywhere: conversation content lives only in
+// the session event log now (spec §3 取舍 A2), written by the runtime's
+// recordUserMessage when the task actually runs. Touching on every submit —
+// including a resubmission of the same task id — is unchanged behaviour.
+func (s *HTTPServer) touchSessionOnSubmit(ctx context.Context, w http.ResponseWriter, task domain.Task, session domain.AgentSession) error {
 	session.UpdatedAt = task.CreatedAt
 	if err := s.sessions.SaveAgentSession(ctx, session); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("touch session: %v", err))
@@ -1266,16 +1241,12 @@ func (s *HTTPServer) handleGetTaskResult(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusInternalServerError, fmt.Sprintf("task result: %v", err))
 		return
 	}
-	// On a completed task tied to a session, persist the assistant answer as a
-	// conversation turn so the GUI can reload the full history. The turn id is
-	// deterministic ("<taskID>:assistant"), and the insert is exactly-once, so
-	// repeated polling of this endpoint yields a single assistant turn.
-	if task.Status == domain.TaskDone && strings.TrimSpace(task.SessionID) != "" && strings.TrimSpace(result) != "" {
-		if err := s.recordAssistantTurn(r.Context(), task, result, usage, generatedFiles); err != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Sprintf("record assistant turn: %v", err))
-			return
-		}
-	}
+	// Nothing is persisted here any more. The assistant answer, its token usage
+	// and its generated files all reach the conversation through the session
+	// event log, which the runtime writes as the task runs and
+	// ListConversationTurns projects back out (spec §3 取舍 A2); a second write
+	// from this read-only endpoint would be the second source of truth that
+	// retiring conversation_turns exists to remove.
 	writeJSON(w, http.StatusOK, taskResultResponse{
 		TaskID:           taskID,
 		Status:           string(task.Status),
@@ -1287,36 +1258,6 @@ func (s *HTTPServer) handleGetTaskResult(w http.ResponseWriter, r *http.Request)
 		ElapsedMs:        usage.ElapsedMs,
 		GeneratedFiles:   s.generatedFilesDTO(task.SessionID, generatedFiles),
 	})
-}
-
-// recordAssistantTurn persists the model answer for a completed task exactly
-// once, keyed by "<taskID>:assistant", together with the token usage and the
-// workspace-relative generated file paths reported for that task, so
-// conversation history carries the same counts and files as the task result
-// response. A nil session store while a task carries a session id is an
-// inconsistent state and is surfaced as an error rather than ignored.
-func (s *HTTPServer) recordAssistantTurn(ctx context.Context, task domain.Task, result string, usage taskUsage, generatedFiles []string) error {
-	if s.sessions == nil {
-		return fmt.Errorf("session store is unavailable")
-	}
-	turn := domain.ConversationTurn{
-		ID:               task.ID + ":assistant",
-		SessionID:        task.SessionID,
-		TaskID:           task.ID,
-		AgentID:          task.AgentID,
-		Role:             domain.ConversationRoleAssistant,
-		Content:          result,
-		PromptTokens:     usage.PromptTokens,
-		CompletionTokens: usage.CompletionTokens,
-		CachedTokens:     usage.CachedTokens,
-		TotalTokens:      usage.TotalTokens,
-		CreatedAt:        time.Now(),
-		GeneratedFiles:   generatedFiles,
-	}
-	if _, err := s.sessions.AppendConversationTurnIfAbsent(ctx, turn); err != nil {
-		return err
-	}
-	return nil
 }
 
 // taskResult scans the runtime event bus for the task_completed event of the

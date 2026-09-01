@@ -37,7 +37,8 @@ var ErrAgentSessionNotFound = errors.New("agent session not found")
 // column migrations in migrate change. Version 2 added the agent_sessions.project
 // and tasks.session_id columns for two-level session grouping. Version 3 added
 // the agent_sessions.archived column for archiving sessions and projects. Version
-// 4 added the conversation_turns_fts FTS5 virtual table backing session_search.
+// 4 added the (since retired) conversation_turns_fts FTS5 virtual table that
+// then backed session_search.
 // Version 5 added the agent_sessions.mode column for persisting manual/auto mode.
 // Version 6 added the agent_sessions.working_dir column for persisting the host
 // filesystem directory a session is bound to.
@@ -50,7 +51,14 @@ var ErrAgentSessionNotFound = errors.New("agent session not found")
 // Version 10 added the session_events_fts FTS5 virtual table, which moves
 // session_search's discovery mode off conversation_turns_fts and onto the event
 // log so tool calls and their results are searchable too.
-const CurrentSchemaVersion = 10
+// Version 11 retired conversation_turns and conversation_turns_fts: their create
+// statements and their additive column migrations are gone, and so are the
+// writers that fed them. The session event log is the single source of truth for
+// conversation content (spec §3 取舍 A2) — ListConversationTurns projects the
+// turns out of it and session_search reads session_events_fts. Existing
+// databases are not migrated (spec §3 取舍 B3): the two tables are simply no
+// longer created, no longer written, and no longer read.
+const CurrentSchemaVersion = 11
 
 type WorkflowState struct {
 	Definition workflow.Definition `json:"definition"`
@@ -308,27 +316,23 @@ func (r *SQLiteRepository) SaveAgentSession(ctx context.Context, session domain.
 }
 
 // DeleteAgentSession removes a session and cascades the delete to everything
-// that reconstructs its conversation — its event log and its (retiring)
-// conversation turn rows — in a single transaction so a partial failure cannot
-// leave orphans. A session id that does not exist is reported as an error
-// rather than silently treated as success, per the fail-loud rule: deleting a
-// nonexistent session is an inconsistent request the caller must learn about.
+// that reconstructs its conversation — its event log and that log's search
+// index — in a single transaction so a partial failure cannot leave orphans. A
+// session id that does not exist is reported as an error rather than silently
+// treated as success, per the fail-loud rule: deleting a nonexistent session is
+// an inconsistent request the caller must learn about.
 //
-// session_events must be cleared here, not only conversation_turns: since
-// ListConversationTurns projects from the event log (spec §3 取舍 A2), leaving
-// the events behind would let a deleted session's whole conversation keep
-// coming back out of the read path — a delete that visibly deletes nothing.
+// session_events is the whole of it now that conversation_turns has been
+// retired: ListConversationTurns projects from the event log (spec §3 取舍 A2),
+// so leaving the events behind would let a deleted session's whole conversation
+// keep coming back out of the read path — a delete that visibly deletes
+// nothing.
 func (r *SQLiteRepository) DeleteAgentSession(ctx context.Context, sessionID string) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin delete agent session %q: %w", sessionID, err)
 	}
 	defer tx.Rollback()
-	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM conversation_turns WHERE session_id = ?
-	`, sessionID); err != nil {
-		return fmt.Errorf("delete conversation turns for session %q: %w", sessionID, err)
-	}
 	if _, err := tx.ExecContext(ctx, `
 		DELETE FROM session_events WHERE session_id = ?
 	`, sessionID); err != nil {
@@ -423,96 +427,6 @@ func (r *SQLiteRepository) ListAgentSessions(ctx context.Context, companyID stri
 		return nil, fmt.Errorf("iterate agent sessions: %w", err)
 	}
 	return sessions, nil
-}
-
-func (r *SQLiteRepository) AppendConversationTurn(ctx context.Context, turn domain.ConversationTurn) error {
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin append conversation turn %q: %w", turn.ID, err)
-	}
-	defer tx.Rollback()
-	gf, err := json.Marshal(turn.GeneratedFiles)
-	if err != nil {
-		return fmt.Errorf("marshal generated files for turn %q: %w", turn.ID, err)
-	}
-	if turn.GeneratedFiles == nil {
-		gf = []byte("[]")
-	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO conversation_turns (
-			id, session_id, task_id, agent_id, model_profile, role, content, created_at,
-			prompt_tokens, completion_tokens, cached_tokens, total_tokens, generated_files
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, turn.ID, turn.SessionID, turn.TaskID, turn.AgentID, turn.ModelProfile, string(turn.Role), turn.Content, formatTime(turn.CreatedAt),
-		turn.PromptTokens, turn.CompletionTokens, turn.CachedTokens, turn.TotalTokens, string(gf)); err != nil {
-		return fmt.Errorf("append conversation turn %q: %w", turn.ID, err)
-	}
-	if err := indexConversationTurn(ctx, tx, turn); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE agent_sessions
-		SET updated_at = ?
-		WHERE id = ?
-	`, formatTime(turn.CreatedAt), turn.SessionID); err != nil {
-		return fmt.Errorf("touch agent session %q: %w", turn.SessionID, err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit append conversation turn %q: %w", turn.ID, err)
-	}
-	return nil
-}
-
-// AppendConversationTurnIfAbsent inserts a turn only when no turn with the same
-// id already exists, returning whether it was inserted. This gives an
-// exactly-once write for turns keyed by a deterministic id (e.g. "<taskID>:user"),
-// so repeated calls — such as polling the task result endpoint — do not duplicate
-// the turn. The session's updated_at is touched only on a real insert. A genuine
-// write failure is returned wrapped, never swallowed.
-func (r *SQLiteRepository) AppendConversationTurnIfAbsent(ctx context.Context, turn domain.ConversationTurn) (bool, error) {
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return false, fmt.Errorf("begin append conversation turn %q if absent: %w", turn.ID, err)
-	}
-	defer tx.Rollback()
-	gf, err := json.Marshal(turn.GeneratedFiles)
-	if err != nil {
-		return false, fmt.Errorf("marshal generated files for turn %q: %w", turn.ID, err)
-	}
-	if turn.GeneratedFiles == nil {
-		gf = []byte("[]")
-	}
-	res, err := tx.ExecContext(ctx, `
-		INSERT OR IGNORE INTO conversation_turns (
-			id, session_id, task_id, agent_id, model_profile, role, content, created_at,
-			prompt_tokens, completion_tokens, cached_tokens, total_tokens, generated_files
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, turn.ID, turn.SessionID, turn.TaskID, turn.AgentID, turn.ModelProfile, string(turn.Role), turn.Content, formatTime(turn.CreatedAt),
-		turn.PromptTokens, turn.CompletionTokens, turn.CachedTokens, turn.TotalTokens, string(gf))
-	if err != nil {
-		return false, fmt.Errorf("append conversation turn %q if absent: %w", turn.ID, err)
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("check inserted conversation turn %q rows affected: %w", turn.ID, err)
-	}
-	if affected == 0 {
-		return false, nil
-	}
-	if err := indexConversationTurn(ctx, tx, turn); err != nil {
-		return false, err
-	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE agent_sessions
-		SET updated_at = ?
-		WHERE id = ?
-	`, formatTime(turn.CreatedAt), turn.SessionID); err != nil {
-		return false, fmt.Errorf("touch agent session %q: %w", turn.SessionID, err)
-	}
-	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("commit append conversation turn %q if absent: %w", turn.ID, err)
-	}
-	return true, nil
 }
 
 // ListConversationTurns 返回一条会话的对话轮次，按时间正序；limit > 0 时只取
@@ -718,21 +632,6 @@ func sessionEventSearchTerms(raw string) (ftsExpr string, likeTerms []string) {
 // index write can run inside the same transaction as the source-row insert.
 type execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
-}
-
-// indexConversationTurn mirrors a conversation turn into the FTS5 index. It runs
-// inside the caller's transaction so the index and the source table commit
-// together; a failure is returned wrapped rather than swallowed, so a turn is
-// never persisted without being searchable.
-func indexConversationTurn(ctx context.Context, ex execer, turn domain.ConversationTurn) error {
-	if _, err := ex.ExecContext(ctx, `
-		INSERT INTO conversation_turns_fts (
-			content, turn_id, session_id, task_id, agent_id, role, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, turn.Content, turn.ID, turn.SessionID, turn.TaskID, turn.AgentID, string(turn.Role), formatTime(turn.CreatedAt)); err != nil {
-		return fmt.Errorf("index conversation turn %q for search: %w", turn.ID, err)
-	}
-	return nil
 }
 
 // searchHitRole maps the event type behind a search hit to the conversation role
@@ -1851,20 +1750,6 @@ func (r *SQLiteRepository) migrate(ctx context.Context) error {
 	if err := r.applyColumnMigrations(ctx); err != nil {
 		return err
 	}
-	// One-time FTS backfill: turns written before schema version 4 predate the
-	// conversation_turns_fts index. Read the prior recorded version now that
-	// schema_migrations exists (0 on a fresh DB) and, when upgrading from below 4,
-	// index any conversation turns not yet present. The backfill is idempotent
-	// (it skips already-indexed rows), so a fresh DB with no turns is a no-op.
-	priorVersion, err := r.SchemaVersion(ctx)
-	if err != nil {
-		return err
-	}
-	if priorVersion < 4 {
-		if _, err := r.BackfillConversationTurnsFTS(ctx); err != nil {
-			return err
-		}
-	}
 	if _, err := r.db.ExecContext(ctx, `
 		INSERT OR IGNORE INTO schema_migrations (version, applied_at)
 		VALUES (?, ?)
@@ -1872,31 +1757,6 @@ func (r *SQLiteRepository) migrate(ctx context.Context) error {
 		return fmt.Errorf("record schema migration: %w", err)
 	}
 	return nil
-}
-
-// BackfillConversationTurnsFTS indexes every conversation turn that is not yet
-// present in the FTS table, returning how many rows were added. It is idempotent
-// via a NOT EXISTS guard, so re-running it never double-indexes a turn. It backs
-// the one-time schema v4 upgrade and can be called directly to repair the index.
-func (r *SQLiteRepository) BackfillConversationTurnsFTS(ctx context.Context) (int, error) {
-	res, err := r.db.ExecContext(ctx, `
-		INSERT INTO conversation_turns_fts (
-			content, turn_id, session_id, task_id, agent_id, role, created_at
-		)
-		SELECT t.content, t.id, t.session_id, t.task_id, t.agent_id, t.role, t.created_at
-		FROM conversation_turns t
-		WHERE NOT EXISTS (
-			SELECT 1 FROM conversation_turns_fts f WHERE f.turn_id = t.id
-		)
-	`)
-	if err != nil {
-		return 0, fmt.Errorf("backfill conversation turns fts: %w", err)
-	}
-	added, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("backfill conversation turns fts rows affected: %w", err)
-	}
-	return int(added), nil
 }
 
 // columnMigration describes one additive column that CREATE TABLE IF NOT EXISTS
@@ -1945,11 +1805,6 @@ var columnMigrations = []columnMigration{
 	// default backfills them correctly rather than leaving a blank that reads
 	// as "unknown".
 	{table: "audit_events", column: "origin", stmt: `ALTER TABLE audit_events ADD COLUMN origin TEXT NOT NULL DEFAULT 'agent'`},
-	{table: "conversation_turns", column: "prompt_tokens", stmt: `ALTER TABLE conversation_turns ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0`},
-	{table: "conversation_turns", column: "completion_tokens", stmt: `ALTER TABLE conversation_turns ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0`},
-	{table: "conversation_turns", column: "cached_tokens", stmt: `ALTER TABLE conversation_turns ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0`},
-	{table: "conversation_turns", column: "total_tokens", stmt: `ALTER TABLE conversation_turns ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0`},
-	{table: "conversation_turns", column: "generated_files", stmt: `ALTER TABLE conversation_turns ADD COLUMN generated_files TEXT NOT NULL DEFAULT '[]'`},
 }
 
 // applyColumnMigrations runs the additive ALTER TABLE migrations idempotently.
@@ -2039,27 +1894,6 @@ func scanAgentSession(row scanner) (domain.AgentSession, error) {
 	session.CreatedAt = parsedCreatedAt
 	session.UpdatedAt = parsedUpdatedAt
 	return session, nil
-}
-
-func scanConversationTurn(row scanner) (domain.ConversationTurn, error) {
-	var turn domain.ConversationTurn
-	var role string
-	var createdAt string
-	var gfRaw string
-	if err := row.Scan(&turn.ID, &turn.SessionID, &turn.TaskID, &turn.AgentID, &turn.ModelProfile, &role, &turn.Content, &createdAt,
-		&turn.PromptTokens, &turn.CompletionTokens, &turn.CachedTokens, &turn.TotalTokens, &gfRaw); err != nil {
-		return domain.ConversationTurn{}, err
-	}
-	parsedCreatedAt, err := parseTime(createdAt)
-	if err != nil {
-		return domain.ConversationTurn{}, fmt.Errorf("parse conversation turn %q created_at: %w", turn.ID, err)
-	}
-	turn.Role = domain.ConversationRole(role)
-	turn.CreatedAt = parsedCreatedAt
-	if err := json.Unmarshal([]byte(gfRaw), &turn.GeneratedFiles); err != nil {
-		return domain.ConversationTurn{}, fmt.Errorf("unmarshal generated files for turn %q: %w", turn.ID, err)
-	}
-	return turn, nil
 }
 
 func scanAgentMessage(row scanner) (domain.AgentMessage, error) {
@@ -2180,36 +2014,6 @@ var schemaStatements = []string{
 		working_dir TEXT NOT NULL DEFAULT '',
 		created_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL
-	)`,
-	`CREATE TABLE IF NOT EXISTS conversation_turns (
-		id TEXT PRIMARY KEY,
-		session_id TEXT NOT NULL,
-		task_id TEXT NOT NULL,
-		agent_id TEXT NOT NULL,
-		model_profile TEXT NOT NULL,
-		role TEXT NOT NULL,
-		content TEXT NOT NULL,
-		created_at TEXT NOT NULL,
-		prompt_tokens INTEGER NOT NULL DEFAULT 0,
-		completion_tokens INTEGER NOT NULL DEFAULT 0,
-		cached_tokens INTEGER NOT NULL DEFAULT 0,
-		total_tokens INTEGER NOT NULL DEFAULT 0,
-		generated_files TEXT NOT NULL DEFAULT '[]'
-	)`,
-	// conversation_turns_fts is a full-text index over conversation turn content,
-	// backing the session_search tool (discovery mode). The non-content columns
-	// are UNINDEXED: they are stored for retrieval only, not tokenized. Rows are
-	// written alongside conversation_turns in the same transaction so the index
-	// never drifts from the source table. Turns written before this table existed
-	// are not backfilled; search covers turns recorded from schema version 4 on.
-	`CREATE VIRTUAL TABLE IF NOT EXISTS conversation_turns_fts USING fts5(
-		content,
-		turn_id UNINDEXED,
-		session_id UNINDEXED,
-		task_id UNINDEXED,
-		agent_id UNINDEXED,
-		role UNINDEXED,
-		created_at UNINDEXED
 	)`,
 	`CREATE TABLE IF NOT EXISTS agent_messages (
 		id TEXT PRIMARY KEY,
