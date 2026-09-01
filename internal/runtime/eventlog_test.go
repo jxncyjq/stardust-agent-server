@@ -190,7 +190,7 @@ func TestOneRoundProducesTheExpectedSequence(t *testing.T) {
 	rec.recordTurnStart(0)
 	rec.recordUserMessage("hello")
 	rec.recordStepStart()
-	rec.recordAssistantMessage("working", []domain.ToolCall{{ID: "c1", Name: "read_file"}}, eventUsage{}, "default")
+	rec.recordAssistantMessage("working", []domain.ToolCall{{ID: "c1", Name: "read_file"}}, eventUsage{}, "default", nil)
 	rec.recordToolCall(domain.ToolCall{ID: "c1", Name: "read_file"})
 	rec.recordToolResult("c1", "ok", false, time.Millisecond)
 	rec.recordStepEnd(domain.StepEndReasonCompleted)
@@ -301,8 +301,8 @@ func TestRecordAssistantMessageFlushesWithManyToolCalls(t *testing.T) {
 
 	rec := newEventRecorder(repo, domain.Task{ID: "t1", SessionID: "s1"})
 	rec.recordAssistantMessage(
-		strings.Repeat("x", maxEventPreviewRunes), // content 也顶到截断上限，模拟最坏情况
-		calls, eventUsage{Prompt: 1, Completion: 2, Cached: 3, Total: 6}, "default",
+		strings.Repeat("x", maxEventPreviewRunes), // content 不小，逼近容量上限时的真实形状
+		calls, eventUsage{Prompt: 1, Completion: 2, Cached: 3, Total: 6}, "default", nil,
 	)
 
 	if err := rec.flush(context.Background()); err != nil {
@@ -381,4 +381,112 @@ func TestABarrierIsANoOpWithoutAStore(t *testing.T) {
 	if err := rec.barrier(context.Background(), "before the model request"); err != nil {
 		t.Errorf("没有 store 的部署被屏障挡住了：%v", err)
 	}
+}
+
+// 投影（P3）要从事件里还原出完整的 domain.ConversationTurn。P2 的载荷缺五个字段，
+// 缺任何一个都不会报错，只会让下游悄悄少点东西：TaskID 缺了模型会看到重复的 user
+// 消息，GeneratedFiles 缺了 GUI 的文件卡片静默失效。所以这里逐字段断言。
+func TestUserMessageEventCarriesEverythingAProjectionNeeds(t *testing.T) {
+	t.Parallel()
+
+	store := &captureEventStore{}
+	rec := newEventRecorder(store, domain.Task{ID: "task-7", SessionID: "sess-1", AgentID: "agent-a"})
+	rec.recordTurnStart(0)
+	rec.recordUserMessage("请读一下 notes.md")
+	if err := rec.flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	data := payloadOfType(t, store.events, domain.SessionEventUserMessage)
+	if got := data["task_id"]; got != "task-7" {
+		t.Errorf("task_id = %v，要 task-7：session_turns.go 用它滤掉任务自己的 user turn，缺了模型会看到重复消息", got)
+	}
+	if got, _ := data["turn_id"].(string); got == "" {
+		t.Error("turn_id 为空：ScrollMessages 用它定位锚点，投影时现生成会让同一条 turn 每次 ID 都不同")
+	}
+	if got := data["content"]; got != "请读一下 notes.md" {
+		t.Errorf("content = %v，要原文", got)
+	}
+}
+
+func TestAssistantMessageEventCarriesEverythingAProjectionNeeds(t *testing.T) {
+	t.Parallel()
+
+	store := &captureEventStore{}
+	rec := newEventRecorder(store, domain.Task{ID: "task-7", SessionID: "sess-1", AgentID: "agent-a"})
+	rec.recordTurnStart(0)
+	rec.recordStepStart()
+	rec.recordAssistantMessage(
+		"读好了",
+		nil,
+		eventUsage{Prompt: 11, Completion: 22, Cached: 3, Total: 33},
+		"fast",
+		[]string{"out/report.md"},
+	)
+	if err := rec.flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	data := payloadOfType(t, store.events, domain.SessionEventAssistantMessage)
+	if got := data["task_id"]; got != "task-7" {
+		t.Errorf("task_id = %v，要 task-7", got)
+	}
+	if got := data["agent_id"]; got != "agent-a" {
+		t.Errorf("agent_id = %v，要 agent-a", got)
+	}
+	if got, _ := data["turn_id"].(string); got == "" {
+		t.Error("turn_id 为空")
+	}
+	files, _ := data["generated_files"].([]any)
+	if len(files) != 1 || files[0] != "out/report.md" {
+		t.Errorf("generated_files = %v，要 [out/report.md]：缺了 GUI 的文件卡片会静默失效", files)
+	}
+}
+
+// 对话正文是对话本体，不是工具输出。模型侧允许 defaultMaxTurnChars = 6000 字符，
+// 而 maxEventPreviewRunes 只有 2000——截断会让历史对话缩到 1/3，
+// 直接违反 P3 判据「五个模型侧消费者行为不变」。
+func TestConversationContentIsStoredWhole(t *testing.T) {
+	t.Parallel()
+
+	long := strings.Repeat("话", 5000) // 远超 maxEventPreviewRunes = 2000
+	store := &captureEventStore{}
+	rec := newEventRecorder(store, domain.Task{ID: "task-7", SessionID: "sess-1", AgentID: "agent-a"})
+	rec.recordTurnStart(0)
+	rec.recordUserMessage(long)
+	rec.recordStepStart()
+	rec.recordAssistantMessage(long, nil, eventUsage{}, "fast", nil)
+	if err := rec.flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	for _, typ := range []domain.SessionEventType{
+		domain.SessionEventUserMessage,
+		domain.SessionEventAssistantMessage,
+	} {
+		data := payloadOfType(t, store.events, typ)
+		got, _ := data["content"].(string)
+		if len([]rune(got)) != 5000 {
+			t.Errorf("%s 的 content 有 %d runes，要 5000：对话正文不该被截断",
+				typ, len([]rune(got)))
+		}
+	}
+}
+
+// payloadOfType 取出指定类型的第一条事件的载荷。找不到就 Fatal——
+// 「没有这条事件」和「这条事件字段不对」是两种不同的失败，不要混在一起报。
+func payloadOfType(t *testing.T, events []domain.SessionEvent, typ domain.SessionEventType) map[string]any {
+	t.Helper()
+	for _, ev := range events {
+		if ev.Type != typ {
+			continue
+		}
+		var data map[string]any
+		if err := json.Unmarshal(ev.Data, &data); err != nil {
+			t.Fatalf("unmarshal %s payload: %v", typ, err)
+		}
+		return data
+	}
+	t.Fatalf("日志里没有 %s 事件", typ)
+	return nil
 }

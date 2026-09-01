@@ -41,6 +41,13 @@ import (
 type eventRecorder struct {
 	store   port.SessionEventStore
 	session string
+	// taskID / agentID 是这次执行的任务与承接它的 agent 身份，newEventRecorder 时
+	// 定死、不随后续调用变化。record* 方法把它们写进 user/message 与
+	// assistant/message 的载荷，供 P3 投影出 domain.ConversationTurn.TaskID/AgentID：
+	// session_turns.go 用 TaskID 滤掉任务自己的 user turn，AgentID 是 /turns 响应
+	// 与 FTS5 索引都要用的字段。
+	taskID  string
+	agentID string
 
 	mu      sync.Mutex
 	pending []domain.SessionEvent
@@ -66,7 +73,7 @@ func newEventRecorder(store port.SessionEventStore, task domain.Task) *eventReco
 	if session == "" {
 		panic("runtime: event recorder needs a session id or a task id; a task with neither cannot own a log")
 	}
-	return &eventRecorder{store: store, session: session}
+	return &eventRecorder{store: store, session: session, taskID: task.ID, agentID: task.AgentID}
 }
 
 // sessionID 是这次执行写入的会话日志。
@@ -138,9 +145,21 @@ func (e *eventRecorder) recordTurnStart(turn int) {
 }
 
 // recordUserMessage 记这一轮的用户输入。
+//
+// content 存**全文**，不截断：对话正文是对话本体，不是工具输出。模型侧允许
+// defaultMaxTurnChars = 6000 字符（session_turns.go），截到 maxEventPreviewRunes
+// = 2000 会让历史对话缩到 1/3。超长单条消息撞 P1 的 64 KiB/条上限时 flush → Append
+// 会 fail-loud 报错——那是正确行为，这里不为它兜底。
+//
+// task_id 供投影滤掉任务自己的 user turn（session_turns.go 用 turn.TaskID ==
+// task.ID）；turn_id 是这条 ConversationTurn 的稳定标识，供 ScrollMessages 定位
+// 锚点，见 newTurnID。
 func (e *eventRecorder) recordUserMessage(content string) {
 	e.append(domain.SessionEventUserMessage, map[string]any{
-		"turn": e.currentTurn(), "content": truncateRunes(content, maxEventPreviewRunes),
+		"turn":    e.currentTurn(),
+		"turn_id": e.newTurnID(domain.SessionEventUserMessage),
+		"task_id": e.taskID,
+		"content": content,
 	})
 }
 
@@ -153,10 +172,20 @@ func (e *eventRecorder) recordStepStart() {
 
 // recordAssistantMessage 记模型响应（含它请求的工具调用与 token 用量）。
 //
+// content 同 recordUserMessage：存**全文**，不截断——理由同样是「对话正文是对话
+// 本体，不是工具输出」，见 recordUserMessage 的文档注释。
+//
+// generatedFiles 是这一步经 write_file 产出的工作区相对路径；GUI 的「对话生成
+// 文件卡片」靠它渲染（server/http.go 的 generatedFilesDTO）。为 nil/空是合法的
+// 可选（这一步没写文件），不是兜底。
+//
+// task_id / agent_id / turn_id 供投影还原 domain.ConversationTurn 的对应字段：
+// turn_id 见 newTurnID 的文档注释。
+//
 // tool_calls 摘要数组**故意不截断**，这是权衡过的决定，不是漏掉的截断：
 // spec §4.3.1 第 2 条要求 P3 投影按 call_id 配对，而这个数组正是配对时要用的清单。
 // 截掉其中任意一项，恢复/投影就会缺项——那是比容量风险更重的正确性缺陷，用一个
-// 换另一个不划算。content/arguments/preview 三处按 maxEventPreviewRunes 截断是因为
+// 换另一个不划算。arguments/preview 两处按 maxEventPreviewRunes 截断是因为
 // 它们是自由文本，截了不影响可配对性；tool_calls 每项只是 call_id+name，本身已经
 // 很小，风险来自「条目数」而不是「单项体积」。
 //
@@ -165,20 +194,53 @@ func (e *eventRecorder) recordStepStart() {
 // 这是 fail-loud 的正确表现，不是数据损坏（不静默丢事件、不裁剪配对信息）。
 // TestRecordAssistantMessageFlushesWithManyToolCalls 用一个远超真实单步工具调用数量
 // 的上界证明：在这个上界内，flush 确实能落盘、不会撞到那个上限。
-func (e *eventRecorder) recordAssistantMessage(content string, calls []domain.ToolCall, usage eventUsage, profile string) {
+func (e *eventRecorder) recordAssistantMessage(content string, calls []domain.ToolCall, usage eventUsage, profile string, generatedFiles []string) {
 	names := make([]map[string]any, 0, len(calls))
 	for _, c := range calls {
 		names = append(names, map[string]any{"call_id": c.ID, "name": c.Name})
 	}
 	e.append(domain.SessionEventAssistantMessage, map[string]any{
 		"turn": e.currentTurn(), "step": e.currentStep(),
-		"content": truncateRunes(content, maxEventPreviewRunes), "tool_calls": names,
+		"turn_id":  e.newTurnID(domain.SessionEventAssistantMessage),
+		"task_id":  e.taskID,
+		"agent_id": e.agentID,
+		"content":  content, "tool_calls": names,
 		"usage": map[string]any{
 			"prompt": usage.Prompt, "completion": usage.Completion,
 			"cached": usage.Cached, "total": usage.Total,
 		},
-		"model_profile": profile,
+		"model_profile":   profile,
+		"generated_files": generatedFiles,
 	})
+}
+
+// newTurnID 生成一个投影稳定的 turn 标识（这里的「turn」指 domain.ConversationTurn
+// 的一行——一条 user/message 或 assistant/message 事件各自投影出一行——不是本文件
+// e.turn 那个「每次 RunTask 一个」的会话轮次计数，两者是同名不同义的两个概念）。
+//
+// 它必须**写进事件**、而不是投影时现生成：ScrollMessages 用 turns[i].ID == aroundID
+// 定位锚点，调用方拿着上一次响应里的 ID 回来；投影每次现生成的话同一条 turn 两次
+// 投影出来的 ID 不同，锚点必然找不到，而那是 fmt.Errorf 直接报错，不是返回空。
+//
+// 用「会话号 + turn 号 + step 号 + 事件类型」派生，不用 seq：append 把事件放进
+// pending 时 seq 还没分配，要 flush 时才知道库里的 next-seq（见 flush 的文档
+// 注释）；为了在这里拿到 seq 而去调 ReadFrom 或 Load 违反 spec §4.3.1 第 3 条
+// （任务执行路径上不许调 Load），且每条消息一次 ReadFrom 是不必要的 O(n) 额外读。
+//
+// 这个组合在一次执行里稳定且唯一：
+//   - user/message 每个会话轮次只记一次（RunTask 顶部一次；resume 路径不重复调
+//     recordUserMessage），此时 step 恒为 recordTurnStart 刚重置过的 0；
+//   - assistant/message 总是紧邻 recordStepStart 之后记，而 step 只在
+//     recordStepEnd 里推进，所以同一 (turn, step) 在这次执行里只会被
+//     recordAssistantMessage 用到一次；
+//   - 事件类型这一段是防两者在同一 (turn, step) 上撞车的关键：user/message 与
+//     一个 turn 内第一条 assistant/message 都发生在 step 0，不带类型会撞出同一
+//     个 ID。
+//
+// 同一条事件被投影多少次，它落盘时的 turn、step、类型都不变，因此这个 ID 在多次
+// 投影之间保持一致——这正是 ScrollMessages 定位锚点所需要的全部保证。
+func (e *eventRecorder) newTurnID(typ domain.SessionEventType) string {
+	return fmt.Sprintf("%s:%d:%d:%s", e.session, e.currentTurn(), e.currentStep(), typ)
 }
 
 // recordToolCall 记一次工具调用**被派发之前**的事实（spec §5 屏障 2 的前提）。
