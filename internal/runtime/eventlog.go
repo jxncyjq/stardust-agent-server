@@ -16,6 +16,22 @@ import (
 // 它是**每次 RunTask 一个**：seq 游标、缓冲区都属于这一次执行，不跨任务共享。
 // 真正的串行化与 seq 连续性由 P1 的 store 保证（它在事务内查 next-seq 并持 per-session
 // 写锁），这里只负责「发什么、什么时候必须落盘」。
+//
+// 接收者契约：本类型的所有方法都假设接收者非 nil。字面 nil 接收者是编程错误，不是本
+// 类型承诺处理的状态，panic 是预期行为，不需要也不应该把它做成「安全返回」。
+// newEventRecorder 保证它返回的 recorder 永不是字面 nil（拿不到 session id 就直接
+// panic），所以持有 recorder 的调用方必须保证字段被赋过值：某次部署没有配置 store 时，
+// 正确做法是持有一个 store 字段为 nil 的 *eventRecorder（走 enabled() 判断的可选路径），
+// 而不是让持有 recorder 的字段保持零值 nil。
+//
+// 这与 enabled() 是两回事，不要混为一谈：enabled() 处理的是「Runtime 没配 store」——
+// 这是契约显式声明的可选部署形态（见 enabled() 的文档注释），不是对错误状态的兜底。
+// enabled() 方法体里的 e != nil 只是让这一个方法本身能在 nil 接收者上求值，不代表
+// 其余方法对 nil 接收者也是安全的：recordUserMessage/recordStepStart/
+// recordAssistantMessage/recordToolCall/recordToolResult/recordTurnEnd 六个方法在
+// 构造 e.append 的参数时会先经由 currentTurn()/currentStep() 直接 e.mu.Lock()，
+// 在字面 nil 接收者上仍会 panic；不要把 enabled() 的 e != nil 读成「本类型对 nil
+// 接收者是安全的」承诺。
 type eventRecorder struct {
 	store   port.SessionEventStore
 	session string
@@ -54,6 +70,11 @@ func (e *eventRecorder) sessionID() string { return e.session }
 //
 // 没有配 store 是**契约允许的可选**（见 Config.SessionEvents），不是错误：内存后端与
 // 大量测试构造都不配。它与「配了但写不进去」是两回事——后者由 flush 硬失败。
+//
+// 方法体里的 e != nil 只是让 enabled() 自己能在 nil 接收者上求值（append/flush/
+// recordTurnStart/recordStepEnd 都先调它），不是本类型「nil 接收者安全」的承诺——
+// 其余六个 record* 方法在构造参数时会先经由 currentTurn()/currentStep() 直接解引用
+// e.mu，enabled() 的判空来不及保护它们。接收者契约见 eventRecorder 类型文档。
 func (e *eventRecorder) enabled() bool { return e != nil && e.store != nil }
 
 // eventUsage 是一次模型响应的 token 用量。
@@ -94,9 +115,12 @@ func (e *eventRecorder) append(typ domain.SessionEventType, payload map[string]a
 
 // recordTurnStart 记一个轮次的开始，并把 step 计数归零（spec §4.1：step 每 turn 重置）。
 //
-// 先过 enabled() 再碰 e.mu：与其余六个 record* 方法共享同一条「怎么处理禁用/nil」的
-// 规则，不单独绕开 append() 的降级路径（记录器没启用时是契约允许的可选部署形态，
-// 不是错误，见 enabled() 的文档注释）。
+// 先过 enabled() 再碰 e.mu：目的是在「没配 store」这个契约允许的可选部署形态下，不必为
+// 丢弃一次记录而白白加锁（见 enabled() 的文档注释）。这**不代表**本方法与其余六个
+// record* 方法在 nil 接收者上的行为一致——那六个方法会先经由 currentTurn()/
+// currentStep() 直接解引用 e.mu，在字面 nil 接收者上仍会 panic；本方法把 enabled()
+// 判断放在任何解引用之前，只是这一个方法自己的写法。真正的接收者契约见 eventRecorder
+// 类型文档：所有方法都假设接收者非 nil，nil 接收者是编程错误，panic 是预期行为。
 func (e *eventRecorder) recordTurnStart(turn int) {
 	if !e.enabled() {
 		return
@@ -179,7 +203,9 @@ func (e *eventRecorder) recordToolResult(callID string, preview string, isError 
 
 // recordStepEnd 记一步的结束，并把 step 计数推进一格。
 //
-// 同 recordTurnStart：先过 enabled() 再碰 e.mu，与其余六个 record* 方法一致。
+// 同 recordTurnStart：先过 enabled() 再碰 e.mu，避免在「没配 store」时白白加锁。这不
+// 意味着与其余六个 record* 方法在 nil 接收者上的行为一致——见 recordTurnStart 与
+// eventRecorder 类型文档对接收者契约的说明。
 func (e *eventRecorder) recordStepEnd(reason string) {
 	if !e.enabled() {
 		return
