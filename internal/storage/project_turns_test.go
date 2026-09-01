@@ -189,6 +189,85 @@ func TestAMalformedPayloadIsRefused(t *testing.T) {
 	}
 }
 
+// 载荷缺字段不只是「JSON 语法损坏」这一种形状：合法 JSON 也能缺业务必填键
+// （例如 {"content":"hi"}，没有 turn_id 键）——json.Unmarshal 对此不报错，
+// 对应字段静默取 Go 零值 ""，如果不额外校验就会产出一条 ID="" 或 TaskID=""
+// 的 turn，函数还正常返回 nil error。这与 TestAMalformedPayloadIsRefused
+// 验的不是一回事：那条测试的载荷是**语法**错误（截断的 JSON，Unmarshal 本身
+// 就会报错）；这里的载荷句句都是合法 JSON，只是**业务**必填键缺失，必须靠
+// 显式的非空校验才能被拒绝。
+//
+// turn_id/task_id 在 user、assistant 两种事件里都校验：turn_id 缺失会让
+// ScrollMessages 的 turns[i].ID == aroundID 锚点定位失败，task_id 缺失会让
+// internal/runtime/session_turns.go 的同任务过滤失效，模型会看到重复的
+// user 消息。agent_id 只在 assistant 分支存在（user/message 事件本来就不带
+// 这个字段），同样按必填校验。
+func TestAPayloadMissingARequiredFieldIsRefused(t *testing.T) {
+	tests := []struct {
+		name      string
+		eventType domain.SessionEventType
+		payload   map[string]any
+		wantField string
+	}{
+		{
+			name:      "user message 缺 turn_id",
+			eventType: domain.SessionEventUserMessage,
+			payload:   map[string]any{"turn": 0, "task_id": "task-7", "content": "hi"},
+			wantField: "turn_id",
+		},
+		{
+			name:      "user message 缺 task_id",
+			eventType: domain.SessionEventUserMessage,
+			payload:   map[string]any{"turn": 0, "turn_id": "sess-1:1", "content": "hi"},
+			wantField: "task_id",
+		},
+		{
+			name:      "assistant message 缺 turn_id",
+			eventType: domain.SessionEventAssistantMessage,
+			payload: map[string]any{
+				"turn": 0, "step": 0, "task_id": "task-7", "agent_id": "agent-a", "content": "回复",
+			},
+			wantField: "turn_id",
+		},
+		{
+			name:      "assistant message 缺 task_id",
+			eventType: domain.SessionEventAssistantMessage,
+			payload: map[string]any{
+				"turn": 0, "step": 0, "turn_id": "sess-1:3", "agent_id": "agent-a", "content": "回复",
+			},
+			wantField: "task_id",
+		},
+		{
+			name:      "assistant message 缺 agent_id",
+			eventType: domain.SessionEventAssistantMessage,
+			payload: map[string]any{
+				"turn": 0, "step": 0, "turn_id": "sess-1:3", "task_id": "task-7", "content": "回复",
+			},
+			wantField: "agent_id",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			events := []domain.SessionEvent{
+				evWith(0, domain.SessionEventTurnStart, map[string]any{"turn": 0}),
+				evWith(1, tt.eventType, tt.payload),
+			}
+
+			_, err := projectTurns("sess-1", events)
+			if err == nil {
+				t.Fatalf("缺 %s 的合法 JSON 载荷没有被拒绝", tt.wantField)
+			}
+			if !strings.Contains(err.Error(), tt.wantField) {
+				t.Errorf("错误没有指名缺失字段 %q：%v", tt.wantField, err)
+			}
+			if !strings.Contains(err.Error(), "seq 1") {
+				t.Errorf("错误没有指名 seq：%v", err)
+			}
+		})
+	}
+}
+
 // 交接项（task-1-review.md 留下的承诺）：「同一事件源重复投影得到相同 ID」
 // 至今没有测试——它要等投影存在才能验。ScrollMessages 靠 turns[i].ID == aroundID
 // 定位锚点，ID 不稳定就是直接报错，所以这条必须补上。

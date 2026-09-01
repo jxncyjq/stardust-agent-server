@@ -56,6 +56,23 @@ func projectTurns(sessionID string, events []domain.SessionEvent) ([]domain.Conv
 				return nil, fmt.Errorf("project session %q: decode user/message at seq %d: %w",
 					sessionID, event.Seq, err)
 			}
+			// json.Unmarshal only catches syntax errors: legal JSON that simply
+			// omits a required key decodes to the Go zero value ("") without
+			// error. turn_id/task_id are not contractually optional here — an
+			// empty turn_id breaks ScrollMessages' anchor lookup
+			// (turns[i].ID == aroundID), and an empty task_id defeats the
+			// same-task filter in internal/runtime/session_turns.go:58, which
+			// would let the model see a duplicate user message. Both must be
+			// checked explicitly; a decoded zero value must not be allowed to
+			// stand in for "field present but empty".
+			if payload.TurnID == "" {
+				return nil, fmt.Errorf("project session %q: user/message at seq %d has no turn_id",
+					sessionID, event.Seq)
+			}
+			if payload.TaskID == "" {
+				return nil, fmt.Errorf("project session %q: user/message at seq %d has no task_id",
+					sessionID, event.Seq)
+			}
 			turns = append(turns, domain.ConversationTurn{
 				ID:        payload.TurnID,
 				SessionID: sessionID,
@@ -83,6 +100,31 @@ func projectTurns(sessionID string, events []domain.SessionEvent) ([]domain.Conv
 			if err := json.Unmarshal(event.Data, &payload); err != nil {
 				return nil, fmt.Errorf("project session %q: decode assistant/message at seq %d: %w",
 					sessionID, event.Seq, err)
+			}
+			// Same rationale as the user/message branch above: a legal-JSON
+			// payload missing a required key decodes to "" without error, and
+			// that must not be allowed to stand in as a valid turn. turn_id and
+			// task_id carry the same stakes here (ScrollMessages anchoring,
+			// session_turns.go's same-task filter). agent_id is checked too:
+			// unlike GeneratedFiles/ModelProfile — which domain.ConversationTurn's
+			// doc comment explicitly marks as a legitimate optional — nothing
+			// documents agent_id as allowed to be absent on an assistant turn,
+			// and internal/runtime/eventlog.go always writes it from
+			// task.AgentID (recordAssistantMessage's doc comment lists it
+			// alongside task_id/turn_id as fields "投影" needs back, with no
+			// optionality carve-out). Per CLAUDE.md's fail-loud rule, when
+			// optionality is undocumented it is treated as required.
+			if payload.TurnID == "" {
+				return nil, fmt.Errorf("project session %q: assistant/message at seq %d has no turn_id",
+					sessionID, event.Seq)
+			}
+			if payload.TaskID == "" {
+				return nil, fmt.Errorf("project session %q: assistant/message at seq %d has no task_id",
+					sessionID, event.Seq)
+			}
+			if payload.AgentID == "" {
+				return nil, fmt.Errorf("project session %q: assistant/message at seq %d has no agent_id",
+					sessionID, event.Seq)
 			}
 			turns = append(turns, domain.ConversationTurn{
 				ID:               payload.TurnID,
