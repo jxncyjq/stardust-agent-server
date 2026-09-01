@@ -28,9 +28,10 @@ type SQLiteRepository struct {
 	sessionEventLocks sessionWriteLocks
 }
 
-// ErrAgentSessionNotFound is returned by DeleteAgentSession when no session with
-// the given id exists. Callers (e.g. the HTTP layer) match it with errors.Is to
-// translate a missing session into a 404 instead of swallowing the failure.
+// ErrAgentSessionNotFound is returned by DeleteAgentSession and TouchAgentSession
+// when no session with the given id exists. Callers (e.g. the HTTP layer) match
+// it with errors.Is to translate a missing session into a 404 instead of
+// swallowing the failure.
 var ErrAgentSessionNotFound = errors.New("agent session not found")
 
 // CurrentSchemaVersion is bumped whenever schemaStatements or the idempotent
@@ -311,6 +312,61 @@ func (r *SQLiteRepository) SaveAgentSession(ctx context.Context, session domain.
 	`, session.ID, session.CompanyID, session.AgentID, session.Project, session.Title, mode, boolToInt(session.Archived), session.WorkingDir, formatTime(session.CreatedAt), formatTime(session.UpdatedAt))
 	if err != nil {
 		return fmt.Errorf("save agent session %q: %w", session.ID, err)
+	}
+	return nil
+}
+
+// TouchAgentSession advances a session's updated_at to at, and touches only
+// that column.
+//
+// Why field-level and not "read the row, mutate UpdatedAt, SaveAgentSession
+// it back": this repo has paid for that exact mistake once already (task-state
+// persistence, PR #44 — "写穿必须字段级不能全行 UPSERT"). SaveAgentSession's
+// INSERT ... ON CONFLICT DO UPDATE writes every column from the caller's
+// in-memory copy. Two processes touching the same session concurrently (e.g.
+// the TUI recording a turn while a GUI-attached server PATCHes title/mode/
+// working_dir) can interleave a read-modify-SaveAgentSession cycle around the
+// other process's write: whichever save lands second wins on *every* column,
+// silently reverting the fields it never meant to touch. A single UPDATE that
+// names only updated_at cannot clobber a sibling column no matter how it
+// interleaves with a concurrent writer — there is nothing else in the
+// statement for it to overwrite. If a future change wants to fold this back
+// into a whole-row upsert "for simplicity", re-read PR #44's postmortem first.
+//
+// Not wrapped in an explicit transaction: it is a single UPDATE statement, and
+// SQLite (via database/sql) auto-commits a lone statement as its own atomic
+// unit — there is no second statement here for a transaction to keep in sync
+// with. Compare AppendConversationTurn's tx.ExecContext calls above (now
+// retired) or DeleteAgentSession below, which need an explicit transaction
+// specifically because they coordinate *multiple* writes that must all land
+// or none.
+//
+// A session id with no matching row is fail-loud, not a silent no-op: the
+// contract this repository exposes doesn't declare "touch a session that was
+// never created, or that another process deleted out from under you" as a
+// legitimate outcome — the one caller today (tuiSessionController.
+// touchCurrentSession) always resolves the id from a session it just created,
+// loaded, or switched to, so a missing row here means the caller's view of
+// the world is stale, not that "no-op" was ever the intended contract.
+// Matches DeleteAgentSession's existing precedent for the same zero-rows
+// case. (server's touchSessionOnSubmit still does its own whole-row
+// SaveAgentSession touch — carrying it over to this method too is follow-up
+// work, not part of this change; see final-review-2.md §4 N-1.)
+func (r *SQLiteRepository) TouchAgentSession(ctx context.Context, sessionID string, at time.Time) error {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE agent_sessions
+		SET updated_at = ?
+		WHERE id = ?
+	`, formatTime(at), sessionID)
+	if err != nil {
+		return fmt.Errorf("touch agent session %q: %w", sessionID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check touched agent session %q rows affected: %w", sessionID, err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("touch agent session %q: %w", sessionID, ErrAgentSessionNotFound)
 	}
 	return nil
 }

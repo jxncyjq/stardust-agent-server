@@ -1025,6 +1025,11 @@ func persistentRunPorts(ctx context.Context, cfg config.Config) (runPorts, func(
 
 type conversationStore interface {
 	SaveAgentSession(context.Context, domain.AgentSession) error
+	// TouchAgentSession advances a session's updated_at without touching any
+	// other column. touchCurrentSession is the only caller in this file; see
+	// storage.SQLiteRepository.TouchAgentSession for why it must stay
+	// field-level rather than a whole-row SaveAgentSession.
+	TouchAgentSession(context.Context, string, time.Time) error
 	LatestAgentSession(context.Context, string, string) (domain.AgentSession, bool, error)
 	ListAgentSessions(context.Context, string, string) ([]domain.AgentSession, error)
 	ListConversationTurns(context.Context, string, int) ([]domain.ConversationTurn, error)
@@ -1280,16 +1285,28 @@ func (c *tuiSessionController) recordTurn(ctx context.Context, role domain.Conve
 // 「会话号」在 agent_sessions 里根本没有行，touch 要么 0 行受影响（静默无效，违反
 // fail-loud），要么就得开特例分支。
 //
+// 为什么必须走 TouchAgentSession（字段级 UPDATE）而不是「读整行、改
+// UpdatedAt、SaveAgentSession 写回去」：本仓在任务状态落盘那一期（PR #44）已经
+// 为同一个错误付过一次代价——「写穿必须字段级不能全行 UPSERT」。
+// SaveAgentSession 的 INSERT ... ON CONFLICT DO UPDATE 会把调用方内存里那份快照
+// 的**每一列**写回去；TUI 与 server（touchSessionOnSubmit）指向同一个 agent.db
+// 时，读到的那份快照和另一进程刚写完的 title/mode/working_dir 之间存在窗口，谁
+// 后落盘谁就把对方刚写的字段静默覆盖回旧值——不报任何错，症状只是数据莫名
+// 回退。TouchAgentSession 只在语句里点名 updated_at 一列，物理上没有别的列可
+// 覆盖，这个窗口就不存在。**下次不要图省事把它改回整行 SaveAgentSession**——
+// 那正是这条注释要挡住的事。
+//
 // 落点在 appendTurnEvent 成功之后：事件写失败就不该把会话标成「刚用过」。
-// RecordExchange 一轮连调两次 recordTurn，因而 touch 两次——SaveAgentSession 是整行
-// upsert，幂等，第二次只是把 updated_at 再往前推一点。
+// RecordExchange 一轮连调两次 recordTurn，因而 touch 两次，第二次只是把
+// updated_at 再往前推一点，幂等。
+//
+// 「当前会话行不存在」不是这里的可选状态，是 fail-loud：c.currentID 只会来自
+// 控制器自己刚创建 / 加载 / 切换到的那条会话，行凭空消失（例如另一进程把它
+// DeleteAgentSession 掉）意味着控制器手里的状态已经跟存储对不上了，装作没
+// touch 到等于用静默无操作掩盖了这个不一致——TouchAgentSession 因此在 0 行
+// 受影响时报错而不是吞掉。
 func (c *tuiSessionController) touchCurrentSession(ctx context.Context, now time.Time) error {
-	session, err := c.currentAgentSession(ctx)
-	if err != nil {
-		return fmt.Errorf("touch session %q after recording a turn: %w", c.currentID, err)
-	}
-	session.UpdatedAt = now
-	if err := c.store.SaveAgentSession(ctx, session); err != nil {
+	if err := c.store.TouchAgentSession(ctx, c.currentID, now); err != nil {
 		return fmt.Errorf("touch session %q after recording a turn: %w", c.currentID, err)
 	}
 	return nil

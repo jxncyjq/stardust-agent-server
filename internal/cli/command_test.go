@@ -1190,6 +1190,116 @@ func TestTUIRestoreLatestFollowsTheSessionThatWasLastUsed(t *testing.T) {
 	}
 }
 
+// touchSpyConversationStore wraps a real conversationStore and counts calls
+// to TouchAgentSession vs. SaveAgentSession, so a test can assert which write
+// path touchCurrentSession actually takes rather than only inspecting the
+// resulting row (which, for a *single* uncontested call, looks identical
+// whether the write was field-level or a whole-row read-modify-write — the
+// two only diverge under concurrent writers, see
+// storage.SQLiteRepository.TouchAgentSession's doc comment). Asserting on the
+// call pattern is what makes the "改回整行写" mutation observably fail
+// without depending on a real, potentially flaky, goroutine race.
+type touchSpyConversationStore struct {
+	conversationStore
+	touchAgentSessionCalls int
+	saveAgentSessionCalls  int
+}
+
+func (s *touchSpyConversationStore) TouchAgentSession(ctx context.Context, sessionID string, at time.Time) error {
+	s.touchAgentSessionCalls++
+	return s.conversationStore.TouchAgentSession(ctx, sessionID, at)
+}
+
+func (s *touchSpyConversationStore) SaveAgentSession(ctx context.Context, session domain.AgentSession) error {
+	s.saveAgentSessionCalls++
+	return s.conversationStore.SaveAgentSession(ctx, session)
+}
+
+// TestTouchCurrentSessionOnlyUpdatesUpdatedAt guards N-1 from the P3 final
+// review (final-review-2.md §4): touchCurrentSession must land as a
+// field-level UPDATE of updated_at, never a whole-row SaveAgentSession that
+// would clobber sibling columns a concurrent writer (server's
+// touchSessionOnSubmit, or a GUI-driven SetMode/SetWorkingDir sharing the
+// same agent.db) just wrote — the exact mistake this repo already paid for
+// once in the task-state-persistence period (PR #44: "写穿必须字段级不能全行
+// UPSERT").
+//
+// It asserts two independent things:
+//  1. Call pattern (via touchSpyConversationStore): touchCurrentSession calls
+//     TouchAgentSession exactly once and never calls SaveAgentSession at all.
+//     This is what actually goes red under the reviewed mutation — reverting
+//     to "read the row, mutate UpdatedAt, SaveAgentSession it back" swaps
+//     which of the two gets called, and the counts flip.
+//  2. Persisted state: seeding every other column with a distinguishing
+//     value and reading the row back after the touch confirms only
+//     updated_at moved. This alone would not catch the mutation (a
+//     single-threaded read-modify-write is indistinguishable from a
+//     field-level update when nothing else writes to the row in between —
+//     the bug only bites under real concurrent writers), but it is the
+//     direct evidence for "touch 只动 updated_at" and would catch a
+//     different regression: TouchAgentSession's own SQL growing back into an
+//     upsert that re-specifies every column from a zero-valued struct.
+func TestTouchCurrentSessionOnlyUpdatesUpdatedAt(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo := openCLITestSQLiteRepository(t)
+
+	createdAt := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+	seed := domain.AgentSession{
+		ID:         "session-touch-only",
+		CompanyID:  "cli-company",
+		AgentID:    "cli-agent",
+		Project:    "distinguishing-project",
+		Title:      "distinguishing title",
+		Mode:       domain.ModePlan,
+		Archived:   true,
+		WorkingDir: t.TempDir(),
+		CreatedAt:  createdAt,
+		UpdatedAt:  createdAt,
+	}
+	if err := repo.SaveAgentSession(ctx, seed); err != nil {
+		t.Fatalf("SaveAgentSession(seed) error = %v, want nil", err)
+	}
+
+	spy := &touchSpyConversationStore{conversationStore: repo}
+	controller := newTUISessionController(tuiSessionControllerConfig{
+		Store:     spy,
+		Enabled:   true,
+		CompanyID: "cli-company",
+		AgentID:   "cli-agent",
+	})
+	controller.currentID = seed.ID
+
+	touchedAt := createdAt.Add(time.Hour)
+	if err := controller.touchCurrentSession(ctx, touchedAt); err != nil {
+		t.Fatalf("touchCurrentSession() error = %v, want nil", err)
+	}
+
+	if spy.touchAgentSessionCalls != 1 {
+		t.Fatalf("TouchAgentSession calls = %d, want 1：touch 应该走字段级更新", spy.touchAgentSessionCalls)
+	}
+	if spy.saveAgentSessionCalls != 0 {
+		t.Fatalf("SaveAgentSession calls = %d, want 0：touch 不该整行写——见 PR #44 的教训", spy.saveAgentSessionCalls)
+	}
+
+	got, ok, err := repo.GetAgentSession(ctx, seed.ID)
+	if err != nil {
+		t.Fatalf("GetAgentSession() error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatalf("GetAgentSession() ok = false, want true")
+	}
+	if !got.UpdatedAt.Equal(touchedAt) {
+		t.Fatalf("UpdatedAt = %v, want %v：touch 没有推进 updated_at", got.UpdatedAt, touchedAt)
+	}
+	if got.CompanyID != seed.CompanyID || got.AgentID != seed.AgentID || got.Project != seed.Project ||
+		got.Title != seed.Title || got.Mode != seed.Mode || got.Archived != seed.Archived ||
+		got.WorkingDir != seed.WorkingDir || !got.CreatedAt.Equal(seed.CreatedAt) {
+		t.Fatalf("touch 覆盖了它不该动的列：got = %#v, seed = %#v", got, seed)
+	}
+}
+
 // TestRunTUITaskAppliesSessionModeAndWorkingDir guards Task 4's runTUITask
 // wiring: the default (non-mentioned-agent) task path must read
 // SessionManager.CurrentMode/CurrentWorkingDir and forward them into
@@ -2691,6 +2801,10 @@ type countingConversationStore struct {
 
 func (s *countingConversationStore) SaveAgentSession(ctx context.Context, session domain.AgentSession) error {
 	return s.delegate.SaveAgentSession(ctx, session)
+}
+
+func (s *countingConversationStore) TouchAgentSession(ctx context.Context, sessionID string, at time.Time) error {
+	return s.delegate.TouchAgentSession(ctx, sessionID, at)
 }
 
 func (s *countingConversationStore) LatestAgentSession(ctx context.Context, companyID string, agentID string) (domain.AgentSession, bool, error) {
