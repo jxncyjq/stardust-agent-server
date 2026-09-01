@@ -207,6 +207,15 @@ const serveEventsToolMarker = "第 000 行：缓存命中率与预取窗口的�
 // 才会被 AgentRuntimeResolver 认出来并走 per-agent 路径。
 const serveEventsAgentName = "researcher"
 
+// serveEventsExpectedModelProfile 是这个 fixture 的两条路径都应该解出的 model_profile
+// 名字。fixture 的 maas 配置只有 base_url，没有 default_profile；researcher.json 也
+// 没有配 MaasProfile，两者都落到 config.MaasConfig.ResolveProfileName 的
+// 「裸 base_url」档：默认 runner 走 BuildServeService 里的
+// `cfg.Maas.ResolveProfileName("")`，per-agent resolver 走 agent_resolver.go 里的
+// `r.rootConfig.Maas.ResolveProfileName(agentCfg.MaasProfile)`（agentCfg.MaasProfile
+// 是空串）——两处入参都归到同一档，所以两条路径的期望值相同。
+const serveEventsExpectedModelProfile = "maas"
+
 // serveEventRow 是查库查出来的一行。
 type serveEventRow struct {
 	seq    int64
@@ -387,6 +396,36 @@ func assertBalancedSessionLog(t *testing.T, rows []serveEventRow, fixture serveE
 	}
 	if !sawPreview {
 		t.Fatal("没有任何 tool/result：判据 4 没有被验到")
+	}
+
+	// 判据 5：每条 assistant/message 都带着这次运行用的模型档位名（spec §4.1 的
+	// model_profile），且是这条路径真该解出的那个值。
+	//
+	// 这一条守的不是「构造点」（buildDefaultRunnerConfig / agent_resolver.go 已经有
+	// 自己的单元测试断言这一段），而是「调用点」——BuildServeService 里
+	// `cfg.Maas.ResolveProfileName("")` 这个实参本身。final-review-2.md I-3 把这个
+	// 调用点改成 "" 之后，全仓测试仍然全绿，因为在这条断言之前没有任何东西读过
+	// assistant/message 的 data 列。
+	sawAssistantMessage := false
+	for _, row := range rows {
+		if domain.SessionEventType(row.typ) != domain.SessionEventAssistantMessage {
+			continue
+		}
+		sawAssistantMessage = true
+		var payload struct {
+			ModelProfile string `json:"model_profile"`
+		}
+		if err := json.Unmarshal([]byte(row.data), &payload); err != nil {
+			t.Fatalf("decode assistant/message payload at seq %d: %v", row.seq, err)
+		}
+		if payload.ModelProfile != serveEventsExpectedModelProfile {
+			t.Errorf("seq %d 的 assistant/message model_profile = %q, want %q："+
+				"这次运行在轨迹里看不出用的是哪个模型",
+				row.seq, payload.ModelProfile, serveEventsExpectedModelProfile)
+		}
+	}
+	if !sawAssistantMessage {
+		t.Fatal("没有任何 assistant/message：判据 5 没有被验到")
 	}
 }
 

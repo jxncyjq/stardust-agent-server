@@ -1511,6 +1511,87 @@ func TestRunCommandPersistsToSQLiteWhenConfigured(t *testing.T) {
 	}
 }
 
+// TestRunCommandCarriesModelProfileIntoTheSessionEventLog 守调用点②
+// （final-review-2.md I-3 N-1）：newRunCommand 的 `--prompt` 分支把
+// runModelProfile(cfg.Maas, maasProfile, maasURL) 的结果传给
+// RunTaskOptions.ModelProfile（command.go:160，「与上面 maasClientFromConfig 选客户端
+// 同源的档位名」那一行）。这条赋值今天是对的，但复核者把它改成 "" 之后全仓测试仍然
+// 全绿——同一调用点上的 SessionEvents 做同样的变异会红，这条断言补的正是这个缺口。
+//
+// 断言的是落进 assistant/message 载荷里的那个值，不是「RunTaskOptions 上有那个
+// 字段」。
+func TestRunCommandCarriesModelProfileIntoTheSessionEventLog(t *testing.T) {
+	t.Parallel()
+
+	dbPath := filepath.Join(t.TempDir(), "agent.db")
+	configPath := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(configPath, []byte(`{
+		"storage": {"driver": "sqlite", "path": "`+filepath.ToSlash(dbPath)+`"}
+	}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", configPath, err)
+	}
+
+	var out bytes.Buffer
+	err := Execute(app.New(), &out, []string{
+		"run",
+		"--plain",
+		"--config", configPath,
+		"--prompt", "Model profile CLI check",
+	})
+	if err != nil {
+		t.Fatalf("Execute(run --config sqlite --prompt) error = %v, want nil", err)
+	}
+
+	repo, err := storage.OpenSQLite(context.Background(), dbPath)
+	if err != nil {
+		t.Fatalf("OpenSQLite(%q) error = %v, want nil", dbPath, err)
+	}
+	t.Cleanup(func() {
+		if err := repo.Close(); err != nil {
+			t.Errorf("Close() error = %v, want nil", err)
+		}
+	})
+	audits, err := repo.ListAuditEvents(context.Background())
+	if err != nil {
+		t.Fatalf("ListAuditEvents() error = %v, want nil", err)
+	}
+	if len(audits) == 0 {
+		t.Fatal("ListAuditEvents() len = 0：没有审计事件，拿不到任务号，查不了会话日志")
+	}
+	// `run --prompt` 的 RunTaskOptions 不带 SessionID（见 sessionKeyForTask 的 D-A
+	// 回退），所以会话键就是任务号本身；这个测试只跑了一个任务，任何一条审计事件的
+	// SubjectID 都是它。
+	taskID := audits[0].SubjectID
+	events, err := repo.ReadFrom(context.Background(), taskID, 0)
+	if err != nil {
+		t.Fatalf("ReadFrom(%q) error = %v, want nil", taskID, err)
+	}
+
+	found := false
+	for _, e := range events {
+		if e.Type != domain.SessionEventAssistantMessage {
+			continue
+		}
+		found = true
+		var payload struct {
+			ModelProfile string `json:"model_profile"`
+		}
+		if err := json.Unmarshal(e.Data, &payload); err != nil {
+			t.Fatalf("unmarshal assistant/message: %v", err)
+		}
+		// 这份配置没有配任何 maas 档位/base_url：runModelProfile 解出的是
+		// config.MaasConfig.ResolveProfileName 兜到底的「录制客户端」这个名字。
+		if payload.ModelProfile != "recording" {
+			t.Errorf("assistant/message 的 model_profile = %q, want %q："+
+				"`agent run --prompt` 跑出来的轨迹里看不出用的是哪个模型",
+				payload.ModelProfile, "recording")
+		}
+	}
+	if !found {
+		t.Fatal("这次运行一条 assistant/message 都没写：断言的前提不成立")
+	}
+}
+
 func TestRunCommandUsesUniqueTaskIDsForPersistentRuns(t *testing.T) {
 	t.Parallel()
 
