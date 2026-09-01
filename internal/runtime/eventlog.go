@@ -275,6 +275,22 @@ func (e *eventRecorder) flush(ctx context.Context) error {
 	return nil
 }
 
+// barrier 是一个 fail-closed 的落盘点（spec §5）。
+//
+// 三处调用：模型请求前、进工具体前、开下一步前。刷不动就返回错误，调用方**不做那件事**。
+// 这是行为改变——数据库写不动时任务会失败而不是照跑——理由在屏障 2：tool/call 必须
+// 先落盘，否则崩在工具体里就成了「工具真的执行过、但日志里没有这次调用」，恢复时补不出
+// 合成结果，而工具正是有外部副作用的那一端。「先记录再执行」保证任何真发生过的副作用
+// 在日志里都有它的调用。
+//
+// at 是这个屏障的位置，进错误信息——排查的人要立刻知道是哪一处挡住了。
+func (e *eventRecorder) barrier(ctx context.Context, at string) error {
+	if err := e.flush(ctx); err != nil {
+		return fmt.Errorf("session event barrier %s: %w", at, err)
+	}
+	return nil
+}
+
 // truncateRunes 按 rune 截断并标注截断量，使读的人知道自己看的是一段而不是全部。
 //
 // 截断标注本身也占 rune：直接把内容砍到 limit 再拼标注会让总长度超过 limit

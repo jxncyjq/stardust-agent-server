@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
@@ -275,5 +276,60 @@ func TestRecordAssistantMessageFlushesWithManyToolCalls(t *testing.T) {
 	}
 	if len(payload.ToolCalls) != callCount {
 		t.Errorf("落盘的 tool_calls 长度 = %d，want %d：说明数组被截断了", len(payload.ToolCalls), callCount)
+	}
+}
+
+// 三个屏障都 fail-closed（spec §5）：刷不动就不发请求、不进工具体、不开下一步。
+//
+// 屏障 2 是这条设计的支点：tool/call 必须先落盘，否则崩在工具体里就成了
+// 「工具真的执行过、但日志里没有这次调用」——恢复时补不出那条合成结果，
+// 而工具是有外部副作用的那一端。
+func TestABarrierFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	store := &captureEventStore{err: errors.New("disk on fire")}
+	rec := newEventRecorder(store, domain.Task{ID: "t1", SessionID: "s1"})
+	rec.recordToolCall(domain.ToolCall{ID: "c1", Name: "write_file"})
+
+	err := rec.barrier(context.Background(), "before dispatching a tool")
+	if err == nil {
+		t.Fatal("落盘失败时屏障放行了：工具会在没有记录的情况下产生副作用")
+	}
+	if !strings.Contains(err.Error(), "before dispatching a tool") {
+		t.Errorf("错误里没说是哪个屏障：%v", err)
+	}
+	if !strings.Contains(err.Error(), "disk on fire") {
+		t.Errorf("错误没有包住底层原因：%v", err)
+	}
+}
+
+// 屏障失败之后事件仍在缓冲里：调用方若重试，不该丢掉已经发生的事实。
+func TestAFailedBarrierKeepsTheEventsBuffered(t *testing.T) {
+	t.Parallel()
+
+	store := &captureEventStore{err: errors.New("disk on fire")}
+	rec := newEventRecorder(store, domain.Task{ID: "t1", SessionID: "s1"})
+	rec.recordToolCall(domain.ToolCall{ID: "c1", Name: "write_file"})
+	_ = rec.barrier(context.Background(), "before dispatching a tool")
+
+	store.mu.Lock()
+	store.err = nil
+	store.mu.Unlock()
+	if err := rec.barrier(context.Background(), "retry"); err != nil {
+		t.Fatalf("重试仍失败：%v", err)
+	}
+	if got := len(store.events); got != 1 {
+		t.Errorf("重试后落盘了 %d 条，want 1：屏障失败时把事件丢了", got)
+	}
+}
+
+// 没有配 store 的部署里，屏障永远放行——它守的是「记录不上就别做」，
+// 而不是「必须有记录才能做」。
+func TestABarrierIsANoOpWithoutAStore(t *testing.T) {
+	t.Parallel()
+
+	rec := newEventRecorder(nil, domain.Task{ID: "t1"})
+	if err := rec.barrier(context.Background(), "before the model request"); err != nil {
+		t.Errorf("没有 store 的部署被屏障挡住了：%v", err)
 	}
 }
