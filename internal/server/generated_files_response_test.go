@@ -133,7 +133,7 @@ func containsEmptyArrayField(body []byte, field string) bool {
 func TestHTTPServerCompletedTaskPersistsGeneratedFilesOnAssistantTurn(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	repo := openServerTestRepo(t)
+	repo, dbPath := openServerTestRepoWithPath(t)
 	scheduler := task.NewScheduler()
 	events := adapter.NewMemoryEventBus()
 	srv := NewHTTPServer(Config{Tasks: scheduler, Sessions: repo, WorkflowEvents: events})
@@ -174,10 +174,10 @@ func TestHTTPServerCompletedTaskPersistsGeneratedFilesOnAssistantTurn(t *testing
 		t.Fatalf("GET result status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
 	}
 
-	turns, err := repo.ListConversationTurns(ctx, "session-gf-turn-1", 0)
-	if err != nil {
-		t.Fatalf("ListConversationTurns error = %v, want nil", err)
-	}
+	// 直接查表：这条测试量的是结果端点**写进 conversation_turns 那一行**的
+	// GeneratedFiles 形状（相对路径而非链接 DTO）。Task 3 之后 ListConversationTurns
+	// 读的是事件日志，而这里没有 runtime 去发事件，用它断言只会量到空。
+	turns := conversationTurnRows(t, dbPath, "session-gf-turn-1")
 	var assistant *domain.ConversationTurn
 	for i := range turns {
 		if turns[i].Role == domain.ConversationRoleAssistant {
@@ -211,7 +211,7 @@ func TestHTTPServerSessionTurnsIncludeGeneratedFilesWithLinks(t *testing.T) {
 	if err := repo.SaveAgentSession(ctx, session); err != nil {
 		t.Fatalf("SaveAgentSession error = %v, want nil", err)
 	}
-	if err := repo.AppendConversationTurn(ctx, domain.ConversationTurn{
+	appendTurnEvents(t, repo, session.ID, domain.ConversationTurn{
 		ID:             "turn-gf-history-1",
 		SessionID:      session.ID,
 		TaskID:         "task-1",
@@ -220,9 +220,7 @@ func TestHTTPServerSessionTurnsIncludeGeneratedFilesWithLinks(t *testing.T) {
 		Content:        "已完成",
 		CreatedAt:      createdAt.Add(time.Second),
 		GeneratedFiles: []string{"out/report.md"},
-	}); err != nil {
-		t.Fatalf("AppendConversationTurn error = %v, want nil", err)
-	}
+	})
 	srv := NewHTTPServer(Config{Sessions: repo})
 
 	rec := httptest.NewRecorder()
@@ -282,7 +280,7 @@ func TestHTTPServerSessionTurnsGeneratedFilesEmptyIsEmptyArray(t *testing.T) {
 	if err := repo.SaveAgentSession(ctx, session); err != nil {
 		t.Fatalf("SaveAgentSession error = %v, want nil", err)
 	}
-	if err := repo.AppendConversationTurn(ctx, domain.ConversationTurn{
+	appendTurnEvents(t, repo, session.ID, domain.ConversationTurn{
 		ID:        "turn-gf-history-empty",
 		SessionID: session.ID,
 		TaskID:    "task-1",
@@ -290,9 +288,7 @@ func TestHTTPServerSessionTurnsGeneratedFilesEmptyIsEmptyArray(t *testing.T) {
 		Role:      domain.ConversationRoleUser,
 		Content:   "你好",
 		CreatedAt: createdAt.Add(time.Second),
-	}); err != nil {
-		t.Fatalf("AppendConversationTurn error = %v, want nil", err)
-	}
+	})
 	srv := NewHTTPServer(Config{Sessions: repo})
 
 	rec := httptest.NewRecorder()

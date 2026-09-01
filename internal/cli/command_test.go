@@ -2533,6 +2533,14 @@ func (s *countingConversationStore) ListConversationTurns(ctx context.Context, s
 	return s.delegate.ListConversationTurns(ctx, sessionID, limit)
 }
 
+func (s *countingConversationStore) Append(ctx context.Context, sessionID string, events []domain.SessionEvent) error {
+	return s.delegate.Append(ctx, sessionID, events)
+}
+
+func (s *countingConversationStore) ReadFrom(ctx context.Context, sessionID string, fromSeq int64) ([]domain.SessionEvent, error) {
+	return s.delegate.ReadFrom(ctx, sessionID, fromSeq)
+}
+
 // fakeSessionLister is a minimal SessionLister test double: it returns items
 // (or err, if set) regardless of the companyID/agentID filter arguments,
 // mirroring distinctSessionBases' actual usage (ListAgentSessions(ctx, "",

@@ -17,9 +17,7 @@ func TestConversationTurnTokenRoundTrip(t *testing.T) {
 		PromptTokens: 1200, CompletionTokens: 340, CachedTokens: 800, TotalTokens: 1540,
 		CreatedAt: time.Now(),
 	}
-	if err := r.AppendConversationTurn(ctx, turn); err != nil {
-		t.Fatal(err)
-	}
+	appendTurnEvents(t, r, "s1", turn)
 	turns, err := r.ListConversationTurns(ctx, "s1", 0)
 	if err != nil {
 		t.Fatal(err)
@@ -32,7 +30,7 @@ func TestConversationTurnTokenRoundTrip(t *testing.T) {
 	}
 }
 
-func TestConversationTurnIfAbsentUserZeroTokens(t *testing.T) {
+func TestConversationTurnUserZeroTokens(t *testing.T) {
 	r := openTestRepo(t)
 	ctx := context.Background()
 	turn := domain.ConversationTurn{
@@ -40,9 +38,7 @@ func TestConversationTurnIfAbsentUserZeroTokens(t *testing.T) {
 		Role: domain.ConversationRoleUser, Content: "q",
 		CreatedAt: time.Now(),
 	}
-	if _, err := r.AppendConversationTurnIfAbsent(ctx, turn); err != nil {
-		t.Fatal(err)
-	}
+	appendTurnEvents(t, r, "s2", turn)
 	turns, err := r.ListConversationTurns(ctx, "s2", 0)
 	if err != nil {
 		t.Fatal(err)

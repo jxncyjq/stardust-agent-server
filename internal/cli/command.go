@@ -1029,6 +1029,12 @@ type conversationStore interface {
 	ListAgentSessions(context.Context, string, string) ([]domain.AgentSession, error)
 	AppendConversationTurn(context.Context, domain.ConversationTurn) error
 	ListConversationTurns(context.Context, string, int) ([]domain.ConversationTurn, error)
+	// Append/ReadFrom 是 TUI 会话把每轮对话写进事件日志用的（见 recordTurn）。
+	// 声明成两个方法而不是内嵌 port.SessionEventStore：这条路不调 Load，而
+	// spec §4.3.1 第 3 条要求 Load 只对没有活跃写入者的会话调用——不把它摆进
+	// 这个接口，就没人能顺手在 TUI 里调它。
+	Append(ctx context.Context, sessionID string, events []domain.SessionEvent) error
+	ReadFrom(ctx context.Context, sessionID string, fromSeq int64) ([]domain.SessionEvent, error)
 }
 
 type tuiSessionControllerConfig struct {
@@ -1235,8 +1241,9 @@ func (c *tuiSessionController) recordTurn(ctx context.Context, role domain.Conve
 		}
 	}
 	now := time.Now()
+	turnID := fmt.Sprintf("%s:%s:%d", c.currentID, role, now.UTC().UnixNano())
 	if err := c.store.AppendConversationTurn(ctx, domain.ConversationTurn{
-		ID:           fmt.Sprintf("%s:%s:%d", c.currentID, role, now.UTC().UnixNano()),
+		ID:           turnID,
 		SessionID:    c.currentID,
 		TaskID:       taskID,
 		AgentID:      firstNonEmpty(agentID, c.agentID),
@@ -1247,7 +1254,83 @@ func (c *tuiSessionController) recordTurn(ctx context.Context, role domain.Conve
 	}); err != nil {
 		return err
 	}
+	if err := c.appendTurnEvent(ctx, turnID, role, taskID, agentID, modelProfile, content, now); err != nil {
+		return err
+	}
 	c.invalidateCurrentSessionCache()
+	return nil
+}
+
+// appendTurnEvent 把这一轮消息追加进 TUI 会话的事件日志。
+//
+// 为什么必须写：RecentTurns（本文件的读侧调用点）走 ListConversationTurns，而它自
+// Task 3 起从事件投影。TUI 这条会话号下**没有别的事件生产者**——App.RunTask 用的是
+// task.ID 而不是 TUI 会话号（P2 已知、P3 明确不在范围内的取舍），runtime 的
+// eventRecorder 写出来的日志因此挂在另一个会话下。这里不写，TUI 的
+// 「Recent conversation:」注入会读到空历史，而且是静默失效，不报任何错。
+//
+// 为什么与上面的 AppendConversationTurn 并存不算双真相源：turn 行今天只剩
+// search_session 的 FTS 索引一个消费者，读路径已经只认事件。Task 4 把搜索也搬到事件
+// 之后，那一行就没有消费者了，Task 5 连同写入方一起删。
+//
+// 正文按 Task 1 的决定**存全文**，不套 truncateSessionTurn：截断是读侧
+// （RecentTurns / RecentTurnsForTask）按各自的 MaxTurnChars 做的事，写侧先砍一刀会
+// 让读侧的上限再也拿不回被砍掉的那部分。
+func (c *tuiSessionController) appendTurnEvent(
+	ctx context.Context,
+	turnID string,
+	role domain.ConversationRole,
+	taskID string,
+	agentID string,
+	modelProfile string,
+	content string,
+	at time.Time,
+) error {
+	// projectTurns 对 task_id 做非空校验（缺了整条会话读不出来）。在这里拦下，
+	// 错误就指向写入的这一刻，而不是下一次读历史时才炸在存储层。
+	if strings.TrimSpace(taskID) == "" {
+		return fmt.Errorf("append session turn event for %q: task id is required", c.currentID)
+	}
+	payload := map[string]any{
+		"turn":    0,
+		"turn_id": turnID,
+		"task_id": taskID,
+		"content": content,
+	}
+	var eventType domain.SessionEventType
+	switch role {
+	case domain.ConversationRoleUser:
+		eventType = domain.SessionEventUserMessage
+	case domain.ConversationRoleAssistant:
+		eventType = domain.SessionEventAssistantMessage
+		payload["step"] = 0
+		payload["agent_id"] = firstNonEmpty(agentID, c.agentID)
+		payload["model_profile"] = firstNonEmpty(modelProfile, c.modelProfile)
+	default:
+		return fmt.Errorf("append session turn event for %q: unknown role %q", c.currentID, role)
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode session turn event for %q: %w", c.currentID, err)
+	}
+	// Append 要求首个 seq 正好是该会话的 next-seq，所以先读出已有的后缀。这是每轮
+	// 两次 O(n) 读；P3 计划已写明这条 O(n) 是本期接受的代价，真机测出慢再优化。
+	existing, err := c.store.ReadFrom(ctx, c.currentID, 0)
+	if err != nil {
+		return fmt.Errorf("read session events for %q: %w", c.currentID, err)
+	}
+	var next int64
+	if n := len(existing); n > 0 {
+		next = existing[n-1].Seq + 1
+	}
+	if err := c.store.Append(ctx, c.currentID, []domain.SessionEvent{{
+		Seq:  next,
+		Type: eventType,
+		Time: at,
+		Data: data,
+	}}); err != nil {
+		return fmt.Errorf("append session turn event for %q: %w", c.currentID, err)
+	}
 	return nil
 }
 

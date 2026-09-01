@@ -156,11 +156,7 @@ func TestSQLiteRepositoryPersistsAgentSessionsAndConversationTurns(t *testing.T)
 			CreatedAt:    createdAt.Add(2 * time.Second),
 		},
 	}
-	for _, turn := range turns {
-		if err := repo.AppendConversationTurn(ctx, turn); err != nil {
-			t.Fatalf("AppendConversationTurn(%q) error = %v, want nil", turn.ID, err)
-		}
-	}
+	appendTurnEvents(t, repo, session.ID, turns...)
 	gotSession, ok, err := repo.LatestAgentSession(ctx, "company-1", "agent-1")
 	if err != nil {
 		t.Fatalf("LatestAgentSession() error = %v, want nil", err)
@@ -669,12 +665,19 @@ func TestSQLiteAppendConversationTurnIfAbsentIsExactlyOnce(t *testing.T) {
 	if inserted {
 		t.Fatalf("AppendConversationTurnIfAbsent() second inserted = true, want false")
 	}
-	turns, err := repo.ListConversationTurns(ctx, session.ID, 0)
-	if err != nil {
-		t.Fatalf("ListConversationTurns() error = %v, want nil", err)
+	// 计数直接查 conversation_turns 表，不走 ListConversationTurns：这条测试的主题是
+	// **写入方**的幂等（同一个 turn id 提交两次只落一行），而 Task 3 之后
+	// ListConversationTurns 读的是事件日志，根本看不见这张表——用它计数只会数出 0，
+	// 那是在量错的东西，不是在量这个不变量。这张表与它的写入方在 Task 5 一起退役，
+	// 这条测试届时随之删除。
+	var rows int
+	if err := repo.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM conversation_turns WHERE session_id = ?`, session.ID,
+	).Scan(&rows); err != nil {
+		t.Fatalf("count conversation_turns error = %v, want nil", err)
 	}
-	if len(turns) != 1 {
-		t.Fatalf("ListConversationTurns() len = %d, want exactly 1", len(turns))
+	if rows != 1 {
+		t.Fatalf("conversation_turns rows = %d, want exactly 1", rows)
 	}
 }
 
@@ -762,11 +765,8 @@ func TestSQLiteRepositoryDeleteAgentSessionCascadesTurns(t *testing.T) {
 		{ID: "del-turn-2", SessionID: target.ID, TaskID: "task-1", AgentID: "agent-1", Role: domain.ConversationRoleAssistant, Content: "回答", CreatedAt: createdAt.Add(2 * time.Second)},
 		{ID: "keep-turn-1", SessionID: other.ID, TaskID: "task-2", AgentID: "agent-1", Role: domain.ConversationRoleUser, Content: "保留问题", CreatedAt: createdAt.Add(3 * time.Second)},
 	}
-	for _, turn := range turns {
-		if err := repo.AppendConversationTurn(ctx, turn); err != nil {
-			t.Fatalf("AppendConversationTurn(%q) error = %v, want nil", turn.ID, err)
-		}
-	}
+	appendTurnEvents(t, repo, target.ID, turns[0], turns[1])
+	appendTurnEvents(t, repo, other.ID, turns[2])
 
 	if err := repo.DeleteAgentSession(ctx, target.ID); err != nil {
 		t.Fatalf("DeleteAgentSession(%q) error = %v, want nil", target.ID, err)
@@ -831,6 +831,11 @@ func TestSQLiteSessionSearchDiscoveryScrollBrowse(t *testing.T) {
 			t.Fatalf("AppendConversationTurn(%q) error = %v, want nil", turn.ID, err)
 		}
 	}
+	// 同一批轮次还要再以事件形式播种一次：discovery（SearchMessages）目前仍搜
+	// conversation_turns_fts，而 scroll（ScrollMessages → ListConversationTurns）
+	// 在 Task 3 之后读的是事件日志。两条路今天落在两个来源上，Task 4 把搜索也搬到
+	// 事件之后，上面那段 AppendConversationTurn 播种就该一并删掉。
+	appendTurnEvents(t, repo, "sess-1", turns...)
 
 	// discovery: FTS5 match returns the relevant turn.
 	hits, err := repo.SearchMessages(ctx, "prompt", 10)

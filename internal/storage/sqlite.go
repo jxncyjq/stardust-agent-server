@@ -304,12 +304,17 @@ func (r *SQLiteRepository) SaveAgentSession(ctx context.Context, session domain.
 	return nil
 }
 
-// DeleteAgentSession removes a session and cascades the delete to every
-// conversation turn belonging to it, in a single transaction so a partial
-// failure cannot leave orphaned turns. A session id that does not exist is
-// reported as an error rather than silently treated as success, per the
-// fail-loud rule: deleting a nonexistent session is an inconsistent request the
-// caller must learn about.
+// DeleteAgentSession removes a session and cascades the delete to everything
+// that reconstructs its conversation — its event log and its (retiring)
+// conversation turn rows — in a single transaction so a partial failure cannot
+// leave orphans. A session id that does not exist is reported as an error
+// rather than silently treated as success, per the fail-loud rule: deleting a
+// nonexistent session is an inconsistent request the caller must learn about.
+//
+// session_events must be cleared here, not only conversation_turns: since
+// ListConversationTurns projects from the event log (spec §3 取舍 A2), leaving
+// the events behind would let a deleted session's whole conversation keep
+// coming back out of the read path — a delete that visibly deletes nothing.
 func (r *SQLiteRepository) DeleteAgentSession(ctx context.Context, sessionID string) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -320,6 +325,11 @@ func (r *SQLiteRepository) DeleteAgentSession(ctx context.Context, sessionID str
 		DELETE FROM conversation_turns WHERE session_id = ?
 	`, sessionID); err != nil {
 		return fmt.Errorf("delete conversation turns for session %q: %w", sessionID, err)
+	}
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM session_events WHERE session_id = ?
+	`, sessionID); err != nil {
+		return fmt.Errorf("delete session events for session %q: %w", sessionID, err)
 	}
 	res, err := tx.ExecContext(ctx, `
 		DELETE FROM agent_sessions WHERE id = ?
@@ -492,39 +502,28 @@ func (r *SQLiteRepository) AppendConversationTurnIfAbsent(ctx context.Context, t
 	return true, nil
 }
 
+// ListConversationTurns 返回一条会话的对话轮次，按时间正序；limit > 0 时只取
+// **最近** limit 条。
+//
+// 轮次由会话事件投影得出（spec §3 取舍 A2：事件日志是唯一真相源）。这里用
+// ReadFrom(0) 而不是 Load：spec §4.3.1 第 3 条要求 Load 只对「确定没有活跃写入者」
+// 的会话调用，而这个方法在任务执行期间也会被调用（多轮 messages 就走它）。
+// ReadFrom 只读后缀、不触发恢复，正是这里要的。
 func (r *SQLiteRepository) ListConversationTurns(ctx context.Context, sessionID string, limit int) ([]domain.ConversationTurn, error) {
-	query := `
-		SELECT id, session_id, task_id, agent_id, model_profile, role, content, created_at,
-			prompt_tokens, completion_tokens, cached_tokens, total_tokens, generated_files
-		FROM conversation_turns
-		WHERE session_id = ?
-		ORDER BY created_at DESC, id DESC
-	`
-	args := []any{sessionID}
-	if limit > 0 {
-		query += ` LIMIT ?`
-		args = append(args, limit)
-	}
-	rows, err := r.db.QueryContext(ctx, query, args...)
+	events, err := r.ReadFrom(ctx, sessionID, 0)
 	if err != nil {
 		return nil, fmt.Errorf("list conversation turns for %q: %w", sessionID, err)
 	}
-	defer rows.Close()
-	var reversed []domain.ConversationTurn
-	for rows.Next() {
-		turn, err := scanConversationTurn(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan conversation turn for %q: %w", sessionID, err)
-		}
-		reversed = append(reversed, turn)
+	turns, err := projectTurns(sessionID, events)
+	if err != nil {
+		return nil, fmt.Errorf("list conversation turns for %q: %w", sessionID, err)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate conversation turns for %q: %w", sessionID, err)
+	// limit 取最近的 N 条：事件是正序的，所以从尾部截。旧实现是
+	// ORDER BY created_at DESC LIMIT n 再反转，语义相同。
+	if limit > 0 && len(turns) > limit {
+		turns = turns[len(turns)-limit:]
 	}
-	for i, j := 0, len(reversed)-1; i < j; i, j = i+1, j-1 {
-		reversed[i], reversed[j] = reversed[j], reversed[i]
-	}
-	return reversed, nil
+	return turns, nil
 }
 
 // AddEpisodicMemory persists one episodic memory entry and its full-text index

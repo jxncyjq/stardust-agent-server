@@ -159,8 +159,8 @@ func TestHTTPServerListsSessionsAndTurns(t *testing.T) {
 	if err := repo.SaveAgentSession(ctx, session); err != nil {
 		t.Fatalf("SaveAgentSession(%q) error = %v, want nil", session.ID, err)
 	}
-	for _, turn := range []domain.ConversationTurn{
-		{
+	appendTurnEvents(t, repo, session.ID,
+		domain.ConversationTurn{
 			ID:           "turn-1",
 			SessionID:    session.ID,
 			TaskID:       "task-1",
@@ -170,7 +170,7 @@ func TestHTTPServerListsSessionsAndTurns(t *testing.T) {
 			Content:      "你是什么模型",
 			CreatedAt:    createdAt.Add(time.Second),
 		},
-		{
+		domain.ConversationTurn{
 			ID:           "turn-2",
 			SessionID:    session.ID,
 			TaskID:       "task-1",
@@ -180,11 +180,7 @@ func TestHTTPServerListsSessionsAndTurns(t *testing.T) {
 			Content:      "我是 Legion Agent",
 			CreatedAt:    createdAt.Add(2 * time.Second),
 		},
-	} {
-		if err := repo.AppendConversationTurn(ctx, turn); err != nil {
-			t.Fatalf("AppendConversationTurn(%q) error = %v, want nil", turn.ID, err)
-		}
-	}
+	)
 	srv := NewHTTPServer(Config{Sessions: repo})
 
 	rec := httptest.NewRecorder()
@@ -272,7 +268,7 @@ func TestHTTPServerCreateSessionUnavailableStore(t *testing.T) {
 func TestHTTPServerTaskWithSessionRecordsUserTurn(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	repo := openServerTestRepo(t)
+	repo, dbPath := openServerTestRepoWithPath(t)
 	scheduler := task.NewScheduler()
 	srv := NewHTTPServer(Config{Tasks: scheduler, Sessions: repo, WorkflowEvents: adapter.NewMemoryEventBus()})
 
@@ -302,10 +298,11 @@ func TestHTTPServerTaskWithSessionRecordsUserTurn(t *testing.T) {
 		t.Fatalf("POST /v1/tasks status = %d, want %d body=%s", rec.Code, http.StatusCreated, rec.Body.String())
 	}
 
-	turns, err := repo.ListConversationTurns(ctx, "session-task-1", 0)
-	if err != nil {
-		t.Fatalf("ListConversationTurns error = %v, want nil", err)
-	}
+	// 直接查表：这条测试的主题是**提交端点确实记下了这条 user turn**，而它记的是
+	// conversation_turns 的行。Task 3 之后 ListConversationTurns 读的是事件日志，
+	// 而事件由 runtime 在任务真正跑起来时才发出（这里没有 runtime），用它断言只会
+	// 量到空。写入点与这条断言在 Task 5 一起退役。
+	turns := conversationTurnRows(t, dbPath, "session-task-1")
 	if len(turns) != 1 || turns[0].Role != domain.ConversationRoleUser || turns[0].Content != "你好" {
 		t.Fatalf("turns after submit = %#v, want one user turn 你好", turns)
 	}
@@ -336,7 +333,7 @@ func TestHTTPServerTaskWithMissingSessionFailsLoud(t *testing.T) {
 func TestHTTPServerCompletedTaskRecordsAssistantTurnOnce(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	repo := openServerTestRepo(t)
+	repo, dbPath := openServerTestRepoWithPath(t)
 	scheduler := task.NewScheduler()
 	events := adapter.NewMemoryEventBus()
 	srv := NewHTTPServer(Config{Tasks: scheduler, Sessions: repo, WorkflowEvents: events})
@@ -384,10 +381,9 @@ func TestHTTPServerCompletedTaskRecordsAssistantTurnOnce(t *testing.T) {
 		}
 	}
 
-	turns, err := repo.ListConversationTurns(ctx, "session-done-1", 0)
-	if err != nil {
-		t.Fatalf("ListConversationTurns error = %v, want nil", err)
-	}
+	// 直接查表，理由同 TestHTTPServerTaskWithSessionRecordsUserTurn：这里量的是结果
+	// 端点往 conversation_turns 写了几行，而不是事件日志投影出几条轮次。
+	turns := conversationTurnRows(t, dbPath, "session-done-1")
 	assistantCount := 0
 	for _, turn := range turns {
 		if turn.Role == domain.ConversationRoleAssistant {
@@ -700,7 +696,7 @@ func TestHTTPServerPatchDoesNotMatchTurnsRoute(t *testing.T) {
 	if err := repo.SaveAgentSession(ctx, session); err != nil {
 		t.Fatalf("SaveAgentSession error = %v, want nil", err)
 	}
-	if err := repo.AppendConversationTurn(ctx, domain.ConversationTurn{
+	appendTurnEvents(t, repo, session.ID, domain.ConversationTurn{
 		ID:        "guard-turn-1",
 		SessionID: session.ID,
 		TaskID:    "task-1",
@@ -708,9 +704,7 @@ func TestHTTPServerPatchDoesNotMatchTurnsRoute(t *testing.T) {
 		Role:      domain.ConversationRoleUser,
 		Content:   "你好",
 		CreatedAt: createdAt.Add(time.Second),
-	}); err != nil {
-		t.Fatalf("AppendConversationTurn error = %v, want nil", err)
-	}
+	})
 	srv := NewHTTPServer(Config{Sessions: repo})
 
 	// A PATCH against the /turns path must not be routed to the session patch
@@ -932,7 +926,7 @@ func TestHTTPWorkflowSubmitResume(t *testing.T) {
 func TestHTTPServerTaskWithImagesPersistsImagesAndAnnotatesTurn(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	repo := openServerTestRepo(t)
+	repo, dbPath := openServerTestRepoWithPath(t)
 	scheduler := task.NewScheduler()
 	srv := NewHTTPServer(Config{Tasks: scheduler, Sessions: repo, WorkflowEvents: adapter.NewMemoryEventBus()})
 
@@ -976,10 +970,8 @@ func TestHTTPServerTaskWithImagesPersistsImagesAndAnnotatesTurn(t *testing.T) {
 
 	// The persisted user turn must annotate the attachment count without storing
 	// the base64 payload (which would bloat sqlite).
-	turns, err := repo.ListConversationTurns(ctx, "session-img-1", 0)
-	if err != nil {
-		t.Fatalf("ListConversationTurns error = %v, want nil", err)
-	}
+	// 直接查表，理由同 TestHTTPServerTaskWithSessionRecordsUserTurn。
+	turns := conversationTurnRows(t, dbPath, "session-img-1")
 	if len(turns) != 1 {
 		t.Fatalf("turns after submit = %#v, want one user turn", turns)
 	}

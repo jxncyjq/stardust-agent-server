@@ -17,9 +17,7 @@ func TestConversationTurnGeneratedFilesRoundTrip(t *testing.T) {
 		GeneratedFiles: []string{"docs/a.html", "out/b.md"},
 		CreatedAt:      time.Now(),
 	}
-	if err := r.AppendConversationTurn(ctx, turn); err != nil {
-		t.Fatal(err)
-	}
+	appendTurnEvents(t, r, "s1", turn)
 	turns, err := r.ListConversationTurns(ctx, "s1", 0)
 	if err != nil {
 		t.Fatal(err)
@@ -36,9 +34,7 @@ func TestConversationTurnNoGeneratedFilesReadsEmpty(t *testing.T) {
 		ID: "t2:user", SessionID: "s2", TaskID: "t2", AgentID: "a1",
 		Role: domain.ConversationRoleUser, Content: "q", CreatedAt: time.Now(),
 	}
-	if _, err := r.AppendConversationTurnIfAbsent(ctx, turn); err != nil {
-		t.Fatal(err)
-	}
+	appendTurnEvents(t, r, "s2", turn)
 	turns, err := r.ListConversationTurns(ctx, "s2", 0)
 	if err != nil {
 		t.Fatal(err)
