@@ -155,6 +155,9 @@ func newRunCommand(application *app.App, out io.Writer) *cobra.Command {
 					WebTools:         webToolOptions(cfg.Web),
 					Browser:          cfg.Browser,
 					DisabledTools:    cfg.Runtime.DisabledTools,
+					SessionEvents:    persistent.sessionEvents,
+					// 与上面 maasClientFromConfig 选客户端同源的档位名。
+					ModelProfile: runModelProfile(cfg.Maas, maasProfile, maasURL),
 				})
 			default:
 				err = fmt.Errorf("run requires --demo or --prompt")
@@ -256,23 +259,12 @@ func newTUICommand(application *app.App, out io.Writer) *cobra.Command {
 				return err
 			}
 			runner := func(ctx context.Context, prompt string, emit func(domain.RuntimeEvent)) (app.DemoResult, error) {
-				return runTUITask(ctx, application, tuiTaskRunConfig{
-					Config:               cfg,
-					Registry:             registry,
-					Prompt:               prompt,
-					DefaultMaas:          maas,
-					DefaultContextPrefix: contextPrefix,
-					DefaultModelProfile:  firstNonEmpty(maasProfile, cfg.Maas.DefaultProfile),
-					Events:               persistent.events,
-					Audit:                persistent.audit,
-					TaskSink:             persistent.taskSink,
-					TaskLedger:           taskLedger,
-					MessageStore:         persistent.messageStore,
-					Emit:                 emit,
-					Session:              session,
-					ToolGate:             approvalGate,
-					Checkpoints:          checkpointStore,
-				})
+				return runTUITask(ctx, application, buildTUITaskRunConfig(
+					cfg, registry, prompt, maas, contextPrefix, maasProfile, maasURL,
+					persistent.events, persistent.audit, persistent.taskSink, taskLedger,
+					persistent.messageStore, emit, session, approvalGate, checkpointStore,
+					persistent.sessionEvents,
+				))
 			}
 			colorProfile := parseTUIColorProfile(cfg.TUI.ColorProfile)
 			renderer := lipgloss.NewRenderer(out, termenv.WithProfile(colorProfile))
@@ -320,6 +312,59 @@ func newTUICommand(application *app.App, out io.Writer) *cobra.Command {
 	cmd.Flags().StringVar(&maasProfile, "maas-profile", "", "MaaS profile name")
 	cmd.Flags().BoolVar(&noContextFiles, "no-context-files", false, "disable AGENTS/SOUL/TOOLS/USER/MEMORY context file loading")
 	return cmd
+}
+
+// buildTUITaskRunConfig assembles the tuiTaskRunConfig for one `agent tui`
+// task run. It is the exact struct literal newTUICommand's StreamingRunner
+// closure used to build inline, pulled out unchanged so it can be exercised
+// by a test without going through tea.Program.Run() — that closure only ever
+// runs when the interactive TUI processes a real keypress, and
+// newTUICommand never wires a test-controllable tea.WithInput, so nothing
+// short of a real TTY session could previously reach this assembly (see
+// final-fix-2-report.md §3). Zero behavior change from the pre-extraction
+// closure body.
+func buildTUITaskRunConfig(
+	cfg config.Config,
+	registry *agentregistry.Registry,
+	prompt string,
+	defaultMaas port.MaasInferenceClient,
+	defaultContextPrefix string,
+	maasProfile string,
+	maasURL string,
+	events port.EventBus,
+	audit port.AuditLog,
+	taskSink app.TaskSink,
+	taskLedger *taskledger.Ledger,
+	messageStore tool.AgentMessageStore,
+	emit func(domain.RuntimeEvent),
+	session *tuiSessionController,
+	toolGate agentruntime.ToolGate,
+	checkpoints *sessionstate.Store,
+	sessionEvents port.SessionEventStore,
+) tuiTaskRunConfig {
+	return tuiTaskRunConfig{
+		Config:               cfg,
+		Registry:             registry,
+		Prompt:               prompt,
+		DefaultMaas:          defaultMaas,
+		DefaultContextPrefix: defaultContextPrefix,
+		DefaultModelProfile:  firstNonEmpty(maasProfile, cfg.Maas.DefaultProfile),
+		// 与 newTUICommand 里选 MaaS 客户端（maasClientFromConfig）同源的档位名，
+		// 归一化于 runModelProfile。这是本次抽取要让测试守住的那一行——参见
+		// model_profile_call_sites_test.go 的
+		// TestBuildTUITaskRunConfigCarriesModelProfileIntoTheSessionEventLog。
+		ModelProfile:  runModelProfile(cfg.Maas, maasProfile, maasURL),
+		Events:        events,
+		Audit:         audit,
+		TaskSink:      taskSink,
+		TaskLedger:    taskLedger,
+		MessageStore:  messageStore,
+		Emit:          emit,
+		Session:       session,
+		ToolGate:      toolGate,
+		Checkpoints:   checkpoints,
+		SessionEvents: sessionEvents,
+	}
 }
 
 func newCommandTaskID(prefix string) string {
@@ -453,6 +498,18 @@ type tuiTaskRunConfig struct {
 	// alone. It shares the same on-disk store the `serve` command's
 	// manualgate flow uses, so it is otherwise inert here.
 	Checkpoints *sessionstate.Store
+	// SessionEvents 是这条 TUI 路径的会话事件落点。两个 TUI 入口（runTUITask 与
+	// runMentionedTUIAgentTask）**都要**接：只接一个的症状是「@某个 agent 提问就
+	// 没有轨迹」，而没有轨迹与没提问在库里长得一样。
+	SessionEvents port.SessionEventStore
+	// ModelProfile 是这次 TUI 运行记进**会话事件**的模型档位名（spec §4.1 的
+	// model_profile），已经过 runModelProfile 归一，永不为空。
+	//
+	// 它与上面的 DefaultModelProfile 不是同一个东西，别合并：DefaultModelProfile
+	// 是写进 conversation_turns 的原始档位名，没有配置档位时它就是空串，而那是
+	// 那张表既有的语义。这里要的是「这一步跑在哪个模型上」，空串在轨迹里与漏传
+	// 无法区分，所以两者取值规则不同。
+	ModelProfile string
 }
 
 func parseTUIAgentPrompt(input string) tuiAgentPrompt {
@@ -561,6 +618,8 @@ func runTUITask(ctx context.Context, application *app.App, cfg tuiTaskRunConfig)
 		ToolGate:          cfg.ToolGate,
 		Checkpoints:       cfg.Checkpoints,
 		DisabledTools:     cfg.Config.Runtime.DisabledTools,
+		SessionEvents:     cfg.SessionEvents,
+		ModelProfile:      cfg.ModelProfile,
 	})
 	if err != nil {
 		return app.DemoResult{}, err
@@ -652,6 +711,10 @@ func runMentionedTUIAgentTask(ctx context.Context, application *app.App, cfg tui
 		ToolGate:          cfg.ToolGate,
 		Checkpoints:       cfg.Checkpoints,
 		DisabledTools:     cfg.Config.Runtime.DisabledTools,
+		SessionEvents:     cfg.SessionEvents,
+		// @提及路径的客户端是 maasFactoryFromConfig 按 agent 自己的档位建的，
+		// 完全不看 --maas-url，所以这里直接按那个档位解，与它同源。
+		ModelProfile: cfg.Config.Maas.ResolveProfileName(agentCfg.MaasProfile),
 	})
 	if err != nil {
 		return app.DemoResult{}, err
@@ -839,6 +902,21 @@ func tuiSkillManagers(cfg config.Config, registry *agentregistry.Registry) map[s
 	return managers
 }
 
+// runModelProfile 解出这次运行记进会话事件的模型档位名（spec §4.1 的 model_profile）。
+//
+// 显式 --maas-url 建的是一个**绕过所有档位**的临时客户端（见 maasClientFromConfig），
+// 它没有档位名可言；用与 tuiDisplayConfig 同一套词汇标成 "custom-maas"，而不是报一个
+// 它并没有在用的档位。其余情形交给 config.MaasConfig.ResolveProfileName，与
+// adapter.NewMaasClientFromProfile 的选择顺序同源。
+//
+// 任何情况下都不返回空串：空串在轨迹里与「装配漏传这个字段」无法区分。
+func runModelProfile(cfg config.MaasConfig, profile string, explicitBaseURL string) string {
+	if strings.TrimSpace(explicitBaseURL) != "" {
+		return "custom-maas"
+	}
+	return cfg.ResolveProfileName(profile)
+}
+
 func tuiDisplayConfig(cfg config.MaasConfig, profile string, explicitBaseURL string) tuiDisplay {
 	if explicitBaseURL != "" {
 		return tuiDisplay{AgentName: "agent", ModelName: "custom-maas"}
@@ -874,6 +952,11 @@ type runPorts struct {
 	taskSink     app.TaskSink
 	sessionStore conversationStore
 	messageStore tool.AgentMessageStore
+	// sessionEvents 是 `agent run --prompt` / `agent tui` 这条路的会话事件落点
+	// （app.RunTaskOptions.SessionEvents）。它与 serve 的装配是两套：serve 在
+	// BuildServeService 里解析同一个仓储，这里在 persistentRunPorts 里。
+	// 非持久化驱动下为 nil，与上面几个字段同义（没有可写的地方，不是错误）。
+	sessionEvents port.SessionEventStore
 }
 
 type streamingEventBus struct {
@@ -929,11 +1012,12 @@ func persistentRunPorts(ctx context.Context, cfg config.Config) (runPorts, func(
 		return runPorts{}, func() {}, err
 	}
 	return runPorts{
-			events:       storage.NewSQLiteEventBus(repo),
-			audit:        storage.NewSQLiteAuditLog(repo),
-			taskSink:     repo,
-			sessionStore: repo,
-			messageStore: repo,
+			events:        storage.NewSQLiteEventBus(repo),
+			audit:         storage.NewSQLiteAuditLog(repo),
+			taskSink:      repo,
+			sessionStore:  repo,
+			messageStore:  repo,
+			sessionEvents: repo,
 		}, func() {
 			closeRepositoryLogging(slog.Default(), repo, "persistent-run")
 		}, nil
@@ -1973,6 +2057,8 @@ func buildDefaultRunnerConfig(
 	skillUsage agentruntime.SkillUsageRecorder,
 	episodeRecorder agentruntime.EpisodeRecorder,
 	gate *taskgate.TaskGate,
+	sessionEvents port.SessionEventStore,
+	modelProfile string,
 ) agentruntime.Config {
 	return agentruntime.Config{
 		Maas:             maas,
@@ -1998,6 +2084,14 @@ func buildDefaultRunnerConfig(
 		// task run against one process-wide tool registry: an apply may only
 		// land when NEITHER has a task in flight.
 		Gate: gate,
+		// 会话事件日志的落点。它必须与 resolver 路径接同一个 store，理由与上面的
+		// Compaction 一模一样：这份配置服务的是**每一个默认 agent 任务**（GUI 自己
+		// 的那条路，也就是绝大多数任务），只接 resolver 会让它们全都没有轨迹——
+		// 而「没有轨迹」与「没有发生过任务」在库里长得一样，不会有任何报错。
+		SessionEvents: sessionEvents,
+		// 默认 agent 跑在哪个档位上。Runtime 自己拿不到这个信息（它只拿到一个建好的
+		// 客户端），漏传的症状是轨迹里 model_profile 永远空白且不报错。
+		ModelProfile: modelProfile,
 	}
 }
 
@@ -2376,6 +2470,18 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// stays nil here for the non-sqlite drivers and is given an in-memory
 	// fallback below, mirroring taskSink/conversationTurns/messageStore above.
 	var episodicStore memory.EpisodicStore
+	// sessionEvents is the session event log (P1's port.SessionEventStore) every
+	// runtime this assembly builds writes its turn/step/tool trace into. It is
+	// ONE store shared by both task paths — the default runner below and every
+	// per-agent runtime the resolver builds — because a single session's turns
+	// may be served by either: wiring only one of them would punch holes in that
+	// session's log, and a hole is indistinguishable from "nothing happened".
+	//
+	// It stays nil for the non-sqlite drivers, mirroring
+	// taskSink/conversationTurns/messageStore above: there is nowhere durable to
+	// append to, and Config.SessionEvents declares nil a legitimate deployment
+	// shape (the whole recording is a no-op), not a fallback.
+	var sessionEvents port.SessionEventStore
 	// skillUsage is the shared usage sidecar: the skill System records activity on
 	// it as skills are selected into task context, and the Curator sweep reads it
 	// to age idle skills. Sharing one instance connects the two.
@@ -2387,6 +2493,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		sessionSearcher = repo
 		taskSink = repo
 		conversationTurns = repo
+		sessionEvents = repo
 		episodicStore = memory.NewPersistentEpisodicStore(repo)
 		curator, err := skill.NewCurator(skill.CuratorConfig{Repository: repo, Usage: skillUsage})
 		if err != nil {
@@ -2631,6 +2738,9 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		ConversationTurns: conversationTurns,
 		EpisodeRecorder:   episodeRecorder,
 		BrowserRuntime:    sharedBrowser,
+		// Same store the default runner gets below: one session's turns can be
+		// served by either path, so a log wired on only one of them has holes.
+		SessionEvents: sessionEvents,
 	})
 	defaultDisplay := tuiDisplayConfig(cfg.Maas, "", "")
 	defaultContext, err := buildRunContextPrefix(ctx, cfg, false, defaultDisplay.ModelName)
@@ -2694,6 +2804,10 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 			skillUsage,
 			episodeRecorder,
 			taskGate,
+			sessionEvents,
+			// serve 没有命令行档位开关，默认 agent 一律跑在 default_profile 上
+			// （defaultMaas 也是这么建的），两者必须同源。
+			cfg.Maas.ResolveProfileName(""),
 		),
 		contextRoot:     cfg.ContextFiles.Root,
 		audit:           auditLog,

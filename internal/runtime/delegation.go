@@ -125,6 +125,17 @@ func (r *Runtime) newSubRuntime(role string, toolsets []string) (*Runtime, error
 		// would make the child invisible to the apply that is waiting for the
 		// parent's boundary, which is the one thing the gate exists to prevent.
 		gate: r.gate,
+		// The store, not a recorder: each RunTask call builds its own
+		// *eventRecorder (one per execution, see eventRecorder's type doc), and
+		// the child's own RunTask does exactly that. Without this the child
+		// silently drops every event it would otherwise write — the exact
+		// "the seam exists but nothing reaches it" failure shape this repo has
+		// hit twice before with per-agent tool/approval wiring.
+		sessionEvents: r.sessionEvents,
+		// The child runs on the parent's inference client, so it runs under the
+		// parent's model profile; without this its own session log would record
+		// an empty model_profile on every assistant/message (spec §4.1).
+		modelProfile: r.modelProfile,
 	}
 	return child, nil
 }
@@ -157,6 +168,13 @@ func (r *Runtime) runChild(ctx context.Context, child *Runtime, subTaskID string
 	if agentID == "" {
 		agentID = subTaskID
 	}
+	// SessionID is deliberately left unset. Task 1's decision D-A already falls
+	// the session event recorder back to task.ID when SessionID is empty
+	// (newEventRecorder), so a sub-task with no session identity of its own
+	// gets its own short session log keyed by subTaskID instead of writing
+	// into its parent's -- the parent's log keeps only the one tool/call +
+	// tool/result pair for RunSubTask itself, exactly the shape spec F1 wants.
+	// No extra code is needed here; this comment is the whole of the decision.
 	task := domain.Task{
 		ID:        subTaskID,
 		AgentID:   agentID,
