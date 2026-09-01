@@ -113,6 +113,15 @@ type RunTaskOptions struct {
 	// error — CLAUDE.md §0 fail-loud — not a silent no-op). Empty disables
 	// nothing.
 	DisabledTools []string
+	// SessionEvents 是这次运行的会话事件日志落点，直接喂给 runtime.Config.SessionEvents。
+	//
+	// 它必须存在，因为这条路（`agent run --prompt` 与 `agent tui`）与 serve 是**两套
+	// 独立的装配**：serve 在 BuildServeService 里解析 store，这条在 persistentRunPorts
+	// 里。只接一边的症状是「另一条路跑出来的任务没有任何轨迹」，而且不会报错。
+	//
+	// nil 是契约允许的部署形态（非持久化驱动、测试），那时整个记录是 no-op——
+	// 见 runtime.Config.SessionEvents 的文档注释，不是兜底。
+	SessionEvents port.SessionEventStore
 }
 
 type TaskSink interface {
@@ -386,6 +395,9 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 		DisabledTools:     opts.DisabledTools,
 		// One-shot task, its own gate — see RunDemo above.
 		Gate: taskgate.NewTaskGate(),
+		// 这条路的会话事件落点。nil 是合法部署形态（非持久化驱动、测试），
+		// 那时整个记录是 no-op（见 runtime.Config.SessionEvents）。
+		SessionEvents: opts.SessionEvents,
 	})
 	task := domain.Task{
 		ID:         opts.TaskID,

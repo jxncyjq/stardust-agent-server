@@ -104,6 +104,16 @@ type AgentRuntimeResolverConfig struct {
 	// launching a Chromium per task — launching per task leaked a browser
 	// process on every worker task. Nil means browser tools are off.
 	BrowserRuntime browser.RuntimeAPI
+	// SessionEvents 是会话事件日志的落点，镜像默认运行时的 Config.SessionEvents。
+	//
+	// 它必须与默认运行时接**同一个** store：两条路径的任务落在同一批会话里（一个
+	// 会话既可能派给具名 agent，也可能走默认 agent），只接一边会让那条会话的日志
+	// 出现空洞——而「有洞的日志」与「这段时间什么都没发生」在数据上完全一样，
+	// 谁也认不出来。本仓已经栽过两次「只接了 resolver、默认路径没接」的同形事故。
+	//
+	// nil 是契约允许的部署形态（非持久化驱动、测试构造），那时这些运行时整体不记
+	// 事件（见 Config.SessionEvents），不是兜底。
+	SessionEvents port.SessionEventStore
 }
 
 type AgentRuntimeResolver struct {
@@ -124,6 +134,7 @@ type AgentRuntimeResolver struct {
 	episodeRecorder   EpisodeRecorder
 	browserRuntime    browser.RuntimeAPI
 	gate              *taskgate.TaskGate
+	sessionEvents     port.SessionEventStore
 }
 
 func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolver {
@@ -152,6 +163,7 @@ func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolv
 		episodeRecorder:   cfg.EpisodeRecorder,
 		browserRuntime:    cfg.BrowserRuntime,
 		gate:              cfg.Gate,
+		sessionEvents:     cfg.SessionEvents,
 	}
 }
 
@@ -328,6 +340,7 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		ConversationTurns:     recentTurns,
 		EpisodeRecorder:       r.episodeRecorder,
 		Gate:                  r.gate,
+		SessionEvents:         r.sessionEvents,
 	})
 	return agent, runner, true, nil
 }
