@@ -28,16 +28,18 @@ type SQLiteRepository struct {
 	sessionEventLocks sessionWriteLocks
 }
 
-// ErrAgentSessionNotFound is returned by DeleteAgentSession when no session with
-// the given id exists. Callers (e.g. the HTTP layer) match it with errors.Is to
-// translate a missing session into a 404 instead of swallowing the failure.
+// ErrAgentSessionNotFound is returned by DeleteAgentSession and TouchAgentSession
+// when no session with the given id exists. Callers (e.g. the HTTP layer) match
+// it with errors.Is to translate a missing session into a 404 instead of
+// swallowing the failure.
 var ErrAgentSessionNotFound = errors.New("agent session not found")
 
 // CurrentSchemaVersion is bumped whenever schemaStatements or the idempotent
 // column migrations in migrate change. Version 2 added the agent_sessions.project
 // and tasks.session_id columns for two-level session grouping. Version 3 added
 // the agent_sessions.archived column for archiving sessions and projects. Version
-// 4 added the conversation_turns_fts FTS5 virtual table backing session_search.
+// 4 added the (since retired) conversation_turns_fts FTS5 virtual table that
+// then backed session_search.
 // Version 5 added the agent_sessions.mode column for persisting manual/auto mode.
 // Version 6 added the agent_sessions.working_dir column for persisting the host
 // filesystem directory a session is bound to.
@@ -47,7 +49,17 @@ var ErrAgentSessionNotFound = errors.New("agent session not found")
 // login state (cookies) across process restarts for the Phase 3 browser feature.
 // Version 9 added the session_events table, the append-only per-session event log
 // that later phases project into conversation transcripts.
-const CurrentSchemaVersion = 9
+// Version 10 added the session_events_fts FTS5 virtual table, which moves
+// session_search's discovery mode off conversation_turns_fts and onto the event
+// log so tool calls and their results are searchable too.
+// Version 11 retired conversation_turns and conversation_turns_fts: their create
+// statements and their additive column migrations are gone, and so are the
+// writers that fed them. The session event log is the single source of truth for
+// conversation content (spec §3 取舍 A2) — ListConversationTurns projects the
+// turns out of it and session_search reads session_events_fts. Existing
+// databases are not migrated (spec §3 取舍 B3): the two tables are simply no
+// longer created, no longer written, and no longer read.
+const CurrentSchemaVersion = 11
 
 type WorkflowState struct {
 	Definition workflow.Definition `json:"definition"`
@@ -304,12 +316,73 @@ func (r *SQLiteRepository) SaveAgentSession(ctx context.Context, session domain.
 	return nil
 }
 
-// DeleteAgentSession removes a session and cascades the delete to every
-// conversation turn belonging to it, in a single transaction so a partial
-// failure cannot leave orphaned turns. A session id that does not exist is
-// reported as an error rather than silently treated as success, per the
-// fail-loud rule: deleting a nonexistent session is an inconsistent request the
-// caller must learn about.
+// TouchAgentSession advances a session's updated_at to at, and touches only
+// that column.
+//
+// Why field-level and not "read the row, mutate UpdatedAt, SaveAgentSession
+// it back": this repo has paid for that exact mistake once already (task-state
+// persistence, PR #44 — "写穿必须字段级不能全行 UPSERT"). SaveAgentSession's
+// INSERT ... ON CONFLICT DO UPDATE writes every column from the caller's
+// in-memory copy. Two processes touching the same session concurrently (e.g.
+// the TUI recording a turn while a GUI-attached server PATCHes title/mode/
+// working_dir) can interleave a read-modify-SaveAgentSession cycle around the
+// other process's write: whichever save lands second wins on *every* column,
+// silently reverting the fields it never meant to touch. A single UPDATE that
+// names only updated_at cannot clobber a sibling column no matter how it
+// interleaves with a concurrent writer — there is nothing else in the
+// statement for it to overwrite. If a future change wants to fold this back
+// into a whole-row upsert "for simplicity", re-read PR #44's postmortem first.
+//
+// Not wrapped in an explicit transaction: it is a single UPDATE statement, and
+// SQLite (via database/sql) auto-commits a lone statement as its own atomic
+// unit — there is no second statement here for a transaction to keep in sync
+// with. Compare AppendConversationTurn's tx.ExecContext calls above (now
+// retired) or DeleteAgentSession below, which need an explicit transaction
+// specifically because they coordinate *multiple* writes that must all land
+// or none.
+//
+// A session id with no matching row is fail-loud, not a silent no-op: the
+// contract this repository exposes doesn't declare "touch a session that was
+// never created, or that another process deleted out from under you" as a
+// legitimate outcome — the one caller today (tuiSessionController.
+// touchCurrentSession) always resolves the id from a session it just created,
+// loaded, or switched to, so a missing row here means the caller's view of
+// the world is stale, not that "no-op" was ever the intended contract.
+// Matches DeleteAgentSession's existing precedent for the same zero-rows
+// case. (server's touchSessionOnSubmit still does its own whole-row
+// SaveAgentSession touch — carrying it over to this method too is follow-up
+// work, not part of this change; see final-review-2.md §4 N-1.)
+func (r *SQLiteRepository) TouchAgentSession(ctx context.Context, sessionID string, at time.Time) error {
+	res, err := r.db.ExecContext(ctx, `
+		UPDATE agent_sessions
+		SET updated_at = ?
+		WHERE id = ?
+	`, formatTime(at), sessionID)
+	if err != nil {
+		return fmt.Errorf("touch agent session %q: %w", sessionID, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check touched agent session %q rows affected: %w", sessionID, err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("touch agent session %q: %w", sessionID, ErrAgentSessionNotFound)
+	}
+	return nil
+}
+
+// DeleteAgentSession removes a session and cascades the delete to everything
+// that reconstructs its conversation — its event log and that log's search
+// index — in a single transaction so a partial failure cannot leave orphans. A
+// session id that does not exist is reported as an error rather than silently
+// treated as success, per the fail-loud rule: deleting a nonexistent session is
+// an inconsistent request the caller must learn about.
+//
+// session_events is the whole of it now that conversation_turns has been
+// retired: ListConversationTurns projects from the event log (spec §3 取舍 A2),
+// so leaving the events behind would let a deleted session's whole conversation
+// keep coming back out of the read path — a delete that visibly deletes
+// nothing.
 func (r *SQLiteRepository) DeleteAgentSession(ctx context.Context, sessionID string) error {
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -317,9 +390,19 @@ func (r *SQLiteRepository) DeleteAgentSession(ctx context.Context, sessionID str
 	}
 	defer tx.Rollback()
 	if _, err := tx.ExecContext(ctx, `
-		DELETE FROM conversation_turns WHERE session_id = ?
+		DELETE FROM session_events WHERE session_id = ?
 	`, sessionID); err != nil {
-		return fmt.Errorf("delete conversation turns for session %q: %w", sessionID, err)
+		return fmt.Errorf("delete session events for session %q: %w", sessionID, err)
+	}
+	// The search index is part of "everything that reconstructs its
+	// conversation" too, now that discovery reads session_events_fts: leaving
+	// its rows behind would keep a deleted session's prose and tool round trips
+	// coming out of session_search, with every scroll back into them failing on
+	// a missing anchor.
+	if _, err := tx.ExecContext(ctx, `
+		DELETE FROM session_events_fts WHERE session_id = ?
+	`, sessionID); err != nil {
+		return fmt.Errorf("delete session event search index for session %q: %w", sessionID, err)
 	}
 	res, err := tx.ExecContext(ctx, `
 		DELETE FROM agent_sessions WHERE id = ?
@@ -402,129 +485,28 @@ func (r *SQLiteRepository) ListAgentSessions(ctx context.Context, companyID stri
 	return sessions, nil
 }
 
-func (r *SQLiteRepository) AppendConversationTurn(ctx context.Context, turn domain.ConversationTurn) error {
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin append conversation turn %q: %w", turn.ID, err)
-	}
-	defer tx.Rollback()
-	gf, err := json.Marshal(turn.GeneratedFiles)
-	if err != nil {
-		return fmt.Errorf("marshal generated files for turn %q: %w", turn.ID, err)
-	}
-	if turn.GeneratedFiles == nil {
-		gf = []byte("[]")
-	}
-	if _, err := tx.ExecContext(ctx, `
-		INSERT INTO conversation_turns (
-			id, session_id, task_id, agent_id, model_profile, role, content, created_at,
-			prompt_tokens, completion_tokens, cached_tokens, total_tokens, generated_files
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, turn.ID, turn.SessionID, turn.TaskID, turn.AgentID, turn.ModelProfile, string(turn.Role), turn.Content, formatTime(turn.CreatedAt),
-		turn.PromptTokens, turn.CompletionTokens, turn.CachedTokens, turn.TotalTokens, string(gf)); err != nil {
-		return fmt.Errorf("append conversation turn %q: %w", turn.ID, err)
-	}
-	if err := indexConversationTurn(ctx, tx, turn); err != nil {
-		return err
-	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE agent_sessions
-		SET updated_at = ?
-		WHERE id = ?
-	`, formatTime(turn.CreatedAt), turn.SessionID); err != nil {
-		return fmt.Errorf("touch agent session %q: %w", turn.SessionID, err)
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("commit append conversation turn %q: %w", turn.ID, err)
-	}
-	return nil
-}
-
-// AppendConversationTurnIfAbsent inserts a turn only when no turn with the same
-// id already exists, returning whether it was inserted. This gives an
-// exactly-once write for turns keyed by a deterministic id (e.g. "<taskID>:user"),
-// so repeated calls — such as polling the task result endpoint — do not duplicate
-// the turn. The session's updated_at is touched only on a real insert. A genuine
-// write failure is returned wrapped, never swallowed.
-func (r *SQLiteRepository) AppendConversationTurnIfAbsent(ctx context.Context, turn domain.ConversationTurn) (bool, error) {
-	tx, err := r.db.BeginTx(ctx, nil)
-	if err != nil {
-		return false, fmt.Errorf("begin append conversation turn %q if absent: %w", turn.ID, err)
-	}
-	defer tx.Rollback()
-	gf, err := json.Marshal(turn.GeneratedFiles)
-	if err != nil {
-		return false, fmt.Errorf("marshal generated files for turn %q: %w", turn.ID, err)
-	}
-	if turn.GeneratedFiles == nil {
-		gf = []byte("[]")
-	}
-	res, err := tx.ExecContext(ctx, `
-		INSERT OR IGNORE INTO conversation_turns (
-			id, session_id, task_id, agent_id, model_profile, role, content, created_at,
-			prompt_tokens, completion_tokens, cached_tokens, total_tokens, generated_files
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	`, turn.ID, turn.SessionID, turn.TaskID, turn.AgentID, turn.ModelProfile, string(turn.Role), turn.Content, formatTime(turn.CreatedAt),
-		turn.PromptTokens, turn.CompletionTokens, turn.CachedTokens, turn.TotalTokens, string(gf))
-	if err != nil {
-		return false, fmt.Errorf("append conversation turn %q if absent: %w", turn.ID, err)
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("check inserted conversation turn %q rows affected: %w", turn.ID, err)
-	}
-	if affected == 0 {
-		return false, nil
-	}
-	if err := indexConversationTurn(ctx, tx, turn); err != nil {
-		return false, err
-	}
-	if _, err := tx.ExecContext(ctx, `
-		UPDATE agent_sessions
-		SET updated_at = ?
-		WHERE id = ?
-	`, formatTime(turn.CreatedAt), turn.SessionID); err != nil {
-		return false, fmt.Errorf("touch agent session %q: %w", turn.SessionID, err)
-	}
-	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("commit append conversation turn %q if absent: %w", turn.ID, err)
-	}
-	return true, nil
-}
-
+// ListConversationTurns 返回一条会话的对话轮次，按时间正序；limit > 0 时只取
+// **最近** limit 条。
+//
+// 轮次由会话事件投影得出（spec §3 取舍 A2：事件日志是唯一真相源）。这里用
+// ReadFrom(0) 而不是 Load：spec §4.3.1 第 3 条要求 Load 只对「确定没有活跃写入者」
+// 的会话调用，而这个方法在任务执行期间也会被调用（多轮 messages 就走它）。
+// ReadFrom 只读后缀、不触发恢复，正是这里要的。
 func (r *SQLiteRepository) ListConversationTurns(ctx context.Context, sessionID string, limit int) ([]domain.ConversationTurn, error) {
-	query := `
-		SELECT id, session_id, task_id, agent_id, model_profile, role, content, created_at,
-			prompt_tokens, completion_tokens, cached_tokens, total_tokens, generated_files
-		FROM conversation_turns
-		WHERE session_id = ?
-		ORDER BY created_at DESC, id DESC
-	`
-	args := []any{sessionID}
-	if limit > 0 {
-		query += ` LIMIT ?`
-		args = append(args, limit)
-	}
-	rows, err := r.db.QueryContext(ctx, query, args...)
+	events, err := r.ReadFrom(ctx, sessionID, 0)
 	if err != nil {
 		return nil, fmt.Errorf("list conversation turns for %q: %w", sessionID, err)
 	}
-	defer rows.Close()
-	var reversed []domain.ConversationTurn
-	for rows.Next() {
-		turn, err := scanConversationTurn(rows)
-		if err != nil {
-			return nil, fmt.Errorf("scan conversation turn for %q: %w", sessionID, err)
-		}
-		reversed = append(reversed, turn)
+	turns, err := projectTurns(sessionID, events)
+	if err != nil {
+		return nil, fmt.Errorf("list conversation turns for %q: %w", sessionID, err)
 	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate conversation turns for %q: %w", sessionID, err)
+	// limit 取最近的 N 条：事件是正序的，所以从尾部截。旧实现是
+	// ORDER BY created_at DESC LIMIT n 再反转，语义相同。
+	if limit > 0 && len(turns) > limit {
+		turns = turns[len(turns)-limit:]
 	}
-	for i, j := 0, len(reversed)-1; i < j; i, j = i+1, j-1 {
-		reversed[i], reversed[j] = reversed[j], reversed[i]
-	}
-	return reversed, nil
+	return turns, nil
 }
 
 // AddEpisodicMemory persists one episodic memory entry and its full-text index
@@ -635,6 +617,25 @@ func (r *SQLiteRepository) SearchEpisodicMemory(ctx context.Context, query strin
 // full window, so trigram can never recall it — those runs are instead
 // returned as LIKE terms so the caller can OR in a substring match.
 func episodicSearchTerms(raw string) (ftsExpr string, likeTerms []string) {
+	var grams []string
+	for _, run := range letterNumberRuns(raw) {
+		chars := []rune(run)
+		if len(chars) < 3 {
+			likeTerms = append(likeTerms, run)
+			continue
+		}
+		for i := 0; i+3 <= len(chars); i++ {
+			grams = append(grams, `"`+string(chars[i:i+3])+`"`)
+		}
+	}
+	return strings.Join(grams, " OR "), likeTerms
+}
+
+// letterNumberRuns splits arbitrary text into its maximal runs of letters and
+// numbers, dropping everything else. Because a run can contain neither an FTS5
+// operator nor a LIKE wildcard, every run is safe to use as a bound parameter in
+// either kind of query. Empty or all-separator input yields no runs.
+func letterNumberRuns(raw string) []string {
 	var runs []string
 	var b strings.Builder
 	flush := func() {
@@ -651,19 +652,36 @@ func episodicSearchTerms(raw string) (ftsExpr string, likeTerms []string) {
 		}
 	}
 	flush()
+	return runs
+}
 
-	var grams []string
-	for _, run := range runs {
-		chars := []rune(run)
-		if len(chars) < 3 {
+// sessionEventSearchTerms turns arbitrary query text into an FTS5 MATCH
+// expression over session_events_fts plus the short runs that expression cannot
+// reach, which the caller ORs in as substring matches.
+//
+// It differs from episodicSearchTerms in one deliberate way: a run of 3+
+// characters becomes a single quoted *phrase* rather than an OR of its own
+// trigrams. Against a trigram-tokenized column a phrase query is exact substring
+// matching, so searching "kubernetes" returns the events that contain that word.
+// OR-ing the trigrams instead would also return everything containing "net" or
+// "ete" — acceptable for episodic recall, where over-recall only widens the pool
+// a ranker then narrows, but wrong for session_search, whose hits are shown to
+// the model as the answer.
+//
+// Runs shorter than the trigram window have no window at all, so trigram can
+// never recall them; they come back as LIKE terms (a lone two-character CJK word
+// is the common case). Empty or all-separator input yields ("", nil), which the
+// caller reports as a caller error rather than searching for nothing.
+func sessionEventSearchTerms(raw string) (ftsExpr string, likeTerms []string) {
+	var phrases []string
+	for _, run := range letterNumberRuns(raw) {
+		if len([]rune(run)) < 3 {
 			likeTerms = append(likeTerms, run)
 			continue
 		}
-		for i := 0; i+3 <= len(chars); i++ {
-			grams = append(grams, `"`+string(chars[i:i+3])+`"`)
-		}
+		phrases = append(phrases, `"`+run+`"`)
 	}
-	return strings.Join(grams, " OR "), likeTerms
+	return strings.Join(phrases, " OR "), likeTerms
 }
 
 // execer is the ExecContext subset shared by *sql.DB and *sql.Tx, so the FTS
@@ -672,25 +690,101 @@ type execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
-// indexConversationTurn mirrors a conversation turn into the FTS5 index. It runs
-// inside the caller's transaction so the index and the source table commit
-// together; a failure is returned wrapped rather than swallowed, so a turn is
-// never persisted without being searchable.
-func indexConversationTurn(ctx context.Context, ex execer, turn domain.ConversationTurn) error {
-	if _, err := ex.ExecContext(ctx, `
-		INSERT INTO conversation_turns_fts (
-			content, turn_id, session_id, task_id, agent_id, role, created_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?)
-	`, turn.Content, turn.ID, turn.SessionID, turn.TaskID, turn.AgentID, string(turn.Role), formatTime(turn.CreatedAt)); err != nil {
-		return fmt.Errorf("index conversation turn %q for search: %w", turn.ID, err)
+// searchHitRole maps the event type behind a search hit to the conversation role
+// the hit is reported under.
+//
+// domain.ConversationRole has exactly two values, user and assistant — there is
+// no tool role. A tool round trip is therefore reported under the assistant that
+// made it: in a provider transcript the tool_calls live on the assistant message
+// and the results feed the assistant's next one, so the assistant turn is where
+// a reader who follows a tool hit back into the conversation actually lands.
+// Inventing a third role would mean changing the domain type and every consumer
+// of it; reporting a tool hit under an empty role would hand callers a turn with
+// no address at all (the id is derived from the role, see SearchMessages).
+//
+// An unknown type is an error, not a silently dropped hit: the index only ever
+// receives the four types searchableText declares searchable, so anything else
+// means the two sides have drifted apart.
+func searchHitRole(eventType domain.SessionEventType) (domain.ConversationRole, error) {
+	switch eventType {
+	case domain.SessionEventUserMessage:
+		return domain.ConversationRoleUser, nil
+	case domain.SessionEventAssistantMessage,
+		domain.SessionEventToolCall,
+		domain.SessionEventToolResult:
+		return domain.ConversationRoleAssistant, nil
+	default:
+		return "", fmt.Errorf("indexed event type %q has no conversation role", eventType)
 	}
-	return nil
 }
 
-// SearchMessages runs an FTS5 full-text query over conversation turn content and
-// returns the best-ranked matches (discovery mode of session_search). query must
-// be a non-empty FTS5 MATCH expression; an empty query is a caller error. limit
-// <= 0 defaults to 20.
+// maxHitsPerTurn is how many matched events of one folded turn a single
+// discovery page may carry. Two is the smallest number that still distinguishes
+// "the call" from "its result", which is the pair a reader following a tool hit
+// wants to see; a third row of the same turn adds a round the reader can reach
+// through scroll anyway. See SearchMessages for why a cap is needed at all.
+//
+// The number is also stated in the session_search tool description
+// (internal/tool/session_search.go) so the model knows what it is getting;
+// changing it here means changing it there.
+const maxHitsPerTurn = 2
+
+// discoveryScanBudgetPerResult is how many index rows one discovery query may
+// read for each result it is asked to return. The per-turn cap only helps if the
+// query looks past the crowding task's rows, so the page is filled from a scan
+// wider than the page itself: at the default limit of 20 that is 500 rows, well
+// past the ~91 searchable rows a tool-loop-capped task can leave behind. It is a
+// bound on work, not a filter — the same kind of truncation limit itself is.
+const discoveryScanBudgetPerResult = 25
+
+// SearchMessages runs a full-text query over the session event log and returns
+// the matching moments as conversation turns (discovery mode of session_search).
+// Tool calls and their results are searchable alongside conversation prose (spec
+// §3 取舍 H1). query is arbitrary user text, not FTS5 syntax: its letter/number
+// runs become substring phrases (see sessionEventSearchTerms), so no caller has
+// to escape anything. An empty query, or one carrying no letter or number at
+// all, is a caller error. limit <= 0 defaults to 20.
+//
+// # What a hit is, and what turn it is reported as
+//
+// A hit is an *event*, while the return type is a turn, and the two are not one
+// to one: projectTurns folds every assistant/message of a task into a single
+// row whose content is the final answer. A hit therefore carries
+//
+//   - the id (and session/task/agent/role) of the *folded* turn that owns the
+//     event — "<task_id>:<role>", byte for byte what projectTurns produces — so
+//     the model can take a discovery hit straight back into scroll mode; and
+//   - the content and timestamp of the *matched event itself*, which for an
+//     intermediate round or a tool round trip is text no folded turn holds.
+//
+// Two events of one turn can therefore both be returned, sharing an id and
+// differing in content. That is the honest answer to "what matched": collapsing
+// them would hide one of the two moments, and reporting the folded content
+// instead would return text that does not contain the query.
+//
+// # Why one turn may not take the whole page
+//
+// A task folds into exactly two turns (user and assistant) but writes one
+// searchable row per event: with the tool loop capped at 30 rounds a single
+// chatty task can leave ~30 tool/call + ~30 tool/result + ~31 assistant/message
+// rows behind. Ordered by rank — or, in the LIKE branch, by recency — those rows
+// would fill the whole default page of 20 under two ids, and the model would see
+// nothing from any other session, which is the one thing discovery exists to do
+// (P3 Task 4 复审 Important-2).
+//
+// So each turn id contributes at most maxHitsPerTurn rows to a page, and the
+// query scans up to discoveryScanBudgetPerResult rows per requested result to
+// fill it. Neither is a silent skip: dropping a capped row loses no information
+// the caller could act on (the turn is already on the page, addressed by the same
+// id), the limit is announced in the session_search tool description so the model
+// knows a task shows up a couple of times rather than a hundred, and a page that
+// ends because the scan budget ran out is bounded work, exactly like limit itself.
+// De-duplicating by id instead would hide *which* round matched, which is the
+// content the hit exists to carry.
+//
+// ModelProfile and the token counters are left zero: they are not in the index,
+// exactly as they were absent from conversation_turns_fts before this moved.
+// Discovery is a locator; /turns and scroll carry the full row.
 func (r *SQLiteRepository) SearchMessages(ctx context.Context, query string, limit int) ([]domain.ConversationTurn, error) {
 	if strings.TrimSpace(query) == "" {
 		return nil, fmt.Errorf("search messages: query is required")
@@ -698,32 +792,120 @@ func (r *SQLiteRepository) SearchMessages(ctx context.Context, query string, lim
 	if limit <= 0 {
 		limit = 20
 	}
-	rows, err := r.db.QueryContext(ctx, `
-		SELECT turn_id, session_id, task_id, agent_id, role, content, created_at
-		FROM conversation_turns_fts
-		WHERE conversation_turns_fts MATCH ?
-		ORDER BY rank
-		LIMIT ?
-	`, query, limit)
+	ftsExpr, likeTerms := sessionEventSearchTerms(query)
+	if ftsExpr == "" && len(likeTerms) == 0 {
+		return nil, fmt.Errorf("search messages %q: the query has no letter or number to search for", query)
+	}
+	// The page is filled in Go (see the per-turn cap below), so SQL is asked for
+	// more rows than the page holds — enough that one chatty task cannot exhaust
+	// the budget before other sessions' hits are reached.
+	scanLimit := limit * discoveryScanBudgetPerResult
+
+	const selectHit = `
+		SELECT session_id, seq, type, task_id, agent_id, content, created_at
+		FROM session_events_fts
+	`
+	var (
+		rows *sql.Rows
+		err  error
+	)
+	if len(likeTerms) == 0 {
+		// Pure MATCH: FTS5 ranks the hits, which is the better ordering when it
+		// is available at all (rank needs a full-text constraint).
+		rows, err = r.db.QueryContext(ctx, selectHit+`
+			WHERE session_events_fts MATCH ?
+			ORDER BY rank
+			LIMIT ?
+		`, ftsExpr, scanLimit)
+	} else {
+		// A run shorter than the trigram window (a two-character CJK word, a
+		// short acronym) has no trigram to match, so it is OR-ed in as a
+		// substring instead. The MATCH stays inside a subquery: FTS5 cannot rank
+		// a query whose rows may come from a plain LIKE, so ordering falls back
+		// to newest first. Same shape as the episodic memory search above.
+		clauses := make([]string, 0, len(likeTerms)+1)
+		args := make([]any, 0, len(likeTerms)+2)
+		if ftsExpr != "" {
+			clauses = append(clauses,
+				`rowid IN (SELECT rowid FROM session_events_fts WHERE session_events_fts MATCH ?)`)
+			args = append(args, ftsExpr)
+		}
+		for _, term := range likeTerms {
+			clauses = append(clauses, `content LIKE ?`)
+			args = append(args, "%"+term+"%")
+		}
+		args = append(args, scanLimit)
+		rows, err = r.db.QueryContext(ctx, selectHit+`
+			WHERE `+strings.Join(clauses, " OR ")+`
+			ORDER BY created_at DESC, seq DESC
+			LIMIT ?
+		`, args...)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("search messages %q: %w", query, err)
 	}
 	defer rows.Close()
+
 	turns := make([]domain.ConversationTurn, 0)
+	// hitsPerTurn counts how many rows of each folded turn already made it onto
+	// the page, so no single task can crowd every other session out of it.
+	hitsPerTurn := make(map[string]int)
 	for rows.Next() {
-		var turn domain.ConversationTurn
-		var role string
-		var createdAt string
-		if err := rows.Scan(&turn.ID, &turn.SessionID, &turn.TaskID, &turn.AgentID, &role, &turn.Content, &createdAt); err != nil {
+		if len(turns) >= limit {
+			break
+		}
+		var (
+			sessionID string
+			seq       int64
+			eventType string
+			taskID    string
+			agentID   string
+			content   string
+			createdAt string
+		)
+		if err := rows.Scan(&sessionID, &seq, &eventType, &taskID, &agentID, &content, &createdAt); err != nil {
 			return nil, fmt.Errorf("scan search result for %q: %w", query, err)
 		}
+		role, err := searchHitRole(domain.SessionEventType(eventType))
+		if err != nil {
+			return nil, fmt.Errorf("search messages %q: event %d of session %q: %w", query, seq, sessionID, err)
+		}
+		// task_id is this hit's whole address: the turn id is built from it, and
+		// without one the caller gets a hit it can never scroll back to. An
+		// empty one means the event was written by an emitter that omitted it
+		// (projectTurns refuses the same log for the same reason), so say which
+		// event rather than returning an unusable turn. agent_id is NOT checked
+		// — an empty agent_id is contractually legal (the built-in default agent
+		// is selected by submitting a task with one), see projectTurns.
+		if taskID == "" {
+			return nil, fmt.Errorf("search messages %q: event %d of session %q has no task_id, so the "+
+				"hit has no turn to point at; the emitter that wrote that event omitted a required field",
+				query, seq, sessionID)
+		}
+		// Per-turn cap. maxHitsPerTurn rows of one turn are enough to show a call
+		// and its result; the rest of that turn's rounds would only push other
+		// sessions off the page (see this method's doc comment). Nothing is lost
+		// silently: the turn is already on the page under this very id, and the
+		// cap is stated in the session_search tool description.
+		turnID := taskID + ":" + string(role)
+		if hitsPerTurn[turnID] >= maxHitsPerTurn {
+			continue
+		}
+		hitsPerTurn[turnID]++
 		parsed, err := parseTime(createdAt)
 		if err != nil {
-			return nil, fmt.Errorf("parse search result %q created_at: %w", turn.ID, err)
+			return nil, fmt.Errorf("parse search result created_at for event %d of session %q: %w",
+				seq, sessionID, err)
 		}
-		turn.Role = domain.ConversationRole(role)
-		turn.CreatedAt = parsed
-		turns = append(turns, turn)
+		turns = append(turns, domain.ConversationTurn{
+			ID:        turnID,
+			SessionID: sessionID,
+			TaskID:    taskID,
+			AgentID:   agentID,
+			Role:      role,
+			Content:   content,
+			CreatedAt: parsed,
+		})
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("iterate search results for %q: %w", query, err)
@@ -1624,20 +1806,6 @@ func (r *SQLiteRepository) migrate(ctx context.Context) error {
 	if err := r.applyColumnMigrations(ctx); err != nil {
 		return err
 	}
-	// One-time FTS backfill: turns written before schema version 4 predate the
-	// conversation_turns_fts index. Read the prior recorded version now that
-	// schema_migrations exists (0 on a fresh DB) and, when upgrading from below 4,
-	// index any conversation turns not yet present. The backfill is idempotent
-	// (it skips already-indexed rows), so a fresh DB with no turns is a no-op.
-	priorVersion, err := r.SchemaVersion(ctx)
-	if err != nil {
-		return err
-	}
-	if priorVersion < 4 {
-		if _, err := r.BackfillConversationTurnsFTS(ctx); err != nil {
-			return err
-		}
-	}
 	if _, err := r.db.ExecContext(ctx, `
 		INSERT OR IGNORE INTO schema_migrations (version, applied_at)
 		VALUES (?, ?)
@@ -1645,31 +1813,6 @@ func (r *SQLiteRepository) migrate(ctx context.Context) error {
 		return fmt.Errorf("record schema migration: %w", err)
 	}
 	return nil
-}
-
-// BackfillConversationTurnsFTS indexes every conversation turn that is not yet
-// present in the FTS table, returning how many rows were added. It is idempotent
-// via a NOT EXISTS guard, so re-running it never double-indexes a turn. It backs
-// the one-time schema v4 upgrade and can be called directly to repair the index.
-func (r *SQLiteRepository) BackfillConversationTurnsFTS(ctx context.Context) (int, error) {
-	res, err := r.db.ExecContext(ctx, `
-		INSERT INTO conversation_turns_fts (
-			content, turn_id, session_id, task_id, agent_id, role, created_at
-		)
-		SELECT t.content, t.id, t.session_id, t.task_id, t.agent_id, t.role, t.created_at
-		FROM conversation_turns t
-		WHERE NOT EXISTS (
-			SELECT 1 FROM conversation_turns_fts f WHERE f.turn_id = t.id
-		)
-	`)
-	if err != nil {
-		return 0, fmt.Errorf("backfill conversation turns fts: %w", err)
-	}
-	added, err := res.RowsAffected()
-	if err != nil {
-		return 0, fmt.Errorf("backfill conversation turns fts rows affected: %w", err)
-	}
-	return int(added), nil
 }
 
 // columnMigration describes one additive column that CREATE TABLE IF NOT EXISTS
@@ -1718,11 +1861,6 @@ var columnMigrations = []columnMigration{
 	// default backfills them correctly rather than leaving a blank that reads
 	// as "unknown".
 	{table: "audit_events", column: "origin", stmt: `ALTER TABLE audit_events ADD COLUMN origin TEXT NOT NULL DEFAULT 'agent'`},
-	{table: "conversation_turns", column: "prompt_tokens", stmt: `ALTER TABLE conversation_turns ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0`},
-	{table: "conversation_turns", column: "completion_tokens", stmt: `ALTER TABLE conversation_turns ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0`},
-	{table: "conversation_turns", column: "cached_tokens", stmt: `ALTER TABLE conversation_turns ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0`},
-	{table: "conversation_turns", column: "total_tokens", stmt: `ALTER TABLE conversation_turns ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0`},
-	{table: "conversation_turns", column: "generated_files", stmt: `ALTER TABLE conversation_turns ADD COLUMN generated_files TEXT NOT NULL DEFAULT '[]'`},
 }
 
 // applyColumnMigrations runs the additive ALTER TABLE migrations idempotently.
@@ -1812,27 +1950,6 @@ func scanAgentSession(row scanner) (domain.AgentSession, error) {
 	session.CreatedAt = parsedCreatedAt
 	session.UpdatedAt = parsedUpdatedAt
 	return session, nil
-}
-
-func scanConversationTurn(row scanner) (domain.ConversationTurn, error) {
-	var turn domain.ConversationTurn
-	var role string
-	var createdAt string
-	var gfRaw string
-	if err := row.Scan(&turn.ID, &turn.SessionID, &turn.TaskID, &turn.AgentID, &turn.ModelProfile, &role, &turn.Content, &createdAt,
-		&turn.PromptTokens, &turn.CompletionTokens, &turn.CachedTokens, &turn.TotalTokens, &gfRaw); err != nil {
-		return domain.ConversationTurn{}, err
-	}
-	parsedCreatedAt, err := parseTime(createdAt)
-	if err != nil {
-		return domain.ConversationTurn{}, fmt.Errorf("parse conversation turn %q created_at: %w", turn.ID, err)
-	}
-	turn.Role = domain.ConversationRole(role)
-	turn.CreatedAt = parsedCreatedAt
-	if err := json.Unmarshal([]byte(gfRaw), &turn.GeneratedFiles); err != nil {
-		return domain.ConversationTurn{}, fmt.Errorf("unmarshal generated files for turn %q: %w", turn.ID, err)
-	}
-	return turn, nil
 }
 
 func scanAgentMessage(row scanner) (domain.AgentMessage, error) {
@@ -1954,36 +2071,6 @@ var schemaStatements = []string{
 		created_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL
 	)`,
-	`CREATE TABLE IF NOT EXISTS conversation_turns (
-		id TEXT PRIMARY KEY,
-		session_id TEXT NOT NULL,
-		task_id TEXT NOT NULL,
-		agent_id TEXT NOT NULL,
-		model_profile TEXT NOT NULL,
-		role TEXT NOT NULL,
-		content TEXT NOT NULL,
-		created_at TEXT NOT NULL,
-		prompt_tokens INTEGER NOT NULL DEFAULT 0,
-		completion_tokens INTEGER NOT NULL DEFAULT 0,
-		cached_tokens INTEGER NOT NULL DEFAULT 0,
-		total_tokens INTEGER NOT NULL DEFAULT 0,
-		generated_files TEXT NOT NULL DEFAULT '[]'
-	)`,
-	// conversation_turns_fts is a full-text index over conversation turn content,
-	// backing the session_search tool (discovery mode). The non-content columns
-	// are UNINDEXED: they are stored for retrieval only, not tokenized. Rows are
-	// written alongside conversation_turns in the same transaction so the index
-	// never drifts from the source table. Turns written before this table existed
-	// are not backfilled; search covers turns recorded from schema version 4 on.
-	`CREATE VIRTUAL TABLE IF NOT EXISTS conversation_turns_fts USING fts5(
-		content,
-		turn_id UNINDEXED,
-		session_id UNINDEXED,
-		task_id UNINDEXED,
-		agent_id UNINDEXED,
-		role UNINDEXED,
-		created_at UNINDEXED
-	)`,
 	`CREATE TABLE IF NOT EXISTS agent_messages (
 		id TEXT PRIMARY KEY,
 		company_id TEXT NOT NULL,
@@ -2041,6 +2128,47 @@ var schemaStatements = []string{
 		time INTEGER NOT NULL,
 		data TEXT NOT NULL,
 		PRIMARY KEY (session_id, seq)
+	)`,
+	// session_events_fts is a full-text index over the searchable text of the
+	// session event log, backing session_search's discovery mode. It replaces
+	// conversation_turns_fts as the source of that mode (spec §3 取舍 H1): the
+	// old index only ever held conversation prose, so tool calls and their
+	// results — which never reached conversation_turns at all — could not be
+	// searched. Indexing the event log makes the whole round trip searchable
+	// from one source of truth.
+	//
+	// A row is written for each of the four event types that carry searchable
+	// text (user/message, assistant/message, tool/call, tool/result) inside the
+	// same transaction as the event itself (see indexSessionEvent), so the index
+	// never drifts from the log. The boundary events (turn/step start and end)
+	// have no text and get no row.
+	//
+	// Non-content columns are UNINDEXED: stored for retrieval, not tokenized.
+	// (session_id, seq) addresses the event a row mirrors; turn_id is the
+	// message event's own id and is empty for tool/call and tool/result, whose
+	// payloads carry no turn_id (see runtime/eventlog.go recordToolCall and
+	// recordToolResult).
+	//
+	// tokenize='trigram' instead of the FTS5 default (unicode61), for the same
+	// reason as episodic_memory_fts below: unicode61 groups an unbroken run of
+	// CJK ideographs into a single opaque token, so MATCH — token equality, not
+	// substring — could never recall a query for part of a Chinese sentence.
+	// Trigram indexes every overlapping 3-character window instead, which lets
+	// sessionEventSearchTerms turn a query into substring-matching phrases.
+	//
+	// Events written before this table existed are not backfilled (spec §3
+	// 取舍 B3: no historical migration); search covers events recorded from
+	// schema version 10 on.
+	`CREATE VIRTUAL TABLE IF NOT EXISTS session_events_fts USING fts5(
+		content,
+		session_id UNINDEXED,
+		seq UNINDEXED,
+		type UNINDEXED,
+		turn_id UNINDEXED,
+		task_id UNINDEXED,
+		agent_id UNINDEXED,
+		created_at UNINDEXED,
+		tokenize = 'trigram'
 	)`,
 	`CREATE TABLE IF NOT EXISTS skills (
 		id TEXT NOT NULL,

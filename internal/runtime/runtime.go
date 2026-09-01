@@ -660,7 +660,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		return domain.TaskRun{}, fmt.Errorf("run task %s: %w", task.ID, err)
 	}
 	rec.recordTurnStart(turn)
-	rec.recordUserMessage(task.Input)
+	rec.recordUserMessage(userMessageContent(task.Input, len(task.Images)))
 
 	// Resume path: a persisted checkpoint means this task previously suspended.
 	// Rebuild loop state from disk and re-enter the loop with the pending calls,
@@ -727,7 +727,9 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 			// 不是同一个语义；把它填进来，任何按 assistant/message 求和统计用量的
 			// 消费者都会在「挂起→恢复」过的任务上多算一大截（final-review.md I-2）。
 			rec.recordStepStart()
-			rec.recordAssistantMessage(st.resp.Text, st.resp.ToolCalls, eventUsage{}, r.modelProfile)
+			// generatedFiles 传 nil：恢复点上这一步的产物尚未确定——checkpoint 里的
+			// PendingCalls 还没执行，任何 write_file 都还没跑，此刻没有可传的文件列表。
+			rec.recordAssistantMessage(st.resp.Text, st.resp.ToolCalls, eventUsage{}, r.modelProfile, nil)
 			if err := rec.barrier(ctx, "before resuming pending tool calls"); err != nil {
 				r.closeTurnOnError(ctx, task, rec, err)
 				return domain.TaskRun{}, fmt.Errorf("run task %s: %w", task.ID, err)
@@ -753,7 +755,9 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	basePrompt := prompt
 	convo := newConversation(basePrompt, task.Images)
 	convo.pinCachePrefix(stablePrefixLen)
-	resp, err := r.generateStep(ctx, rec, requestID, task.ID, convo, effTools)
+	// generatedFiles 传 nil：这是这次执行的第一次模型请求，还没有任何工具跑过，
+	// 不可能已经产出文件。
+	resp, err := r.generateStep(ctx, rec, requestID, task.ID, convo, effTools, nil)
 	if err != nil {
 		r.closeTurnOnError(ctx, task, rec, err)
 		r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInferenceError)
@@ -983,7 +987,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 			st.convo.appendUser(fmt.Sprintf(
 				"[系统] 你已多次以完全相同的参数调用同一工具，结果没有变化。不要再重复该调用：改用其他工具，或基于已获取的信息直接给出最终回答。（连续%d次/累计%d次）", streak, repeatCount))
 		}
-		st.resp, err = r.generateStep(ctx, rec, requestID, task.ID, st.convo, st.tools)
+		st.resp, err = r.generateStep(ctx, rec, requestID, task.ID, st.convo, st.tools, st.generatedFiles)
 		if err != nil {
 			// generateStep closes the step it opened on its own error path, so
 			// there is nothing open left here -- only the turn to close.
@@ -1045,7 +1049,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 			closing = "[系统] 检测到你在重复同一个工具调用，已停止工具循环。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。"
 		}
 		st.convo.appendUser(closing)
-		final, err := r.generateFinalStep(ctx, rec, requestID, task.ID, st.convo)
+		final, err := r.generateFinalStep(ctx, rec, requestID, task.ID, st.convo, st.generatedFiles)
 		if err != nil {
 			// Like generateStep, it closes its own step on the error path.
 			r.closeTurnOnError(ctx, task, rec, err)
@@ -1287,7 +1291,7 @@ func (r *Runtime) generateNoTools(ctx context.Context, requestID string, taskID 
 // context.Canceled) is read back through to give the closing reason
 // "cancelled" instead of "failed", matching closingTurnReason's mapping for
 // the turn this step lives in.
-func (r *Runtime) generateStep(ctx context.Context, rec *eventRecorder, requestID, taskID string, convo *conversation, tools *tool.Registry) (resp port.InferenceResponse, err error) {
+func (r *Runtime) generateStep(ctx context.Context, rec *eventRecorder, requestID, taskID string, convo *conversation, tools *tool.Registry, generatedFiles []string) (resp port.InferenceResponse, err error) {
 	rec.recordStepStart()
 	defer func() {
 		if err != nil {
@@ -1313,7 +1317,7 @@ func (r *Runtime) generateStep(ctx context.Context, rec *eventRecorder, requestI
 	rec.recordAssistantMessage(resp.Text, resp.ToolCalls, eventUsage{
 		Prompt: resp.PromptTokens, Completion: resp.CompletionTokens,
 		Cached: resp.CachedTokens, Total: resp.TotalTokens,
-	}, r.modelProfile)
+	}, r.modelProfile, generatedFiles)
 	return resp, nil
 }
 
@@ -1321,7 +1325,7 @@ func (r *Runtime) generateStep(ctx context.Context, rec *eventRecorder, requestI
 // / loop-cut closing answer (generateNoTools): same step lifecycle (step/start
 // + barrier 1, record the response, leave closing to the caller), no tools
 // offered so the model is forced to answer in text.
-func (r *Runtime) generateFinalStep(ctx context.Context, rec *eventRecorder, requestID, taskID string, convo *conversation) (resp port.InferenceResponse, err error) {
+func (r *Runtime) generateFinalStep(ctx context.Context, rec *eventRecorder, requestID, taskID string, convo *conversation, generatedFiles []string) (resp port.InferenceResponse, err error) {
 	rec.recordStepStart()
 	defer func() {
 		if err != nil {
@@ -1346,7 +1350,7 @@ func (r *Runtime) generateFinalStep(ctx context.Context, rec *eventRecorder, req
 	rec.recordAssistantMessage(resp.Text, resp.ToolCalls, eventUsage{
 		Prompt: resp.PromptTokens, Completion: resp.CompletionTokens,
 		Cached: resp.CachedTokens, Total: resp.TotalTokens,
-	}, r.modelProfile)
+	}, r.modelProfile, generatedFiles)
 	return resp, nil
 }
 

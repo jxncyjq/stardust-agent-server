@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,6 +42,13 @@ import (
 type eventRecorder struct {
 	store   port.SessionEventStore
 	session string
+	// taskID / agentID 是这次执行的任务与承接它的 agent 身份，newEventRecorder 时
+	// 定死、不随后续调用变化。record* 方法把它们写进 user/message 与
+	// assistant/message 的载荷，供 P3 投影出 domain.ConversationTurn.TaskID/AgentID：
+	// session_turns.go 用 TaskID 滤掉任务自己的 user turn，AgentID 是 /turns 响应
+	// 与 FTS5 索引都要用的字段。
+	taskID  string
+	agentID string
 
 	mu      sync.Mutex
 	pending []domain.SessionEvent
@@ -50,6 +58,19 @@ type eventRecorder struct {
 	seqKnown bool
 	turn     int
 	step     int
+	// issuedTurnIDs 记录这次执行里 newTurnID 已经发放过的 (turn, step, type) 坐标。
+	// 只在 enabled() 时使用（懒初始化），理由见 newTurnID 里对 enabled() 分支的
+	// 说明。与 pending/nextSeq/turn/step 用同一把 e.mu 保护，不新造锁。
+	issuedTurnIDs map[turnIDCoordinate]bool
+}
+
+// turnIDCoordinate 是 newTurnID 用来判断一个坐标是否已经发放过的键，分量与
+// newTurnID 派生 ID 字符串时用的分量一一对应——session 已经是这个 eventRecorder
+// 唯一固定的一份，不需要再放进键里。
+type turnIDCoordinate struct {
+	turn int
+	step int
+	typ  domain.SessionEventType
 }
 
 // newEventRecorder 建一次任务执行的记录器。
@@ -58,6 +79,18 @@ type eventRecorder struct {
 // 会话号，让它们各自成为一条短日志，比加特例分支更简单，轨迹也一样看得到）。
 // 两者都空说明这条任务没有任何身份——写出来的事件谁也认不回去，直接 panic：
 // 这是编程错误，不是运行期状况。
+//
+// task.ID 单独再拦一道，即使 SessionID 非空、会话号已经解得出来：task.ID 会被原样
+// 写进 user/message 与 assistant/message 载荷的 task_id，而读侧拿它当**唯一的地址**
+// ——projectTurns 用它当折叠键与 ID 词干，storage.SearchMessages 用它拼 discovery
+// 命中的 turn id。缺了它写出来的是一条搜得到却回访不了的事件。
+//
+// 为什么必须堵在这一侧：SearchMessages 是**全库**检索，没有会话过滤，所以库里任何
+// 一条会话留下一条缺 task_id 的消息事件，所有词面命中它的 discovery 查询都会整体
+// fail-loud，健康会话的命中一并丢失——一条坏事件让整个部署的 session_search 失效
+// （P3 Task 4 复审 Important-1）。读侧那条校验本身是对的——把「task_id 非空」当成
+// 过滤条件塞进 SQL 才是静默跳过——错的是让它有机会在生产上触发。堵住这里之后，
+// 读侧的校验退化成一条永不触发的深层断言。
 func newEventRecorder(store port.SessionEventStore, task domain.Task) *eventRecorder {
 	// 与 RunTask 取会话执行锁用的是同一个解析函数，这一点是硬要求而不是顺手复用：
 	// 锁按 A 解出的键切分、日志按 B 解出的键写，两者一旦漂移，锁就守不住它要守的那条
@@ -66,7 +99,11 @@ func newEventRecorder(store port.SessionEventStore, task domain.Task) *eventReco
 	if session == "" {
 		panic("runtime: event recorder needs a session id or a task id; a task with neither cannot own a log")
 	}
-	return &eventRecorder{store: store, session: session}
+	if task.ID == "" {
+		panic("runtime: event recorder needs a task id; every message event carries it as the address of the " +
+			"turn it belongs to, and one event without it fails every session_search discovery query in the database")
+	}
+	return &eventRecorder{store: store, session: session, taskID: task.ID, agentID: task.AgentID}
 }
 
 // sessionID 是这次执行写入的会话日志。
@@ -138,9 +175,34 @@ func (e *eventRecorder) recordTurnStart(turn int) {
 }
 
 // recordUserMessage 记这一轮的用户输入。
+//
+// content 存**全文**，不截断：对话正文是对话本体，不是工具输出。模型侧允许
+// defaultMaxTurnChars = 6000 字符（session_turns.go），截到 maxEventPreviewRunes
+// = 2000 会让历史对话缩到 1/3。超长单条消息撞 P1 的 64 KiB/条上限时 flush → Append
+// 会 fail-loud 报错——那是正确行为，这里不为它兜底。
+//
+// content 由 userMessageContent 渲染：带附件的任务在正文尾部多一行
+// "[附图 N 张]" 标记，图片本身（base64 data URI）从不进日志。这条标注在
+// conversation_turns 退役前由 server/http.go 的 recordUserTurn 写，现在只能在这里
+// 产出——事件日志是唯一真相源（spec §3 取舍 A2）。
+//
+// task_id 供投影滤掉任务自己的 user turn（session_turns.go 用 turn.TaskID ==
+// task.ID），同时是投影折叠这一行 turn 的键与它 id 的词干；自 Task 4 起它还是
+// discovery 命中拼 turn id 的词干（storage.SearchMessages）。turn_id 标识**这一条
+// 事件**，P4 轨迹按它定位；Task 4 的检索**不**按它定位（SearchMessages 连这一列
+// 都不 SELECT），见 newTurnID。
+//
+// agent_id 与 assistant/message 一样必填：/turns 的响应与 conversation_turns_fts
+// 的索引都带这个字段，退役中的 recordUserTurn（server/http.go）写的正是
+// task.AgentID。P3 计划把它列为要补齐的五个字段缺口之一，Task 1 当时只补了
+// assistant 一侧，缺了这里 /turns 的 user 项 agent_id 就恒为空。
 func (e *eventRecorder) recordUserMessage(content string) {
 	e.append(domain.SessionEventUserMessage, map[string]any{
-		"turn": e.currentTurn(), "content": truncateRunes(content, maxEventPreviewRunes),
+		"turn":     e.currentTurn(),
+		"turn_id":  e.newTurnID(domain.SessionEventUserMessage),
+		"task_id":  e.taskID,
+		"agent_id": e.agentID,
+		"content":  content,
 	})
 }
 
@@ -153,10 +215,20 @@ func (e *eventRecorder) recordStepStart() {
 
 // recordAssistantMessage 记模型响应（含它请求的工具调用与 token 用量）。
 //
+// content 同 recordUserMessage：存**全文**，不截断——理由同样是「对话正文是对话
+// 本体，不是工具输出」，见 recordUserMessage 的文档注释。
+//
+// generatedFiles 是这一步经 write_file 产出的工作区相对路径；GUI 的「对话生成
+// 文件卡片」靠它渲染（server/http.go 的 generatedFilesDTO）。为 nil/空是合法的
+// 可选（这一步没写文件），不是兜底。
+//
+// task_id / agent_id / turn_id 供投影还原 domain.ConversationTurn 的对应字段：
+// turn_id 见 newTurnID 的文档注释。
+//
 // tool_calls 摘要数组**故意不截断**，这是权衡过的决定，不是漏掉的截断：
 // spec §4.3.1 第 2 条要求 P3 投影按 call_id 配对，而这个数组正是配对时要用的清单。
 // 截掉其中任意一项，恢复/投影就会缺项——那是比容量风险更重的正确性缺陷，用一个
-// 换另一个不划算。content/arguments/preview 三处按 maxEventPreviewRunes 截断是因为
+// 换另一个不划算。arguments/preview 两处按 maxEventPreviewRunes 截断是因为
 // 它们是自由文本，截了不影响可配对性；tool_calls 每项只是 call_id+name，本身已经
 // 很小，风险来自「条目数」而不是「单项体积」。
 //
@@ -165,20 +237,107 @@ func (e *eventRecorder) recordStepStart() {
 // 这是 fail-loud 的正确表现，不是数据损坏（不静默丢事件、不裁剪配对信息）。
 // TestRecordAssistantMessageFlushesWithManyToolCalls 用一个远超真实单步工具调用数量
 // 的上界证明：在这个上界内，flush 确实能落盘、不会撞到那个上限。
-func (e *eventRecorder) recordAssistantMessage(content string, calls []domain.ToolCall, usage eventUsage, profile string) {
+func (e *eventRecorder) recordAssistantMessage(content string, calls []domain.ToolCall, usage eventUsage, profile string, generatedFiles []string) {
 	names := make([]map[string]any, 0, len(calls))
 	for _, c := range calls {
 		names = append(names, map[string]any{"call_id": c.ID, "name": c.Name})
 	}
 	e.append(domain.SessionEventAssistantMessage, map[string]any{
 		"turn": e.currentTurn(), "step": e.currentStep(),
-		"content": truncateRunes(content, maxEventPreviewRunes), "tool_calls": names,
+		"turn_id":  e.newTurnID(domain.SessionEventAssistantMessage),
+		"task_id":  e.taskID,
+		"agent_id": e.agentID,
+		"content":  content, "tool_calls": names,
 		"usage": map[string]any{
 			"prompt": usage.Prompt, "completion": usage.Completion,
 			"cached": usage.Cached, "total": usage.Total,
 		},
-		"model_profile": profile,
+		"model_profile":   profile,
+		"generated_files": generatedFiles,
 	})
+}
+
+// newTurnID 生成一条消息事件的稳定标识（这里的「turn」是历史遗留的叫法，指一条
+// user/message 或 assistant/message 事件，不是本文件 e.turn 那个「每次 RunTask
+// 一个」的会话轮次计数，两者是同名不同义的两个概念）。
+//
+// 它标识的是**事件**，不是 domain.ConversationTurn 的一行：P3 Task 3 复审之后，
+// 投影按 (task_id, role) 折叠，ConversationTurn.ID 由 storage.projectTurns 派生成
+// "<task_id>:<role>"（与退役中 server/http.go 的 recordUserTurn /
+// recordAssistantTurn 逐字一致，这样 search_session 的 discovery 与 scroll（投影）
+// 落在同一个 ID 空间——Task 4 之后 discovery 搜的是事件索引，命中后同样把 task_id
+// 与 role 拼成这个形状）。一次带 N 轮工具的任务写出 N+1 条 assistant/message，
+// 它们折成同一行 turn，各自的 turn_id 仍然互不相同——那正是 P4 轨迹定位「哪一条
+// 事件」所需要的（检索不按它定位：SearchMessages 只用 task_id 与 type）。
+//
+// 它必须**写进事件**、而不是投影时现生成：投影每次现生成的话，同一条事件两次投影
+// 出来的标识不同，任何按事件定位的消费者都会落空。
+//
+// 用「会话号 + turn 号 + step 号 + 事件类型」派生，不用 seq：append 把事件放进
+// pending 时 seq 还没分配，要 flush 时才知道库里的 next-seq（见 flush 的文档
+// 注释）；为了在这里拿到 seq 而去调 ReadFrom 或 Load 违反 spec §4.3.1 第 3 条
+// （任务执行路径上不许调 Load），且每条消息一次 ReadFrom 是不必要的 O(n) 额外读。
+//
+// 这个组合在一次执行里稳定且唯一：
+//   - user/message 每个会话轮次只记一次（RunTask 顶部一次；resume 路径不重复调
+//     recordUserMessage），此时 step 恒为 recordTurnStart 刚重置过的 0；
+//   - assistant/message 总是紧邻 recordStepStart 之后记，而 step 只在
+//     recordStepEnd 里推进，所以同一 (turn, step) 在这次执行里只会被
+//     recordAssistantMessage 用到一次；
+//   - 事件类型这一段是防两者在同一 (turn, step) 上撞车的关键：user/message 与
+//     一个 turn 内第一条 assistant/message 都发生在 step 0，不带类型会撞出同一
+//     个 ID。
+//
+// 同一条事件被读多少次，它落盘时的 turn、step、类型都不变，因此这个标识在多次
+// 读取之间保持一致——这正是按事件定位所需要的全部保证。
+//
+// # 这个派生方式为什么站得住脚，以及它现在只靠什么撑着
+//
+// 「(session, turn, step, type) 唯一」不是类型系统保证的，它是一条**隐式控制流
+// 不变量**：本文件之外——RunTask/runToolLoop（runtime.go）——必须保证同一
+// (turn, step) 在一次执行里最多被一次 recordAssistantMessage（或一次
+// recordUserMessage）用到。今天这条不变量成立，论证见 P3 Task 1 复审
+// （.superpowers/sdd/task-1-review.md I-1）：resume 分支手工记一次之后，
+// runToolLoop 在决定是否继续循环之前先 recordStepEnd 把 step 推进，循环内两处
+// 提前 break 也都在 recordStepEnd 之后才发生，所以不会有两次 recordAssistantMessage
+// 落在同一个 (turn, step) 上。
+//
+// 但这条不变量**只被走查验证过**，不被 newTurnID 的签名或类型强制。下面的运行期
+// 断言就是补这个洞：newTurnID 每发放一个坐标就记下来，同一坐标被要第二次时立刻
+// panic，而不是安静地返回同一个字符串——那样的话，两行本应各自独立的事件会在
+// 投影时用同一个 turn_id 互相覆盖，不会有任何测试或运行时信号提示这件事，正是
+// spec 反复强调的「不报错、只是悄悄少东西」的失败形态。它守的不变量正是上一段
+// 说的那条：谁在将来改动 runToolLoop（例如把 resume 分支的「手工记一次 + 继续走
+// 循环」改成别的形态，或者在循环内加一条新的 recordAssistantMessage 调用点）
+// 一旦破坏了它，第一次真的撞车就会在这里响亮地炸出来，而不是被投影悄悄吞掉。
+//
+// 只在 e.enabled()（配了 store）时才记坐标、才检查撞车：没配 store 时这条 ID
+// 从不会被真正落盘或投影，根本不存在「两行事件互相覆盖」这回事——大量测试与
+// 无 store 部署会反复用同样的 (turn, step) 构造 disabled recorder，那不是撞车，
+// 是这个可选部署形态的正常使用。在这个分支上加检查，等于把「没有 store」这个
+// 契约允许的可选状态错当成错误状态去 fail-loud，违反的是同一条铁律的另一半。
+func (e *eventRecorder) newTurnID(typ domain.SessionEventType) string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	turn, step := e.turn, e.step
+	id := fmt.Sprintf("%s:%d:%d:%s", e.session, turn, step, typ)
+	if !e.enabled() {
+		return id
+	}
+	coord := turnIDCoordinate{turn: turn, step: step, typ: typ}
+	if e.issuedTurnIDs == nil {
+		e.issuedTurnIDs = make(map[turnIDCoordinate]bool)
+	}
+	if e.issuedTurnIDs[coord] {
+		panic(fmt.Sprintf(
+			"runtime: turn_id coordinate (session=%q, turn=%d, step=%d, type=%s) issued twice in one execution: "+
+				"two %s events were recorded for the same (turn, step); newTurnID's uniqueness guarantee assumes "+
+				"this never happens (see its doc comment) — the two rows would collide on the same turn_id and "+
+				"silently overwrite each other in projection",
+			e.session, turn, step, typ, typ))
+	}
+	e.issuedTurnIDs[coord] = true
+	return id
 }
 
 // recordToolCall 记一次工具调用**被派发之前**的事实（spec §5 屏障 2 的前提）。
@@ -359,4 +518,28 @@ func truncateRunes(s string, limit int) string {
 	}
 	suffix := fmt.Sprintf("\n…[truncated: %d of %d runes shown]", kept, total)
 	return string(runes[:kept]) + suffix
+}
+
+// userMessageContent renders the text a user/message event stores for a task.
+//
+// Base64 image data is deliberately never written into the event log (it would
+// bloat the sqlite log by megabytes per attachment, and spec §4.3 不变量 6 caps
+// event growth at call count, not payload size). Instead, when the task carried
+// images, a "[附图 N 张]" marker is appended so replayed history — the GUI's
+// /turns, the model's own recent-turns window — shows that images were attached
+// without re-embedding them.
+//
+// This lived in internal/server (userTurnContent) until P3 Task 5 retired
+// conversation_turns. The server wrote it at submit time; the event log is now
+// the single source of truth (spec §3 取舍 A2), so the annotation has to be
+// produced where the user/message event is produced or it is lost outright.
+func userMessageContent(input string, imageCount int) string {
+	if imageCount <= 0 {
+		return input
+	}
+	marker := fmt.Sprintf("[附图 %d 张]", imageCount)
+	if strings.TrimSpace(input) == "" {
+		return marker
+	}
+	return input + "\n" + marker
 }

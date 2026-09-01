@@ -1013,6 +1013,293 @@ func TestRunTUITaskInjectsAndPersistsSessionTurns(t *testing.T) {
 	}
 }
 
+// recordTurn 现在只写一处：会话事件日志（Task 5 删掉了 conversation_turns 那一行的
+// 写入方，spec §3 取舍 A2）。事件与它的 FTS 索引在同一个事务里提交
+// （storage.indexSessionEvent），所以事件写失败时**什么都不该落盘**——尤其不该留下
+// 一条投影不出来的孤儿索引：那种孤儿会被 discovery 搜到、再被 scroll 用
+// "anchor not found" 硬顶回去。
+//
+// 这条测试让事件写入失败，断言两件事：错误确实往上抛（不是静默吞掉），以及检索一侧
+// 一个字都没写。
+func TestTUISessionRecordTurnLeavesNoSearchableOrphanWhenTheEventWriteFails(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo := openCLITestSQLiteRepository(t)
+	store := &failingAppendConversationStore{conversationStore: repo, err: errors.New("disk on fire")}
+	session := newTUISessionController(tuiSessionControllerConfig{
+		Store:        store,
+		Enabled:      true,
+		CompanyID:    "cli-company",
+		AgentID:      "cli-agent",
+		ModelProfile: "dev",
+		RecentTurns:  4,
+		MaxTurnChars: 6000,
+	})
+	if _, err := session.NewSession(ctx); err != nil {
+		t.Fatalf("NewSession() error = %v, want nil", err)
+	}
+
+	err := session.recordTurn(ctx, domain.ConversationRoleUser, "task-orphan", "cli-agent", "dev", "孤儿探针")
+	if err == nil {
+		t.Fatalf("recordTurn() error = nil, want the event-write failure to propagate")
+	}
+	if !strings.Contains(err.Error(), "disk on fire") {
+		t.Errorf("recordTurn() error = %v, want it to carry the underlying cause", err)
+	}
+
+	hits, searchErr := repo.SearchMessages(ctx, "孤儿探针", 10)
+	if searchErr != nil {
+		t.Fatalf("SearchMessages() error = %v, want nil", searchErr)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("SearchMessages() = %+v，要 0 条：事件写失败却留下了 FTS 索引，"+
+			"discovery 搜得到、scroll 必然 anchor not found", hits)
+	}
+}
+
+// failingAppendConversationStore 让会话事件的 Append 失败，其余方法照常委派。
+type failingAppendConversationStore struct {
+	conversationStore
+	err error
+}
+
+func (s *failingAppendConversationStore) Append(context.Context, string, []domain.SessionEvent) error {
+	return s.err
+}
+
+// TUI 注入历史时的 limit 语义：取**最近** N 条，且返回时仍按时间正序。
+//
+// tuiSessionController.RecentTurns 把 c.recentTurns 传给 ListConversationTurns，
+// 而后者在 P3 之后是「投影完再从尾部截」。把那一段写成从头截（取最早 N 条）不会
+// 报任何错，只会让模型在「Recent conversation:」里看见一段错的历史——正是 spec
+// 反复强调的「不报错、只是悄悄变差」。既有的
+// TestRunTUITaskInjectsAndPersistsSessionTurns 用 4 条 turn 配 RecentTurns: 4，
+// 正好取不到边界，所以这条单独补。
+func TestTUISessionRecentTurnsTakesTheMostRecent(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo := openCLITestSQLiteRepository(t)
+	session := newTUISessionController(tuiSessionControllerConfig{
+		Store:        repo,
+		Enabled:      true,
+		CompanyID:    "cli-company",
+		AgentID:      "cli-agent",
+		ModelProfile: "dev",
+		RecentTurns:  2,
+		MaxTurnChars: 6000,
+	})
+	if _, err := session.NewSession(ctx); err != nil {
+		t.Fatalf("NewSession() error = %v, want nil", err)
+	}
+	// 三次问答，每次一个任务（TUI 每次 runTUITask 现取一个 task id）。
+	for _, exchange := range []struct{ taskID, prompt, answer string }{
+		{"task-1", "第一问", "第一答"},
+		{"task-2", "第二问", "第二答"},
+		{"task-3", "第三问", "第三答"},
+	} {
+		if err := session.RecordExchange(ctx, exchange.taskID, "cli-agent", "dev", exchange.prompt, exchange.answer); err != nil {
+			t.Fatalf("RecordExchange(%s) error = %v, want nil", exchange.taskID, err)
+		}
+	}
+
+	turns, err := session.RecentTurns(ctx)
+	if err != nil {
+		t.Fatalf("RecentTurns() error = %v, want nil", err)
+	}
+	if len(turns) != 2 {
+		t.Fatalf("RecentTurns() len = %d, want 2 (RecentTurns: 2)：%#v", len(turns), turns)
+	}
+	if turns[0].Content != "第三问" || turns[1].Content != "第三答" {
+		t.Fatalf("RecentTurns() = %q, %q，要最近的两条「第三问」「第三答」（正序）："+
+			"limit 取错一端，模型会看见最早的历史而不是最近的",
+			turns[0].Content, turns[1].Content)
+	}
+	if turns[0].Role != domain.ConversationRoleUser || turns[1].Role != domain.ConversationRoleAssistant {
+		t.Errorf("RecentTurns() 顺序不对：%v, %v，要按时间正序", turns[0].Role, turns[1].Role)
+	}
+}
+
+// restore_latest 恢复的是「最近**使用**」的会话，不是「最近**创建**」的。
+//
+// LatestAgentSession 按 agent_sessions.updated_at 排序，所以「被用过」这件事必须
+// 有人把 updated_at 推进。退役前这一步由 AppendConversationTurn 在写 turn 的同一个
+// 事务里顺带做，写入方删掉之后 TUI 这条路就没人做了：restore_latest 会静默退化成按
+// 创建时间选，重启后模型拿到的是**另一条会话**的历史（实测为 0 条），而 TUI
+// 的历史注入正是 spec §6 那五个「行为必须不变」的模型侧消费者之一。
+//
+// 这条测试的形状就是那次回归的取证探针：建 A → 建 B（更晚）→ 切回 A 真对话一轮 →
+// 新建控制器（= 重启）+ RestoreLatest → 断言恢复的是 A，且模型确实能拿到 A 的历史。
+// 两个断言缺一不可：只断言 id 会漏掉「选对了会话但读不出历史」，只断言历史条数会在
+// B 恰好也有历史时误绿。
+func TestTUIRestoreLatestFollowsTheSessionThatWasLastUsed(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo := openCLITestSQLiteRepository(t)
+	newController := func() *tuiSessionController {
+		return newTUISessionController(tuiSessionControllerConfig{
+			Store:         repo,
+			Enabled:       true,
+			CompanyID:     "cli-company",
+			AgentID:       "cli-agent",
+			ModelProfile:  "dev",
+			RecentTurns:   6,
+			MaxTurnChars:  6000,
+			RestoreLatest: true,
+		})
+	}
+
+	controller := newController()
+	sessionA, err := controller.NewSession(ctx)
+	if err != nil {
+		t.Fatalf("NewSession() A error = %v, want nil", err)
+	}
+	sessionB, err := controller.NewSession(ctx)
+	if err != nil {
+		t.Fatalf("NewSession() B error = %v, want nil", err)
+	}
+	if err := controller.SwitchSession(ctx, sessionA); err != nil {
+		t.Fatalf("SwitchSession(%q) error = %v, want nil", sessionA, err)
+	}
+	if err := controller.RecordExchange(ctx, "task-1", "cli-agent", "dev", "旧会话里的一问", "旧会话里的一答"); err != nil {
+		t.Fatalf("RecordExchange() error = %v, want nil", err)
+	}
+
+	// 重启：全新的控制器，只靠库里的状态决定恢复哪一条。
+	restarted := newController()
+	if err := restarted.Initialize(ctx); err != nil {
+		t.Fatalf("Initialize() error = %v, want nil", err)
+	}
+	if got := restarted.CurrentSessionID(); got != sessionA {
+		t.Fatalf("restore_latest 恢复了 %q，要最近**使用**过的 %q（%q 只是创建得更晚）："+
+			"会话被用过却没推进 updated_at，restore_latest 退化成按创建时间选",
+			got, sessionA, sessionB)
+	}
+
+	turns, err := restarted.RecentTurns(ctx)
+	if err != nil {
+		t.Fatalf("RecentTurns() error = %v, want nil", err)
+	}
+	if len(turns) != 2 {
+		t.Fatalf("RecentTurns() len = %d, want 2：重启后模型侧注入的历史条数变了（%#v）", len(turns), turns)
+	}
+	if turns[0].Content != "旧会话里的一问" || turns[1].Content != "旧会话里的一答" {
+		t.Fatalf("RecentTurns() = %q, %q，要 A 会话里的那一轮对话", turns[0].Content, turns[1].Content)
+	}
+}
+
+// touchSpyConversationStore wraps a real conversationStore and counts calls
+// to TouchAgentSession vs. SaveAgentSession, so a test can assert which write
+// path touchCurrentSession actually takes rather than only inspecting the
+// resulting row (which, for a *single* uncontested call, looks identical
+// whether the write was field-level or a whole-row read-modify-write — the
+// two only diverge under concurrent writers, see
+// storage.SQLiteRepository.TouchAgentSession's doc comment). Asserting on the
+// call pattern is what makes the "改回整行写" mutation observably fail
+// without depending on a real, potentially flaky, goroutine race.
+type touchSpyConversationStore struct {
+	conversationStore
+	touchAgentSessionCalls int
+	saveAgentSessionCalls  int
+}
+
+func (s *touchSpyConversationStore) TouchAgentSession(ctx context.Context, sessionID string, at time.Time) error {
+	s.touchAgentSessionCalls++
+	return s.conversationStore.TouchAgentSession(ctx, sessionID, at)
+}
+
+func (s *touchSpyConversationStore) SaveAgentSession(ctx context.Context, session domain.AgentSession) error {
+	s.saveAgentSessionCalls++
+	return s.conversationStore.SaveAgentSession(ctx, session)
+}
+
+// TestTouchCurrentSessionOnlyUpdatesUpdatedAt guards N-1 from the P3 final
+// review (final-review-2.md §4): touchCurrentSession must land as a
+// field-level UPDATE of updated_at, never a whole-row SaveAgentSession that
+// would clobber sibling columns a concurrent writer (server's
+// touchSessionOnSubmit, or a GUI-driven SetMode/SetWorkingDir sharing the
+// same agent.db) just wrote — the exact mistake this repo already paid for
+// once in the task-state-persistence period (PR #44: "写穿必须字段级不能全行
+// UPSERT").
+//
+// It asserts two independent things:
+//  1. Call pattern (via touchSpyConversationStore): touchCurrentSession calls
+//     TouchAgentSession exactly once and never calls SaveAgentSession at all.
+//     This is what actually goes red under the reviewed mutation — reverting
+//     to "read the row, mutate UpdatedAt, SaveAgentSession it back" swaps
+//     which of the two gets called, and the counts flip.
+//  2. Persisted state: seeding every other column with a distinguishing
+//     value and reading the row back after the touch confirms only
+//     updated_at moved. This alone would not catch the mutation (a
+//     single-threaded read-modify-write is indistinguishable from a
+//     field-level update when nothing else writes to the row in between —
+//     the bug only bites under real concurrent writers), but it is the
+//     direct evidence for "touch 只动 updated_at" and would catch a
+//     different regression: TouchAgentSession's own SQL growing back into an
+//     upsert that re-specifies every column from a zero-valued struct.
+func TestTouchCurrentSessionOnlyUpdatesUpdatedAt(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo := openCLITestSQLiteRepository(t)
+
+	createdAt := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+	seed := domain.AgentSession{
+		ID:         "session-touch-only",
+		CompanyID:  "cli-company",
+		AgentID:    "cli-agent",
+		Project:    "distinguishing-project",
+		Title:      "distinguishing title",
+		Mode:       domain.ModePlan,
+		Archived:   true,
+		WorkingDir: t.TempDir(),
+		CreatedAt:  createdAt,
+		UpdatedAt:  createdAt,
+	}
+	if err := repo.SaveAgentSession(ctx, seed); err != nil {
+		t.Fatalf("SaveAgentSession(seed) error = %v, want nil", err)
+	}
+
+	spy := &touchSpyConversationStore{conversationStore: repo}
+	controller := newTUISessionController(tuiSessionControllerConfig{
+		Store:     spy,
+		Enabled:   true,
+		CompanyID: "cli-company",
+		AgentID:   "cli-agent",
+	})
+	controller.currentID = seed.ID
+
+	touchedAt := createdAt.Add(time.Hour)
+	if err := controller.touchCurrentSession(ctx, touchedAt); err != nil {
+		t.Fatalf("touchCurrentSession() error = %v, want nil", err)
+	}
+
+	if spy.touchAgentSessionCalls != 1 {
+		t.Fatalf("TouchAgentSession calls = %d, want 1：touch 应该走字段级更新", spy.touchAgentSessionCalls)
+	}
+	if spy.saveAgentSessionCalls != 0 {
+		t.Fatalf("SaveAgentSession calls = %d, want 0：touch 不该整行写——见 PR #44 的教训", spy.saveAgentSessionCalls)
+	}
+
+	got, ok, err := repo.GetAgentSession(ctx, seed.ID)
+	if err != nil {
+		t.Fatalf("GetAgentSession() error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatalf("GetAgentSession() ok = false, want true")
+	}
+	if !got.UpdatedAt.Equal(touchedAt) {
+		t.Fatalf("UpdatedAt = %v, want %v：touch 没有推进 updated_at", got.UpdatedAt, touchedAt)
+	}
+	if got.CompanyID != seed.CompanyID || got.AgentID != seed.AgentID || got.Project != seed.Project ||
+		got.Title != seed.Title || got.Mode != seed.Mode || got.Archived != seed.Archived ||
+		got.WorkingDir != seed.WorkingDir || !got.CreatedAt.Equal(seed.CreatedAt) {
+		t.Fatalf("touch 覆盖了它不该动的列：got = %#v, seed = %#v", got, seed)
+	}
+}
+
 // TestRunTUITaskAppliesSessionModeAndWorkingDir guards Task 4's runTUITask
 // wiring: the default (non-mentioned-agent) task path must read
 // SessionManager.CurrentMode/CurrentWorkingDir and forward them into
@@ -2516,6 +2803,10 @@ func (s *countingConversationStore) SaveAgentSession(ctx context.Context, sessio
 	return s.delegate.SaveAgentSession(ctx, session)
 }
 
+func (s *countingConversationStore) TouchAgentSession(ctx context.Context, sessionID string, at time.Time) error {
+	return s.delegate.TouchAgentSession(ctx, sessionID, at)
+}
+
 func (s *countingConversationStore) LatestAgentSession(ctx context.Context, companyID string, agentID string) (domain.AgentSession, bool, error) {
 	return s.delegate.LatestAgentSession(ctx, companyID, agentID)
 }
@@ -2524,13 +2815,17 @@ func (s *countingConversationStore) ListAgentSessions(ctx context.Context, compa
 	return s.delegate.ListAgentSessions(ctx, companyID, agentID)
 }
 
-func (s *countingConversationStore) AppendConversationTurn(ctx context.Context, turn domain.ConversationTurn) error {
-	return s.delegate.AppendConversationTurn(ctx, turn)
-}
-
 func (s *countingConversationStore) ListConversationTurns(ctx context.Context, sessionID string, limit int) ([]domain.ConversationTurn, error) {
 	s.listConversationTurnsCalls++
 	return s.delegate.ListConversationTurns(ctx, sessionID, limit)
+}
+
+func (s *countingConversationStore) Append(ctx context.Context, sessionID string, events []domain.SessionEvent) error {
+	return s.delegate.Append(ctx, sessionID, events)
+}
+
+func (s *countingConversationStore) ReadFrom(ctx context.Context, sessionID string, fromSeq int64) ([]domain.SessionEvent, error) {
+	return s.delegate.ReadFrom(ctx, sessionID, fromSeq)
 }
 
 // fakeSessionLister is a minimal SessionLister test double: it returns items

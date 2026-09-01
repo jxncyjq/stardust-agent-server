@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -156,11 +157,7 @@ func TestSQLiteRepositoryPersistsAgentSessionsAndConversationTurns(t *testing.T)
 			CreatedAt:    createdAt.Add(2 * time.Second),
 		},
 	}
-	for _, turn := range turns {
-		if err := repo.AppendConversationTurn(ctx, turn); err != nil {
-			t.Fatalf("AppendConversationTurn(%q) error = %v, want nil", turn.ID, err)
-		}
-	}
+	appendTurnEvents(t, repo, session.ID, turns...)
 	gotSession, ok, err := repo.LatestAgentSession(ctx, "company-1", "agent-1")
 	if err != nil {
 		t.Fatalf("LatestAgentSession() error = %v, want nil", err)
@@ -172,7 +169,9 @@ func TestSQLiteRepositoryPersistsAgentSessionsAndConversationTurns(t *testing.T)
 	if err != nil {
 		t.Fatalf("ListConversationTurns(%q) error = %v, want nil", session.ID, err)
 	}
-	if len(gotTurns) != 1 || gotTurns[0].ID != "turn-2" || gotTurns[0].Content != "缓存使用内存 map" {
+	// 投影出来的 ID 是 "<task_id>:<role>"（按 (task_id, role) 折叠），不是夹具传进去的
+	// 那个事件 turn_id；这个形状与退役中 server/http.go 写的那一行逐字一致。
+	if len(gotTurns) != 1 || gotTurns[0].ID != "task-1:assistant" || gotTurns[0].Content != "缓存使用内存 map" {
 		t.Fatalf("ListConversationTurns(%q, 1) = %#v, want latest assistant turn", session.ID, gotTurns)
 	}
 }
@@ -629,55 +628,6 @@ func TestSQLiteColumnMigrationsAreIdempotent(t *testing.T) {
 	}
 }
 
-func TestSQLiteAppendConversationTurnIfAbsentIsExactlyOnce(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	repo := openTestSQLiteRepository(t)
-	createdAt := time.Date(2026, 6, 27, 9, 0, 0, 0, time.UTC)
-	session := domain.AgentSession{
-		ID:        "session-once",
-		CompanyID: "company-1",
-		AgentID:   "agent-1",
-		Project:   "项目",
-		Title:     "once",
-		CreatedAt: createdAt,
-		UpdatedAt: createdAt,
-	}
-	if err := repo.SaveAgentSession(ctx, session); err != nil {
-		t.Fatalf("SaveAgentSession error = %v, want nil", err)
-	}
-	turn := domain.ConversationTurn{
-		ID:        "task-x:assistant",
-		SessionID: session.ID,
-		TaskID:    "task-x",
-		AgentID:   "agent-1",
-		Role:      domain.ConversationRoleAssistant,
-		Content:   "真实回答",
-		CreatedAt: createdAt.Add(time.Second),
-	}
-	inserted, err := repo.AppendConversationTurnIfAbsent(ctx, turn)
-	if err != nil {
-		t.Fatalf("AppendConversationTurnIfAbsent() first error = %v, want nil", err)
-	}
-	if !inserted {
-		t.Fatalf("AppendConversationTurnIfAbsent() first inserted = false, want true")
-	}
-	inserted, err = repo.AppendConversationTurnIfAbsent(ctx, turn)
-	if err != nil {
-		t.Fatalf("AppendConversationTurnIfAbsent() second error = %v, want nil", err)
-	}
-	if inserted {
-		t.Fatalf("AppendConversationTurnIfAbsent() second inserted = true, want false")
-	}
-	turns, err := repo.ListConversationTurns(ctx, session.ID, 0)
-	if err != nil {
-		t.Fatalf("ListConversationTurns() error = %v, want nil", err)
-	}
-	if len(turns) != 1 {
-		t.Fatalf("ListConversationTurns() len = %d, want exactly 1", len(turns))
-	}
-}
-
 func TestSQLiteRepositoryPersistsSessionArchivedFlag(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -762,11 +712,8 @@ func TestSQLiteRepositoryDeleteAgentSessionCascadesTurns(t *testing.T) {
 		{ID: "del-turn-2", SessionID: target.ID, TaskID: "task-1", AgentID: "agent-1", Role: domain.ConversationRoleAssistant, Content: "回答", CreatedAt: createdAt.Add(2 * time.Second)},
 		{ID: "keep-turn-1", SessionID: other.ID, TaskID: "task-2", AgentID: "agent-1", Role: domain.ConversationRoleUser, Content: "保留问题", CreatedAt: createdAt.Add(3 * time.Second)},
 	}
-	for _, turn := range turns {
-		if err := repo.AppendConversationTurn(ctx, turn); err != nil {
-			t.Fatalf("AppendConversationTurn(%q) error = %v, want nil", turn.ID, err)
-		}
-	}
+	appendTurnEvents(t, repo, target.ID, turns[0], turns[1])
+	appendTurnEvents(t, repo, other.ID, turns[2])
 
 	if err := repo.DeleteAgentSession(ctx, target.ID); err != nil {
 		t.Fatalf("DeleteAgentSession(%q) error = %v, want nil", target.ID, err)
@@ -792,7 +739,7 @@ func TestSQLiteRepositoryDeleteAgentSessionCascadesTurns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListConversationTurns(kept) error = %v, want nil", err)
 	}
-	if len(keptTurns) != 1 || keptTurns[0].ID != "keep-turn-1" {
+	if len(keptTurns) != 1 || keptTurns[0].ID != "task-2:user" {
 		t.Fatalf("ListConversationTurns(kept) = %#v, want the unrelated turn preserved", keptTurns)
 	}
 }
@@ -821,24 +768,38 @@ func TestSQLiteSessionSearchDiscoveryScrollBrowse(t *testing.T) {
 		t.Fatalf("SaveAgentSession() error = %v, want nil", err)
 	}
 
-	turns := []domain.ConversationTurn{
-		{ID: "t1", SessionID: "sess-1", TaskID: "task-1", AgentID: "researcher", Role: domain.ConversationRoleUser, Content: "如何做 token 压缩阈值", CreatedAt: time.Unix(2, 0)},
-		{ID: "t2", SessionID: "sess-1", TaskID: "task-1", AgentID: "researcher", Role: domain.ConversationRoleAssistant, Content: "prompt cache 复用稳定前缀", CreatedAt: time.Unix(3, 0)},
-		{ID: "t3", SessionID: "sess-1", TaskID: "task-1", AgentID: "researcher", Role: domain.ConversationRoleUser, Content: "delegate subtask summary", CreatedAt: time.Unix(4, 0)},
+	// 只播事件：discovery（SearchMessages → session_events_fts）与 scroll
+	// （ScrollMessages → ListConversationTurns → 投影）现在同源于事件日志
+	// （P3 Task 4 把搜索也搬了过来），退役中的 conversation_turns 一侧不再参与，
+	// 所以那段 AppendConversationTurn 播种一并删掉——留着一份没人读的种子，只会让
+	// 下一个读这条测试的人以为 discovery 还来自旧索引。
+	//
+	// 事件载荷里的 turn_id 用 runtime 的 newTurnID 形状
+	// "<session>:<turn>:<step>:<type>"，与 discovery/scroll 两侧都必须给出的
+	// "<task_id>:<role>" **不相等**——这是生产上真实的形状差。两个 id 空间靠
+	// task_id + role 重新合一：投影这样折叠 turn.ID，SearchMessages 也这样拼命中的
+	// id。任何一侧改回去用事件自己的 turn_id，这条测试就会在 ScrollMessages 那一步
+	// anchor not found。
+	//
+	// 一个任务恰好一条 user + 一条 assistant，所以第三条消息属于 task-2。
+	eventTurns := []domain.ConversationTurn{
+		{SessionID: "sess-1", TaskID: "task-1", AgentID: "researcher", Role: domain.ConversationRoleUser, Content: "如何做 token 压缩阈值", CreatedAt: time.Unix(2, 0)},
+		{SessionID: "sess-1", TaskID: "task-1", AgentID: "researcher", Role: domain.ConversationRoleAssistant, Content: "prompt cache 复用稳定前缀", CreatedAt: time.Unix(3, 0)},
+		{SessionID: "sess-1", TaskID: "task-2", AgentID: "researcher", Role: domain.ConversationRoleUser, Content: "delegate subtask summary", CreatedAt: time.Unix(4, 0)},
 	}
-	for _, turn := range turns {
-		if err := repo.AppendConversationTurn(ctx, turn); err != nil {
-			t.Fatalf("AppendConversationTurn(%q) error = %v, want nil", turn.ID, err)
-		}
+	for i := range eventTurns {
+		// appendTurnEvents 把 turn.ID 写进事件载荷的 turn_id。
+		eventTurns[i].ID = fmt.Sprintf("sess-1:%d:0:%s/message", i, eventTurns[i].Role)
 	}
+	appendTurnEvents(t, repo, "sess-1", eventTurns...)
 
 	// discovery: FTS5 match returns the relevant turn.
 	hits, err := repo.SearchMessages(ctx, "prompt", 10)
 	if err != nil {
 		t.Fatalf("SearchMessages() error = %v, want nil", err)
 	}
-	if len(hits) != 1 || hits[0].ID != "t2" {
-		t.Fatalf("SearchMessages(prompt) = %+v, want single hit t2", hits)
+	if len(hits) != 1 || hits[0].ID != "task-1:assistant" {
+		t.Fatalf("SearchMessages(prompt) = %+v, want single hit task-1:assistant", hits)
 	}
 
 	// discovery error path: empty query fails loud.
@@ -846,13 +807,14 @@ func TestSQLiteSessionSearchDiscoveryScrollBrowse(t *testing.T) {
 		t.Fatalf("SearchMessages(empty) error = nil, want non-nil")
 	}
 
-	// scroll: window around an anchor returns neighbors in order.
-	scrolled, err := repo.ScrollMessages(ctx, "sess-1", "t2", 1)
+	// scroll: 锚点直接用 discovery 返回的那个 id——这正是模型的用法，也是两个 id
+	// 空间必须相等的地方。
+	scrolled, err := repo.ScrollMessages(ctx, "sess-1", hits[0].ID, 1)
 	if err != nil {
-		t.Fatalf("ScrollMessages() error = %v, want nil", err)
+		t.Fatalf("ScrollMessages(discovery hit %q) error = %v, want nil：discovery 与 scroll 的 id 空间分叉了", hits[0].ID, err)
 	}
-	if len(scrolled) != 3 || scrolled[0].ID != "t1" || scrolled[2].ID != "t3" {
-		t.Fatalf("ScrollMessages(t2, 1) = %+v, want t1..t3", scrolled)
+	if len(scrolled) != 3 || scrolled[0].ID != "task-1:user" || scrolled[2].ID != "task-2:user" {
+		t.Fatalf("ScrollMessages(%q, 1) = %+v, want task-1:user..task-2:user", hits[0].ID, scrolled)
 	}
 
 	// scroll error path: unknown anchor fails loud.
@@ -867,43 +829,6 @@ func TestSQLiteSessionSearchDiscoveryScrollBrowse(t *testing.T) {
 	}
 	if len(sessions) != 1 || sessions[0].ID != "sess-1" {
 		t.Fatalf("BrowseSessions() = %+v, want sess-1", sessions)
-	}
-}
-
-func TestSQLiteBackfillConversationTurnsFTS(t *testing.T) {
-	ctx := context.Background()
-	repo := openTestSQLiteRepository(t)
-
-	turn := domain.ConversationTurn{
-		ID: "t1", SessionID: "s1", TaskID: "task-1", AgentID: "a1",
-		Role: domain.ConversationRoleUser, Content: "prompt cache 稳定前缀", CreatedAt: time.Unix(2, 0),
-	}
-	if err := repo.AppendConversationTurn(ctx, turn); err != nil {
-		t.Fatalf("AppendConversationTurn() error = %v, want nil", err)
-	}
-	// Simulate a pre-v4 row: drop it from the FTS index but keep the source row.
-	if _, err := repo.db.ExecContext(ctx, `DELETE FROM conversation_turns_fts WHERE turn_id = ?`, "t1"); err != nil {
-		t.Fatalf("delete fts row error = %v, want nil", err)
-	}
-	if hits, err := repo.SearchMessages(ctx, "prompt", 10); err != nil || len(hits) != 0 {
-		t.Fatalf("SearchMessages before backfill = %v (err %v), want no hits", hits, err)
-	}
-
-	added, err := repo.BackfillConversationTurnsFTS(ctx)
-	if err != nil {
-		t.Fatalf("BackfillConversationTurnsFTS() error = %v, want nil", err)
-	}
-	if added != 1 {
-		t.Fatalf("BackfillConversationTurnsFTS() added = %d, want 1", added)
-	}
-	hits, err := repo.SearchMessages(ctx, "prompt", 10)
-	if err != nil || len(hits) != 1 || hits[0].ID != "t1" {
-		t.Fatalf("SearchMessages after backfill = %v (err %v), want t1", hits, err)
-	}
-	// Idempotent: a second backfill adds nothing.
-	again, err := repo.BackfillConversationTurnsFTS(ctx)
-	if err != nil || again != 0 {
-		t.Fatalf("second BackfillConversationTurnsFTS() = %d (err %v), want 0", again, err)
 	}
 }
 

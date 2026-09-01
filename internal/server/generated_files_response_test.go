@@ -126,71 +126,12 @@ func containsEmptyArrayField(body []byte, field string) bool {
 	return strings.Contains(string(body), `"`+field+`":[]`)
 }
 
-// TestHTTPServerCompletedTaskPersistsGeneratedFilesOnAssistantTurn guards that
-// the relative GeneratedFiles paths (not the linked DTOs) are what land on the
-// persisted assistant conversation turn, since the turn is replayed later and
-// links must be rebuilt fresh from fileURL rather than baked in at write time.
-func TestHTTPServerCompletedTaskPersistsGeneratedFilesOnAssistantTurn(t *testing.T) {
-	t.Parallel()
-	ctx := context.Background()
-	repo := openServerTestRepo(t)
-	scheduler := task.NewScheduler()
-	events := adapter.NewMemoryEventBus()
-	srv := NewHTTPServer(Config{Tasks: scheduler, Sessions: repo, WorkflowEvents: events})
-
-	session := domain.AgentSession{
-		ID:        "session-gf-turn-1",
-		CompanyID: "default-company",
-		AgentID:   "default-agent",
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
-	}
-	if err := repo.SaveAgentSession(ctx, session); err != nil {
-		t.Fatalf("SaveAgentSession error = %v, want nil", err)
-	}
-	if err := scheduler.Add(ctx, domain.Task{
-		ID:        "task-gf-turn-1",
-		CompanyID: "default-company",
-		AgentID:   "default-agent",
-		SessionID: "session-gf-turn-1",
-		Status:    domain.TaskDone,
-		Input:     "写文件",
-	}); err != nil {
-		t.Fatalf("scheduler.Add error = %v, want nil", err)
-	}
-	if err := events.Publish(ctx, domain.RuntimeEvent{
-		Type:           "task_completed",
-		TaskID:         "task-gf-turn-1",
-		Message:        "写好了",
-		GeneratedFiles: []string{"docs/a.md", "out/b.csv"},
-	}); err != nil {
-		t.Fatalf("events.Publish error = %v, want nil", err)
-	}
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/v1/tasks/task-gf-turn-1/result", nil)
-	srv.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("GET result status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
-	}
-
-	turns, err := repo.ListConversationTurns(ctx, "session-gf-turn-1", 0)
-	if err != nil {
-		t.Fatalf("ListConversationTurns error = %v, want nil", err)
-	}
-	var assistant *domain.ConversationTurn
-	for i := range turns {
-		if turns[i].Role == domain.ConversationRoleAssistant {
-			assistant = &turns[i]
-		}
-	}
-	if assistant == nil {
-		t.Fatalf("turns = %#v, want an assistant turn", turns)
-	}
-	if len(assistant.GeneratedFiles) != 2 || assistant.GeneratedFiles[0] != "docs/a.md" || assistant.GeneratedFiles[1] != "out/b.csv" {
-		t.Fatalf("assistant turn GeneratedFiles = %#v, want [docs/a.md out/b.csv]", assistant.GeneratedFiles)
-	}
-}
+// 「结果端点把相对路径写进 assistant turn」那条测试随写入方一起删除：
+// conversation_turns 退役后（spec §3 取舍 A2）端点不写任何东西，GeneratedFiles 从
+// assistant/message 事件的 generated_files 载荷经 storage.projectTurns 取并集还原
+// ——那条不变量由 storage 包的 TestAToolLoopTaskProjectsToOneAssistantTurn 与
+// TestASuspendedAndResumedTaskStillProjectsToOneTurnPerRole 守着。下面这条测试守的
+// 是另一端：/turns 出口把相对路径渲染成链接 DTO。
 
 // TestHTTPServerSessionTurnsIncludeGeneratedFilesWithLinks guards that the
 // history-turns endpoint (GET /v1/sessions/{id}/turns), consumed directly by
@@ -211,7 +152,7 @@ func TestHTTPServerSessionTurnsIncludeGeneratedFilesWithLinks(t *testing.T) {
 	if err := repo.SaveAgentSession(ctx, session); err != nil {
 		t.Fatalf("SaveAgentSession error = %v, want nil", err)
 	}
-	if err := repo.AppendConversationTurn(ctx, domain.ConversationTurn{
+	appendTurnEvents(t, repo, session.ID, domain.ConversationTurn{
 		ID:             "turn-gf-history-1",
 		SessionID:      session.ID,
 		TaskID:         "task-1",
@@ -220,9 +161,7 @@ func TestHTTPServerSessionTurnsIncludeGeneratedFilesWithLinks(t *testing.T) {
 		Content:        "已完成",
 		CreatedAt:      createdAt.Add(time.Second),
 		GeneratedFiles: []string{"out/report.md"},
-	}); err != nil {
-		t.Fatalf("AppendConversationTurn error = %v, want nil", err)
-	}
+	})
 	srv := NewHTTPServer(Config{Sessions: repo})
 
 	rec := httptest.NewRecorder()
@@ -250,7 +189,9 @@ func TestHTTPServerSessionTurnsIncludeGeneratedFilesWithLinks(t *testing.T) {
 	}
 	got := turns[0]
 	// Existing fields must remain intact (least-breaking augmentation).
-	if got.ID != "turn-gf-history-1" || got.SessionID != session.ID || got.Role != string(domain.ConversationRoleAssistant) || got.Content != "已完成" {
+	// id 是投影折叠出来的 "<task_id>:<role>"，与退役中 recordAssistantTurn 写的形状
+	// 逐字一致；夹具传进去的 "turn-gf-history-1" 是那条**事件**的 turn_id。
+	if got.ID != "task-1:assistant" || got.SessionID != session.ID || got.Role != string(domain.ConversationRoleAssistant) || got.Content != "已完成" {
 		t.Fatalf("turn base fields = %#v, want existing fields preserved", got)
 	}
 	if len(got.GeneratedFiles) != 1 {
@@ -282,7 +223,7 @@ func TestHTTPServerSessionTurnsGeneratedFilesEmptyIsEmptyArray(t *testing.T) {
 	if err := repo.SaveAgentSession(ctx, session); err != nil {
 		t.Fatalf("SaveAgentSession error = %v, want nil", err)
 	}
-	if err := repo.AppendConversationTurn(ctx, domain.ConversationTurn{
+	appendTurnEvents(t, repo, session.ID, domain.ConversationTurn{
 		ID:        "turn-gf-history-empty",
 		SessionID: session.ID,
 		TaskID:    "task-1",
@@ -290,9 +231,7 @@ func TestHTTPServerSessionTurnsGeneratedFilesEmptyIsEmptyArray(t *testing.T) {
 		Role:      domain.ConversationRoleUser,
 		Content:   "你好",
 		CreatedAt: createdAt.Add(time.Second),
-	}); err != nil {
-		t.Fatalf("AppendConversationTurn error = %v, want nil", err)
-	}
+	})
 	srv := NewHTTPServer(Config{Sessions: repo})
 
 	rec := httptest.NewRecorder()

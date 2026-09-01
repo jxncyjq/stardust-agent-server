@@ -1025,10 +1025,20 @@ func persistentRunPorts(ctx context.Context, cfg config.Config) (runPorts, func(
 
 type conversationStore interface {
 	SaveAgentSession(context.Context, domain.AgentSession) error
+	// TouchAgentSession advances a session's updated_at without touching any
+	// other column. touchCurrentSession is the only caller in this file; see
+	// storage.SQLiteRepository.TouchAgentSession for why it must stay
+	// field-level rather than a whole-row SaveAgentSession.
+	TouchAgentSession(context.Context, string, time.Time) error
 	LatestAgentSession(context.Context, string, string) (domain.AgentSession, bool, error)
 	ListAgentSessions(context.Context, string, string) ([]domain.AgentSession, error)
-	AppendConversationTurn(context.Context, domain.ConversationTurn) error
 	ListConversationTurns(context.Context, string, int) ([]domain.ConversationTurn, error)
+	// Append/ReadFrom 是 TUI 会话把每轮对话写进事件日志用的（见 recordTurn）。
+	// 声明成两个方法而不是内嵌 port.SessionEventStore：这条路不调 Load，而
+	// spec §4.3.1 第 3 条要求 Load 只对没有活跃写入者的会话调用——不把它摆进
+	// 这个接口，就没人能顺手在 TUI 里调它。
+	Append(ctx context.Context, sessionID string, events []domain.SessionEvent) error
+	ReadFrom(ctx context.Context, sessionID string, fromSeq int64) ([]domain.SessionEvent, error)
 }
 
 type tuiSessionControllerConfig struct {
@@ -1235,19 +1245,152 @@ func (c *tuiSessionController) recordTurn(ctx context.Context, role domain.Conve
 		}
 	}
 	now := time.Now()
-	if err := c.store.AppendConversationTurn(ctx, domain.ConversationTurn{
-		ID:           fmt.Sprintf("%s:%s:%d", c.currentID, role, now.UTC().UnixNano()),
-		SessionID:    c.currentID,
-		TaskID:       taskID,
-		AgentID:      firstNonEmpty(agentID, c.agentID),
-		ModelProfile: firstNonEmpty(modelProfile, c.modelProfile),
-		Role:         role,
-		Content:      truncateSessionTurn(content, c.maxTurnChars),
-		CreatedAt:    now,
-	}); err != nil {
+	// eventTurnID 标识**事件日志里的那一条事件**（P4 轨迹按它定位；Task 4 的检索
+	// **不**按它定位，storage.SearchMessages 连这一列都不 SELECT），与 runtime 的
+	// newTurnID 同一角色，因此逐条唯一。
+	//
+	// 它不是这一轮对话在读侧的 id：投影按 (task_id, role) 折叠成 "<task_id>:<role>"
+	// （storage.projectTurns），discovery 命中一条事件后也把它的 task_id 与 role 拼
+	// 成同一个形状（storage.SearchMessages），两个 ID 空间因此相等，模型拿 discovery
+	// 给的 id 回来 scroll 才落得到锚点。taskID 每次 runTUITask 现取
+	// （newCommandTaskID），所以同一条会话里两次交换折不到一起。
+	//
+	// Task 5 之前这里还要再写一行 conversation_turns（连同它的 FTS 索引），两步不在
+	// 同一个事务里，中间失败会留下半截状态。那一行连同它的写入方已经退役，事件日志
+	// 是唯一真相源（spec §3 取舍 A2），这个窗口随之消失。
+	eventTurnID := fmt.Sprintf("%s:%s:%d", c.currentID, role, now.UTC().UnixNano())
+	if err := c.appendTurnEvent(ctx, eventTurnID, role, taskID, agentID, modelProfile, content, now); err != nil {
+		return err
+	}
+	if err := c.touchCurrentSession(ctx, now); err != nil {
 		return err
 	}
 	c.invalidateCurrentSessionCache()
+	return nil
+}
+
+// touchCurrentSession 把当前会话的 updated_at 推到 now：会话收到一轮对话，就是
+// 「被用过」。
+//
+// 为什么必须在 TUI 这一层做：退役前这一步由 storage 的 AppendConversationTurn 在写
+// turn 的同一个事务里顺带做，写入方随 Task 5 删掉之后，serve/GUI 那一侧由
+// server/http.go 的 touchSessionOnSubmit 补上了，TUI 这一侧没有人补。三个消费者按
+// agent_sessions.updated_at 排序——restore_latest（Initialize 走 LatestAgentSession）、
+// ListAgentSessions（TUI 的 /sessions 列表）、storage.BrowseSessions（session_search
+// 的 browse 模式，模型直接用的工具）——不推进就一起退化成按「创建时间」排，重启后
+// TUI 恢复的是另一条会话，模型侧的历史注入静默变空。
+//
+// 为什么不做在 storage.Append 里：那等于给一个纯追加方法加一条跨表契约，而且它守不
+// 住——runtime 的 sessionKeyForTask 在任务没有 SessionID 时用 task.ID 当会话号，那种
+// 「会话号」在 agent_sessions 里根本没有行，touch 要么 0 行受影响（静默无效，违反
+// fail-loud），要么就得开特例分支。
+//
+// 为什么必须走 TouchAgentSession（字段级 UPDATE）而不是「读整行、改
+// UpdatedAt、SaveAgentSession 写回去」：本仓在任务状态落盘那一期（PR #44）已经
+// 为同一个错误付过一次代价——「写穿必须字段级不能全行 UPSERT」。
+// SaveAgentSession 的 INSERT ... ON CONFLICT DO UPDATE 会把调用方内存里那份快照
+// 的**每一列**写回去；TUI 与 server（touchSessionOnSubmit）指向同一个 agent.db
+// 时，读到的那份快照和另一进程刚写完的 title/mode/working_dir 之间存在窗口，谁
+// 后落盘谁就把对方刚写的字段静默覆盖回旧值——不报任何错，症状只是数据莫名
+// 回退。TouchAgentSession 只在语句里点名 updated_at 一列，物理上没有别的列可
+// 覆盖，这个窗口就不存在。**下次不要图省事把它改回整行 SaveAgentSession**——
+// 那正是这条注释要挡住的事。
+//
+// 落点在 appendTurnEvent 成功之后：事件写失败就不该把会话标成「刚用过」。
+// RecordExchange 一轮连调两次 recordTurn，因而 touch 两次，第二次只是把
+// updated_at 再往前推一点，幂等。
+//
+// 「当前会话行不存在」不是这里的可选状态，是 fail-loud：c.currentID 只会来自
+// 控制器自己刚创建 / 加载 / 切换到的那条会话，行凭空消失（例如另一进程把它
+// DeleteAgentSession 掉）意味着控制器手里的状态已经跟存储对不上了，装作没
+// touch 到等于用静默无操作掩盖了这个不一致——TouchAgentSession 因此在 0 行
+// 受影响时报错而不是吞掉。
+func (c *tuiSessionController) touchCurrentSession(ctx context.Context, now time.Time) error {
+	if err := c.store.TouchAgentSession(ctx, c.currentID, now); err != nil {
+		return fmt.Errorf("touch session %q after recording a turn: %w", c.currentID, err)
+	}
+	return nil
+}
+
+// appendTurnEvent 把这一轮消息追加进 TUI 会话的事件日志。
+//
+// 为什么必须写：RecentTurns（本文件的读侧调用点）走 ListConversationTurns，而它自
+// Task 3 起从事件投影。TUI 这条会话号下**没有别的事件生产者**——App.RunTask 用的是
+// task.ID 而不是 TUI 会话号（P2 已知、P3 明确不在范围内的取舍），runtime 的
+// eventRecorder 写出来的日志因此挂在另一个会话下。这里不写，TUI 的
+// 「Recent conversation:」注入会读到空历史，而且是静默失效，不报任何错。
+//
+// 这是 TUI 这条路唯一的写入方：Task 4 把 search_session 的 discovery 也搬到了
+// session_events_fts 之后，conversation_turns 那一行连最后一个消费者也没有了，
+// Task 5 已经连同它的写入方与 conversation_turns_fts 一起删掉。
+//
+// 正文按 Task 1 的决定**存全文**，不套 truncateSessionTurn：截断是读侧
+// （RecentTurns / RecentTurnsForTask）按各自的 MaxTurnChars 做的事，写侧先砍一刀会
+// 让读侧的上限再也拿不回被砍掉的那部分。
+func (c *tuiSessionController) appendTurnEvent(
+	ctx context.Context,
+	turnID string,
+	role domain.ConversationRole,
+	taskID string,
+	agentID string,
+	modelProfile string,
+	content string,
+	at time.Time,
+) error {
+	// projectTurns 对 task_id 做非空校验（缺了整条会话读不出来）。在这里拦下，
+	// 错误就指向写入的这一刻，而不是下一次读历史时才炸在存储层。
+	if strings.TrimSpace(taskID) == "" {
+		return fmt.Errorf("append session turn event for %q: task id is required", c.currentID)
+	}
+	// agent_id 在投影那一侧是契约允许为空的可选（内置默认 agent 就是用空 agent_id
+	// 选中的，见 storage.projectTurns 的注释），所以这条检查**不是**投影的要求。
+	// 它是 TUI 这条路自己的不变量：c.agentID 由 newTUISessionController 兜成
+	// "cli-agent"，永远非空，真的取到空串意味着控制器没按契约装配起来——那是编程
+	// 错误，在写入的这一刻拦下比让它写进日志更容易定位。
+	resolvedAgentID := firstNonEmpty(agentID, c.agentID)
+	if resolvedAgentID == "" {
+		return fmt.Errorf("append session turn event for %q: agent id is required", c.currentID)
+	}
+	payload := map[string]any{
+		"turn":     0,
+		"turn_id":  turnID,
+		"task_id":  taskID,
+		"agent_id": resolvedAgentID,
+		"content":  content,
+	}
+	var eventType domain.SessionEventType
+	switch role {
+	case domain.ConversationRoleUser:
+		eventType = domain.SessionEventUserMessage
+	case domain.ConversationRoleAssistant:
+		eventType = domain.SessionEventAssistantMessage
+		payload["step"] = 0
+		payload["model_profile"] = firstNonEmpty(modelProfile, c.modelProfile)
+	default:
+		return fmt.Errorf("append session turn event for %q: unknown role %q", c.currentID, role)
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("encode session turn event for %q: %w", c.currentID, err)
+	}
+	// Append 要求首个 seq 正好是该会话的 next-seq，所以先读出已有的后缀。这是每轮
+	// 两次 O(n) 读；P3 计划已写明这条 O(n) 是本期接受的代价，真机测出慢再优化。
+	existing, err := c.store.ReadFrom(ctx, c.currentID, 0)
+	if err != nil {
+		return fmt.Errorf("read session events for %q: %w", c.currentID, err)
+	}
+	var next int64
+	if n := len(existing); n > 0 {
+		next = existing[n-1].Seq + 1
+	}
+	if err := c.store.Append(ctx, c.currentID, []domain.SessionEvent{{
+		Seq:  next,
+		Type: eventType,
+		Time: at,
+		Data: data,
+	}}); err != nil {
+		return fmt.Errorf("append session turn event for %q: %w", c.currentID, err)
+	}
 	return nil
 }
 

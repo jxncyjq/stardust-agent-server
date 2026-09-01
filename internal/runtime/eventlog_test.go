@@ -55,6 +55,25 @@ func TestARecorderWithNoIdentityIsRefused(t *testing.T) {
 	newEventRecorder(stubEventStore{}, domain.Task{})
 }
 
+// 有 SessionID、却没有 ID 的任务同样被拒。
+//
+// 这一格以前是开着的：会话号从 SessionID 解得出来，于是 recorder 造得出来，
+// task.ID 被原样写成 "" 进每一条 user/message 与 assistant/message 的 task_id。
+// 而 storage.SearchMessages 是**全库**检索，一条这样的事件会让所有词面命中它的
+// discovery 查询整体报错——一条坏事件让整个部署的 session_search 失效
+// （P3 Task 4 复审 Important-1）。缺 task_id 是编程错误，堵在写侧。
+func TestARecorderWithASessionButNoTaskIDIsRefused(t *testing.T) {
+	t.Parallel()
+
+	defer func() {
+		if recover() == nil {
+			t.Error("有 SessionID 但没有 ID 的任务被接受了：它写出的事件缺 task_id，" +
+				"会让全库的 session_search discovery 整体失效")
+		}
+	}()
+	newEventRecorder(stubEventStore{}, domain.Task{SessionID: "s1"})
+}
+
 // 没有配 store 的部署（内存后端、测试构造）不记事件。
 //
 // 这**不是兜底**：Config.SessionEvents 是契约里显式声明的可选项（见它的文档注释），
@@ -190,7 +209,7 @@ func TestOneRoundProducesTheExpectedSequence(t *testing.T) {
 	rec.recordTurnStart(0)
 	rec.recordUserMessage("hello")
 	rec.recordStepStart()
-	rec.recordAssistantMessage("working", []domain.ToolCall{{ID: "c1", Name: "read_file"}}, eventUsage{}, "default")
+	rec.recordAssistantMessage("working", []domain.ToolCall{{ID: "c1", Name: "read_file"}}, eventUsage{}, "default", nil)
 	rec.recordToolCall(domain.ToolCall{ID: "c1", Name: "read_file"})
 	rec.recordToolResult("c1", "ok", false, time.Millisecond)
 	rec.recordStepEnd(domain.StepEndReasonCompleted)
@@ -301,8 +320,8 @@ func TestRecordAssistantMessageFlushesWithManyToolCalls(t *testing.T) {
 
 	rec := newEventRecorder(repo, domain.Task{ID: "t1", SessionID: "s1"})
 	rec.recordAssistantMessage(
-		strings.Repeat("x", maxEventPreviewRunes), // content 也顶到截断上限，模拟最坏情况
-		calls, eventUsage{Prompt: 1, Completion: 2, Cached: 3, Total: 6}, "default",
+		strings.Repeat("x", maxEventPreviewRunes), // content 不小，逼近容量上限时的真实形状
+		calls, eventUsage{Prompt: 1, Completion: 2, Cached: 3, Total: 6}, "default", nil,
 	)
 
 	if err := rec.flush(context.Background()); err != nil {
@@ -381,4 +400,162 @@ func TestABarrierIsANoOpWithoutAStore(t *testing.T) {
 	if err := rec.barrier(context.Background(), "before the model request"); err != nil {
 		t.Errorf("没有 store 的部署被屏障挡住了：%v", err)
 	}
+}
+
+// 投影（P3）要从事件里还原出完整的 domain.ConversationTurn。P2 的载荷缺五个字段，
+// 缺任何一个都不会报错，只会让下游悄悄少点东西：TaskID 缺了模型会看到重复的 user
+// 消息，GeneratedFiles 缺了 GUI 的文件卡片静默失效。所以这里逐字段断言。
+func TestUserMessageEventCarriesEverythingAProjectionNeeds(t *testing.T) {
+	t.Parallel()
+
+	store := &captureEventStore{}
+	rec := newEventRecorder(store, domain.Task{ID: "task-7", SessionID: "sess-1", AgentID: "agent-a"})
+	rec.recordTurnStart(0)
+	rec.recordUserMessage("请读一下 notes.md")
+	if err := rec.flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	data := payloadOfType(t, store.events, domain.SessionEventUserMessage)
+	if got := data["task_id"]; got != "task-7" {
+		t.Errorf("task_id = %v，要 task-7：session_turns.go 用它滤掉任务自己的 user turn，缺了模型会看到重复消息", got)
+	}
+	if got, _ := data["turn_id"].(string); got == "" {
+		t.Error("turn_id 为空：ScrollMessages 用它定位锚点，投影时现生成会让同一条 turn 每次 ID 都不同")
+	}
+	if got := data["content"]; got != "请读一下 notes.md" {
+		t.Errorf("content = %v，要原文", got)
+	}
+}
+
+func TestAssistantMessageEventCarriesEverythingAProjectionNeeds(t *testing.T) {
+	t.Parallel()
+
+	store := &captureEventStore{}
+	rec := newEventRecorder(store, domain.Task{ID: "task-7", SessionID: "sess-1", AgentID: "agent-a"})
+	rec.recordTurnStart(0)
+	rec.recordStepStart()
+	rec.recordAssistantMessage(
+		"读好了",
+		nil,
+		eventUsage{Prompt: 11, Completion: 22, Cached: 3, Total: 33},
+		"fast",
+		[]string{"out/report.md"},
+	)
+	if err := rec.flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	data := payloadOfType(t, store.events, domain.SessionEventAssistantMessage)
+	if got := data["task_id"]; got != "task-7" {
+		t.Errorf("task_id = %v，要 task-7", got)
+	}
+	if got := data["agent_id"]; got != "agent-a" {
+		t.Errorf("agent_id = %v，要 agent-a", got)
+	}
+	if got, _ := data["turn_id"].(string); got == "" {
+		t.Error("turn_id 为空")
+	}
+	files, _ := data["generated_files"].([]any)
+	if len(files) != 1 || files[0] != "out/report.md" {
+		t.Errorf("generated_files = %v，要 [out/report.md]：缺了 GUI 的文件卡片会静默失效", files)
+	}
+}
+
+// 对话正文是对话本体，不是工具输出。模型侧允许 defaultMaxTurnChars = 6000 字符，
+// 而 maxEventPreviewRunes 只有 2000——截断会让历史对话缩到 1/3，
+// 直接违反 P3 判据「五个模型侧消费者行为不变」。
+func TestConversationContentIsStoredWhole(t *testing.T) {
+	t.Parallel()
+
+	long := strings.Repeat("话", 5000) // 远超 maxEventPreviewRunes = 2000
+	store := &captureEventStore{}
+	rec := newEventRecorder(store, domain.Task{ID: "task-7", SessionID: "sess-1", AgentID: "agent-a"})
+	rec.recordTurnStart(0)
+	rec.recordUserMessage(long)
+	rec.recordStepStart()
+	rec.recordAssistantMessage(long, nil, eventUsage{}, "fast", nil)
+	if err := rec.flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	for _, typ := range []domain.SessionEventType{
+		domain.SessionEventUserMessage,
+		domain.SessionEventAssistantMessage,
+	} {
+		data := payloadOfType(t, store.events, typ)
+		got, _ := data["content"].(string)
+		if len([]rune(got)) != 5000 {
+			t.Errorf("%s 的 content 有 %d runes，要 5000：对话正文不该被截断",
+				typ, len([]rune(got)))
+		}
+	}
+}
+
+// newTurnID 的唯一性论证（见其文档注释）依赖一条隐式控制流不变量：同一
+// (turn, step) 在一次执行里最多被一次 recordAssistantMessage 用到。今天没有
+// 代码路径违反它，但类型系统不拦这件事——这条测试断言的不是"这个场景该被禁止"
+// （那是 runtime.go 的事），而是"如果它真的发生了，运行期断言确实会响亮地炸出来"，
+// 即 P3 Task 1 复审 I-1 要求补的守卫确实在生效。
+func TestDuplicateTurnIDCoordinatePanics(t *testing.T) {
+	t.Parallel()
+
+	store := &captureEventStore{}
+	rec := newEventRecorder(store, domain.Task{ID: "task-7", SessionID: "sess-1", AgentID: "agent-a"})
+	rec.recordTurnStart(0)
+	rec.recordStepStart()
+	rec.recordAssistantMessage("第一条", nil, eventUsage{}, "fast", nil)
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("同一 (turn, step) 上记第二条 assistant/message 没有 panic：turn_id 会静默撞车，两行事件会在投影时互相覆盖")
+		}
+		msg, ok := r.(string)
+		if !ok {
+			t.Fatalf("panic 值不是字符串: %v (%T)", r, r)
+		}
+		for _, want := range []string{"turn=0", "step=0", string(domain.SessionEventAssistantMessage)} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("panic 信息 = %q，缺少 %q：排查的人要能立刻从 panic 信息定位到撞车的坐标", msg, want)
+			}
+		}
+	}()
+	// 同一 turn/step 上第二次记 assistant/message：今天没有任何调用点这样做，
+	// 这里是直接调用 record* 方法模拟"控制流不变量被破坏"的场景，不是复现
+	// runtime.go 里的真实路径。
+	rec.recordAssistantMessage("第二条（撞车）", nil, eventUsage{}, "fast", nil)
+}
+
+// 禁用（没配 store）时 newTurnID 不追踪坐标、也不检查撞车：这条 ID 从不会被真正
+// 落盘或投影，复用坐标不构成任何风险——大量测试与无 store 部署本就会用同样的
+// (turn, step) 反复构造 disabled recorder。在这个分支上加检查，等于把"没有
+// store"这个契约允许的可选部署形态错当成错误状态去 fail-loud，是新断言必须
+// 避免的行为改变。
+func TestDisabledRecorderDoesNotTrackTurnIDCoordinates(t *testing.T) {
+	t.Parallel()
+
+	rec := newEventRecorder(nil, domain.Task{ID: "t1"})
+	rec.recordTurnStart(0)
+	rec.recordStepStart()
+	rec.recordAssistantMessage("第一条", nil, eventUsage{}, "fast", nil)
+	rec.recordAssistantMessage("第二条", nil, eventUsage{}, "fast", nil) // 不应 panic
+}
+
+// payloadOfType 取出指定类型的第一条事件的载荷。找不到就 Fatal——
+// 「没有这条事件」和「这条事件字段不对」是两种不同的失败，不要混在一起报。
+func payloadOfType(t *testing.T, events []domain.SessionEvent, typ domain.SessionEventType) map[string]any {
+	t.Helper()
+	for _, ev := range events {
+		if ev.Type != typ {
+			continue
+		}
+		var data map[string]any
+		if err := json.Unmarshal(ev.Data, &data); err != nil {
+			t.Fatalf("unmarshal %s payload: %v", typ, err)
+		}
+		return data
+	}
+	t.Fatalf("日志里没有 %s 事件", typ)
+	return nil
 }

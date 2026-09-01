@@ -43,10 +43,6 @@ func (f *fileTestSessionStore) DeleteAgentSession(ctx context.Context, sessionID
 	return nil
 }
 
-func (f *fileTestSessionStore) AppendConversationTurnIfAbsent(ctx context.Context, turn domain.ConversationTurn) (bool, error) {
-	return true, nil
-}
-
 // filesRouteURL builds a GET /v1/files request URL from query parameters,
 // mirroring how the fileURL builder under test assembles the same route.
 func filesRouteURL(sessionID, relPath string, download bool) string {

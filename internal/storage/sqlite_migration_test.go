@@ -27,13 +27,15 @@ func columnExists(t *testing.T, r *SQLiteRepository, table, col string) bool {
 	return false
 }
 
+// conversation_turns 的四个 token 列不在这张清单里：那张表连同它的写入方已在 P3
+// Task 5 退役（事件日志是唯一真相源，spec §3 取舍 A2），token 用量走事件载荷的
+// usage 字段、由 storage.projectTurns 累加还原。audit_events 一侧仍然落盘，所以
+// 这条测试守的就只剩它。
 func TestTokenColumnsExistAfterInit(t *testing.T) {
 	r := openTestRepo(t)
 	for _, tc := range []struct{ table, col string }{
 		{"audit_events", "prompt_tokens"}, {"audit_events", "completion_tokens"},
 		{"audit_events", "cached_tokens"}, {"audit_events", "total_tokens"},
-		{"conversation_turns", "prompt_tokens"}, {"conversation_turns", "completion_tokens"},
-		{"conversation_turns", "cached_tokens"}, {"conversation_turns", "total_tokens"},
 	} {
 		if !columnExists(t, r, tc.table, tc.col) {
 			t.Errorf("missing column %s.%s", tc.table, tc.col)

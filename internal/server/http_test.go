@@ -159,8 +159,8 @@ func TestHTTPServerListsSessionsAndTurns(t *testing.T) {
 	if err := repo.SaveAgentSession(ctx, session); err != nil {
 		t.Fatalf("SaveAgentSession(%q) error = %v, want nil", session.ID, err)
 	}
-	for _, turn := range []domain.ConversationTurn{
-		{
+	appendTurnEvents(t, repo, session.ID,
+		domain.ConversationTurn{
 			ID:           "turn-1",
 			SessionID:    session.ID,
 			TaskID:       "task-1",
@@ -170,7 +170,7 @@ func TestHTTPServerListsSessionsAndTurns(t *testing.T) {
 			Content:      "你是什么模型",
 			CreatedAt:    createdAt.Add(time.Second),
 		},
-		{
+		domain.ConversationTurn{
 			ID:           "turn-2",
 			SessionID:    session.ID,
 			TaskID:       "task-1",
@@ -180,11 +180,7 @@ func TestHTTPServerListsSessionsAndTurns(t *testing.T) {
 			Content:      "我是 Legion Agent",
 			CreatedAt:    createdAt.Add(2 * time.Second),
 		},
-	} {
-		if err := repo.AppendConversationTurn(ctx, turn); err != nil {
-			t.Fatalf("AppendConversationTurn(%q) error = %v, want nil", turn.ID, err)
-		}
-	}
+	)
 	srv := NewHTTPServer(Config{Sessions: repo})
 
 	rec := httptest.NewRecorder()
@@ -211,7 +207,7 @@ func TestHTTPServerListsSessionsAndTurns(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&turns); err != nil {
 		t.Fatalf("Decode(turns) error = %v, want nil", err)
 	}
-	if len(turns) != 1 || turns[0].ID != "turn-2" || turns[0].Content != "我是 Legion Agent" {
+	if len(turns) != 1 || turns[0].ID != "task-1:assistant" || turns[0].Content != "我是 Legion Agent" {
 		t.Fatalf("GET /v1/sessions/session-http-1/turns = %#v, want latest turn", turns)
 	}
 }
@@ -269,21 +265,29 @@ func TestHTTPServerCreateSessionUnavailableStore(t *testing.T) {
 	}
 }
 
-func TestHTTPServerTaskWithSessionRecordsUserTurn(t *testing.T) {
+// 提交端点不再写任何对话内容：conversation_turns 已退役，user/message 事件由
+// runtime 在任务真正跑起来时发出（spec §3 取舍 A2，事件日志是唯一真相源）。
+// 提交时仍然要做的只有一件事——把会话浮到列表顶部。
+//
+// 顺带断言「这条会话此刻读不出任何 turn」：这不是为了描述缺失，而是守住 A2——
+// 服务端一旦又开始写一份自己的对话内容，这里就会多出一条，那正是退役要消灭的
+// 第二个真相源。
+func TestHTTPServerTaskWithSessionTouchesSessionAndWritesNoTurn(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	repo := openServerTestRepo(t)
 	scheduler := task.NewScheduler()
 	srv := NewHTTPServer(Config{Tasks: scheduler, Sessions: repo, WorkflowEvents: adapter.NewMemoryEventBus()})
 
+	createdAt := time.Date(2026, 6, 27, 9, 0, 0, 0, time.UTC)
 	session := domain.AgentSession{
 		ID:        "session-task-1",
 		CompanyID: "default-company",
 		AgentID:   "default-agent",
 		Project:   "测试项目",
 		Title:     "会话1",
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		CreatedAt: createdAt,
+		UpdatedAt: createdAt,
 	}
 	if err := repo.SaveAgentSession(ctx, session); err != nil {
 		t.Fatalf("SaveAgentSession error = %v, want nil", err)
@@ -302,12 +306,22 @@ func TestHTTPServerTaskWithSessionRecordsUserTurn(t *testing.T) {
 		t.Fatalf("POST /v1/tasks status = %d, want %d body=%s", rec.Code, http.StatusCreated, rec.Body.String())
 	}
 
+	touched, ok, err := repo.GetAgentSession(ctx, "session-task-1")
+	if err != nil || !ok {
+		t.Fatalf("GetAgentSession = %#v, %t, %v, want the saved session", touched, ok, err)
+	}
+	if !touched.UpdatedAt.After(createdAt) {
+		t.Fatalf("session updated_at = %v, want it refreshed past %v：提交没有把会话浮到列表顶部",
+			touched.UpdatedAt, createdAt)
+	}
+
 	turns, err := repo.ListConversationTurns(ctx, "session-task-1", 0)
 	if err != nil {
 		t.Fatalf("ListConversationTurns error = %v, want nil", err)
 	}
-	if len(turns) != 1 || turns[0].Role != domain.ConversationRoleUser || turns[0].Content != "你好" {
-		t.Fatalf("turns after submit = %#v, want one user turn 你好", turns)
+	if len(turns) != 0 {
+		t.Fatalf("提交后读出 %#v，要空：对话内容只能来自 runtime 写的事件日志，"+
+			"服务端再写一份就是第二个真相源", turns)
 	}
 }
 
@@ -333,7 +347,14 @@ func TestHTTPServerTaskWithMissingSessionFailsLoud(t *testing.T) {
 	}
 }
 
-func TestHTTPServerCompletedTaskRecordsAssistantTurnOnce(t *testing.T) {
+// 结果端点是只读的：反复轮询既不写对话内容，也不改变返回的答案。
+//
+// 它原来会往 conversation_turns 记一条 assistant turn，用确定性 id 保证「轮询多少次
+// 只落一行」。那一行退役之后（spec §3 取舍 A2），答案、用量与产出文件都从 runtime
+// 写的 assistant/message 事件投影出来，「每任务恰好一条」由投影按 (task_id, role)
+// 折叠保证（storage 包的 TestAToolLoopTaskProjectsToOneAssistantTurn 守它）。这里
+// 剩下要守的是：这个端点别再自己写一份。
+func TestHTTPServerCompletedTaskResultEndpointWritesNothing(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	repo := openServerTestRepo(t)
@@ -373,8 +394,6 @@ func TestHTTPServerCompletedTaskRecordsAssistantTurnOnce(t *testing.T) {
 		t.Fatalf("events.Publish error = %v, want nil", err)
 	}
 
-	// Poll the result endpoint several times; the assistant turn must be written
-	// exactly once regardless of how many times it is queried.
 	for i := range 3 {
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/v1/tasks/task-done-1/result", nil)
@@ -382,23 +401,21 @@ func TestHTTPServerCompletedTaskRecordsAssistantTurnOnce(t *testing.T) {
 		if rec.Code != http.StatusOK {
 			t.Fatalf("GET result attempt %d status = %d, want %d body=%s", i, rec.Code, http.StatusOK, rec.Body.String())
 		}
+		var body taskResultResponse
+		if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+			t.Fatalf("decode result attempt %d: %v", i, err)
+		}
+		if body.Result != "你好，我是模型的真实回答" || body.TotalTokens != 42 {
+			t.Fatalf("GET result attempt %d = %#v, want the published answer and usage", i, body)
+		}
 	}
 
 	turns, err := repo.ListConversationTurns(ctx, "session-done-1", 0)
 	if err != nil {
 		t.Fatalf("ListConversationTurns error = %v, want nil", err)
 	}
-	assistantCount := 0
-	for _, turn := range turns {
-		if turn.Role == domain.ConversationRoleAssistant {
-			assistantCount++
-			if turn.Content != "你好，我是模型的真实回答" {
-				t.Fatalf("assistant turn content = %q, want model answer", turn.Content)
-			}
-		}
-	}
-	if assistantCount != 1 {
-		t.Fatalf("assistant turn count = %d, want exactly 1 (turns=%#v)", assistantCount, turns)
+	if len(turns) != 0 {
+		t.Fatalf("轮询结果端点后读出 %#v，要空：答案只能来自 runtime 写的事件日志", turns)
 	}
 }
 
@@ -578,16 +595,25 @@ func TestHTTPServerDeleteSessionRemovesSessionAndTurns(t *testing.T) {
 	if err := repo.SaveAgentSession(ctx, session); err != nil {
 		t.Fatalf("SaveAgentSession error = %v, want nil", err)
 	}
-	if err := repo.AppendConversationTurn(ctx, domain.ConversationTurn{
-		ID:        "del-turn-1",
+	// 从事件一侧播种：conversation_turns 退役后（spec §3 取舍 A2），会话的对话内容
+	// 只存在于事件日志里，删会话要清的也正是它。
+	appendTurnEvents(t, repo, session.ID, domain.ConversationTurn{
+		ID:        "sess-del:0:0:user/message",
 		SessionID: session.ID,
 		TaskID:    "task-1",
 		AgentID:   "agent-1",
 		Role:      domain.ConversationRoleUser,
 		Content:   "你好",
 		CreatedAt: createdAt.Add(time.Second),
-	}); err != nil {
-		t.Fatalf("AppendConversationTurn error = %v, want nil", err)
+	})
+	// 前提检查：删之前确实读得出东西。少了这一句，「删完是空的」在播种失效时也会
+	// 通过——那是空验。
+	seeded, err := repo.ListConversationTurns(ctx, session.ID, 0)
+	if err != nil {
+		t.Fatalf("ListConversationTurns(before delete) error = %v, want nil", err)
+	}
+	if len(seeded) != 1 {
+		t.Fatalf("删除前读出 %#v，要 1 条：夹具没播出可删的内容，下面的断言是空验", seeded)
 	}
 	srv := NewHTTPServer(Config{Sessions: repo})
 
@@ -700,7 +726,7 @@ func TestHTTPServerPatchDoesNotMatchTurnsRoute(t *testing.T) {
 	if err := repo.SaveAgentSession(ctx, session); err != nil {
 		t.Fatalf("SaveAgentSession error = %v, want nil", err)
 	}
-	if err := repo.AppendConversationTurn(ctx, domain.ConversationTurn{
+	appendTurnEvents(t, repo, session.ID, domain.ConversationTurn{
 		ID:        "guard-turn-1",
 		SessionID: session.ID,
 		TaskID:    "task-1",
@@ -708,9 +734,7 @@ func TestHTTPServerPatchDoesNotMatchTurnsRoute(t *testing.T) {
 		Role:      domain.ConversationRoleUser,
 		Content:   "你好",
 		CreatedAt: createdAt.Add(time.Second),
-	}); err != nil {
-		t.Fatalf("AppendConversationTurn error = %v, want nil", err)
-	}
+	})
 	srv := NewHTTPServer(Config{Sessions: repo})
 
 	// A PATCH against the /turns path must not be routed to the session patch
@@ -734,7 +758,7 @@ func TestHTTPServerPatchDoesNotMatchTurnsRoute(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&turns); err != nil {
 		t.Fatalf("Decode(turns) error = %v, want nil", err)
 	}
-	if len(turns) != 1 || turns[0].ID != "guard-turn-1" {
+	if len(turns) != 1 || turns[0].ID != "task-1:user" {
 		t.Fatalf("GET /turns = %#v, want the unmodified turn", turns)
 	}
 }
@@ -929,7 +953,13 @@ func TestHTTPWorkflowSubmitResume(t *testing.T) {
 	}
 }
 
-func TestHTTPServerTaskWithImagesPersistsImagesAndAnnotatesTurn(t *testing.T) {
+// 带图片的任务：图片必须原样留在 task 上给 runtime 用，而服务端不写任何对话内容
+// ——conversation_turns 退役之后（spec §3 取舍 A2）它根本不写。
+//
+// 「历史里看得出附了图、且不嵌 base64」那条断言随写入方一起搬到了 internal/runtime
+// 的 TestAUserMessageEventAnnotatesAttachedImagesWithoutEmbeddingThem：user/message
+// 事件在那里产出，那也是唯一还验得到它的地方。
+func TestHTTPServerTaskWithImagesKeepsImagesOnTheTaskOnly(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	repo := openServerTestRepo(t)
@@ -974,32 +1004,12 @@ func TestHTTPServerTaskWithImagesPersistsImagesAndAnnotatesTurn(t *testing.T) {
 		t.Fatalf("stored task images = %#v, want the two posted data URIs", got.Images)
 	}
 
-	// The persisted user turn must annotate the attachment count without storing
-	// the base64 payload (which would bloat sqlite).
 	turns, err := repo.ListConversationTurns(ctx, "session-img-1", 0)
 	if err != nil {
 		t.Fatalf("ListConversationTurns error = %v, want nil", err)
 	}
-	if len(turns) != 1 {
-		t.Fatalf("turns after submit = %#v, want one user turn", turns)
-	}
-	content := turns[0].Content
-	if want := "描述这张图\n[附图 2 张]"; content != want {
-		t.Fatalf("user turn content = %q, want %q", content, want)
-	}
-	if bytes.Contains([]byte(content), []byte("base64")) {
-		t.Fatalf("user turn content embeds base64 image data: %q", content)
-	}
-}
-
-func TestHTTPServerTaskWithoutImagesLeavesTurnUnannotated(t *testing.T) {
-	t.Parallel()
-
-	if got := userTurnContent("你好", 0); got != "你好" {
-		t.Fatalf("userTurnContent(no images) = %q, want unchanged 你好", got)
-	}
-	if got := userTurnContent("", 3); got != "[附图 3 张]" {
-		t.Fatalf("userTurnContent(empty input, 3 images) = %q, want bare marker", got)
+	if len(turns) != 0 {
+		t.Fatalf("提交后读出 %#v，要空：服务端不写对话内容，图片更不能被它写进历史", turns)
 	}
 }
 
