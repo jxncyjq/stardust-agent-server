@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -159,6 +160,12 @@ type Config struct {
 	// where plugins are applied must share ONE gate with the loader; a gate of
 	// its own would let its tasks run straight through another gate's boundary.
 	Gate *taskgate.TaskGate
+	// SessionEvents 是会话事件日志的落点（P1 的 port.SessionEventStore）。
+	//
+	// 允许为 nil，且 nil 是一种**契约声明的合法部署形态**（内存后端、绝大多数测试
+	// 构造），不是兜底：那时整个记录是 no-op，三个屏障永远放行。它与「配了但写不进去」
+	// 是两回事——后者由屏障 fail-closed 挡住。
+	SessionEvents port.SessionEventStore
 }
 
 // SkillUsageRecorder is the usage sidecar skill.UsageStore satisfies.
@@ -206,6 +213,13 @@ type Runtime struct {
 	// gate is never nil: NewRuntime refuses a nil Config.Gate and newSubRuntime
 	// carries the parent's over, so RunTask can register on it unconditionally.
 	gate *taskgate.TaskGate
+	// sessionEvents is the session event log's store (Config.SessionEvents).
+	// Nil is a contract-optional deployment shape, not a wiring gap: RunTask
+	// always builds an *eventRecorder from it (newTaskRecorder), and a nil
+	// store makes that recorder a no-op (eventRecorder.enabled()) rather than
+	// leaving the recorder field itself nil -- see eventRecorder's type doc on
+	// why a literal nil recorder is refused, not tolerated.
+	sessionEvents port.SessionEventStore
 }
 
 // loopState is the mutable state threaded through the tool-execution loop.
@@ -264,6 +278,13 @@ type loopState struct {
 	// executeToolCalls's success branch, surfaced by finishRun onto both the
 	// task_completed RuntimeEvent and the returned TaskRun.
 	generatedFiles []string
+	// events is this run's session event recorder (spec §5), built once in
+	// RunTask (newTaskRecorder) and carried through the whole loop so
+	// executeToolCalls/dispatchToolCall can record tool/call and tool/result
+	// without their own signatures growing a recorder parameter. Never nil
+	// (see eventRecorder's type doc): a deployment with no SessionEvents store
+	// still gets a recorder, just one whose enabled() is false.
+	events *eventRecorder
 }
 
 // effectiveTools returns the tool registry a run should use: in Plan mode only
@@ -369,6 +390,7 @@ func NewRuntime(cfg Config) *Runtime {
 		compactTokenThreshold: cfg.CompactTokenThreshold,
 		episodeRecorder:       cfg.EpisodeRecorder,
 		gate:                  cfg.Gate,
+		sessionEvents:         cfg.SessionEvents,
 	}
 }
 
@@ -406,6 +428,79 @@ func normalizePositive(value, fallback int) int {
 
 func (r *Runtime) Interrupt() {
 	r.interrupted.Store(true)
+}
+
+// newTaskRecorder builds this run's session event recorder (spec §5) and
+// resolves the turn number it opens with.
+//
+// Turn numbers are monotonic PER SESSION (spec §4.1): the resolved value is
+// one past the highest turn already recorded among this session's existing
+// events, or 0 when it has none yet. That covers r.sessionEvents == nil too —
+// the contract-optional deployment shape (see Config.SessionEvents) — under
+// which newEventRecorder itself returns a disabled (store == nil) recorder
+// and the turn number is never observed by anything: enabled() is false, so
+// every record* call becomes a no-op. Skipping the ReadFrom in that case is
+// not an optimisation shortcut, it is required — there is no store to read.
+func (r *Runtime) newTaskRecorder(ctx context.Context, task domain.Task) (*eventRecorder, int, error) {
+	rec := newEventRecorder(r.sessionEvents, task)
+	if r.sessionEvents == nil {
+		return rec, 0, nil
+	}
+	existing, err := r.sessionEvents.ReadFrom(ctx, rec.sessionID(), 0)
+	if err != nil {
+		return nil, 0, fmt.Errorf("resolve turn number for session %q: %w", rec.sessionID(), err)
+	}
+	turn := 0
+	for _, e := range existing {
+		var payload struct {
+			Turn int `json:"turn"`
+		}
+		if err := json.Unmarshal(e.Data, &payload); err != nil {
+			return nil, 0, fmt.Errorf("decode existing session event seq %d for %q: %w", e.Seq, rec.sessionID(), err)
+		}
+		if payload.Turn >= turn {
+			turn = payload.Turn + 1
+		}
+	}
+	return rec, turn, nil
+}
+
+// closingTurnReason maps a RunTask-ending error to the turn/end reason that
+// best describes it: a caller-cancelled context closes as "cancelled",
+// anything else as "failed". Never "interrupted" -- that reason is reserved
+// for crash recovery reconstructing a turn nobody closed, which is a
+// different code path entirely (not exercised by P2); a controlled error
+// return here always gets to write its own closing event.
+func closingTurnReason(err error) string {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return domain.TurnEndReasonCancelled
+	}
+	return domain.TurnEndReasonFailed
+}
+
+// closingStepReason is closingTurnReason's step/end counterpart, used wherever
+// a step is closed on the same error that is about to close its turn, so the
+// two closing events agree on why (both "cancelled" for a caller-cancelled
+// context, both "failed" otherwise).
+func closingStepReason(err error) string {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return domain.StepEndReasonCancelled
+	}
+	return domain.StepEndReasonFailed
+}
+
+// closeTurnOnError records this run's closing turn/end (see closingTurnReason)
+// and makes a best-effort attempt to flush it, for use on an error-return path
+// where the caller already has the real error to report. A flush failure here
+// is logged rather than returned: it must never replace or mask the primary
+// error, and the buffered events survive a failed flush (eventRecorder.flush)
+// so nothing is lost, only left for a later attempt that this run will not make.
+func (r *Runtime) closeTurnOnError(ctx context.Context, task domain.Task, rec *eventRecorder, cause error) {
+	rec.recordTurnEnd(closingTurnReason(cause))
+	if err := rec.flush(ctx); err != nil {
+		r.logger.Warn("session event flush failed while closing a failed run",
+			"task_id", task.ID, "cause", cause, "flush_error", err)
+	}
 }
 
 // RunTask runs one task from prompt to result, including the whole tool loop,
@@ -490,12 +585,28 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		return domain.TaskRun{}, fmt.Errorf("run task %s: %w", task.ID, ErrManualGateMissing)
 	}
 
+	// One RunTask execution is one turn (spec §4.1): the recorder and the turn
+	// number are resolved before anything that could produce an event, and
+	// EVERY control-flow path out of this function from here on -- resume,
+	// fresh run, any of their failure branches -- shares this one rec so the
+	// turn it opens here gets exactly one closing turn/end. Building it any
+	// earlier would record turns for tasks that never actually ran (refused by
+	// the gate, interrupted, no maas configured, missing manual gate) -- those
+	// returns above cost nothing to unwind and are deliberately not turns.
+	rec, turn, err := r.newTaskRecorder(ctx, task)
+	if err != nil {
+		return domain.TaskRun{}, fmt.Errorf("run task %s: %w", task.ID, err)
+	}
+	rec.recordTurnStart(turn)
+	rec.recordUserMessage(task.Input)
+
 	// Resume path: a persisted checkpoint means this task previously suspended.
 	// Rebuild loop state from disk and re-enter the loop with the pending calls,
 	// skipping the initial prompt build + generate.
 	if r.checkpoints != nil {
 		cp, ok, err := r.checkpoints.Load(sessionKeyForTask(task), task.WorkingDir)
 		if err != nil {
+			r.closeTurnOnError(ctx, task, rec, err)
 			return domain.TaskRun{}, fmt.Errorf("load checkpoint for task %s: %w", task.ID, err)
 		}
 		if ok {
@@ -525,6 +636,24 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 				// load_capabilities issued in a resumed round still resolves, scoped
 				// to the same effective registry.
 				catalog: r.buildCatalog(effTools),
+				events:  rec,
+			}
+			// The carried-over pending calls are this NEW turn's opening step:
+			// there is no fresh model request to wrap (the response came from
+			// the checkpoint, not a generate call), so this step is recorded
+			// directly rather than through generateStep. It still needs a
+			// barrier before runToolLoop may dispatch any of these calls again
+			// -- same "record before acting" guarantee barrier 2 gives a fresh
+			// call, just applied to calls resumed from disk instead of ones
+			// just generated.
+			rec.recordStepStart()
+			rec.recordAssistantMessage(st.resp.Text, st.resp.ToolCalls, eventUsage{
+				Prompt: st.promptTokens, Completion: st.completionTokens,
+				Cached: st.cachedTokens, Total: st.totalTokens,
+			}, "")
+			if err := rec.barrier(ctx, "before resuming pending tool calls"); err != nil {
+				r.closeTurnOnError(ctx, task, rec, err)
+				return domain.TaskRun{}, fmt.Errorf("run task %s: %w", task.ID, err)
 			}
 			return r.runToolLoop(ctx, requestID, agent, task, st)
 		}
@@ -534,6 +663,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	catalog := r.buildCatalog(effTools)
 	prompt, stablePrefixLen, err := r.buildPrompt(ctx, agent, task, catalog)
 	if err != nil {
+		r.closeTurnOnError(ctx, task, rec, err)
 		return domain.TaskRun{}, err
 	}
 	if task.Mode == domain.ModePlan {
@@ -546,8 +676,9 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	basePrompt := prompt
 	convo := newConversation(basePrompt, task.Images)
 	convo.pinCachePrefix(stablePrefixLen)
-	resp, err := r.generate(ctx, requestID, task.ID, convo, effTools)
+	resp, err := r.generateStep(ctx, rec, requestID, task.ID, convo, effTools)
 	if err != nil {
+		r.closeTurnOnError(ctx, task, rec, err)
 		r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInferenceError)
 		return domain.TaskRun{}, fmt.Errorf("generate inference: %w", err)
 	}
@@ -567,6 +698,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		toolNameGuard:    newSharedToolBudget(),
 		toolFailGuard:    newRepeatGuard(),
 		catalog:          catalog,
+		events:           rec,
 	}
 	return r.runToolLoop(ctx, requestID, agent, task, st)
 }
@@ -577,6 +709,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 // says suspend, it writes a checkpoint and returns ErrSuspended, releasing the
 // goroutine. A successfully completed run deletes any checkpoint.
 func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domain.Agent, task domain.Task, st loopState) (domain.TaskRun, error) {
+	rec := st.events
 	// Each round appends the model's own turn and one tool turn per executed
 	// call, so the exchange the model sees grows monotonically and its repeated
 	// calls stay visible to it.
@@ -588,9 +721,31 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 	for st.round < r.maxToolRounds && len(st.resp.ToolCalls) > 0 {
 		suspend, err := r.checkSuspend(ctx, task, st)
 		if err != nil {
+			// st.resp's step was opened (step/start + assistant/message) by
+			// whoever produced it -- RunTask's initial generateStep, the resumed
+			// step, or the previous iteration's trailing generateStep -- and
+			// never got the chance to execute its tool calls. Close it here
+			// rather than leaving it dangling: this is a hard failure, not a
+			// suspend, so nothing will resume this turn later.
+			rec.recordStepEnd(closingStepReason(err))
+			r.closeTurnOnError(ctx, task, rec, err)
 			return domain.TaskRun{}, err
 		}
 		if suspend {
+			// Suspension is a normal pause, not a failure: the checkpoint (just
+			// written by checkSuspend) holds everything needed to resume,
+			// including this step's still-open response. Deliberately leave the
+			// step and the turn open rather than closing them -- resuming opens
+			// a fresh turn (newTaskRecorder resolves the next turn number from
+			// what is already on disk), and this turn's story simply continues
+			// there instead of closing here. What MUST happen is flushing
+			// whatever is already buffered (this step's step/start +
+			// assistant/message), so it is not lost with this *eventRecorder
+			// when RunTask returns -- fail loud if that flush itself fails,
+			// since an un-flushed step/start silently vanishes forever.
+			if err := rec.flush(ctx); err != nil {
+				return domain.TaskRun{}, fmt.Errorf("flush session events before suspend for task %s: %w", task.ID, err)
+			}
 			return domain.TaskRun{}, ErrSuspended
 		}
 		calls := st.resp.ToolCalls
@@ -623,6 +778,13 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		st.convo.appendAssistant(st.resp.Text, calls)
 		results, err := r.executeToolCalls(ctx, agent, task, &st)
 		if err != nil {
+			// executeToolCalls records tool/call + tool/result around every
+			// dispatch it reaches (including the one whose error aborted the
+			// loop, via its own barrier/dispatch-error handling); what it never
+			// gets to is closing THIS step, since the step only finishes once
+			// every one of the round's calls has been accounted for.
+			rec.recordStepEnd(closingStepReason(err))
+			r.closeTurnOnError(ctx, task, rec, err)
 			r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonToolError)
 			return domain.TaskRun{}, fmt.Errorf("execute model tool calls: %w", err)
 		}
@@ -648,6 +810,21 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// new definitions as their own turn rather than re-sending the whole
 		// block every round.
 		st.convo.syncLoaded(renderLoaded(st.loaded))
+
+		// This round's step is done: its response was recorded when it was
+		// generated (RunTask's initial generateStep for round 0, the manually
+		// recorded resumed step, or the previous iteration's trailing
+		// generateStep call below), and every one of its tool calls, if any,
+		// was just dispatched above with its own tool/call+tool/result pair.
+		// Close it now, before deciding whether the loop continues, breaks
+		// (loopCut/capHit), or falls through to the budget-exhausted branch --
+		// all three paths share this one closing point so the step is never
+		// left open regardless of which one the guards below choose.
+		rec.recordStepEnd(domain.StepEndReasonCompleted)
+		if err := rec.barrier(ctx, "before next step"); err != nil {
+			r.closeTurnOnError(ctx, task, rec, err)
+			return domain.TaskRun{}, err
+		}
 		if capHit != "" {
 			if err := r.events.Publish(ctx, domain.RuntimeEvent{
 				Type:      "tool_loop_broken",
@@ -686,8 +863,9 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 			st.convo.appendUser(fmt.Sprintf(
 				"[系统] 你已多次以完全相同的参数调用同一工具，结果没有变化。不要再重复该调用：改用其他工具，或基于已获取的信息直接给出最终回答。（连续%d次/累计%d次）", streak, repeatCount))
 		}
-		st.resp, err = r.generate(ctx, requestID, task.ID, st.convo, st.tools)
+		st.resp, err = r.generateStep(ctx, rec, requestID, task.ID, st.convo, st.tools)
 		if err != nil {
+			r.closeTurnOnError(ctx, task, rec, err)
 			r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInferenceError)
 			return domain.TaskRun{}, fmt.Errorf("generate inference after tools: %w", err)
 		}
@@ -709,20 +887,34 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		}
 	}
 	if len(st.resp.ToolCalls) > 0 {
-		// Tool-round budget exhausted but the model still wants tools. Rather
-		// than hard-failing the whole task (which discards every tool result
-		// gathered so far and surfaces as "任务执行失败" to the user), make a
-		// final inference with no tools offered, and explicitly instruct the
-		// model to answer rather than narrate another tool call — otherwise it
-		// tends to emit text like "list_files 参数: {...}" instead of a real
-		// answer when it is cut off mid-exploration.
+		// Tool-round budget exhausted, or loopCut broke out of the loop above:
+		// either way st.resp is the response from the loop's last trailing
+		// generateStep (or, on the very first round, RunTask's initial
+		// generateStep), still open -- the loop exited before a new iteration
+		// could execute these calls. They are being deliberately abandoned
+		// (never dispatched, so no orphaned tool/call -- spec invariant 1 only
+		// requires an answer for calls actually recorded), so this step closes
+		// as "cancelled" rather than "completed": the tool loop stopped it, not
+		// a normal finish.
+		rec.recordStepEnd(domain.StepEndReasonCancelled)
+		if err := rec.barrier(ctx, "before next step"); err != nil {
+			r.closeTurnOnError(ctx, task, rec, err)
+			return domain.TaskRun{}, err
+		}
+		// Rather than hard-failing the whole task (which discards every tool
+		// result gathered so far and surfaces as "任务执行失败" to the user),
+		// make a final inference with no tools offered, and explicitly instruct
+		// the model to answer rather than narrate another tool call —
+		// otherwise it tends to emit text like "list_files 参数: {...}" instead
+		// of a real answer when it is cut off mid-exploration.
 		closing := "[系统] 工具调用已达上限。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。"
 		if loopCut {
 			closing = "[系统] 检测到你在重复同一个工具调用，已停止工具循环。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。"
 		}
 		st.convo.appendUser(closing)
-		final, err := r.generateNoTools(ctx, requestID, task.ID, st.convo)
+		final, err := r.generateFinalStep(ctx, rec, requestID, task.ID, st.convo)
 		if err != nil {
+			r.closeTurnOnError(ctx, task, rec, err)
 			r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonInferenceError)
 			return domain.TaskRun{}, fmt.Errorf("generate final answer after tool budget exhausted: %w", err)
 		}
@@ -732,7 +924,25 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		st.totalTokens += final.TotalTokens
 		st.resp = final
 	}
-	return r.finishRun(ctx, requestID, agent, task, st)
+	// Whatever step is currently open at this point -- the loop's normal-exit
+	// trailing response (no more tool calls requested), or the closing
+	// generateFinalStep answer just above -- is this turn's last step. Close
+	// it before the turn itself closes.
+	rec.recordStepEnd(domain.StepEndReasonCompleted)
+	if err := rec.barrier(ctx, "before next step"); err != nil {
+		r.closeTurnOnError(ctx, task, rec, err)
+		return domain.TaskRun{}, err
+	}
+	run, err := r.finishRun(ctx, requestID, agent, task, st)
+	if err != nil {
+		r.closeTurnOnError(ctx, task, rec, err)
+		return domain.TaskRun{}, err
+	}
+	rec.recordTurnEnd(domain.TurnEndReasonCompleted)
+	if err := rec.flush(ctx); err != nil {
+		return domain.TaskRun{}, fmt.Errorf("flush final session events for task %s: %w", task.ID, err)
+	}
+	return run, nil
 }
 
 // checkSuspend consults the ToolGate for the current round's pending calls and,
@@ -925,6 +1135,65 @@ func (r *Runtime) generateNoTools(ctx context.Context, requestID string, taskID 
 	return r.runInference(ctx, taskID, req)
 }
 
+// generateStep opens one step of the event log (spec §5: step/start, then
+// barrier 1 "before model request"), issues req via generate, and records the
+// resulting assistant/message. It does NOT close the step -- the caller
+// closes it once it knows the fate of any tool calls this response requested
+// (see runToolLoop), because a step is not finished until they have been
+// dispatched or explicitly abandoned.
+//
+// On its OWN failure (the barrier or the generate call itself) it closes the
+// step here, before returning: nothing downstream will ever get the chance
+// to, since the caller has nothing to execute a fate for. errors.Is(err,
+// context.Canceled) is read back through to give the closing reason
+// "cancelled" instead of "failed", matching closingTurnReason's mapping for
+// the turn this step lives in.
+func (r *Runtime) generateStep(ctx context.Context, rec *eventRecorder, requestID, taskID string, convo *conversation, tools *tool.Registry) (resp port.InferenceResponse, err error) {
+	rec.recordStepStart()
+	defer func() {
+		if err != nil {
+			rec.recordStepEnd(closingStepReason(err))
+		}
+	}()
+	if err = rec.barrier(ctx, "before model request"); err != nil {
+		return port.InferenceResponse{}, err
+	}
+	resp, err = r.generate(ctx, requestID, taskID, convo, tools)
+	if err != nil {
+		return port.InferenceResponse{}, err
+	}
+	rec.recordAssistantMessage(resp.Text, resp.ToolCalls, eventUsage{
+		Prompt: resp.PromptTokens, Completion: resp.CompletionTokens,
+		Cached: resp.CachedTokens, Total: resp.TotalTokens,
+	}, "")
+	return resp, nil
+}
+
+// generateFinalStep is generateStep's counterpart for the tool-budget-exhausted
+// / loop-cut closing answer (generateNoTools): same step lifecycle (step/start
+// + barrier 1, record the response, leave closing to the caller), no tools
+// offered so the model is forced to answer in text.
+func (r *Runtime) generateFinalStep(ctx context.Context, rec *eventRecorder, requestID, taskID string, convo *conversation) (resp port.InferenceResponse, err error) {
+	rec.recordStepStart()
+	defer func() {
+		if err != nil {
+			rec.recordStepEnd(closingStepReason(err))
+		}
+	}()
+	if err = rec.barrier(ctx, "before model request"); err != nil {
+		return port.InferenceResponse{}, err
+	}
+	resp, err = r.generateNoTools(ctx, requestID, taskID, convo)
+	if err != nil {
+		return port.InferenceResponse{}, err
+	}
+	rec.recordAssistantMessage(resp.Text, resp.ToolCalls, eventUsage{
+		Prompt: resp.PromptTokens, Completion: resp.CompletionTokens,
+		Cached: resp.CachedTokens, Total: resp.TotalTokens,
+	}, "")
+	return resp, nil
+}
+
 // runInference sends req, streaming token deltas as RuntimeEvent{Type:"token"}
 // when the maas client supports streaming, otherwise going through the
 // synchronous path. A token publish failure is logged (Warn) but never aborts
@@ -991,8 +1260,28 @@ func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task
 		}); err != nil {
 			return nil, fmt.Errorf("publish tool request event: %w", err)
 		}
+		// spec §5 barrier 2: tool/call must be durably on disk BEFORE dispatch,
+		// not after. Otherwise a crash inside the tool body -- the one place a
+		// call has external side effects -- leaves a call that really happened
+		// with no record of it ever being made, and recovery cannot reconstruct
+		// a result for a call it never saw. A flush failure here means the call
+		// is NOT dispatched at all (fail-closed): st.events.barrier returning an
+		// error aborts this whole executeToolCalls call before dispatchToolCall
+		// is ever reached.
+		st.events.recordToolCall(call)
+		if err := st.events.barrier(ctx, "before tool dispatch"); err != nil {
+			return nil, fmt.Errorf("session event barrier before dispatching call %s for task %s: %w", call.ID, task.ID, err)
+		}
+		dispatchStart := time.Now()
 		result, err := r.dispatchToolCall(ctx, agent, task, call, st)
+		dispatchDur := time.Since(dispatchStart)
 		if err != nil {
+			// spec §4.3.1 rule 1: every recorded tool/call gets a tool/result,
+			// failure/denial/cancellation included -- a dispatch-level Go error
+			// is exactly that case (the call never produced a domain.ToolResult
+			// at all), so it is recorded here rather than silently only living
+			// on as the synthesized ToolResult fed back to the model below.
+			st.events.recordToolResult(call.ID, err.Error(), true, dispatchDur)
 			if pubErr := r.events.Publish(ctx, domain.RuntimeEvent{
 				Type:      "tool_failed",
 				TaskID:    task.ID,
@@ -1009,6 +1298,15 @@ func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task
 			continue
 		}
 		results = append(results, result)
+		// A successful dispatch still may have Success=false (a tool that ran
+		// and reported its own failure, or the ToolGate's "denied by human
+		// approver" result) -- that is answered here too, is_error tracking
+		// result.Success rather than the nil dispatch error.
+		preview := result.Output
+		if !result.Success {
+			preview = result.Error
+		}
+		st.events.recordToolResult(result.CallID, preview, !result.Success, dispatchDur)
 		if call.Name == "write_file" {
 			raw, ok := call.Arguments["path"]
 			if !ok || strings.TrimSpace(raw) == "" {
