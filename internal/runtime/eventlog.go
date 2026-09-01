@@ -165,14 +165,20 @@ func (e *eventRecorder) recordTurnStart(turn int) {
 // 会 fail-loud 报错——那是正确行为，这里不为它兜底。
 //
 // task_id 供投影滤掉任务自己的 user turn（session_turns.go 用 turn.TaskID ==
-// task.ID）；turn_id 是这条 ConversationTurn 的稳定标识，供 ScrollMessages 定位
-// 锚点，见 newTurnID。
+// task.ID），同时是投影折叠这一行 turn 的键与它 id 的词干；turn_id 标识**这一条
+// 事件**（P4 轨迹与 Task 4 检索按它定位），见 newTurnID。
+//
+// agent_id 与 assistant/message 一样必填：/turns 的响应与 conversation_turns_fts
+// 的索引都带这个字段，退役中的 recordUserTurn（server/http.go）写的正是
+// task.AgentID。P3 计划把它列为要补齐的五个字段缺口之一，Task 1 当时只补了
+// assistant 一侧，缺了这里 /turns 的 user 项 agent_id 就恒为空。
 func (e *eventRecorder) recordUserMessage(content string) {
 	e.append(domain.SessionEventUserMessage, map[string]any{
-		"turn":    e.currentTurn(),
-		"turn_id": e.newTurnID(domain.SessionEventUserMessage),
-		"task_id": e.taskID,
-		"content": content,
+		"turn":     e.currentTurn(),
+		"turn_id":  e.newTurnID(domain.SessionEventUserMessage),
+		"task_id":  e.taskID,
+		"agent_id": e.agentID,
+		"content":  content,
 	})
 }
 
@@ -227,13 +233,20 @@ func (e *eventRecorder) recordAssistantMessage(content string, calls []domain.To
 	})
 }
 
-// newTurnID 生成一个投影稳定的 turn 标识（这里的「turn」指 domain.ConversationTurn
-// 的一行——一条 user/message 或 assistant/message 事件各自投影出一行——不是本文件
-// e.turn 那个「每次 RunTask 一个」的会话轮次计数，两者是同名不同义的两个概念）。
+// newTurnID 生成一条消息事件的稳定标识（这里的「turn」是历史遗留的叫法，指一条
+// user/message 或 assistant/message 事件，不是本文件 e.turn 那个「每次 RunTask
+// 一个」的会话轮次计数，两者是同名不同义的两个概念）。
 //
-// 它必须**写进事件**、而不是投影时现生成：ScrollMessages 用 turns[i].ID == aroundID
-// 定位锚点，调用方拿着上一次响应里的 ID 回来；投影每次现生成的话同一条 turn 两次
-// 投影出来的 ID 不同，锚点必然找不到，而那是 fmt.Errorf 直接报错，不是返回空。
+// 它标识的是**事件**，不是 domain.ConversationTurn 的一行：P3 Task 3 复审之后，
+// 投影按 (task_id, role) 折叠，ConversationTurn.ID 由 storage.projectTurns 派生成
+// "<task_id>:<role>"（与退役中 server/http.go 的 recordUserTurn /
+// recordAssistantTurn 逐字一致，这样 search_session 的 discovery（FTS）与 scroll
+// （投影）落在同一个 ID 空间）。一次带 N 轮工具的任务写出 N+1 条
+// assistant/message，它们折成同一行 turn，各自的 turn_id 仍然互不相同——那正是
+// P4 轨迹与 Task 4 检索定位「哪一条事件」所需要的。
+//
+// 它必须**写进事件**、而不是投影时现生成：投影每次现生成的话，同一条事件两次投影
+// 出来的标识不同，任何按事件定位的消费者都会落空。
 //
 // 用「会话号 + turn 号 + step 号 + 事件类型」派生，不用 seq：append 把事件放进
 // pending 时 seq 还没分配，要 flush 时才知道库里的 next-seq（见 flush 的文档
@@ -250,8 +263,8 @@ func (e *eventRecorder) recordAssistantMessage(content string, calls []domain.To
 //     一个 turn 内第一条 assistant/message 都发生在 step 0，不带类型会撞出同一
 //     个 ID。
 //
-// 同一条事件被投影多少次，它落盘时的 turn、step、类型都不变，因此这个 ID 在多次
-// 投影之间保持一致——这正是 ScrollMessages 定位锚点所需要的全部保证。
+// 同一条事件被读多少次，它落盘时的 turn、step、类型都不变，因此这个标识在多次
+// 读取之间保持一致——这正是按事件定位所需要的全部保证。
 //
 // # 这个派生方式为什么站得住脚，以及它现在只靠什么撑着
 //

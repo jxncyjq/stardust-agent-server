@@ -29,6 +29,14 @@ import (
 // eventRecorder 发出，这里只是把同样形状的载荷直接摆进日志，好让 /turns 的读路径有
 // 东西可读。只能对一条尚无事件的会话调用一次：seq 从 0 开始，Append 要求它正好接上
 // 该会话的 next-seq。
+//
+// 传进来的 turn.ID 落进事件载荷的 turn_id（那是**事件**的标识）。投影出来的
+// domain.ConversationTurn.ID 不是它，而是按 (task_id, role) 折叠出的
+// "<task_id>:<role>"——与退役中 server/http.go 的 recordUserTurn /
+// recordAssistantTurn 写的形状逐字一致。断言 id 时要用后者。
+//
+// 同一个 (TaskID, Role) 传两条会折成一行（正文取最后一条、用量累加、
+// generated_files 取并集），那正是生产上多轮工具循环与「挂起→恢复」的形状。
 func appendTurnEvents(t *testing.T, repo *storage.SQLiteRepository, sessionID string, turns ...domain.ConversationTurn) {
 	t.Helper()
 	events := make([]domain.SessionEvent, 0, len(turns))
@@ -41,7 +49,8 @@ func appendTurnEvents(t *testing.T, repo *storage.SQLiteRepository, sessionID st
 		case domain.ConversationRoleUser:
 			typ = domain.SessionEventUserMessage
 			data = map[string]any{
-				"turn": 0, "turn_id": turn.ID, "task_id": turn.TaskID, "content": turn.Content,
+				"turn": 0, "turn_id": turn.ID, "task_id": turn.TaskID,
+				"agent_id": turn.AgentID, "content": turn.Content,
 			}
 		case domain.ConversationRoleAssistant:
 			typ = domain.SessionEventAssistantMessage

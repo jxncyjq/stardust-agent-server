@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -168,7 +169,9 @@ func TestSQLiteRepositoryPersistsAgentSessionsAndConversationTurns(t *testing.T)
 	if err != nil {
 		t.Fatalf("ListConversationTurns(%q) error = %v, want nil", session.ID, err)
 	}
-	if len(gotTurns) != 1 || gotTurns[0].ID != "turn-2" || gotTurns[0].Content != "缓存使用内存 map" {
+	// 投影出来的 ID 是 "<task_id>:<role>"（按 (task_id, role) 折叠），不是夹具传进去的
+	// 那个事件 turn_id；这个形状与退役中 server/http.go 写的那一行逐字一致。
+	if len(gotTurns) != 1 || gotTurns[0].ID != "task-1:assistant" || gotTurns[0].Content != "缓存使用内存 map" {
 		t.Fatalf("ListConversationTurns(%q, 1) = %#v, want latest assistant turn", session.ID, gotTurns)
 	}
 }
@@ -792,7 +795,7 @@ func TestSQLiteRepositoryDeleteAgentSessionCascadesTurns(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListConversationTurns(kept) error = %v, want nil", err)
 	}
-	if len(keptTurns) != 1 || keptTurns[0].ID != "keep-turn-1" {
+	if len(keptTurns) != 1 || keptTurns[0].ID != "task-2:user" {
 		t.Fatalf("ListConversationTurns(kept) = %#v, want the unrelated turn preserved", keptTurns)
 	}
 }
@@ -821,29 +824,48 @@ func TestSQLiteSessionSearchDiscoveryScrollBrowse(t *testing.T) {
 		t.Fatalf("SaveAgentSession() error = %v, want nil", err)
 	}
 
-	turns := []domain.ConversationTurn{
-		{ID: "t1", SessionID: "sess-1", TaskID: "task-1", AgentID: "researcher", Role: domain.ConversationRoleUser, Content: "如何做 token 压缩阈值", CreatedAt: time.Unix(2, 0)},
-		{ID: "t2", SessionID: "sess-1", TaskID: "task-1", AgentID: "researcher", Role: domain.ConversationRoleAssistant, Content: "prompt cache 复用稳定前缀", CreatedAt: time.Unix(3, 0)},
-		{ID: "t3", SessionID: "sess-1", TaskID: "task-1", AgentID: "researcher", Role: domain.ConversationRoleUser, Content: "delegate subtask summary", CreatedAt: time.Unix(4, 0)},
+	// 两侧用**各自生产上真实的 id 形状**播种，不是同一组 id：
+	//
+	//   - FTS 一侧（discovery，SearchMessages 至今仍搜 conversation_turns_fts）由
+	//     serve 路径写入，id 是 "<task_id>:user" / "<task_id>:assistant"
+	//     （server/http.go 的 recordUserTurn / recordAssistantTurn）。
+	//   - 事件一侧（scroll，ScrollMessages → ListConversationTurns → 投影）的
+	//     turn_id 是 runtime 的 newTurnID 形状 "<session>:<turn>:<step>:<type>"，
+	//     与上面那组**不相等**。
+	//
+	// 两侧播同一组 id 会让一个生产上不可能成立的前置条件在测试里成立，从而掩盖
+	// discovery→scroll 的 id 空间分叉（模型拿 discovery 给的 id 回来 scroll 会
+	// anchor not found）。这条测试要能发现那种回归，靠的是投影把 ConversationTurn.ID
+	// 折叠成 "<task_id>:<role>"、与 serve 写进 FTS 的 id 重新合一。
+	//
+	// 一个任务恰好一条 user + 一条 assistant，所以第三条消息属于 task-2。
+	ftsTurns := []domain.ConversationTurn{
+		{ID: "task-1:user", SessionID: "sess-1", TaskID: "task-1", AgentID: "researcher", Role: domain.ConversationRoleUser, Content: "如何做 token 压缩阈值", CreatedAt: time.Unix(2, 0)},
+		{ID: "task-1:assistant", SessionID: "sess-1", TaskID: "task-1", AgentID: "researcher", Role: domain.ConversationRoleAssistant, Content: "prompt cache 复用稳定前缀", CreatedAt: time.Unix(3, 0)},
+		{ID: "task-2:user", SessionID: "sess-1", TaskID: "task-2", AgentID: "researcher", Role: domain.ConversationRoleUser, Content: "delegate subtask summary", CreatedAt: time.Unix(4, 0)},
 	}
-	for _, turn := range turns {
+	for _, turn := range ftsTurns {
 		if err := repo.AppendConversationTurn(ctx, turn); err != nil {
 			t.Fatalf("AppendConversationTurn(%q) error = %v, want nil", turn.ID, err)
 		}
 	}
-	// 同一批轮次还要再以事件形式播种一次：discovery（SearchMessages）目前仍搜
-	// conversation_turns_fts，而 scroll（ScrollMessages → ListConversationTurns）
-	// 在 Task 3 之后读的是事件日志。两条路今天落在两个来源上，Task 4 把搜索也搬到
-	// 事件之后，上面那段 AppendConversationTurn 播种就该一并删掉。
-	appendTurnEvents(t, repo, "sess-1", turns...)
+	eventTurns := make([]domain.ConversationTurn, 0, len(ftsTurns))
+	for i, turn := range ftsTurns {
+		// 夹具把 turn.ID 写进事件载荷的 turn_id，所以这里故意换成 runtime 形状：
+		// 事件 id 与 FTS id 不同，投影仍必须还原出 FTS 那一组。
+		turn.ID = fmt.Sprintf("sess-1:%d:0:%s/message", i, turn.Role)
+		eventTurns = append(eventTurns, turn)
+	}
+	// Task 4 把搜索也搬到事件之后，上面那段 AppendConversationTurn 播种就该一并删掉。
+	appendTurnEvents(t, repo, "sess-1", eventTurns...)
 
 	// discovery: FTS5 match returns the relevant turn.
 	hits, err := repo.SearchMessages(ctx, "prompt", 10)
 	if err != nil {
 		t.Fatalf("SearchMessages() error = %v, want nil", err)
 	}
-	if len(hits) != 1 || hits[0].ID != "t2" {
-		t.Fatalf("SearchMessages(prompt) = %+v, want single hit t2", hits)
+	if len(hits) != 1 || hits[0].ID != "task-1:assistant" {
+		t.Fatalf("SearchMessages(prompt) = %+v, want single hit task-1:assistant", hits)
 	}
 
 	// discovery error path: empty query fails loud.
@@ -851,13 +873,14 @@ func TestSQLiteSessionSearchDiscoveryScrollBrowse(t *testing.T) {
 		t.Fatalf("SearchMessages(empty) error = nil, want non-nil")
 	}
 
-	// scroll: window around an anchor returns neighbors in order.
-	scrolled, err := repo.ScrollMessages(ctx, "sess-1", "t2", 1)
+	// scroll: 锚点直接用 discovery 返回的那个 id——这正是模型的用法，也是两个 id
+	// 空间必须相等的地方。
+	scrolled, err := repo.ScrollMessages(ctx, "sess-1", hits[0].ID, 1)
 	if err != nil {
-		t.Fatalf("ScrollMessages() error = %v, want nil", err)
+		t.Fatalf("ScrollMessages(discovery hit %q) error = %v, want nil：discovery 与 scroll 的 id 空间分叉了", hits[0].ID, err)
 	}
-	if len(scrolled) != 3 || scrolled[0].ID != "t1" || scrolled[2].ID != "t3" {
-		t.Fatalf("ScrollMessages(t2, 1) = %+v, want t1..t3", scrolled)
+	if len(scrolled) != 3 || scrolled[0].ID != "task-1:user" || scrolled[2].ID != "task-2:user" {
+		t.Fatalf("ScrollMessages(%q, 1) = %+v, want task-1:user..task-2:user", hits[0].ID, scrolled)
 	}
 
 	// scroll error path: unknown anchor fails loud.

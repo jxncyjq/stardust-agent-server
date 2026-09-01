@@ -1241,9 +1241,36 @@ func (c *tuiSessionController) recordTurn(ctx context.Context, role domain.Conve
 		}
 	}
 	now := time.Now()
-	turnID := fmt.Sprintf("%s:%s:%d", c.currentID, role, now.UTC().UnixNano())
+	// 两个不同的标识，别把它们合成一个：
+	//
+	//   - rowID 是 conversation_turns 那一行（连同它的 FTS 索引）的 id。它必须与
+	//     投影出来的 ConversationTurn.ID 逐字相同——search_session 的 discovery
+	//     今天仍搜 FTS、scroll 走投影，两个 ID 空间一旦分叉，模型拿 discovery 给的
+	//     id 回来 scroll 必然 anchor not found。投影按 (task_id, role) 折叠成
+	//     "<task_id>:<role>"（storage.projectTurns），serve 路径写的也是这个形状
+	//     （server/http.go 的 recordUserTurn / recordAssistantTurn），TUI 这里跟上。
+	//     taskID 每次 runTUITask 现取（newCommandTaskID），所以同一条会话里两次
+	//     交换不会撞 id；真撞上是主键冲突，会响亮地失败而不是悄悄覆盖。
+	//   - eventTurnID 标识**事件日志里的那一条事件**（P4 轨迹、Task 4 检索按它
+	//     定位），与 runtime 的 newTurnID 同一角色，因此仍然逐条唯一。
+	rowID := taskID + ":" + string(role)
+	eventTurnID := fmt.Sprintf("%s:%s:%d", c.currentID, role, now.UTC().UnixNano())
+	// 先写事件、再写 turn 行，这个顺序是刻意的。两步不在同一个事务里（P3 复审
+	// I-3），中间失败必然留下半截状态，但两个方向的半截不一样重：
+	//
+	//   - 先写 turn 行、事件失败 → FTS 里多了一条**投影不出来**的索引。
+	//     search_session 的 discovery 能搜到它，模型拿这个 id 回来 scroll 就撞
+	//     "anchor not found" —— 一次硬报错。
+	//   - 先写事件、turn 行失败 → 事件日志（读路径的唯一真相源）是完整的，只是
+	//     这一条暂时搜不到。历史读得出来、scroll 也照常工作，只是检索少一条。
+	//
+	// 两步都会 fail-loud 地把 error 抛给调用方（runTUITask 直接中止），所以这里
+	// 选的是「哪一种残留更轻」。Task 5 删掉 turn 行的写入方之后，这个窗口一起消失。
+	if err := c.appendTurnEvent(ctx, eventTurnID, role, taskID, agentID, modelProfile, content, now); err != nil {
+		return err
+	}
 	if err := c.store.AppendConversationTurn(ctx, domain.ConversationTurn{
-		ID:           turnID,
+		ID:           rowID,
 		SessionID:    c.currentID,
 		TaskID:       taskID,
 		AgentID:      firstNonEmpty(agentID, c.agentID),
@@ -1252,9 +1279,6 @@ func (c *tuiSessionController) recordTurn(ctx context.Context, role domain.Conve
 		Content:      truncateSessionTurn(content, c.maxTurnChars),
 		CreatedAt:    now,
 	}); err != nil {
-		return err
-	}
-	if err := c.appendTurnEvent(ctx, turnID, role, taskID, agentID, modelProfile, content, now); err != nil {
 		return err
 	}
 	c.invalidateCurrentSessionCache()
@@ -1291,11 +1315,18 @@ func (c *tuiSessionController) appendTurnEvent(
 	if strings.TrimSpace(taskID) == "" {
 		return fmt.Errorf("append session turn event for %q: task id is required", c.currentID)
 	}
+	// agent_id 同理：projectTurns 对 user/assistant 两侧都做非空校验，缺了整条会话
+	// 读不出来。在这里拦下，错误就指向写入的这一刻。
+	resolvedAgentID := firstNonEmpty(agentID, c.agentID)
+	if resolvedAgentID == "" {
+		return fmt.Errorf("append session turn event for %q: agent id is required", c.currentID)
+	}
 	payload := map[string]any{
-		"turn":    0,
-		"turn_id": turnID,
-		"task_id": taskID,
-		"content": content,
+		"turn":     0,
+		"turn_id":  turnID,
+		"task_id":  taskID,
+		"agent_id": resolvedAgentID,
+		"content":  content,
 	}
 	var eventType domain.SessionEventType
 	switch role {
@@ -1304,7 +1335,6 @@ func (c *tuiSessionController) appendTurnEvent(
 	case domain.ConversationRoleAssistant:
 		eventType = domain.SessionEventAssistantMessage
 		payload["step"] = 0
-		payload["agent_id"] = firstNonEmpty(agentID, c.agentID)
 		payload["model_profile"] = firstNonEmpty(modelProfile, c.modelProfile)
 	default:
 		return fmt.Errorf("append session turn event for %q: unknown role %q", c.currentID, role)

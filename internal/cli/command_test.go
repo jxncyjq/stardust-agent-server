@@ -1013,6 +1013,114 @@ func TestRunTUITaskInjectsAndPersistsSessionTurns(t *testing.T) {
 	}
 }
 
+// recordTurn 的两步写入（事件日志 + conversation_turns 行）不在同一个事务里
+// （P3 复审 I-3）。窗口消不掉——Task 5 删掉 turn 行的写入方才会消失——但顺序
+// 决定了中间失败留下的残留有多重：先写事件，事件失败时**什么都没落盘**，FTS 里
+// 就不会留下一条投影不出来的孤儿索引（那种孤儿会被 discovery 搜到、再被 scroll
+// 用 "anchor not found" 硬顶回去）。
+//
+// 这条测试让事件写入失败，断言两件事：错误确实往上抛（不是静默吞掉），以及
+// conversation_turns / FTS 一侧一个字都没写。
+func TestTUISessionRecordTurnLeavesNoSearchableOrphanWhenTheEventWriteFails(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo := openCLITestSQLiteRepository(t)
+	store := &failingAppendConversationStore{conversationStore: repo, err: errors.New("disk on fire")}
+	session := newTUISessionController(tuiSessionControllerConfig{
+		Store:        store,
+		Enabled:      true,
+		CompanyID:    "cli-company",
+		AgentID:      "cli-agent",
+		ModelProfile: "dev",
+		RecentTurns:  4,
+		MaxTurnChars: 6000,
+	})
+	if _, err := session.NewSession(ctx); err != nil {
+		t.Fatalf("NewSession() error = %v, want nil", err)
+	}
+
+	err := session.recordTurn(ctx, domain.ConversationRoleUser, "task-orphan", "cli-agent", "dev", "孤儿探针")
+	if err == nil {
+		t.Fatalf("recordTurn() error = nil, want the event-write failure to propagate")
+	}
+	if !strings.Contains(err.Error(), "disk on fire") {
+		t.Errorf("recordTurn() error = %v, want it to carry the underlying cause", err)
+	}
+
+	hits, searchErr := repo.SearchMessages(ctx, "孤儿探针", 10)
+	if searchErr != nil {
+		t.Fatalf("SearchMessages() error = %v, want nil", searchErr)
+	}
+	if len(hits) != 0 {
+		t.Fatalf("SearchMessages() = %+v，要 0 条：事件写失败却留下了 FTS 索引，"+
+			"discovery 搜得到、scroll 必然 anchor not found", hits)
+	}
+}
+
+// failingAppendConversationStore 让会话事件的 Append 失败，其余方法照常委派。
+type failingAppendConversationStore struct {
+	conversationStore
+	err error
+}
+
+func (s *failingAppendConversationStore) Append(context.Context, string, []domain.SessionEvent) error {
+	return s.err
+}
+
+// TUI 注入历史时的 limit 语义：取**最近** N 条，且返回时仍按时间正序。
+//
+// tuiSessionController.RecentTurns 把 c.recentTurns 传给 ListConversationTurns，
+// 而后者在 P3 之后是「投影完再从尾部截」。把那一段写成从头截（取最早 N 条）不会
+// 报任何错，只会让模型在「Recent conversation:」里看见一段错的历史——正是 spec
+// 反复强调的「不报错、只是悄悄变差」。既有的
+// TestRunTUITaskInjectsAndPersistsSessionTurns 用 4 条 turn 配 RecentTurns: 4，
+// 正好取不到边界，所以这条单独补。
+func TestTUISessionRecentTurnsTakesTheMostRecent(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	repo := openCLITestSQLiteRepository(t)
+	session := newTUISessionController(tuiSessionControllerConfig{
+		Store:        repo,
+		Enabled:      true,
+		CompanyID:    "cli-company",
+		AgentID:      "cli-agent",
+		ModelProfile: "dev",
+		RecentTurns:  2,
+		MaxTurnChars: 6000,
+	})
+	if _, err := session.NewSession(ctx); err != nil {
+		t.Fatalf("NewSession() error = %v, want nil", err)
+	}
+	// 三次问答，每次一个任务（TUI 每次 runTUITask 现取一个 task id）。
+	for _, exchange := range []struct{ taskID, prompt, answer string }{
+		{"task-1", "第一问", "第一答"},
+		{"task-2", "第二问", "第二答"},
+		{"task-3", "第三问", "第三答"},
+	} {
+		if err := session.RecordExchange(ctx, exchange.taskID, "cli-agent", "dev", exchange.prompt, exchange.answer); err != nil {
+			t.Fatalf("RecordExchange(%s) error = %v, want nil", exchange.taskID, err)
+		}
+	}
+
+	turns, err := session.RecentTurns(ctx)
+	if err != nil {
+		t.Fatalf("RecentTurns() error = %v, want nil", err)
+	}
+	if len(turns) != 2 {
+		t.Fatalf("RecentTurns() len = %d, want 2 (RecentTurns: 2)：%#v", len(turns), turns)
+	}
+	if turns[0].Content != "第三问" || turns[1].Content != "第三答" {
+		t.Fatalf("RecentTurns() = %q, %q，要最近的两条「第三问」「第三答」（正序）："+
+			"limit 取错一端，模型会看见最早的历史而不是最近的",
+			turns[0].Content, turns[1].Content)
+	}
+	if turns[0].Role != domain.ConversationRoleUser || turns[1].Role != domain.ConversationRoleAssistant {
+		t.Errorf("RecentTurns() 顺序不对：%v, %v，要按时间正序", turns[0].Role, turns[1].Role)
+	}
+}
+
 // TestRunTUITaskAppliesSessionModeAndWorkingDir guards Task 4's runTUITask
 // wiring: the default (non-mentioned-agent) task path must read
 // SessionManager.CurrentMode/CurrentWorkingDir and forward them into

@@ -207,7 +207,7 @@ func TestHTTPServerListsSessionsAndTurns(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&turns); err != nil {
 		t.Fatalf("Decode(turns) error = %v, want nil", err)
 	}
-	if len(turns) != 1 || turns[0].ID != "turn-2" || turns[0].Content != "我是 Legion Agent" {
+	if len(turns) != 1 || turns[0].ID != "task-1:assistant" || turns[0].Content != "我是 Legion Agent" {
 		t.Fatalf("GET /v1/sessions/session-http-1/turns = %#v, want latest turn", turns)
 	}
 }
@@ -728,7 +728,7 @@ func TestHTTPServerPatchDoesNotMatchTurnsRoute(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&turns); err != nil {
 		t.Fatalf("Decode(turns) error = %v, want nil", err)
 	}
-	if len(turns) != 1 || turns[0].ID != "guard-turn-1" {
+	if len(turns) != 1 || turns[0].ID != "task-1:user" {
 		t.Fatalf("GET /turns = %#v, want the unmodified turn", turns)
 	}
 }

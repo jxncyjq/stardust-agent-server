@@ -45,7 +45,8 @@ func TestOneRoundProjectsToTwoTurns(t *testing.T) {
 	events := []domain.SessionEvent{
 		evWith(0, domain.SessionEventTurnStart, map[string]any{"turn": 0}),
 		evWith(1, domain.SessionEventUserMessage, map[string]any{
-			"turn": 0, "turn_id": "sess-1:1", "task_id": "task-7", "content": "读 notes.md",
+			"turn": 0, "turn_id": "sess-1:1", "task_id": "task-7",
+			"agent_id": "agent-a", "content": "读 notes.md",
 		}),
 		evWith(2, domain.SessionEventStepStart, map[string]any{"turn": 0, "step": 0}),
 		evWith(3, domain.SessionEventAssistantMessage, map[string]any{
@@ -72,8 +73,14 @@ func TestOneRoundProjectsToTwoTurns(t *testing.T) {
 	if user.Role != domain.ConversationRoleUser {
 		t.Errorf("turns[0].Role = %v，要 user", user.Role)
 	}
-	if user.ID != "sess-1:1" || user.SessionID != "sess-1" || user.TaskID != "task-7" {
+	// ID 是 "<task_id>:<role>"，不是载荷里的 turn_id：投影按 (task_id, role) 折叠，
+	// 且这个形状必须与退役中 server/http.go 的 recordUserTurn 逐字一致，否则
+	// search_session 的 discovery（搜 FTS）与 scroll（走投影）落在两个 ID 空间上。
+	if user.ID != "task-7:user" || user.SessionID != "sess-1" || user.TaskID != "task-7" {
 		t.Errorf("user turn 身份不对：ID=%q SessionID=%q TaskID=%q", user.ID, user.SessionID, user.TaskID)
+	}
+	if user.AgentID != "agent-a" {
+		t.Errorf("user.AgentID = %q，要 agent-a：/turns 的响应与 FTS 索引都带这个字段", user.AgentID)
 	}
 	if user.Content != "读 notes.md" {
 		t.Errorf("user.Content = %q", user.Content)
@@ -82,6 +89,9 @@ func TestOneRoundProjectsToTwoTurns(t *testing.T) {
 	asst := turns[1]
 	if asst.Role != domain.ConversationRoleAssistant {
 		t.Errorf("turns[1].Role = %v，要 assistant", asst.Role)
+	}
+	if asst.ID != "task-7:assistant" {
+		t.Errorf("assistant turn ID = %q，要 task-7:assistant", asst.ID)
 	}
 	if asst.AgentID != "agent-a" || asst.ModelProfile != "fast" {
 		t.Errorf("assistant turn 身份不对：AgentID=%q ModelProfile=%q", asst.AgentID, asst.ModelProfile)
@@ -113,7 +123,8 @@ func TestToolResultsPairByCallIDNotByPosition(t *testing.T) {
 	events := []domain.SessionEvent{
 		evWith(0, domain.SessionEventTurnStart, map[string]any{"turn": 0}),
 		evWith(1, domain.SessionEventUserMessage, map[string]any{
-			"turn": 0, "turn_id": "s:1", "task_id": "t", "content": "干活",
+			"turn": 0, "turn_id": "s:1", "task_id": "t",
+			"agent_id": "agent-a", "content": "干活",
 		}),
 		evWith(2, domain.SessionEventStepStart, map[string]any{"turn": 0, "step": 0}),
 		evWith(3, domain.SessionEventAssistantMessage, map[string]any{
@@ -197,11 +208,12 @@ func TestAMalformedPayloadIsRefused(t *testing.T) {
 // 就会报错）；这里的载荷句句都是合法 JSON，只是**业务**必填键缺失，必须靠
 // 显式的非空校验才能被拒绝。
 //
-// turn_id/task_id 在 user、assistant 两种事件里都校验：turn_id 缺失会让
-// ScrollMessages 的 turns[i].ID == aroundID 锚点定位失败，task_id 缺失会让
-// internal/runtime/session_turns.go 的同任务过滤失效，模型会看到重复的
-// user 消息。agent_id 只在 assistant 分支存在（user/message 事件本来就不带
-// 这个字段），同样按必填校验。
+// turn_id/task_id/agent_id 在 user、assistant 两种事件里都校验：turn_id 缺失
+// 会让 P4 的轨迹与 Task 4 的检索定位不到这一条事件，task_id 缺失会让
+// internal/runtime/session_turns.go 的同任务过滤失效（模型会看到重复的 user
+// 消息），而且它是投影的折叠键与 turn ID 的词干——缺了就会把不相干的任务并成
+// 一行。agent_id 是 P3 计划列出的五个字段缺口之一，/turns 的响应与 FTS 索引
+// 都带它，两侧同样按必填校验。
 func TestAPayloadMissingARequiredFieldIsRefused(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -212,14 +224,20 @@ func TestAPayloadMissingARequiredFieldIsRefused(t *testing.T) {
 		{
 			name:      "user message 缺 turn_id",
 			eventType: domain.SessionEventUserMessage,
-			payload:   map[string]any{"turn": 0, "task_id": "task-7", "content": "hi"},
+			payload:   map[string]any{"turn": 0, "task_id": "task-7", "agent_id": "agent-a", "content": "hi"},
 			wantField: "turn_id",
 		},
 		{
 			name:      "user message 缺 task_id",
 			eventType: domain.SessionEventUserMessage,
-			payload:   map[string]any{"turn": 0, "turn_id": "sess-1:1", "content": "hi"},
+			payload:   map[string]any{"turn": 0, "turn_id": "sess-1:1", "agent_id": "agent-a", "content": "hi"},
 			wantField: "task_id",
+		},
+		{
+			name:      "user message 缺 agent_id",
+			eventType: domain.SessionEventUserMessage,
+			payload:   map[string]any{"turn": 0, "turn_id": "sess-1:1", "task_id": "task-7", "content": "hi"},
+			wantField: "agent_id",
 		},
 		{
 			name:      "assistant message 缺 turn_id",
@@ -274,11 +292,17 @@ func TestAPayloadMissingARequiredFieldIsRefused(t *testing.T) {
 //
 // 同一批事件（同一个切片，不重新构造）投影两次，两次产出的 turn 必须逐条 ID
 // 相同——包括顺序、条数、每条的 ID 字符串。
+//
+// 两个会话轮次分属两个任务（task-7 / task-8），这是生产上的真实形状：e.turn 每次
+// RunTask 递增一次，而每次 RunTask 有自己的 task.ID。同一个 task_id 下的多条
+// 消息事件会按 (task_id, role) 折叠成一行，那验的是另一回事（见
+// TestAToolLoopTaskProjectsToOneAssistantTurn）。
 func TestProjectingTheSameEventsTwiceProducesIdenticalTurnIDs(t *testing.T) {
 	events := []domain.SessionEvent{
 		evWith(0, domain.SessionEventTurnStart, map[string]any{"turn": 0}),
 		evWith(1, domain.SessionEventUserMessage, map[string]any{
-			"turn": 0, "turn_id": "sess-1:0:0:user/message", "task_id": "task-7", "content": "第一轮",
+			"turn": 0, "turn_id": "sess-1:0:0:user/message", "task_id": "task-7",
+			"agent_id": "agent-a", "content": "第一轮",
 		}),
 		evWith(2, domain.SessionEventStepStart, map[string]any{"turn": 0, "step": 0}),
 		evWith(3, domain.SessionEventAssistantMessage, map[string]any{
@@ -292,12 +316,13 @@ func TestProjectingTheSameEventsTwiceProducesIdenticalTurnIDs(t *testing.T) {
 		evWith(5, domain.SessionEventTurnEnd, map[string]any{"turn": 0, "reason": "completed"}),
 		evWith(6, domain.SessionEventTurnStart, map[string]any{"turn": 1}),
 		evWith(7, domain.SessionEventUserMessage, map[string]any{
-			"turn": 1, "turn_id": "sess-1:1:0:user/message", "task_id": "task-7", "content": "第二轮",
+			"turn": 1, "turn_id": "sess-1:1:0:user/message", "task_id": "task-8",
+			"agent_id": "agent-a", "content": "第二轮",
 		}),
 		evWith(8, domain.SessionEventStepStart, map[string]any{"turn": 1, "step": 0}),
 		evWith(9, domain.SessionEventAssistantMessage, map[string]any{
 			"turn": 1, "step": 0, "turn_id": "sess-1:1:0:assistant/message",
-			"task_id": "task-7", "agent_id": "agent-a", "content": "回复二",
+			"task_id": "task-8", "agent_id": "agent-a", "content": "回复二",
 			"tool_calls":    []any{},
 			"usage":         map[string]any{"prompt": 1, "completion": 1, "cached": 0, "total": 2},
 			"model_profile": "fast",
@@ -327,7 +352,7 @@ func TestProjectingTheSameEventsTwiceProducesIdenticalTurnIDs(t *testing.T) {
 				i, first[i].ID, second[i].ID)
 		}
 	}
-	// ID 本身也要彼此不同：四条 turn 落在四个不同的 (turn, step, type) 坐标上。
+	// ID 本身也要彼此不同：四条 turn 落在四个不同的 (task_id, role) 折叠键上。
 	seen := make(map[string]bool, len(first))
 	for _, turn := range first {
 		if seen[turn.ID] {
@@ -349,7 +374,8 @@ func TestToolCallAndResultOrderNeverAffectsProjection(t *testing.T) {
 		events := []domain.SessionEvent{
 			evWith(0, domain.SessionEventTurnStart, map[string]any{"turn": 0}),
 			evWith(1, domain.SessionEventUserMessage, map[string]any{
-				"turn": 0, "turn_id": "s:1", "task_id": "t", "content": "干活",
+				"turn": 0, "turn_id": "s:1", "task_id": "t",
+				"agent_id": "agent-a", "content": "干活",
 			}),
 			evWith(2, domain.SessionEventStepStart, map[string]any{"turn": 0, "step": 0}),
 			evWith(3, domain.SessionEventAssistantMessage, map[string]any{

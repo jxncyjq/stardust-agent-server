@@ -248,7 +248,9 @@ func TestHTTPServerSessionTurnsIncludeGeneratedFilesWithLinks(t *testing.T) {
 	}
 	got := turns[0]
 	// Existing fields must remain intact (least-breaking augmentation).
-	if got.ID != "turn-gf-history-1" || got.SessionID != session.ID || got.Role != string(domain.ConversationRoleAssistant) || got.Content != "已完成" {
+	// id 是投影折叠出来的 "<task_id>:<role>"，与退役中 recordAssistantTurn 写的形状
+	// 逐字一致；夹具传进去的 "turn-gf-history-1" 是那条**事件**的 turn_id。
+	if got.ID != "task-1:assistant" || got.SessionID != session.ID || got.Role != string(domain.ConversationRoleAssistant) || got.Content != "已完成" {
 		t.Fatalf("turn base fields = %#v, want existing fields preserved", got)
 	}
 	if len(got.GeneratedFiles) != 1 {
