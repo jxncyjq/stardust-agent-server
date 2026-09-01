@@ -97,12 +97,13 @@ func mergeGeneratedFiles(existing, incoming []string) []string {
 // (task_id, role) 折叠：
 //
 //   - ID = "<task_id>:<role>"，与退役中的写入方逐字一致。这不只是形状好看：
-//     search_session 的 discovery 走 conversation_turns_fts（Task 4 之前仍是
-//     serve 写的那批行，id 正是这个形状），scroll 走本函数投影出来的 ID，两个
-//     ID 空间必须相等，否则模型拿 discovery 给的 id 回来 scroll 必然
-//     anchor not found。事件载荷里的 turn_id 标识的是**那一条事件**（P4 轨迹与
-//     Task 4 的检索按它定位），不是这一行 turn 的 id；它仍然必须存在（下面的
-//     非空校验），只是不再充当 ConversationTurn.ID。
+//     search_session 的 discovery 自 Task 4 起搜 session_events_fts，命中一条
+//     事件后把它的 task_id 与 role 拼成同样的 "<task_id>:<role>"
+//     （storage.SearchMessages），scroll 走本函数投影出来的 ID，两个 ID 空间必须
+//     相等，否则模型拿 discovery 给的 id 回来 scroll 必然 anchor not found。
+//     事件载荷里的 turn_id 标识的是**那一条事件**（P4 轨迹按它定位；检索**不**按
+//     它定位——SearchMessages 连这一列都不 SELECT），不是这一行 turn 的 id；
+//     它仍然必须存在（下面的非空校验），只是不再充当 ConversationTurn.ID。
 //   - Content / CreatedAt 取该 (task_id, role) 的**最后**一条事件：assistant 的
 //     最后一条就是最终答案（工具循环退出的条件正是模型不再请求工具，那一轮的
 //     响应即答案；撞上限走 generateFinalStep 时同理）。
@@ -168,11 +169,12 @@ func projectTurns(sessionID string, events []domain.SessionEvent) ([]domain.Conv
 			// a duplicate user message, and it is also this turn's folding key
 			// and the stem of its ID, so an empty one silently merges unrelated
 			// tasks into one row. turn_id identifies the *event* (P4's
-			// trajectory and Task 4's search locate by it) rather than the
-			// projected turn; an absent one means the producer is broken, and
-			// letting it through would hand those consumers an unaddressable
-			// event. Both must be checked explicitly; a decoded zero value must
-			// not be allowed to stand in for "field present but empty".
+			// trajectory locates by it; Task 4's search does not — see
+			// SearchMessages) rather than the projected turn; an absent one
+			// means the producer is broken, and letting it through would hand
+			// those consumers an unaddressable event. Both must be checked
+			// explicitly; a decoded zero value must not be allowed to stand in
+			// for "field present but empty".
 			if payload.TurnID == "" {
 				return nil, fmt.Errorf("project session %q: user/message at seq %d has no turn_id",
 					sessionID, event.Seq)
@@ -241,9 +243,11 @@ func projectTurns(sessionID string, events []domain.SessionEvent) ([]domain.Conv
 			// Same rationale as the user/message branch above: a legal-JSON
 			// payload missing a required key decodes to "" without error, and
 			// that must not be allowed to stand in as a valid turn. turn_id and
-			// task_id carry the same stakes here (event addressability for P4 /
-			// Task 4, and session_turns.go's same-task filter plus this turn's
-			// folding key and ID stem). agent_id is deliberately NOT checked —
+			// task_id carry the same stakes here (event addressability for P4's
+			// trajectory, and session_turns.go's same-task filter plus this
+			// turn's folding key and ID stem — which is also the stem
+			// SearchMessages builds a discovery hit's id from). agent_id is
+			// deliberately NOT checked —
 			// it is contract-optional (serve/GUI's built-in default agent is
 			// selected by submitting a task with an empty agent_id); the user
 			// branch above carries the full rationale, including why tightening

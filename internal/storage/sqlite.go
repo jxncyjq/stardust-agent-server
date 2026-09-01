@@ -763,6 +763,25 @@ func searchHitRole(eventType domain.SessionEventType) (domain.ConversationRole, 
 	}
 }
 
+// maxHitsPerTurn is how many matched events of one folded turn a single
+// discovery page may carry. Two is the smallest number that still distinguishes
+// "the call" from "its result", which is the pair a reader following a tool hit
+// wants to see; a third row of the same turn adds a round the reader can reach
+// through scroll anyway. See SearchMessages for why a cap is needed at all.
+//
+// The number is also stated in the session_search tool description
+// (internal/tool/session_search.go) so the model knows what it is getting;
+// changing it here means changing it there.
+const maxHitsPerTurn = 2
+
+// discoveryScanBudgetPerResult is how many index rows one discovery query may
+// read for each result it is asked to return. The per-turn cap only helps if the
+// query looks past the crowding task's rows, so the page is filled from a scan
+// wider than the page itself: at the default limit of 20 that is 500 rows, well
+// past the ~91 searchable rows a tool-loop-capped task can leave behind. It is a
+// bound on work, not a filter — the same kind of truncation limit itself is.
+const discoveryScanBudgetPerResult = 25
+
 // SearchMessages runs a full-text query over the session event log and returns
 // the matching moments as conversation turns (discovery mode of session_search).
 // Tool calls and their results are searchable alongside conversation prose (spec
@@ -788,6 +807,26 @@ func searchHitRole(eventType domain.SessionEventType) (domain.ConversationRole, 
 // them would hide one of the two moments, and reporting the folded content
 // instead would return text that does not contain the query.
 //
+// # Why one turn may not take the whole page
+//
+// A task folds into exactly two turns (user and assistant) but writes one
+// searchable row per event: with the tool loop capped at 30 rounds a single
+// chatty task can leave ~30 tool/call + ~30 tool/result + ~31 assistant/message
+// rows behind. Ordered by rank — or, in the LIKE branch, by recency — those rows
+// would fill the whole default page of 20 under two ids, and the model would see
+// nothing from any other session, which is the one thing discovery exists to do
+// (P3 Task 4 复审 Important-2).
+//
+// So each turn id contributes at most maxHitsPerTurn rows to a page, and the
+// query scans up to discoveryScanBudgetPerResult rows per requested result to
+// fill it. Neither is a silent skip: dropping a capped row loses no information
+// the caller could act on (the turn is already on the page, addressed by the same
+// id), the limit is announced in the session_search tool description so the model
+// knows a task shows up a couple of times rather than a hundred, and a page that
+// ends because the scan budget ran out is bounded work, exactly like limit itself.
+// De-duplicating by id instead would hide *which* round matched, which is the
+// content the hit exists to carry.
+//
 // ModelProfile and the token counters are left zero: they are not in the index,
 // exactly as they were absent from conversation_turns_fts before this moved.
 // Discovery is a locator; /turns and scroll carry the full row.
@@ -802,6 +841,10 @@ func (r *SQLiteRepository) SearchMessages(ctx context.Context, query string, lim
 	if ftsExpr == "" && len(likeTerms) == 0 {
 		return nil, fmt.Errorf("search messages %q: the query has no letter or number to search for", query)
 	}
+	// The page is filled in Go (see the per-turn cap below), so SQL is asked for
+	// more rows than the page holds — enough that one chatty task cannot exhaust
+	// the budget before other sessions' hits are reached.
+	scanLimit := limit * discoveryScanBudgetPerResult
 
 	const selectHit = `
 		SELECT session_id, seq, type, task_id, agent_id, content, created_at
@@ -818,7 +861,7 @@ func (r *SQLiteRepository) SearchMessages(ctx context.Context, query string, lim
 			WHERE session_events_fts MATCH ?
 			ORDER BY rank
 			LIMIT ?
-		`, ftsExpr, limit)
+		`, ftsExpr, scanLimit)
 	} else {
 		// A run shorter than the trigram window (a two-character CJK word, a
 		// short acronym) has no trigram to match, so it is OR-ed in as a
@@ -836,7 +879,7 @@ func (r *SQLiteRepository) SearchMessages(ctx context.Context, query string, lim
 			clauses = append(clauses, `content LIKE ?`)
 			args = append(args, "%"+term+"%")
 		}
-		args = append(args, limit)
+		args = append(args, scanLimit)
 		rows, err = r.db.QueryContext(ctx, selectHit+`
 			WHERE `+strings.Join(clauses, " OR ")+`
 			ORDER BY created_at DESC, seq DESC
@@ -849,7 +892,13 @@ func (r *SQLiteRepository) SearchMessages(ctx context.Context, query string, lim
 	defer rows.Close()
 
 	turns := make([]domain.ConversationTurn, 0)
+	// hitsPerTurn counts how many rows of each folded turn already made it onto
+	// the page, so no single task can crowd every other session out of it.
+	hitsPerTurn := make(map[string]int)
 	for rows.Next() {
+		if len(turns) >= limit {
+			break
+		}
 		var (
 			sessionID string
 			seq       int64
@@ -878,13 +927,23 @@ func (r *SQLiteRepository) SearchMessages(ctx context.Context, query string, lim
 				"hit has no turn to point at; the emitter that wrote that event omitted a required field",
 				query, seq, sessionID)
 		}
+		// Per-turn cap. maxHitsPerTurn rows of one turn are enough to show a call
+		// and its result; the rest of that turn's rounds would only push other
+		// sessions off the page (see this method's doc comment). Nothing is lost
+		// silently: the turn is already on the page under this very id, and the
+		// cap is stated in the session_search tool description.
+		turnID := taskID + ":" + string(role)
+		if hitsPerTurn[turnID] >= maxHitsPerTurn {
+			continue
+		}
+		hitsPerTurn[turnID]++
 		parsed, err := parseTime(createdAt)
 		if err != nil {
 			return nil, fmt.Errorf("parse search result created_at for event %d of session %q: %w",
 				seq, sessionID, err)
 		}
 		turns = append(turns, domain.ConversationTurn{
-			ID:        taskID + ":" + string(role),
+			ID:        turnID,
 			SessionID: sessionID,
 			TaskID:    taskID,
 			AgentID:   agentID,

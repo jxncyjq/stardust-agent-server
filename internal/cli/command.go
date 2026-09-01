@@ -1244,15 +1244,17 @@ func (c *tuiSessionController) recordTurn(ctx context.Context, role domain.Conve
 	// 两个不同的标识，别把它们合成一个：
 	//
 	//   - rowID 是 conversation_turns 那一行（连同它的 FTS 索引）的 id。它必须与
-	//     投影出来的 ConversationTurn.ID 逐字相同——search_session 的 discovery
-	//     今天仍搜 FTS、scroll 走投影，两个 ID 空间一旦分叉，模型拿 discovery 给的
-	//     id 回来 scroll 必然 anchor not found。投影按 (task_id, role) 折叠成
+	//     投影出来的 ConversationTurn.ID 逐字相同——Task 4 之后 discovery 搜的是
+	//     session_events_fts，命中后把事件的 task_id 与 role 拼成同一个形状，
+	//     scroll 走投影；三处 ID 空间一旦分叉，模型拿 discovery 给的 id 回来
+	//     scroll 必然 anchor not found。投影按 (task_id, role) 折叠成
 	//     "<task_id>:<role>"（storage.projectTurns），serve 路径写的也是这个形状
 	//     （server/http.go 的 recordUserTurn / recordAssistantTurn），TUI 这里跟上。
 	//     taskID 每次 runTUITask 现取（newCommandTaskID），所以同一条会话里两次
 	//     交换不会撞 id；真撞上是主键冲突，会响亮地失败而不是悄悄覆盖。
-	//   - eventTurnID 标识**事件日志里的那一条事件**（P4 轨迹、Task 4 检索按它
-	//     定位），与 runtime 的 newTurnID 同一角色，因此仍然逐条唯一。
+	//   - eventTurnID 标识**事件日志里的那一条事件**（P4 轨迹按它定位；Task 4 的
+	//     检索**不**按它定位，storage.SearchMessages 连这一列都不 SELECT），与
+	//     runtime 的 newTurnID 同一角色，因此仍然逐条唯一。
 	rowID := taskID + ":" + string(role)
 	eventTurnID := fmt.Sprintf("%s:%s:%d", c.currentID, role, now.UTC().UnixNano())
 	// 先写事件、再写 turn 行，这个顺序是刻意的。两步不在同一个事务里（P3 复审
@@ -1293,9 +1295,9 @@ func (c *tuiSessionController) recordTurn(ctx context.Context, role domain.Conve
 // eventRecorder 写出来的日志因此挂在另一个会话下。这里不写，TUI 的
 // 「Recent conversation:」注入会读到空历史，而且是静默失效，不报任何错。
 //
-// 为什么与上面的 AppendConversationTurn 并存不算双真相源：turn 行今天只剩
-// search_session 的 FTS 索引一个消费者，读路径已经只认事件。Task 4 把搜索也搬到事件
-// 之后，那一行就没有消费者了，Task 5 连同写入方一起删。
+// 为什么与上面的 AppendConversationTurn 并存不算双真相源：读路径已经只认事件，而
+// Task 4 把 search_session 的 discovery 也搬到了 session_events_fts，那一行连最后
+// 一个消费者也没有了，Task 5 连同写入方与 conversation_turns_fts 一起删。
 //
 // 正文按 Task 1 的决定**存全文**，不套 truncateSessionTurn：截断是读侧
 // （RecentTurns / RecentTurnsForTask）按各自的 MaxTurnChars 做的事，写侧先砍一刀会

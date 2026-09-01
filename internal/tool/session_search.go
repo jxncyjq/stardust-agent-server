@@ -35,13 +35,24 @@ func RegisterSessionSearchTool(registry *Registry, searcher MessageSearcher) {
 	}))
 }
 
+// sessionSearchDescriptor declares the tool the model sees.
+//
+// The "at most 2 hits per turn id" sentence is not decoration: discovery returns
+// one row per matched *event*, so a long task legitimately produces many hits
+// under two turn ids, and storage caps how many of them reach the page
+// (storage.maxHitsPerTurn). The model has to be told, or it reads a capped page
+// as "that task only mentioned it twice". Keep the number in step with that
+// constant.
 func sessionSearchDescriptor() Descriptor {
 	return Descriptor{
 		Name: "session_search",
 		Description: "Search past conversation history instead of stacking it into context. " +
 			"Three modes inferred from arguments: (1) discovery — pass query to full-text search prior turns; " +
 			"(2) scroll — pass session_id and around_message_id to read the turns surrounding a specific message; " +
-			"(3) browse — pass no query to list the most recent sessions. Optional limit/window bound the result size.",
+			"(3) browse — pass no query to list the most recent sessions. Optional limit/window bound the result size. " +
+			"In discovery a hit is one matched moment (a message, a tool call, or a tool result), so several hits can share " +
+			"one turn id and differ in content; at most 2 hits per turn id are returned, so one long task cannot fill the page " +
+			"and hits from other sessions stay visible. Scroll with a hit's id to read that turn's full surroundings.",
 		RiskLevel: "low",
 		Timeout:   5 * time.Second,
 		Group:     "history",

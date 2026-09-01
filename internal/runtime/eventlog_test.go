@@ -55,6 +55,25 @@ func TestARecorderWithNoIdentityIsRefused(t *testing.T) {
 	newEventRecorder(stubEventStore{}, domain.Task{})
 }
 
+// 有 SessionID、却没有 ID 的任务同样被拒。
+//
+// 这一格以前是开着的：会话号从 SessionID 解得出来，于是 recorder 造得出来，
+// task.ID 被原样写成 "" 进每一条 user/message 与 assistant/message 的 task_id。
+// 而 storage.SearchMessages 是**全库**检索，一条这样的事件会让所有词面命中它的
+// discovery 查询整体报错——一条坏事件让整个部署的 session_search 失效
+// （P3 Task 4 复审 Important-1）。缺 task_id 是编程错误，堵在写侧。
+func TestARecorderWithASessionButNoTaskIDIsRefused(t *testing.T) {
+	t.Parallel()
+
+	defer func() {
+		if recover() == nil {
+			t.Error("有 SessionID 但没有 ID 的任务被接受了：它写出的事件缺 task_id，" +
+				"会让全库的 session_search discovery 整体失效")
+		}
+	}()
+	newEventRecorder(stubEventStore{}, domain.Task{SessionID: "s1"})
+}
+
 // 没有配 store 的部署（内存后端、测试构造）不记事件。
 //
 // 这**不是兜底**：Config.SessionEvents 是契约里显式声明的可选项（见它的文档注释），

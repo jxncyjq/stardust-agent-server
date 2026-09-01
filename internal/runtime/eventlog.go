@@ -78,6 +78,18 @@ type turnIDCoordinate struct {
 // 会话号，让它们各自成为一条短日志，比加特例分支更简单，轨迹也一样看得到）。
 // 两者都空说明这条任务没有任何身份——写出来的事件谁也认不回去，直接 panic：
 // 这是编程错误，不是运行期状况。
+//
+// task.ID 单独再拦一道，即使 SessionID 非空、会话号已经解得出来：task.ID 会被原样
+// 写进 user/message 与 assistant/message 载荷的 task_id，而读侧拿它当**唯一的地址**
+// ——projectTurns 用它当折叠键与 ID 词干，storage.SearchMessages 用它拼 discovery
+// 命中的 turn id。缺了它写出来的是一条搜得到却回访不了的事件。
+//
+// 为什么必须堵在这一侧：SearchMessages 是**全库**检索，没有会话过滤，所以库里任何
+// 一条会话留下一条缺 task_id 的消息事件，所有词面命中它的 discovery 查询都会整体
+// fail-loud，健康会话的命中一并丢失——一条坏事件让整个部署的 session_search 失效
+// （P3 Task 4 复审 Important-1）。读侧那条校验本身是对的——把「task_id 非空」当成
+// 过滤条件塞进 SQL 才是静默跳过——错的是让它有机会在生产上触发。堵住这里之后，
+// 读侧的校验退化成一条永不触发的深层断言。
 func newEventRecorder(store port.SessionEventStore, task domain.Task) *eventRecorder {
 	// 与 RunTask 取会话执行锁用的是同一个解析函数，这一点是硬要求而不是顺手复用：
 	// 锁按 A 解出的键切分、日志按 B 解出的键写，两者一旦漂移，锁就守不住它要守的那条
@@ -85,6 +97,10 @@ func newEventRecorder(store port.SessionEventStore, task domain.Task) *eventReco
 	session := sessionKeyForTask(task)
 	if session == "" {
 		panic("runtime: event recorder needs a session id or a task id; a task with neither cannot own a log")
+	}
+	if task.ID == "" {
+		panic("runtime: event recorder needs a task id; every message event carries it as the address of the " +
+			"turn it belongs to, and one event without it fails every session_search discovery query in the database")
 	}
 	return &eventRecorder{store: store, session: session, taskID: task.ID, agentID: task.AgentID}
 }
@@ -165,8 +181,10 @@ func (e *eventRecorder) recordTurnStart(turn int) {
 // 会 fail-loud 报错——那是正确行为，这里不为它兜底。
 //
 // task_id 供投影滤掉任务自己的 user turn（session_turns.go 用 turn.TaskID ==
-// task.ID），同时是投影折叠这一行 turn 的键与它 id 的词干；turn_id 标识**这一条
-// 事件**（P4 轨迹与 Task 4 检索按它定位），见 newTurnID。
+// task.ID），同时是投影折叠这一行 turn 的键与它 id 的词干；自 Task 4 起它还是
+// discovery 命中拼 turn id 的词干（storage.SearchMessages）。turn_id 标识**这一条
+// 事件**，P4 轨迹按它定位；Task 4 的检索**不**按它定位（SearchMessages 连这一列
+// 都不 SELECT），见 newTurnID。
 //
 // agent_id 与 assistant/message 一样必填：/turns 的响应与 conversation_turns_fts
 // 的索引都带这个字段，退役中的 recordUserTurn（server/http.go）写的正是
@@ -240,10 +258,11 @@ func (e *eventRecorder) recordAssistantMessage(content string, calls []domain.To
 // 它标识的是**事件**，不是 domain.ConversationTurn 的一行：P3 Task 3 复审之后，
 // 投影按 (task_id, role) 折叠，ConversationTurn.ID 由 storage.projectTurns 派生成
 // "<task_id>:<role>"（与退役中 server/http.go 的 recordUserTurn /
-// recordAssistantTurn 逐字一致，这样 search_session 的 discovery（FTS）与 scroll
-// （投影）落在同一个 ID 空间）。一次带 N 轮工具的任务写出 N+1 条
-// assistant/message，它们折成同一行 turn，各自的 turn_id 仍然互不相同——那正是
-// P4 轨迹与 Task 4 检索定位「哪一条事件」所需要的。
+// recordAssistantTurn 逐字一致，这样 search_session 的 discovery 与 scroll（投影）
+// 落在同一个 ID 空间——Task 4 之后 discovery 搜的是事件索引，命中后同样把 task_id
+// 与 role 拼成这个形状）。一次带 N 轮工具的任务写出 N+1 条 assistant/message，
+// 它们折成同一行 turn，各自的 turn_id 仍然互不相同——那正是 P4 轨迹定位「哪一条
+// 事件」所需要的（检索不按它定位：SearchMessages 只用 task_id 与 type）。
 //
 // 它必须**写进事件**、而不是投影时现生成：投影每次现生成的话，同一条事件两次投影
 // 出来的标识不同，任何按事件定位的消费者都会落空。

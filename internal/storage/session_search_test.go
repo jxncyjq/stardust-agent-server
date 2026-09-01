@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -361,5 +362,154 @@ func TestDeletingASessionRemovesItFromTheSearchIndex(t *testing.T) {
 	}
 	if len(hits) != 0 {
 		t.Errorf("会话删掉了却还搜得到 %+v：删除必须级联到检索索引", hits)
+	}
+}
+
+// evAt 是 evWith 的定时版本：跨会话的先后由 created_at 决定，而 evWith 的时间是从
+// seq 推出来的，两条会话的 seq 都从 0 起，光靠它排不出「谁更早」。
+func evAt(seq int64, typ domain.SessionEventType, at time.Time, data map[string]any) domain.SessionEvent {
+	event := evWith(seq, typ, data)
+	event.Time = at
+	return event
+}
+
+// chattyTaskLog 造一条「一个任务跑了 rounds 轮工具，每一轮都提到 word」的日志。
+//
+// 形状与 toolRoundTripLog 一致（assistant/message → tool/call → tool/result），
+// 只是把轮数拉到工具循环的上限量级：这正是生产上一个话痨任务留下的可搜行数。
+func chattyTaskLog(taskID string, word string, rounds int, start time.Time) []domain.SessionEvent {
+	seq := int64(0)
+	at := func() time.Time {
+		return start.Add(time.Duration(seq) * time.Second)
+	}
+	events := []domain.SessionEvent{
+		evAt(seq, domain.SessionEventTurnStart, at(), map[string]any{"turn": 0}),
+	}
+	seq++
+	events = append(events, evAt(seq, domain.SessionEventUserMessage, at(), map[string]any{
+		"turn": 0, "turn_id": "chatty:0:0:user/message", "task_id": taskID,
+		"agent_id": "researcher", "content": "帮我查一下" + word + "的分布",
+	}))
+	for round := 0; round < rounds; round++ {
+		seq++
+		events = append(events, evAt(seq, domain.SessionEventAssistantMessage, at(), map[string]any{
+			"turn": 0, "step": round,
+			"turn_id": fmt.Sprintf("chatty:0:%d:assistant/message", round),
+			"task_id": taskID, "agent_id": "researcher",
+			"content":         fmt.Sprintf("第 %d 次翻%s的资料", round, word),
+			"tool_calls":      []any{map[string]any{"call_id": fmt.Sprintf("c%d", round), "name": "read_file"}},
+			"usage":           map[string]any{"prompt": 1, "completion": 1, "cached": 0, "total": 2},
+			"model_profile":   "dev",
+			"generated_files": []any{},
+		}))
+		seq++
+		events = append(events, evAt(seq, domain.SessionEventToolCall, at(), map[string]any{
+			"turn": 0, "step": round, "call_id": fmt.Sprintf("c%d", round),
+			"name": "read_file", "arguments": fmt.Sprintf(`{"path":"%s-%d.md"}`, word, round),
+		}))
+		seq++
+		events = append(events, evAt(seq, domain.SessionEventToolResult, at(), map[string]any{
+			"turn": 0, "step": round, "call_id": fmt.Sprintf("c%d", round),
+			"preview": word + "的分布见下表", "is_error": false, "duration_ms": 1,
+		}))
+	}
+	return events
+}
+
+// 一个话痨任务不许占满一页 discovery——别的会话的命中必须还看得见。
+//
+// 这是 discovery 存在的全部理由（「跨会话找回历史」）。一个任务折叠出来只有两行
+// turn，却按事件写出上百条可搜行：工具循环上限 30 轮 ≈ 30 条 tool/call + 30 条
+// tool/result + 31 条 assistant/message。它们只要词面命中，默认 20 条结果就会被
+// 这**一个任务的两个 id** 全部占满，模型看不到任何别的会话（P3 Task 4 复审
+// Important-2）。
+//
+// 用两个字的中文查询是刻意的：它走 LIKE 分支，排序退化成 created_at DESC，最近
+// 那个话痨任务会稳定霸榜——这正是复审指出的最坏情况，也让这条断言不依赖 bm25 的
+// 打分碰巧把谁排前面。
+func TestAChattyTaskDoesNotCrowdOtherSessionsOffTheDiscoveryPage(t *testing.T) {
+	repo := newEventRepo(t)
+	ctx := context.Background()
+
+	// 更早的一条会话：只提了一次「水獭」。
+	if err := repo.Append(ctx, "sess-quiet", []domain.SessionEvent{
+		evAt(0, domain.SessionEventUserMessage, time.Date(2026, 9, 1, 11, 0, 0, 0, time.UTC),
+			map[string]any{
+				"turn": 0, "turn_id": "sess-quiet:0:0:user/message", "task_id": "task-quiet",
+				"agent_id": "researcher", "content": "水獭那次结论是什么",
+			}),
+	}); err != nil {
+		t.Fatalf("append quiet session: %v", err)
+	}
+
+	// 更晚的一条会话：一个任务跑满 30 轮，每一轮都提到「水獭」。
+	chatty := chattyTaskLog("task-chatty", "水獭", 30, time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC))
+	if err := repo.Append(ctx, "sess-chatty", chatty); err != nil {
+		t.Fatalf("append chatty session: %v", err)
+	}
+	// 前提自检：这个任务确实写出了远超一页的可搜行，否则这条测试什么也没守住。
+	var searchable int
+	if err := repo.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM session_events_fts WHERE session_id = ?`, "sess-chatty",
+	).Scan(&searchable); err != nil {
+		t.Fatalf("count searchable rows: %v", err)
+	}
+	if searchable <= 20 {
+		t.Fatalf("话痨任务只写出 %d 条可搜行，撑不满一页：这条测试没有守住任何东西", searchable)
+	}
+
+	hits, err := repo.SearchMessages(ctx, "水獭", 20)
+	if err != nil {
+		t.Fatalf("SearchMessages: %v", err)
+	}
+
+	perTurn := map[string]int{}
+	quietSeen := false
+	for _, hit := range hits {
+		perTurn[hit.ID]++
+		if hit.SessionID == "sess-quiet" {
+			quietSeen = true
+		}
+	}
+	if !quietSeen {
+		t.Errorf("话痨任务占满了这一页 %+v：discovery 的全部意义是跨会话找回历史，"+
+			"别的会话的命中不能被一个任务挤掉", hits)
+	}
+	for id, count := range perTurn {
+		if count > 2 {
+			t.Errorf("turn %q 在一页里出现了 %d 次, want <= 2", id, count)
+		}
+	}
+	if len(hits) > 20 {
+		t.Errorf("返回了 %d 条, want <= limit 20", len(hits))
+	}
+}
+
+// 限流不是去重：同一行 turn 的两条命中都要留下来。
+//
+// 去重会把「哪一轮匹配的」这个信息藏掉——而那正是一条命中要携带的内容。上限取 2
+// 就是为了让「调用」与「结果」这一对还能同时出现。
+func TestTheCapKeepsTwoHitsOfTheSameTurn(t *testing.T) {
+	repo := newEventRepo(t)
+	ctx := context.Background()
+
+	if err := repo.Append(ctx, "sess-1", toolRoundTripLog("task-1")); err != nil {
+		t.Fatalf("append events: %v", err)
+	}
+
+	// "3" 在同一行 turn 的两条事件里各出现一次：tool/result 的预览 "replicas: 3"
+	// 与最后那条 assistant/message 的正文 "副本数是 3"。
+	hits, err := repo.SearchMessages(ctx, "3", 10)
+	if err != nil {
+		t.Fatalf("SearchMessages: %v", err)
+	}
+	if len(hits) != 2 {
+		t.Fatalf("SearchMessages(3) = %+v, want 同一行 turn 的两条命中（上限是 2，不是去重成 1）", hits)
+	}
+	if hits[0].ID != "task-1:assistant" || hits[1].ID != "task-1:assistant" {
+		t.Errorf("两条命中的 id = %q/%q, want 都是 %q", hits[0].ID, hits[1].ID, "task-1:assistant")
+	}
+	if hits[0].Content == hits[1].Content {
+		t.Errorf("两条命中的正文相同（%q）：命中携带的是那条事件自己的正文", hits[0].Content)
 	}
 }
