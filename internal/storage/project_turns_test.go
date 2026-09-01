@@ -208,12 +208,15 @@ func TestAMalformedPayloadIsRefused(t *testing.T) {
 // 就会报错）；这里的载荷句句都是合法 JSON，只是**业务**必填键缺失，必须靠
 // 显式的非空校验才能被拒绝。
 //
-// turn_id/task_id/agent_id 在 user、assistant 两种事件里都校验：turn_id 缺失
+// turn_id/task_id 在 user、assistant 两种事件里都校验：turn_id 缺失
 // 会让 P4 的轨迹与 Task 4 的检索定位不到这一条事件，task_id 缺失会让
 // internal/runtime/session_turns.go 的同任务过滤失效（模型会看到重复的 user
 // 消息），而且它是投影的折叠键与 turn ID 的词干——缺了就会把不相干的任务并成
-// 一行。agent_id 是 P3 计划列出的五个字段缺口之一，/turns 的响应与 FTS 索引
-// 都带它，两侧同样按必填校验。
+// 一行。
+//
+// agent_id **不在**这张必填表里：它是契约允许为空的可选（默认 agent 用空
+// agent_id 提交任务），空值必须被放行。守这一条的是
+// TestADefaultAgentSessionWithNoAgentIDStillReadsBack。
 func TestAPayloadMissingARequiredFieldIsRefused(t *testing.T) {
 	tests := []struct {
 		name      string
@@ -234,12 +237,6 @@ func TestAPayloadMissingARequiredFieldIsRefused(t *testing.T) {
 			wantField: "task_id",
 		},
 		{
-			name:      "user message 缺 agent_id",
-			eventType: domain.SessionEventUserMessage,
-			payload:   map[string]any{"turn": 0, "turn_id": "sess-1:1", "task_id": "task-7", "content": "hi"},
-			wantField: "agent_id",
-		},
-		{
 			name:      "assistant message 缺 turn_id",
 			eventType: domain.SessionEventAssistantMessage,
 			payload: map[string]any{
@@ -254,14 +251,6 @@ func TestAPayloadMissingARequiredFieldIsRefused(t *testing.T) {
 				"turn": 0, "step": 0, "turn_id": "sess-1:3", "agent_id": "agent-a", "content": "回复",
 			},
 			wantField: "task_id",
-		},
-		{
-			name:      "assistant message 缺 agent_id",
-			eventType: domain.SessionEventAssistantMessage,
-			payload: map[string]any{
-				"turn": 0, "step": 0, "turn_id": "sess-1:3", "task_id": "task-7", "content": "回复",
-			},
-			wantField: "agent_id",
 		},
 	}
 

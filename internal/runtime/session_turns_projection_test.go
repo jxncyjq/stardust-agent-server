@@ -154,3 +154,80 @@ func projectionEvent(t *testing.T, seq int64, typ domain.SessionEventType, at ti
 	}
 	return domain.SessionEvent{Seq: seq, Type: typ, Time: at, Data: data}
 }
+
+// 一次**真的** RunTask，任务的 AgentID 留空（serve/GUI 的默认 agent 路径），
+// 之后必须读得回自己的历史。
+//
+// 这是上一条测试的默认 agent 版本，守的是一次真实事故：投影一度把事件载荷里的
+// agent_id 当必填校验，而内置默认 agent 恰恰是靠「提交任务时 agent_id 留空」
+// 选中的（internal/server/http.go 的 handleListAgents 文档注释写明了这点，
+// 它也因此不出现在 /agents 列表；handleCreateTask 原样透传 req.AgentID，
+// AgentRuntimeResolver 对空值不解析、协调器落回默认 runtime，跑的是**未经修改**
+// 的 task；app.RunTask 里那句把空 AgentID 兜成 "cli-agent" 的代码只在 CLI/TUI
+// 路径上）。于是这类会话事件写得进去、历史却一条都读不出来，且事件已落盘、
+// 不清库无法自愈。
+//
+// 形状按协调器的真实取值构造：runner agent 是宿主 agent（这里 "legion-agent"），
+// 而 task.AgentID 为空——eventRecorder 取的是后者。
+func TestARealDefaultAgentRunWithEmptyAgentIDStillReadsBackItsHistory(t *testing.T) {
+	ctx := context.Background()
+	repo, err := storage.OpenSQLite(ctx, filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite: %v", err)
+	}
+	t.Cleanup(func() { _ = repo.Close() })
+
+	rt := newTestRuntimeWithEvents(t, repo)
+	if _, err := rt.RunTask(ctx, domain.Agent{ID: "legion-agent"}, domain.Task{
+		ID: "task-default", SessionID: "sess-default", AgentID: "", Input: "读 notes.md",
+	}); err != nil {
+		t.Fatalf("RunTask: %v", err)
+	}
+
+	// 前提检查：这条会话确实写出了带空 agent_id 的消息事件，否则下面读成功是白验的。
+	events, err := repo.ReadFrom(ctx, "sess-default", 0)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	emptyAgentMessages := 0
+	for _, event := range events {
+		if event.Type != domain.SessionEventUserMessage && event.Type != domain.SessionEventAssistantMessage {
+			continue
+		}
+		var payload struct {
+			AgentID string `json:"agent_id"`
+		}
+		if err := json.Unmarshal(event.Data, &payload); err != nil {
+			t.Fatalf("decode %s at seq %d: %v", event.Type, event.Seq, err)
+		}
+		if payload.AgentID == "" {
+			emptyAgentMessages++
+		}
+	}
+	if emptyAgentMessages == 0 {
+		t.Fatalf("这条会话没有一条空 agent_id 的消息事件，夹具没跑出默认 agent 的形状")
+	}
+
+	turns, err := repo.ListConversationTurns(ctx, "sess-default", 0)
+	if err != nil {
+		t.Fatalf("默认 agent 的会话读不出历史：%v（空 agent_id 是契约允许的可选；"+
+			"把它当必填会让 /turns、RecentTurnsForTask、ScrollMessages 全部报错，"+
+			"这条会话的历史永久死掉）", err)
+	}
+	if len(turns) != 2 {
+		t.Fatalf("投影出 %d 条 turn，要 2 条（一条 user + 一条 assistant）：%#v", len(turns), turns)
+	}
+	if turns[0].ID != "task-default:user" || turns[1].ID != "task-default:assistant" {
+		t.Errorf("turn id = %q / %q，要 task-default:user / task-default:assistant",
+			turns[0].ID, turns[1].ID)
+	}
+	if turns[1].Content != "读完了：那个文件讲的是缓存" {
+		t.Errorf("assistant 正文 = %q，要最终答案", turns[1].Content)
+	}
+	for _, turn := range turns {
+		if turn.AgentID != "" {
+			t.Errorf("turn %q 的 AgentID = %q，要空串：空表示「内置默认 agent」，不许被兜成别的值",
+				turn.ID, turn.AgentID)
+		}
+	}
+}

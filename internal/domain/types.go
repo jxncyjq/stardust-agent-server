@@ -222,9 +222,17 @@ type AgentSession struct {
 }
 
 type ConversationTurn struct {
-	ID           string           `json:"id"`
-	SessionID    string           `json:"session_id"`
-	TaskID       string           `json:"task_id"`
+	ID        string `json:"id"`
+	SessionID string `json:"session_id"`
+	TaskID    string `json:"task_id"`
+	// AgentID names the sub-agent that produced this turn. It is
+	// contract-optional and legitimately empty: the built-in default agent is
+	// selected by submitting a task with an empty agent_id (see
+	// internal/server/http.go's handleListAgents, which for that reason does
+	// not list it), so every serve/GUI default-agent turn carries "" here.
+	// Empty means "the built-in default agent", not "the value went missing" —
+	// consumers must not treat it as a broken record, and the event projection
+	// in internal/storage/project_turns.go must not reject it.
 	AgentID      string           `json:"agent_id"`
 	ModelProfile string           `json:"model_profile"`
 	Role         ConversationRole `json:"role"`

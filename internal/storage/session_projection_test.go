@@ -374,3 +374,64 @@ func TestAProjectionFailureIsReportedNotSwallowed(t *testing.T) {
 		t.Errorf("报错的同时还返回了 %d 条 turn", len(turns))
 	}
 }
+
+// 默认 agent 的会话（事件里 agent_id 为空）历史必须能正常读出来。
+//
+// 这条测试守的是一次真实事故：投影曾把 agent_id 当必填校验，而 serve/GUI 的
+// 内置**默认 agent** 恰恰是靠「提交任务时 agent_id 留空」选中的（见
+// internal/server/http.go 的 handleListAgents 文档注释，它因此不列在 /agents
+// 里；handleCreateTask 原样透传 req.AgentID 不兜底，解析器对空值落回默认
+// runtime，eventRecorder 于是照实写出 agent_id ""）。于是这类会话的事件写得
+// 进去、却一条都读不出来：projectTurns 报错 → ListConversationTurns 报错 →
+// /turns 500、RecentTurnsForTask 与 ScrollMessages 一并报错，而且事件已落盘、
+// 不清库无法自愈。**不是少几条，是整条会话的历史永久死掉。**
+//
+// 所以断言的是「读得出来、条数和字段都对」，并且 AgentID 就是空串——空在这里
+// 表示「内置默认 agent」，是契约允许的可选值（见
+// domain.ConversationTurn.AgentID 的文档注释），不是丢失的数据，不许有人拿旧
+// 值或 "cli-agent" 之类去兜。
+func TestADefaultAgentSessionWithNoAgentIDStillReadsBack(t *testing.T) {
+	repo := newEventRepo(t)
+	ctx := context.Background()
+
+	// 默认 agent 路径写出的载荷：turn_id/task_id 齐全，agent_id 为空串。
+	if err := repo.Append(ctx, "sess-default", []domain.SessionEvent{
+		evWith(0, domain.SessionEventTurnStart, map[string]any{"turn": 0}),
+		evWith(1, domain.SessionEventUserMessage, map[string]any{
+			"turn": 0, "turn_id": "sess-default:1", "task_id": "task-d",
+			"agent_id": "", "content": "读 notes.md",
+		}),
+		evWith(2, domain.SessionEventStepStart, map[string]any{"turn": 0, "step": 0}),
+		evWith(3, domain.SessionEventAssistantMessage, map[string]any{
+			"turn": 0, "step": 0, "turn_id": "sess-default:3",
+			"task_id": "task-d", "agent_id": "", "content": "读好了",
+			"usage": map[string]any{"prompt": 11, "completion": 22, "cached": 3, "total": 33},
+		}),
+	}); err != nil {
+		t.Fatalf("append events: %v", err)
+	}
+
+	turns, err := repo.ListConversationTurns(ctx, "sess-default", 0)
+	if err != nil {
+		t.Fatalf("默认 agent 的会话读不出历史：%v（空 agent_id 是契约允许的可选，"+
+			"把它当必填会让这条会话的全部历史永久读不出来）", err)
+	}
+	if len(turns) != 2 {
+		t.Fatalf("拿到 %d 条 turn，要 2 条（一条 user + 一条 assistant）：%#v", len(turns), turns)
+	}
+	if turns[0].ID != "task-d:user" || turns[1].ID != "task-d:assistant" {
+		t.Errorf("turn id = %q / %q，要 task-d:user / task-d:assistant", turns[0].ID, turns[1].ID)
+	}
+	if turns[0].Content != "读 notes.md" || turns[1].Content != "读好了" {
+		t.Errorf("正文不对：%q / %q", turns[0].Content, turns[1].Content)
+	}
+	if turns[1].TotalTokens != 33 {
+		t.Errorf("assistant TotalTokens = %d，要 33", turns[1].TotalTokens)
+	}
+	for _, turn := range turns {
+		if turn.AgentID != "" {
+			t.Errorf("turn %q 的 AgentID = %q，要空串：空表示「内置默认 agent」，"+
+				"不许被兜成别的值", turn.ID, turn.AgentID)
+		}
+	}
+}

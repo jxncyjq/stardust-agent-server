@@ -181,16 +181,34 @@ func projectTurns(sessionID string, events []domain.SessionEvent) ([]domain.Conv
 				return nil, fmt.Errorf("project session %q: user/message at seq %d has no task_id",
 					sessionID, event.Seq)
 			}
-			// agent_id 与 assistant 分支同样是必填、同样显式校验：P3 计划把它列为
-			// 五个字段缺口之一（"/turns 响应与 FTS5 索引都带这个字段"），退役中的
-			// recordUserTurn 写的正是 task.AgentID。它没有任何「可选」的契约声明，
-			// 而两个生产写入方都保证它非空（app.RunTask 把空的 AgentID 兜成
-			// "cli-agent" 之后才建 domain.Task；TUI 的 appendTurnEvent 在写之前
-			// 自己先校验），所以「解出空串」只可能是写入方坏了，不是合法状态。
-			if payload.AgentID == "" {
-				return nil, fmt.Errorf("project session %q: user/message at seq %d has no agent_id",
-					sessionID, event.Seq)
-			}
+			// agent_id **不**校验，而 turn_id / task_id 校验——这个不对称是刻意的，
+			// 别「顺手把校验补齐」：
+			//
+			// 空 agent_id 是契约允许的合法状态，不是坏掉的写入方。serve/GUI 的内置
+			// 默认 agent 正是**用空 agent_id 提交任务**来选中的：见
+			// internal/server/http.go 的 handleListAgents 文档注释（"the built-in
+			// default agent is reached by submitting a task with an empty
+			// agent_id"）——它因此不出现在 /agents 列表里。handleCreateTask 把
+			// req.AgentID 原样赋给 task.AgentID、不兜底，AgentRuntimeResolver 对空
+			// agent_id 直接落回默认 runtime，eventRecorder 于是照实写出
+			// agent_id ""。（app.RunTask 里那句把空 AgentID 兜成 "cli-agent" 的代码
+			// 只在 CLI/TUI 路径上，serve 不经过它。）
+			//
+			// 曾经这里按必填校验过，依据是「domain.ConversationTurn 的文档注释没把它
+			// 标注为可选」这条间接证据。那是误判：一旦一条默认 agent 的会话写进日志，
+			// 投影就会报错 → ListConversationTurns 报错 → 这条会话的**全部**历史永久
+			// 读不出来（/turns 500、RecentTurnsForTask 与 ScrollMessages 一并报错），
+			// 而且事件已落盘、不清库无法自愈。domain.ConversationTurn.AgentID 的文档
+			// 注释现在显式写明了这条可选性。
+			//
+			// turn_id / task_id 没有任何这样的契约，缺失也会造成具体伤害（见上），
+			// 所以它们保持必填。fail-loud 铁律的判别标准是「可选 = 契约允许它不存在；
+			// 兜底 = 出错了却假装没事」——空 agent_id 属前者，放行它不是开兜底；
+			// 空 turn_id / task_id 属后者，必须继续拒。
+			//
+			// 守卫：TestADefaultAgentSessionWithNoAgentIDStillReadsBack（本包）与
+			// internal/runtime 的
+			// TestARealDefaultAgentRunWithEmptyAgentIDStillReadsBackItsHistory。
 			fold(domain.ConversationTurn{
 				ID:        payload.TaskID + ":" + string(domain.ConversationRoleUser),
 				SessionID: sessionID,
@@ -225,25 +243,18 @@ func projectTurns(sessionID string, events []domain.SessionEvent) ([]domain.Conv
 			// that must not be allowed to stand in as a valid turn. turn_id and
 			// task_id carry the same stakes here (event addressability for P4 /
 			// Task 4, and session_turns.go's same-task filter plus this turn's
-			// folding key and ID stem). agent_id is checked too:
-			// unlike GeneratedFiles/ModelProfile — which domain.ConversationTurn's
-			// doc comment explicitly marks as a legitimate optional — nothing
-			// documents agent_id as allowed to be absent on an assistant turn,
-			// and internal/runtime/eventlog.go always writes it from
-			// task.AgentID (recordAssistantMessage's doc comment lists it
-			// alongside task_id/turn_id as fields "投影" needs back, with no
-			// optionality carve-out). Per CLAUDE.md's fail-loud rule, when
-			// optionality is undocumented it is treated as required.
+			// folding key and ID stem). agent_id is deliberately NOT checked —
+			// it is contract-optional (serve/GUI's built-in default agent is
+			// selected by submitting a task with an empty agent_id); the user
+			// branch above carries the full rationale, including why tightening
+			// it again would make every default-agent session's history
+			// permanently unreadable.
 			if payload.TurnID == "" {
 				return nil, fmt.Errorf("project session %q: assistant/message at seq %d has no turn_id",
 					sessionID, event.Seq)
 			}
 			if payload.TaskID == "" {
 				return nil, fmt.Errorf("project session %q: assistant/message at seq %d has no task_id",
-					sessionID, event.Seq)
-			}
-			if payload.AgentID == "" {
-				return nil, fmt.Errorf("project session %q: assistant/message at seq %d has no agent_id",
 					sessionID, event.Seq)
 			}
 			fold(domain.ConversationTurn{
