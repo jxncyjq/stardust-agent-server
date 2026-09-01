@@ -341,6 +341,9 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		EpisodeRecorder:       r.episodeRecorder,
 		Gate:                  r.gate,
 		SessionEvents:         r.sessionEvents,
+		// 这个 agent 跑在哪个档位上，与上面 r.maasFactory(agentCfg.MaasProfile) 选
+		// 客户端用的是同一个解析顺序，所以轨迹里记的名字与真正被调用的客户端一致。
+		ModelProfile: r.rootConfig.Maas.ResolveProfileName(agentCfg.MaasProfile),
 	})
 	return agent, runner, true, nil
 }

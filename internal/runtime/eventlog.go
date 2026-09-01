@@ -14,8 +14,14 @@ import (
 // eventRecorder 把一次任务执行写成会话事件日志（spec §5）。
 //
 // 它是**每次 RunTask 一个**：seq 游标、缓冲区都属于这一次执行，不跨任务共享。
-// 真正的串行化与 seq 连续性由 P1 的 store 保证（它在事务内查 next-seq 并持 per-session
-// 写锁），这里只负责「发什么、什么时候必须落盘」。
+//
+// **seq 的连续性不是由 store 保证的**：P1 的 store（internal/storage.appendLocked）
+// 是**校验** seq 而不是分配 seq——首条 seq 对不上库里的 next-seq 就整批硬失败。所以
+// 「同一会话上同时只有一个写入者」必须在这一层之外成立，它由 RunTask 持有的会话执行
+// 锁（sessionRunLocks）提供。曾经有一版注释把这件事写成「store 保证串行化」，于是
+// flush 的「首刷对齐、之后本地递增」看上去是安全的——它不安全，两条并发任务会让其中
+// 一条在第二次 flush 上硬失败并连累整条任务（C-1）。这里只负责「发什么、什么时候
+// 必须落盘」。
 //
 // 接收者契约：本类型的所有方法都假设接收者非 nil。字面 nil 接收者是编程错误，不是本
 // 类型承诺处理的状态，panic 是预期行为，不需要也不应该把它做成「安全返回」。
@@ -53,10 +59,10 @@ type eventRecorder struct {
 // 两者都空说明这条任务没有任何身份——写出来的事件谁也认不回去，直接 panic：
 // 这是编程错误，不是运行期状况。
 func newEventRecorder(store port.SessionEventStore, task domain.Task) *eventRecorder {
-	session := task.SessionID
-	if session == "" {
-		session = task.ID
-	}
+	// 与 RunTask 取会话执行锁用的是同一个解析函数，这一点是硬要求而不是顺手复用：
+	// 锁按 A 解出的键切分、日志按 B 解出的键写，两者一旦漂移，锁就守不住它要守的那条
+	// 日志（C-1）。让它们共用一个函数，漂移就不可能发生。
+	session := sessionKeyForTask(task)
 	if session == "" {
 		panic("runtime: event recorder needs a session id or a task id; a task with neither cannot own a log")
 	}
@@ -278,6 +284,9 @@ func (e *eventRecorder) currentStep() int {
 // seq 在这里才分配：P1 的 store 要求首个 seq 等于库里的 next-seq，而库里走到哪只有
 // 这一刻才知道（同一会话可能有别的写入者）。第一次 flush 用 ReadFrom 对齐游标，
 // 之后按本次执行自己写过的条数递增。
+//
+// 「之后按自己写过的条数递增」只在**本次执行是这条会话当前唯一的写入者**时成立，
+// 而这一条由 RunTask 持有的会话执行锁（sessionRunLocks）提供，不是这里自己保证的。
 //
 // **失败就是失败**：调用方（屏障）据此决定不发请求、不进工具体、不开下一步。
 // 缓冲保持不变，让调用方能在重试时不丢事件。

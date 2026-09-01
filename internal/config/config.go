@@ -344,6 +344,29 @@ type MaasConfig struct {
 	Profiles       map[string]MaasProfile `json:"profiles"`
 }
 
+// ResolveProfileName 解出一次运行实际跑在哪个模型档位上，供需要「这一步用的是哪个
+// 模型」的记录用（会话事件的 model_profile，spec §4.1）。
+//
+// explicit 是调用方显式指定的档位（--maas-profile、agent 配置里的 maas_profile），
+// 空则退到 default_profile —— 与 adapter.NewMaasClientFromProfile 选客户端的顺序
+// 完全一致，所以记下来的名字与真正被调用的那个客户端总是同一个。
+//
+// 两者都为空说明这个部署根本没有「档位」这个概念（裸 base_url，或连 base_url 都没有
+// 的离线录制客户端）。那时返回它实际使用的客户端形态而不是空串：空串在轨迹里与
+// 「装配漏传了这个字段」长得一模一样，而这两件事要区分开。
+func (c MaasConfig) ResolveProfileName(explicit string) string {
+	if strings.TrimSpace(explicit) != "" {
+		return explicit
+	}
+	if strings.TrimSpace(c.DefaultProfile) != "" {
+		return c.DefaultProfile
+	}
+	if strings.TrimSpace(c.BaseURL) != "" {
+		return "maas"
+	}
+	return "recording"
+}
+
 type MaasProfile struct {
 	Model   string `json:"model"`
 	BaseURL string `json:"base_url"`

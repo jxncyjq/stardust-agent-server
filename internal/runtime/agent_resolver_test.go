@@ -72,6 +72,59 @@ func TestResolverInjectsCheckpointsAndGate(t *testing.T) {
 	}
 }
 
+// TestResolverInjectsTheModelProfile 守 per-agent 路径的 model_profile
+// （final-review.md I-3）。
+//
+// 这个值在 Runtime 里拿不到（它只拿到一个已经建好的推理客户端），只能由装配处传；
+// 漏传不会有任何报错，症状是这个 agent 的轨迹里「用的是哪个模型」永远空白。
+// 取值必须与上面 maasFactory(agentCfg.MaasProfile) 选客户端同源。
+func TestResolverInjectsTheModelProfile(t *testing.T) {
+	t.Parallel()
+
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{Gate: taskgate.NewTaskGate(),
+		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
+			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep"},
+			"generalist": {ID: "agent-generalist", Role: "developer"},
+		}),
+		RootConfig: config.Config{
+			Runtime: config.RuntimeConfig{MaxToolRounds: 1},
+			Maas:    config.MaasConfig{DefaultProfile: "fallback"},
+		},
+		Audit:  adapter.NewMemoryAuditLog(),
+		Events: adapter.NewMemoryEventBus(),
+		MaasFactory: func(string) (MaasRunnerFactoryResult, error) {
+			return MaasRunnerFactoryResult{Client: &resolverCaptureMaas{response: "ok"}}, nil
+		},
+	})
+
+	cases := []struct{ agentID, taskID, want string }{
+		// agent 自己指名的档位。
+		{"researcher", "task-profile-named", "deep"},
+		// 没指名的 agent 跑在 default_profile 上——与 NewMaasClientFromProfile 的
+		// 回退顺序一致。
+		{"generalist", "task-profile-default", "fallback"},
+	}
+	for _, tc := range cases {
+		_, runner, ok, err := resolver.ResolveTaskRunner(context.Background(), domain.Task{
+			ID: tc.taskID, AgentID: tc.agentID,
+		})
+		if err != nil {
+			t.Fatalf("ResolveTaskRunner(%s) error = %v, want nil", tc.agentID, err)
+		}
+		if !ok {
+			t.Fatalf("ResolveTaskRunner(%s) ok = false, want true", tc.agentID)
+		}
+		rt, isRuntime := runner.(*Runtime)
+		if !isRuntime {
+			t.Fatalf("runner type = %T, want *Runtime", runner)
+		}
+		if rt.modelProfile != tc.want {
+			t.Errorf("agent %q 的 runtime modelProfile = %q, want %q："+
+				"这个 agent 的轨迹里看不出用的是哪个模型", tc.agentID, rt.modelProfile, tc.want)
+		}
+	}
+}
+
 // TestResolverInjectsSkillUsage guards the per-agent half of the I-1 fix: a
 // resolver constructed with SkillUsage must pass it through to every per-agent
 // *Runtime it builds, mirroring TestResolverInjectsCheckpointsAndGate. Without

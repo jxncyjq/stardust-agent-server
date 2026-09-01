@@ -156,6 +156,8 @@ func newRunCommand(application *app.App, out io.Writer) *cobra.Command {
 					Browser:          cfg.Browser,
 					DisabledTools:    cfg.Runtime.DisabledTools,
 					SessionEvents:    persistent.sessionEvents,
+					// 与上面 maasClientFromConfig 选客户端同源的档位名。
+					ModelProfile: runModelProfile(cfg.Maas, maasProfile, maasURL),
 				})
 			default:
 				err = fmt.Errorf("run requires --demo or --prompt")
@@ -264,6 +266,7 @@ func newTUICommand(application *app.App, out io.Writer) *cobra.Command {
 					DefaultMaas:          maas,
 					DefaultContextPrefix: contextPrefix,
 					DefaultModelProfile:  firstNonEmpty(maasProfile, cfg.Maas.DefaultProfile),
+					ModelProfile:         runModelProfile(cfg.Maas, maasProfile, maasURL),
 					Events:               persistent.events,
 					Audit:                persistent.audit,
 					TaskSink:             persistent.taskSink,
@@ -459,6 +462,14 @@ type tuiTaskRunConfig struct {
 	// runMentionedTUIAgentTask）**都要**接：只接一个的症状是「@某个 agent 提问就
 	// 没有轨迹」，而没有轨迹与没提问在库里长得一样。
 	SessionEvents port.SessionEventStore
+	// ModelProfile 是这次 TUI 运行记进**会话事件**的模型档位名（spec §4.1 的
+	// model_profile），已经过 runModelProfile 归一，永不为空。
+	//
+	// 它与上面的 DefaultModelProfile 不是同一个东西，别合并：DefaultModelProfile
+	// 是写进 conversation_turns 的原始档位名，没有配置档位时它就是空串，而那是
+	// 那张表既有的语义。这里要的是「这一步跑在哪个模型上」，空串在轨迹里与漏传
+	// 无法区分，所以两者取值规则不同。
+	ModelProfile string
 }
 
 func parseTUIAgentPrompt(input string) tuiAgentPrompt {
@@ -568,6 +579,7 @@ func runTUITask(ctx context.Context, application *app.App, cfg tuiTaskRunConfig)
 		Checkpoints:       cfg.Checkpoints,
 		DisabledTools:     cfg.Config.Runtime.DisabledTools,
 		SessionEvents:     cfg.SessionEvents,
+		ModelProfile:      cfg.ModelProfile,
 	})
 	if err != nil {
 		return app.DemoResult{}, err
@@ -660,6 +672,9 @@ func runMentionedTUIAgentTask(ctx context.Context, application *app.App, cfg tui
 		Checkpoints:       cfg.Checkpoints,
 		DisabledTools:     cfg.Config.Runtime.DisabledTools,
 		SessionEvents:     cfg.SessionEvents,
+		// @提及路径的客户端是 maasFactoryFromConfig 按 agent 自己的档位建的，
+		// 完全不看 --maas-url，所以这里直接按那个档位解，与它同源。
+		ModelProfile: cfg.Config.Maas.ResolveProfileName(agentCfg.MaasProfile),
 	})
 	if err != nil {
 		return app.DemoResult{}, err
@@ -845,6 +860,21 @@ func tuiSkillManagers(cfg config.Config, registry *agentregistry.Registry) map[s
 		managers[name] = skill.NewDiskManager(root, nil)
 	}
 	return managers
+}
+
+// runModelProfile 解出这次运行记进会话事件的模型档位名（spec §4.1 的 model_profile）。
+//
+// 显式 --maas-url 建的是一个**绕过所有档位**的临时客户端（见 maasClientFromConfig），
+// 它没有档位名可言；用与 tuiDisplayConfig 同一套词汇标成 "custom-maas"，而不是报一个
+// 它并没有在用的档位。其余情形交给 config.MaasConfig.ResolveProfileName，与
+// adapter.NewMaasClientFromProfile 的选择顺序同源。
+//
+// 任何情况下都不返回空串：空串在轨迹里与「装配漏传这个字段」无法区分。
+func runModelProfile(cfg config.MaasConfig, profile string, explicitBaseURL string) string {
+	if strings.TrimSpace(explicitBaseURL) != "" {
+		return "custom-maas"
+	}
+	return cfg.ResolveProfileName(profile)
 }
 
 func tuiDisplayConfig(cfg config.MaasConfig, profile string, explicitBaseURL string) tuiDisplay {
@@ -1988,6 +2018,7 @@ func buildDefaultRunnerConfig(
 	episodeRecorder agentruntime.EpisodeRecorder,
 	gate *taskgate.TaskGate,
 	sessionEvents port.SessionEventStore,
+	modelProfile string,
 ) agentruntime.Config {
 	return agentruntime.Config{
 		Maas:             maas,
@@ -2018,6 +2049,9 @@ func buildDefaultRunnerConfig(
 		// 的那条路，也就是绝大多数任务），只接 resolver 会让它们全都没有轨迹——
 		// 而「没有轨迹」与「没有发生过任务」在库里长得一样，不会有任何报错。
 		SessionEvents: sessionEvents,
+		// 默认 agent 跑在哪个档位上。Runtime 自己拿不到这个信息（它只拿到一个建好的
+		// 客户端），漏传的症状是轨迹里 model_profile 永远空白且不报错。
+		ModelProfile: modelProfile,
 	}
 }
 
@@ -2731,6 +2765,9 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 			episodeRecorder,
 			taskGate,
 			sessionEvents,
+			// serve 没有命令行档位开关，默认 agent 一律跑在 default_profile 上
+			// （defaultMaas 也是这么建的），两者必须同源。
+			cfg.Maas.ResolveProfileName(""),
 		),
 		contextRoot:     cfg.ContextFiles.Root,
 		audit:           auditLog,

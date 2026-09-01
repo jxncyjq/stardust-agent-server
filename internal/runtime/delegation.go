@@ -132,6 +132,10 @@ func (r *Runtime) newSubRuntime(role string, toolsets []string) (*Runtime, error
 		// "the seam exists but nothing reaches it" failure shape this repo has
 		// hit twice before with per-agent tool/approval wiring.
 		sessionEvents: r.sessionEvents,
+		// The child runs on the parent's inference client, so it runs under the
+		// parent's model profile; without this its own session log would record
+		// an empty model_profile on every assistant/message (spec §4.1).
+		modelProfile: r.modelProfile,
 	}
 	return child, nil
 }

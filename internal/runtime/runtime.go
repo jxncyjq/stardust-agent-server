@@ -166,6 +166,18 @@ type Config struct {
 	// 构造），不是兜底：那时整个记录是 no-op，三个屏障永远放行。它与「配了但写不进去」
 	// 是两回事——后者由屏障 fail-closed 挡住。
 	SessionEvents port.SessionEventStore
+	// ModelProfile 是这次运行使用的模型档位名，会话事件的 assistant/message 用它
+	// 填 spec §4.1 的 model_profile 字段（P3 的轨迹里「这一步用的是哪个模型」那一栏）。
+	//
+	// 它**必须由装配处传**。Runtime 自己拿不到这个信息（它只拿到一个已经建好的
+	// MaasInferenceClient，客户端上没有档位这个概念），所以留空不是「默认值」，而是
+	// 让轨迹里这一栏永远空白、且没有任何东西会报错——那正是 fail-loud 铁律要防的
+	// 「零值假装正常」。四个生产装配点各有断言钉住它（见各自的 wiring 测试）。
+	//
+	// 取值：具名档位优先（config.MaasConfig.ResolveProfileName），没有具名档位的
+	// 部署用它实际使用的客户端形态（裸 base_url 的 "maas"、离线的 "recording"），
+	// 不用空串——空串在轨迹里与「装配漏传」无法区分。
+	ModelProfile string
 }
 
 // SkillUsageRecorder is the usage sidecar skill.UsageStore satisfies.
@@ -220,6 +232,10 @@ type Runtime struct {
 	// leaving the recorder field itself nil -- see eventRecorder's type doc on
 	// why a literal nil recorder is refused, not tolerated.
 	sessionEvents port.SessionEventStore
+	// modelProfile is the model profile name this runtime runs under, recorded
+	// on every assistant/message event (spec §4.1's model_profile). See
+	// Config.ModelProfile for why it has to come from assembly.
+	modelProfile string
 }
 
 // loopState is the mutable state threaded through the tool-execution loop.
@@ -391,6 +407,7 @@ func NewRuntime(cfg Config) *Runtime {
 		episodeRecorder:       cfg.EpisodeRecorder,
 		gate:                  cfg.Gate,
 		sessionEvents:         cfg.SessionEvents,
+		modelProfile:          cfg.ModelProfile,
 	}
 }
 
@@ -455,11 +472,16 @@ func (r *Runtime) Interrupt() {
 //     is a better trade than a task that fails because someone else wrote
 //     first; making it cheap needs a store-side next-turn query, which is P1's
 //     surface, not this function's.
-//   - Two tasks running concurrently on ONE session resolve the same turn
-//     number here (sessionKeyForTask does not serialise them). Nothing in P2
-//     prevents it; whether the scheduler can produce it is a Task 5 question.
-//     The consequence is two turns sharing a number, not lost or interleaved
-//     events — the store still assigns seq under its own per-session lock.
+//   - This read is a read-modify-write on the session log (resolve the highest
+//     turn, then write events numbered one past it), and so is the recorder's
+//     seq alignment. Both are only correct because RunTask holds this session's
+//     run lock across the whole call (see sessionRunLocks and the acquire site
+//     in RunTask). An earlier revision left them unserialised and two
+//     concurrent tasks on one session then resolved the SAME turn number, reused
+//     one call_id for two unanswered tool/calls, and — because the real store
+//     VALIDATES seq rather than assigning it — failed the second flush outright,
+//     which a fail-closed barrier turns into a failed task. Do not move this
+//     read outside the lock.
 func (r *Runtime) newTaskRecorder(ctx context.Context, task domain.Task) (*eventRecorder, int, error) {
 	rec := newEventRecorder(r.sessionEvents, task)
 	if r.sessionEvents == nil {
@@ -604,6 +626,27 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		return domain.TaskRun{}, fmt.Errorf("run task %s: %w", task.ID, ErrManualGateMissing)
 	}
 
+	// 同一会话上的任务从这里开始串行执行（C-1，见 sessionlock.go 对代价的完整说明）。
+	//
+	// 锁必须在 newTaskRecorder **之前**取：turn 号是从已落盘的事件里解出来的
+	// （读-改-写），两条任务并发读同一条日志会解出同一个 turn 号；而 seq 的分配同样
+	// 是读-改-写，撞车时 Append 会硬失败，失败落在 fail-closed 的屏障里 = 整条任务
+	// 失败。锁持有到 RunTask 返回为止（defer），所以整个工具循环、包括收尾的那次
+	// flush，都在同一把锁下。
+	//
+	// 代价——一条在等锁的任务会占着协调器的一个 worker 槽（MaxWorkers 默认 4）——是
+	// 权衡过的，不是没想到：理由与最坏情况写在 sessionRunLocks 的文档注释里。
+	//
+	// 会话键与 newEventRecorder 用的是同一个 sessionKeyForTask，两者不可能漂移。
+	// 它为空只可能出现在「既没有 SessionID 也没有 ID」的任务上，那种任务紧接着就会
+	// 在 newEventRecorder 里 panic（那是编程错误，不是运行期状况）。
+	sessionCtx, releaseSession, err := acquireSessionRunLock(ctx, sessionKeyForTask(task))
+	if err != nil {
+		return domain.TaskRun{}, fmt.Errorf("run task %s: %w", task.ID, err)
+	}
+	defer releaseSession()
+	ctx = sessionCtx
+
 	// One RunTask execution is one turn (spec §4.1): the recorder and the turn
 	// number are resolved before anything that could produce an event, and
 	// EVERY control-flow path out of this function from here on -- resume,
@@ -675,11 +718,16 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 			// above them would be unreadable. The user/message recorded at the
 			// top of RunTask repeats for the same reason -- the resumed turn is
 			// still answering it.
+			//
+			// usage 记 0，这是**这次记录真实的增量用量**，不是「拿不到就填零」：
+			// 这条响应的 token 已经由生成它的那一轮（suspend 前的 generateStep）
+			// 按单次响应用量记过一次了，这里是同一条响应在新 turn 里的重记。
+			// checkpoint 存的 st.promptTokens/… 是**整次运行的累计值**（runToolLoop
+			// 逐轮累加），与 generateStep/generateFinalStep 传的「单次响应用量」
+			// 不是同一个语义；把它填进来，任何按 assistant/message 求和统计用量的
+			// 消费者都会在「挂起→恢复」过的任务上多算一大截（final-review.md I-2）。
 			rec.recordStepStart()
-			rec.recordAssistantMessage(st.resp.Text, st.resp.ToolCalls, eventUsage{
-				Prompt: st.promptTokens, Completion: st.completionTokens,
-				Cached: st.cachedTokens, Total: st.totalTokens,
-			}, "")
+			rec.recordAssistantMessage(st.resp.Text, st.resp.ToolCalls, eventUsage{}, r.modelProfile)
 			if err := rec.barrier(ctx, "before resuming pending tool calls"); err != nil {
 				r.closeTurnOnError(ctx, task, rec, err)
 				return domain.TaskRun{}, fmt.Errorf("run task %s: %w", task.ID, err)
@@ -1265,7 +1313,7 @@ func (r *Runtime) generateStep(ctx context.Context, rec *eventRecorder, requestI
 	rec.recordAssistantMessage(resp.Text, resp.ToolCalls, eventUsage{
 		Prompt: resp.PromptTokens, Completion: resp.CompletionTokens,
 		Cached: resp.CachedTokens, Total: resp.TotalTokens,
-	}, "")
+	}, r.modelProfile)
 	return resp, nil
 }
 
@@ -1298,7 +1346,7 @@ func (r *Runtime) generateFinalStep(ctx context.Context, rec *eventRecorder, req
 	rec.recordAssistantMessage(resp.Text, resp.ToolCalls, eventUsage{
 		Prompt: resp.PromptTokens, Completion: resp.CompletionTokens,
 		Cached: resp.CachedTokens, Total: resp.TotalTokens,
-	}, "")
+	}, r.modelProfile)
 	return resp, nil
 }
 

@@ -122,6 +122,13 @@ type RunTaskOptions struct {
 	// nil 是契约允许的部署形态（非持久化驱动、测试），那时整个记录是 no-op——
 	// 见 runtime.Config.SessionEvents 的文档注释，不是兜底。
 	SessionEvents port.SessionEventStore
+	// ModelProfile 是这次运行使用的模型档位名，直接喂给 runtime.Config.ModelProfile
+	// （会话事件 assistant/message 的 model_profile，spec §4.1）。
+	//
+	// 调用方用 config.MaasConfig.ResolveProfileName 解它，取值与它给 Maas 字段建的
+	// 那个客户端同源。留空的症状是这条路（`agent run --prompt` / `agent tui`）跑出来
+	// 的轨迹里这一栏永远空白，且不会有任何报错——见 runtime.Config.ModelProfile。
+	ModelProfile string
 }
 
 type TaskSink interface {
@@ -209,11 +216,13 @@ func (a *App) ClearPlugins() {
 	a.plugins = nil
 }
 
-func (a *App) RunDemo(ctx context.Context) (DemoResult, error) {
-	maas := adapter.NewRecordingMaas("demo task completed")
-	audit := adapter.NewMemoryAuditLog()
-	events := adapter.NewMemoryEventBus()
-	runner := runtime.NewRuntime(runtime.Config{
+// demoRuntimeConfig 是 `agent run --demo` 那条路的运行时配置。
+//
+// 它被从 RunDemo 里提出来，是为了让「这个构造点有没有漏接字段」可被直接断言——
+// 与 cli.buildDefaultRunnerConfig 提出来的理由一样。这条路全用内存适配器，作用域内
+// 没有任何持久化仓储，所以它**正确地**不接 SessionEvents（会话事件记录整体是 no-op）。
+func demoRuntimeConfig(maas port.MaasInferenceClient, audit port.AuditLog, events port.EventBus) runtime.Config {
+	return runtime.Config{
 		Maas:     maas,
 		Audit:    audit,
 		Events:   events,
@@ -225,7 +234,24 @@ func (a *App) RunDemo(ctx context.Context) (DemoResult, error) {
 		// makes "which boundary does this runtime's task belong to?" an answered
 		// question at every construction site.
 		Gate: taskgate.NewTaskGate(),
-	})
+		// 这条路跑的是 adapter.NewRecordingMaas，不是任何一个配置档位——所以档位名
+		// 就是 "recording"，与 config.MaasConfig.ResolveProfileName 在「没有任何
+		// MaaS 配置」时给出的名字一致。
+		//
+		// 没有 SessionEvents 意味着今天没有任何事件会读到这个值。仍然填上而不是留空：
+		// 留空的构造点是下一个人复制粘贴的模板，而空串在轨迹里与「漏传」无法区分。
+		ModelProfile: demoModelProfile,
+	}
+}
+
+// demoModelProfile 是 demo 路径的档位名：它跑在录制客户端上，没有任何配置档位。
+const demoModelProfile = "recording"
+
+func (a *App) RunDemo(ctx context.Context) (DemoResult, error) {
+	maas := adapter.NewRecordingMaas("demo task completed")
+	audit := adapter.NewMemoryAuditLog()
+	events := adapter.NewMemoryEventBus()
+	runner := runtime.NewRuntime(demoRuntimeConfig(maas, audit, events))
 	task := domain.Task{
 		ID:        "demo-task",
 		CompanyID: "demo-company",
@@ -398,6 +424,9 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 		// 这条路的会话事件落点。nil 是合法部署形态（非持久化驱动、测试），
 		// 那时整个记录是 no-op（见 runtime.Config.SessionEvents）。
 		SessionEvents: opts.SessionEvents,
+		// 这次运行的模型档位。它与上面的 Maas 客户端必须同源，由调用方一起解出来
+		// （见 RunTaskOptions.ModelProfile）。
+		ModelProfile: opts.ModelProfile,
 	})
 	task := domain.Task{
 		ID:         opts.TaskID,

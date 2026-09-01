@@ -36,7 +36,11 @@ type oneToolThenTextMaas struct {
 	// entry, since the runtime's tool loop treats a pathless write_file success
 	// as an invariant violation (see runtime.go executeToolCalls).
 	toolArgs map[string]string
-	calls    int
+	// usage 是第 1 轮响应报告的 token 用量。零值（默认）表示不报，与既有用例一致；
+	// 需要让 checkpoint 里存下**非零的累计用量**的用例（恢复路径的 usage 语义）
+	// 必须设它，否则那条断言在全零的日志上永远成立、等于没测。
+	usage port.InferenceResponse
+	calls int
 }
 
 func (m *oneToolThenTextMaas) Generate(ctx context.Context, req port.InferenceRequest) (port.InferenceResponse, error) {
@@ -49,7 +53,9 @@ func (m *oneToolThenTextMaas) Generate(ctx context.Context, req port.InferenceRe
 		if args == nil {
 			args = map[string]string{}
 		}
-		return port.InferenceResponse{ToolCalls: []domain.ToolCall{{ID: "c1", Name: m.toolName, Arguments: args}}}, nil
+		resp := m.usage
+		resp.ToolCalls = []domain.ToolCall{{ID: "c1", Name: m.toolName, Arguments: args}}
+		return resp, nil
 	}
 	return port.InferenceResponse{Text: "done"}, nil
 }

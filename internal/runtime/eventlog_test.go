@@ -87,6 +87,25 @@ func (c *captureEventStore) Append(_ context.Context, sessionID string, events [
 	if c.err != nil {
 		return c.err
 	}
+	// seq 校验：与真 store（internal/storage.appendLocked）**同款**，不是可选的严格模式。
+	//
+	// 之前这里把拿到的 seq 原样收下、从不校验，而真 store 是校验 seq 而不是分配 seq。
+	// 夹具与它替代的真实组件在这一点上语义相反，于是任何 seq 相关的回归对整套测试
+	// 结构性隐形——C-1（同一会话并发任务让其中一条整任务失败）就是这么活到最终复审的。
+	// 少一道校验就等于给用这个夹具的每一条测试开一个后门，所以这道校验必须在。
+	if len(events) > 0 {
+		next := int64(len(c.bySession[sessionID]))
+		if events[0].Seq != next {
+			return fmt.Errorf("append session events for %q: first seq is %d but the log continues at %d; "+
+				"the log is append-only and its seq must stay contiguous", sessionID, events[0].Seq, next)
+		}
+		for i := 1; i < len(events); i++ {
+			if events[i].Seq != events[i-1].Seq+1 {
+				return fmt.Errorf("append session events for %q: batch element %d has seq %d, want %d",
+					sessionID, i, events[i].Seq, events[i-1].Seq+1)
+			}
+		}
+	}
 	c.events = append(c.events, events...)
 	if c.bySession == nil {
 		c.bySession = make(map[string][]domain.SessionEvent)
