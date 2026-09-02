@@ -3094,6 +3094,13 @@ func (f *fakeCLITurnLister) ListConversationTurns(_ context.Context, sessionID s
 	return f.turns, nil
 }
 
+// ListConversationTranscript 报错而不是返回空：这个 double 只服务 G3 关闭那条路，
+// 一旦有测试把开关打开却仍然用它，返回 (nil, nil) 会让「历史没注进去」看起来
+// 和「这条会话本来就没历史」一模一样（CLAUDE.md §0）。
+func (f *fakeCLITurnLister) ListConversationTranscript(_ context.Context, sessionID string, _ int) ([]port.InferenceMessage, error) {
+	return nil, fmt.Errorf("fakeCLITurnLister: session %q asked for a transcript, but this double only serves the G3-off turns path", sessionID)
+}
+
 // promptRecordingMaas records the flattened prompt of the first inference and
 // answers with plain text (no tool calls), ending the loop immediately.
 type promptRecordingMaas struct{ lastPrompt string }

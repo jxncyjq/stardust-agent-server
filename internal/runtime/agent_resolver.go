@@ -33,11 +33,25 @@ type MaasRunnerFactoryResult struct {
 
 type MaasRunnerFactory func(profile string) (MaasRunnerFactoryResult, error)
 
-// ConversationTurnLister loads a session's recent conversation turns. It is the
-// one method the resolver needs from the session store, kept as its own
-// interface so the runtime package does not depend on the whole store.
+// ConversationTurnLister loads a session's recent history in either of the two
+// shapes G3 selects between. It is the set of methods the resolver needs from
+// the session store, kept as its own interface so the runtime package does not
+// depend on the whole store.
+//
+// Both projections live in ONE interface on purpose. They read the same events
+// and a store can serve both; a store that could only do turns would turn G3
+// into a switch that silently kept the old shape, which is exactly the "the
+// seam is there but nobody calls it" failure this repo has hit twice. Declaring
+// both here makes that a compile error at the wiring site instead.
 type ConversationTurnLister interface {
 	ListConversationTurns(ctx context.Context, sessionID string, limit int) ([]domain.ConversationTurn, error)
+	// ListConversationTranscript returns the same history as a provider
+	// transcript (assistant with tool_calls, followed by the tool messages that
+	// answer them). limit caps the messages returned, counting from the most
+	// recent; see storage.SQLiteRepository.ListConversationTranscript for why a
+	// cap may keep one or two extra messages rather than split an assistant
+	// from its tool results.
+	ListConversationTranscript(ctx context.Context, sessionID string, limit int) ([]port.InferenceMessage, error)
 }
 
 type AgentRuntimeResolverConfig struct {
@@ -188,20 +202,21 @@ func (r *AgentRuntimeResolver) resolveHomeDir(ctx context.Context) string {
 	return homeDir
 }
 
-// recentTurnsForTask loads the session turns to inject into this task's prompt:
-// the most recent DefaultRecentTurns turns of task.SessionID, excluding the
-// task's own user turn (the HTTP layer records it before enqueuing, so it would
-// otherwise be duplicated alongside task.Input), each truncated to
-// Session.MaxTurnChars.
+// sessionHistoryForTask loads the session history to inject into this task, in
+// whichever shape G3 (Session.ToolTranscriptEnabled) selects: the recent turns
+// the prompt renders as "Recent conversation:", or the provider transcript that
+// carries the history's tool round-trips.
 //
 // A nil lister or an empty task.SessionID is a legitimate "no session history"
-// state and yields (nil, nil). A store failure is NOT: it returns an error, so
-// a lost history is never mistaken for an empty one (CLAUDE.md fail-loud).
-func (r *AgentRuntimeResolver) recentTurnsForTask(ctx context.Context, task domain.Task) ([]domain.ConversationTurn, error) {
+// state and yields an empty SessionHistory. A store failure is NOT: it returns
+// an error, so a lost history is never mistaken for an empty one (CLAUDE.md
+// fail-loud).
+func (r *AgentRuntimeResolver) sessionHistoryForTask(ctx context.Context, task domain.Task) (SessionHistory, error) {
 	// Delegated to the shared helper so this path and the CLI's
 	// defaultTaskRunner cannot drift apart — wiring history into only one of
-	// them is exactly how the GUI ended up with no cross-turn memory.
-	return RecentTurnsForTask(ctx, r.conversationTurns, r.rootConfig.Session, task)
+	// them is exactly how the GUI ended up with no cross-turn memory, and the
+	// same hole would swallow the G3 switch.
+	return SessionHistoryForTask(ctx, r.conversationTurns, r.rootConfig.Session, task)
 }
 
 func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domain.Task) (domain.Agent, TaskRunner, bool, error) {
@@ -316,7 +331,7 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		// Shared runtime injected at serve assembly; no per-task browser launch.
 		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: r.browserRuntime, ToolRoot: toolRoot})
 	}
-	recentTurns, err := r.recentTurnsForTask(ctx, task)
+	history, err := r.sessionHistoryForTask(ctx, task)
 	if err != nil {
 		return domain.Agent{}, nil, false, err
 	}
@@ -337,10 +352,13 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		CapabilitySkills:      capabilitySkills,
 		SkillUsage:            r.skillUsage,
 		DisabledTools:         agentCfg.DisabledTools,
-		ConversationTurns:     recentTurns,
-		EpisodeRecorder:       r.episodeRecorder,
-		Gate:                  r.gate,
-		SessionEvents:         r.sessionEvents,
+		// 两者是同一个选择的两半，SessionHistoryForTask 只会填其中一个；两个都传，
+		// 是为了让「开关选了哪一边」在这里没有第二次做主的机会。
+		ConversationTurns: history.Turns,
+		HistoryTranscript: history.Transcript,
+		EpisodeRecorder:   r.episodeRecorder,
+		Gate:              r.gate,
+		SessionEvents:     r.sessionEvents,
 		// 这个 agent 跑在哪个档位上，与上面 r.maasFactory(agentCfg.MaasProfile) 选
 		// 客户端用的是同一个解析顺序，所以轨迹里记的名字与真正被调用的客户端一致。
 		ModelProfile: r.rootConfig.Maas.ResolveProfileName(agentCfg.MaasProfile),

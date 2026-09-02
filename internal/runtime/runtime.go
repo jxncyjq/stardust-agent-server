@@ -94,6 +94,15 @@ type Config struct {
 	// so a fixed field is correct.
 	ToolRoot          string
 	ConversationTurns []domain.ConversationTurn
+	// HistoryTranscript is the session history as provider messages, the shape
+	// G3 (config session.tool_transcript_enabled) selects. It is appended after
+	// message[0] instead of being rendered into the prompt text, so the model
+	// sees the history's tool round-trips.
+	//
+	// It and ConversationTurns are the two halves of one choice and are never
+	// both set: SessionHistoryForTask picks exactly one. Filling both would send
+	// the same history twice.
+	HistoryTranscript []port.InferenceMessage
 	// Delegation controls. Role is "orchestrator" (may spawn sub-tasks) or "leaf"
 	// (may not); an empty Role at the root (Depth 0) defaults to orchestrator, and
 	// spawned children default to leaf. Depth is the current delegation depth (0
@@ -207,6 +216,7 @@ type Runtime struct {
 	toolRoot              string
 	lazyTools             bool
 	conversationTurns     []domain.ConversationTurn
+	historyTranscript     []port.InferenceMessage
 	interrupted           atomic.Bool
 	role                  string
 	depth                 int
@@ -392,6 +402,7 @@ func NewRuntime(cfg Config) *Runtime {
 		toolRoot:              cfg.ToolRoot,
 		lazyTools:             cfg.LazyTools,
 		conversationTurns:     append([]domain.ConversationTurn(nil), cfg.ConversationTurns...),
+		historyTranscript:     append([]port.InferenceMessage(nil), cfg.HistoryTranscript...),
 		role:                  role,
 		depth:                 cfg.Depth,
 		maxSpawnDepth:         normalizePositive(cfg.MaxSpawnDepth, defaultMaxSpawnDepth),
@@ -807,6 +818,20 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	basePrompt := prompt
 	convo := newConversation(basePrompt, task.Images)
 	convo.pinCachePrefix(stablePrefixLen)
+	// G3 打开时，历史以 provider transcript 的形式排在 message[0] 之后；关闭时
+	// historyTranscript 为空，这里一个字节都不动，历史仍在 basePrompt 的
+	// "Recent conversation:" 段里（两者永不同时非空，见 SessionHistoryForTask）。
+	//
+	// 为什么历史排在 message[0] 之后而不是之前：message[0] 必须仍以那段跨任务
+	// 逐字节相同的稳定前缀开头，pinCachePrefix 打在它上面、adapter 据此设 provider
+	// 的缓存断点（internal/adapter/http_maas.go）。历史插到前面会让每次请求都缓存
+	// 未命中——G3 的代价本就是体积，再赔上缓存不划算。
+	//
+	// 代价是 basePrompt 的 header 段里那句 "Input: <当前任务输入>" 出现在历史之前，
+	// 时序上是颠倒的。这是有意的取舍：缓存命中比时序美观值钱。
+	if len(r.historyTranscript) > 0 {
+		convo.appendHistory(r.historyTranscript)
+	}
 	// generatedFiles 传 nil：这是这次执行的第一次模型请求，还没有任何工具跑过，
 	// 不可能已经产出文件。
 	resp, err := r.generateStep(ctx, rec, requestID, task.ID, convo, effTools, nil)

@@ -2362,11 +2362,15 @@ func (d *defaultTaskRunner) RunTask(ctx context.Context, agent domain.Agent, tas
 	runtimeCfg := d.runtimeCfg
 	runtimeCfg.Tools = tools
 	runtimeCfg.ToolRoot = root
-	turns, err := agentruntime.RecentTurnsForTask(ctx, d.conversationTurns, d.sessionCfg, task)
+	// 走与 AgentRuntimeResolver 相同的选路：G3 关着填 Turns（历史进 prompt 文本），
+	// 打开填 Transcript（历史以 provider 消息排在 message[0] 之后）。两个字段都赋，
+	// 因为只赋一个就等于在这里替开关又做了一次主。
+	history, err := agentruntime.SessionHistoryForTask(ctx, d.conversationTurns, d.sessionCfg, task)
 	if err != nil {
 		return domain.TaskRun{}, err
 	}
-	runtimeCfg.ConversationTurns = turns
+	runtimeCfg.ConversationTurns = history.Turns
+	runtimeCfg.HistoryTranscript = history.Transcript
 	rt := agentruntime.NewRuntime(runtimeCfg)
 	rt.RegisterDelegateTaskTool(tools)
 	return rt.RunTask(ctx, agent, task)

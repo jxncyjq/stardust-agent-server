@@ -48,6 +48,20 @@ func (c *conversation) pinCachePrefix(n int) {
 	}
 }
 
+// appendHistory appends the session's history transcript (G3 on) right after
+// message[0], VERBATIM.
+//
+// Verbatim matters in one specific way: it must not touch StablePrefixLen.
+// That field is only meaningful on message[0] — the adapter turns it into the
+// provider's cache_control breakpoint — so copying message[0]'s value onto a
+// history message would place a second breakpoint inside content that changes
+// every task. The history the projection produces carries a zero there, and
+// this function keeps it that way.
+// 守卫：TestTheCacheBreakpointStaysOnTheFirstMessage。
+func (c *conversation) appendHistory(history []port.InferenceMessage) {
+	c.messages = append(c.messages, history...)
+}
+
 // appendAssistant records the model's turn. calls may be empty (a plain textual
 // answer) and text may be empty (a pure tool-call turn).
 func (c *conversation) appendAssistant(text string, calls []domain.ToolCall) {
