@@ -53,7 +53,7 @@ func BuildOpenAPISpec() OpenAPISpec {
 			"/v1/sessions/{id}":       {Patch: openAPIOperation("patchSession", "Update session mode or working directory", true), Delete: openAPIOperation("deleteSession", "Delete agent session", true)},
 			"/v1/sessions/{id}/turns": {Get: openAPIOperation("listSessionTurns", "List session conversation turns", true)},
 			"/v1/sessions/{id}/events": {Get: openAPIOperation("listSessionEvents",
-				"Read a session's raw event log from a sequence number, one page at a time", true)},
+				"Read a session's raw event log from a sequence number, one page at a time", true, "404", "503")},
 			"/v1/agents":                          {Get: openAPIOperation("listAgents", "List configured sub-agents", true)},
 			"/v1/agents/{id}/messages":            {Get: openAPIOperation("listAgentMessages", "List agent messages", true), Post: openAPIOperation("sendAgentMessage", "Send agent message", true)},
 			"/v1/tasks":                           {Get: openAPIOperation("listTasks", "List tasks", true), Post: openAPIOperation("submitTask", "Submit task", true)},
@@ -188,6 +188,7 @@ func errorResponse(status string) map[string]any {
 		"409": "Conflict: the resource exists but is in the wrong state for this call",
 		"422": "Unprocessable entity",
 		"500": "Internal server error",
+		"503": "Service unavailable: the backing store for this endpoint was not configured",
 	}
 	description, ok := descriptions[status]
 	if !ok {

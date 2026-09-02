@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -33,6 +34,12 @@ type sessionEventsTestStore struct {
 	// deleted 记下 DeleteAgentSession 是否被调用过，供路由守卫的测试断言
 	// 「这条请求没有变成一次删除」。
 	deleted bool
+
+	// getSessionErr 让 GetAgentSession 报错，用来触发端点的 fail-loud 500 分支
+	// （会话存在性查询本身失败，例如 DB 不可用）。ReadFrom 的错误分支不用这个
+	// 开关——那条走的是夹具自带的、与真 store 语义一致的日志损坏检测（见下），
+	// 这里没有对应的「损坏数据」概念可言，注入错误就是合理的触发方式。
+	getSessionErr error
 }
 
 func newSessionEventsTestStore(sessionID string, stored []storedEvent) *sessionEventsTestStore {
@@ -58,6 +65,9 @@ func (s *sessionEventsTestStore) ListConversationTurns(ctx context.Context, sess
 }
 
 func (s *sessionEventsTestStore) GetAgentSession(ctx context.Context, sessionID string) (domain.AgentSession, bool, error) {
+	if s.getSessionErr != nil {
+		return domain.AgentSession{}, false, s.getSessionErr
+	}
 	if sessionID != s.sessionID {
 		return domain.AgentSession{}, false, nil
 	}
@@ -300,5 +310,76 @@ func TestWriteMethodsOnTheEventsSubresourceAreNotSessionWrites(t *testing.T) {
 		if store.deleted {
 			t.Errorf("%s /v1/sessions/sess-1/events 删掉了会话本体——子资源路径被当成了会话本体", method)
 		}
+	}
+}
+
+// 没有配置会话存储时，端点必须响亮地报 503，而不是把「无存储」悄悄当成
+// 「没有事件」冒充 200。对应 session_events.go 的 s.sessions == nil 分支。
+func TestNoSessionStoreConfiguredReturnsServiceUnavailable(t *testing.T) {
+	srv := NewHTTPServer(Config{})
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/sessions/sess-1/events", nil))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("状态码 %d，要 503：%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "session store") {
+		t.Errorf("错误信息没说清是会话存储不可用：%s", rec.Body.String())
+	}
+}
+
+// GetAgentSession 本身报错（例如会话存在性查询所依赖的存储层出了问题）必须
+// 500 且指名是哪个会话，而不是被悄悄当成「会话不存在」而回 404，或者当成
+// 「会话存在」而继续往下读事件。对应 session_events.go 的 :59 分支。
+func TestGetAgentSessionErrorReturnsInternalServerError(t *testing.T) {
+	store := newSessionEventsTestStore("sess-1", nil)
+	store.getSessionErr = errors.New("db connection reset")
+	srv := NewHTTPServer(Config{Sessions: store})
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/sessions/sess-1/events", nil))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("状态码 %d，要 500：%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "sess-1") {
+		t.Errorf("错误信息没指名会话 sess-1：%s", rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "db connection reset") {
+		t.Errorf("错误信息丢了底层原因：%s", rec.Body.String())
+	}
+}
+
+// ReadFrom 报错（这里用夹具里真实存在、与真 store 语义对齐的「日志损坏」分支
+// 触发——相邻事件 seq 跳号）必须 500 且指名会话，而不是把损坏的日志当成
+// 正常的空页或部分页悄悄吐出去。对应 session_events.go 的 :81 分支。
+//
+// 之所以要用夹具的损坏分支真实触发，而不是另加一个「无条件返回 error」的
+// 开关：sessionEventsTestStore.ReadFrom 复刻了 SQLiteRepository.ReadFrom 的
+// 严格语义（seq 断裂 / 窗口起点落洞都报错），如果不通过真实构造断裂数据去
+// 触发它，这段与真 store 对齐的逻辑就永远是死代码，谁都不知道它现在还成立。
+func TestReadFromErrorReturnsInternalServerError(t *testing.T) {
+	// seq 从 0 跳到 5：夹具的 ReadFrom 在相邻事件间发现跳号会报「日志损坏」，
+	// 与 internal/storage/session_events.go 的 SQLiteRepository.ReadFrom 同一
+	// 套判据。
+	srv := newTestServerWithSessionEvents(t, "sess-1", []storedEvent{
+		{Seq: 0, Type: "turn/start", Data: `{"turn":0}`},
+		{Seq: 5, Type: "turn/end", Data: `{"turn":0,"reason":"completed"}`},
+	})
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/sessions/sess-1/events", nil))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("状态码 %d，要 500：%s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "sess-1") {
+		t.Errorf("错误信息没指名会话 sess-1：%s", rec.Body.String())
+	}
+	// 断言错误确实来自夹具的损坏检测分支（"seq jumps"），而不是别的什么
+	// 500——证明这次真的走了那段与真 store 对齐的逻辑，不是巧合命中别的错误。
+	if !strings.Contains(rec.Body.String(), "seq jumps") {
+		t.Errorf("错误信息不是来自损坏检测分支，本测试没有真正触发它：%s", rec.Body.String())
 	}
 }
