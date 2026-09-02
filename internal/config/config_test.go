@@ -230,6 +230,43 @@ func TestLoadSessionConfig(t *testing.T) {
 	}
 }
 
+// G3 默认必须是关。spec §3 的理由原文：「它改的是每次请求的体积，不该在做轨迹的
+// 顺路上悄悄打开」。所以「配置里没写」必须解析成 false，而不是任何形式的默认开。
+func TestToolTranscriptIsOffWhenTheKeyIsAbsent(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(path, []byte(`{"session":{"enabled":true}}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", path, err)
+	}
+
+	cfg, err := Load(context.Background(), Options{Path: path})
+	if err != nil {
+		t.Fatalf("Load(%q) error = %v, want nil", path, err)
+	}
+	if cfg.Session.ToolTranscriptEnabled {
+		t.Error("session.tool_transcript_enabled 缺席时被解析成了 true：G3 必须默认关")
+	}
+}
+
+// 显式打开要生效——否则这个开关等于不存在。
+func TestToolTranscriptCanBeTurnedOn(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(path, []byte(`{"session":{"enabled":true,"tool_transcript_enabled":true}}`), 0o600); err != nil {
+		t.Fatalf("WriteFile(%q) error = %v, want nil", path, err)
+	}
+
+	cfg, err := Load(context.Background(), Options{Path: path})
+	if err != nil {
+		t.Fatalf("Load(%q) error = %v, want nil", path, err)
+	}
+	if !cfg.Session.ToolTranscriptEnabled {
+		t.Error("显式配 true 没有生效")
+	}
+}
+
 func TestDefaultSessionCacheConfig(t *testing.T) {
 	// Not parallel: it points STARDUST_HOME at an empty directory, and a test
 	// that reads "no config file" must not depend on whether the developer
