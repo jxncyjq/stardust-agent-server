@@ -100,9 +100,30 @@ func translate(ev domain.RuntimeEvent) observability.EventEnvelope {
 	if ev.ElapsedMs != 0 {
 		data["elapsed_ms"] = ev.ElapsedMs
 	}
+	subject := ev.TaskID
+	// A session_event frame addresses ONE event of ONE session log (spec §7).
+	// The three keys below are its entire contract with the front end: it tracks
+	// seq continuity, and on a gap it back-fills from
+	// GET /v1/sessions/{id}/events?from_seq= rather than guessing.
+	//
+	// seq is written UNCONDITIONALLY, unlike every "omit when zero" field above:
+	// seq 0 is the first event of a log, and a frame that dropped it would tell
+	// a subscriber "no seq here" for a position that very much exists. The
+	// zero-value shorthand is only safe for fields whose zero means "not
+	// reported"; seq's zero means zero.
+	//
+	// The subject is the session rather than the task, because the session log
+	// is what this frame is about — a subscriber filtering by subject wants one
+	// session's trajectory, not one task's lifecycle.
+	if ev.Type == domain.RuntimeEventSessionEvent {
+		data["session_id"] = ev.SessionID
+		data["seq"] = ev.Seq
+		data["event_type"] = ev.SessionEventType
+		subject = ev.SessionID
+	}
 	return observability.EventEnvelope{
 		Type:      ev.Type,
-		SubjectID: ev.TaskID,
+		SubjectID: subject,
 		Data:      data,
 		CreatedAt: ev.CreatedAt,
 	}

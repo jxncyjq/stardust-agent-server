@@ -60,6 +60,11 @@ type SessionStore interface {
 	GetAgentSession(ctx context.Context, sessionID string) (domain.AgentSession, bool, error)
 	SaveAgentSession(ctx context.Context, session domain.AgentSession) error
 	DeleteAgentSession(ctx context.Context, sessionID string) error
+	// ReadFrom 返回 seq >= fromSeq 的会话事件，按 seq 升序。读路径只走它、绝不走
+	// Load：Load 会替未收尾的日志补事件并落盘，而它的调用契约是「只对确定没有活跃
+	// 写入者的会话调用」（spec §4.3.1 第 3 条）——这个端点在任务执行期间也会被前端
+	// 拉，两者不相容。
+	ReadFrom(ctx context.Context, sessionID string, fromSeq int64) ([]domain.SessionEvent, error)
 }
 
 type MessageStore interface {
@@ -337,9 +342,16 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleListSessions(rec, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/sessions/") && strings.HasSuffix(r.URL.Path, "/turns"):
 		s.handleListSessionTurns(rec, r)
-	case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/v1/sessions/") && !strings.HasSuffix(r.URL.Path, "/turns"):
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/sessions/") && strings.HasSuffix(r.URL.Path, "/events"):
+		s.handleSessionEvents(rec, r)
+	// 会话本体的写：判据是「路径解出了一个会话 id」，而不是「路径不以某个已知子资源
+	// 后缀结尾」。后者每加一个子资源就要补一条排除，漏补一次就意味着
+	// DELETE /v1/sessions/{id}/events 落进会话删除分支——数据损坏级的错误。
+	// sessionIDFromPath 只在 /v1/sessions/{id} 这一种形状上返回非空，于是子资源
+	// 路径天然被排除，将来再加也不必回头改这里。
+	case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, "/v1/sessions/") && sessionIDFromPath(r.URL.Path) != "":
 		s.handlePatchSession(rec, r)
-	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1/sessions/") && !strings.HasSuffix(r.URL.Path, "/turns"):
+	case r.Method == http.MethodDelete && strings.HasPrefix(r.URL.Path, "/v1/sessions/") && sessionIDFromPath(r.URL.Path) != "":
 		s.handleDeleteSession(rec, r)
 	case (r.Method == http.MethodGet || r.Method == http.MethodPost) && strings.HasPrefix(r.URL.Path, "/v1/agents/") && strings.HasSuffix(r.URL.Path, "/messages"):
 		s.handleAgentMessages(rec, r)

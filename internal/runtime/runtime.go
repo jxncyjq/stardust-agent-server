@@ -447,6 +447,52 @@ func (r *Runtime) Interrupt() {
 	r.interrupted.Store(true)
 }
 
+// publishSessionEvents announces one durably-appended batch of session events on
+// the runtime event bus, one RuntimeEvent per event (spec §7). It is the
+// notifier eventRecorder.flush calls after Append succeeds, and it is the only
+// producer of domain.RuntimeEventSessionEvent.
+//
+// # What the frame carries, and what it deliberately does not
+//
+// session_id + seq + event_type, and nothing of the event's own payload. The
+// frame is a NOTIFICATION: a subscriber that wants the event reads it back from
+// GET /v1/sessions/{id}/events?from_seq=. Putting the payload in would let one
+// large event (an assistant message, a tool result) flood a stream that also
+// carries every other lifecycle event — and the stream is at-most-once anyway,
+// so a payload delivered over it could never be relied on.
+//
+// A subscriber detects a miss by seq continuity and back-fills from the
+// endpoint, which is why the seq here must be the one the store actually
+// accepted (it is: flush passes the persisted batch) and why a lost frame is
+// recoverable while a WRONG seq is not — a wrong seq reads as "nothing was
+// missed".
+//
+// # Why a publish failure does not fail the run
+//
+// By the time this is called the events are already durable. Turning a
+// notification-channel failure into a flush failure would make the fail-closed
+// barrier abort a task whose log is intact, over a channel whose loss the
+// consumer is designed to recover from — and the barrier could not even retry
+// usefully, since flush has already cleared the buffer. So the failure is
+// handled here, at its boundary, and recorded (Warn) with the session and the
+// seq range it covers: not propagating is a decision about scope, and it is not
+// a licence to swallow it silently.
+func (r *Runtime) publishSessionEvents(ctx context.Context, taskID, sessionID string, events []domain.SessionEvent) {
+	for _, event := range events {
+		if err := r.events.Publish(ctx, domain.RuntimeEvent{
+			Type:             domain.RuntimeEventSessionEvent,
+			TaskID:           taskID,
+			SessionID:        sessionID,
+			Seq:              event.Seq,
+			SessionEventType: string(event.Type),
+			CreatedAt:        event.Time,
+		}); err != nil {
+			r.logger.Warn("publish session event frame failed",
+				"session_id", sessionID, "seq", event.Seq, "event_type", string(event.Type), "err", err)
+		}
+	}
+}
+
 // newTaskRecorder builds this run's session event recorder (spec §5) and
 // resolves the turn number it opens with.
 //
@@ -483,7 +529,13 @@ func (r *Runtime) Interrupt() {
 //     which a fail-closed barrier turns into a failed task. Do not move this
 //     read outside the lock.
 func (r *Runtime) newTaskRecorder(ctx context.Context, task domain.Task) (*eventRecorder, int, error) {
-	rec := newEventRecorder(r.sessionEvents, task)
+	// 通知口在这里装配：Runtime 是持有事件总线的那一层（runtime.go 里每一处
+	// r.events.Publish 都在这一层），记录器只负责说「这批带这些 seq 的事件落盘了」。
+	// 闭包捕获 task.ID 是为了让帧也带上任务号——GUI 用它把会话事件对到任务上——
+	// 而不必让通知口的签名替记录器多背一个身份字段。
+	rec := newEventRecorder(r.sessionEvents, task, func(ctx context.Context, sessionID string, events []domain.SessionEvent) {
+		r.publishSessionEvents(ctx, task.ID, sessionID, events)
+	})
 	if r.sessionEvents == nil {
 		return rec, 0, nil
 	}
@@ -889,7 +941,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 			}
 		}
 		st.convo.appendAssistant(st.resp.Text, calls)
-		results, err := r.executeToolCalls(ctx, agent, task, &st)
+		results, rendered, err := r.executeToolCalls(ctx, agent, task, &st)
 		if err != nil {
 			// executeToolCalls records tool/call + tool/result around every
 			// dispatch it reaches (including the one whose error aborted the
@@ -901,7 +953,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 			r.recordLearningFailure(ctx, agent, task, evolution.FailureReasonToolError)
 			return domain.TaskRun{}, fmt.Errorf("execute model tool calls: %w", err)
 		}
-		st.convo.appendToolResults(calls, results, r.maxToolResultChars, r.toolRoot, sessionCacheDir(task), r.logger)
+		st.convo.appendToolResults(calls, rendered)
 		// P2: same-tool failure warning. Count failures by tool NAME (not
 		// callsKey) so "same tool, different args" failing repeatedly is caught.
 		// Warn only — the loop cap is the hard stop.
@@ -1471,15 +1523,38 @@ func disambiguateCallIDs(calls []domain.ToolCall, taskID string) []string {
 }
 
 // executeToolCalls runs the current round's tool calls and returns their
-// results. It takes the mutable *loopState so a dispatched load_capabilities can
-// pin definitions into st.loaded and the caller sees the write when it composes
-// the next round's prompt; it reads the pending calls, effective registry and
-// catalog off st for the same reason.
-func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task domain.Task, st *loopState) ([]domain.ToolResult, error) {
+// results together with the text each one reaches the model as, keyed by call
+// ID (what conversation.appendToolResults appends). It takes the mutable
+// *loopState so a dispatched load_capabilities can pin definitions into
+// st.loaded and the caller sees the write when it composes the next round's
+// prompt; it reads the pending calls, effective registry and catalog off st for
+// the same reason.
+//
+// The rendering happens HERE, per call, rather than in appendToolResults where
+// it used to: renderToolResultContent writes the spill file whose path is spec
+// §4.1's spill_locator, and the tool/result event recorded a few lines below has
+// to carry that locator. Rendering after the round would put the file's creation
+// after the event that names it (and, for a multi-call round, after that event
+// was already flushed by the next call's pre-dispatch barrier). Rendering first
+// also means the file exists by the time an event points at it.
+func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task domain.Task, st *loopState) ([]domain.ToolResult, map[string]string, error) {
 	if st.tools == nil {
-		return nil, fmt.Errorf("tool registry unavailable")
+		return nil, nil, fmt.Errorf("tool registry unavailable")
 	}
 	calls := st.resp.ToolCalls
+	cacheDir := sessionCacheDir(task)
+	rendered := make(map[string]string, len(calls))
+	// render turns one finished call into the text the model sees, records that
+	// text under the call's ID, and hands back the spill locator for the
+	// tool/result event. Both outputs come from ONE renderToolResultContent call
+	// so the file named in the event and the footer shown to the model can never
+	// name different files.
+	render := func(toolName string, res domain.ToolResult) string {
+		text, spillLocator := renderToolResultContent(toolName, modelFacingToolContent(res),
+			r.maxToolResultChars, r.toolRoot, cacheDir, r.logger)
+		rendered[res.CallID] = text
+		return spillLocator
+	}
 	// spec §4.3.1 rule 4: within one step, two unanswered tool/call events must
 	// not share a call_id -- the projection pairs a result to its call by that
 	// id alone (rule 2), so two live calls under one id make the pair
@@ -1501,7 +1576,7 @@ func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task
 			Message:   call.Name,
 			CreatedAt: time.Now(),
 		}); err != nil {
-			return nil, fmt.Errorf("publish tool request event: %w", err)
+			return nil, nil, fmt.Errorf("publish tool request event: %w", err)
 		}
 		// spec §5 barrier 2: tool/call must be durably on disk BEFORE dispatch,
 		// not after. Otherwise a crash inside the tool body -- the one place a
@@ -1525,7 +1600,7 @@ func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task
 			// recording less (spec §4.3.1 rule 1 guards the opposite direction),
 			// so take it back before returning.
 			st.events.dropBufferedToolCall(call.ID)
-			return nil, fmt.Errorf("session event barrier before dispatching call %s for task %s: %w", call.ID, task.ID, err)
+			return nil, nil, fmt.Errorf("session event barrier before dispatching call %s for task %s: %w", call.ID, task.ID, err)
 		}
 		dispatchStart := time.Now()
 		result, err := r.dispatchToolCall(ctx, agent, task, call, st)
@@ -1536,20 +1611,27 @@ func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task
 			// is exactly that case (the call never produced a domain.ToolResult
 			// at all), so it is recorded here rather than silently only living
 			// on as the synthesized ToolResult fed back to the model below.
-			st.events.recordToolResult(call.ID, err.Error(), true, dispatchDur)
+			//
+			// Rendered first, and from the SAME synthesized result that is fed
+			// back below, so a dispatch error long enough to be spilled reaches
+			// the trajectory with a locator too -- and so the text the model is
+			// shown and the file the event names come from one render.
+			failed := domain.ToolResult{CallID: call.ID, Success: false, Error: err.Error()}
+			spillLocator := render(call.Name, failed)
+			st.events.recordToolResult(call.ID, err.Error(), true, dispatchDur, spillLocator)
 			if pubErr := r.events.Publish(ctx, domain.RuntimeEvent{
 				Type:      "tool_failed",
 				TaskID:    task.ID,
 				Message:   call.Name,
 				CreatedAt: time.Now(),
 			}); pubErr != nil {
-				return nil, fmt.Errorf("publish tool failed event: %w", pubErr)
+				return nil, nil, fmt.Errorf("publish tool failed event: %w", pubErr)
 			}
 			// Feed the tool error back to the model instead of failing the task.
 			// The error is already surfaced via the tool_failed event and is
 			// rendered into the next prompt by promptWithToolResults, so the
 			// model can recover or answer directly on the following round.
-			results = append(results, domain.ToolResult{CallID: call.ID, Success: false, Error: err.Error()})
+			results = append(results, failed)
 			continue
 		}
 		// One id for this call, everywhere: the tool/call above was recorded
@@ -1570,17 +1652,23 @@ func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task
 		if !result.Success {
 			preview = result.Error
 		}
-		st.events.recordToolResult(call.ID, preview, !result.Success, dispatchDur)
+		// Its own statement, not an argument expression: render is what WRITES
+		// the spill file, and the event below names that file. An event naming a
+		// file that does not exist yet is a locator the trajectory cannot
+		// follow, so the ordering is load-bearing and must not rest on Go's
+		// argument-evaluation order.
+		spillLocator := render(call.Name, result)
+		st.events.recordToolResult(call.ID, preview, !result.Success, dispatchDur, spillLocator)
 		if call.Name == "write_file" {
 			raw, ok := call.Arguments["path"]
 			if !ok || strings.TrimSpace(raw) == "" {
 				// write_file's contract always carries a path; a reported success
 				// without one is an invariant violation, not an optional field.
-				return nil, fmt.Errorf("write_file for task %s reported success without a path argument", task.ID)
+				return nil, nil, fmt.Errorf("write_file for task %s reported success without a path argument", task.ID)
 			}
 			rel, err := workspaceRelPath(task.WorkingDir, raw)
 			if err != nil {
-				return nil, fmt.Errorf("normalize generated file %q for task %s: %w", raw, task.ID, err)
+				return nil, nil, fmt.Errorf("normalize generated file %q for task %s: %w", raw, task.ID, err)
 			}
 			st.generatedFiles = appendUniqueStr(st.generatedFiles, rel)
 		}
@@ -1590,7 +1678,7 @@ func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task
 			Message:   result.Output,
 			CreatedAt: time.Now(),
 		}); err != nil {
-			return nil, fmt.Errorf("publish tool result event: %w", err)
+			return nil, nil, fmt.Errorf("publish tool result event: %w", err)
 		}
 		if err := r.events.Publish(ctx, domain.RuntimeEvent{
 			Type:      "tool_executed",
@@ -1598,10 +1686,10 @@ func (r *Runtime) executeToolCalls(ctx context.Context, agent domain.Agent, task
 			Message:   call.Name,
 			CreatedAt: time.Now(),
 		}); err != nil {
-			return nil, fmt.Errorf("publish tool executed event: %w", err)
+			return nil, nil, fmt.Errorf("publish tool executed event: %w", err)
 		}
 	}
-	return results, nil
+	return results, rendered, nil
 }
 
 // workspaceRelPath normalizes a write_file path (relative, or absolute within

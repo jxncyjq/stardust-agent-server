@@ -2,7 +2,6 @@ package runtime
 
 import (
 	"fmt"
-	"log/slog"
 	"slices"
 	"sort"
 	"strings"
@@ -59,31 +58,53 @@ func (c *conversation) appendAssistant(text string, calls []domain.ToolCall) {
 	})
 }
 
-// appendToolResults records one tool turn per executed call, paired by call ID.
-// A failed call is reported to the model as its own tool turn rather than being
-// dropped: the model needs to see the failure to recover, and a provider
-// rejects an assistant tool call left unanswered. Oversized successful results
-// are cached to toolRoot/cacheDir and replaced with a preview + read_file footer
-// (renderToolResultContent); an empty toolRoot or a read_file result degrades to
-// plain self-describing truncation.
-func (c *conversation) appendToolResults(calls []domain.ToolCall, results []domain.ToolResult, maxResultChars int, toolRoot, cacheDir string, logger *slog.Logger) {
-	byID := make(map[string]domain.ToolResult, len(results))
-	for _, res := range results {
-		byID[res.CallID] = res
+// modelFacingToolContent is the raw text one tool result reaches the model as,
+// before any truncation or spilling: the output on success, an explicitly
+// labelled failure line otherwise. A failed call is reported to the model
+// rather than dropped — the model needs to see the failure to recover, and a
+// provider rejects an assistant tool call left unanswered.
+//
+// It lives here, next to appendToolResults, but is applied at DISPATCH time
+// (executeToolCalls) because the rendering that consumes it has to happen there:
+// see appendToolResults for why. One function so the two sites cannot drift into
+// spilling one string and showing the model another.
+func modelFacingToolContent(res domain.ToolResult) string {
+	if !res.Success {
+		return "failed: " + res.Error
 	}
+	return res.Output
+}
+
+// appendToolResults records one tool turn per executed call, paired by call ID,
+// from content ALREADY rendered by renderToolResultContent (rendered is keyed by
+// call ID).
+//
+// The rendering deliberately does not happen here any more. It writes the spill
+// file whose path is spec §4.1's spill_locator, and the tool/result event that
+// must carry that locator is recorded inside executeToolCalls, one call at a
+// time, BEFORE this function runs for the round (and, for a multi-call round,
+// already flushed to disk by the next call's pre-dispatch barrier). Rendering
+// here would mean the locator only came into existence after the event that
+// needs it had been written — so the render moved to the dispatch site and the
+// text it produced is handed here. Rendering it twice instead was rejected: two
+// writes of the same content-addressed file, two chances to disagree.
+//
+// A call with no rendered entry is a wiring error, not a state to absorb:
+// executeToolCalls fills the map in the same loop that fills results, so every
+// dispatched call has one. Panicking here (fail-loud 铁律) keeps a future caller
+// from silently dropping a tool turn and leaving the provider with an
+// unanswered assistant tool call.
+func (c *conversation) appendToolResults(calls []domain.ToolCall, rendered map[string]string) {
 	for _, call := range calls {
-		res, ok := byID[call.ID]
+		content, ok := rendered[call.ID]
 		if !ok {
-			continue
-		}
-		content := res.Output
-		if !res.Success {
-			content = "failed: " + res.Error
+			panic(fmt.Sprintf("runtime: no rendered tool result for call %s (%s); "+
+				"every dispatched call must be answered back to the model", call.ID, call.Name))
 		}
 		c.messages = append(c.messages, port.InferenceMessage{
 			Role:       port.RoleTool,
 			ToolCallID: call.ID,
-			Content:    renderToolResultContent(call.Name, content, maxResultChars, toolRoot, cacheDir, logger),
+			Content:    content,
 		})
 	}
 }

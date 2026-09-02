@@ -32,12 +32,12 @@ func (stubEventStore) Load(context.Context, string) ([]domain.SessionEvent, erro
 func TestTheSessionIDFallsBackToTheTaskID(t *testing.T) {
 	t.Parallel()
 
-	withSession := newEventRecorder(stubEventStore{}, domain.Task{ID: "t1", SessionID: "s1"})
+	withSession := newEventRecorder(stubEventStore{}, domain.Task{ID: "t1", SessionID: "s1"}, nil)
 	if got := withSession.sessionID(); got != "s1" {
 		t.Errorf("sessionID() = %q, want %q", got, "s1")
 	}
 
-	withoutSession := newEventRecorder(stubEventStore{}, domain.Task{ID: "t1"})
+	withoutSession := newEventRecorder(stubEventStore{}, domain.Task{ID: "t1"}, nil)
 	if got := withoutSession.sessionID(); got != "t1" {
 		t.Errorf("sessionID() = %q, want the task id %q: 没有会话号的任务也要有自己的日志", got, "t1")
 	}
@@ -52,7 +52,7 @@ func TestARecorderWithNoIdentityIsRefused(t *testing.T) {
 			t.Error("既没有 SessionID 也没有 ID 的任务被接受了：写出来的事件谁也认不回去")
 		}
 	}()
-	newEventRecorder(stubEventStore{}, domain.Task{})
+	newEventRecorder(stubEventStore{}, domain.Task{}, nil)
 }
 
 // 有 SessionID、却没有 ID 的任务同样被拒。
@@ -71,7 +71,7 @@ func TestARecorderWithASessionButNoTaskIDIsRefused(t *testing.T) {
 				"会让全库的 session_search discovery 整体失效")
 		}
 	}()
-	newEventRecorder(stubEventStore{}, domain.Task{SessionID: "s1"})
+	newEventRecorder(stubEventStore{}, domain.Task{SessionID: "s1"}, nil)
 }
 
 // 没有配 store 的部署（内存后端、测试构造）不记事件。
@@ -81,7 +81,7 @@ func TestARecorderWithASessionButNoTaskIDIsRefused(t *testing.T) {
 func TestNoStoreMeansNoRecording(t *testing.T) {
 	t.Parallel()
 
-	rec := newEventRecorder(nil, domain.Task{ID: "t1"})
+	rec := newEventRecorder(nil, domain.Task{ID: "t1"}, nil)
 	if rec.enabled() {
 		t.Error("没有 store 却报告 enabled")
 	}
@@ -203,7 +203,7 @@ func TestOneRoundProducesTheExpectedSequence(t *testing.T) {
 	t.Parallel()
 
 	store := &captureEventStore{}
-	rec := newEventRecorder(store, domain.Task{ID: "t1", SessionID: "s1"})
+	rec := newEventRecorder(store, domain.Task{ID: "t1", SessionID: "s1"}, nil)
 	ctx := context.Background()
 
 	rec.recordTurnStart(0)
@@ -211,7 +211,7 @@ func TestOneRoundProducesTheExpectedSequence(t *testing.T) {
 	rec.recordStepStart()
 	rec.recordAssistantMessage("working", []domain.ToolCall{{ID: "c1", Name: "read_file"}}, eventUsage{}, "default", nil)
 	rec.recordToolCall(domain.ToolCall{ID: "c1", Name: "read_file"})
-	rec.recordToolResult("c1", "ok", false, time.Millisecond)
+	rec.recordToolResult("c1", "ok", false, time.Millisecond, "")
 	rec.recordStepEnd(domain.StepEndReasonCompleted)
 	rec.recordTurnEnd(domain.TurnEndReasonCompleted)
 	if err := rec.flush(ctx); err != nil {
@@ -245,7 +245,7 @@ func TestStepNumbersResetPerTurn(t *testing.T) {
 	t.Parallel()
 
 	store := &captureEventStore{}
-	rec := newEventRecorder(store, domain.Task{ID: "t1", SessionID: "s1"})
+	rec := newEventRecorder(store, domain.Task{ID: "t1", SessionID: "s1"}, nil)
 
 	rec.recordTurnStart(0)
 	rec.recordStepStart() // turn 0 step 0
@@ -276,10 +276,10 @@ func TestAToolResultCarriesAPreviewNotTheWholeOutput(t *testing.T) {
 	t.Parallel()
 
 	store := &captureEventStore{}
-	rec := newEventRecorder(store, domain.Task{ID: "t1", SessionID: "s1"})
+	rec := newEventRecorder(store, domain.Task{ID: "t1", SessionID: "s1"}, nil)
 	huge := strings.Repeat("x", maxEventPreviewRunes*3)
 
-	rec.recordToolResult("c1", huge, false, time.Millisecond)
+	rec.recordToolResult("c1", huge, false, time.Millisecond, "")
 	if err := rec.flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -318,7 +318,7 @@ func TestRecordAssistantMessageFlushesWithManyToolCalls(t *testing.T) {
 		calls[i] = domain.ToolCall{ID: fmt.Sprintf("call-%04d", i), Name: "read_file"}
 	}
 
-	rec := newEventRecorder(repo, domain.Task{ID: "t1", SessionID: "s1"})
+	rec := newEventRecorder(repo, domain.Task{ID: "t1", SessionID: "s1"}, nil)
 	rec.recordAssistantMessage(
 		strings.Repeat("x", maxEventPreviewRunes), // content 不小，逼近容量上限时的真实形状
 		calls, eventUsage{Prompt: 1, Completion: 2, Cached: 3, Total: 6}, "default", nil,
@@ -356,7 +356,7 @@ func TestABarrierFailsClosed(t *testing.T) {
 	t.Parallel()
 
 	store := &captureEventStore{err: errors.New("disk on fire")}
-	rec := newEventRecorder(store, domain.Task{ID: "t1", SessionID: "s1"})
+	rec := newEventRecorder(store, domain.Task{ID: "t1", SessionID: "s1"}, nil)
 	rec.recordToolCall(domain.ToolCall{ID: "c1", Name: "write_file"})
 
 	err := rec.barrier(context.Background(), "before dispatching a tool")
@@ -376,7 +376,7 @@ func TestAFailedBarrierKeepsTheEventsBuffered(t *testing.T) {
 	t.Parallel()
 
 	store := &captureEventStore{err: errors.New("disk on fire")}
-	rec := newEventRecorder(store, domain.Task{ID: "t1", SessionID: "s1"})
+	rec := newEventRecorder(store, domain.Task{ID: "t1", SessionID: "s1"}, nil)
 	rec.recordToolCall(domain.ToolCall{ID: "c1", Name: "write_file"})
 	_ = rec.barrier(context.Background(), "before dispatching a tool")
 
@@ -396,7 +396,7 @@ func TestAFailedBarrierKeepsTheEventsBuffered(t *testing.T) {
 func TestABarrierIsANoOpWithoutAStore(t *testing.T) {
 	t.Parallel()
 
-	rec := newEventRecorder(nil, domain.Task{ID: "t1"})
+	rec := newEventRecorder(nil, domain.Task{ID: "t1"}, nil)
 	if err := rec.barrier(context.Background(), "before the model request"); err != nil {
 		t.Errorf("没有 store 的部署被屏障挡住了：%v", err)
 	}
@@ -409,7 +409,7 @@ func TestUserMessageEventCarriesEverythingAProjectionNeeds(t *testing.T) {
 	t.Parallel()
 
 	store := &captureEventStore{}
-	rec := newEventRecorder(store, domain.Task{ID: "task-7", SessionID: "sess-1", AgentID: "agent-a"})
+	rec := newEventRecorder(store, domain.Task{ID: "task-7", SessionID: "sess-1", AgentID: "agent-a"}, nil)
 	rec.recordTurnStart(0)
 	rec.recordUserMessage("请读一下 notes.md")
 	if err := rec.flush(context.Background()); err != nil {
@@ -432,7 +432,7 @@ func TestAssistantMessageEventCarriesEverythingAProjectionNeeds(t *testing.T) {
 	t.Parallel()
 
 	store := &captureEventStore{}
-	rec := newEventRecorder(store, domain.Task{ID: "task-7", SessionID: "sess-1", AgentID: "agent-a"})
+	rec := newEventRecorder(store, domain.Task{ID: "task-7", SessionID: "sess-1", AgentID: "agent-a"}, nil)
 	rec.recordTurnStart(0)
 	rec.recordStepStart()
 	rec.recordAssistantMessage(
@@ -470,7 +470,7 @@ func TestConversationContentIsStoredWhole(t *testing.T) {
 
 	long := strings.Repeat("话", 5000) // 远超 maxEventPreviewRunes = 2000
 	store := &captureEventStore{}
-	rec := newEventRecorder(store, domain.Task{ID: "task-7", SessionID: "sess-1", AgentID: "agent-a"})
+	rec := newEventRecorder(store, domain.Task{ID: "task-7", SessionID: "sess-1", AgentID: "agent-a"}, nil)
 	rec.recordTurnStart(0)
 	rec.recordUserMessage(long)
 	rec.recordStepStart()
@@ -501,7 +501,7 @@ func TestDuplicateTurnIDCoordinatePanics(t *testing.T) {
 	t.Parallel()
 
 	store := &captureEventStore{}
-	rec := newEventRecorder(store, domain.Task{ID: "task-7", SessionID: "sess-1", AgentID: "agent-a"})
+	rec := newEventRecorder(store, domain.Task{ID: "task-7", SessionID: "sess-1", AgentID: "agent-a"}, nil)
 	rec.recordTurnStart(0)
 	rec.recordStepStart()
 	rec.recordAssistantMessage("第一条", nil, eventUsage{}, "fast", nil)
@@ -535,7 +535,7 @@ func TestDuplicateTurnIDCoordinatePanics(t *testing.T) {
 func TestDisabledRecorderDoesNotTrackTurnIDCoordinates(t *testing.T) {
 	t.Parallel()
 
-	rec := newEventRecorder(nil, domain.Task{ID: "t1"})
+	rec := newEventRecorder(nil, domain.Task{ID: "t1"}, nil)
 	rec.recordTurnStart(0)
 	rec.recordStepStart()
 	rec.recordAssistantMessage("第一条", nil, eventUsage{}, "fast", nil)
@@ -558,4 +558,46 @@ func payloadOfType(t *testing.T, events []domain.SessionEvent, typ domain.Sessio
 	}
 	t.Fatalf("日志里没有 %s 事件", typ)
 	return nil
+}
+
+// spec §4.1 声明了 spill_locator：tool/result 只存预览，全文落在工具根下的缓存文件里，
+// 定位符是取回全文的唯一线索。没有它，轨迹里点开一条被截断的结果就没有下文。
+func TestAToolResultEventCarriesTheSpillLocator(t *testing.T) {
+	t.Parallel()
+
+	store := &captureEventStore{}
+	rec := newEventRecorder(store, domain.Task{ID: "task-7", SessionID: "sess-1", AgentID: "agent-a"}, nil)
+	rec.recordTurnStart(0)
+	rec.recordStepStart()
+	const locator = ".stardust/tool_results/sess-1/fetch_url-abc1234567.md"
+	rec.recordToolResult("c1", "预览片段", false, 12*time.Millisecond, locator)
+	if err := rec.flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	data := payloadOfType(t, store.events, domain.SessionEventToolResult)
+	if got := data["spill_locator"]; got != locator {
+		t.Errorf("spill_locator = %v，要 %s", got, locator)
+	}
+}
+
+// 没有 spill 时定位符为空串——结果没超长就没有全文文件。
+// 这是契约显式声明的可选，不是兜底。
+func TestAToolResultWithoutSpillCarriesAnEmptyLocator(t *testing.T) {
+	t.Parallel()
+
+	store := &captureEventStore{}
+	rec := newEventRecorder(store, domain.Task{ID: "task-7", SessionID: "sess-1", AgentID: "agent-a"}, nil)
+	rec.recordTurnStart(0)
+	rec.recordStepStart()
+	rec.recordToolResult("c1", "短结果", false, time.Millisecond, "")
+	if err := rec.flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	data := payloadOfType(t, store.events, domain.SessionEventToolResult)
+	got, ok := data["spill_locator"].(string)
+	if !ok || got != "" {
+		t.Errorf("spill_locator = %v，要空串（字段必须在，取值为空）", data["spill_locator"])
+	}
 }

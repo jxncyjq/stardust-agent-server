@@ -193,9 +193,36 @@ type RuntimeEvent struct {
 	// GeneratedFiles carries workspace-relative paths of files the task produced
 	// via write_file; populated on the task_completed event. Empty for events
 	// that produced no files (a legitimate optional, not a fallback).
-	GeneratedFiles []string  `json:"generated_files,omitempty"`
-	CreatedAt      time.Time `json:"created_at"`
+	GeneratedFiles []string `json:"generated_files,omitempty"`
+	// SessionID / Seq / SessionEventType address ONE session event that was
+	// just durably appended to the session event log. They are populated only
+	// on RuntimeEventSessionEvent events (spec §7) and are zero on every other
+	// type.
+	//
+	// The three of them are the whole payload of that notification on purpose:
+	// the frame says "session S now has an event at seq N of kind K", and a
+	// consumer that wants the event itself reads it back from
+	// GET /v1/sessions/{id}/events?from_seq=. Carrying the event's own Data
+	// here would let one large event flood a stream that also carries every
+	// other lifecycle event.
+	//
+	// Seq is contract-REQUIRED on a session_event and 0 is a real value (it is
+	// the first event of a log), so no consumer may read a zero Seq as
+	// "absent". The `omitempty` below is about this struct's own JSON (the
+	// /v1/runtime-events listing, where the session fields are noise on the
+	// other 99% of events) — it is NOT the SSE frame, which is built field by
+	// field in eventbridge.translate and always emits seq.
+	SessionID        string    `json:"session_id,omitempty"`
+	Seq              int64     `json:"seq,omitempty"`
+	SessionEventType string    `json:"session_event_type,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
 }
+
+// RuntimeEventSessionEvent is the Type of the notification published once per
+// session event that reaches the session event log, and therefore the SSE frame
+// type (`event: session_event`) a trajectory front end subscribes to with
+// /v1/events?type=session_event.
+const RuntimeEventSessionEvent = "session_event"
 
 type ConversationRole string
 

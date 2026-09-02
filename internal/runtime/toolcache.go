@@ -40,17 +40,37 @@ const (
 // the model still gets a usable, self-describing answer. A sandbox-escape
 // failure (port.ErrPathOutsideWorkspace, "本不该发生") is logged at Error; other
 // write failures (disk full, etc.) at Warn.
-func renderToolResultContent(toolName, content string, maxResultChars int, toolRoot, cacheDir string, logger *slog.Logger) string {
+//
+// The SECOND return value is the spill locator (spec §4.1's spill_locator): the
+// TOOL-ROOT-RELATIVE path of the file holding the full text, which is the only
+// clue a trajectory viewer has for fetching what the preview cut off. It is the
+// empty string on every path that wrote no such file — that is the contract's
+// declared optional ("结果没超长就没有全文文件"), NOT a fallback for an error:
+//
+//   - maxResultChars <= 0 (folding disabled): nothing was truncated, so there is
+//     no full-text file to point at.
+//   - Within maxResultChars: same — the model already has the whole thing.
+//   - Oversized but NOT cacheable (empty toolRoot / read_file): truncateText
+//     writes nothing to disk, so no file exists to name.
+//   - Cache write FAILED: the failure is already logged loudly above; the full
+//     text genuinely does not exist on disk, so naming a path would point the
+//     trajectory at a file that is not there. Empty is the honest answer.
+//   - Cache write succeeded: relPath, the path the footer also hands the model.
+//
+// Before this, relPath only ever reached the model's footer text; no caller
+// could see it, so the event log had no way to carry it and a truncated tool
+// result in the trajectory had no continuation.
+func renderToolResultContent(toolName, content string, maxResultChars int, toolRoot, cacheDir string, logger *slog.Logger) (string, string) {
 	if maxResultChars <= 0 {
-		return content
+		return content, ""
 	}
 	runes := []rune(content)
 	total := len(runes)
 	if total <= maxResultChars {
-		return content
+		return content, ""
 	}
 	if strings.TrimSpace(toolRoot) == "" || toolName == "read_file" {
-		return truncateText(content, maxResultChars)
+		return truncateText(content, maxResultChars), ""
 	}
 	relPath, err := writeToolResultCache(toolRoot, cacheDir, toolName, content)
 	if err != nil {
@@ -65,7 +85,7 @@ func renderToolResultContent(toolName, content string, maxResultChars int, toolR
 		} else {
 			logger.Warn(msg, attrs...)
 		}
-		return truncateText(content, maxResultChars)
+		return truncateText(content, maxResultChars), ""
 	}
 	return string(runes[:maxResultChars]) + fmt.Sprintf(
 		"\n\n──────── [输出被硬截断 / OUTPUT HARD-TRUNCATED] ────────\n"+
@@ -73,7 +93,7 @@ func renderToolResultContent(toolName, content string, maxResultChars int, toolR
 			"This is a hard truncation; retrying won't help. The result is saved to a file — page through it with read_file.\n"+
 			"显示 %d / 共 %d 字符（rune）。\n"+
 			"取回剩余：read_file path=%q offset=%d\n",
-		maxResultChars, total, relPath, maxResultChars)
+		maxResultChars, total, relPath, maxResultChars), relPath
 }
 
 // writeToolResultCache writes content to toolRoot/cacheDir/<tool>-<hash>.md,
