@@ -816,6 +816,7 @@ git commit -m "feat(runtime): tool/result 带上全文定位符"
 - 首屏与翻页：`GET /v1/sessions/{id}/events?from_seq=&limit=`，响应带 `next_seq`
 - 实时追加：SSE 的 `session_event` 帧，带 `session_id` + `seq`；**按 seq 连续性判断漏帧，漏了回到上面那个端点从断点补拉**，不要猜
 - 工具结果全文：事件里的 `spill_locator` 直接交给 `/v1/files?session_id=<sid>&path=<locator>`
+- **这条同源关系仅当会话绑定了 `working_dir` 时成立**：未绑定 `working_dir` 的会话，`spill_locator` 仍可能非空（工具根回退到 `ContextFiles.Root`），但 `/v1/files` 对空 `WorkingDir` 直接 404「session has no working directory」，取不回全文。P4b 必须把这个 404 当成「全文不可得」的合法结果来渲染（例如「全文不可用」的占位态），**不要**当成错误弹窗或网络故障处理。
 - GUI 已有 SSE 桥（`sse_bridge.go` → Wails 事件），新帧走同一条桥，不要新开流
 
 ## 本期已知、不在范围内的事

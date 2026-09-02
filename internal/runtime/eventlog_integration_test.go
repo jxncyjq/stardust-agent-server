@@ -772,6 +772,102 @@ func newTestRuntimeWithOversizedTool(t *testing.T, store port.SessionEventStore,
 	})
 }
 
+// newTestRuntimeWithFailingToolOversizedError builds a Runtime whose one
+// registered tool's handler returns a Go error (not a domain.ToolResult) long
+// enough to be spilled to disk -- the shape
+// TestDispatchErrorRecordsASpillLocatorThatNamesARealFile needs to exercise
+// the DISPATCH-ERROR emission point in executeToolCalls (runtime.go's
+// `if err != nil` branch around recordToolResult(call.ID, err.Error(), true,
+// ...)), as distinct from the successful-dispatch emission point a few lines
+// below it that newTestRuntimeWithOversizedTool / TestRunTaskRecordsASpillLocatorThatNamesARealFile
+// already guards.
+func newTestRuntimeWithFailingToolOversizedError(t *testing.T, store port.SessionEventStore, toolRoot string, errMsg string) *Runtime {
+	t.Helper()
+	audit := adapter.NewMemoryAuditLog()
+	registry := tool.NewRegistry(
+		tool.NewExecutionPolicy(tool.ExecutionPolicyConfig{AutoAllowTools: []string{"lookup"}}),
+		tool.PermissionEnforcerFunc(func(domain.Agent, domain.ToolCall) error { return nil }),
+		tool.NoopGuardrails{},
+	).WithAuditLog(audit)
+	registry.RegisterDescriptor(tool.Descriptor{
+		Name:        "lookup",
+		Description: "lookup test data",
+		InputSchema: map[string]any{
+			"required":   []string{"query"},
+			"properties": map[string]any{"query": map[string]any{"type": "string"}},
+		},
+	}, tool.HandlerFunc(func(_ context.Context, _ domain.ToolCall) (domain.ToolResult, error) {
+		// A Go error, not a ToolResult{Success:false} -- this is what makes
+		// executeToolCalls take the `err != nil` dispatch-error branch instead
+		// of the ordinary successful-dispatch branch.
+		return domain.ToolResult{}, errors.New(errMsg)
+	}))
+	return NewRuntime(Config{
+		Gate: taskgate.NewTaskGate(),
+		Maas: &toolThenAnswerMaas{
+			calls: []domain.ToolCall{{ID: "lookup-1", Name: "lookup", Arguments: map[string]string{"query": "cache"}}},
+			// Same hard-truncation footer text newTestRuntimeWithOversizedTool
+			// uses: it only appears once the oversized result actually goes
+			// through the cache-and-footer render path, which is exactly what
+			// this test needs to confirm happened on the ERROR branch too.
+			marker: "输出被硬截断",
+			answer: "查不到，先这样回答",
+		},
+		Audit:              audit,
+		MaxToolRounds:      3,
+		Events:             adapter.NewMemoryEventBus(),
+		Tools:              registry,
+		SessionEvents:      store,
+		ToolRoot:           toolRoot,
+		MaxToolResultChars: 200,
+	})
+}
+
+// 接线守卫（dispatch 错误路径）：runtime.go 里第二个 recordToolResult 发射点——
+// dispatchToolCall 返回 Go error 时那条——同样必须传真实的 spill_locator，不是
+// 一路传空串到事件里。这条测试是 TestRunTaskRecordsASpillLocatorThatNamesARealFile
+// 在错误分支上的对称版：两个生产发射点各自有测试守着，其中一个改坏了，只有对应的
+// 那条测试会红，不会两条一起哑。
+//
+// 断言同样用证据而不是形状：拿事件里的定位符去 toolRoot 下 Stat，文件必须真的在，
+// 内容必须真的是这次 dispatch 错误的全文（"failed: " 前缀 + handler 返回的 error）。
+func TestDispatchErrorRecordsASpillLocatorThatNamesARealFile(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	errMsg := strings.Repeat("X", 5000)
+	store := &captureEventStore{}
+	rt := newTestRuntimeWithFailingToolOversizedError(t, store, root, errMsg)
+
+	if _, err := rt.RunTask(context.Background(), domain.Agent{ID: "a1"},
+		domain.Task{ID: "t1", SessionID: "s1", Input: "跑一下那个会失败的 lookup"}); err != nil {
+		t.Fatalf("RunTask: %v", err)
+	}
+
+	data := payloadOfType(t, store.events, domain.SessionEventToolResult)
+	if isError, ok := data["is_error"].(bool); !ok || !isError {
+		t.Fatalf("tool/result 载荷的 is_error = %v，want true：这条结果本该来自 dispatch 错误分支", data["is_error"])
+	}
+	locator, ok := data["spill_locator"].(string)
+	if !ok {
+		t.Fatalf("tool/result 载荷里没有字符串字段 spill_locator：%v", data)
+	}
+	if locator == "" {
+		t.Fatal("spill_locator 是空串，但这次 dispatch 错误的全文确实超长并落了盘：" +
+			"dispatch 错误分支的渲染点与记录点之间的线没接上")
+	}
+	full := filepath.Join(root, filepath.FromSlash(locator))
+	got, err := os.ReadFile(full)
+	if err != nil {
+		t.Fatalf("按 spill_locator=%q 在工具根 %q 下取全文失败：%v（定位符必须是工具根相对路径）",
+			locator, root, err)
+	}
+	wantBody := "failed: " + errMsg
+	if string(got) != wantBody {
+		t.Errorf("取回的全文长度 = %d，要 %d：落盘的不是这次 dispatch 错误的全文", len(got), len(wantBody))
+	}
+}
+
 // 接线守卫：spill_locator 必须是**这次执行真的写出来的那个文件**的路径，而不是
 // 一路传空串到事件里。renderToolResultContent 落盘、recordToolResult 记录，两者
 // 之间的那根线断了，单看载荷断言（recordToolResult 直接收一个字面量）照样是绿的。
