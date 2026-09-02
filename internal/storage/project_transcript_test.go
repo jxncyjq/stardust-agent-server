@@ -226,8 +226,20 @@ func TestAnUnansweredCallIsNotAnnouncedInTheTranscript(t *testing.T) {
 
 // 内容是**预览**不是全文（spec §6：全文仍靠 read_file 按定位符取）。
 // 这条守的是 G3 的成本上界：把全文塞进每次请求正是它要避免的事。
+//
+// 判据是「投影不放大」：产出 ≤ 预览长度 + 定位符长度 + 一个常数尾巴，而不是某个与
+// 写入侧无关的魔数。夹具喂一条**贴着写入侧上限**的预览（internal/runtime 的
+// maxEventPreviewRunes = 2000，跨包引不到，这里按同值复刻并写明来源）：喂一条 6 个
+// 字的预览再断言「不超过 500」，只能证明「短的还是短的」——将来投影侧真的开始展开
+// 全文，只要单条预览不超 500 rune 它照样不红，护不住它声称的东西。
 func TestToolContentIsThePreviewNotTheWholeText(t *testing.T) {
-	const preview = "只有这一小段"
+	// 与 internal/runtime.maxEventPreviewRunes 同值：预览在写入侧就已经截到这里，
+	// 投影侧拿到的最长就是这么长。
+	const maxEventPreviewRunes = 2000
+	// 投影允许在预览外多写的东西：is_error 前缀加定位符那行的固定文字。
+	const renderOverheadRunes = 40
+	preview := strings.Repeat("每条预览都可能顶着写入侧的上限", maxEventPreviewRunes/15)
+	const locator = ".stardust/cache/read_file-abc.md"
 	msgs, err := projectTranscript("s", []domain.SessionEvent{
 		evWith(0, domain.SessionEventTurnStart, map[string]any{"turn": 0}),
 		evWith(1, domain.SessionEventUserMessage, map[string]any{
@@ -246,7 +258,7 @@ func TestToolContentIsThePreviewNotTheWholeText(t *testing.T) {
 		}),
 		evWith(5, domain.SessionEventToolResult, map[string]any{
 			"turn": 0, "step": 0, "call_id": "c1", "preview": preview, "is_error": false,
-			"spill_locator": ".stardust/cache/read_file-abc.md",
+			"spill_locator": locator,
 		}),
 		evWith(6, domain.SessionEventStepEnd, map[string]any{"turn": 0, "step": 0, "reason": "completed"}),
 		evWith(7, domain.SessionEventTurnEnd, map[string]any{"turn": 0, "reason": "completed"}),
@@ -262,9 +274,16 @@ func TestToolContentIsThePreviewNotTheWholeText(t *testing.T) {
 		if !strings.Contains(m.Content, preview) {
 			t.Errorf("tool 消息没有带预览：%q", m.Content)
 		}
-		// 定位符可以出现（让模型知道去哪取全文），但全文本身绝不能在这里。
-		if len([]rune(m.Content)) > 500 {
-			t.Errorf("tool 消息 %d runes，太长了——G3 的成本上界就是靠「只放预览」守的", len([]rune(m.Content)))
+		// 定位符可以出现（让模型知道去哪取全文），但全文本身绝不能在这里：
+		// 投影只许在预览之上加那点固定尾巴，不许放大。
+		if !strings.Contains(m.Content, locator) {
+			t.Errorf("tool 消息没有带定位符，模型不知道去哪取全文：%q", m.Content)
+		}
+		want := len([]rune(preview)) + len([]rune(locator)) + renderOverheadRunes
+		if got := len([]rune(m.Content)); got > want {
+			t.Errorf("tool 消息 %d runes > 预览 %d + 定位符 %d + 尾巴 %d = %d——"+
+				"投影把内容放大了，G3 的成本上界就是靠「只放预览」守的",
+				got, len([]rune(preview)), len([]rune(locator)), renderOverheadRunes, want)
 		}
 	}
 }
@@ -355,4 +374,311 @@ func TestACorruptPayloadIsRefusedByTypeAndSeq(t *testing.T) {
 			}
 		})
 	}
+}
+
+// 🔴 Critical-1 的守卫：同一条会话里两轮工具循环**都用 call_1**，每条 tool 消息
+// 必须拿到**自己那一轮**的结果。
+//
+// 这不是理论场景：spec §4.3.1 第 4 条明文允许跨 turn/step 复用 call_id（provider 的
+// tool call id 只保证单次响应内唯一，按序号生成 call_1 / tooluse_0 的实现是存在的），
+// 而 runtime 的 disambiguateCallIDs 只在单轮内去重——它的 used/arrived 两张表都是
+// 每次调用新建的局部变量。所以下面这份日志是合法且预期的，会原样落盘。
+//
+// 把配对键退回成会话级的 map[string]string（只按 call_id），第一轮的 tool 消息会拿到
+// 第二轮的结果，而且 port.InferenceRequest.Validate() 照样放行、provider 照单全收——
+// 模型读到一条张冠李戴的历史工具输出，没有任何东西会报错。这条测试就是那道警报。
+//
+// 事件形状抄自一次真实 RunTask 的事件日志（同一 turn、两个 step、两轮都是 call_1）。
+func TestTheSameCallIDInTwoRoundsPairsToItsOwnResult(t *testing.T) {
+	msgs, err := projectTranscript("s", []domain.SessionEvent{
+		evWith(0, domain.SessionEventTurnStart, map[string]any{"turn": 0}),
+		evWith(1, domain.SessionEventUserMessage, map[string]any{
+			"turn": 0, "turn_id": "t:user", "task_id": "t", "content": "先读再写",
+		}),
+		// 第一轮：call_1 = read_file。
+		evWith(2, domain.SessionEventStepStart, map[string]any{"turn": 0, "step": 0}),
+		evWith(3, domain.SessionEventAssistantMessage, map[string]any{
+			"turn": 0, "step": 0, "turn_id": "t:assistant", "task_id": "t", "agent_id": "a",
+			"content":       "先读",
+			"tool_calls":    []any{map[string]any{"call_id": "call_1", "name": "read_file"}},
+			"usage":         map[string]any{"prompt": 1, "completion": 1, "cached": 0, "total": 2},
+			"model_profile": "fast",
+		}),
+		evWith(4, domain.SessionEventToolCall, map[string]any{
+			"turn": 0, "step": 0, "call_id": "call_1", "name": "read_file", "arguments": "{}",
+		}),
+		evWith(5, domain.SessionEventToolResult, map[string]any{
+			"turn": 0, "step": 0, "call_id": "call_1", "preview": "READ 的结果", "is_error": false,
+		}),
+		evWith(6, domain.SessionEventStepEnd, map[string]any{"turn": 0, "step": 0, "reason": "completed"}),
+		// 第二轮：同一个 call_1，这次是 write_file。
+		evWith(7, domain.SessionEventStepStart, map[string]any{"turn": 0, "step": 1}),
+		evWith(8, domain.SessionEventAssistantMessage, map[string]any{
+			"turn": 0, "step": 1, "turn_id": "t:assistant", "task_id": "t", "agent_id": "a",
+			"content":       "再写",
+			"tool_calls":    []any{map[string]any{"call_id": "call_1", "name": "write_file"}},
+			"usage":         map[string]any{"prompt": 2, "completion": 1, "cached": 0, "total": 3},
+			"model_profile": "fast",
+		}),
+		evWith(9, domain.SessionEventToolCall, map[string]any{
+			"turn": 0, "step": 1, "call_id": "call_1", "name": "write_file", "arguments": "{}",
+		}),
+		evWith(10, domain.SessionEventToolResult, map[string]any{
+			"turn": 0, "step": 1, "call_id": "call_1", "preview": "WRITE 的结果", "is_error": false,
+		}),
+		evWith(11, domain.SessionEventStepEnd, map[string]any{"turn": 0, "step": 1, "reason": "completed"}),
+		evWith(12, domain.SessionEventTurnEnd, map[string]any{"turn": 0, "reason": "completed"}),
+	})
+	if err != nil {
+		t.Fatalf("projectTranscript: %v", err)
+	}
+
+	// 两条 tool 消息按出现顺序就是两轮的顺序（每条紧随宣告它的 assistant）。
+	var tools []port.InferenceMessage
+	for _, m := range msgs {
+		if m.Role == port.RoleTool {
+			tools = append(tools, m)
+		}
+	}
+	if len(tools) != 2 {
+		t.Fatalf("tool 消息 %d 条，要 2 条（两轮各一条）：%+v", len(tools), msgs)
+	}
+	if !strings.Contains(tools[0].Content, "READ 的结果") {
+		t.Errorf("第一轮的 tool 消息拿到了 %q，要「READ 的结果」——"+
+			"会话级 call_id 配对键会让第二轮的结果覆盖第一轮的，而 Validate() 放行、provider 照收", tools[0].Content)
+	}
+	if !strings.Contains(tools[1].Content, "WRITE 的结果") {
+		t.Errorf("第二轮的 tool 消息拿到了 %q，要「WRITE 的结果」", tools[1].Content)
+	}
+}
+
+// 🟠 Important-1 的裁定：过滤掉全部未答调用之后什么都不剩的 assistant 消息，整条跳过。
+//
+// 模型只返工具调用、不返文本时 content 就是 ""（很常见）。若这一步的调用全部未答
+// （硬崩），照样 append 会产出 {role:"assistant", content:"", tool_calls:nil}——
+// OpenAI 兼容 provider 拒收这种消息，而 port.InferenceRequest.Validate() 管不到它
+// （它只校验 role=tool 必须有 ToolCallID）。
+//
+// 裁定是跳过而不是塞占位内容：占位内容是替模型编一句它没说过的话。
+func TestAnAssistantMessageWithNothingLeftToSayIsSkipped(t *testing.T) {
+	msgs, err := projectTranscript("s", []domain.SessionEvent{
+		evWith(0, domain.SessionEventTurnStart, map[string]any{"turn": 0}),
+		evWith(1, domain.SessionEventUserMessage, map[string]any{
+			"turn": 0, "turn_id": "t:user", "task_id": "t", "content": "干活",
+		}),
+		evWith(2, domain.SessionEventStepStart, map[string]any{"turn": 0, "step": 0}),
+		evWith(3, domain.SessionEventAssistantMessage, map[string]any{
+			"turn": 0, "step": 0, "turn_id": "t:assistant", "task_id": "t", "agent_id": "a",
+			// 只调工具、不说话，然后硬崩：c1 没有结果。
+			"content":       "",
+			"tool_calls":    []any{map[string]any{"call_id": "c1", "name": "read_file"}},
+			"usage":         map[string]any{"prompt": 1, "completion": 1, "cached": 0, "total": 2},
+			"model_profile": "fast",
+		}),
+		evWith(4, domain.SessionEventToolCall, map[string]any{
+			"turn": 0, "step": 0, "call_id": "c1", "name": "read_file", "arguments": "{}",
+		}),
+	})
+	if err != nil {
+		t.Fatalf("projectTranscript: %v", err)
+	}
+
+	for i, m := range msgs {
+		if m.Role != port.RoleAssistant {
+			continue
+		}
+		if len(m.ToolCalls) == 0 && strings.TrimSpace(m.Content) == "" {
+			t.Errorf("msgs[%d] 是一条既无 content 也无 tool_calls 的 assistant 消息——provider 拒收它", i)
+		}
+	}
+	if len(msgs) != 1 || msgs[0].Role != port.RoleUser {
+		t.Fatalf("投影出 %+v，要只剩那条 user 消息", msgs)
+	}
+}
+
+// 有话说的 assistant 消息不会因为调用被过滤光就跟着消失——跳过的判据是「什么都不剩」，
+// 不是「没有 tool_calls」。这条钉住上一条测试不会被实现成「有 tool_calls 才留」。
+func TestAnAssistantMessageWithTextSurvivesWhenItsCallsAreFilteredOut(t *testing.T) {
+	msgs, err := projectTranscript("s", []domain.SessionEvent{
+		evWith(0, domain.SessionEventTurnStart, map[string]any{"turn": 0}),
+		evWith(1, domain.SessionEventAssistantMessage, map[string]any{
+			"turn": 0, "step": 0, "turn_id": "t:assistant", "task_id": "t", "agent_id": "a",
+			"content":       "我先想想，顺手读一下",
+			"tool_calls":    []any{map[string]any{"call_id": "c1", "name": "read_file"}},
+			"usage":         map[string]any{"prompt": 1, "completion": 1, "cached": 0, "total": 2},
+			"model_profile": "fast",
+		}),
+	})
+	if err != nil {
+		t.Fatalf("projectTranscript: %v", err)
+	}
+	if len(msgs) != 1 || msgs[0].Content != "我先想想，顺手读一下" || len(msgs[0].ToolCalls) != 0 {
+		t.Fatalf("投影出 %+v，要保留那条有正文的 assistant 消息、且不宣告未答的 c1", msgs)
+	}
+}
+
+// 🟠 Important-2 的连带裁定：挂起→恢复会把同一条响应的同一批 tool_calls 记成两条
+// assistant/message（runtime.go 的 resume 分支，挂起那一轮只记 step/end+turn/end，
+// **不记** tool/call / tool/result）。会话级配对键下两条 assistant 都查得到那唯一的
+// 结果，于是同一个 tool_call_id 在 transcript 里出现两次，token 成本翻倍。
+//
+// (turn, step, call_id) 键让挂起那一轮（turn 0）查不到任何结果——结果落在 turn 1——
+// 于是它不宣告，重复自然消失。这条测试把这个连带效果钉住。
+func TestAResumedTurnDoesNotAnnounceTheSameCallTwice(t *testing.T) {
+	msgs, err := projectTranscript("s", []domain.SessionEvent{
+		// 挂起的那一轮：记了响应，没来得及派发。
+		evWith(0, domain.SessionEventTurnStart, map[string]any{"turn": 0}),
+		evWith(1, domain.SessionEventUserMessage, map[string]any{
+			"turn": 0, "turn_id": "t:user", "task_id": "t", "content": "删掉临时目录",
+		}),
+		evWith(2, domain.SessionEventStepStart, map[string]any{"turn": 0, "step": 0}),
+		evWith(3, domain.SessionEventAssistantMessage, map[string]any{
+			"turn": 0, "step": 0, "turn_id": "t:assistant", "task_id": "t", "agent_id": "a",
+			"content":       "我来删",
+			"tool_calls":    []any{map[string]any{"call_id": "c1", "name": "delete_path"}},
+			"usage":         map[string]any{"prompt": 1, "completion": 1, "cached": 0, "total": 2},
+			"model_profile": "fast",
+		}),
+		evWith(4, domain.SessionEventStepEnd, map[string]any{"turn": 0, "step": 0, "reason": "cancelled"}),
+		evWith(5, domain.SessionEventTurnEnd, map[string]any{"turn": 0, "reason": "cancelled"}),
+		// 恢复：新 turn 重记同一条响应，这次真的派发了。
+		evWith(6, domain.SessionEventTurnStart, map[string]any{"turn": 1}),
+		evWith(7, domain.SessionEventUserMessage, map[string]any{
+			"turn": 1, "turn_id": "t:user", "task_id": "t", "content": "删掉临时目录",
+		}),
+		evWith(8, domain.SessionEventStepStart, map[string]any{"turn": 1, "step": 0}),
+		evWith(9, domain.SessionEventAssistantMessage, map[string]any{
+			"turn": 1, "step": 0, "turn_id": "t:assistant", "task_id": "t", "agent_id": "a",
+			"content":       "我来删",
+			"tool_calls":    []any{map[string]any{"call_id": "c1", "name": "delete_path"}},
+			"usage":         map[string]any{"prompt": 0, "completion": 0, "cached": 0, "total": 0},
+			"model_profile": "fast",
+		}),
+		evWith(10, domain.SessionEventToolCall, map[string]any{
+			"turn": 1, "step": 0, "call_id": "c1", "name": "delete_path", "arguments": "{}",
+		}),
+		evWith(11, domain.SessionEventToolResult, map[string]any{
+			"turn": 1, "step": 0, "call_id": "c1", "preview": "removed", "is_error": false,
+		}),
+		evWith(12, domain.SessionEventStepEnd, map[string]any{"turn": 1, "step": 0, "reason": "completed"}),
+		evWith(13, domain.SessionEventTurnEnd, map[string]any{"turn": 1, "reason": "completed"}),
+	})
+	if err != nil {
+		t.Fatalf("projectTranscript: %v", err)
+	}
+
+	announced, answered := 0, 0
+	for _, m := range msgs {
+		for _, c := range m.ToolCalls {
+			if c.ID == "c1" {
+				announced++
+			}
+		}
+		if m.Role == port.RoleTool && m.ToolCallID == "c1" {
+			answered++
+		}
+	}
+	if announced != 1 || answered != 1 {
+		t.Errorf("c1 被宣告 %d 次、被应答 %d 次，各要 1 次——挂起那一轮不该再宣告一遍：%+v",
+			announced, answered, msgs)
+	}
+}
+
+// 同一次调用出现两条结果是坏日志，必须报错而不是取后者。
+//
+// 它在合法路径上不可能发生：单轮内 call_id 由 runtime 的 disambiguateCallIDs 去重；
+// 恢复对每个 call_id 至多合成一条结果，且只为**从未被应答**的调用合成
+// （session_events.go 的 planRecovery）。所以撞键只可能是日志本身坏了，
+// 「取后者接着跑」正是 CLAUDE.md §0 禁的兜底。
+func TestTwoResultsForTheSameCallAreRefused(t *testing.T) {
+	_, err := projectTranscript("s", []domain.SessionEvent{
+		evWith(0, domain.SessionEventToolResult, map[string]any{
+			"turn": 0, "step": 0, "call_id": "c1", "preview": "第一条", "is_error": false,
+		}),
+		evWith(1, domain.SessionEventToolResult, map[string]any{
+			"turn": 0, "step": 0, "call_id": "c1", "preview": "第二条", "is_error": false,
+		}),
+	})
+	if err == nil {
+		t.Fatal("同一次调用的两条结果没有被拒绝——后者会静默覆盖前者")
+	}
+	if !strings.Contains(err.Error(), "c1") || !strings.Contains(err.Error(), "seq 1") {
+		t.Errorf("错误没有指名 call_id 与那条重复事件：%v", err)
+	}
+}
+
+// 🟡 Minor-2 的裁定：配不上任何宣告的 tool/result 不进 transcript，且这是**想清楚的**
+// 决定，不是漏网。
+//
+// 一条没有 assistant 宣告过的 tool 消息本来就发不出去（provider 拒收配不上前面
+// tool_calls 的 tool 消息，见 port.InferenceMessage 的文档注释），把它铺进去只会
+// 让整个请求被拒。丢掉它产出的是一份**合法**的 transcript，与「未答的调用不宣告」
+// 是同一类，不是给错误兜底。
+//
+// 这条测试的作用是把这个决定钉在代码里：下一个人重构 collectToolResults 时看得到
+// 它是被想过的，而不是碰巧如此。
+func TestAnOrphanResultIsNotProjected(t *testing.T) {
+	msgs, err := projectTranscript("s", []domain.SessionEvent{
+		evWith(0, domain.SessionEventTurnStart, map[string]any{"turn": 0}),
+		evWith(1, domain.SessionEventAssistantMessage, map[string]any{
+			"turn": 0, "step": 0, "turn_id": "t:assistant", "task_id": "t", "agent_id": "a",
+			"content":       "调一个",
+			"tool_calls":    []any{map[string]any{"call_id": "c1", "name": "read_file"}},
+			"usage":         map[string]any{"prompt": 1, "completion": 1, "cached": 0, "total": 2},
+			"model_profile": "fast",
+		}),
+		evWith(2, domain.SessionEventToolResult, map[string]any{
+			"turn": 0, "step": 0, "call_id": "c1", "preview": "c1 的结果", "is_error": false,
+		}),
+		// 谁也没宣告过它：没有任何 assistant/message 的 (turn, step) 上有这个 call_id。
+		evWith(3, domain.SessionEventToolResult, map[string]any{
+			"turn": 0, "step": 9, "call_id": "ORPHAN", "preview": "没人认领的结果", "is_error": false,
+		}),
+	})
+	if err != nil {
+		t.Fatalf("projectTranscript: %v", err)
+	}
+	for i, m := range msgs {
+		if m.ToolCallID == "ORPHAN" || strings.Contains(m.Content, "没人认领的结果") {
+			t.Errorf("msgs[%d] = %+v：孤儿结果被铺进了 transcript，provider 会拒收整个请求", i, m)
+		}
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("投影出 %d 条消息，要 2 条（assistant + c1 的 tool）：%+v", len(msgs), msgs)
+	}
+}
+
+// turn/step 缺失必须报错并指名 seq：turn 0 / step 0 是合法坐标，缺字段的零值会伪装
+// 成它们，配对键随之指到别处去——正是 CLAUDE.md §0 的「凑个值接着跑」。
+func TestAMissingTurnOrStepIsRefused(t *testing.T) {
+	t.Run("tool/result", func(t *testing.T) {
+		_, err := projectTranscript("s", []domain.SessionEvent{
+			evWith(1, domain.SessionEventToolResult, map[string]any{
+				"turn": 0, "call_id": "c1", "preview": "结果", "is_error": false,
+			}),
+		})
+		if err == nil {
+			t.Fatal("缺 step 的 tool/result 没有被拒绝")
+		}
+		if !strings.Contains(err.Error(), "seq 1") || !strings.Contains(err.Error(), "turn/step") {
+			t.Errorf("错误没有指明缺的是 turn/step 以及是哪条事件：%v", err)
+		}
+	})
+	t.Run("assistant/message", func(t *testing.T) {
+		_, err := projectTranscript("s", []domain.SessionEvent{
+			evWith(2, domain.SessionEventAssistantMessage, map[string]any{
+				"turn": 0, "turn_id": "t:assistant", "task_id": "t", "agent_id": "a",
+				"content":       "调工具",
+				"tool_calls":    []any{map[string]any{"call_id": "c1", "name": "read_file"}},
+				"usage":         map[string]any{"prompt": 1, "completion": 1, "cached": 0, "total": 2},
+				"model_profile": "fast",
+			}),
+		})
+		if err == nil {
+			t.Fatal("缺 step 的 assistant/message（带 tool_calls）没有被拒绝")
+		}
+		if !strings.Contains(err.Error(), "seq 2") || !strings.Contains(err.Error(), "turn/step") {
+			t.Errorf("错误没有指明缺的是 turn/step 以及是哪条事件：%v", err)
+		}
+	})
 }
