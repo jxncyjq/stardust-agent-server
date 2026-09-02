@@ -192,6 +192,16 @@ func projectTurns(events []SessionEvent) []domain.ConversationTurn
 
 **详情读取**：`tool/result` 只有预览 + 定位符，展开时按定位符取全文。Legion 已有根限定的 `/v1/files`；spill 落在 `toolRoot/cacheDir` 下，**能否直接被它服务需在实现时确认——根不同源就要补**。这正是本期反复栽的接缝类问题，写进计划逐条验。
 
+> **P4a 的答案（2026-09-02，已用端到端测试钉住）**：**同源，不用补**——但有一个前提。
+> 任务的 `WorkingDir` 继承自会话（`server/http.go:1070`），而 `/v1/files` 的根就是
+> `session.WorkingDir`（`http.go:744`），所以定位符可以原样交给
+> `/v1/files?session_id=<sid>&path=<locator>`。
+>
+> **前提是会话绑定了 `working_dir`。** 未绑定时 `toolRoot` 回退到 `ContextFiles.Root`，
+> spill 落在那里并产出一个非空定位符，而 `handleServeFile` 对空 `WorkingDir` 直接 404——
+> 那个定位符**取不回来**。这是有意不修的：让它在不可服务时返回空串等于「有全文却说没有」，
+> 是另一种不诚实。**P4b 必须把 404 当成「全文不可得」的合法结果渲染，不是错误弹窗。**
+
 **前端组件**（照抄 harness 的切分，不抄它的框架）：
 
 ```
