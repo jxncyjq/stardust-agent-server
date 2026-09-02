@@ -430,11 +430,24 @@ func (e *eventRecorder) dropBufferedToolCall(callID string) {
 // **每条记录过的 tool/call 都必须有它**（spec §4.3.1 第 1 条）：工具失败、取消、被
 // 拒绝一样要发，`isError` 为真。少发一条，恢复时会把它当成「崩在工具里」而补一条
 // 合成结果，日志就与真实发生的事不符了。
-func (e *eventRecorder) recordToolResult(callID string, preview string, isError bool, dur time.Duration) {
+//
+// spillLocator 是全文的**工具根相对路径**（spec §4.1 的 spill_locator）：事件里只存
+// 预览，超长结果的全文被 renderToolResultContent 落在工具根下的缓存文件里，这个路径
+// 是取回它的唯一线索。结果没超长（或按渲染契约压根没落盘）时为**空串**——那是契约
+// 显式声明的可选「没有全文文件」，不是对错误的兜底；哪条渲染路径给空串、为什么，见
+// renderToolResultContent 的文档注释。
+//
+// 前端展开全文时把它原样交给 /v1/files?session_id=&path= —— 两个根同源：任务的
+// WorkingDir 继承自会话（server/http.go 的 taskWorkingDir = session.WorkingDir），
+// 工具根又优先取 task.WorkingDir（agentToolRoot），而 /v1/files 的根就是
+// session.WorkingDir。internal/server 的 TestASpillLocatorCanBeServedByTheFilesEndpoint
+// 用一次真实 HTTP 往返钉住这条关系。
+func (e *eventRecorder) recordToolResult(callID string, preview string, isError bool, dur time.Duration, spillLocator string) {
 	e.append(domain.SessionEventToolResult, map[string]any{
 		"turn": e.currentTurn(), "step": e.currentStep(),
 		"call_id": callID, "preview": truncateRunes(preview, maxEventPreviewRunes),
 		"is_error": isError, "duration_ms": dur.Milliseconds(),
+		"spill_locator": spillLocator,
 	})
 }
 

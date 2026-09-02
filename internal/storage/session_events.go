@@ -651,9 +651,13 @@ func synthesizeClosers(plan recoveryPlan, nextSeq int64, at time.Time) ([]domain
 	for _, call := range plan.unansweredCalls {
 		data, err := json.Marshal(map[string]any{
 			"turn": call.turn, "step": call.step, "call_id": call.callID,
-			"preview":     "the agent stopped before this tool returned; its result was never recorded",
-			"is_error":    true,
-			"duration_ms": 0,
+			"preview":  "the agent stopped before this tool returned; its result was never recorded",
+			"is_error": true,
+			// 空串：这条结果是补出来的，工具从没返回过内容，也就没有落盘的全文可指。
+			// 字段照发，好让 tool/result 的载荷形状不因「真的发生过」还是「补出来的」
+			// 而不同——消费方（轨迹前端）读到的永远是「有这个字段，值为空」。
+			"spill_locator": "",
+			"duration_ms":   0,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("marshal synthetic tool result for %q: %w", call.callID, err)

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -729,5 +731,82 @@ func TestATransientBarrierTwoFailureLeavesNoOrphanToolCall(t *testing.T) {
 	if sawToolCall {
 		t.Error("屏障 2 失败后，那条从未被派发的 tool/call 还是被写进了日志：" +
 			"它永远等不到 tool/result，恢复会为一次没发生过的调用补一条合成结果")
+	}
+}
+
+// newTestRuntimeWithOversizedTool builds a Runtime whose one tool returns far
+// more text than maxToolResultChars allows, sandboxed to toolRoot — the shape
+// that makes the tool loop actually spill a full result to disk.
+func newTestRuntimeWithOversizedTool(t *testing.T, store port.SessionEventStore, toolRoot string, body string) *Runtime {
+	t.Helper()
+	audit := adapter.NewMemoryAuditLog()
+	registry := tool.NewRegistry(
+		tool.NewExecutionPolicy(tool.ExecutionPolicyConfig{AutoAllowTools: []string{"fetch_url"}}),
+		tool.PermissionEnforcerFunc(func(domain.Agent, domain.ToolCall) error { return nil }),
+		tool.NoopGuardrails{},
+	).WithAuditLog(audit)
+	registry.RegisterDescriptor(tool.Descriptor{
+		Name:        "fetch_url",
+		Description: "fetch a url",
+		InputSchema: map[string]any{
+			"required":   []string{"url"},
+			"properties": map[string]any{"url": map[string]any{"type": "string"}},
+		},
+	}, tool.HandlerFunc(func(_ context.Context, call domain.ToolCall) (domain.ToolResult, error) {
+		return domain.ToolResult{CallID: call.ID, Success: true, Output: body}, nil
+	}))
+	return NewRuntime(Config{
+		Gate: taskgate.NewTaskGate(),
+		Maas: &toolThenAnswerMaas{
+			calls:  []domain.ToolCall{{ID: "call-1", Name: "fetch_url", Arguments: map[string]string{"url": "https://example.invalid/big"}}},
+			marker: "输出被硬截断",
+			answer: "读完了",
+		},
+		Audit:              audit,
+		MaxToolRounds:      3,
+		Events:             adapter.NewMemoryEventBus(),
+		Tools:              registry,
+		SessionEvents:      store,
+		ToolRoot:           toolRoot,
+		MaxToolResultChars: 200,
+	})
+}
+
+// 接线守卫：spill_locator 必须是**这次执行真的写出来的那个文件**的路径，而不是
+// 一路传空串到事件里。renderToolResultContent 落盘、recordToolResult 记录，两者
+// 之间的那根线断了，单看载荷断言（recordToolResult 直接收一个字面量）照样是绿的。
+//
+// 断言用的是证据而不是形状：拿事件里的定位符去 toolRoot 下 Stat，文件必须真的在，
+// 内容必须真的是被截掉的那段全文。
+func TestRunTaskRecordsASpillLocatorThatNamesARealFile(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	body := strings.Repeat("X", 5000)
+	store := &captureEventStore{}
+	rt := newTestRuntimeWithOversizedTool(t, store, root, body)
+
+	if _, err := rt.RunTask(context.Background(), domain.Agent{ID: "a1"},
+		domain.Task{ID: "t1", SessionID: "s1", Input: "抓一下那个大页面"}); err != nil {
+		t.Fatalf("RunTask: %v", err)
+	}
+
+	data := payloadOfType(t, store.events, domain.SessionEventToolResult)
+	locator, ok := data["spill_locator"].(string)
+	if !ok {
+		t.Fatalf("tool/result 载荷里没有字符串字段 spill_locator：%v", data)
+	}
+	if locator == "" {
+		t.Fatal("spill_locator 是空串，但这次执行的工具结果确实超长并落了盘：" +
+			"渲染点与记录点之间的线没接上")
+	}
+	full := filepath.Join(root, filepath.FromSlash(locator))
+	got, err := os.ReadFile(full)
+	if err != nil {
+		t.Fatalf("按 spill_locator=%q 在工具根 %q 下取全文失败：%v（定位符必须是工具根相对路径）",
+			locator, root, err)
+	}
+	if string(got) != body {
+		t.Errorf("取回的全文长度 = %d，要 %d：落盘的不是这次工具结果的全文", len(got), len(body))
 	}
 }

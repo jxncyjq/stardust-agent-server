@@ -14,7 +14,7 @@ import (
 func TestRenderToolResultCachesAndFooter(t *testing.T) {
 	root := t.TempDir()
 	big := strings.Repeat("X", 20000)
-	out := renderToolResultContent("fetch_url", big, 4000, root, defaultToolResultCacheDir, slog.Default())
+	out, locator := renderToolResultContent("fetch_url", big, 4000, root, defaultToolResultCacheDir, slog.Default())
 
 	if !strings.Contains(out, "硬截断") {
 		t.Fatalf("missing hard-truncation footer: %q", out[:min2(300, len(out))])
@@ -26,6 +26,12 @@ func TestRenderToolResultCachesAndFooter(t *testing.T) {
 		t.Fatalf("preview head missing")
 	}
 	rel := footerCachePath(t, out)
+	// spec §4.1 spill_locator: the returned locator IS the cached file's
+	// tool-root-relative path -- the same one the footer hands the model, so an
+	// event and the model can never be pointed at different files.
+	if locator != rel {
+		t.Fatalf("spill locator = %q, want the footer's cache path %q", locator, rel)
+	}
 	data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
 	if err != nil {
 		t.Fatalf("cache file unreadable: %v", err)
@@ -38,31 +44,43 @@ func TestRenderToolResultCachesAndFooter(t *testing.T) {
 func TestRenderToolResultReadFileExemptFromCache(t *testing.T) {
 	root := t.TempDir()
 	big := strings.Repeat("Y", 20000)
-	out := renderToolResultContent("read_file", big, 4000, root, defaultToolResultCacheDir, slog.Default())
+	out, locator := renderToolResultContent("read_file", big, 4000, root, defaultToolResultCacheDir, slog.Default())
 	if strings.Contains(out, ".stardust/tool_results") {
 		t.Fatalf("read_file result must not be cached, got %q", out)
 	}
 	if !strings.Contains(out, "硬截断") {
 		t.Fatalf("read_file oversize should still get plain truncation footer")
 	}
+	// Nothing was written, so there is no full text to point at.
+	if locator != "" {
+		t.Fatalf("spill locator = %q, want empty: an uncached read_file result has no full-text file", locator)
+	}
 }
 
 func TestRenderToolResultEmptyRootPlainTruncation(t *testing.T) {
 	big := strings.Repeat("Z", 20000)
-	out := renderToolResultContent("fetch_url", big, 4000, "", defaultToolResultCacheDir, slog.Default())
+	out, locator := renderToolResultContent("fetch_url", big, 4000, "", defaultToolResultCacheDir, slog.Default())
 	if strings.Contains(out, "tool_results") {
 		t.Fatalf("empty toolRoot must not cache, got %q", out[:min2(200, len(out))])
 	}
 	if !strings.Contains(out, "硬截断") {
 		t.Fatalf("empty toolRoot oversize should get plain truncation")
 	}
+	if locator != "" {
+		t.Fatalf("spill locator = %q, want empty: without a sandbox nothing was written", locator)
+	}
 }
 
 func TestRenderToolResultUnderBudgetUnchanged(t *testing.T) {
 	small := "short"
-	out := renderToolResultContent("fetch_url", small, 4000, t.TempDir(), defaultToolResultCacheDir, slog.Default())
+	out, locator := renderToolResultContent("fetch_url", small, 4000, t.TempDir(), defaultToolResultCacheDir, slog.Default())
 	if out != small {
 		t.Fatalf("under-budget content must be returned verbatim, got %q", out)
+	}
+	// The contract's declared optional: nothing was truncated, so there is no
+	// full-text file -- an empty locator here is correct, not a fallback.
+	if locator != "" {
+		t.Fatalf("spill locator = %q, want empty for an un-truncated result", locator)
 	}
 }
 
@@ -128,12 +146,15 @@ func TestSessionScopedRenderReadBack(t *testing.T) {
 	root := t.TempDir()
 	dir := sessionCacheDir(domain.Task{ID: "t1", SessionID: "sess-X"})
 	big := strings.Repeat("Y", 20000)
-	out := renderToolResultContent("fetch_url", big, 4000, root, dir, slog.Default())
+	out, locator := renderToolResultContent("fetch_url", big, 4000, root, dir, slog.Default())
 
 	if !strings.Contains(out, "tool_results/sess-X/") {
 		t.Fatalf("footer path not session-scoped: %q", out)
 	}
 	rel := footerCachePath(t, out)
+	if locator != rel {
+		t.Fatalf("spill locator = %q, want the footer's session-scoped cache path %q", locator, rel)
+	}
 	data, err := os.ReadFile(filepath.Join(root, filepath.FromSlash(rel)))
 	if err != nil {
 		t.Fatalf("read back session-scoped cache: %v", err)
@@ -201,5 +222,36 @@ func TestWriteToolResultCacheNormalRootKeepsStardust(t *testing.T) {
 	}
 	if !strings.HasPrefix(filepath.ToSlash(rel), ".stardust/tool_results/") {
 		t.Fatalf("normal root should nest under .stardust/tool_results, got %q", rel)
+	}
+}
+
+// 第五条返回路径：折叠被关掉（maxResultChars <= 0）时内容原样返回，也就没有全文文件。
+func TestRenderToolResultFoldingDisabledHasNoLocator(t *testing.T) {
+	big := strings.Repeat("X", 20000)
+	out, locator := renderToolResultContent("fetch_url", big, 0, t.TempDir(), defaultToolResultCacheDir, slog.Default())
+	if out != big {
+		t.Fatalf("maxResultChars<=0 must return the content verbatim (len %d, want %d)", len(out), len(big))
+	}
+	if locator != "" {
+		t.Fatalf("spill locator = %q, want empty: nothing was truncated so nothing was spilled", locator)
+	}
+}
+
+// 写缓存失败那条路径：定位符必须是空串。它已经在 fail-loud 地记日志了，而全文
+// **确实不存在**——这时报一个路径出去，轨迹会去取一个不在那儿的文件。
+func TestRenderToolResultCacheWriteFailureHasNoLocator(t *testing.T) {
+	root := t.TempDir()
+	big := strings.Repeat("X", 20000)
+	// 一个逃出沙箱的 cacheDir：guard.Check 在任何 mkdir 之前就拒掉它。
+	out, locator := renderToolResultContent("fetch_url", big, 4000, root,
+		filepath.Join("..", "escaped"), slog.Default())
+	if locator != "" {
+		t.Fatalf("spill locator = %q, want empty: the cache write failed so there is no full-text file", locator)
+	}
+	if !strings.Contains(out, "硬截断") {
+		t.Fatalf("cache write failure should still degrade to plain truncation, got %q", out[:min2(200, len(out))])
+	}
+	if strings.Contains(out, "escaped") {
+		t.Fatalf("a failed cache write must not advertise a path, got %q", out)
 	}
 }

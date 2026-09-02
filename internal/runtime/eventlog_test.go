@@ -211,7 +211,7 @@ func TestOneRoundProducesTheExpectedSequence(t *testing.T) {
 	rec.recordStepStart()
 	rec.recordAssistantMessage("working", []domain.ToolCall{{ID: "c1", Name: "read_file"}}, eventUsage{}, "default", nil)
 	rec.recordToolCall(domain.ToolCall{ID: "c1", Name: "read_file"})
-	rec.recordToolResult("c1", "ok", false, time.Millisecond)
+	rec.recordToolResult("c1", "ok", false, time.Millisecond, "")
 	rec.recordStepEnd(domain.StepEndReasonCompleted)
 	rec.recordTurnEnd(domain.TurnEndReasonCompleted)
 	if err := rec.flush(ctx); err != nil {
@@ -279,7 +279,7 @@ func TestAToolResultCarriesAPreviewNotTheWholeOutput(t *testing.T) {
 	rec := newEventRecorder(store, domain.Task{ID: "t1", SessionID: "s1"}, nil)
 	huge := strings.Repeat("x", maxEventPreviewRunes*3)
 
-	rec.recordToolResult("c1", huge, false, time.Millisecond)
+	rec.recordToolResult("c1", huge, false, time.Millisecond, "")
 	if err := rec.flush(context.Background()); err != nil {
 		t.Fatalf("flush: %v", err)
 	}
@@ -558,4 +558,46 @@ func payloadOfType(t *testing.T, events []domain.SessionEvent, typ domain.Sessio
 	}
 	t.Fatalf("日志里没有 %s 事件", typ)
 	return nil
+}
+
+// spec §4.1 声明了 spill_locator：tool/result 只存预览，全文落在工具根下的缓存文件里，
+// 定位符是取回全文的唯一线索。没有它，轨迹里点开一条被截断的结果就没有下文。
+func TestAToolResultEventCarriesTheSpillLocator(t *testing.T) {
+	t.Parallel()
+
+	store := &captureEventStore{}
+	rec := newEventRecorder(store, domain.Task{ID: "task-7", SessionID: "sess-1", AgentID: "agent-a"}, nil)
+	rec.recordTurnStart(0)
+	rec.recordStepStart()
+	const locator = ".stardust/tool_results/sess-1/fetch_url-abc1234567.md"
+	rec.recordToolResult("c1", "预览片段", false, 12*time.Millisecond, locator)
+	if err := rec.flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	data := payloadOfType(t, store.events, domain.SessionEventToolResult)
+	if got := data["spill_locator"]; got != locator {
+		t.Errorf("spill_locator = %v，要 %s", got, locator)
+	}
+}
+
+// 没有 spill 时定位符为空串——结果没超长就没有全文文件。
+// 这是契约显式声明的可选，不是兜底。
+func TestAToolResultWithoutSpillCarriesAnEmptyLocator(t *testing.T) {
+	t.Parallel()
+
+	store := &captureEventStore{}
+	rec := newEventRecorder(store, domain.Task{ID: "task-7", SessionID: "sess-1", AgentID: "agent-a"}, nil)
+	rec.recordTurnStart(0)
+	rec.recordStepStart()
+	rec.recordToolResult("c1", "短结果", false, time.Millisecond, "")
+	if err := rec.flush(context.Background()); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	data := payloadOfType(t, store.events, domain.SessionEventToolResult)
+	got, ok := data["spill_locator"].(string)
+	if !ok || got != "" {
+		t.Errorf("spill_locator = %v，要空串（字段必须在，取值为空）", data["spill_locator"])
+	}
 }
