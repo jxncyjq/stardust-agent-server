@@ -400,7 +400,20 @@ func openAIChatRequestToolCalls(calls []domain.ToolCall) ([]openAIChatToolCall, 
 	}
 	out := make([]openAIChatToolCall, 0, len(calls))
 	for _, call := range calls {
-		args, err := json.Marshal(call.Arguments)
+		// function.arguments 必须是一个 JSON **对象**的字符串。nil map 编出来是
+		// `null`，不是对象——Anthropic 兼容网关会把它解成 tool_use.input，null 过不了
+		// input schema。入站方向对「没有参数」的处理就是 map[string]string{}
+		// （openAIToolCalls），出站保持同一个形状，不是替 nil 兜底。
+		//
+		// 这条规则写在**产生线上字节的那一层**，因为契约是这一层的：
+		// storage.decodeTranscriptCallArguments 已经保证会话历史投影不产出 nil，
+		// 但「哪个上游造了这条 ToolCall」不该决定线上字节合不合法。
+		// 守卫：TestToolCallsWithNoArgumentsAreEncodedAsAnEmptyObject。
+		arguments := call.Arguments
+		if arguments == nil {
+			arguments = map[string]string{}
+		}
+		args, err := json.Marshal(arguments)
 		if err != nil {
 			return nil, fmt.Errorf("marshal arguments of tool call %s: %w", call.ID, err)
 		}

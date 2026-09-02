@@ -103,6 +103,16 @@ func projectTranscript(sessionID string, events []domain.SessionEvent) ([]port.I
 	if err != nil {
 		return nil, err
 	}
+	// 同样先扫完的还有每次调用的**参数**。tool/call 事件是 arguments 唯一的落点：
+	// assistant/message 的 tool_calls 载荷里只有 call_id 与 name
+	// （internal/runtime/eventlog.go 的 recordAssistantMessage）。不收这一遍，
+	// domain.ToolCall.Arguments 就是 nil，adapter 把 nil map 编成 `null` 送上线，
+	// 而 OpenAI 兼容契约要求 function.arguments 是一个 **JSON 对象**的字符串。
+	// 守卫：TestHistoryToolCallsCarryTheirArgumentsOnTheWire（internal/runtime）。
+	arguments, err := collectToolCallArguments(sessionID, events)
+	if err != nil {
+		return nil, err
+	}
 
 	msgs := make([]port.InferenceMessage, 0, len(events)/3)
 	for _, event := range events {
@@ -162,7 +172,22 @@ func projectTranscript(sessionID string, events []domain.SessionEvent) ([]port.I
 				if _, answered := results[key]; !answered {
 					continue
 				}
-				calls = append(calls, domain.ToolCall{ID: c.CallID, Name: c.Name})
+				// 有结果的调用必然有它的 tool/call 事件：屏障 2 先记 tool/call 再落盘，
+				// 落盘失败时 dropBufferedToolCall 把它撤回、这次调用根本不派发，因此
+				// 也不会有结果（internal/runtime/eventlog.go）；恢复合成的结果同样只
+				// 为**读到过的 tool/call** 补。所以缺了它是坏日志，不是崩溃残留——
+				// 后者已经在上面那条「未答就不宣告」里被跳过了。
+				// 守卫：TestAnAnsweredCallWithNoToolCallEventIsRefused。
+				raw, recorded := arguments[key]
+				if !recorded {
+					return nil, fmt.Errorf("project transcript for %q: assistant/message at seq %d announces answered call_id %q in turn %d step %d, but no tool/call event recorded its arguments",
+						sessionID, event.Seq, c.CallID, key.turn, key.step)
+				}
+				args, err := decodeTranscriptCallArguments(sessionID, event.Seq, c.CallID, raw)
+				if err != nil {
+					return nil, err
+				}
+				calls = append(calls, domain.ToolCall{ID: c.CallID, Name: c.Name, Arguments: args})
 				keys = append(keys, key)
 			}
 			// 什么都不剩的 assistant 消息发不出去，整条跳过——见函数头那一节。
@@ -263,6 +288,111 @@ func collectToolResults(sessionID string, events []domain.SessionEvent) (map[tra
 		results[key] = renderTranscriptToolContent(payload.Preview, payload.IsError, payload.SpillLocator)
 	}
 	return results, nil
+}
+
+// collectToolCallArguments 扫一遍事件，把每条 tool/call 记下的 arguments 按
+// (turn, step, call_id) 收起来。
+//
+// 单独收一张表而不是「边走边从 assistant 后面找最近的 tool/call」，理由与
+// collectToolResults 相同：恢复补出的事件位置不可靠，只有键是可靠的。
+//
+// 撞键就报错、不覆盖：同一 (turn, step, call_id) 出现两条 tool/call 意味着同一次
+// 调用被记了两遍，而没有任何合法路径能产生它——runtime 的 disambiguateCallIDs 在
+// 单轮内去重，跨轮复用同一个 call_id 时 (turn, step) 不同，挂起→恢复那条路上待派发
+// 的调用是在**新的 turn** 里才第一次被记录的（恢复分支手工重记的是 assistant 响应，
+// 不是 tool/call）。撞了却挑一个用，模型就会读到一份张冠李戴的参数。
+// 守卫：TestTwoToolCallEventsForTheSameCallAreRefused。
+func collectToolCallArguments(sessionID string, events []domain.SessionEvent) (map[transcriptCallKey]string, error) {
+	arguments := make(map[transcriptCallKey]string)
+	for _, event := range events {
+		if event.Type != domain.SessionEventToolCall {
+			continue
+		}
+		var payload struct {
+			// 指针的理由同 collectToolResults：turn 0 / step 0 是合法坐标。
+			Turn      *int   `json:"turn"`
+			Step      *int   `json:"step"`
+			CallID    string `json:"call_id"`
+			Arguments string `json:"arguments"`
+		}
+		if err := json.Unmarshal(event.Data, &payload); err != nil {
+			return nil, fmt.Errorf("project transcript for %q: decode tool/call at seq %d: %w",
+				sessionID, event.Seq, err)
+		}
+		if strings.TrimSpace(payload.CallID) == "" {
+			return nil, fmt.Errorf("project transcript for %q: tool/call at seq %d has no call_id, so its arguments can never be attached to the call that used them",
+				sessionID, event.Seq)
+		}
+		if payload.Turn == nil || payload.Step == nil {
+			return nil, fmt.Errorf("project transcript for %q: tool/call at seq %d for call_id %q has no turn/step, so it cannot be paired with the assistant message that announced it",
+				sessionID, event.Seq, payload.CallID)
+		}
+		key := transcriptCallKey{turn: *payload.Turn, step: *payload.Step, callID: payload.CallID}
+		if _, duplicate := arguments[key]; duplicate {
+			return nil, fmt.Errorf("project transcript for %q: tool/call at seq %d is a second record of call_id %q in turn %d step %d; one call can only be dispatched once",
+				sessionID, event.Seq, payload.CallID, *payload.Turn, *payload.Step)
+		}
+		arguments[key] = payload.Arguments
+	}
+	return arguments, nil
+}
+
+// argumentsTruncationMarker 是 runtime 的 truncateRunes 截断时缀在尾部的记号
+// （internal/runtime/eventlog.go）。recordToolCall 按 maxEventPreviewRunes 截
+// arguments，所以一段**合法**的 tool/call 载荷完全可能不是合法 JSON——write_file
+// 带一整个文件正文的调用天天发生。
+//
+// 这个常量是这里唯一能把「契约允许的截断」与「载荷坏了」分开的依据。写死一份字面量
+// 是有意的：storage 不该为了读一个记号去依赖 runtime。它若哪天变了，下面的分支会把
+// 截断过的参数判成坏载荷并**报错**——响亮地错，而不是继续静默产出 `null`。
+const argumentsTruncationMarker = "…[truncated:"
+
+// truncatedArgumentsKey 是参数被截断时，那段截断文本挂在哪个键下。
+//
+// 名字以下划线开头，与任何工具的真实参数名区分开：模型读到它就知道这不是它当时
+// 传的参数名，而是一段被截断的原文。
+const truncatedArgumentsKey = "_truncated_arguments"
+
+// decodeTranscriptCallArguments 把 tool/call 事件里的 arguments 还原成
+// domain.ToolCall.Arguments 需要的键值表。
+//
+// 三种输入，三种处理，谁也不冒充谁：
+//
+//   - 空串：契约允许的「这次调用没有参数」。adapter 的入站方向对同一件事的处理就是
+//     map[string]string{}（openAIToolCalls），出站编成 `{}`，正是 provider 要的对象。
+//     **不是**兜底：空参数是 openAIChatToolCall 明确允许的状态。
+//   - 合法 JSON 对象：原样解出来。值不是字符串的（数字、嵌套对象）按 adapter 入站
+//     方向的同一规则 fmt.Sprint 成字符串——那一侧就是这么把 provider 的参数塞进
+//     map[string]string 的，两边保持同一个损失面。
+//   - 被 maxEventPreviewRunes 截断过：解不出来，但这是契约声明过的合法状态。把那段
+//     截断原文挂在 truncatedArgumentsKey 下送给模型：它是一个合法 JSON 对象（发得
+//     出去），内容是日志里真实存着的字节（没有替模型编造它没传过的参数）。
+//
+// 除此以外解不出来的载荷只可能来自坏掉的写入方，报错。
+func decodeTranscriptCallArguments(sessionID string, seq int64, callID string, raw string) (map[string]string, error) {
+	if strings.TrimSpace(raw) == "" {
+		return map[string]string{}, nil
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal([]byte(raw), &decoded); err != nil {
+		if strings.Contains(raw, argumentsTruncationMarker) {
+			return map[string]string{truncatedArgumentsKey: raw}, nil
+		}
+		return nil, fmt.Errorf("project transcript for %q: decode arguments of call_id %q recorded for assistant/message at seq %d: %w",
+			sessionID, callID, seq, err)
+	}
+	// JSON 字面量 null 解进 map 得到 nil map，而 nil map 正是本条 Critical 的病根：
+	// adapter 会把它编回 `null`。空对象是同一件事的合法线上形状。
+	args := make(map[string]string, len(decoded))
+	for key, value := range decoded {
+		switch typed := value.(type) {
+		case string:
+			args[key] = typed
+		default:
+			args[key] = fmt.Sprint(typed)
+		}
+	}
+	return args, nil
 }
 
 // renderTranscriptToolContent 把一条结果渲染成模型看到的文本。

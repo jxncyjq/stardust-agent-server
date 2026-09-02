@@ -627,11 +627,16 @@ func TestAnOrphanResultIsNotProjected(t *testing.T) {
 			"usage":         map[string]any{"prompt": 1, "completion": 1, "cached": 0, "total": 2},
 			"model_profile": "fast",
 		}),
-		evWith(2, domain.SessionEventToolResult, map[string]any{
+		// c1 派发前记下的那条：真日志里每次被派发的调用都有它，投影从这里取参数。
+		evWith(2, domain.SessionEventToolCall, map[string]any{
+			"turn": 0, "step": 0, "call_id": "c1", "name": "read_file",
+			"arguments": `{"path":"notes.md"}`,
+		}),
+		evWith(3, domain.SessionEventToolResult, map[string]any{
 			"turn": 0, "step": 0, "call_id": "c1", "preview": "c1 的结果", "is_error": false,
 		}),
 		// 谁也没宣告过它：没有任何 assistant/message 的 (turn, step) 上有这个 call_id。
-		evWith(3, domain.SessionEventToolResult, map[string]any{
+		evWith(4, domain.SessionEventToolResult, map[string]any{
 			"turn": 0, "step": 9, "call_id": "ORPHAN", "preview": "没人认领的结果", "is_error": false,
 		}),
 	})

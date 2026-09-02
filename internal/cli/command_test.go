@@ -2820,6 +2820,10 @@ func (s *countingConversationStore) ListConversationTurns(ctx context.Context, s
 	return s.delegate.ListConversationTurns(ctx, sessionID, limit)
 }
 
+func (s *countingConversationStore) ListConversationTranscript(ctx context.Context, sessionID string, limit int) ([]port.InferenceMessage, error) {
+	return s.delegate.ListConversationTranscript(ctx, sessionID, limit)
+}
+
 func (s *countingConversationStore) Append(ctx context.Context, sessionID string, events []domain.SessionEvent) error {
 	return s.delegate.Append(ctx, sessionID, events)
 }

@@ -829,6 +829,14 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	//
 	// 代价是 basePrompt 的 header 段里那句 "Input: <当前任务输入>" 出现在历史之前，
 	// 时序上是颠倒的。这是有意的取舍：缓存命中比时序美观值钱。
+	//
+	// 这个取舍还有第二个后果，尚未真机验证（P5 Task 3 复审 I3）：历史的最后一条常
+	// 常是一条**没有 tool_calls 的 assistant**（上一轮的收尾回答），于是整个请求以
+	// 它结尾。今天 tool loop 里请求以 tool 消息结尾是常态，以这种 assistant 结尾是
+	// G3 新引入的形状——Anthropic 系会把尾部 assistant 当 prefill 续写，OpenAI 系
+	// 虽然接受，但模型「最后读到的」是一段旧回答而不是当前任务，可能顺着旧话题往下
+	// 说。真机验证清单里这是单独一条；若真机上确认有害，修法是排布问题（例如把当前
+	// 输入复述成末尾一条 user 消息），不是把历史挪到 message[0] 之前——那会赔掉缓存。
 	if len(r.historyTranscript) > 0 {
 		convo.appendHistory(r.historyTranscript)
 	}

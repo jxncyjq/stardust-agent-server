@@ -244,17 +244,7 @@ func newTUICommand(application *app.App, out io.Writer) *cobra.Command {
 				logger.Warn("workspace root fallback", "detail", workspaceRootWarning)
 			}
 			checkpointStore := sessionstate.NewStore(workspaceRoot)
-			session := newTUISessionController(tuiSessionControllerConfig{
-				Store:         persistent.sessionStore,
-				Enabled:       cfg.Session.Enabled,
-				CompanyID:     "cli-company",
-				AgentID:       "cli-agent",
-				ModelProfile:  firstNonEmpty(maasProfile, cfg.Maas.DefaultProfile),
-				RecentTurns:   cfg.Session.DefaultRecentTurns,
-				MaxTurnChars:  cfg.Session.MaxTurnChars,
-				RestoreLatest: cfg.Session.RestoreLatestOnTUIStart,
-				Cache:         newSessionContextCache(cfg.Session),
-			})
+			session := buildTUISessionController(cfg, persistent.sessionStore, maasProfile)
 			if err := session.Initialize(cmd.Context()); err != nil {
 				return err
 			}
@@ -480,9 +470,14 @@ type tuiTaskRunConfig struct {
 	TaskSink             app.TaskSink
 	Emit                 func(domain.RuntimeEvent)
 	Session              *tuiSessionController
-	ConversationTurns    []domain.ConversationTurn
-	TaskLedger           *taskledger.Ledger
-	MessageStore         tool.AgentMessageStore
+	// ConversationTurns 与 HistoryTranscript 是同一个选择的两半，由
+	// tuiSessionController.SessionHistory 填其中一个（见 runTUITask）。两条 TUI 任务
+	// 入口都要把它们转发进 app.RunTaskOptions：只转发一个，@提及那条路就会在 G3 打开
+	// 时静默丢掉历史。
+	ConversationTurns []domain.ConversationTurn
+	HistoryTranscript []port.InferenceMessage
+	TaskLedger        *taskledger.Ledger
+	MessageStore      tool.AgentMessageStore
 	// ToolGate gates Manual-mode sensitive tool calls for both TUI task
 	// entry points (runTUITask and runMentionedTUIAgentTask must both wire
 	// it — an @mention path that skipped it would let a Manual-mode agent
@@ -569,11 +564,15 @@ func firstNonEmpty(values ...string) string {
 func runTUITask(ctx context.Context, application *app.App, cfg tuiTaskRunConfig) (app.DemoResult, error) {
 	parsed := parseTUIAgentPrompt(cfg.Prompt)
 	if cfg.Session != nil {
-		turns, err := cfg.Session.RecentTurns(ctx)
+		// 与 serve 两条路相同的选路：G3 关着填 Turns（历史进 prompt 文本），打开填
+		// Transcript（历史以 provider 消息排在 message[0] 之后）。两个字段都赋，
+		// 因为只赋一个就等于在这里替开关又做了一次主。
+		history, err := cfg.Session.SessionHistory(ctx)
 		if err != nil {
 			return app.DemoResult{}, err
 		}
-		cfg.ConversationTurns = turns
+		cfg.ConversationTurns = history.Turns
+		cfg.HistoryTranscript = history.Transcript
 	}
 	agentID, modelProfile := tuiSessionTurnMetadata(cfg, parsed)
 	userPrompt := parsed.Prompt
@@ -613,6 +612,7 @@ func runTUITask(ctx context.Context, application *app.App, cfg tuiTaskRunConfig)
 		MaxToolRounds:     cfg.Config.Runtime.MaxToolRounds,
 		LazyTools:         cfg.Config.Runtime.LazyTools,
 		ConversationTurns: cfg.ConversationTurns,
+		HistoryTranscript: cfg.HistoryTranscript,
 		WebTools:          webToolOptions(cfg.Config.Web),
 		Browser:           cfg.Config.Browser,
 		ToolGate:          cfg.ToolGate,
@@ -706,6 +706,7 @@ func runMentionedTUIAgentTask(ctx context.Context, application *app.App, cfg tui
 		MaxToolRounds:     cfg.Config.Runtime.MaxToolRounds,
 		LazyTools:         cfg.Config.Runtime.LazyTools,
 		ConversationTurns: cfg.ConversationTurns,
+		HistoryTranscript: cfg.HistoryTranscript,
 		WebTools:          webToolOptions(cfg.Config.Web),
 		Browser:           cfg.Config.Browser,
 		ToolGate:          cfg.ToolGate,
@@ -1033,6 +1034,14 @@ type conversationStore interface {
 	LatestAgentSession(context.Context, string, string) (domain.AgentSession, bool, error)
 	ListAgentSessions(context.Context, string, string) ([]domain.AgentSession, error)
 	ListConversationTurns(context.Context, string, int) ([]domain.ConversationTurn, error)
+	// ListConversationTranscript 是同一段历史的另一种形状（G3 打开时走它）：
+	// assistant 消息带 tool_calls，其后跟与之配对的 tool 消息。
+	//
+	// 声明在这里而不是做成「可选接口 + 类型断言」，理由与
+	// agentruntime.ConversationTurnLister 相同：一个只会 turns 的 store 会让 G3
+	// 变成一个悄悄保持旧形状的开关，而那正是本仓栽过的形状。放进接口，它就是
+	// 编译错误。
+	ListConversationTranscript(context.Context, string, int) ([]port.InferenceMessage, error)
 	// Append/ReadFrom 是 TUI 会话把每轮对话写进事件日志用的（见 recordTurn）。
 	// 声明成两个方法而不是内嵌 port.SessionEventStore：这条路不调 Load，而
 	// spec §4.3.1 第 3 条要求 Load 只对没有活跃写入者的会话调用——不把它摆进
@@ -1051,6 +1060,9 @@ type tuiSessionControllerConfig struct {
 	MaxTurnChars  int
 	RestoreLatest bool
 	Cache         sessionContextCache
+	// ToolTranscriptEnabled 是 G3（config session.tool_transcript_enabled）在 TUI
+	// 这条路上的落点。漏传它，`legion tui` 会在用户明明打开了开关时静默停在旧形状。
+	ToolTranscriptEnabled bool
 }
 
 type tuiSessionController struct {
@@ -1063,7 +1075,9 @@ type tuiSessionController struct {
 	maxTurnChars  int
 	restoreLatest bool
 	cache         sessionContextCache
-	currentID     string
+	// toolTranscriptEnabled 决定 SessionHistory 返回哪一半，见那个方法。
+	toolTranscriptEnabled bool
+	currentID             string
 	// currentMode and currentWorkingDir mirror the AgentSession.Mode/WorkingDir
 	// of the session identified by currentID, kept in sync by NewSession,
 	// Initialize, SwitchSession, SetMode and SetWorkingDir so CurrentMode/
@@ -1078,6 +1092,30 @@ type sessionContextCache interface {
 	InvalidateSession(string)
 }
 
+// buildTUISessionController 把 `legion tui` 的会话控制器从根配置装配出来。
+//
+// 它是一个纯函数（无渲染、无 I/O）而不是留在 newTUICommand 的 RunE 闭包体里，理由与
+// buildTUITaskRunConfig 完全相同：闭包体只有 tea.Program.Run() 会跑，任何自动化测试
+// 都够不着，于是这里的每一行配置映射都没有断言守着。G3 恰恰栽在这个位置——
+// `legion tui` 是第三条取历史的生产路径，它当时根本没接这个开关，用户打开了也毫无
+// 动静，且不报任何错。
+// 守卫：TestTheTUISessionControllerCarriesTheTranscriptSwitch。
+func buildTUISessionController(cfg config.Config, store conversationStore, maasProfile string) *tuiSessionController {
+	return newTUISessionController(tuiSessionControllerConfig{
+		Store:         store,
+		Enabled:       cfg.Session.Enabled,
+		CompanyID:     "cli-company",
+		AgentID:       "cli-agent",
+		ModelProfile:  firstNonEmpty(maasProfile, cfg.Maas.DefaultProfile),
+		RecentTurns:   cfg.Session.DefaultRecentTurns,
+		MaxTurnChars:  cfg.Session.MaxTurnChars,
+		RestoreLatest: cfg.Session.RestoreLatestOnTUIStart,
+		Cache:         newSessionContextCache(cfg.Session),
+		// G3：漏了这一行，开关在 TUI 这条路上就是死的。
+		ToolTranscriptEnabled: cfg.Session.ToolTranscriptEnabled,
+	})
+}
+
 func newTUISessionController(cfg tuiSessionControllerConfig) *tuiSessionController {
 	return &tuiSessionController{
 		store:         cfg.Store,
@@ -1089,6 +1127,8 @@ func newTUISessionController(cfg tuiSessionControllerConfig) *tuiSessionControll
 		maxTurnChars:  normalizeMaxTurnCharsForSession(cfg.MaxTurnChars),
 		restoreLatest: cfg.RestoreLatest,
 		cache:         cfg.Cache,
+
+		toolTranscriptEnabled: cfg.ToolTranscriptEnabled,
 	}
 }
 
@@ -1196,6 +1236,48 @@ func (c *tuiSessionController) ClearSession(ctx context.Context) error {
 	}
 	_, err := c.NewSession(ctx)
 	return err
+}
+
+// SessionHistory 返回这条会话的历史，形状由 G3 选：关着是今天的 turns（进 prompt
+// 文本），打开是 provider transcript（历史的工具往返以消息进模型）。
+//
+// 它是 `legion tui` 这条生产路径上做这个选择的**唯一**一处，与 serve 那两条路
+// （agentruntime.SessionHistoryForTask）并列。TUI 不能直接调那个函数：它在这一刻
+// 还没有 domain.Task——历史是在任务构造**之前**取的，而那个函数按 task.SessionID
+// 取会话、按 task.ID 滤掉任务自己的 user turn。
+//
+// 关闭那半原样委托给 RecentTurns，一个字节都不动（缓存、截断、归一化全在那边）；
+// 打开那半走 agentruntime.SessionTranscript，与 serve 两条路共用同一份预算换算与
+// 同一个 MaxTurnChars 上限——把那段算术在这里抄一遍，正是「一条路悄悄变成无界」的
+// 来源。
+//
+// 打开时不走 c.cache：那个缓存装的是 []domain.ConversationTurn，形状对不上。少一层
+// 缓存只是多读一次库，而把两种形状塞进同一个缓存键会让开关切换后读到上一种形状。
+// 守卫：TestTheTUIPathSendsHistoryAsATranscript。
+func (c *tuiSessionController) SessionHistory(ctx context.Context) (agentruntime.SessionHistory, error) {
+	if c == nil || !c.enabled {
+		return agentruntime.SessionHistory{}, nil
+	}
+	if !c.toolTranscriptEnabled {
+		turns, err := c.RecentTurns(ctx)
+		if err != nil {
+			return agentruntime.SessionHistory{}, err
+		}
+		return agentruntime.SessionHistory{Turns: turns}, nil
+	}
+	if c.currentID == "" {
+		if err := c.Initialize(ctx); err != nil {
+			return agentruntime.SessionHistory{}, err
+		}
+	}
+	msgs, err := agentruntime.SessionTranscript(ctx, c.store, config.SessionConfig{
+		DefaultRecentTurns: c.recentTurns,
+		MaxTurnChars:       c.maxTurnChars,
+	}, c.currentID)
+	if err != nil {
+		return agentruntime.SessionHistory{}, err
+	}
+	return agentruntime.SessionHistory{Transcript: msgs}, nil
 }
 
 func (c *tuiSessionController) RecentTurns(ctx context.Context) ([]domain.ConversationTurn, error) {

@@ -85,6 +85,19 @@ type RunTaskOptions struct {
 	MaxToolRounds     int
 	LazyTools         bool
 	ConversationTurns []domain.ConversationTurn
+	// HistoryTranscript is the session history in G3's other shape
+	// (config session.tool_transcript_enabled): provider messages carrying the
+	// history's tool round-trips, appended after message[0] instead of being
+	// rendered into the prompt text.
+	//
+	// It and ConversationTurns are the two halves of one choice and are never
+	// both set — whoever fills them makes the selection once
+	// (tuiSessionController.SessionHistory on this path). Filling both sends the
+	// same history twice; filling neither half when the switch is on is the
+	// silent failure this field exists to prevent: `legion tui` used to have no
+	// way to carry the transcript at all, so the switch did nothing there and
+	// said nothing about it.
+	HistoryTranscript []port.InferenceMessage
 	WebTools          tool.WebToolOptions
 	// Browser gates the built-in browser tools (browser_open/read/click/type/
 	// close). Disabled by default: enabling requires a usable Chromium in the
@@ -415,6 +428,7 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 		MaxToolRounds:     opts.MaxToolRounds,
 		LazyTools:         opts.LazyTools,
 		ConversationTurns: opts.ConversationTurns,
+		HistoryTranscript: opts.HistoryTranscript,
 		ToolGate:          opts.ToolGate,
 		Checkpoints:       opts.Checkpoints,
 		Logger:            taskLogger,
