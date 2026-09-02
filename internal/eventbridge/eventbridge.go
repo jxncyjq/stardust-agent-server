@@ -115,7 +115,7 @@ func translate(ev domain.RuntimeEvent) observability.EventEnvelope {
 	// The subject is the session rather than the task, because the session log
 	// is what this frame is about — a subscriber filtering by subject wants one
 	// session's trajectory, not one task's lifecycle.
-	if ev.SessionID != "" {
+	if ev.Type == domain.RuntimeEventSessionEvent {
 		data["session_id"] = ev.SessionID
 		data["seq"] = ev.Seq
 		data["event_type"] = ev.SessionEventType

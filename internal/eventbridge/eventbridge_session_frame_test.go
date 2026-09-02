@@ -62,3 +62,28 @@ func TestTranslateLeavesNonSessionEventsWithoutSessionFields(t *testing.T) {
 		t.Errorf("envelope.SubjectID = %q, want the task %q (unchanged)", envelope.SubjectID, "task-1")
 	}
 }
+
+// 判据必须是 Type，不是 SessionID 是否非空：SessionID 是个通用名字的公开字段，
+// 未来任何人在非 session_event 的事件上顺手填了 SessionID（字段名本身就诱导这么做），
+// 若判据看 SessionID != ""，该事件会凭空长出 "seq":0 与 "event_type":""，SubjectID
+// 也会被错误改写成会话号——这正是 review 里点名的「唯一还能发出错误 seq 的口子」。
+// 这条用例专门覆盖 TestTranslateLeavesNonSessionEventsWithoutSessionFields 看不见的
+// 方向：那条用例的 SessionID 是空字符串，测的其实是当前判据本身。
+func TestTranslateIgnoresSessionIDWhenTypeIsNotSessionEvent(t *testing.T) {
+	envelope := translate(domain.RuntimeEvent{
+		Type:             "task_completed",
+		TaskID:           "task-1",
+		SessionID:        "sess-1",
+		Seq:              7,
+		SessionEventType: "turn/start",
+	})
+
+	for _, key := range []string{"session_id", "seq", "event_type"} {
+		if _, present := envelope.Data[key]; present {
+			t.Errorf("task_completed 携带了非空 SessionID，但它不是 session_event：data 里不该出现 %q\ndata=%v", key, envelope.Data)
+		}
+	}
+	if envelope.SubjectID != "task-1" {
+		t.Errorf("envelope.SubjectID = %q, want the task %q:非 session_event 事件即便带了 SessionID，subject 也不能被改写成会话号", envelope.SubjectID, "task-1")
+	}
+}
