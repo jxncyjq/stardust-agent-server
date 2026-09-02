@@ -62,7 +62,38 @@ type eventRecorder struct {
 	// 只在 enabled() 时使用（懒初始化），理由见 newTurnID 里对 enabled() 分支的
 	// 说明。与 pending/nextSeq/turn/step 用同一把 e.mu 保护，不新造锁。
 	issuedTurnIDs map[turnIDCoordinate]bool
+
+	// notify 在一批事件**确实落盘之后**被调用一次，见 flush。构造时定死、之后不变，
+	// 所以读它不需要 e.mu。
+	notify sessionEventNotifier
 }
+
+// sessionEventNotifier 是「这批事件已经在库里了」的通知口，flush 在 Append 成功之后
+// 调它一次，参数是这一批事件**最终的** seq。
+//
+// # 为什么是一个函数，而不是 port.EventBus
+//
+// eventRecorder 的职责是「把事件写进 store」。让它持有事件总线，它就要同时知道
+// domain.RuntimeEvent 的形状、发布失败算不算失败、以及 SSE 那一侧的送达语义——三件
+// 与「写进 store」无关的事。函数值把它需要说的话压到一句：**这些事件、带这些 seq、
+// 已经落盘了**。总线归 Runtime 持有（runtime.go 里其余每一处 r.events.Publish 都在
+// 那一层），由它决定这句话怎么翻译成一条 RuntimeEvent。
+//
+// # 为什么没有 error 返回
+//
+// 这是**契约**，不是把错误吞掉：通知失败与落盘失败是两件不同的事，本类型不接受前者
+// 改变后者的结论。调用到这里时 Append 已经成功，事件是持久的；此时再把一次 SSE 通知
+// 的失败反向变成 flush 的失败，会让 fail-closed 的屏障因为一条通知发不出去而中断一个
+// 数据其实完好的任务，而且缓冲已经清空、重试也补不回来。通知丢了有既定的补救路径
+// （前端按 seq 连续性发现缺口，回到 GET /v1/sessions/{id}/events 从断点补拉），落盘
+// 丢了没有。
+//
+// 「不改变结论」不等于「不记录」：实现者**必须**在自己那一侧处理并记录失败（见
+// runtime.go 里 newTaskRecorder 装配的那个闭包，它把失败按 Warn 记进 r.logger 并带
+// 上 session/seq），否则就成了静默吞错。
+//
+// events 是调用方只读的：flush 之后不再持有这个切片，但也不承诺它是副本。
+type sessionEventNotifier func(ctx context.Context, sessionID string, events []domain.SessionEvent)
 
 // turnIDCoordinate 是 newTurnID 用来判断一个坐标是否已经发放过的键，分量与
 // newTurnID 派生 ID 字符串时用的分量一一对应——session 已经是这个 eventRecorder
@@ -91,7 +122,12 @@ type turnIDCoordinate struct {
 // （P3 Task 4 复审 Important-1）。读侧那条校验本身是对的——把「task_id 非空」当成
 // 过滤条件塞进 SQL 才是静默跳过——错的是让它有机会在生产上触发。堵住这里之后，
 // 读侧的校验退化成一条永不触发的深层断言。
-func newEventRecorder(store port.SessionEventStore, task domain.Task) *eventRecorder {
+//
+// notify 是这次执行的落盘通知口（见 sessionEventNotifier）。nil 是契约允许的可选：
+// 没有人要听的部署（大量单元测试构造、以及任何不关心 SSE 的调用方）就不发通知，与
+// store 为 nil 时不记事件是同一种可选，不是对错误状态的兜底。生产装配点
+// （Runtime.newTaskRecorder）永远传非 nil。
+func newEventRecorder(store port.SessionEventStore, task domain.Task, notify sessionEventNotifier) *eventRecorder {
 	// 与 RunTask 取会话执行锁用的是同一个解析函数，这一点是硬要求而不是顺手复用：
 	// 锁按 A 解出的键切分、日志按 B 解出的键写，两者一旦漂移，锁就守不住它要守的那条
 	// 日志（C-1）。让它们共用一个函数，漂移就不可能发生。
@@ -103,7 +139,7 @@ func newEventRecorder(store port.SessionEventStore, task domain.Task) *eventReco
 		panic("runtime: event recorder needs a task id; every message event carries it as the address of the " +
 			"turn it belongs to, and one event without it fails every session_search discovery query in the database")
 	}
-	return &eventRecorder{store: store, session: session, taskID: task.ID, agentID: task.AgentID}
+	return &eventRecorder{store: store, session: session, taskID: task.ID, agentID: task.AgentID, notify: notify}
 }
 
 // sessionID 是这次执行写入的会话日志。
@@ -449,19 +485,56 @@ func (e *eventRecorder) currentStep() int {
 //
 // **失败就是失败**：调用方（屏障）据此决定不发请求、不进工具体、不开下一步。
 // 缓冲保持不变，让调用方能在重试时不丢事件。
+//
+// 落盘成功之后，这里是**唯一**的会话事件通知点（notify，spec §7 的 SSE session_event
+// 帧由它一路发到平台总线）。发布点必须在这里，因为 seq 到这一刻才既确定又已经被库
+// 接受；而通知的成败不回头改变落盘的结论，见 sessionEventNotifier。
 func (e *eventRecorder) flush(ctx context.Context) error {
 	if !e.enabled() {
 		return nil
 	}
+	batch, err := e.persistPending(ctx)
+	if err != nil {
+		return err
+	}
+	// 通知**只在这里**发，而且只在 persistPending 返回之后：这一刻，也只有这一刻，
+	// 这批事件既已经在库里、又带着它们最终的 seq。更早发只能猜 seq，而一个猜错的
+	// seq 比一条没发出去的通知糟得多——收到它的前端会认为自己没漏帧，于是不去补拉。
+	//
+	// 落盘失败时上面已经 return 了，一条通知也不会发：库里不存在的 seq 绝不能被宣告。
+	//
+	// notify 为 nil 是契约允许的可选（见 newEventRecorder），不是缺失的依赖。
+	// 它没有 error 返回，理由见 sessionEventNotifier 的文档注释：通知渠道的失败不
+	// 改变落盘已经成功这个结论，但实现者必须自己记录它。
+	if len(batch) == 0 || e.notify == nil {
+		return nil
+	}
+	// 在 e.mu 之外调用：notify 会一路走到事件总线（它有自己的锁），把外部调用夹在
+	// 本记录器的锁里是自找的锁序问题。e.session 构造后不变，读它不需要锁。
+	//
+	// 代价是「通知的先后」不再由 e.mu 串起来：两次并发的 flush 可以先后拿到各自的
+	// batch、再乱序通知。今天这件事不可能发生——flush 只从三个屏障点被调，而它们在
+	// 一次 RunTask 的循环里是顺序执行的，同一会话的并发任务又被会话执行锁隔开（见
+	// 本类型的文档注释）——它与 seq 分配依赖的是**同一条**串行化前提。谁将来让屏障
+	// 并发起来，破坏的也是同一条：那时 seq 本身就先错了，通知顺序只是随之而来的。
+	e.notify(ctx, e.session, batch)
+	return nil
+}
+
+// persistPending 把缓冲里的事件分配 seq 并落盘，返回**实际写进去的那一批**（带最终
+// seq），供 flush 拿去通知。没东西可写时返回空批。
+//
+// 它是 flush 里持锁的那一半：拆出来是为了让 flush 能在锁外通知，见 flush。
+func (e *eventRecorder) persistPending(ctx context.Context) ([]domain.SessionEvent, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if len(e.pending) == 0 {
-		return nil
+		return nil, nil
 	}
 	if !e.seqKnown {
 		existing, err := e.store.ReadFrom(ctx, e.session, 0)
 		if err != nil {
-			return fmt.Errorf("align session event cursor for %q: %w", e.session, err)
+			return nil, fmt.Errorf("align session event cursor for %q: %w", e.session, err)
 		}
 		e.nextSeq = int64(len(existing))
 		e.seqKnown = true
@@ -472,11 +545,11 @@ func (e *eventRecorder) flush(ctx context.Context) error {
 		batch[i] = event
 	}
 	if err := e.store.Append(ctx, e.session, batch); err != nil {
-		return fmt.Errorf("persist session events for %q: %w", e.session, err)
+		return nil, fmt.Errorf("persist session events for %q: %w", e.session, err)
 	}
 	e.nextSeq += int64(len(batch))
 	e.pending = e.pending[:0]
-	return nil
+	return batch, nil
 }
 
 // barrier 是一个 fail-closed 的落盘点（spec §5）。

@@ -447,6 +447,52 @@ func (r *Runtime) Interrupt() {
 	r.interrupted.Store(true)
 }
 
+// publishSessionEvents announces one durably-appended batch of session events on
+// the runtime event bus, one RuntimeEvent per event (spec §7). It is the
+// notifier eventRecorder.flush calls after Append succeeds, and it is the only
+// producer of domain.RuntimeEventSessionEvent.
+//
+// # What the frame carries, and what it deliberately does not
+//
+// session_id + seq + event_type, and nothing of the event's own payload. The
+// frame is a NOTIFICATION: a subscriber that wants the event reads it back from
+// GET /v1/sessions/{id}/events?from_seq=. Putting the payload in would let one
+// large event (an assistant message, a tool result) flood a stream that also
+// carries every other lifecycle event — and the stream is at-most-once anyway,
+// so a payload delivered over it could never be relied on.
+//
+// A subscriber detects a miss by seq continuity and back-fills from the
+// endpoint, which is why the seq here must be the one the store actually
+// accepted (it is: flush passes the persisted batch) and why a lost frame is
+// recoverable while a WRONG seq is not — a wrong seq reads as "nothing was
+// missed".
+//
+// # Why a publish failure does not fail the run
+//
+// By the time this is called the events are already durable. Turning a
+// notification-channel failure into a flush failure would make the fail-closed
+// barrier abort a task whose log is intact, over a channel whose loss the
+// consumer is designed to recover from — and the barrier could not even retry
+// usefully, since flush has already cleared the buffer. So the failure is
+// handled here, at its boundary, and recorded (Warn) with the session and the
+// seq range it covers: not propagating is a decision about scope, and it is not
+// a licence to swallow it silently.
+func (r *Runtime) publishSessionEvents(ctx context.Context, taskID, sessionID string, events []domain.SessionEvent) {
+	for _, event := range events {
+		if err := r.events.Publish(ctx, domain.RuntimeEvent{
+			Type:             domain.RuntimeEventSessionEvent,
+			TaskID:           taskID,
+			SessionID:        sessionID,
+			Seq:              event.Seq,
+			SessionEventType: string(event.Type),
+			CreatedAt:        event.Time,
+		}); err != nil {
+			r.logger.Warn("publish session event frame failed",
+				"session_id", sessionID, "seq", event.Seq, "event_type", string(event.Type), "err", err)
+		}
+	}
+}
+
 // newTaskRecorder builds this run's session event recorder (spec §5) and
 // resolves the turn number it opens with.
 //
@@ -483,7 +529,13 @@ func (r *Runtime) Interrupt() {
 //     which a fail-closed barrier turns into a failed task. Do not move this
 //     read outside the lock.
 func (r *Runtime) newTaskRecorder(ctx context.Context, task domain.Task) (*eventRecorder, int, error) {
-	rec := newEventRecorder(r.sessionEvents, task)
+	// 通知口在这里装配：Runtime 是持有事件总线的那一层（runtime.go 里每一处
+	// r.events.Publish 都在这一层），记录器只负责说「这批带这些 seq 的事件落盘了」。
+	// 闭包捕获 task.ID 是为了让帧也带上任务号——GUI 用它把会话事件对到任务上——
+	// 而不必让通知口的签名替记录器多背一个身份字段。
+	rec := newEventRecorder(r.sessionEvents, task, func(ctx context.Context, sessionID string, events []domain.SessionEvent) {
+		r.publishSessionEvents(ctx, task.ID, sessionID, events)
+	})
 	if r.sessionEvents == nil {
 		return rec, 0, nil
 	}
