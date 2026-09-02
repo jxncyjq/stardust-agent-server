@@ -213,7 +213,21 @@ TrajectoryView
       └─ TrajectoryCell   USER / ASSISTANT / TOOL 行：徽章 + 摘要 +（TOOL）→ 结果预览
 ```
 
-- **位置**：对话栏上方的标签页（「对话 / 轨迹」），与对话互斥。轨迹落地后，右侧状态栏现有的「事件」标签退休——它是同一批数据的贫瘠版本。
+- **位置**：对话栏上方的标签页（「对话 / 轨迹」），与对话互斥。
+
+> **「事件」标签退休这条被 P4b 用证据推翻了（2026-09-02）——它不退休。**
+>
+> 原文说它是「同一批数据的贫瘠版本」。核实下来不成立：`ListRuntimeEvents` 读的是全局
+> workflow event bus（`domain.RuntimeEvent`），与会话事件日志的 8 种类型**完全不重叠**。
+> `tool_loop_broken`（152 轮事故的止损信号）、`approval_pending`、`inference_completed`、
+> `memory_prefetched`、`subtask_completed`、`workflow_*` **只在那条总线上**。
+>
+> 决定性证据在 `internal/domain/types.go`：`SessionID`/`Seq`/`SessionEventType` 三个字段
+> 「only on RuntimeEventSessionEvent events and are zero on every other type」——轨迹按
+> session 取数，**取不到**其余类型。两者作用域也不同：全局最近 200 条 vs 当前会话。
+>
+> 删掉是真丢功能。若将来要收编，正确做法是按类型收窄（只保留轨迹拿不到的那些），
+> 那是另一个任务。
 - **搜索**：客户端在已加载事件里搜，与 harness 一致。与服务端 FTS5 不共用：用户搜的是「我刚看到的这些」，模型搜的是「整个历史」。
 - **虚拟滚动先不做**：靠 `limit` 分页压住每屏事件数；测出卡顿再加（harness 有 `trajectory-virtual-rows.ts` 可参考）。
 
