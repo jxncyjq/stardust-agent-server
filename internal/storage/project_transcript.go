@@ -155,6 +155,21 @@ func projectTranscript(sessionID string, events []domain.SessionEvent) ([]port.I
 			}
 			calls := make([]domain.ToolCall, 0, len(payload.ToolCalls))
 			keys := make([]transcriptCallKey, 0, len(payload.ToolCalls))
+			// 一条 assistant 不得两次宣告同一个 call_id。
+			//
+			// spec §4.3.1 第 4 条禁的是「同一个 step 内、还未被应答的 tool/call 复用
+			// call_id」（跨 turn/step 的复用是允许的）——同一条 assistant 里的两次宣告
+			// 在发出时都还没被应答，正落在禁区里。
+			//
+			// 不拒的话两次都会命中同一个 results[key]/arguments[key]，产出
+			// tool_calls=[c1, c1] 加两条 tool_call_id 相同的 tool 消息，provider 拒收
+			// 整个请求——响亮，但发生在离原因很远的地方。在这里拒能直接指名 seq。
+			//
+			// 这补的是一处不对称：collectToolResults 与 collectToolCallArguments 都为
+			// 撞键写了 fail-loud（见后者「is a second record of call_id」那条），三处
+			// 同性质的地方只有宣告侧放行。
+			// 守卫：TestAnAssistantAnnouncingTheSameCallIDTwiceIsRefused。
+			announced := make(map[string]bool, len(payload.ToolCalls))
 			for _, c := range payload.ToolCalls {
 				// 空 call_id 只可能来自坏掉的写入方：recordAssistantMessage 原样抄
 				// domain.ToolCall.ID，而它是 provider 给的调用标识。不拒的话它会掉进
@@ -167,6 +182,11 @@ func projectTranscript(sessionID string, events []domain.SessionEvent) ([]port.I
 					return nil, fmt.Errorf("project transcript for %q: assistant/message at seq %d announces a tool call with no call_id, so it can never be paired",
 						sessionID, event.Seq)
 				}
+				if announced[c.CallID] {
+					return nil, fmt.Errorf("project transcript for %q: assistant/message at seq %d announces call_id %q twice in turn %d step %d; one assistant cannot make the same call twice",
+						sessionID, event.Seq, c.CallID, *payload.Turn, *payload.Step)
+				}
+				announced[c.CallID] = true
 				key := transcriptCallKey{turn: *payload.Turn, step: *payload.Step, callID: c.CallID}
 				// 只宣告有结果的调用——见函数头那一节。
 				if _, answered := results[key]; !answered {

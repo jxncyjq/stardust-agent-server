@@ -32,6 +32,8 @@ func snapshotMessages(convo *conversation) []sessionstate.MessageSnapshot {
 			Images:     msg.Images,
 			ToolCalls:  msg.ToolCalls,
 			ToolCallID: msg.ToolCallID,
+			// 缓存断点跟着走：恢复路径不经 pinCachePrefix，不抄它就永久丢失。
+			StablePrefixLen: msg.StablePrefixLen,
 		})
 	}
 	return out
@@ -70,11 +72,12 @@ func restoreConversation(snaps []sessionstate.MessageSnapshot, taskStart int) *c
 	}
 	for _, s := range snaps {
 		convo.messages = append(convo.messages, port.InferenceMessage{
-			Role:       s.Role,
-			Content:    s.Content,
-			Images:     s.Images,
-			ToolCalls:  s.ToolCalls,
-			ToolCallID: s.ToolCallID,
+			Role:            s.Role,
+			Content:         s.Content,
+			Images:          s.Images,
+			ToolCalls:       s.ToolCalls,
+			ToolCallID:      s.ToolCallID,
+			StablePrefixLen: s.StablePrefixLen,
 		})
 	}
 	return convo
