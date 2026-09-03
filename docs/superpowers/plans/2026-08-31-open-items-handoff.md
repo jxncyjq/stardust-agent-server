@@ -74,13 +74,30 @@ set-of-marks 的唯一前提。链条断在：`domain.ToolResult` 只有 `Output
 
 ## 四、未完成：不需要拍板，做就是了
 
-### T-1 Windows 上 `TestBrowserStreamE2EObservationProgressFrame` 抖动约 40%
+### ~~T-1 Windows 上 `TestBrowserStreamE2EObservationProgressFrame` 抖动约 40%~~ ✅ 已处置（2026-09-03，server#151）
 
-近 5 次 Browser Matrix 里红了 3 次（master 的 `565f133b`、`f127ec81`，以及 server#132 的第一次），重跑即绿。症状是 `progress=false frame=false`——超时窗口内没等到帧。
+**这里原先给的取证方向被推翻了。** 原话是「先判定是『Windows 上首帧确实更慢』还是『测试的等待窗口写死得太紧』——前者要改产品，后者改测试」，做法是三平台打点比较分布。
 
-**为什么它比它测的功能更重要**：一条经常红的测试会把人训练成忽略红灯。本期我已经在这上面栽过一次（agent-ci 连红四次而我只看 Browser Matrix）。
+两条都不是。问题在测试自己身上：**它把诊断需要的信息全丢了**。
 
-**下一步**：先判定是「Windows 上首帧确实更慢」还是「测试的等待窗口写死得太紧」——前者要改产品，后者改测试。取证方式：在该测试里把「订阅成功 → 首帧到达」的时间打出来，在三平台各跑几次比较分布。
+```go
+read, _ := rt.Read(...)     // 错误丢弃
+for ... { if 名字含「按钮」 { ref = e.Ref } }
+_, _ = rt.Click(...)        // 错误丢弃，ref 可能是空串
+```
+
+Read 失败或页面里找不到那个按钮时，ref 是空串、Click 必然失败、progress 永远不来，而测试只报一句 `missing events: progress=false`。**红了三次都查不下去，正是因为这两个被丢掉的错误**（顺带违反 fail-loud 铁律）。
+
+另两处一并修了：
+
+- `time.Sleep(200ms)` 等订阅建立是多余的——`handleBrowserStream` 先 `Subscribe` 再写响应头，`Do()` 返回时订阅已经在了。去掉后本机耗时 1.4–1.6s → 1.3s。
+- `for sc.Scan() && time.Now().Before(deadline)` 里的 deadline 形同虚设：`Scan()` 阻塞，时间只在每次 Scan 返回之后才检查，流里迟迟没有新行时它根本不生效。
+
+现在失败信息能区分三种病：动作本身失败了（带上读到的元素名）、动作成功但帧没到、动作到此刻还没返回。
+
+**没有声称「修好了 flake」**：本机带 `-tags chromium` 连跑 5 次全绿，复现不了 CI 的抖动。这次改的是**下次它再红时能不能查下去**。合并时三平台 Browser e2e 全绿（含 windows-latest）。
+
+变异验证：把页面按钮的 `aria-label` 改掉，测试报「触发动作本身就失败了：页面里没有名字含「按钮」的元素，读到的是 ["别的东西"]」，而不是从前那句看不出原因的话。
 
 ### T-2 GUI 插件面板人眼走查
 

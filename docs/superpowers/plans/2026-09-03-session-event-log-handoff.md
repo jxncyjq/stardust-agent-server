@@ -128,13 +128,13 @@ The `reasoning_content` in the thinking mode must be passed back to the API.
 - 工具的读写根来自**建会话时**的 `working_dir`（`POST /v1/sessions`），不是配置里的 `workspace`。
 - 任务完成状态是 **`done`**，不是 `completed`。我最初的轮询判据写的是 `completed`，前几轮是靠循环跑满后恰好已落盘才拿到结果——判据错了却"看起来能用"。
 
-### T-2 `configs/agent.complete.example.json` 缺 `tool_transcript_enabled`
+### ~~T-2 示例配置缺字段~~ / ~~T-3 没有环境变量覆盖~~ ✅ 已完成（2026-09-03，server#150）
 
-已核实：全仓 `configs/` 与 `agent.json` 都搜不到这个 key。不看代码的人不知道有这个开关。加一行，附一句「打开后请求体积可能涨数倍」。
+两个示例的 `session` 段都只列了 4 个字段，而 `SessionConfig` 有 6 个——`cache_enabled`、`cache_max_entries`、`tool_transcript_enabled` 一直缺着。三个都补上了。
 
-### T-3 没有环境变量覆盖
+顺手加了一条**结构性**断言 `TestTheExampleConfigsListEverySessionField`：用反射取 `SessionConfig` 的每个 json tag，逐个检查两个示例里都有。示例与结构体的同步靠人记是记不住的（这次就漏了三个），让它变成会红的测试。
 
-`config.go:479` 只有 json tag。容器部署里改一个开关要重新打配置文件。
+环境变量 `LEGION_AGENT_TOOL_TRANSCRIPT` 走 `REQUIRE_IDENTITY` 那一档而非便利开关的 `== "true" || == "1"`：这个开关改的是每次请求的体积，写 `=yes` 的人是想打开它，静默落回 false 会让他拿到零效果加零警告，而「体积没变」最容易被读成「这开关没用」。不可解析的值 fail-loud。
 
 ### T-4 per-task review 的 Minor 项
 
@@ -142,15 +142,16 @@ P4a 16 条 / P4b 14 条 / P5 5+ 条。**数字来自当时各轮 review 的记�
 
 ### T-5 零散的已知项
 
-| 事项 | 说明 |
+| 事项 | 状态 |
 |---|---|
-| 一个 assistant 的 `tool_calls` 内重复 `call_id` 静默允许 | spec §4.3.1 只禁「同 step 跨消息复用」 |
-| `Blocks` 多一条 `{conversation 0}` | G3 打开时历史离开 prompt，该条 Chars=0 |
-| `CurrentSchemaVersion` 无守卫 | |
-| `restore_latest` / `Append` 的触碰面 | 设计待议 |
-| `[附图 N 张]` 标记位置 | |
-| GUI 注释引用了另一个仓的 spec 路径 | 跨仓引用，那边一改就悬空 |
-| `internal/plugin/fetch` 的 Windows 文件锁抖动 | 全量并发跑时 `Access is denied`；单独重跑 3 次、两次后续全量都没复现。与上一期 T-1 的 `TestBrowserStreamE2EObservationProgressFrame` 抖动同类，可一起处理 |
+| ~~`CurrentSchemaVersion` 无守卫~~ | ✅ server#150。核实出的缺陷比记录具体：`migrate` 只 `INSERT OR IGNORE`、**从不读回**，于是旧二进制打开新库不被拒，会一路跑到某个查询撞上不存在的列才炸，期间的写入还可能污染库。现在建表前读回 `max(version)`，高于当前值就拒绝启动 |
+| ~~GUI 注释引用另一个仓的 spec 路径~~ | ✅ gui#47。核实后比记录更糟：那份文档**从未提交**，两仓皆无、git 历史也没有。改成自包含注释 |
+| ~~`Blocks` 多一条 `{conversation 0}`~~ | ✅ 核实为**有意设计**，不是缺陷——`core.go` 注释明写「always listed, named for the route it took」，零 size 正是让读者看出走了哪条路。**这条是我原先记错了** |
+| ~~`[附图 N 张]` 标记位置~~ | ✅ 核实无缺陷。`eventlog.go:632` 的 `userMessageContent` 有完整注释说明为什么在这里产生（P3 退休 `conversation_turns` 后，注解必须与 user/message 事件同源，否则丢失） |
+| 一个 assistant 的 `tool_calls` 内重复 `call_id` 静默允许 | **spec 门控**：spec §4.3.1 只禁「同 step 跨消息复用」，是否收紧要先改 spec |
+| `restore_latest` / `Append` 的触碰面 | **需拍板**：设计待议 |
+| `internal/plugin/fetch` 的 Windows 文件锁抖动 | 未处理。与上一期 T-1 同类但根因不同（T-1 是测试丢弃错误，见下）|
+| **新增：`go test ./...` 默认并发会触发 Go 工具链自身崩溃** | 这台机器上每次崩在不同包（`internal/task` → 标准库 `net`/`go/ast` → `internal/browser`），逐包单跑与 `-p 2` 全绿。是环境问题，但会干扰全量验证——**以后全量一律用 `go test -p 2 ./...`** |
 
 ## 五、spec 门控（要先改 spec 才能做）
 
