@@ -1,7 +1,6 @@
 package runtime
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/stardust/legion-agent/internal/port"
@@ -18,8 +17,8 @@ import (
 //
 // provider 把尾部 assistant 当成要续写的 prefill，thinking 模型于是要求这条
 // assistant 必须带回它的 reasoning_content——而历史里的 assistant 永远没有。
-// 本仓 agent.json 的四个 profile 全指向 deepseek，所以「G3 打开 + 恢复会话」
-// 在默认部署上是 100% 失败，不是偶发。
+// 凡是 default_profile 指向 thinking 系模型的部署（本仓样例的 dev/fast/review
+// 都是），「G3 打开 + 恢复会话」就必然失败，不是偶发。
 //
 // 取证是一次受控对照：同一段 head + 同一批历史，唯一的差别是末尾多一条 user
 // 消息——补上就通过并正确答出只存在于工具往返里的事实，不补就 400。
@@ -51,11 +50,15 @@ func TestTheRequestDoesNotEndOnAStaleAssistantWhenHistoryIsATranscript(t *testin
 			last.Role, port.RoleUser)
 	}
 
-	// 收尾那条必须真的是**当前任务的输入**，而不是随便一条 user 消息——历史里
-	// 每一轮都以 user 开头，拿其中一条来凑同样能让上面的角色断言通过。
-	if !strings.Contains(last.Content, "接着说") {
-		t.Errorf("收尾的 user 消息里没有当前任务输入「接着说」，实际是 %q："+
-			"模型最后读到的是别的东西", truncateForMessage(last.Content))
+	// 收尾那条必须**恰好**是当前任务的输入，而不是「含有」它。
+	//
+	// 这里不能用 strings.Contains：message[0] 的 header 本来就渲染了
+	// "Input: 接着说"（cognitive/core.go），所以一个把整段 prompt 再发一遍的实现
+	// ——请求体积直接翻倍——同样能让「含有」通过。等值断言才钉得住
+	// appendCurrentInput 的契约：原样复述当前输入，一个字不多。
+	if last.Content != "接着说" {
+		t.Errorf("收尾的 user 消息 = %q，要恰好是当前任务输入「接着说」："+
+			"多出来的内容意味着复述的不只是输入", truncateForMessage(last.Content))
 	}
 }
 

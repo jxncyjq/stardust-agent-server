@@ -832,12 +832,14 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	//
 	// 这个取舍的第二个后果**真机上已确认有害**（P5 Task 3 复审 I3）：历史的最后一条
 	// 常常是一条**没有 tool_calls 的 assistant**（上一轮的收尾回答），于是整个请求
-	// 以它结尾。provider 把尾部 assistant 当 prefill 续写，thinking 模型据此要求它
-	// 带回 reasoning_content——历史里的 assistant 永远没有，请求直接 400。本仓
-	// agent.json 四个 profile 全指向 deepseek，所以这在默认部署上是必然失败。
+	// 以它结尾。provider 把尾部 assistant 当 prefill 续写，thinking 系模型据此要求它
+	// 带回 reasoning_content——历史里的 assistant 永远没有，请求直接 400。凡是
+	// default_profile 指向 thinking 系模型的部署，「G3 打开 + 恢复会话」就必然失败，
+	// 不是偶发。
 	//
 	// 修法按当初写下的那条：把当前输入复述成末尾一条 user 消息（appendCurrentInput），
 	// 而不是把历史挪到 message[0] 之前——那会赔掉缓存。
+	// 守卫：TestTheRequestDoesNotEndOnAStaleAssistantWhenHistoryIsATranscript。
 	if len(r.historyTranscript) > 0 {
 		convo.appendHistory(r.historyTranscript)
 		convo.appendCurrentInput(task.Input)
