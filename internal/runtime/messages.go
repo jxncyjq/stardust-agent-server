@@ -72,6 +72,16 @@ func (c *conversation) pinCachePrefix(n int) {
 // this function keeps it that way.
 // 守卫：TestTheCacheBreakpointStaysOnTheFirstMessage。
 func (c *conversation) appendHistory(history []port.InferenceMessage) {
+	// 历史必须在本任务开口之前注入。若这时 conversation 里已经有本任务的轮次，
+	// 下面那行会把边界推到它们之后——重复熔断从此恒为 1，**静默失效**，没有任何
+	// 测试会红。今天只有一处调用（RunTask 里、第一次模型请求之前），这条断言是为了
+	// 让「将来有人在任务跑起来后补一次历史」当场炸掉而不是悄悄关掉熔断。
+	if len(c.messages) != 1 {
+		panic(fmt.Sprintf("runtime: appendHistory called with %d messages already in the "+
+			"conversation; history must be injected before the task's own turns, otherwise "+
+			"taskStart moves past them and the repeat guard silently stops counting",
+			len(c.messages)))
+	}
 	c.messages = append(c.messages, history...)
 	// 历史之后才是本任务自己的轮次——重复熔断只数这一段，理由见 taskStart。
 	c.taskStart = len(c.messages)

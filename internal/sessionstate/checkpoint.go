@@ -69,7 +69,20 @@ type Checkpoint struct {
 	// 不存的话，续跑的任务会把历史算进「连续重复的轮次」，一条正常的会话就足以
 	// 触发重复警告。
 	//
-	// 0 表示这份检查点写于本字段引入之前：那时不存在历史 transcript 段，起点恒为 1。
+	// 0 表示**字段缺席**。这个编码没有歧义，靠的是「0 从来不是合法的 taskStart」：
+	// 四个写入方给出的值分别是 1（newConversation）、>=1（appendHistory）、
+	// >=2（applyCompaction）、>=1（restoreConversation）。omitempty 因此不会把一个
+	// 合法值编码成缺席。若将来有人让 taskStart 合法地取 0，这套编码会静默崩塌。
+	//
+	// 缺席的检查点按 1 处理。**这不等于「那份检查点里没有历史段」**：G3 的 transcript
+	// 注入早于本字段存在，所以由旧二进制在 G3 打开时写下的检查点，Messages 里带着
+	// 历史而 task_start 缺席，边界已不可恢复——续跑那一次仍可能把历史算进 streak。
+	// 这是升级窗口的已知代价，只影响升级瞬间已挂起的任务。
+	//
+	// 为什么不 bump CheckpointSchemaVersion（本文件 v2→v3 仅因新增 Loaded 字段就
+	// bump 过，本次偏离了那个惯例）：Load 对版本是严格相等比较，bump 会让升级瞬间
+	// **所有**挂起中的检查点直接失效，包括等待人工审批的任务——代价大于上面那一次
+	// 误报。取舍写在这里，不是漏了。
 	TaskStart        int               `json:"task_start,omitempty"`
 	PendingCalls     []domain.ToolCall `json:"pending_calls"`
 	PromptTokens     int               `json:"prompt_tokens"`

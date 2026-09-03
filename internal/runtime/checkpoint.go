@@ -45,10 +45,14 @@ func snapshotMessages(convo *conversation) []sessionstate.MessageSnapshot {
 // 的地方，也是唯一一个不经 newConversation/appendHistory 的——新增字段时最容易漏掉
 // 的正是它。
 //
-// taskStart 为 0 表示这份检查点写于该字段引入之前：那时 conversation 里不存在历史
-// transcript 段，起点恒为 1，按 1 处理。这是契约声明的可选，不是替坏值兜底——一个
-// 大过消息条数的下标是检查点损坏，直接 panic，因为将就下去只会让 panic 发生在离
-// 现场很远的地方。
+// taskStart 为 0 表示字段缺席（0 从不是合法值，见 sessionstate.Checkpoint.TaskStart
+// 对这个编码的说明），按 1 处理。
+//
+// 越界的下标属于**磁盘上那份文件不合法**，校验归 sessionstate.Store.Load——它旁边
+// 就是 SchemaVersion 检查，返回 error 而不是 panic：检查点是外部输入，而 RunTask
+// 跑在没有 recover 覆盖的任务 goroutine 里，panic 会把一份坏文件放大成整个 agent
+// 进程崩溃。这里保留的 panic 只是**进程内**的编程错误断言：调用方是本包代码，传进
+// 越界值意味着代码写错了，不是数据坏了。
 // 守卫：TestRestoringACheckpointKeepsTheTaskBoundary、
 // TestACheckpointFromBeforeTheBoundaryFieldRestoresToOne、
 // TestACorruptBoundaryFailsLoudAtRestore。

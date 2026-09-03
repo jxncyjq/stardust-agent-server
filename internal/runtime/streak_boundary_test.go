@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -55,6 +56,104 @@ func TestCompactionKeepsTheTaskBoundaryValid(t *testing.T) {
 	if got := convo.repeatedCallStreak(live); got != 1 {
 		t.Errorf("压缩后 streak = %d，要 1：边界指错了位置，历史（或摘要）被算进了本任务的轮次", got)
 	}
+}
+
+// 上一条把 applyCompaction 调在了 taskStart == preserveStart 这个点上，平移项
+// (taskStart - preserveStart) 恰好是 0——于是「+1 的 off-by-one」和「删掉整个 A 支、
+// 无条件置 2」两种写法都能让它通过。它证明的只是「边界不大过新长度」这个弱性质。
+//
+// 这两条把平移项做成非零，并断言 streak 的**具体值**：位移错一位，保留下来的那轮
+// assistant 就会跨到边界的另一侧，streak 随之改变。
+func TestCompactionShiftsTheBoundaryWhenItLandsInTheKeptTail(t *testing.T) {
+	t.Parallel()
+
+	call := domain.ToolCall{ID: "c", Name: "read_file",
+		Arguments: map[string]string{"path": "config.md"}}
+	live := []domain.ToolCall{call}
+
+	convo := newConversation("base", nil)
+	convo.appendHistory([]port.InferenceMessage{
+		{Role: port.RoleAssistant, ToolCalls: []domain.ToolCall{
+			{ID: "old", Name: "list_files", Arguments: map[string]string{"path": "."}}}},
+		{Role: port.RoleTool, ToolCallID: "old", Content: "历史结果"},
+	})
+	convo.appendCurrentInput("读 config.md")
+	// 本任务已经跑过两轮同样的调用。
+	for i := 0; i < 2; i++ {
+		convo.appendAssistant("我读一下", []domain.ToolCall{call})
+		convo.appendToolResults([]domain.ToolCall{call}, map[string]string{"c": "文件内容"})
+	}
+	// messages: [base, 历史A, 历史T, 当前输入, A1, T1, A2, T2] = 8 条，taskStart = 3。
+	if convo.taskStart != 3 {
+		t.Fatalf("夹具没搭对：taskStart = %d，要 3", convo.taskStart)
+	}
+	// preserveStart = 1：整段都保留，平移项 = 3 - 1 = 2（非零，这是关键）。
+	convo.applyCompaction(1, "摘要")
+	// 新数组 [base, 摘要] + 原 messages[1:]，本任务的起点前移到 2 + 2 = 4。
+	if convo.taskStart != 4 {
+		t.Errorf("压缩后 taskStart = %d，要 4（下标 2 的基准 + 平移项 2）：平移算错了", convo.taskStart)
+	}
+	// 本任务那两轮仍在边界之内 + 待发的这一轮 = 3。位移错一位就会把 A1 或当前输入
+	// 挪到边界另一侧，这个数随之变化。
+	if got := convo.repeatedCallStreak(live); got != 3 {
+		t.Errorf("压缩后 streak = %d，要 3（本任务已跑 2 轮 + 待发 1 轮）："+
+			"边界平移错位，本任务的轮次被切掉或历史被算了进来", got)
+	}
+}
+
+// B 支：边界落在被压缩掉的那一段里，说明历史已被摘要吞并，本任务的消息全在 tail 中。
+func TestCompactionPutsTheBoundaryAfterTheSummaryWhenHistoryIsFoldedIn(t *testing.T) {
+	t.Parallel()
+
+	call := domain.ToolCall{ID: "c", Name: "read_file",
+		Arguments: map[string]string{"path": "config.md"}}
+	live := []domain.ToolCall{call}
+
+	convo := newConversation("base", nil)
+	convo.appendHistory([]port.InferenceMessage{
+		{Role: port.RoleAssistant, ToolCalls: []domain.ToolCall{call}}, // 与本轮相同的调用
+		{Role: port.RoleTool, ToolCallID: "old", Content: "历史结果"},
+	})
+	convo.appendCurrentInput("读 config.md")
+	convo.appendAssistant("我读一下", []domain.ToolCall{call})
+	convo.appendToolResults([]domain.ToolCall{call}, map[string]string{"c": "文件内容"})
+	// messages: [base, 历史A, 历史T, 当前输入, A1, T1] = 6 条，taskStart = 3。
+
+	// preserveStart = 5 > taskStart=3 → B 支：历史与当前输入、A1 一起被摘要吞掉。
+	convo.applyCompaction(5, "摘要")
+	if convo.taskStart != 2 {
+		t.Errorf("压缩后 taskStart = %d，要 2（摘要之后）", convo.taskStart)
+	}
+	// 新数组 [base, 摘要, T1]：本任务在边界之内没有任何 assistant 轮次，
+	// 且被吞掉的那条历史 assistant 绝不能被算进来。
+	if got := convo.repeatedCallStreak(live); got != 1 {
+		t.Errorf("压缩后 streak = %d，要 1：摘要之前的东西（含那条与本轮相同的历史调用）"+
+			"被算进了本任务的轮次", got)
+	}
+}
+
+// 历史必须在本任务开口之前注入。晚了的话 appendHistory 会把边界推到本任务的轮次
+// 之后，repeatedCallStreak 从此恒为 1——重复熔断**静默失效**，而不是报错。
+//
+// 今天只有一处调用（RunTask 里、第一次模型请求之前），所以这条断言守的是将来：
+// 「在任务跑起来后补一次历史」这种改动必须当场炸掉，不能悄悄把熔断关掉。
+func TestAppendingHistoryAfterTheTaskHasSpokenFailsLoud(t *testing.T) {
+	t.Parallel()
+
+	convo := newConversation("base", nil)
+	convo.appendCurrentInput("本任务已经开口了")
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("在本任务的轮次之后注入历史却没有 fail-loud：" +
+				"边界会被推到那些轮次之后，重复熔断从此恒为 1，静默失效")
+		}
+		if msg := fmt.Sprint(r); !strings.Contains(msg, "appendHistory") {
+			t.Errorf("panic 信息里没提 appendHistory，定位不到坏在哪：%q", msg)
+		}
+	}()
+	convo.appendHistory([]port.InferenceMessage{{Role: port.RoleAssistant, Content: "迟到的历史"}})
 }
 
 // 检查点恢复必须把边界一起带回来，否则续跑的任务会把历史算进 streak。
@@ -168,7 +267,10 @@ func TestACorruptBoundaryFailsLoudAtRestore(t *testing.T) {
 		if r == nil {
 			t.Fatal("taskStart 大过消息条数却没有 fail-loud：这个下标会在后面某处 panic，届时看不出是检查点坏了")
 		}
-		if msg, ok := r.(string); ok && !strings.Contains(msg, "task_start") {
+		// 用 fmt.Sprint 取文本而不是断言成 string：写成 r.(string) 的话，谁把
+		// panic 值换成 error（例如 panic(fmt.Errorf(...))），ok 就变 false，
+		// 这条断言会**静默消失**，只剩「有没有 panic」——正是 §0 点名的静默跳过。
+		if msg := fmt.Sprint(r); !strings.Contains(msg, "task_start") {
 			t.Errorf("panic 信息里没提 task_start，定位不到坏在哪：%q", msg)
 		}
 	}()
