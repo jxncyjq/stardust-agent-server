@@ -66,7 +66,11 @@
     "enabled": true,
     "default_recent_turns": 6,
     "max_turn_chars": 6000,
-    "restore_latest_on_tui_start": true
+    "restore_latest_on_tui_start": true,
+    "cache_enabled": true,
+    "cache_max_entries": 256,
+    "tool_transcript_enabled": false,
+    "_comment_tool_transcript_enabled": "默认关。打开后注入模型的历史从「Recent conversation:」文本块换成 provider transcript（assistant 带 tool_calls + 配对的 tool 消息），模型因此能看见历史的工具往返、会话恢复时不再失忆；代价是每次请求体积可能涨数倍。环境变量 LEGION_AGENT_TOOL_TRANSCRIPT 可覆盖。"
   },
   "tui": {
     "_comment": "交互式 Bubble Tea TUI 配置。",
@@ -109,8 +113,17 @@
     "max_index_lines": 500,
     "max_task_lines": 300,
     "max_message_chars": 300,
-    "active_statuses": ["planned", "ready", "in_progress", "blocked", "review"],
-    "done_statuses": ["done", "cancelled"]
+    "active_statuses": [
+      "planned",
+      "ready",
+      "in_progress",
+      "blocked",
+      "review"
+    ],
+    "done_statuses": [
+      "done",
+      "cancelled"
+    ]
   },
   "skills": {
     "_comment": "远端 skill registry 可后续再配置；本地技能默认安装到 skills。",
