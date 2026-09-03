@@ -16,6 +16,15 @@ func (s *HTTPServer) handleEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "event bus is unavailable")
 		return
 	}
+	// 失效信号必须在**写响应头之前**取。写头+Flush 之后客户端的请求就返回了，
+	// 于是「运维在流刚建立那一瞬轮换 token」会落进一个窗口：轮换关闭的是当前这一代
+	// channel 并换上新的，而 handler 此刻还没取值，取到的将是新那一代——它永远不会
+	// 因为刚才那次轮换而关闭，这条流就再也不会被断开。吊销对它失效，而不被断开的
+	// 长连接正是这套机制要堵的漏。
+	//
+	// 提到这里之后，残余窗口只剩「鉴权通过 → 这一行」这段同进程指令，不再跨越任何
+	// 网络往返或 Flush。
+	revoked := s.tokens.Changed()
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -32,8 +41,6 @@ func (s *HTTPServer) handleEvents(w http.ResponseWriter, r *http.Request) {
 	eventType := r.URL.Query().Get("type")
 	events, cancel := s.platformEvents.Subscribe(r.Context())
 	defer cancel()
-	// 这一代凭证的失效信号，在进入循环前取一次：取到之后发生的轮换会关闭它。
-	revoked := s.tokens.Changed()
 	for {
 		select {
 		case <-revoked:

@@ -67,6 +67,13 @@ func (s *HTTPServer) handleBrowserStream(w http.ResponseWriter, r *http.Request)
 	}
 	defer cancel()
 
+	// 失效信号在**写响应头之前**取，理由同 events.go：写头+Flush 之后客户端的请求
+	// 已经返回，此时发生的轮换会关闭当前这一代 channel 并换上新的，而 handler 取到
+	// 的将是新那一代——永远不会因为刚才那次轮换而关闭。screencast 是本服务里活得最久
+	// 的一条流（一个接管中的会话可以挂几个小时），它继续送帧就等于被吊销的凭证仍在
+	// 看着用户的屏幕。
+	revoked := s.tokens.Changed()
+
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -88,10 +95,6 @@ func (s *HTTPServer) handleBrowserStream(w http.ResponseWriter, r *http.Request)
 		flush()
 	}
 
-	// 这一代凭证的失效信号，在进入循环前取一次。screencast 是本服务里活得最久的
-	// 一条流（一个接管中的会话可以挂几个小时），它继续送帧就等于被吊销的凭证仍在
-	// 看着用户的屏幕。
-	revoked := s.tokens.Changed()
 	for {
 		select {
 		case ev, ok := <-ch:
