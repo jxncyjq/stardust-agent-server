@@ -61,7 +61,16 @@ type Checkpoint struct {
 	Round      int    `json:"round"`
 	// Messages is the exchange as it stood when the run suspended. Restoring it
 	// verbatim is what lets a resumed run keep seeing the calls it already made.
-	Messages         []MessageSnapshot `json:"messages"`
+	Messages []MessageSnapshot `json:"messages"`
+	// TaskStart 是本任务自己的消息在 Messages 里的起点：G3 打开时会话历史以
+	// transcript 排在 message[0] 之后，这个下标就落在历史之后；关闭时它是 1。
+	//
+	// 存它是因为重复调用熔断按它决定扫描起点（runtime.conversation.taskStart）。
+	// 不存的话，续跑的任务会把历史算进「连续重复的轮次」，一条正常的会话就足以
+	// 触发重复警告。
+	//
+	// 0 表示这份检查点写于本字段引入之前：那时不存在历史 transcript 段，起点恒为 1。
+	TaskStart        int               `json:"task_start,omitempty"`
 	PendingCalls     []domain.ToolCall `json:"pending_calls"`
 	PromptTokens     int               `json:"prompt_tokens"`
 	CompletionTokens int               `json:"completion_tokens"`

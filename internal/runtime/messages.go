@@ -198,6 +198,18 @@ func (c *conversation) applyCompaction(preserveStart int, summary string) {
 		c.messages[0],
 		{Role: port.RoleUser, Content: "[对话摘要]\n" + summary},
 	}, tail...)
+	// taskStart 是个下标，压缩把 messages 变短了，不跟着算就会指错位置——大过新长度
+	// 时 repeatedCallStreak 会直接在切片上 panic。
+	//
+	// 新数组是 [message0, 摘要] + tail，保留下来的那段整体前移到下标 2：边界原本落在
+	// tail 里就跟着平移；落在被压缩掉的那段里，说明历史已经被摘要吞并，本任务的消息
+	// 全在 tail 中，边界即摘要之后。
+	// 守卫：TestCompactionKeepsTheTaskBoundaryValid。
+	if c.taskStart >= preserveStart {
+		c.taskStart = 2 + (c.taskStart - preserveStart)
+	} else {
+		c.taskStart = 2
+	}
 }
 
 // render returns the messages to send, folding the oldest tool outputs first

@@ -744,7 +744,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 				started:          started,
 				basePrompt:       cp.BasePrompt,
 				round:            cp.Round,
-				convo:            restoreConversation(cp.Messages),
+				convo:            restoreConversation(cp.Messages, cp.TaskStart),
 				loaded:           restoreLoaded(cp.Loaded),
 				resp:             port.InferenceResponse{ToolCalls: cp.PendingCalls},
 				promptTokens:     cp.PromptTokens,
@@ -1193,14 +1193,16 @@ func (r *Runtime) checkSuspend(ctx context.Context, task domain.Task, st loopSta
 		return false, nil
 	}
 	cp := sessionstate.Checkpoint{
-		SchemaVersion:    sessionstate.CheckpointSchemaVersion,
-		TaskID:           task.ID,
-		AgentID:          task.AgentID,
-		SessionKey:       sessionKeyForTask(task),
-		Mode:             task.Mode,
-		BasePrompt:       st.basePrompt,
-		Round:            st.round,
-		Messages:         snapshotMessages(st.convo),
+		SchemaVersion: sessionstate.CheckpointSchemaVersion,
+		TaskID:        task.ID,
+		AgentID:       task.AgentID,
+		SessionKey:    sessionKeyForTask(task),
+		Mode:          task.Mode,
+		BasePrompt:    st.basePrompt,
+		Round:         st.round,
+		Messages:      snapshotMessages(st.convo),
+		// 与 Messages 成对：丢了它，续跑时历史会重新被算进重复熔断的 streak。
+		TaskStart:        st.convo.taskStart,
 		Loaded:           snapshotLoaded(st.loaded),
 		PendingCalls:     st.resp.ToolCalls,
 		PromptTokens:     st.promptTokens,
