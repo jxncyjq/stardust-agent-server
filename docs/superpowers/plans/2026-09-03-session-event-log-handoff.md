@@ -76,13 +76,33 @@ The `reasoning_content` in the thinking mode must be passed back to the API.
 
 ## 四、未完成：不需要拍板，做就是了
 
-### T-1 G3 端到端真机验证（本期唯一有实质风险的一条）
+### ~~T-1 G3 端到端真机验证~~ ✅ 已完成（2026-09-03）
 
-这次真机验证是**探针直连 provider**：从 `agent.db` 投影出 transcript → `port.InferenceRequest.Validate()` → 用项目自己的 adapter 发给 deepseek。三个验证点都过了（形状被接受、模型确实看得见工具往返、`_truncated_arguments` 读得懂），400 那个 bug 也是这么抓到的。
+起了两个真实 `agent serve`（同一份配置，只拨 `session.tool_transcript_enabled`，各自独立端口与库），跑同一组两轮对话。
 
-**但没有起过真实 `agent serve` 跑完整链路**。差的是：`session.tool_transcript_enabled` 从配置读进来 → `SessionHistoryForTask` 选路 → runtime 装配 → 真实工具循环 → 落盘 → 下一轮恢复。
+**实验设计**：第一轮让 agent 用 `read_file` 读一份端口表，并要求它「不要复述任何具体端口号」——模型照做了，所以 `shadow-indexer=52984` 这个事实**只存在于 `tool/result` 事件里**。第二轮追问这个数字，并明令「不要再读文件、不要调用任何工具」。
 
-启动坑（P3 走查时踩过）：`agent.json` 的 `agents` 段用的是相对仓库根的路径，配置文件复制到别处要改成绝对路径，否则 `--config` 看起来像被忽略了。
+| | G3 开 | G3 关（对照） |
+|---|---|---|
+| 第二轮回答 | **52984** ✅ | 「我不知道」 |
+| 第二轮工具调用 | **0 次**（查事件日志确认） | — |
+| 第二轮 prompt tokens | 1752 | 1470 |
+
+对照组自己解释了原因：「之前的对话记录只说明了 ports.md 的内容性质，并未透露具体端口值」——正是 G3 要治的失忆。
+
+**验到的东西**：
+
+1. 完整链路通了：配置读入 → `SessionHistoryForTask` 选路 → runtime 装配 → 真实工具循环 → 事件落盘（第一轮 16 条，含两次 `tool/call`+`tool/result`）→ 下一轮恢复时模型真能看见。
+2. **server#147 的修复在真机上生效**。第二轮正是「带历史 transcript 恢复会话」的场景——若那个修复不在，它必然 400（`reasoning_content` must be passed back）。它成功了。
+3. **G3 的真实代价：+282 tokens（+19%）**，远小于 P5 单测合成夹具的 3.00x——因为这个会话的工具输出不大。真实部署的倍数取决于工具输出体积，单测那个数字不能当预期值用。
+4. 两个 serve 的日志里 0 处 error/panic/400。
+
+**踩到的坑（下次照做/避开）**：
+
+- `agent.json` 的 `storage` 段是 `{"driver":"sqlite","path":"..."}`。我改配置时用 `list(keys())[0]` 猜 key，把 `driver` 覆盖成了路径，启动直接被 fail-loud 拦下：`storage driver "<路径>" provides no task sink`。**报错信息把错误指得很准**——这是 fail-loud 铁律在真机上兑现的一次。
+- `agents` 段是相对仓库根的路径，配置挪到别处必须改绝对路径（P3 走查时踩过，这次照做了，没再踩）。
+- 工具的读写根来自**建会话时**的 `working_dir`（`POST /v1/sessions`），不是配置里的 `workspace`。
+- 任务完成状态是 **`done`**，不是 `completed`。我最初的轮询判据写的是 `completed`，前几轮是靠循环跑满后恰好已落盘才拿到结果——判据错了却"看起来能用"。
 
 ### T-2 `configs/agent.complete.example.json` 缺 `tool_transcript_enabled`
 
