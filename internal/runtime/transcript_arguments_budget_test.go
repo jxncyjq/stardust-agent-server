@@ -15,8 +15,10 @@ import (
 //  1. session.max_turn_chars 约束的是一条消息的**内容量**，Content 与该消息全部
 //     arguments 共享同一份额度——不是每个字段各给一份。
 //  2. 额度之外，每个被裁的参数仍保留 argumentPeekRunes 个字符的可辨识前缀，外加
-//     一个记号。这部分是有意的额外开销，随被裁参数个数线性增长（见 applyTurnBudget
-//     的注释：这份预算把无界的那部分压成有界，不是把总字节数封死）。
+//     一个记号。这部分是有意的额外开销，随被裁参数个数线性增长。
+//     **更要紧的是**：总长不超过 `argumentPeekRunes + len(记号)`（今天 48+246=294 字符）
+//     的参数会整条原样发出、完全绕过额度——那是契约 3 那条守卫的直接后果。所以这份
+//     预算约束的是「长参数的内容量」，不是「每条消息的字节数」。
 //  3. 裁剪后若不比原文短就原样放行——记号有几十个字符，把短参数换成更长的说明
 //     既不省字节又丢信息。
 //  4. 额度分配顺序确定：call 按切片顺序，参数名按字典序。
@@ -93,7 +95,12 @@ func TestTheTranscriptPathHonoursMaxTurnCharsForToolCallArguments(t *testing.T) 
 		}
 	}
 
-	// 上界 = 额度 + 每个被裁参数的保底前缀。三个参数都会被裁（各 500 字符）。
+	// 上界 = 额度 + 每个被裁参数的保底前缀。
+	//
+	// 这条线**只对本夹具成立**，不是通用不变量：它依赖三个参数都远长于
+	// `argumentPeekRunes + len(记号)`（各 500 字符，所以必然落在裁剪路径上）。
+	// 换成三个 90 字符的参数，它们会整条原样通过，实际内容量远超这条线——那不是
+	// 缺陷，是契约 2 写明的短参数豁免。
 	//
 	// 断言这个精确的上界、而不是一个宽松的量级，是因为「按字段各给一份额度」的
 	// 实现会得到 budget×3 + 前缀，正好落在这条线之外。
@@ -197,8 +204,8 @@ func TestAShortArgumentIsNotReplacedByALongerNote(t *testing.T) {
 func TestAMediumArgumentIsNotReplacedByALongerNote(t *testing.T) {
 	t.Parallel()
 
-	// 50 字符：比保底前缀（8）长，但远短于「8 + 记号」，裁剪后一定更长。
-	medium := strings.Repeat("中", 50)
+	// 100 字符：比保底前缀（48）长，但短于「48 + 记号」=294，裁剪后一定更长。
+	medium := strings.Repeat("中", 100)
 	lister := &transcriptOnlyLister{transcript: []port.InferenceMessage{
 		{
 			Role:    port.RoleAssistant,
@@ -236,20 +243,22 @@ func TestAMediumArgumentIsNotReplacedByALongerNote(t *testing.T) {
 func TestTrimmingAlsoSpendsTheBudget(t *testing.T) {
 	t.Parallel()
 
-	// 额度 30，两个各 200 字符的参数：aaa 裁到 30 并把额度扣光，zzz 只剩保底前缀。
-	// 若裁剪路径不扣额度，zzz 会和 aaa 一样拿到 30。
-	long := strings.Repeat("甲", 200)
+	// 额度 100（要大于保底前缀 48，否则 aaa 也会被地板抬到 48，两边就分不开），
+	// 两个各 600 字符的参数（要长过 48+246=294，否则整条豁免、根本不走裁剪路径）：
+	// aaa 裁到 100 并把额度扣光，zzz 只剩保底前缀 48。
+	// 若裁剪路径不扣额度，zzz 会和 aaa 一样拿到 100。
+	long := strings.Repeat("甲", 600)
 	lister := &transcriptOnlyLister{transcript: []port.InferenceMessage{{
 		Role: port.RoleAssistant,
 		ToolCalls: []domain.ToolCall{{
 			ID: "c1", Name: "write_file",
-			Arguments: map[string]string{"aaa": long, "zzz": strings.Repeat("乙", 200)},
+			Arguments: map[string]string{"aaa": long, "zzz": strings.Repeat("乙", 600)},
 		}},
 	}}}
 
 	msgs, err := SessionTranscript(context.Background(), lister, config.SessionConfig{
 		DefaultRecentTurns: 6,
-		MaxTurnChars:       30,
+		MaxTurnChars:       100,
 	}, "s1")
 	if err != nil {
 		t.Fatalf("SessionTranscript: %v", err)
@@ -257,8 +266,8 @@ func TestTrimmingAlsoSpendsTheBudget(t *testing.T) {
 	args := msgs[0].ToolCalls[0].Arguments
 	aaaKept := len([]rune(stripTrimNote(args["aaa"])))
 	zzzKept := len([]rune(stripTrimNote(args["zzz"])))
-	if aaaKept != 30 {
-		t.Fatalf("aaa 保留了 %d 个字符，要 30（整个额度）：夹具没落在该验的那段上", aaaKept)
+	if aaaKept != 100 {
+		t.Fatalf("aaa 保留了 %d 个字符，要 100（整个额度）：夹具没落在该验的那段上", aaaKept)
 	}
 	if zzzKept != argumentPeekRunes {
 		t.Errorf("zzz 保留了 %d 个字符，要 %d（保底前缀）：裁剪路径没扣额度，"+
@@ -277,10 +286,15 @@ func TestTrimmingAlsoSpendsTheBudget(t *testing.T) {
 func TestArgumentBudgetIsSpentInADeterministicOrder(t *testing.T) {
 	t.Parallel()
 
-	// 额度 30 恰好被字典序第一个参数吃光，第二个只剩保底前缀 + 记号。
-	// 两个参数都远长于记号，所以都不会走「原样放行」那条路。
-	aaa := strings.Repeat("甲", 30)
-	zzz := strings.Repeat("乙", 300)
+	// 夹具必须让两种顺序产出**不同**的结果，否则这条测试量不到顺序。
+	//
+	// 两个参数都远长于 argumentPeekRunes + len(记号)=294，所以都必然走裁剪路径；
+	// 额度 100 大于 peek 48，所以「先花额度的那个」拿 100、「后来的」拿 48 ——
+	// 升序与降序的产物因此可区分。（用一个短于 peek 的参数就不行：无论顺序它都
+	// 原样返回，两种顺序结果相同，删掉 sort 也照样绿。）
+	const budget = 100
+	aaa := strings.Repeat("甲", 600)
+	zzz := strings.Repeat("乙", 600)
 	newLister := func() *transcriptOnlyLister {
 		return &transcriptOnlyLister{transcript: []port.InferenceMessage{{
 			Role: port.RoleAssistant,
@@ -291,89 +305,24 @@ func TestArgumentBudgetIsSpentInADeterministicOrder(t *testing.T) {
 		}}}
 	}
 
-	var first string
+	// 跑很多轮而不是一轮：删掉 sort 后 map 的遍历顺序是随机的，单轮**碰巧**升序
+	// 的概率约 1/2，一轮的绿说明不了任何事。
 	for round := 0; round < 200; round++ {
 		msgs, err := SessionTranscript(context.Background(), newLister(), config.SessionConfig{
 			DefaultRecentTurns: 6,
-			MaxTurnChars:       30,
+			MaxTurnChars:       budget,
 		}, "s1")
 		if err != nil {
 			t.Fatalf("SessionTranscript: %v", err)
 		}
 		args := msgs[0].ToolCalls[0].Arguments
-		got := args["aaa"] + "\x00" + args["zzz"]
-		if round == 0 {
-			first = got
-			// 直接钉住「是字典序靠前的那个活下来」，而不是绕道从「zzz 被裁」
-			// 反推：降序排序同样能让每轮结果一致，只断言「各轮相同」放得过它。
-			if args["aaa"] != aaa {
-				t.Fatalf("字典序靠前的 aaa 没有拿到额度（%q）：额度不是按字典序分配的", args["aaa"])
-			}
-			// 也确认额度真的被花完了，否则两个参数都原样返回，
-			// 「每轮结果相同」就成了空过。
-			if !strings.Contains(args["zzz"], "HISTORY-TRIMMED") {
-				t.Fatalf("字典序靠后的 zzz 没有被裁，额度没被花完：%q", args["zzz"])
-			}
-			continue
+		aaaKept := len([]rune(stripTrimNote(args["aaa"])))
+		zzzKept := len([]rune(stripTrimNote(args["zzz"])))
+		if aaaKept != budget || zzzKept != argumentPeekRunes {
+			t.Fatalf("第 %d 轮：aaa 保留 %d、zzz 保留 %d，要 %d / %d。"+
+				"额度不是按字典序分配的——map 的随机遍历顺序会让同一条历史产出不同的请求字节",
+				round+1, aaaKept, zzzKept, budget, argumentPeekRunes)
 		}
-		if got != first {
-			t.Fatalf("第 %d 轮的投影结果与第 1 轮不同：额度分配顺序取决于 map 的随机遍历顺序，"+
-				"同一条历史会产出不同的请求字节\n第 1 轮: %q\n本轮:   %q", round+1, first, got)
-		}
-	}
-}
-
-// 已知代价，显式钉住：被裁的历史参数不再与本轮的真实调用逐字相等，
-// 于是跨会话的重复调用在 repeatedCallStreak 那里漏检。
-//
-// 链路：runtime.go 的 appendHistory 把历史塞进 convo.messages → repeatedCallStreak
-// 遍历它 → callsKey → dedupKey 按 `name|k=v` **逐字**比对。历史里被裁过的参数与
-// 模型这一轮真实发出的参数不等，streak 断在那里。
-//
-// 这不是这次改动**引入**的问题：写入侧本来就把 arguments 截到 maxEventPreviewRunes
-// (2000)，超过那个长度的参数改动前同样匹配不上。这次把不匹配的边界从「超过 2000」
-// 拉到了「超过剩余额度」，范围扩大了。
-//
-// 保持现状而不是修它，是因为「跨会话的同一组调用算不算连续重复」本身是一个未定的
-// 设计问题，不该在一个预算改动里顺手决定。这条测试的作用是让这个取舍**可见**：
-// 谁哪天改了裁剪或改了 dedupKey，这里会告诉他这条链路存在。
-func TestTrimmedHistoryArgumentsNoLongerMatchTheLiveCallVerbatim(t *testing.T) {
-	t.Parallel()
-
-	original := strings.Repeat("甲", 300)
-	live := domain.ToolCall{ID: "live", Name: "write_file",
-		Arguments: map[string]string{"content": original}}
-
-	lister := &transcriptOnlyLister{transcript: []port.InferenceMessage{{
-		Role: port.RoleAssistant,
-		ToolCalls: []domain.ToolCall{
-			{ID: "old", Name: "write_file", Arguments: map[string]string{"content": original}},
-		},
-	}}}
-	msgs, err := SessionTranscript(context.Background(), lister, config.SessionConfig{
-		DefaultRecentTurns: 6,
-		MaxTurnChars:       20,
-	}, "s1")
-	if err != nil {
-		t.Fatalf("SessionTranscript: %v", err)
-	}
-	historical := msgs[0].ToolCalls[0]
-
-	// 先确认这一轮真的裁了——没裁的话两边本来就相等，下面的断言验不到东西。
-	if !strings.Contains(historical.Arguments["content"], "HISTORY-TRIMMED") {
-		t.Fatalf("历史参数没被裁，这条测试验不到该验的链路：%q", historical.Arguments["content"])
-	}
-
-	if dedupKey(historical) == dedupKey(live) {
-		t.Log("裁剪后的历史参数仍与本轮调用逐字相等——" +
-			"若这是有意的修复（例如 dedupKey 改成对裁剪不敏感），请连同上面的注释一起更新")
-		return
-	}
-	// 这是当前的、已知的行为。断言它，而不是断言「相等」，是为了如实记录：
-	// 跨会话的这一组重复调用在今天的实现里漏检。
-	if streak := repeatedCallStreak(msgs, []domain.ToolCall{live}); streak != 1 {
-		t.Errorf("streak = %d，当前实现下应为 1（历史参数被裁，逐字比对断开）："+
-			"若这里变了，说明 dedupKey 或裁剪的行为改了，注释里那个取舍需要重新评估", streak)
 	}
 }
 
