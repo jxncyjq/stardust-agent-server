@@ -62,8 +62,11 @@ func TestCompactionKeepsTheTaskBoundaryValid(t *testing.T) {
 // (taskStart - preserveStart) 恰好是 0——于是「+1 的 off-by-one」和「删掉整个 A 支、
 // 无条件置 2」两种写法都能让它通过。它证明的只是「边界不大过新长度」这个弱性质。
 //
-// 这两条把平移项做成非零，并断言 streak 的**具体值**：位移错一位，保留下来的那轮
-// assistant 就会跨到边界的另一侧，streak 随之改变。
+// 这两条把平移项做成非零，判别力来自对 taskStart 的**精确**断言。
+//
+// 别删那两条 taskStart 断言：这两个夹具里的 streak 断言其实是恒真的装饰——A 支
+// 在 taskStart ∈ {2,4,5} 上 streak 都是 3，B 支在 taskStart ∈ {0..3} 上都是 1。
+// 它们留着是为了说明「边界指对了位置」这件事的后果，不是判别力的来源。
 func TestCompactionShiftsTheBoundaryWhenItLandsInTheKeptTail(t *testing.T) {
 	t.Parallel()
 

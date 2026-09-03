@@ -156,6 +156,39 @@ func (s *Store) Save(cp Checkpoint) error {
 	return nil
 }
 
+// validateCheckpoint rejects a decoded checkpoint whose contents are not
+// internally consistent. It is shared by the package's TWO deserialisation
+// paths — Load and ListSuspendedIn — because a check that lives in only one of
+// them leaves the other reading unvalidated state; the SchemaVersion comparison
+// used to be inlined in both, which is exactly how they could have drifted.
+//
+// Everything here is a fact about a FILE ON DISK, so every fault returns an
+// error rather than panicking: a checkpoint is external input (hand-edited,
+// truncated by a disk fault, or written by some future bug on the write side),
+// not a programming error inside this process. That distinction matters —
+// RunTask runs on a task goroutine with no recover anywhere above it, so a
+// panic here would turn one corrupt file into an agent-wide crash that takes
+// every concurrent task with it.
+//
+// 守卫：TestLoadRejectsATaskStartPastTheEndOfMessages。
+func validateCheckpoint(cp Checkpoint, path string) error {
+	if cp.SchemaVersion != CheckpointSchemaVersion {
+		return fmt.Errorf("checkpoint %q schema version %d unsupported (want %d)",
+			path, cp.SchemaVersion, CheckpointSchemaVersion)
+	}
+	// TaskStart indexes into Messages (see its field doc). An out-of-range value
+	// would slice out of bounds the moment the resumed conversation counts a
+	// repeat streak, far from the file that caused it.
+	//
+	// An empty Messages counts as corrupt: the write side always snapshots a
+	// conversation that has at least message[0].
+	if cp.TaskStart < 0 || cp.TaskStart > len(cp.Messages) {
+		return fmt.Errorf("checkpoint %q task_start %d out of range for %d messages",
+			path, cp.TaskStart, len(cp.Messages))
+	}
+	return nil
+}
+
 // Load reads the checkpoint for sessionKey under SessionBase(s.workspaceRoot,
 // workingDir). Absence is legitimate (fresh task): it returns (zero, false,
 // nil). Any other fault — unreadable file, corrupt JSON, or an unrecognised
@@ -175,8 +208,8 @@ func (s *Store) Load(sessionKey, workingDir string) (Checkpoint, bool, error) {
 	if err := json.Unmarshal(data, &cp); err != nil {
 		return Checkpoint{}, false, fmt.Errorf("decode checkpoint %q: %w", path, err)
 	}
-	if cp.SchemaVersion != CheckpointSchemaVersion {
-		return Checkpoint{}, false, fmt.Errorf("checkpoint %q schema version %d unsupported (want %d)", path, cp.SchemaVersion, CheckpointSchemaVersion)
+	if err := validateCheckpoint(cp, path); err != nil {
+		return Checkpoint{}, false, err
 	}
 	return cp, true, nil
 }
@@ -244,8 +277,8 @@ func (s *Store) ListSuspendedIn(base string) ([]Checkpoint, error) {
 		if err := json.Unmarshal(data, &cp); err != nil {
 			return nil, fmt.Errorf("decode suspended checkpoint %q: %w", path, err)
 		}
-		if cp.SchemaVersion != CheckpointSchemaVersion {
-			return nil, fmt.Errorf("checkpoint %q schema version %d unsupported (want %d)", path, cp.SchemaVersion, CheckpointSchemaVersion)
+		if err := validateCheckpoint(cp, path); err != nil {
+			return nil, err
 		}
 		out = append(out, cp)
 	}
