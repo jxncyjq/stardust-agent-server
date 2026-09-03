@@ -279,3 +279,38 @@ func TestACorruptBoundaryFailsLoudAtRestore(t *testing.T) {
 	}()
 	restoreConversation(snaps, 99)
 }
+
+// appendToolResults 的 panic 分支：一个被派发了却没有渲染结果的调用是接线错误，
+// 不是可以吞掉的状态。
+//
+// executeToolCalls 在同一个循环里填 results 和 rendered，所以每个派发过的调用都有
+// 一份渲染结果；真出现缺口意味着有人改坏了那条接线。吞掉它会给 provider 留下一个
+// 未被应答的 assistant tool call——请求直接被拒，而原因在很远的地方。
+//
+// 这条断言此前是缺的：全仓 16 处 appendToolResults 调用**全部**传 key 对得上的 map，
+// panic 分支一次都没被执行过。本仓规矩是「fail-loud 分支须有测试断言确实报错」，
+// 而「绿得不是地方」这个形状本期已经栽了十次以上——一个从未被执行的 panic 分支，
+// 改成 continue 也不会有任何测试变红。
+func TestAppendingAToolResultWithNoRenderedContentFailsLoud(t *testing.T) {
+	t.Parallel()
+
+	convo := newConversation("base", nil)
+	calls := []domain.ToolCall{
+		{ID: "c1", Name: "read_file", Arguments: map[string]string{"path": "a.md"}},
+	}
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("派发过的调用没有渲染结果，却没有 fail-loud：" +
+				"这条 tool 消息会被悄悄丢掉，provider 收到一个未被应答的 assistant " +
+				"tool call 后拒收整个请求，而原因看不出在这里")
+		}
+		msg := fmt.Sprint(r)
+		if !strings.Contains(msg, "c1") || !strings.Contains(msg, "read_file") {
+			t.Errorf("panic 信息里没有指明是哪个调用，定位不到：%q", msg)
+		}
+	}()
+	// rendered 里没有 c1 —— 正是接线坏掉时的形状。
+	convo.appendToolResults(calls, map[string]string{"other": "内容"})
+}

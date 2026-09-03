@@ -687,3 +687,48 @@ func TestAMissingTurnOrStepIsRefused(t *testing.T) {
 		}
 	})
 }
+
+// 一条 assistant 两次宣告同一个 call_id：spec §4.3.1 第 4 条禁的正是「同一个 step 内、
+// 还未被应答的 tool/call 复用 call_id」，而同一条 assistant 里的两次宣告在发出时都还
+// 没被应答。
+//
+// 不拒的话两次都命中同一个 results/arguments 键，产出 tool_calls=[c1, c1] 加两条
+// tool_call_id 相同的 tool 消息，provider 拒收整个请求——响亮，但发生在离原因很远的
+// 地方。这里拒能直接指名 seq。
+//
+// 它补的是一处不对称：collectToolResults 与 collectToolCallArguments 都为撞键写了
+// fail-loud，三处同性质的地方只有宣告侧曾经放行。
+func TestAnAssistantAnnouncingTheSameCallIDTwiceIsRefused(t *testing.T) {
+	_, err := projectTranscript("s", []domain.SessionEvent{
+		evWith(0, domain.SessionEventTurnStart, map[string]any{"turn": 0}),
+		evWith(1, domain.SessionEventUserMessage, map[string]any{
+			"turn": 0, "turn_id": "t:user", "task_id": "t", "content": "干活",
+		}),
+		evWith(2, domain.SessionEventStepStart, map[string]any{"turn": 0, "step": 0}),
+		evWith(3, domain.SessionEventAssistantMessage, map[string]any{
+			"turn": 0, "step": 0, "turn_id": "t:assistant", "task_id": "t", "agent_id": "a",
+			"content": "调工具",
+			"tool_calls": []any{
+				map[string]any{"call_id": "c1", "name": "read_file"},
+				map[string]any{"call_id": "c1", "name": "read_file"},
+			},
+			"usage":         map[string]any{"prompt": 1, "completion": 1, "cached": 0, "total": 2},
+			"model_profile": "fast",
+		}),
+		evWith(4, domain.SessionEventToolCall, map[string]any{
+			"turn": 0, "step": 0, "call_id": "c1", "name": "read_file",
+			"arguments": `{"path":"a.md"}`,
+		}),
+		evWith(5, domain.SessionEventToolResult, map[string]any{
+			"turn": 0, "step": 0, "call_id": "c1", "preview": "内容", "is_error": false,
+		}),
+	})
+	if err == nil {
+		t.Fatal("同一条 assistant 两次宣告同一个 call_id 没有被拒绝——" +
+			"投影会产出两条 tool_call_id 相同的 tool 消息，provider 拒收整个请求，" +
+			"而错误发生在离这里很远的地方")
+	}
+	if !strings.Contains(err.Error(), "twice") || !strings.Contains(err.Error(), "seq 3") {
+		t.Errorf("错误没有指明是重复宣告以及是哪条事件：%v", err)
+	}
+}
