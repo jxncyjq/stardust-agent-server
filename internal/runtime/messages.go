@@ -22,6 +22,14 @@ import (
 // each turn distinct is what makes repetition visible to the model.
 type conversation struct {
 	messages []port.InferenceMessage
+	// taskStart 是**本任务**自己的消息在 messages 里的起点：G3 打开时历史以
+	// transcript 排在 message[0] 之后，这个下标就落在历史之后；关闭时它一直是 1。
+	//
+	// 它存在只为一件事：repeatedCallStreak 数的是「本任务内连续多少轮请求了同样的
+	// 工具调用」，扫描不能越过这个界跑进上一个会话——那会把「用户连问了三次同样的
+	// 问题」读成「模型卡在循环里」，平白触发重复警告，历史再长一点就是直接中止。
+	// 守卫：TestHistoryToolCallsDoNotCountIntoTheRepeatStreak。
+	taskStart int
 	// lastLoaded is the loaded-capability block as it was last shown to the
 	// model, so syncLoaded only spends a turn when the block actually changed.
 	lastLoaded string
@@ -31,11 +39,16 @@ type conversation struct {
 // the task's images attached to it — the same placement the single-turn
 // contract used.
 func newConversation(basePrompt string, images []string) *conversation {
-	return &conversation{messages: []port.InferenceMessage{{
-		Role:    port.RoleUser,
-		Content: basePrompt,
-		Images:  images,
-	}}}
+	return &conversation{
+		messages: []port.InferenceMessage{{
+			Role:    port.RoleUser,
+			Content: basePrompt,
+			Images:  images,
+		}},
+		// 没有历史时本任务的消息紧跟在 message[0] 之后。appendHistory 会把这个
+		// 界推到历史之后。
+		taskStart: 1,
+	}
 }
 
 // pinCachePrefix marks the first message's stable cache-prefix rune length, the
@@ -60,6 +73,8 @@ func (c *conversation) pinCachePrefix(n int) {
 // 守卫：TestTheCacheBreakpointStaysOnTheFirstMessage。
 func (c *conversation) appendHistory(history []port.InferenceMessage) {
 	c.messages = append(c.messages, history...)
+	// 历史之后才是本任务自己的轮次——重复熔断只数这一段，理由见 taskStart。
+	c.taskStart = len(c.messages)
 }
 
 // appendCurrentInput 让请求以**当前任务**收尾。
@@ -313,10 +328,13 @@ var _ tool.LoopBudget = (*sharedToolBudget)(nil)
 // same tool calls, counting the pending calls as the newest round. It returns 1
 // when the pending calls differ from the previous round, and 0 when there are
 // no pending calls.
-func repeatedCallStreak(msgs []port.InferenceMessage, calls []domain.ToolCall) int {
+// 它只看**本任务**的消息（从 taskStart 起），历史一概不数：那是上一个会话的轮次，
+// 把它算进来会让「用户连问了三次同样的问题」被读成「模型卡在循环里」。
+func (c *conversation) repeatedCallStreak(calls []domain.ToolCall) int {
 	if len(calls) == 0 {
 		return 0
 	}
+	msgs := c.messages[c.taskStart:]
 	want := callsKey(calls)
 	streak := 1
 	for i := len(msgs) - 1; i >= 0; i-- {
