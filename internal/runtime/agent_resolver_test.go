@@ -912,6 +912,14 @@ func (f *fakeTurnLister) ListConversationTurns(ctx context.Context, sessionID st
 	return f.turns, nil
 }
 
+// ListConversationTranscript 报错而不是返回空：这个 double 只服务 G3 关闭那条路
+// （上面这些测试都把开关留在零值）。返回 (nil, nil) 会让「开关打开却没人喂
+// transcript」看起来和「这条会话没有历史」一模一样（CLAUDE.md §0）。真正跑
+// transcript 的接线测试接的是真仓储，见 transcript_wiring_test.go。
+func (f *fakeTurnLister) ListConversationTranscript(_ context.Context, sessionID string, _ int) ([]port.InferenceMessage, error) {
+	return nil, fmt.Errorf("fakeTurnLister: session %q asked for a transcript, but this double only serves the G3-off turns path", sessionID)
+}
+
 func TestRecentTurnsForTaskExcludesCurrentTurn(t *testing.T) {
 	task := domain.Task{ID: "task-9", SessionID: "s1", AgentID: "a"}
 	lister := &fakeTurnLister{turns: []domain.ConversationTurn{
@@ -922,9 +930,10 @@ func TestRecentTurnsForTaskExcludesCurrentTurn(t *testing.T) {
 	r := &AgentRuntimeResolver{conversationTurns: lister, rootConfig: config.Config{
 		Session: config.SessionConfig{DefaultRecentTurns: 6, MaxTurnChars: 6000},
 	}}
-	got, err := r.recentTurnsForTask(t.Context(), task)
+	history, err := r.sessionHistoryForTask(t.Context(), task)
+	got := history.Turns
 	if err != nil {
-		t.Fatalf("recentTurnsForTask err = %v, want nil", err)
+		t.Fatalf("sessionHistoryForTask err = %v, want nil", err)
 	}
 	for _, turn := range got {
 		if turn.TaskID == task.ID {
@@ -945,7 +954,8 @@ func TestRecentTurnsForTaskTruncatesAndFailsLoud(t *testing.T) {
 		}},
 		rootConfig: config.Config{Session: config.SessionConfig{DefaultRecentTurns: 6, MaxTurnChars: 10}},
 	}
-	got, err := r.recentTurnsForTask(t.Context(), task)
+	history, err := r.sessionHistoryForTask(t.Context(), task)
+	got := history.Turns
 	if err != nil {
 		t.Fatalf("err = %v", err)
 	}
@@ -961,7 +971,7 @@ func TestRecentTurnsForTaskTruncatesAndFailsLoud(t *testing.T) {
 		conversationTurns: &fakeTurnLister{err: fmt.Errorf("db down")},
 		rootConfig:        config.Config{Session: config.SessionConfig{DefaultRecentTurns: 6}},
 	}
-	if _, err := rErr.recentTurnsForTask(t.Context(), task); err == nil {
+	if _, err := rErr.sessionHistoryForTask(t.Context(), task); err == nil {
 		t.Fatalf("lister error must propagate (fail-loud), got nil")
 	}
 }
@@ -972,13 +982,15 @@ func TestRecentTurnsForTaskSkipsWhenNoSessionOrLister(t *testing.T) {
 		conversationTurns: &fakeTurnLister{turns: []domain.ConversationTurn{{ID: "x", TaskID: "t"}}},
 		rootConfig:        config.Config{Session: config.SessionConfig{DefaultRecentTurns: 6}},
 	}
-	got, err := r.recentTurnsForTask(t.Context(), task)
+	history, err := r.sessionHistoryForTask(t.Context(), task)
+	got := history.Turns
 	if err != nil || len(got) != 0 {
 		t.Fatalf("no SessionID → (nil,nil), got (%v,%v)", got, err)
 	}
 	// lister == nil 同样不注入、不 panic
 	rNil := &AgentRuntimeResolver{rootConfig: config.Config{Session: config.SessionConfig{DefaultRecentTurns: 6}}}
-	got, err = rNil.recentTurnsForTask(t.Context(), domain.Task{ID: "t", SessionID: "s1"})
+	history, err = rNil.sessionHistoryForTask(t.Context(), domain.Task{ID: "t", SessionID: "s1"})
+	got = history.Turns
 	if err != nil || len(got) != 0 {
 		t.Fatalf("nil lister → (nil,nil), got (%v,%v)", got, err)
 	}
@@ -1031,9 +1043,10 @@ func TestRecentTurnsForTaskTrimsToLimit(t *testing.T) {
 			DefaultRecentTurns: limit, MaxTurnChars: 6000,
 		}},
 	}
-	got, err := r.recentTurnsForTask(t.Context(), task)
+	history, err := r.sessionHistoryForTask(t.Context(), task)
+	got := history.Turns
 	if err != nil {
-		t.Fatalf("recentTurnsForTask err = %v, want nil", err)
+		t.Fatalf("sessionHistoryForTask err = %v, want nil", err)
 	}
 	if len(got) != limit {
 		t.Fatalf("len(got) = %d, want %d", len(got), limit)
@@ -1058,9 +1071,10 @@ func TestRecentTurnsForTaskNormalisesZeroMaxTurnChars(t *testing.T) {
 			DefaultRecentTurns: 6, MaxTurnChars: 0,
 		}},
 	}
-	got, err := r.recentTurnsForTask(t.Context(), task)
+	history, err := r.sessionHistoryForTask(t.Context(), task)
+	got := history.Turns
 	if err != nil {
-		t.Fatalf("recentTurnsForTask err = %v, want nil", err)
+		t.Fatalf("sessionHistoryForTask err = %v, want nil", err)
 	}
 	if len([]rune(got[0].Content)) >= len([]rune(huge)) {
 		t.Fatalf("MaxTurnChars=0 must fall back to the default cap, got %d runes", len([]rune(got[0].Content)))

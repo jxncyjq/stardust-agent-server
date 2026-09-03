@@ -469,6 +469,14 @@ type SessionConfig struct {
 	RestoreLatestOnTUIStart bool `json:"restore_latest_on_tui_start"`
 	CacheEnabled            bool `json:"cache_enabled"`
 	CacheMaxEntries         int  `json:"cache_max_entries"`
+	// ToolTranscriptEnabled 打开后，注入模型的会话历史从「Recent conversation:」
+	// 文本块换成 provider transcript——assistant 消息带 tool_calls，其后跟与之
+	// call_id 配对的 tool 消息（spec §6 的 G3）。模型因此能看见历史的工具往返，
+	// 不再在会话恢复时失忆。
+	//
+	// 零值 false 就是关，而且必须是关：它改的是**每次请求的体积**（可能涨数倍），
+	// spec §3 明确「不该在做轨迹的顺路上悄悄打开」。这是一次单独的、可度量的决定。
+	ToolTranscriptEnabled bool `json:"tool_transcript_enabled"`
 }
 
 type ThemeConfig struct {

@@ -17,6 +17,23 @@ type Request struct {
 	Task              domain.Task
 	Tools             []string
 	ConversationTurns []domain.ConversationTurn
+	// HistoryInTranscript states that the caller is carrying this task's session
+	// history as provider transcript messages (G3 on, spec §6) instead of handing
+	// it over in ConversationTurns to be rendered into the prompt.
+	//
+	// It changes nothing about the assembled text -- with the switch on the
+	// runtime passes no turns, so the conversation block would be empty either
+	// way. What it changes is the ACCOUNTING: Blocks then names the history
+	// section "conversation_transcript" with a zero size, which is what lets a
+	// reader tell "this task had no history" apart from "its history left the
+	// prompt and its cost is on the messages instead". Without that distinction
+	// the section is simply absent and "where did the history go" has no answer
+	// in Blocks at all -- the same gap the plugin_prompt block was added to close.
+	//
+	// The two are mutually exclusive by construction (runtime.SessionHistory
+	// populates exactly one of its two fields); setting both is refused rather
+	// than absorbed, because it means the history is about to be sent twice.
+	HistoryInTranscript bool
 	// Catalog, when non-nil, is the per-task capability catalog rendered into the
 	// prompt. The runtime supplies one built from the run's effective (per-task,
 	// Plan-scoped) tool registry so the prompt advertises exactly what that task
@@ -39,6 +56,11 @@ type BuiltContext struct {
 	// files, the capability catalog, conversation history or anything else.
 	// The sizes sum to the assembled prompt's rune count when no compressor
 	// rewrote it.
+	//
+	// Empty sections are omitted, with ONE exception: the session history is
+	// always listed, named for the route it took ("conversation" when it is in
+	// this prompt, "conversation_transcript" when G3 moved it onto the provider
+	// messages). See BuildContext for why that section may not go missing.
 	Blocks []BlockSize
 }
 
@@ -146,6 +168,16 @@ func (c *Core) BuildContext(ctx context.Context, req Request) (BuiltContext, err
 	if err := ctx.Err(); err != nil {
 		return BuiltContext{}, err
 	}
+	// Both halves of the history choice populated at once means the caller is
+	// about to send the same history twice -- once as this prompt's
+	// "Recent conversation:" block and once as the transcript it is carrying.
+	// Nothing downstream would report it: the request stays valid, the model
+	// just reads everything twice and the size doubles. Refuse instead.
+	if req.HistoryInTranscript && len(req.ConversationTurns) > 0 {
+		return BuiltContext{}, fmt.Errorf(
+			"build context for task %q: history is carried as a transcript but %d conversation turns were also passed to be rendered into the prompt; it would be sent twice",
+			req.Task.ID, len(req.ConversationTurns))
+	}
 	durableBlock, err := c.durableMemoryBlock(ctx, req)
 	if err != nil {
 		return BuiltContext{}, err
@@ -164,14 +196,21 @@ func (c *Core) BuildContext(ctx context.Context, req Request) (BuiltContext, err
 	}
 	var prompt string
 	var blocks []BlockSize
+	// record appends one named section and its size unconditionally, empty body
+	// included. Only the history section uses it directly; see the conversation
+	// block below for why that one section is always accounted for.
+	record := func(name, body string) {
+		prompt += body
+		blocks = append(blocks, BlockSize{Name: name, Chars: len([]rune(body))})
+	}
 	// add appends one named section and records its size, so the caller can
 	// attribute prompt growth to a specific block instead of only seeing a total.
+	// An empty section contributes nothing and is not listed.
 	add := func(name, body string) {
 		if body == "" {
 			return
 		}
-		prompt += body
-		blocks = append(blocks, BlockSize{Name: name, Chars: len([]rune(body))})
+		record(name, body)
 	}
 	// --- Stable prefix: byte-identical across a session's tasks. Order matters:
 	// nothing task-specific may appear before the boundary or the cache misses. ---
@@ -204,7 +243,31 @@ func (c *Core) BuildContext(ctx context.Context, req Request) (BuiltContext, err
 	))
 	add("capability", capabilityBlock)
 	add("prefetch", prefetched)
-	add("conversation", conversationBlock(req.ConversationTurns))
+	// The session history is the ONE section recorded even when it is empty, and
+	// it is named after the route it took. G3 (spec §6) moves the history out of
+	// this prompt and into provider transcript messages, whose cost is "每次请求
+	// 体积可能涨数倍" -- and §6 calls that "一次单独的、可度量的决定". Left to the
+	// ordinary `add`, the section would simply vanish from Blocks the moment the
+	// switch is on, and "the prompt shrank by 300 chars, where did the history
+	// go" would have no answer here at all.
+	//
+	// So Blocks always carries exactly one history entry:
+	//
+	//   conversation            N -- history is in this prompt, N runes of it
+	//   conversation            0 -- history goes in this prompt; there is none yet
+	//   conversation_transcript 0 -- history left the prompt; its size is on the
+	//                                messages (runtime.SessionTranscript), not here
+	//
+	// The zero on the transcript entry is not a placeholder: it is the true
+	// contribution of the history to THIS prompt, which is what Blocks accounts
+	// for. It keeps the documented invariant intact -- the sizes still sum to the
+	// assembled prompt's rune count.
+	// 守卫：TestHistoryVolumeIsAttributableInBlocks（internal/runtime）。
+	if req.HistoryInTranscript {
+		record("conversation_transcript", "")
+	} else {
+		record("conversation", conversationBlock(req.ConversationTurns))
+	}
 	result, err := c.compressor.Compress(ctx, prompt)
 	if err != nil {
 		return BuiltContext{}, fmt.Errorf("compress context: %w", err)

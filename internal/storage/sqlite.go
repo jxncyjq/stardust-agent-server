@@ -14,6 +14,7 @@ import (
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/evolution"
 	"github.com/stardust/legion-agent/internal/memory"
+	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/quality"
 	"github.com/stardust/legion-agent/internal/skill"
 	"github.com/stardust/legion-agent/internal/workflow"
@@ -507,6 +508,51 @@ func (r *SQLiteRepository) ListConversationTurns(ctx context.Context, sessionID 
 		turns = turns[len(turns)-limit:]
 	}
 	return turns, nil
+}
+
+// ListConversationTranscript 返回一条会话的历史，形状是 provider transcript
+// （spec §6 的 G3）：assistant 消息带 tool_calls，其后跟与之 call_id 配对的
+// tool 消息。
+//
+// 与 ListConversationTurns 并列而不是取代它：G3 关闭时走 turns，打开时走这里。
+// 两者读同一批事件，谁也不改谁。
+//
+// 用 ReadFrom(0) 而不是 Load：spec §4.3.1 第 3 条要求 Load 只对「确定没有活跃
+// 写入者」的会话调用，而这个方法在任务执行期间也会被调用。
+//
+// # limit 是「最近 limit 条消息」，但不会把一批 tool 消息与宣告它的 assistant 切散
+//
+// 从尾部截断可能正好切在 assistant 与它的 tool 之间，留下开头几条无人宣告的 tool
+// 消息——provider 拒收那样的请求（port.InferenceMessage 的文档注释），而且是整个
+// 请求被拒，不是显示得难看一点。所以截完之后把窗口起点**向前**走过开头的 tool
+// 消息，直到落在宣告它们的那条 assistant 上。
+//
+// 选「向前走到宣告它的 assistant」而不是「把这几条 tool 丢掉」，是因为丢掉会让
+// 那次调用的结果无声消失，而模型看得见调用、看不见结果；也不选「向前走到最近的
+// user 边界」，因为一条「用户只问了一次、之后跑了几百轮工具」的会话里，最近的
+// user 边界就是整条会话的开头，limit 会形同虚设——而 G3 的全部代价就是体积。
+// 向前走过 tool 的步数由那一步的调用条数封顶，是有界的。
+//
+// 这与 runtime 的 compactionSplit 走开 orphan RoleTool 边界是同一个手法，理由也
+// 相同：先划窗口，再把窗口挪到一个 provider 收得下的边界上。
+// 守卫：TestTheLimitNeverSplitsAnAssistantFromItsToolMessages。
+func (r *SQLiteRepository) ListConversationTranscript(ctx context.Context, sessionID string, limit int) ([]port.InferenceMessage, error) {
+	events, err := r.ReadFrom(ctx, sessionID, 0)
+	if err != nil {
+		return nil, fmt.Errorf("list conversation transcript for %q: %w", sessionID, err)
+	}
+	msgs, err := projectTranscript(sessionID, events)
+	if err != nil {
+		return nil, fmt.Errorf("list conversation transcript for %q: %w", sessionID, err)
+	}
+	if limit > 0 && len(msgs) > limit {
+		start := len(msgs) - limit
+		for start > 0 && msgs[start].Role == port.RoleTool {
+			start--
+		}
+		msgs = msgs[start:]
+	}
+	return msgs, nil
 }
 
 // AddEpisodicMemory persists one episodic memory entry and its full-text index

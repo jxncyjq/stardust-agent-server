@@ -2820,6 +2820,10 @@ func (s *countingConversationStore) ListConversationTurns(ctx context.Context, s
 	return s.delegate.ListConversationTurns(ctx, sessionID, limit)
 }
 
+func (s *countingConversationStore) ListConversationTranscript(ctx context.Context, sessionID string, limit int) ([]port.InferenceMessage, error) {
+	return s.delegate.ListConversationTranscript(ctx, sessionID, limit)
+}
+
 func (s *countingConversationStore) Append(ctx context.Context, sessionID string, events []domain.SessionEvent) error {
 	return s.delegate.Append(ctx, sessionID, events)
 }
@@ -3092,6 +3096,13 @@ func (f *fakeCLITurnLister) ListConversationTurns(_ context.Context, sessionID s
 	f.gotSessID = sessionID
 	f.gotLimit = limit
 	return f.turns, nil
+}
+
+// ListConversationTranscript 报错而不是返回空：这个 double 只服务 G3 关闭那条路，
+// 一旦有测试把开关打开却仍然用它，返回 (nil, nil) 会让「历史没注进去」看起来
+// 和「这条会话本来就没历史」一模一样（CLAUDE.md §0）。
+func (f *fakeCLITurnLister) ListConversationTranscript(_ context.Context, sessionID string, _ int) ([]port.InferenceMessage, error) {
+	return nil, fmt.Errorf("fakeCLITurnLister: session %q asked for a transcript, but this double only serves the G3-off turns path", sessionID)
 }
 
 // promptRecordingMaas records the flattened prompt of the first inference and
