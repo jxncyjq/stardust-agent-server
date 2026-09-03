@@ -136,9 +136,41 @@ The `reasoning_content` in the thinking mode must be passed back to the API.
 
 环境变量 `LEGION_AGENT_TOOL_TRANSCRIPT` 走 `REQUIRE_IDENTITY` 那一档而非便利开关的 `== "true" || == "1"`：这个开关改的是每次请求的体积，写 `=yes` 的人是想打开它，静默落回 false 会让他拿到零效果加零警告，而「体积没变」最容易被读成「这开关没用」。不可解析的值 fail-loud。
 
-### T-4 per-task review 的 Minor 项
+### T-4 per-task review 的 Minor 项 —— 已分诊（2026-09-03），修掉 3 条，其余分类待办
 
-P4a 16 条 / P4b 14 条 / P5 5+ 条。**数字来自当时各轮 review 的记录，本次没有逐条复核**；原始 review 文件在 `.superpowers/sdd/`（git-ignored，`git clean -fdx` 会清掉）。
+原先记的「P4a 16 条 / P4b 14 条 / P5 5+ 条」**三个数都不准**，两个 subagent 逐条核实到代码后：
+
+| 原记 | 实际 |
+|---|---|
+| P5 「5+ 条」 | **18 条**（去重后） |
+| P4a「16 条」 | **21 条** —— 只抄了 `archive-p4a-final-review.md` §4 清单 A 的 16 条，漏掉 §6 最终复审自己新提的 N1–N5 |
+| P4b「14 条」 | 未分诊（在 GUI 仓） |
+
+**「原始 review 文件在 `.superpowers/sdd/`」这句对 P4a 不成立**：`task-1/2/3-review.md` 已被 **P5** 的同名文件覆盖，P4a 那批的唯一幸存记录是 `archive-p4a-final-review.md` 的 roll-up 表。以后归档要带阶段前缀。
+
+分诊还核出一条**记错的**：P4a 的 T2-M5「帧顺序=seq 顺序没有常驻测试」不成立——`internal/runtime/eventlog_session_frame_test.go:89-95` 就是按序逐条比对、乱序即红，辅助函数不排序、还显式钉了绝对值 `0,1,2`。
+
+#### 已修（server#152）
+
+- **P5 T3-1-M4 检查点丢 `StablePrefixLen`** —— 唯一有真实运行时影响的一条：恢复路径不经 `pinCachePrefix`，续跑的每一次请求都失去 prompt cache，而 G3 把历史排在 `messages[0]` 之后的整个取舍就是为了保住这个断点。修复前测试直接红（0 != 34）。
+- **P5 MIN-5 宣告侧缺撞键 fail-loud** —— 三处同性质只有它放行。
+- **P4a T3-M1/N4 `appendToolResults` 的 panic 从未被执行过** —— 16 处调用全传对得上的 map，改成 `continue` 也不会有任何测试变红。
+
+#### 值得修但需拍板（3 条）
+
+| 项 | 要拍的板 |
+|---|---|
+| **P5 T4-顾虑2** `totalChars` 不计 `ToolCalls` | #148 之后「度量口径与预算口径都只看 Content 所以一致」这条立论**已破**：arguments 被预算裁了却量不到，`runtime.debug` 的数会系统性低估 G3 代价（T-1 记的 +19% 正是这个口径）。**并进 `total_content_chars`（破坏与历史日志可比性）还是新开 `total_tool_call_chars`？** |
+| **P4a T1-M4** `limit` 无上界 | `session_events.go:76` 只有下界 1，SQL 无 LIMIT 下推。修正一处描述：全量读**不是端点特有的**，`ReadFrom(ctx,id,0)` 已在五处热路径（`runtime.go:553` 每次 `newTaskRecorder` 为算 turn 号把整条日志 JSON 解一遍等），端点独有的只是响应体不设限。**加上界（6 行）还是连 SQL 下推一起做？** |
+| **P4a T2-M1** 取消时 `turn/end` 不落盘 | `runtime.go:602-608` 的 `closeTurnOnError` 直接把任务 ctx 交给 `rec.flush`；全仓 11 处 `WithoutCancel` 这条路径一处都没有。取消时 `Append` 先失败，日志留下永远开着的 turn。**需要新测试与取消路径推演，建议单独一次。** |
+
+#### 注释订正一批（9 条，纯文字，可一次提交）
+
+`session_turns.go:357` 描述了一个不存在的 HTTP 前置写入方（且与同文件 `:90-97` 已写对的那段**直接矛盾**）、`runtime.go` 取舍注释没记「连续两条 user」、`builtin.go:40/45` 把截断归给已搬走的函数、`eventbridge.go:110` 描述了不存在的按 subject 过滤能力、`eventlog.go:448` 的回退链对 server 顶层任务不准、`http.go:567` 路由判据的隐形前提没写、`openapi_coverage_test.go:158` 的 `negated` 成死代码且注释指着已换掉的代码、`RuntimeEvent.Seq` 的 `omitempty` 让 `/v1/runtime-events` 丢 `seq=0`、`agent.full.example.json:78` 两处不实。
+
+#### 不该修（16 条）
+
+多数是「有意的设计」「spec 门控」「改判据会让路由 case 变复杂」这类；P4a T3-M2 的提醒目的已随 gui#46 过期。详见两份分诊。
 
 ### T-5 零散的已知项
 
