@@ -380,7 +380,7 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 		events = adapter.NewMemoryEventBus()
 	}
 	var contextBuilder runtime.ContextBuilder
-	if opts.ContextPrefix != "" || len(opts.ConversationTurns) > 0 {
+	if opts.ContextPrefix != "" || len(opts.ConversationTurns) > 0 || len(opts.HistoryTranscript) > 0 {
 		contextBuilder = cognitive.NewCore(cognitive.NoopCompressor{}).WithContextFiles(opts.ContextPrefix)
 	}
 	toolRoot := strings.TrimSpace(opts.WorkingDir)

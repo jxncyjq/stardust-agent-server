@@ -220,15 +220,27 @@ func TestTheTUIPathSendsHistoryAsATranscript(t *testing.T) {
 			Runtime: config.RuntimeConfig{MaxToolRounds: 1},
 			Session: sessionCfg,
 		},
-		Prompt:      "接着说",
-		DefaultMaas: maas,
-		Session:     session,
+		Prompt: "接着说",
+		// 故意留空：模拟 --no-context-files（或 context_files.enabled=false）。
+		// G3 打开时 ConversationTurns 恒空（历史改走 Transcript），若 app.go:383 那个门
+		// 仍拿 ConversationTurns 当条件，ContextPrefix 又空，cognitive Core 就整个不建——
+		// 这条测试原来留空且不断言 header，因此在那种坏配置下也照样绿（空断言）。现在下面
+		// 显式断言 header 仍在，就必须靠 HistoryTranscript 撑住这个门。
+		DefaultContextPrefix: "",
+		DefaultMaas:          maas,
+		Session:              session,
 	}); err != nil {
 		t.Fatalf("runTUITask() error = %v, want nil", err)
 	}
 
 	msgs := maas.first(t)
 	assertCLIModelSawTheToolRoundTrip(t, msgs, "runTUITask")
+	// G3 打开时 cognitive Core 仍必须建：history.Transcript 非空也要让 app.go:383 那个门
+	// 打开，否则模型收不到 "Agent:"/"Role:"/"Task:"/"Tools:" 这个任务框架头，且不报任何错。
+	if !strings.Contains(msgs[0].Content, "Agent: cli-agent") ||
+		!strings.Contains(msgs[0].Content, "Tools: ") {
+		t.Errorf("打开时丢了 cognitive Core 的任务框架 header（Agent:/Role:/Task:/Tools:）\n%s", msgs[0].Content)
+	}
 	// 历史不能同时再走一遍文本块：那会让同一段历史进两次，体积白涨一倍。
 	if strings.Contains(msgs[0].Content, "Recent conversation:") {
 		t.Errorf("打开时 prompt 里还留着 \"Recent conversation:\"：历史进了两次\n%s", msgs[0].Content)
