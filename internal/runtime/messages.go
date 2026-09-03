@@ -62,6 +62,39 @@ func (c *conversation) appendHistory(history []port.InferenceMessage) {
 	c.messages = append(c.messages, history...)
 }
 
+// appendCurrentInput 让请求以**当前任务**收尾。
+//
+// 历史排在 message[0] 之后（见 runtime.go 里 appendHistory 调用处对缓存断点的
+// 说明），而历史的最后一条几乎总是上一轮的收尾回答——一条没有 tool_calls 的
+// assistant。请求就此以它结尾，provider 把它当成要续写的 prefill：thinking 模型
+// 于是要求这条 assistant 带回自己的 reasoning_content，而历史里的 assistant 永远
+// 没有，请求直接 400（真机取证见 transcript_tail_test.go 的注释）。
+//
+// 修法是排布而不是搬家：把当前输入复述成末尾一条 user 消息。历史仍在 message[0]
+// 之后，跨任务逐字节相同的稳定前缀仍在 message[0] 开头，缓存断点不动。
+//
+// 代价是当前输入在请求里出现两次（message[0] 的 header 一次、这里一次），且
+// **每一轮工具循环都重发**：input 不受 MaxTurnChars 约束（它只截历史消息，见
+// session_turns.go），render 也只折叠 tool 角色的内容。所以这份重复与输入本身
+// 同量级——历史长时可忽略，输入大而历史短时不可。换回的是「模型最后读到的是
+// 现在要做什么」。
+//
+// 前置条件：input 非空。四个入口都已 fail-loud 拦下空输入（server http.go、
+// TUI interactive.go、@提及 command.go、委派 delegation.go），因为一条 content
+// 为空的尾部 user 消息正是 thinking 系 provider 最容易挑刺的位置——与这里修的
+// 是同一类失败。
+//
+// 只在历史以 transcript 形式进来时调用。关闭 G3 时历史在 message[0] 的
+// "Recent conversation:" 段里，请求本就以 message[0] 结尾，没有这个问题。
+//
+// 守卫：TestTheRequestDoesNotEndOnAStaleAssistantWhenHistoryIsATranscript。
+func (c *conversation) appendCurrentInput(input string) {
+	c.messages = append(c.messages, port.InferenceMessage{
+		Role:    port.RoleUser,
+		Content: input,
+	})
+}
+
 // appendAssistant records the model's turn. calls may be empty (a plain textual
 // answer) and text may be empty (a pure tool-call turn).
 func (c *conversation) appendAssistant(text string, calls []domain.ToolCall) {
