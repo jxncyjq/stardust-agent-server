@@ -166,6 +166,9 @@ func TestCheckpointRoundTripPreservesMode(t *testing.T) {
 		Mode:          "manual",
 		BasePrompt:    "p",
 		Round:         1,
+		// 一条最小的消息：空 Messages 是损坏（validateCheckpoint），而这条测试
+		// 测的是 Mode 的往返，不该撞在那条校验上。
+		Messages: []MessageSnapshot{{Role: "user", Content: "p"}},
 	}
 	if err := store.Save(cp); err != nil {
 		t.Fatalf("Save: %v", err)
@@ -186,6 +189,7 @@ func TestCheckpointSaveLoadUnderWorkingDir(t *testing.T) {
 	cp := Checkpoint{
 		SchemaVersion: CheckpointSchemaVersion, TaskID: "t1", SessionKey: "s1",
 		WorkingDir: workingDir, BasePrompt: "p", CreatedAt: time.Unix(1, 0),
+		Messages: []MessageSnapshot{{Role: "user", Content: "p"}},
 	}
 	if err := s.Save(cp); err != nil {
 		t.Fatalf("Save error = %v, want nil", err)
@@ -207,7 +211,8 @@ func TestCheckpointSaveLoadUnderWorkingDir(t *testing.T) {
 func TestCheckpointSaveLoadWorkspaceRootWhenNoWorkingDir(t *testing.T) {
 	workspaceRoot := t.TempDir()
 	s := NewStore(workspaceRoot)
-	cp := Checkpoint{SchemaVersion: CheckpointSchemaVersion, TaskID: "t2", SessionKey: "s2", CreatedAt: time.Unix(1, 0)}
+	cp := Checkpoint{SchemaVersion: CheckpointSchemaVersion, TaskID: "t2", SessionKey: "s2", CreatedAt: time.Unix(1, 0),
+		Messages: []MessageSnapshot{{Role: "user", Content: "p"}}}
 	if err := s.Save(cp); err != nil {
 		t.Fatalf("Save error = %v, want nil", err)
 	}
@@ -224,7 +229,8 @@ func TestListSuspendedInScansGivenBase(t *testing.T) {
 	workspaceRoot := t.TempDir()
 	workingDir := t.TempDir()
 	s := NewStore(workspaceRoot)
-	_ = s.Save(Checkpoint{SchemaVersion: CheckpointSchemaVersion, TaskID: "t1", SessionKey: "s1", WorkingDir: workingDir, CreatedAt: time.Unix(1, 0)})
+	_ = s.Save(Checkpoint{SchemaVersion: CheckpointSchemaVersion, TaskID: "t1", SessionKey: "s1", WorkingDir: workingDir, CreatedAt: time.Unix(1, 0),
+		Messages: []MessageSnapshot{{Role: "user", Content: "p"}}})
 	base := SessionBase(workspaceRoot, workingDir)
 	got, err := s.ListSuspendedIn(base)
 	if err != nil {
@@ -270,7 +276,11 @@ func TestLoadCheckpointWithoutLoadedFieldIsEmptyNotError(t *testing.T) {
 	if err := os.MkdirAll(sessDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	payload := fmt.Sprintf(`{"schema_version":%d,"task_id":"t1","session_key":"sess-noloaded"}`, CheckpointSchemaVersion)
+	// messages 必须给：这条测试钉的是「缺 loaded 键合法」，而一份没有任何消息的
+	// 检查点本身就是损坏的（validateCheckpoint 会拒），不给的话它会撞在那条校验上
+	// 而不是它要测的东西。
+	payload := fmt.Sprintf(`{"schema_version":%d,"task_id":"t1","session_key":"sess-noloaded",`+
+		`"messages":[{"role":"user","content":"base"}]}`, CheckpointSchemaVersion)
 	if err := os.WriteFile(filepath.Join(sessDir, checkpointFileName), []byte(payload), 0o644); err != nil {
 		t.Fatal(err)
 	}

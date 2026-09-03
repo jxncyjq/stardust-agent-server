@@ -64,6 +64,31 @@ func TestLoadRejectsATaskStartPastTheEndOfMessages(t *testing.T) {
 	}
 }
 
+// 没有任何消息的检查点是损坏的，而且它需要**自己那条**校验：范围检查放它过去
+// （0 > 0 为假），于是一份空检查点会恢复成一个空 conversation，续跑时对 message[0]
+// 取下标当场越界。写侧永远至少快照 message[0]（base prompt），所以空的不来自我们。
+func TestLoadRejectsACheckpointWithNoMessages(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	writeCheckpointFile(t, root, Checkpoint{
+		SchemaVersion: CheckpointSchemaVersion,
+		TaskID:        "t1",
+		SessionKey:    "sess-x",
+		Messages:      nil,
+		TaskStart:     0,
+	})
+
+	store := NewStore(root)
+	_, ok, err := store.Load("sess-x", "")
+	if err == nil {
+		t.Fatalf("一份没有消息的检查点被照收了（ok=%v）：续跑时会对 message[0] 越界", ok)
+	}
+	if !strings.Contains(err.Error(), "no messages") {
+		t.Errorf("错误信息没说清是缺消息：%v", err)
+	}
+}
+
 // 合法的 task_start 必须原样通过——校验不能把正常的检查点也挡掉。
 func TestLoadAcceptsAValidTaskStart(t *testing.T) {
 	t.Parallel()

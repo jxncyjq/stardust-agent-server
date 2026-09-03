@@ -180,8 +180,16 @@ func validateCheckpoint(cp Checkpoint, path string) error {
 	// would slice out of bounds the moment the resumed conversation counts a
 	// repeat streak, far from the file that caused it.
 	//
-	// An empty Messages counts as corrupt: the write side always snapshots a
-	// conversation that has at least message[0].
+	// An empty Messages is itself corrupt, and it needs its own check: the range
+	// test below passes it (0 > 0 is false), so without this a checkpoint with no
+	// messages would restore into a conversation the resumed run then indexes
+	// message[0] of. The write side always snapshots a conversation carrying at
+	// least message[0] (the base prompt), so an empty one never comes from us.
+	// 守卫：TestLoadRejectsACheckpointWithNoMessages。
+	if len(cp.Messages) == 0 {
+		return fmt.Errorf("checkpoint %q has no messages; a suspended run always carries "+
+			"at least its base prompt", path)
+	}
 	if cp.TaskStart < 0 || cp.TaskStart > len(cp.Messages) {
 		return fmt.Errorf("checkpoint %q task_start %d out of range for %d messages",
 			path, cp.TaskStart, len(cp.Messages))
