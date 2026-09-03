@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/stardust/legion-agent/internal/config"
@@ -124,7 +125,9 @@ func SessionHistoryForTask(ctx context.Context, lister ConversationTurnLister, s
 //     (maxEventPreviewRunes = 2000), so in practice this only bites user/assistant
 //     bodies; it is applied uniformly anyway rather than by role, because "which
 //     roles happen to be pre-truncated today" is not something this budget should
-//     depend on.
+//     depend on. The same reasoning is why it covers an assistant's
+//     ToolCalls[].Arguments too, and why the budget is per MESSAGE rather than per
+//     field — see applyTurnBudget.
 //
 // A nil lister or an empty sessionID is the legitimate "no session history
 // configured" state and yields (nil, nil). A lister error is wrapped and
@@ -150,9 +153,75 @@ func SessionTranscript(ctx context.Context, lister ConversationTurnLister, sessi
 		return nil, fmt.Errorf("list conversation transcript for session %q: %w", sessionID, err)
 	}
 	for i := range msgs {
-		msgs[i].Content = truncateText(msgs[i].Content, maxTurnChars)
+		msgs[i] = applyTurnBudget(msgs[i], maxTurnChars)
 	}
 	return msgs, nil
+}
+
+// applyTurnBudget 把 maxTurnChars 施加在一条历史消息的**全部**模型可见内容上：
+// Content 与 assistant 的 ToolCalls[].Arguments 共享同一份额度，先来后到。
+//
+// 为什么 arguments 也要算进来：max_turn_chars 的语义是「每条历史消息最长多少」，
+// 而 G3 打开后新进入模型的恰恰就是 tool call 的参数。只截 Content 的话，一条带
+// N 个 call 的 assistant 能送出 N 份不受任何约束的参数，用户配的那个数就不再是
+// 这条消息的上限。
+//
+// 「写入侧已经按 maxEventPreviewRunes(2000) 截过了」不足以顶替这份预算，理由与
+// 上面对 tool 消息给出的是同一条：预算不该依赖「哪些角色今天碰巧被预先截过」。
+// 何况 2000 是**每个 call** 的上限，累加起来与配置值没有关系。
+//
+// 额度只计**内容**，不计截断记号：这与 Content 那条路原本的口径一致
+// （truncateText 把内容截到 maxChars，记号是额外附加的）。记号有界且每个被截的
+// 单元至多一个，所以总量仍然受控。
+//
+// 遍历顺序必须确定：call 按切片顺序，参数名按字典序。map 的随机遍历顺序会让同一
+// 条历史两次投影出不同的字节，既毁掉 provider 的 prompt 缓存，也让「同样的输入
+// 得到同样的请求」不再成立。
+// 守卫：TestTheTranscriptPathHonoursMaxTurnCharsForToolCallArguments。
+func applyTurnBudget(msg port.InferenceMessage, maxTurnChars int) port.InferenceMessage {
+	remaining := maxTurnChars
+
+	// spend 从剩余额度里扣掉 s 实际占用的内容量，返回该发给模型的文本。
+	spend := func(s string) string {
+		if s == "" {
+			return s
+		}
+		if remaining <= 0 {
+			// 额度已尽。这里不能调 truncateText(s, 0)——它把非正的上限解释成
+			// 「不截断」，会把整段原文原样放行，正是这个预算要堵的洞。
+			return fmt.Sprintf(
+				"[参数被完全省略 / ARGUMENT OMITTED：本条消息 %d 字符的预算已用尽；原文 %d 字符]",
+				maxTurnChars, len([]rune(s)))
+		}
+		out := truncateText(s, remaining)
+		if n := len([]rune(s)); n < remaining {
+			remaining -= n
+		} else {
+			remaining = 0
+		}
+		return out
+	}
+
+	msg.Content = spend(msg.Content)
+	for i := range msg.ToolCalls {
+		args := msg.ToolCalls[i].Arguments
+		if len(args) == 0 {
+			continue
+		}
+		names := make([]string, 0, len(args))
+		for name := range args {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		// 就地改写会污染调用方持有的那份 map（投影层可能复用底层存储），所以
+		// 换一份新的。
+		trimmed := make(map[string]string, len(args))
+		for _, name := range names {
+			trimmed[name] = spend(args[name])
+		}
+		msg.ToolCalls[i].Arguments = trimmed
+	}
+	return msg
 }
 
 // RecentTurnsForTask loads the conversation turns to inject as cross-turn
