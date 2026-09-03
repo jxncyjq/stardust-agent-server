@@ -385,16 +385,23 @@ func decodeSessionEvent(sessionID string, seq int64, typ string, millis int64, d
 //
 // 返回的这段必须自身连续：中间有洞说明日志损坏，报错而不是把缺口当成「本来就这样」
 // （spec §4.3 不变量 3）。
-func (r *SQLiteRepository) ReadFrom(ctx context.Context, sessionID string, fromSeq int64) ([]domain.SessionEvent, error) {
+func (r *SQLiteRepository) ReadFrom(ctx context.Context, sessionID string, fromSeq int64, limit int64) ([]domain.SessionEvent, error) {
 	if fromSeq < 0 {
 		return nil, fmt.Errorf("read session events for %q: fromSeq %d is negative", sessionID, fromSeq)
+	}
+	// SQLite 把负的 LIMIT 解释为「不限」，正好是契约里 limit <= 0 的含义；归一化成
+	// -1 而不是直接传进去，是为了让 limit=0 与 limit=-3 走同一条确定的路。
+	sqlLimit := limit
+	if sqlLimit <= 0 {
+		sqlLimit = -1
 	}
 	rows, err := r.db.QueryContext(ctx, `
 		SELECT seq, type, time, data
 		FROM session_events
 		WHERE session_id = ? AND seq >= ?
 		ORDER BY seq
-	`, sessionID, fromSeq)
+		LIMIT ?
+	`, sessionID, fromSeq, sqlLimit)
 	if err != nil {
 		return nil, fmt.Errorf("read session events for %q: %w", sessionID, err)
 	}
@@ -484,7 +491,7 @@ func (r *SQLiteRepository) Load(ctx context.Context, sessionID string) ([]domain
 	defer lock.Unlock()
 
 	// ReadFrom 不取这把锁（它是纯读路径），所以这里不会重入。
-	events, err := r.ReadFrom(ctx, sessionID, 0)
+	events, err := r.ReadFrom(ctx, sessionID, 0, 0)
 	if err != nil {
 		return nil, err
 	}

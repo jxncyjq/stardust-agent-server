@@ -1047,7 +1047,7 @@ type conversationStore interface {
 	// spec §4.3.1 第 3 条要求 Load 只对没有活跃写入者的会话调用——不把它摆进
 	// 这个接口，就没人能顺手在 TUI 里调它。
 	Append(ctx context.Context, sessionID string, events []domain.SessionEvent) error
-	ReadFrom(ctx context.Context, sessionID string, fromSeq int64) ([]domain.SessionEvent, error)
+	ReadFrom(ctx context.Context, sessionID string, fromSeq int64, limit int64) ([]domain.SessionEvent, error)
 }
 
 type tuiSessionControllerConfig struct {
@@ -1457,7 +1457,7 @@ func (c *tuiSessionController) appendTurnEvent(
 	}
 	// Append 要求首个 seq 正好是该会话的 next-seq，所以先读出已有的后缀。这是每轮
 	// 两次 O(n) 读；P3 计划已写明这条 O(n) 是本期接受的代价，真机测出慢再优化。
-	existing, err := c.store.ReadFrom(ctx, c.currentID, 0)
+	existing, err := c.store.ReadFrom(ctx, c.currentID, 0, 0)
 	if err != nil {
 		return fmt.Errorf("read session events for %q: %w", c.currentID, err)
 	}

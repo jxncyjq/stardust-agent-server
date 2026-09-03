@@ -64,7 +64,7 @@ type SessionStore interface {
 	// Load：Load 会替未收尾的日志补事件并落盘，而它的调用契约是「只对确定没有活跃
 	// 写入者的会话调用」（spec §4.3.1 第 3 条）——这个端点在任务执行期间也会被前端
 	// 拉，两者不相容。
-	ReadFrom(ctx context.Context, sessionID string, fromSeq int64) ([]domain.SessionEvent, error)
+	ReadFrom(ctx context.Context, sessionID string, fromSeq int64, limit int64) ([]domain.SessionEvent, error)
 }
 
 type MessageStore interface {

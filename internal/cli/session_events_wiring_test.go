@@ -102,7 +102,7 @@ func (stubSessionEventStore) Append(context.Context, string, []domain.SessionEve
 	return nil
 }
 
-func (stubSessionEventStore) ReadFrom(context.Context, string, int64) ([]domain.SessionEvent, error) {
+func (stubSessionEventStore) ReadFrom(context.Context, string, int64, int64) ([]domain.SessionEvent, error) {
 	return nil, nil
 }
 

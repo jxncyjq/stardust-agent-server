@@ -155,7 +155,7 @@ func TestTwoConcurrentTasksOnOneSessionDoNotCorruptTheLog(t *testing.T) {
 		}
 	}
 
-	events, err := repo.ReadFrom(context.Background(), session, 0)
+	events, err := repo.ReadFrom(context.Background(), session, 0, 0)
 	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}

@@ -21,7 +21,14 @@ type SessionEventStore interface {
 	Append(ctx context.Context, sessionID string, events []domain.SessionEvent) error
 
 	// ReadFrom 返回 seq >= fromSeq 的事件，按 seq 升序。fromSeq 越过末尾返回空切片。
-	ReadFrom(ctx context.Context, sessionID string, fromSeq int64) ([]domain.SessionEvent, error)
+	//
+	// limit 是**这一次读**最多取几条，limit <= 0 表示不限。它下推到存储层，而不是
+	// 让调用方读回整条日志再自己截：一条跑了很久的会话，事件日志可以有几万条，
+	// 每条都要解一次 JSON——「只想看最近 50 条」不该先把几万条搬进内存。
+	//
+	// 注意 limit 只截条数，不破坏 seq 的连续性：返回的仍是一段连续后缀，实现里那条
+	// 「seq 必须逐条连续」的校验照常生效。
+	ReadFrom(ctx context.Context, sessionID string, fromSeq int64, limit int64) ([]domain.SessionEvent, error)
 
 	// Load 返回该会话的全部事件，必要时先补出崩溃恢复的关闭事件并落盘。
 	//

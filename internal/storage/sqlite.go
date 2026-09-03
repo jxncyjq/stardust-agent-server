@@ -494,7 +494,7 @@ func (r *SQLiteRepository) ListAgentSessions(ctx context.Context, companyID stri
 // 的会话调用，而这个方法在任务执行期间也会被调用（多轮 messages 就走它）。
 // ReadFrom 只读后缀、不触发恢复，正是这里要的。
 func (r *SQLiteRepository) ListConversationTurns(ctx context.Context, sessionID string, limit int) ([]domain.ConversationTurn, error) {
-	events, err := r.ReadFrom(ctx, sessionID, 0)
+	events, err := r.ReadFrom(ctx, sessionID, 0, 0)
 	if err != nil {
 		return nil, fmt.Errorf("list conversation turns for %q: %w", sessionID, err)
 	}
@@ -537,7 +537,7 @@ func (r *SQLiteRepository) ListConversationTurns(ctx context.Context, sessionID 
 // 相同：先划窗口，再把窗口挪到一个 provider 收得下的边界上。
 // 守卫：TestTheLimitNeverSplitsAnAssistantFromItsToolMessages。
 func (r *SQLiteRepository) ListConversationTranscript(ctx context.Context, sessionID string, limit int) ([]port.InferenceMessage, error) {
-	events, err := r.ReadFrom(ctx, sessionID, 0)
+	events, err := r.ReadFrom(ctx, sessionID, 0, 0)
 	if err != nil {
 		return nil, fmt.Errorf("list conversation transcript for %q: %w", sessionID, err)
 	}

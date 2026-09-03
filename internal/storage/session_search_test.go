@@ -100,7 +100,7 @@ func TestAFailedIndexWriteRollsBackTheWholeAppend(t *testing.T) {
 	}
 
 	// 关键的一半：整批必须回滚，不能留下半条日志。
-	events, readErr := repo.ReadFrom(ctx, "sess-1", 0)
+	events, readErr := repo.ReadFrom(ctx, "sess-1", 0, 0)
 	if readErr != nil {
 		t.Fatalf("ReadFrom: %v", readErr)
 	}

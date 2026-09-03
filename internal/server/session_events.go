@@ -16,6 +16,16 @@ import (
 // 而不会让单个响应大到需要流式。
 const defaultSessionEventsLimit = 500
 
+// maxSessionEventsLimit 是一次请求能取走的事件条数上限。
+//
+// 没有上界时 limit 由调用方随便写，而这个端点会把那么多条事件全部解 JSON 装进内存
+// 再序列化出去——一条跑了很久的会话，事件日志有几万条。上界是拒绝而不是夹紧：
+// 见下面 handler 里的理由。
+//
+// 5000 是默认值的十倍：足够一次拉走一条长会话的绝大部分，又不至于让单个请求把整条
+// 日志搬进内存。
+const maxSessionEventsLimit = 5000
+
 // sessionEventsResponse 是 GET /v1/sessions/{id}/events 的响应体。
 //
 // NextSeq 由服务端给出而不是让前端从 events 末尾自己算：那样会把「这一页恰好读完」
@@ -76,8 +86,17 @@ func (s *HTTPServer) handleSessionEvents(w http.ResponseWriter, r *http.Request)
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// 上界同样要拒而不是悄悄夹紧：写 limit=1000000 的人以为自己拿到了一百万条，
+	// 静默改成 5000 会让他把「只有 5000 条」读成「日志只有这么多」。
+	if limit > maxSessionEventsLimit {
+		writeError(w, http.StatusBadRequest,
+			fmt.Sprintf("limit must be at most %d, got %d", maxSessionEventsLimit, limit))
+		return
+	}
 
-	events, err := s.sessions.ReadFrom(r.Context(), sessionID, fromSeq)
+	// 多取一条：用「有没有第 limit+1 条」判断截断，而不是把整条日志读回来再比长度。
+	// 一条跑了很久的会话事件日志可以有几万条，每条都要解一次 JSON。
+	events, err := s.sessions.ReadFrom(r.Context(), sessionID, fromSeq, limit+1)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError,
 			fmt.Sprintf("read session events for %q: %v", sessionID, err))

@@ -550,7 +550,7 @@ func (r *Runtime) newTaskRecorder(ctx context.Context, task domain.Task) (*event
 	if r.sessionEvents == nil {
 		return rec, 0, nil
 	}
-	existing, err := r.sessionEvents.ReadFrom(ctx, rec.sessionID(), 0)
+	existing, err := r.sessionEvents.ReadFrom(ctx, rec.sessionID(), 0, 0)
 	if err != nil {
 		return nil, 0, fmt.Errorf("resolve turn number for session %q: %w", rec.sessionID(), err)
 	}

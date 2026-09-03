@@ -20,7 +20,7 @@ import (
 type stubEventStore struct{}
 
 func (stubEventStore) Append(context.Context, string, []domain.SessionEvent) error { return nil }
-func (stubEventStore) ReadFrom(context.Context, string, int64) ([]domain.SessionEvent, error) {
+func (stubEventStore) ReadFrom(context.Context, string, int64, int64) ([]domain.SessionEvent, error) {
 	return nil, nil
 }
 func (stubEventStore) Load(context.Context, string) ([]domain.SessionEvent, error) { return nil, nil }
@@ -138,7 +138,7 @@ func (c *captureEventStore) Append(_ context.Context, sessionID string, events [
 // 恒返回 nil 的版本让 newTaskRecorder 解出的 turn 永远是 0：「turn 号 = 已有事件里
 // 最大 turn + 1」这段逻辑（spec §4.1 的单调性）一行都执行不到。回放真实内容才让它
 // 可被断言。
-func (c *captureEventStore) ReadFrom(_ context.Context, sessionID string, from int64) ([]domain.SessionEvent, error) {
+func (c *captureEventStore) ReadFrom(_ context.Context, sessionID string, from int64, _ int64) ([]domain.SessionEvent, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	var out []domain.SessionEvent
@@ -328,7 +328,7 @@ func TestRecordAssistantMessageFlushesWithManyToolCalls(t *testing.T) {
 		t.Fatalf("flush with %d tool calls: %v", callCount, err)
 	}
 
-	events, err := repo.ReadFrom(context.Background(), "s1", 0)
+	events, err := repo.ReadFrom(context.Background(), "s1", 0, 0)
 	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}
