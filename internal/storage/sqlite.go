@@ -1844,6 +1844,33 @@ func (r *SQLiteRepository) ListDegradationDecisions(ctx context.Context, query q
 }
 
 func (r *SQLiteRepository) migrate(ctx context.Context) error {
+	// 先看这个库是不是比本程序还新。
+	//
+	// 往前迁移是自动的：schemaStatements 全是 CREATE IF NOT EXISTS，
+	// applyColumnMigrations 的 ALTER 也幂等，所以新程序打开旧库能自己补齐。
+	// 反方向不行——旧程序打开新库时，schema_migrations 里那个更高的版本号是唯一的
+	// 线索，而这里以前只 INSERT OR IGNORE、从不读回：进程会照常启动，一路跑到某个
+	// 查询撞上不存在的列（或读到一张已被新版语义改写的表）才炸，届时离原因很远，
+	// 而且期间的写入可能已经污染了库。
+	//
+	// 所以在建表之前拒绝启动。fail-loud 铁律：版本比自己高是「本不该发生」的部署
+	// 事故（回滚了二进制却没回滚数据），不是可容忍的输入。
+	// 守卫：TestMigrateRefusesADatabaseNewerThanTheBinary。
+	if _, err := r.db.ExecContext(ctx, `CREATE TABLE IF NOT EXISTS schema_migrations (
+		version INTEGER PRIMARY KEY,
+		applied_at TEXT NOT NULL
+	)`); err != nil {
+		return fmt.Errorf("ensure schema_migrations: %w", err)
+	}
+	found, err := r.SchemaVersion(ctx)
+	if err != nil {
+		return err
+	}
+	if found > CurrentSchemaVersion {
+		return fmt.Errorf("sqlite schema version %d is newer than this binary supports (%d); "+
+			"the database was written by a later version of the agent — upgrade the binary "+
+			"rather than running against it", found, CurrentSchemaVersion)
+	}
 	for _, stmt := range schemaStatements {
 		if _, err := r.db.ExecContext(ctx, stmt); err != nil {
 			return fmt.Errorf("migrate sqlite: %w", err)
