@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -119,6 +120,66 @@ func TestAnOpenStreamIsToldToReauthenticateAndThenClosed(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("the stream is still open 5s after reauth was sent")
 		}
+	}
+}
+
+// rotateOnWriteHeader 在 handler 写响应头的**那一刻**同步轮换 token。
+//
+// 它把一个真实存在过的时序竞态变成确定性的：吊销的失效信号必须在写头之前就取到，
+// 否则轮换关闭的是当前这一代 channel、handler 随后取到的是新那一代，那条流就再也
+// 不会被断开——而不被断开的长连接正是这套机制要堵的漏。
+//
+// 这个竞态曾以「CI 上偶发的 5s 超时」的面目出现过两次（P2 与 P5 各一次），本地永远
+// 复现不了，因为它取决于 handler 在 Flush 之后、取信号之前被调度器停留多久。
+type rotateOnWriteHeader struct {
+	rec    *httptest.ResponseRecorder
+	tokens *TokenStore
+	once   sync.Once
+}
+
+func (w *rotateOnWriteHeader) Header() http.Header { return w.rec.Header() }
+
+func (w *rotateOnWriteHeader) Write(b []byte) (int, error) { return w.rec.Write(b) }
+
+func (w *rotateOnWriteHeader) WriteHeader(code int) {
+	// 恰在这一刻轮换：比 handler 里任何一行「写头之后」的代码都早。
+	w.once.Do(func() { w.tokens.Rotate() })
+	w.rec.WriteHeader(code)
+}
+
+func (w *rotateOnWriteHeader) Flush() { w.rec.Flush() }
+
+// TestTheRevocationSignalIsTakenBeforeTheResponseHeadersGoOut 守的是取信号的**位置**，
+// 不是某个超时窗口够不够宽。
+//
+// 修复前：`revoked := s.tokens.Changed()` 在 WriteHeader/Flush 之后，于是本测试构造的
+// 那次轮换（发生在写头的瞬间）会被彻底错过，handler 挂在 select 上直到客户端断开——
+// 一条被吊销的凭证继续喂着事件。
+//
+// 它不需要真 socket、不等墙钟：handler 收到失效信号后会写 reauth 并返回，所以
+// ServeHTTP 自己就会结束。
+func TestTheRevocationSignalIsTakenBeforeTheResponseHeadersGoOut(t *testing.T) {
+	srv, tokens := newTokenTestServer(t, "old-token")
+
+	req := httptest.NewRequest(http.MethodGet, "/v1/events", nil)
+	req.Header.Set("Authorization", "Bearer old-token")
+	w := &rotateOnWriteHeader{rec: httptest.NewRecorder(), tokens: tokens}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		srv.ServeHTTP(w, req)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("handler 没有返回：写头那一刻的轮换被错过了，这条流不会被断开——" +
+			"失效信号必须在写响应头**之前**取")
+	}
+
+	if body := w.rec.Body.String(); !strings.Contains(body, "event: reauth") {
+		t.Errorf("响应里没有 reauth（写头那一刻发生的轮换必须仍能断开这条流）：%q", body)
 	}
 }
 
