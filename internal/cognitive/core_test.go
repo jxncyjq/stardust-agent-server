@@ -366,3 +366,61 @@ func TestBuildContextReportsBlockSizes(t *testing.T) {
 		t.Fatalf("block chars sum = %d, want prompt length %d", total, len([]rune(built.Prompt)))
 	}
 }
+
+// 打开 G3 时历史那一段必须仍在 Blocks 里，只是换了名字、大小为 0：Blocks 是体积
+// 归因，「这一段不见了」与「这一段占 0」是两件事，后者才说得出历史去了哪。
+func TestHistoryCarriedAsTranscriptIsStillAccountedForInBlocks(t *testing.T) {
+	core := NewCore(NoopCompressor{}).WithContextFiles("CONTEXT-FILES-BODY")
+	built, err := core.BuildContext(t.Context(), Request{
+		Agent:               domain.Agent{ID: "a", Role: "developer"},
+		Task:                domain.Task{ID: "t1", Input: "hi"},
+		Tools:               []string{"read_file"},
+		HistoryInTranscript: true,
+	})
+	if err != nil {
+		t.Fatalf("BuildContext error = %v, want nil", err)
+	}
+	var found *BlockSize
+	total := 0
+	for i, b := range built.Blocks {
+		total += b.Chars
+		if b.Name == "conversation_transcript" {
+			found = &built.Blocks[i]
+		}
+		if b.Name == "conversation" {
+			t.Errorf("历史走了 transcript，Blocks 里却还有 conversation 段：%+v", built.Blocks)
+		}
+	}
+	if found == nil {
+		t.Fatalf("Blocks 里没有 conversation_transcript 段：历史去哪了无从回答\n%+v", built.Blocks)
+	}
+	if found.Chars != 0 {
+		t.Errorf("conversation_transcript = %d 字符，要 0：历史一个字都不在 prompt 里", found.Chars)
+	}
+	if strings.Contains(built.Prompt, "Recent conversation:") {
+		t.Errorf("prompt 里出现了 \"Recent conversation:\"：归因说历史走了 transcript，实际没走\n%s", built.Prompt)
+	}
+	if total != len([]rune(built.Prompt)) {
+		t.Fatalf("block chars sum = %d, want prompt length %d", total, len([]rune(built.Prompt)))
+	}
+}
+
+// 两半历史同时给出，意味着同一段历史要进模型两次（prompt 一次、transcript 一次）。
+// 没有任何下游会报这件事——请求仍然合法，只是体积翻倍、模型读两遍。所以在这里拒。
+func TestBothHistoryShapesAtOnceAreRefused(t *testing.T) {
+	core := NewCore(NoopCompressor{})
+	_, err := core.BuildContext(t.Context(), Request{
+		Agent:               domain.Agent{ID: "a", Role: "developer"},
+		Task:                domain.Task{ID: "t1", Input: "hi"},
+		HistoryInTranscript: true,
+		ConversationTurns: []domain.ConversationTurn{
+			{Role: domain.ConversationRoleUser, Content: "EARLIER"},
+		},
+	})
+	if err == nil {
+		t.Fatal("BuildContext error = nil，要报错：历史同时走两条路会被送进模型两次")
+	}
+	if !strings.Contains(err.Error(), "sent twice") {
+		t.Errorf("错误信息没说清是哪件事：%v", err)
+	}
+}

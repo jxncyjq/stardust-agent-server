@@ -1827,7 +1827,13 @@ func (r *Runtime) buildPrompt(ctx context.Context, agent domain.Agent, task doma
 			Agent:             agent,
 			Task:              task,
 			ConversationTurns: append([]domain.ConversationTurn(nil), r.conversationTurns...),
-			Tools:             toolNames,
+			// G3 打开时历史不走 prompt 而走 messages（下面 RunTask 里的
+			// convo.appendHistory）。告诉 Core 这件事，纯粹是为了让它的分节核算
+			// 说得出「历史这一段去哪了」——没有这一句，Blocks 里的历史项会在开关
+			// 打开时整个消失，prompt 变小却无人认领。它不改变装配出的任何文本。
+			// 守卫：TestHistoryVolumeIsAttributableInBlocks。
+			HistoryInTranscript: len(r.historyTranscript) > 0,
+			Tools:               toolNames,
 			// Per-task, effective-registry-scoped catalog; nil under the eager
 			// protocol so the Core renders no <available_capabilities> block.
 			Catalog: catalog,
