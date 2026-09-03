@@ -78,7 +78,13 @@
     "_comment_max_turn_chars": "单条 turn 注入和存储前的最大字符数，超出会追加 [truncated] 标记。",
     "max_turn_chars": 6000,
     "_comment_restore_latest_on_tui_start": "TUI 启动时是否自动恢复当前 agent 最近 session；false 时每次启动创建新 session。",
-    "restore_latest_on_tui_start": true
+    "restore_latest_on_tui_start": true,
+    "_comment_cache_enabled": "是否启用会话级 prompt 缓存（sqlite 存储下可用）。",
+    "cache_enabled": true,
+    "_comment_cache_max_entries": "缓存最多保留多少条目，超出按最久未用淘汰。",
+    "cache_max_entries": 256,
+    "_comment_tool_transcript_enabled": "spec §6 的 G3，**默认关**。打开后历史以 provider transcript 形式进入模型上下文（assistant 消息带 tool_calls，其后跟与之 call_id 配对的 tool 消息），模型能看见历史的工具往返，恢复会话时不再失忆。代价是每次请求的体积可能涨数倍——spec §3 把它定为一次单独的、可度量的决定，所以不会跟着别的开关一起打开。环境变量 LEGION_AGENT_TOOL_TRANSCRIPT 可覆盖（值不可解析会 fail-loud，不静默落回关）。",
+    "tool_transcript_enabled": false
   },
   "tui": {
     "_comment": "交互式 TUI 展示配置。thinking 优先显示 MaaS/OpenAI-compatible 响应中明确返回的 reasoning_summary/reasoning_content；没有公开 reasoning 字段时回落为 Agent 可观测运行过程摘要。",
@@ -145,9 +151,18 @@
     "_comment_max_message_chars": "单条消息写入 tasks.md 前的最大建议字符数，长内容应摘要加链接。",
     "max_message_chars": 300,
     "_comment_active_statuses": "会保留在 tasks.md 看板中的状态。",
-    "active_statuses": ["planned", "ready", "in_progress", "blocked", "review"],
+    "active_statuses": [
+      "planned",
+      "ready",
+      "in_progress",
+      "blocked",
+      "review"
+    ],
     "_comment_done_statuses": "应从 tasks.md 移到 archive 的终态。",
-    "done_statuses": ["done", "cancelled"]
+    "done_statuses": [
+      "done",
+      "cancelled"
+    ]
   },
   "skills": {
     "_comment": "P12 远端 Skill registry 同步配置。",

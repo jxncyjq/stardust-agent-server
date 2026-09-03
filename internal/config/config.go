@@ -833,6 +833,17 @@ func applyEnv(cfg *Config) error {
 	if value := os.Getenv("LEGION_AGENT_REQUEST_ID_HEADER"); value != "" {
 		cfg.Server.RequestIDHeader = value
 	}
+	if value := os.Getenv("LEGION_AGENT_TOOL_TRANSCRIPT"); value != "" {
+		// 与 REQUIRE_IDENTITY 同一档，不走上面那些便利开关的 `== "true" || == "1"`：
+		// 这个开关改的是**每次请求的体积**（可能涨数倍），spec §3 把它定为「一次单独
+		// 的、可度量的决定」。写 TOOL_TRANSCRIPT=yes 的人是想打开它，若静默落回 false
+		// 就会拿到零效果加零警告，而「体积没变」恰恰会被读成「这开关没用」。
+		enabled, err := strconv.ParseBool(value)
+		if err != nil {
+			return fmt.Errorf("parse LEGION_AGENT_TOOL_TRANSCRIPT %q: %w", value, err)
+		}
+		cfg.Session.ToolTranscriptEnabled = enabled
+	}
 	if value := os.Getenv("LEGION_AGENT_BACKGROUND_INTERVAL"); value != "" {
 		cfg.Service.BackgroundInterval = value
 	}
