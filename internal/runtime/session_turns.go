@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/stardust/legion-agent/internal/config"
@@ -124,7 +125,9 @@ func SessionHistoryForTask(ctx context.Context, lister ConversationTurnLister, s
 //     (maxEventPreviewRunes = 2000), so in practice this only bites user/assistant
 //     bodies; it is applied uniformly anyway rather than by role, because "which
 //     roles happen to be pre-truncated today" is not something this budget should
-//     depend on.
+//     depend on. The same reasoning is why it covers an assistant's
+//     ToolCalls[].Arguments too, and why the budget is per MESSAGE rather than per
+//     field — see applyTurnBudget.
 //
 // A nil lister or an empty sessionID is the legitimate "no session history
 // configured" state and yields (nil, nil). A lister error is wrapped and
@@ -150,9 +153,191 @@ func SessionTranscript(ctx context.Context, lister ConversationTurnLister, sessi
 		return nil, fmt.Errorf("list conversation transcript for session %q: %w", sessionID, err)
 	}
 	for i := range msgs {
-		msgs[i].Content = truncateText(msgs[i].Content, maxTurnChars)
+		msgs[i] = applyTurnBudget(msgs[i], maxTurnChars)
 	}
 	return msgs, nil
+}
+
+// applyTurnBudget 把 maxTurnChars 施加在一条历史消息的**全部**模型可见内容上：
+// Content 与 assistant 的 ToolCalls[].Arguments 共享同一份额度，先来后到。
+//
+// 为什么 arguments 也要算进来：max_turn_chars 的语义是「每条历史消息最长多少」，
+// 而 G3 打开后新进入模型的恰恰就是 tool call 的参数。只截 Content 的话，一条带
+// N 个 call 的 assistant 能送出 N 份不受任何约束的参数，用户配的那个数就不再是
+// 这条消息的上限。
+//
+// 「写入侧已经按 maxEventPreviewRunes(2000) 截过了」不足以顶替这份预算，理由与
+// 上面对 tool 消息给出的是同一条：预算不该依赖「哪些角色今天碰巧被预先截过」。
+// 何况 2000 是**每个 call** 的上限，累加起来与配置值没有关系。
+//
+// 额度只计**内容**，不计截断记号：这与 Content 那条路原本的口径一致
+// （truncateText 把内容截到 maxChars，记号是额外附加的）。
+//
+// 所以这份预算收紧的是**长参数的内容量**，不是每条消息的字节数。一条消息的实际
+// 上限是：
+//
+//	maxTurnChars + 一个 262 字符的正文 footer + K × (argumentPeekRunes + len(记号))
+//
+// K 是被裁参数的个数，由模型每轮发几个 call 决定，不受这份预算约束。更要紧的是
+// 那个 `argumentPeekRunes + len(记号)`（今天 48 + 246 = 294 字符）：**短于它的参数整条
+// 原样发出，完全绕过额度**——见 spendArgument 里那条「换上去更长就不换」的守卫。
+//
+// 所以说「总量受控」是不对的。这份预算做的是把无界的那部分（长参数的正文）压成
+// 有界，代价是一项随 call 个数线性增长的固定开销，外加短参数的整体豁免。
+//
+// 前提：maxTurnChars 必须为正。SessionTranscript 在调用前已归一化；这里再断言一次，
+// 因为下面 spendContent 走的 truncateText 把非正上限解释成「不截断」，一个零值会
+// 让整条消息静默地无界——那正是这份预算要堵的洞。
+//
+// 遍历顺序必须确定：call 按切片顺序，参数名按字典序。map 的随机遍历顺序会让同一
+// 条历史两次投影出不同的字节，既毁掉 provider 的 prompt 缓存，也让「同样的输入
+// 得到同样的请求」不再成立。（排序钉住的不是 wire 上的 key 顺序——
+// json.Marshal(map[string]string) 本来就按 key 排序——而是「哪个参数被裁」。）
+//
+// 已知代价：被裁的历史参数不再与本轮真实调用逐字相等，于是 repeatedCallStreak →
+// callsKey → dedupKey 那条逐字比对的链路会漏掉跨会话的重复调用。写入侧本就把
+// arguments 截到 maxEventPreviewRunes(2000)，所以这不是新问题，只是把不匹配的
+// 边界从「超过 2000」拉到了「超过剩余额度」。「跨会话的同一组调用算不算连续重复」
+// 是一个未定的设计问题，不在一个预算改动里顺手决定。
+// 钉住取舍：TestTrimmedHistoryArgumentsNoLongerMatchTheLiveCallVerbatim。
+// 守卫：TestTheTranscriptPathHonoursMaxTurnCharsForToolCallArguments。
+func applyTurnBudget(msg port.InferenceMessage, maxTurnChars int) port.InferenceMessage {
+	// 非正的上限会让 truncateText 原样放行整条正文（它把 maxChars <= 0 解释成
+	// 「不截断」）。调用方已归一化，这里是编程错误而不是可容忍的输入。
+	if maxTurnChars <= 0 {
+		panic(fmt.Sprintf("runtime: applyTurnBudget got maxTurnChars=%d; "+
+			"a non-positive budget silently disables truncation and must be normalised by the caller",
+			maxTurnChars))
+	}
+	remaining := maxTurnChars
+
+	// spendContent 从剩余额度里扣掉 s 实际占用的内容量，返回该发给模型的文本。
+	// 它用于消息正文，截断记号沿用 truncateText 的那一套。
+	spendContent := func(s string) string {
+		if s == "" {
+			return s
+		}
+		out := truncateText(s, remaining)
+		spendBudget(&remaining, s)
+		return out
+	}
+
+	msg.Content = spendContent(msg.Content)
+	// 复制切片再改：msg 是调用方那条消息的**值**拷贝，但 msg.ToolCalls 的切片头
+	// 指向同一块底层数组，就地写 msg.ToolCalls[i] 会改到调用方手里的那份。今天
+	// 生产上 projectTranscript 每次都新构造所以看不出来，但那是没写进
+	// ConversationTurnLister 契约的前提——一个带缓存的 lister 会让第二次投影读到
+	// 第一次裁剪过的参数（记号被再裁一次、再接一个记号），且不会有任何测试变红。
+	msg.ToolCalls = append([]domain.ToolCall(nil), msg.ToolCalls...)
+	for i := range msg.ToolCalls {
+		args := msg.ToolCalls[i].Arguments
+		if len(args) == 0 {
+			continue
+		}
+		names := make([]string, 0, len(args))
+		for name := range args {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		// 就地改写会污染调用方持有的那份 map，所以换一份新的。切片也已在上面
+		// 整个复制过了——只换 map 不够：msg 是元素的值拷贝，msg.ToolCalls 的
+		// 切片头仍指向调用方那块底层数组。
+		trimmed := make(map[string]string, len(args))
+		for _, name := range names {
+			trimmed[name] = spendArgument(&remaining, args[name])
+		}
+		msg.ToolCalls[i].Arguments = trimmed
+	}
+	return msg
+}
+
+// spendBudget 从 remaining 里扣掉 s 实际占用的内容量（额度只计内容，不计记号）。
+func spendBudget(remaining *int, s string) {
+	if n := len([]rune(s)); n < *remaining {
+		*remaining -= n
+	} else {
+		*remaining = 0
+	}
+}
+
+// argumentTrimNote 是参数被历史投影裁剪时留下的记号。
+//
+// 它不能复用 truncateText 的 footer。那段文字是给工具**输出**写的，原话是
+// 「输出被硬截断……非数据或参数问题——换参数或换工具重试不会有帮助」：
+//
+//   - 用在参数位置上它自称「输出」、自称「非参数问题」，而被裁的恰恰是参数；
+//   - 它嵌在 write_file 的 content 参数里时，那 262 个字符极可能被模型读成
+//     「我当时写进文件的内容的一部分」。
+//
+// footer 存在的理由本是「别让模型把截断读成参数错误后换参数重试」（那次 60 次
+// 调用的事故），搬到参数位置反而**制造**那个失败模式。所以这里自己说三件事：
+// 这是历史渲染的裁剪、你当时实际发出的不是这个、不要据此重试。
+// 记号同时说明该值可能在**写入侧**就已经被截过一次（recordToolCall 按
+// maxEventPreviewRunes 截整个 arguments JSON），以及它是个语法上残缺的片段——
+// 参数值常常是 JSON、diff 或代码，模型看到半截可能会试图「修好」它。
+func argumentTrimNote(kept, total int) string {
+	return fmt.Sprintf(
+		"…[历史裁剪 HISTORY-TRIMMED：仅存前 %d / 共 %d 字符的片段（写入时可能已被截过一次），"+
+			"不是完整或可解析的值。这是会话历史为省上下文所做的裁剪，"+
+			"不是你当时实际发出的参数，也不表示调用失败或参数有误——请勿据此重试。"+
+			" / Trimmed for history; an incomplete, unparsable fragment; "+
+			"not what you actually sent; the call did not fail; do not retry.]",
+		kept, total)
+}
+
+// argumentPeekRunes 是额度耗尽后仍为每个参数保留的可辨识前缀长度。
+//
+// 留一点而不是一个字不留：参数是「这次调用在干什么」的唯一载体——紧随其后的
+// tool 消息只带 call_id 与结果正文，既没有工具名也没有参数。参数整段消失会让
+// 那份结果在模型眼里变成「某次不知道在干嘛的调用返回了这些」，等于连带废掉了
+// 后面那条消息。
+//
+// 为什么是 48 而不是个位数：写入侧截的是**整个 arguments JSON 对象**，超长时
+// 投影塌成单键 `{"_truncated_arguments": "{\"content\":\"…"}`（project_transcript.go）。
+// 对那个值取前 8 个字符只得到 `{"content` —— 既不是路径也不是意图，等于零信息，
+// 而记号本身有一百多个字符。额外成本是每个被裁参数 40 个字符，换回的是「能认出
+// 这是哪次调用」。
+const argumentPeekRunes = 48
+
+// spendArgument 按剩余额度裁剪一个 tool call 的参数值，并扣减额度。
+//
+// 额度耗尽时不能回落到 truncateText(s, 0)——它把非正上限解释成「不截断」，
+// 会把整段原文原样放行，正是这份预算要堵的洞。
+//
+// 裁剪后若不比原文短，就原样返回：短参数不是这份预算的敌人，把
+// `{"path":"a.md"}` 换成一段更长的说明既没省下字节又丢掉了信息。
+//
+// **这条守卫的代价要说清**：keep 已被地板抬到 argumentPeekRunes，所以任何
+// 总长不超过 `argumentPeekRunes + len(记号)`（今天 48 + 246 = 294 个字符）的参数都会
+// **整条原样发出，完全不看剩余额度**。这是有意的——真实的工具参数（路径、开关、
+// 小 JSON）大多落在这个量级，让模型看清它们比省那点字节值钱，而写入侧每参数
+// 2000 的上限加上 48 条消息的窗口仍然兜住总量。但它意味着这份预算约束的是
+// 「长参数的内容量」，不是「每条消息的字节数」。
+func spendArgument(remaining *int, s string) string {
+	if s == "" {
+		return s
+	}
+	total := len([]rune(s))
+	keep := *remaining
+	if keep >= total {
+		spendBudget(remaining, s)
+		return s
+	}
+	if keep < argumentPeekRunes {
+		keep = argumentPeekRunes
+	}
+	if keep >= total {
+		spendBudget(remaining, s)
+		return s
+	}
+	out := string([]rune(s)[:keep]) + argumentTrimNote(keep, total)
+	if len([]rune(out)) >= total {
+		// 换上去比原文还长：不换。
+		spendBudget(remaining, s)
+		return s
+	}
+	spendBudget(remaining, string([]rune(s)[:keep]))
+	return out
 }
 
 // RecentTurnsForTask loads the conversation turns to inject as cross-turn
