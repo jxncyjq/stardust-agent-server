@@ -41,28 +41,31 @@ The `reasoning_content` in the thinking mode must be passed back to the API.
 
 ## 三、未完成：需要拍板的
 
-### D-1 老会话的历史读不出来了（P3 没做数据迁移）
+### ~~D-1 老会话的历史读不出来了~~ ✅ 已处置（2026-09-03，拍板：删表）
 
-**这是本次整理新查到的，优先级最高。**
+**实测确认了问题**：会话列表返回 32 个（GUI 会全列出来），点开老会话 **0 条 turn**——用户看到的是 31 个空白会话。
 
-本机 `agent.db` 实测：
+**先前写在这里的推荐（方案 2 删表）当时的理由是错的**，记下来因为这类误判会再来：我说「迁移会造出假的事件日志（缺工具往返、seq 凭空构造）」。实测后三条都不成立——
 
-| 表 | 会话数 | 行数 |
-|---|---|---|
-| `conversation_turns`（P3 已退休） | 31 | 314 |
-| `session_events`（新的唯一真相源） | 1 | 53 |
+- 老表字段是**完整的**：`task_id / agent_id / model_profile / role / content / created_at / 四个 token 列 / generated_files`，正好是 `projectTurns` 产出的 `ConversationTurn` 全部字段；
+- 数据质量干净：`task_id` 为空 0 行、role 非 user/assistant 0 行、content 为空 0 行；
+- 「缺工具往返」是老表**本来就没存**，如实反映而非伪造；`seq` 按 `created_at` 排序是确定的，不是编的。
 
-**31 个老会话在事件日志里一条记录都没有**，最近的一个停在 `2026-08-11T12:49`。P3 把 `ListConversationTurns` 改成 `ReadFrom` + 投影之后，这些会话的历史**再也读不出来**——GUI 打开老会话会是空的。数据没丢（老表还在），但没有任何读路径能到达它。
+我据此在真实库的副本上把迁移写出来并跑通了：31 个会话 314 行全部转换成功，读出内容正确，逐会话核对 turn 数与老表按 `(task_id, role)` 折叠后完全一致，且**幂等**（第二次跑 0 个待迁移）、**不碰**已有事件日志的会话（那个新会话 53 条一条未动）。
 
-老表连 FTS5 影子表一共 **7 张**（`conversation_turns` / `_fts` / `_fts_data` / `_fts_idx` / `_fts_content` / `_fts_docsize` / `_fts_config`），不是先前记的「两张空表」。
+**用户拍板：不迁移，删表。** 我提出实测表明这会删掉真实有价值的对话（浏览器任务等），用户重申了这个决定——按其决定执行。
 
-**要拍的板**：
+**已执行**：
 
-1. **写一次性迁移**：把 `conversation_turns` 投影回 `session_events`。难点是老表只有 (task_id, role) 折叠后的结果，没有 step/tool 事件——补出来的事件日志会缺工具往返，且 `seq` 要凭空构造。
-2. **明确接受**：宣布「P3 之前的会话历史不再可读」，把 7 张表 drop 掉，在 CHANGELOG 里写明。
-3. **保留只读旁路**：让 `ListConversationTurns` 在事件日志为空时回落到老表——**但这违反 fail-loud 铁律**（CLAUDE.md §0：出错就响亮地错），且会让「事件日志是唯一真相源」这条不变量失效。不推荐，列在这里是因为它一定会被想到。
+1. 备份 `agent-before-d1-20260903.db.bak`（2088960 bytes，`.gitignore:24` 的 `*.bak` 覆盖）
+2. `drop table conversation_turns_fts` + `drop table conversation_turns`——FTS 主表带走 5 张影子表，7 张全清
+3. `vacuum`：2.09MB → 1.11MB
+4. 起 serve 验证：正常启动（建表/迁移逻辑不因缺表而失败）、0 error/panic、新会话读写不受影响
+5. 迁移工具 `cmd/zzmigrate` 已按拍板删除，仓库无痕
 
-我的建议是 2：老会话已经三周没动，而 1 造出来的是一份**假的**事件日志（缺工具往返、seq 是编的），比没有更糟——将来没人分得清哪些 seq 是真的。
+**遗留后果（未处理，需要时另行决定）**：那 31 个会话在 `agent_sessions` 里仍在，GUI 会列出它们、点开永远空白。要消掉这个体验，得另外清 `agent_sessions` 里对应的 31 行——那是第二次删数据，没有一并做。
+
+**备份里还留着那 314 行**，改主意还来得及；备份一旦删掉就真没了。
 
 ### D-2 I-3：被裁的历史参数让循环检测漏检
 
