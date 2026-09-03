@@ -624,6 +624,7 @@ func TestRecoverSuspendedRestoresMode(t *testing.T) {
 	store := sessionstate.NewStore(dir)
 	if err := store.Save(sessionstate.Checkpoint{
 		SchemaVersion: sessionstate.CheckpointSchemaVersion,
+		Messages:      []sessionstate.MessageSnapshot{{Role: "user", Content: "p"}},
 		TaskID:        "t1", AgentID: "a1", SessionKey: "s1", Mode: domain.ModeManual,
 	}); err != nil {
 		t.Fatal(err)

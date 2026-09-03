@@ -61,7 +61,29 @@ type Checkpoint struct {
 	Round      int    `json:"round"`
 	// Messages is the exchange as it stood when the run suspended. Restoring it
 	// verbatim is what lets a resumed run keep seeing the calls it already made.
-	Messages         []MessageSnapshot `json:"messages"`
+	Messages []MessageSnapshot `json:"messages"`
+	// TaskStart 是本任务自己的消息在 Messages 里的起点：G3 打开时会话历史以
+	// transcript 排在 message[0] 之后，这个下标就落在历史之后；关闭时它是 1。
+	//
+	// 存它是因为重复调用熔断按它决定扫描起点（runtime.conversation.taskStart）。
+	// 不存的话，续跑的任务会把历史算进「连续重复的轮次」，一条正常的会话就足以
+	// 触发重复警告。
+	//
+	// 0 表示**字段缺席**。这个编码没有歧义，靠的是「0 从来不是合法的 taskStart」：
+	// 四个写入方给出的值分别是 1（newConversation）、>=1（appendHistory）、
+	// >=2（applyCompaction）、>=1（restoreConversation）。omitempty 因此不会把一个
+	// 合法值编码成缺席。若将来有人让 taskStart 合法地取 0，这套编码会静默崩塌。
+	//
+	// 缺席的检查点按 1 处理。**这不等于「那份检查点里没有历史段」**：G3 的 transcript
+	// 注入早于本字段存在，所以由旧二进制在 G3 打开时写下的检查点，Messages 里带着
+	// 历史而 task_start 缺席，边界已不可恢复——续跑那一次仍可能把历史算进 streak。
+	// 这是升级窗口的已知代价，只影响升级瞬间已挂起的任务。
+	//
+	// 为什么不 bump CheckpointSchemaVersion（本文件 v2→v3 仅因新增 Loaded 字段就
+	// bump 过，本次偏离了那个惯例）：Load 对版本是严格相等比较，bump 会让升级瞬间
+	// **所有**挂起中的检查点直接失效，包括等待人工审批的任务——代价大于上面那一次
+	// 误报。取舍写在这里，不是漏了。
+	TaskStart        int               `json:"task_start,omitempty"`
 	PendingCalls     []domain.ToolCall `json:"pending_calls"`
 	PromptTokens     int               `json:"prompt_tokens"`
 	CompletionTokens int               `json:"completion_tokens"`
@@ -134,6 +156,47 @@ func (s *Store) Save(cp Checkpoint) error {
 	return nil
 }
 
+// validateCheckpoint rejects a decoded checkpoint whose contents are not
+// internally consistent. It is shared by the package's TWO deserialisation
+// paths — Load and ListSuspendedIn — because a check that lives in only one of
+// them leaves the other reading unvalidated state; the SchemaVersion comparison
+// used to be inlined in both, which is exactly how they could have drifted.
+//
+// Everything here is a fact about a FILE ON DISK, so every fault returns an
+// error rather than panicking: a checkpoint is external input (hand-edited,
+// truncated by a disk fault, or written by some future bug on the write side),
+// not a programming error inside this process. That distinction matters —
+// RunTask runs on a task goroutine with no recover anywhere above it, so a
+// panic here would turn one corrupt file into an agent-wide crash that takes
+// every concurrent task with it.
+//
+// 守卫：TestLoadRejectsATaskStartPastTheEndOfMessages。
+func validateCheckpoint(cp Checkpoint, path string) error {
+	if cp.SchemaVersion != CheckpointSchemaVersion {
+		return fmt.Errorf("checkpoint %q schema version %d unsupported (want %d)",
+			path, cp.SchemaVersion, CheckpointSchemaVersion)
+	}
+	// TaskStart indexes into Messages (see its field doc). An out-of-range value
+	// would slice out of bounds the moment the resumed conversation counts a
+	// repeat streak, far from the file that caused it.
+	//
+	// An empty Messages is itself corrupt, and it needs its own check: the range
+	// test below passes it (0 > 0 is false), so without this a checkpoint with no
+	// messages would restore into a conversation the resumed run then indexes
+	// message[0] of. The write side always snapshots a conversation carrying at
+	// least message[0] (the base prompt), so an empty one never comes from us.
+	// 守卫：TestLoadRejectsACheckpointWithNoMessages。
+	if len(cp.Messages) == 0 {
+		return fmt.Errorf("checkpoint %q has no messages; a suspended run always carries "+
+			"at least its base prompt", path)
+	}
+	if cp.TaskStart < 0 || cp.TaskStart > len(cp.Messages) {
+		return fmt.Errorf("checkpoint %q task_start %d out of range for %d messages",
+			path, cp.TaskStart, len(cp.Messages))
+	}
+	return nil
+}
+
 // Load reads the checkpoint for sessionKey under SessionBase(s.workspaceRoot,
 // workingDir). Absence is legitimate (fresh task): it returns (zero, false,
 // nil). Any other fault — unreadable file, corrupt JSON, or an unrecognised
@@ -153,8 +216,8 @@ func (s *Store) Load(sessionKey, workingDir string) (Checkpoint, bool, error) {
 	if err := json.Unmarshal(data, &cp); err != nil {
 		return Checkpoint{}, false, fmt.Errorf("decode checkpoint %q: %w", path, err)
 	}
-	if cp.SchemaVersion != CheckpointSchemaVersion {
-		return Checkpoint{}, false, fmt.Errorf("checkpoint %q schema version %d unsupported (want %d)", path, cp.SchemaVersion, CheckpointSchemaVersion)
+	if err := validateCheckpoint(cp, path); err != nil {
+		return Checkpoint{}, false, err
 	}
 	return cp, true, nil
 }
@@ -222,8 +285,8 @@ func (s *Store) ListSuspendedIn(base string) ([]Checkpoint, error) {
 		if err := json.Unmarshal(data, &cp); err != nil {
 			return nil, fmt.Errorf("decode suspended checkpoint %q: %w", path, err)
 		}
-		if cp.SchemaVersion != CheckpointSchemaVersion {
-			return nil, fmt.Errorf("checkpoint %q schema version %d unsupported (want %d)", path, cp.SchemaVersion, CheckpointSchemaVersion)
+		if err := validateCheckpoint(cp, path); err != nil {
+			return nil, err
 		}
 		out = append(out, cp)
 	}

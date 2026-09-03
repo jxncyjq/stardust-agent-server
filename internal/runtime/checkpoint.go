@@ -1,6 +1,8 @@
 package runtime
 
 import (
+	"fmt"
+
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/sessionstate"
@@ -37,8 +39,35 @@ func snapshotMessages(convo *conversation) []sessionstate.MessageSnapshot {
 
 // restoreConversation rebuilds the exchange from a checkpoint snapshot, so a
 // resumed loop continues from the same history the model was last shown.
-func restoreConversation(snaps []sessionstate.MessageSnapshot) *conversation {
-	convo := &conversation{messages: make([]port.InferenceMessage, 0, len(snaps))}
+// taskStart 必须一起带回来。它是重复熔断的扫描起点（见 conversation.taskStart）：
+// 丢了它，续跑的任务会把 G3 注入的历史重新算进 streak，一条正常的会话就能把 streak
+// 顶过 repeatWarnStreak，模型平白收到重复调用警告。这里是本包第二个构造 conversation
+// 的地方，也是唯一一个不经 newConversation/appendHistory 的——新增字段时最容易漏掉
+// 的正是它。
+//
+// taskStart 为 0 表示字段缺席（0 从不是合法值，见 sessionstate.Checkpoint.TaskStart
+// 对这个编码的说明），按 1 处理。
+//
+// 越界的下标属于**磁盘上那份文件不合法**，校验归 sessionstate.Store.Load——它旁边
+// 就是 SchemaVersion 检查，返回 error 而不是 panic：检查点是外部输入，而 RunTask
+// 跑在没有 recover 覆盖的任务 goroutine 里，panic 会把一份坏文件放大成整个 agent
+// 进程崩溃。这里保留的 panic 只是**进程内**的编程错误断言：调用方是本包代码，传进
+// 越界值意味着代码写错了，不是数据坏了。
+// 守卫：TestRestoringACheckpointKeepsTheTaskBoundary、
+// TestACheckpointFromBeforeTheBoundaryFieldRestoresToOne、
+// TestACorruptBoundaryFailsLoudAtRestore。
+func restoreConversation(snaps []sessionstate.MessageSnapshot, taskStart int) *conversation {
+	if taskStart == 0 {
+		taskStart = 1
+	}
+	if taskStart < 0 || taskStart > len(snaps) {
+		panic(fmt.Sprintf("runtime: checkpoint task_start=%d is out of range for %d messages; "+
+			"the checkpoint is corrupt", taskStart, len(snaps)))
+	}
+	convo := &conversation{
+		messages:  make([]port.InferenceMessage, 0, len(snaps)),
+		taskStart: taskStart,
+	}
 	for _, s := range snaps {
 		convo.messages = append(convo.messages, port.InferenceMessage{
 			Role:       s.Role,

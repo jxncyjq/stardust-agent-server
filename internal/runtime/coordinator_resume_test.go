@@ -30,6 +30,7 @@ func TestHeartbeatResumesRunningCheckpointedTask(t *testing.T) {
 	store := sessionstate.NewStore(dir)
 	if err := store.Save(sessionstate.Checkpoint{
 		SchemaVersion: sessionstate.CheckpointSchemaVersion,
+		Messages:      []sessionstate.MessageSnapshot{{Role: "user", Content: "p"}},
 		TaskID:        "t1",
 		AgentID:       "a1",
 		SessionKey:    "s1",
@@ -147,6 +148,7 @@ func TestHeartbeatResumeNoDoubleDispatchUnderRace(t *testing.T) {
 		id := taskIDForIndex(i)
 		if err := store.Save(sessionstate.Checkpoint{
 			SchemaVersion: sessionstate.CheckpointSchemaVersion,
+			Messages:      []sessionstate.MessageSnapshot{{Role: "user", Content: "p"}},
 			TaskID:        id,
 			AgentID:       "a1",
 			SessionKey:    id,
@@ -220,6 +222,7 @@ func TestHeartbeatResumeNoDoubleDispatchWhenRunOutlivesLease(t *testing.T) {
 	store := sessionstate.NewStore(dir)
 	if err := store.Save(sessionstate.Checkpoint{
 		SchemaVersion: sessionstate.CheckpointSchemaVersion,
+		Messages:      []sessionstate.MessageSnapshot{{Role: "user", Content: "p"}},
 		TaskID:        "t1",
 		AgentID:       "a1",
 		SessionKey:    "s1",

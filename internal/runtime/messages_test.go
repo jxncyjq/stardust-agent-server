@@ -198,7 +198,7 @@ func TestRepeatedCallStreakCountsIdenticalConsecutiveRounds(t *testing.T) {
 	}
 
 	pending := []domain.ToolCall{{ID: "c3", Name: "read_file", Arguments: map[string]string{"path": "a.txt"}}}
-	if got := repeatedCallStreak(convo.messages, pending); got != 4 {
+	if got := convo.repeatedCallStreak(pending); got != 4 {
 		t.Fatalf("repeatedCallStreak = %d, want 4 (3 recorded rounds + the pending one)", got)
 	}
 }
@@ -214,7 +214,7 @@ func TestRepeatedCallStreakResetsOnDifferentArguments(t *testing.T) {
 	}
 
 	pending := []domain.ToolCall{{ID: "c-next", Name: "read_file", Arguments: map[string]string{"path": "c.txt"}}}
-	if got := repeatedCallStreak(convo.messages, pending); got != 1 {
+	if got := convo.repeatedCallStreak(pending); got != 1 {
 		t.Fatalf("repeatedCallStreak = %d, want 1 for a call the model has not just made", got)
 	}
 }
@@ -223,7 +223,7 @@ func TestRepeatedCallStreakIsZeroWithoutPendingCalls(t *testing.T) {
 	t.Parallel()
 	convo := newConversation("base", nil)
 
-	if got := repeatedCallStreak(convo.messages, nil); got != 0 {
+	if got := convo.repeatedCallStreak(nil); got != 0 {
 		t.Fatalf("repeatedCallStreak(no pending calls) = %d, want 0", got)
 	}
 }

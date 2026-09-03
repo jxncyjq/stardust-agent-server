@@ -88,6 +88,7 @@ func TestCoordinatorInterruptResumedTaskCancels(t *testing.T) {
 	const id = "t-resume-interrupt"
 	if err := store.Save(sessionstate.Checkpoint{
 		SchemaVersion: sessionstate.CheckpointSchemaVersion,
+		Messages:      []sessionstate.MessageSnapshot{{Role: "user", Content: "p"}},
 		TaskID:        id,
 		AgentID:       "default-agent",
 		SessionKey:    "s1",

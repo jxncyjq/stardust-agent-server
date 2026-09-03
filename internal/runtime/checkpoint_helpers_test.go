@@ -21,7 +21,7 @@ func TestMessageSnapshotRoundTrip(t *testing.T) {
 	convo.appendAssistant("thinking", calls)
 	convo.appendToolResults(calls, map[string]string{"c1": "hi"})
 
-	restored := restoreConversation(snapshotMessages(convo))
+	restored := restoreConversation(snapshotMessages(convo), 1)
 
 	if len(restored.messages) != len(convo.messages) {
 		t.Fatalf("restored len = %d, want %d", len(restored.messages), len(convo.messages))

@@ -73,6 +73,7 @@ func TestRecoverSuspendedReRegistersTasks(t *testing.T) {
 	store := sessionstate.NewStore(dir)
 	if err := store.Save(sessionstate.Checkpoint{
 		SchemaVersion: sessionstate.CheckpointSchemaVersion,
+		Messages:      []sessionstate.MessageSnapshot{{Role: "user", Content: "p"}},
 		TaskID:        "task-9",
 		AgentID:       "default-agent",
 		SessionKey:    "sess-9",
@@ -129,6 +130,7 @@ func TestRecoverSuspendedSkipsTaskAlreadyPresent(t *testing.T) {
 	store := sessionstate.NewStore(dir)
 	if err := store.Save(sessionstate.Checkpoint{
 		SchemaVersion: sessionstate.CheckpointSchemaVersion,
+		Messages:      []sessionstate.MessageSnapshot{{Role: "user", Content: "p"}},
 		TaskID:        "task-dup",
 		AgentID:       "default-agent",
 		SessionKey:    "sess-dup",
@@ -171,6 +173,7 @@ func TestRecoverSuspendedAcrossBasesBackfillsWorkingDir(t *testing.T) {
 
 	if err := store.Save(sessionstate.Checkpoint{
 		SchemaVersion: sessionstate.CheckpointSchemaVersion,
+		Messages:      []sessionstate.MessageSnapshot{{Role: "user", Content: "p"}},
 		TaskID:        "task-root",
 		AgentID:       "default-agent",
 		SessionKey:    "sess-root",
@@ -179,6 +182,7 @@ func TestRecoverSuspendedAcrossBasesBackfillsWorkingDir(t *testing.T) {
 	}
 	if err := store.Save(sessionstate.Checkpoint{
 		SchemaVersion: sessionstate.CheckpointSchemaVersion,
+		Messages:      []sessionstate.MessageSnapshot{{Role: "user", Content: "p"}},
 		TaskID:        "task-wd",
 		AgentID:       "default-agent",
 		SessionKey:    "sess-wd",
