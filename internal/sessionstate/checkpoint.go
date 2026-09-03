@@ -42,6 +42,13 @@ type MessageSnapshot struct {
 	Images     []string          `json:"images,omitempty"`
 	ToolCalls  []domain.ToolCall `json:"tool_calls,omitempty"`
 	ToolCallID string            `json:"tool_call_id,omitempty"`
+	// StablePrefixLen 是这条消息里那段跨任务逐字节相同的稳定前缀有多长（rune 数）。
+	// 它只在 messages[0] 上非零：adapter 据它给 provider 打 prompt-cache 断点。
+	//
+	// 不存它，续跑的任务就会丢掉这个断点——而 G3 把会话历史排在 messages[0] **之后**
+	// 而不是之前，整个取舍的唯一理由正是保住它。0 表示这条消息不带断点，也表示这份
+	// 检查点写于本字段引入之前（那时恢复出来的本来就是 0，行为不变，无需迁移）。
+	StablePrefixLen int `json:"stable_prefix_len,omitempty"`
 }
 
 // Checkpoint is the serialised mid-flight state of a suspended tool loop: enough
