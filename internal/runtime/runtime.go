@@ -601,7 +601,18 @@ func closingStepReason(err error) string {
 // so nothing is lost, only left for a later attempt that this run will not make.
 func (r *Runtime) closeTurnOnError(ctx context.Context, task domain.Task, rec *eventRecorder, cause error) {
 	rec.recordTurnEnd(closingTurnReason(cause))
-	if err := rec.flush(ctx); err != nil {
+	// 收尾必须脱离这次运行的 ctx。
+	//
+	// 传进来的 ctx 常常**正是**收尾的原因——用户按了停止、上游超时。直接拿它去
+	// flush，Append 一进去就因 ctx.Err() 失败，turn/end 根本不进库，只留下下面那条
+	// Warn。而后果不是「少一条事件」：日志里那个 turn 永远开着，投影按 turn 边界折叠
+	// 会把它之后的东西一起卷进来，崩溃恢复（Load）也分不出「一个活着的进程留下的
+	// 开口」与「一次真崩溃留下的开口」——两者在数据上完全一样。
+	//
+	// 取消是常规路径，不是异常，所以这条不能指望「下次 flush 补上」：这次运行不会
+	// 再有下一次。写这条 turn/end 是收尾动作本身，不该被它要记录的那个原因取消掉。
+	// 守卫：TestTheClosingTurnEndIsPersistedEvenWhenTheRunWasCancelled。
+	if err := rec.flush(context.WithoutCancel(ctx)); err != nil {
 		r.logger.Warn("session event flush failed while closing a failed run",
 			"task_id", task.ID, "cause", cause, "flush_error", err)
 	}

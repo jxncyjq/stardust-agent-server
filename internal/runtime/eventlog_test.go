@@ -100,7 +100,14 @@ type captureEventStore struct {
 	err       error // 非 nil 时 Append 失败，供屏障测试用
 }
 
-func (c *captureEventStore) Append(_ context.Context, sessionID string, events []domain.SessionEvent) error {
+func (c *captureEventStore) Append(ctx context.Context, sessionID string, events []domain.SessionEvent) error {
+	// ctx 要看，不能丢：真 store 走 db.ExecContext(ctx, ...)，ctx 一取消 Append 就失败。
+	// 以前这里签名写 `_ context.Context`，于是「运行被取消时收尾还能不能落盘」这类
+	// 问题在测试里根本不成立——夹具比真 store 宽松，缺陷就藏在那道缝里。
+	// 与下面 seq 校验同一个理由：fake 的严格程度必须对齐真 store。
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("append session events for %q: %w", sessionID, err)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.err != nil {
