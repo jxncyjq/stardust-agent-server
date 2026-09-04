@@ -29,7 +29,7 @@ func (s *recordingSessionEventStore) Append(_ context.Context, sessionID string,
 	return nil
 }
 
-func (s *recordingSessionEventStore) ReadFrom(_ context.Context, sessionID string, from int64) ([]domain.SessionEvent, error) {
+func (s *recordingSessionEventStore) ReadFrom(_ context.Context, sessionID string, from int64, _ int64) ([]domain.SessionEvent, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var out []domain.SessionEvent

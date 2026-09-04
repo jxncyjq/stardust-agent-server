@@ -104,7 +104,7 @@ func TestARealToolLoopRunProjectsToOneTurnPerRole(t *testing.T) {
 	}
 
 	// 前提检查：这次执行确实走了多轮（否则下面的「折叠成一条」是白验的）。
-	events, err := repo.ReadFrom(ctx, "sess-real", 0)
+	events, err := repo.ReadFrom(ctx, "sess-real", 0, 0)
 	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}
@@ -185,7 +185,7 @@ func TestARealDefaultAgentRunWithEmptyAgentIDStillReadsBackItsHistory(t *testing
 	}
 
 	// 前提检查：这条会话确实写出了带空 agent_id 的消息事件，否则下面读成功是白验的。
-	events, err := repo.ReadFrom(ctx, "sess-default", 0)
+	events, err := repo.ReadFrom(ctx, "sess-default", 0, 0)
 	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}

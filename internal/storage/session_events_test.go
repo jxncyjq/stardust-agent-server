@@ -265,7 +265,7 @@ func TestReadFromReturnsOnlyTheSuffix(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 
-	got, err := repo.ReadFrom(ctx, "s1", 1)
+	got, err := repo.ReadFrom(ctx, "s1", 1, 0)
 	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}
@@ -283,7 +283,7 @@ func TestReadFromPastTheEndIsEmptyNotAnError(t *testing.T) {
 		t.Fatalf("Append: %v", err)
 	}
 
-	got, err := repo.ReadFrom(ctx, "s1", 99)
+	got, err := repo.ReadFrom(ctx, "s1", 99, 0)
 	if err != nil {
 		t.Fatalf("ReadFrom(99) = %v, want nil error", err)
 	}
@@ -307,7 +307,7 @@ func TestReadFromDoesNotWriteAnything(t *testing.T) {
 	}
 
 	before := countEvents(t, repo, "s1")
-	if _, err := repo.ReadFrom(ctx, "s1", 0); err != nil {
+	if _, err := repo.ReadFrom(ctx, "s1", 0, 0); err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}
 	if after := countEvents(t, repo, "s1"); after != before {
@@ -337,7 +337,7 @@ func TestAHoleInTheMiddleIsRefused(t *testing.T) {
 		t.Fatalf("制造断裂: %v", err)
 	}
 
-	_, err := repo.ReadFrom(ctx, "s1", 0)
+	_, err := repo.ReadFrom(ctx, "s1", 0, 0)
 	if err == nil {
 		t.Fatal("seq 有洞却读成功了")
 	}
@@ -368,7 +368,7 @@ func TestReadFromWithFromSeqLandingInAHoleIsRefused(t *testing.T) {
 		t.Fatalf("制造断裂: %v", err)
 	}
 
-	_, err := repo.ReadFrom(ctx, "s1", 1)
+	_, err := repo.ReadFrom(ctx, "s1", 1, 0)
 	if err == nil {
 		t.Fatal("fromSeq 落在洞里却读成功了：调用方无法察觉 seq=1 曾经存在又消失了")
 	}
@@ -389,7 +389,7 @@ func TestReadFromRefusesANegativeFromSeq(t *testing.T) {
 	ctx := context.Background()
 	repo := newEventRepo(t)
 
-	_, err := repo.ReadFrom(ctx, "s1", -1)
+	_, err := repo.ReadFrom(ctx, "s1", -1, 0)
 	if err == nil {
 		t.Fatal("fromSeq 为负数却读成功了")
 	}
@@ -494,7 +494,7 @@ func TestLoadPersistsTheRecoveryItSynthesized(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	// 再读一次：补出来的事件必须在库里，而不只是在返回值里。
-	again, err := repo.ReadFrom(ctx, "s1", 0)
+	again, err := repo.ReadFrom(ctx, "s1", 0, 0)
 	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}
@@ -740,7 +740,7 @@ func TestConcurrentAppendsKeepTheLogContiguous(t *testing.T) {
 			for j := 0; j < perWriter; j++ {
 				succeeded := false
 				for attempt := 0; attempt < maxConcurrentAppendRetries; attempt++ {
-					existing, err := repo.ReadFrom(ctx, "s1", 0)
+					existing, err := repo.ReadFrom(ctx, "s1", 0, 0)
 					if err != nil {
 						t.Errorf("ReadFrom: %v", err)
 						return
@@ -767,7 +767,7 @@ func TestConcurrentAppendsKeepTheLogContiguous(t *testing.T) {
 	}
 	wg.Wait()
 
-	events, err := repo.ReadFrom(ctx, "s1", 0)
+	events, err := repo.ReadFrom(ctx, "s1", 0, 0)
 	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}
@@ -959,7 +959,7 @@ func TestReadFromRefusesAnUnknownEventTypeInTheTable(t *testing.T) {
 		t.Fatalf("绕过 Append 写入未知类型: %v", err)
 	}
 
-	_, err := repo.ReadFrom(ctx, "s1", 0)
+	_, err := repo.ReadFrom(ctx, "s1", 0, 0)
 	if err == nil {
 		t.Fatal("表里的未知事件类型被读成了合法事件：重建出的历史会缺一段而没人知道")
 	}
@@ -984,7 +984,7 @@ func TestReadFromRefusesInvalidJSONInTheTable(t *testing.T) {
 		t.Fatalf("绕过 Append 写入非法 JSON: %v", err)
 	}
 
-	_, err := repo.ReadFrom(ctx, "s1", 0)
+	_, err := repo.ReadFrom(ctx, "s1", 0, 0)
 	if err == nil {
 		t.Fatal("表里的非法 JSON 被读成了合法事件")
 	}
@@ -1045,5 +1045,74 @@ func TestConcurrentLoadsRecoverExactlyOnce(t *testing.T) {
 	if got := countEvents(t, repo, "c1"); got != wantAfterRecovery {
 		t.Fatalf("最终库里 %d 条，want %d：恢复被补了不止一次（或一次都没补）",
 			got, wantAfterRecovery)
+	}
+}
+
+// limit 下推到 SQL：读的时候就只取那么多行，而不是把整条日志搬进内存再截。
+//
+// 一条跑了很久的会话事件日志可以有几万条，每条都要解一次 JSON——「只想看最近 50 条」
+// 不该先付那笔钱。
+func TestReadFromPushesTheLimitDownToSQL(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+
+	var events []domain.SessionEvent
+	for i := 0; i < 20; i++ {
+		events = append(events, ev(int64(i), domain.SessionEventTurnStart))
+	}
+	if err := repo.Append(ctx, "s1", events); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	got, err := repo.ReadFrom(ctx, "s1", 0, 5)
+	if err != nil {
+		t.Fatalf("ReadFrom: %v", err)
+	}
+	if len(got) != 5 {
+		t.Fatalf("limit=5 读回 %d 条，要 5：limit 没有下推到 SQL", len(got))
+	}
+	// 取的必须是**最前面**那 5 条（seq 升序的前缀），而不是随便 5 条。
+	for i, e := range got {
+		if e.Seq != int64(i) {
+			t.Errorf("第 %d 条的 seq = %d，要 %d：limit 截的不是升序前缀", i, e.Seq, i)
+		}
+	}
+
+	// fromSeq 与 limit 一起用：从中间取一段。
+	got, err = repo.ReadFrom(ctx, "s1", 10, 3)
+	if err != nil {
+		t.Fatalf("ReadFrom(from=10, limit=3): %v", err)
+	}
+	if len(got) != 3 || got[0].Seq != 10 || got[2].Seq != 12 {
+		t.Errorf("from=10 limit=3 读回 %d 条、首尾 seq 见下：要 3 条 seq 10..12", len(got))
+		for _, e := range got {
+			t.Logf("  seq=%d", e.Seq)
+		}
+	}
+}
+
+// limit <= 0 表示不限——三处热路径（runtime 算 turn 号、eventlog、投影）都靠它读全量，
+// 归一化必须让 0 与负数走同一条确定的路。
+func TestReadFromTreatsANonPositiveLimitAsUnbounded(t *testing.T) {
+	ctx := context.Background()
+	repo := newEventRepo(t)
+
+	var events []domain.SessionEvent
+	for i := 0; i < 7; i++ {
+		events = append(events, ev(int64(i), domain.SessionEventTurnStart))
+	}
+	if err := repo.Append(ctx, "s1", events); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+
+	for _, limit := range []int64{0, -1, -3} {
+		got, err := repo.ReadFrom(ctx, "s1", 0, limit)
+		if err != nil {
+			t.Fatalf("ReadFrom(limit=%d): %v", limit, err)
+		}
+		if len(got) != 7 {
+			t.Errorf("limit=%d 读回 %d 条，要 7（不限）：非正的 limit 没有被当成不限，"+
+				"三处热路径会少读事件", limit, len(got))
+		}
 	}
 }

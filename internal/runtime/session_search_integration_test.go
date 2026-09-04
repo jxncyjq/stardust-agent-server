@@ -39,7 +39,7 @@ func TestARealToolLoopRunMakesItsToolCallSearchable(t *testing.T) {
 	}
 
 	// 前提检查：这次执行确实调了工具，否则下面搜不搜得到都说明不了问题。
-	events, err := repo.ReadFrom(ctx, "sess-real", 0)
+	events, err := repo.ReadFrom(ctx, "sess-real", 0, 0)
 	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}

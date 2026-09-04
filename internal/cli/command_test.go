@@ -1849,7 +1849,7 @@ func TestRunCommandCarriesModelProfileIntoTheSessionEventLog(t *testing.T) {
 	// 回退），所以会话键就是任务号本身；这个测试只跑了一个任务，任何一条审计事件的
 	// SubjectID 都是它。
 	taskID := audits[0].SubjectID
-	events, err := repo.ReadFrom(context.Background(), taskID, 0)
+	events, err := repo.ReadFrom(context.Background(), taskID, 0, 0)
 	if err != nil {
 		t.Fatalf("ReadFrom(%q) error = %v, want nil", taskID, err)
 	}
@@ -2828,8 +2828,8 @@ func (s *countingConversationStore) Append(ctx context.Context, sessionID string
 	return s.delegate.Append(ctx, sessionID, events)
 }
 
-func (s *countingConversationStore) ReadFrom(ctx context.Context, sessionID string, fromSeq int64) ([]domain.SessionEvent, error) {
-	return s.delegate.ReadFrom(ctx, sessionID, fromSeq)
+func (s *countingConversationStore) ReadFrom(ctx context.Context, sessionID string, fromSeq int64, limit int64) ([]domain.SessionEvent, error) {
+	return s.delegate.ReadFrom(ctx, sessionID, fromSeq, limit)
 }
 
 // fakeSessionLister is a minimal SessionLister test double: it returns items

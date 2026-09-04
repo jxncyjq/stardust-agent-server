@@ -555,7 +555,7 @@ func (e *eventRecorder) persistPending(ctx context.Context) ([]domain.SessionEve
 		return nil, nil
 	}
 	if !e.seqKnown {
-		existing, err := e.store.ReadFrom(ctx, e.session, 0)
+		existing, err := e.store.ReadFrom(ctx, e.session, 0, 0)
 		if err != nil {
 			return nil, fmt.Errorf("align session event cursor for %q: %w", e.session, err)
 		}

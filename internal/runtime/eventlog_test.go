@@ -20,7 +20,7 @@ import (
 type stubEventStore struct{}
 
 func (stubEventStore) Append(context.Context, string, []domain.SessionEvent) error { return nil }
-func (stubEventStore) ReadFrom(context.Context, string, int64) ([]domain.SessionEvent, error) {
+func (stubEventStore) ReadFrom(context.Context, string, int64, int64) ([]domain.SessionEvent, error) {
 	return nil, nil
 }
 func (stubEventStore) Load(context.Context, string) ([]domain.SessionEvent, error) { return nil, nil }
@@ -100,7 +100,14 @@ type captureEventStore struct {
 	err       error // 非 nil 时 Append 失败，供屏障测试用
 }
 
-func (c *captureEventStore) Append(_ context.Context, sessionID string, events []domain.SessionEvent) error {
+func (c *captureEventStore) Append(ctx context.Context, sessionID string, events []domain.SessionEvent) error {
+	// ctx 要看，不能丢：真 store 走 db.ExecContext(ctx, ...)，ctx 一取消 Append 就失败。
+	// 以前这里签名写 `_ context.Context`，于是「运行被取消时收尾还能不能落盘」这类
+	// 问题在测试里根本不成立——夹具比真 store 宽松，缺陷就藏在那道缝里。
+	// 与下面 seq 校验同一个理由：fake 的严格程度必须对齐真 store。
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("append session events for %q: %w", sessionID, err)
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.err != nil {
@@ -138,7 +145,7 @@ func (c *captureEventStore) Append(_ context.Context, sessionID string, events [
 // 恒返回 nil 的版本让 newTaskRecorder 解出的 turn 永远是 0：「turn 号 = 已有事件里
 // 最大 turn + 1」这段逻辑（spec §4.1 的单调性）一行都执行不到。回放真实内容才让它
 // 可被断言。
-func (c *captureEventStore) ReadFrom(_ context.Context, sessionID string, from int64) ([]domain.SessionEvent, error) {
+func (c *captureEventStore) ReadFrom(_ context.Context, sessionID string, from int64, _ int64) ([]domain.SessionEvent, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	var out []domain.SessionEvent
@@ -328,7 +335,7 @@ func TestRecordAssistantMessageFlushesWithManyToolCalls(t *testing.T) {
 		t.Fatalf("flush with %d tool calls: %v", callCount, err)
 	}
 
-	events, err := repo.ReadFrom(context.Background(), "s1", 0)
+	events, err := repo.ReadFrom(context.Background(), "s1", 0, 0)
 	if err != nil {
 		t.Fatalf("ReadFrom: %v", err)
 	}

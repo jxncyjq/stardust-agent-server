@@ -46,7 +46,7 @@ func (f *fileTestSessionStore) DeleteAgentSession(ctx context.Context, sessionID
 
 // ReadFrom 报错而不是回空：这个桩是给 GET /v1/files 用的，没有事件日志可读。
 // 回一段空事件会让一条误路由的读看起来像「这条会话本来就没有事件」。
-func (f *fileTestSessionStore) ReadFrom(ctx context.Context, sessionID string, fromSeq int64) ([]domain.SessionEvent, error) {
+func (f *fileTestSessionStore) ReadFrom(ctx context.Context, sessionID string, fromSeq int64, limit int64) ([]domain.SessionEvent, error) {
 	return nil, fmt.Errorf("fileTestSessionStore has no session event log for %q", sessionID)
 }
 

@@ -86,7 +86,7 @@ func (s *sessionEventsTestStore) DeleteAgentSession(ctx context.Context, session
 // ReadFrom 复刻真 store 的读契约（见 internal/storage/session_events.go 的
 // SQLiteRepository.ReadFrom）：负 fromSeq 报错，只回 seq >= fromSeq 的升序后缀，
 // 相邻断裂与「窗口起点落在洞里」都算日志损坏。
-func (s *sessionEventsTestStore) ReadFrom(ctx context.Context, sessionID string, fromSeq int64) ([]domain.SessionEvent, error) {
+func (s *sessionEventsTestStore) ReadFrom(ctx context.Context, sessionID string, fromSeq int64, limit int64) ([]domain.SessionEvent, error) {
 	if fromSeq < 0 {
 		return nil, fmt.Errorf("read session events for %q: fromSeq %d is negative", sessionID, fromSeq)
 	}
@@ -265,6 +265,9 @@ func TestBadPagingParametersAreRefusedByName(t *testing.T) {
 		// limit=0 同理：一页零条事件对谁都没用，把它悄悄换成默认的 500
 		// 就是「悄悄当成默认值」——调用方会以为自己的分页生效了。
 		{"?limit=0", "limit"},
+		// 上界同理，而且更要紧：写 limit=1000000 的人以为自己拿到了一百万条，
+		// 悄悄夹紧成 5000 会让他把「只有 5000 条」读成「日志只有这么多」。
+		{"?limit=1000000", "limit"},
 	} {
 		rec := httptest.NewRecorder()
 		srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/sessions/sess-1/events"+tc.query, nil))
@@ -381,5 +384,40 @@ func TestReadFromErrorReturnsInternalServerError(t *testing.T) {
 	// 500——证明这次真的走了那段与真 store 对齐的逻辑，不是巧合命中别的错误。
 	if !strings.Contains(rec.Body.String(), "seq jumps") {
 		t.Errorf("错误信息不是来自损坏检测分支，本测试没有真正触发它：%s", rec.Body.String())
+	}
+}
+
+// 上界是**拒绝**而不是夹紧，且错误信息要给出那个上界——否则调用方不知道该写多少。
+func TestAnOverLargeLimitIsRefusedWithTheBound(t *testing.T) {
+	srv := newTestServerWithSessionEvents(t, "sess-1", nil)
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
+		"/v1/sessions/sess-1/events?limit=999999", nil))
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("超上界的 limit → 状态码 %d，要 400：悄悄夹紧会让调用方把"+
+			"「只有这么多」读成日志的真实长度", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "5000") {
+		t.Errorf("错误信息里没给出上界，调用方不知道该写多少：%s", body)
+	}
+	if !strings.Contains(body, "999999") {
+		t.Errorf("错误信息里没回显他写的值：%s", body)
+	}
+}
+
+// 正好等于上界必须放行——边界是闭区间，差一就会把一个合法请求拒掉。
+func TestALimitExactlyAtTheBoundIsAccepted(t *testing.T) {
+	srv := newTestServerWithSessionEvents(t, "sess-1", nil)
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
+		"/v1/sessions/sess-1/events?limit=5000", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("limit 正好等于上界 → 状态码 %d，要 200：边界差一，合法请求被拒",
+			rec.Code)
 	}
 }
