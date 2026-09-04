@@ -476,6 +476,18 @@ const lockStaleAfter = 2 * time.Minute
 // The returned release function reports its own failure instead of discarding
 // it: a lock that cannot be removed blocks every later write, so it must not be
 // swallowed.
+//
+// Two removals in here are NOT guarded against a name in transition, and that
+// is a deliberate line, not an oversight. The create and the stat are guarded
+// because they race with an ORDINARY release: every handover of the lock is
+// such a window, which is what made this fail at random on Windows. The
+// removals — this one's own release, and the reclaim of a lock judged stale —
+// can only collide with each other, and that needs a lock left behind for
+// longer than lockStaleAfter AND its owner deleting it at the same instant as
+// a reclaimer. No guard was added for it because nothing here can exercise it
+// on purpose, and a guard nothing tests is a guard nobody knows still works;
+// if it is ever seen, it surfaces loudly as a reported removal failure rather
+// than as a silent one.
 func (l *Ledger) acquireLock(ctx context.Context) (func() error, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -492,7 +504,10 @@ func (l *Ledger) acquireLock(ctx context.Context) (func() error, error) {
 	// Two attempts at most: acquire, and if an abandoned lock was cleared,
 	// acquire again. More would risk two writers ping-ponging over one lock.
 	for attempt := range 2 {
-		file, err := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+		// Not os.OpenFile directly: on some platforms a create can fail
+		// because another writer is RELEASING this name, which is neither
+		// "held" nor "cannot be created". See createLockFile.
+		file, err := createLockFile(lockPath)
 		if err == nil {
 			// The stamp is diagnostic only — staleness is judged by mtime, which
 			// cannot be corrupted by a partial write.
@@ -521,8 +536,15 @@ func (l *Ledger) acquireLock(ctx context.Context) (func() error, error) {
 
 		info, statErr := os.Stat(lockPath)
 		if statErr != nil {
-			if errors.Is(statErr, os.ErrNotExist) {
-				// Released between our attempt and the stat; retry immediately.
+			// Both of these mean the same thing: the lock was released
+			// between our attempt and the stat, so there is nothing to judge
+			// the staleness of. It is gone (ErrNotExist), or its name is
+			// still being unlinked and the stat was refused for that
+			// (lockNameIsInTransition — on Windows a delete-pending name
+			// refuses the stat exactly as it refuses the create). Retry
+			// immediately; do NOT report it, and do NOT let it reach the
+			// reclaim decision below, which needs a real mtime.
+			if errors.Is(statErr, os.ErrNotExist) || lockNameIsInTransition(statErr) {
 				continue
 			}
 			return nil, fmt.Errorf("inspect task ledger lock: %w", statErr)
@@ -535,7 +557,12 @@ func (l *Ledger) acquireLock(ctx context.Context) (func() error, error) {
 			return nil, fmt.Errorf("reclaim stale task ledger lock: %w", removeErr)
 		}
 	}
-	return nil, fmt.Errorf("acquire task ledger lock: still held after reclaiming a stale lock")
+	// Reached when the second attempt also found the lock held. The first
+	// attempt may have reclaimed a stale lock, or may simply have seen it
+	// released and retried — so this says what is certain (still held after a
+	// second attempt) rather than asserting a reclamation that may not have
+	// happened.
+	return nil, fmt.Errorf("acquire task ledger lock: still held after a second attempt")
 }
 
 func (l *Ledger) eventsRoot() (string, error) {
