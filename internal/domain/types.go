@@ -212,6 +212,18 @@ type RuntimeEvent struct {
 	// /v1/runtime-events listing, where the session fields are noise on the
 	// other 99% of events) — it is NOT the SSE frame, which is built field by
 	// field in eventbridge.translate and always emits seq.
+	//
+	// The price is stated plainly rather than glossed: in THAT listing a
+	// session_event sitting at seq 0 is serialised without a seq key, and a
+	// reader of that one endpoint cannot tell it from an event that carries no
+	// seq at all. Dropping the `omitempty` would trade that for the opposite
+	// defect — every task lifecycle event growing a bare `"seq":0`, which
+	// TestTranslateLeavesNonSessionEventsWithoutSessionFields (eventbridge)
+	// forbids for the SSE
+	// frame on the grounds that it reads as a real position. The listing is a
+	// lifecycle view, not the seq-continuity channel: anything that actually
+	// tracks seq must read the SSE frame or
+	// GET /v1/sessions/{id}/events?from_seq=, both of which always carry it.
 	SessionID        string    `json:"session_id,omitempty"`
 	Seq              int64     `json:"seq,omitempty"`
 	SessionEventType string    `json:"session_event_type,omitempty"`

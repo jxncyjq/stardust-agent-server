@@ -37,12 +37,12 @@ const (
 	searchContentReadChunk = 32 * 1024
 	// readFilePageRunes is both the default and the maximum number of runes one
 	// read_file call returns. It is deliberately below runtime's
-	// maxToolResultChars (4000): appendToolResults truncates any longer tool
-	// result to that cap, which would silently cut the page short and defeat
-	// pagination.
+	// maxToolResultChars (4000): runtime.renderToolResultContent truncates any
+	// longer tool result to that cap at dispatch time, which would silently cut
+	// the page short and defeat pagination.
 	readFilePageRunes = 3500
 	// toolResultBudgetRunes mirrors runtime's maxToolResultChars (4000):
-	// appendToolResults hard-truncates any longer tool result from the front, so
+	// runtime.renderToolResultContent hard-truncates any longer tool result, so
 	// a read_file page plus everything appended to it (the subtree agents.md
 	// note, the repeat-read notice, the continuation hint) must fit inside this
 	// budget. Without that accounting the continuation hint — the one thing that

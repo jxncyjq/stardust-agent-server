@@ -568,6 +568,14 @@ func (s *HTTPServer) conversationTurnResponses(turns []domain.ConversationTurn) 
 // "" when the trimmed remainder is empty or still contains a slash (a nested
 // path that this handler does not own), so the caller can reject it as a bad
 // request instead of acting on a malformed id.
+//
+// It is also the ROUTING predicate for PATCH and DELETE /v1/sessions/{id} (see
+// the routing switch above): those two branches are selected by "this path
+// resolves to a session id", precisely so that every sub-resource path is
+// excluded without having to enumerate the suffixes. Loosening it — accepting a
+// remainder that contains a slash — therefore does not merely admit a malformed
+// id: it routes DELETE /v1/sessions/{id}/events into handleDeleteSession, i.e.
+// deletes the session. Any change here must keep the "no slash" rule.
 func sessionIDFromPath(path string) string {
 	trimmed := strings.TrimPrefix(path, "/v1/sessions/")
 	if strings.Contains(trimmed, "/") {

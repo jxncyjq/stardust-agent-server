@@ -444,10 +444,13 @@ func (e *eventRecorder) dropBufferedToolCall(callID string) {
 // 用一次真实 HTTP 往返钉住这条关系。
 //
 // 这条同源关系**仅当会话绑定了 working_dir 时成立**。若 session.WorkingDir 为空，
-// task.WorkingDir 也随之为空，agentToolRoot/taskRoot 会回退到 ContextFiles.Root——
-// spill 文件仍会写、spillLocator 仍会非空，但那是相对 ContextFiles.Root 的路径，
+// task.WorkingDir 也随之为空，工具根就落到各自的回退链上——per-agent 的那条是
+// agentToolRoot（agent_resolver.go）的 task.WorkingDir → agentCfg.ContextFiles.Root
+// → rootCfg.ContextFiles.Root；server 顶层任务走的是 app.go 的 WorkingDir →
+// opts.ToolRoot → "."，跟 ContextFiles.Root 没有关系。两条都不是 session.WorkingDir——
+// spill 文件仍会写、spillLocator 仍会非空，但那是相对上面那条回退根的路径，
 // 不是相对 session.WorkingDir 的；而 handleServeFile 对空 WorkingDir 直接
-// 404「session has no working directory」，不会去 ContextFiles.Root 下找。也就是
+// 404「session has no working directory」，不会去那个回退根下找。也就是
 // 说，未绑定 working_dir 的会话，其事件会带一个 /v1/files 永远取不回来的定位符。
 // 这不是本函数要兜底的场景（下游按契约把 404 当「全文不可得」处理，见 P4a 计划文档
 // 「交给 P4b 的东西」一节），只是这条同源注释的适用范围有前提，写在这里免得被当成

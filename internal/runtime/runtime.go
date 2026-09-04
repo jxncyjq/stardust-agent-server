@@ -841,6 +841,11 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	// 代价是 basePrompt 的 header 段里那句 "Input: <当前任务输入>" 出现在历史之前，
 	// 时序上是颠倒的。这是有意的取舍：缓存命中比时序美观值钱。
 	//
+	// 形状上还有一个后果，值得先写在这里免得被当成拼接 bug：message[0] 自己就是一条
+	// user（basePrompt，见 newConversation），而历史的第一条几乎总是 user（会话由用户
+	// 开口）——所以 G3 打开时，常规请求的 message[0] 与 message[1] 是**连续两条 user**。
+	// 这是预期形状，不是漏了角色。
+	//
 	// 这个取舍的第二个后果**真机上已确认有害**（P5 Task 3 复审 I3）：历史的最后一条
 	// 常常是一条**没有 tool_calls 的 assistant**（上一轮的收尾回答），于是整个请求
 	// 以它结尾。provider 把尾部 assistant 当 prefill 续写，thinking 系模型据此要求它
