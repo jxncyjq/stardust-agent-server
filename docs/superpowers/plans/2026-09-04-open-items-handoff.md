@@ -2,9 +2,9 @@
 
 **这份文档的用途**：会话事件日志 P1–P5 那一期已经收尾，随后的清账（真机验证、遗留 Minor 分诊、三条拍板项）也做完了。这里只写**还没做的事**，每条都说清「为什么它还在、下一步具体做什么、需不需要人拍板」。给下一个接手的人看。
 
-**三仓 tip**：`stardust-agent-server` `c118723` / `stardust-agent-gui` `4d35a3a` / `docs` `8c9202d`。工作树均干净，**三仓零开放 PR**。
+**三仓 tip**：`stardust-agent-server` `bc6d5a9` / `stardust-agent-gui` `4d35a3a` / `docs` `8c9202d`。工作树均干净，**三仓零开放 PR**。
 
-**2026-09-04 二次更新**：§二 的 A（注释订正）与 D（`internal/plugin/fetch` 的 Windows 锁抖动）已做完并合入 master（server#154 / server#155，master CI 双绿）。两条都推翻了这份文档原本的判断，改动记在各自小节里；新长出来的一条待办见 §二 E。
+**2026-09-04 二次更新**：§二 的 A（注释订正）与 D（`internal/plugin/fetch` 的 Windows 锁抖动）已做完并合入 master（server#154 / server#155，master CI 双绿）。两条都推翻了这份文档原本的判断，改动记在各自小节里；A 的副产品 E（`internal/taskledger` 同形状缺陷）随后也做完了，见 §二 E。
 
 **上两份**：[2026-09-03-session-event-log-handoff.md](2026-09-03-session-event-log-handoff.md)（那一期的完成记录与教训，§七 值得先读）、[2026-08-31-open-items-handoff.md](2026-08-31-open-items-handoff.md)（浏览器/插件那期，§三 的四条拍板项仍未决）。
 
@@ -24,9 +24,13 @@
 本轮合入的 PR：#141–#153（含 D-1 删表、D-2 熔断边界、T-1 e2e 可诊断化、T-2/T-3 配置
 可见性、T-5 schema 降级守卫、遗留 Minor 三条）。
 
-**二次更新补记**：此后又合入 #154（§二 A 的注释订正）与 #155（§二 D 的 Windows 锁争用），
-两条都在 master CI 上跑绿；本地在 master 上另跑过 `go test -count=20 ./internal/plugin/fetch/`
-（修前必红的那个 count）与 `go test -p 2 ./...`（ok=50 FAIL=0）。
+**二次更新补记**：此后又合入 #154（§二 A 的注释订正）、#155（§二 D 的 Windows 锁争用）与
+#156（§二 E，同一类缺陷在 `internal/taskledger`），三条都在 master CI 上跑绿；本地在 master 上
+另跑过两个包各自 `-count=20`（修前必红的那个 count）与 `go test -p 2 ./...`（ok=50 FAIL=0）。
+
+**注意 CI 的证明范围**：#155/#156 修的是 Windows 专属路径，而 CI 跑在 Linux runner 上——CI 绿
+只证明没写坏别的平台（POSIX 侧判据恒 false，行为逐字不变），Windows 侧的证据全部是本机的
+（修前必红 / 变异必红 / 修后 `-count=20` 与 `-race` 绿）。
 
 ## 二、能直接做，不需要拍板
 
@@ -98,12 +102,29 @@ Windows 上这条判据是错的：删除一个文件不一定立刻解除名字
 再报等于把权限问题变成挂起。代价（真打不开的锁文件要等满 `lockWait` 才报）由超时消息带上
 最后一次创建错误来兜，否则权限故障会被报成一个不存在的锁持有者。
 
-### E. `internal/taskledger` 有同形状的缺陷（D 的副产品，**未做**）
+### E. `internal/taskledger` 的同形状缺陷 ——**已做完，server#156 合入 `bc6d5a9`**
 
-`internal/taskledger/ledger.go:495` 用同样方式取锁、同样「非 `ErrExist` 即致命」，在 Windows 上
-有同样的暴露面。没有在 server#155 里一并改，因为它的重试策略不同（最多两次 + 按 mtime 判陈旧），
-**errno 5 不是关于锁年龄的证据**，不能直接喂进陈旧判定，要单独设计。照 `internal/plugin/fetch`
-的三个文件抄形状即可，但争用锤测要按它自己的策略重写。
+`acquireLock` 与 D 同一类：把「不是 `ErrExist`」一律判为致命，于是 Windows 上一次普通的锁交接
+就让 `Append`/`Rebuild` 硬失败。
+
+**比 D 多一处，而且是照抄会漏掉的那处**：`os.Stat` 也在同一个窗口里。`acquireLock` 拿到
+`ErrExist` 后要 stat 锁文件判陈旧，而 delete-pending 的名字**同样拒绝 stat**。第一版只按 D 的
+样子修了 create，争用锤测当场把它翻出来（`inspect task ledger lock: ... Access is denied`）。
+处置与既有的 `ErrNotExist` 分支相同：锁在尝试与 stat 之间被释放了，立即重试。
+
+**为什么不能照抄 D 的修法**（这一条比修法本身更值得记）：fetch 那把锁**等待到 deadline**，
+所以那边把 errno 5 并入等待即可；这把锁**不等待**（最多两次尝试、按 mtime 判陈旧后回收）。于是
+`lockNameIsInTransition` 只认「名字正在被另一个 writer 操作」，**不含 `ErrExist`**——`ErrExist`
+是「锁被持有」，必须继续走 stat → 判陈旧 → 回收那条路，并进重试会让被杀进程留下的锁**再也回收
+不了**（已由单测钉住）。同理，errno 5 不是关于锁年龄的证据，**绝不允许流到回收判定**。
+create 的重试预算 250ms/2ms，只够覆盖一次解链，不会把「不等待」的契约悄悄变成等待。
+
+**明确不做的一处**：`acquireLock` 里两处 `os.Remove` 没加同样的守卫，理由写进了函数注释——它们
+只可能与彼此相撞（要一把超过 `lockStaleAfter` 的陈旧锁**加上**同一瞬间的回收），没有任何测试
+能故意触发，而一条没人测的守卫等于没人知道它还活着。
+
+顺带订正了一条错误信息：收尾那句原本断言「回收过陈旧锁之后仍被持有」，而到达它的路径有三条，
+其中两条没有回收过任何东西。
 
 ---
 
@@ -208,6 +229,16 @@ D 原本记着「单独重跑 3 次、两次后续全量都没复现」，据此
 探针不碰被测代码，所以它的结论不依赖对被测代码的任何假设。
 
 推论：判「疑似抖动」之前先算一下——如果真实复现率是 p，我这几次不复现的概率是多少。
+
+### 「照抄同类修法」要先读被抄方的策略（二次更新新增）
+
+E 与 D 是同一个平台陷阱，但两把锁的策略相反：fetch 那把**等待到 deadline**，taskledger 那把
+**不等待**（两次尝试 + 按 mtime 判陈旧后回收）。照 D 的样子把 `ErrExist` 一起并进重试，会让被杀
+进程留下的锁再也回收不了——**修好一个缺陷的同时悄悄删掉一个功能**。同理，errno 5 说的是「有人
+正在删这个名字」，不是「这把锁很旧」，喂进陈旧判定就可能删掉活着的 writer 的锁。
+
+还有一条：**照抄只会抄到被抄方修过的那些点**。D 修的是 create，E 里 `os.Stat` 也在同一个窗口
+里，第一版按 D 抄完就漏了它，是争用锤测当场翻出来的。抄之前先问「这个窗口还罩着谁」。
 
 ### 「加了守卫却不写测试」
 
