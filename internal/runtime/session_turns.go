@@ -87,14 +87,21 @@ func SessionHistoryForTask(ctx context.Context, lister ConversationTurnLister, s
 	if lister == nil || strings.TrimSpace(task.SessionID) == "" {
 		return SessionHistory{}, nil
 	}
-	// The task's own user turn needs no filtering here, the way RecentTurnsForTask
-	// drops it by TaskID: this call happens BEFORE the task runs, and both writers
-	// of a user/message event record it later — RunTask's own recorder (opened
-	// further down RunTask) and the TUI controller's RecordExchange (which writes
-	// the question together with the answer, after the exchange). The projected
-	// messages carry no task_id anyway, so filtering here is not available; if a
-	// third writer ever records a task's question up front, this is where the
-	// duplicate would show up.
+	// The task's own user turn cannot be filtered here the way RecentTurnsForTask
+	// drops it by TaskID: the projected provider messages carry no task_id.
+	//
+	// On a FRESH run there is nothing to filter: this call happens before the task
+	// runs, and both writers of a user/message event record it later — RunTask's
+	// own recorder (opened further down RunTask) and the TUI controller's
+	// RecordExchange (which writes the question together with the answer, after the
+	// exchange). If a third writer ever records a task's question up front, this is
+	// where the duplicate would show up.
+	//
+	// On the RESUME path (Coordinator.runResume) the earlier run of this same task
+	// already logged its user/message, so the transcript replays it and RunTask's
+	// appendCurrentInput restates the same input right after: with G3 on, a resumed
+	// task shows the model its own question twice. RecentTurnsForTask filters that
+	// case by TaskID; this shape cannot, and the duplicate is left standing.
 	msgs, err := SessionTranscript(ctx, lister, sessionCfg, task.SessionID)
 	if err != nil {
 		return SessionHistory{}, err
@@ -354,9 +361,20 @@ func spendArgument(remaining *int, s string) string {
 // cross-turn memory at all, so a new runner must go through SessionHistoryForTask
 // (or, without a task, SessionTranscript) rather than re-deriving the rules below.
 //
-// It asks for one more turn than the limit and then drops the task's own user
-// turn: the HTTP layer persists that turn (as "<taskID>:user") before the task
-// is enqueued, so it would otherwise be replayed alongside task.Input.
+// It asks for one more turn than the limit and then drops any turn already
+// carrying this task's ID. No writer records a task's user turn before it runs:
+// the HTTP layer deliberately stopped doing that (server/http.go's
+// touchSessionOnSubmit — "it no longer writes the prompt anywhere"), and the only
+// writers today are the runtime's recordUserMessage (runtime.go, inside RunTask)
+// and the TUI controller's RecordExchange (cli/command.go). On a FRESH run the
+// history is therefore read before any such turn exists — ResolveTaskRunner, and
+// with it this call, runs in the coordinator before RunTask — so the filter finds
+// nothing.
+//
+// It is still not dead code: Coordinator.runResume re-resolves the runner, and so
+// re-reads history, for a task whose EARLIER run already logged its user/message
+// under this same task ID. Without the filter that turn would be replayed
+// alongside task.Input.
 //
 // A nil lister or a task with no SessionID is a legitimate "no session history
 // configured" state and yields (nil, nil). A lister error is returned wrapped:

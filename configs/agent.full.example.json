@@ -75,7 +75,7 @@
     "enabled": true,
     "_comment_default_recent_turns": "每次模型调用前注入最近多少条 conversation turn。建议 4-10，避免上下文膨胀。",
     "default_recent_turns": 6,
-    "_comment_max_turn_chars": "单条 turn 注入和存储前的最大字符数，超出会追加 [truncated] 标记。",
+    "_comment_max_turn_chars": "单条 turn 注入前的最大字符数。只作用于读侧：写侧一律存全文（若写侧先砍一刀，读侧的上限就再也拿不回被砍掉的那部分）。超出后追加的标记按路径不同：serve/runtime 的历史注入追加一段中英文的「输出被硬截断」说明，TUI 自己那条注入路径追加 [truncated]。",
     "max_turn_chars": 6000,
     "_comment_restore_latest_on_tui_start": "TUI 启动时是否自动恢复当前 agent 最近 session；false 时每次启动创建新 session。",
     "restore_latest_on_tui_start": true,

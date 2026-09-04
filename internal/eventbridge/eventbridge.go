@@ -112,9 +112,15 @@ func translate(ev domain.RuntimeEvent) observability.EventEnvelope {
 	// zero-value shorthand is only safe for fields whose zero means "not
 	// reported"; seq's zero means zero.
 	//
-	// The subject is the session rather than the task, because the session log
-	// is what this frame is about — a subscriber filtering by subject wants one
-	// session's trajectory, not one task's lifecycle.
+	// The subject is the session rather than the task, because the session log is
+	// what this frame is about: what a consumer of this frame wants to group by is
+	// one session's trajectory, not one task's lifecycle.
+	//
+	// "Filter by subject" is NOT a capability the SSE endpoint offers today:
+	// server/events.go filters on ?type= only, and it emits subject_id as an SSE
+	// COMMENT line (": subject_id=…"), which EventSource does not surface to the
+	// page at all. The subject is grouping metadata for whoever reads the raw
+	// stream; a real per-session filter would have to be added server-side.
 	if ev.Type == domain.RuntimeEventSessionEvent {
 		data["session_id"] = ev.SessionID
 		data["seq"] = ev.Seq

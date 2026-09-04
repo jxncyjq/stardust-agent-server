@@ -157,9 +157,12 @@ func routesFromServeHTTP(t *testing.T) []string {
 // "/stream"）、只有前缀（"/v1/tasks/"，其后是可变段）。只有前缀时补一个 {}，因为
 // 那正是规范里要写占位符的地方。
 func routeFromCase(clause *ast.CaseClause) (string, bool) {
-	// 取反的 HasSuffix 要先认出来再跳过：会话那几条分支写的是
-	// `HasPrefix("/v1/sessions/") && !HasSuffix("/turns")`——把那个后缀当成路径的一
-	// 部分，就会得出「/v1/sessions/{id} 没人服务」这种正好相反的结论。
+	// 取反的 HasSuffix 要先认出来再跳过。**今天路由里一条都没有**（P4a 之后会话那几条
+	// 分支改用 sessionIDFromPath 当判据，`!strings.HasSuffix` 在 http.go 里出现 0 次），
+	// 所以 negated 恒为空表、下面那个 skip 分支从不命中。留着不是因为它现在有用，而是
+	// 因为它是这个还原器的正确性前提：一旦有人再写回
+	// `HasPrefix("/v1/sessions/") && !HasSuffix("/turns")`，把取反的后缀当成路径的一
+	// 部分就会得出「/v1/sessions/{id} 没人服务」这种正好相反的结论。
 	negated := map[ast.Node]bool{}
 	ast.Inspect(clause, func(n ast.Node) bool {
 		if unary, ok := n.(*ast.UnaryExpr); ok && unary.Op == token.NOT {
