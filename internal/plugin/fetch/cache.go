@@ -449,6 +449,9 @@ func (c *Cache) commit(tmp, final string) (err error) {
 // one filesystem operation both POSIX and Windows make atomic against other
 // processes, which is what makes this work where a mutex cannot.
 //
+// What that create returns when the lock IS held is platform-dependent, and
+// getting it wrong fails installs at random: see lockCreateIsContended.
+//
 // The wait is bounded by c.lockWait. A process killed while holding the lock
 // leaves the file behind, and rather than block forever on it, a writer that
 // has waited that long gives up and returns an error naming the file and
@@ -472,6 +475,12 @@ func (c *Cache) lockDigestDir(dir string) (unlock func() error, err error) {
 	}
 
 	deadline := time.Now().Add(c.lockWait)
+	// lastErr is the create failure the wait is still on, carried so the
+	// timeout can name it. Without it a lock that cannot be created for a
+	// reason of its own — an ACL that denies this process, a read-only
+	// location — would be reported as "another writer has held it", which
+	// sends an operator looking for a process that does not exist.
+	var lastErr error
 	for {
 		f, openErr := os.OpenFile(lockPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 		if openErr == nil {
@@ -487,13 +496,16 @@ func (c *Cache) lockDigestDir(dir string) (unlock func() error, err error) {
 			}
 			return release, nil
 		}
-		if !errors.Is(openErr, fs.ErrExist) {
+		// Which failures are "held by someone else" is a platform question,
+		// not just "does the file exist": see lockCreateIsContended.
+		if !lockCreateIsContended(openErr) {
 			return nil, fmt.Errorf("acquire cache lock %s: %w", lockPath, openErr)
 		}
+		lastErr = openErr
 		if time.Now().After(deadline) {
 			return nil, fmt.Errorf(
-				"acquire cache lock %s: another writer has held it for more than %s; if no other process is installing plugins, that file is a leftover from one that was killed and clearing it means deleting exactly that file",
-				lockPath, c.lockWait)
+				"acquire cache lock %s: another writer has held it for more than %s (last attempt: %v); if no other process is installing plugins, that file is a leftover from one that was killed and clearing it means deleting exactly that file — and if the last attempt above reports a permission failure rather than an existing file, the problem is the location's permissions, not a lock holder",
+				lockPath, c.lockWait, lastErr)
 		}
 		time.Sleep(c.lockPoll)
 	}
