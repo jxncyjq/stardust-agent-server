@@ -19,6 +19,15 @@ const (
 	lockWait = 5 * time.Second
 	// lockPoll 是两次重试之间的间隔。
 	lockPoll = 20 * time.Millisecond
+
+	// publishWait 是发布一个文件时等目标那个名字被放开的上限，publishPoll 是两次
+	// rename 之间的间隔。read 不取目录锁，所以「发布的时候有人正开着同一个名字」
+	// 是常规状态，而在有些平台上那会让 rename 失败（见 publishRename）。
+	//
+	// 间隔比 lockPoll 短一个量级还多：这里等的是一次 os.ReadFile 收手，不是一个
+	// 写者放开整个刷新。
+	publishWait = 5 * time.Second
+	publishPoll = time.Millisecond
 )
 
 // errNoCache 表示这台机器还没有任何缓存的清单——目录是空的。
@@ -121,6 +130,10 @@ func (c *cache) path(name string) string { return filepath.Join(c.dir, name) }
 // 不可信」。这个窗口只有一次 write 那么长，且下一次 read 就好了；而让 read 去争
 // 同一把排他锁的代价要大得多——一个被杀死的写者留下的锁文件会把启动时的缓存读取
 // 一起挡住，那是比一次可重试的失败更坏的故障。
+//
+// 代价还有另一半，方向相反：在有些平台上，一个打开着的读句柄会让写者那一次覆盖
+// 同名文件的 rename 失败。所以发布走 publishRename 而不是裸的 os.Rename——那个
+// 方向的代价由写者自己吸收，不能让「有人正在读」变成一次刷新的失败。
 func (c *cache) read() (Document, *revokedSet, error) {
 	listData, err := os.ReadFile(c.path(listFileName))
 	if err != nil {
@@ -225,6 +238,10 @@ func (c *cache) readRevoked() (*revokedSet, error) {
 // 一对配不上的文件，下次 read 会把它报成不可信的缓存——响亮，且一次成功的 write
 // 就能修好，好过静默使用一份签名对不上的清单。
 //
+// 原子不等于随时能做成：在有些平台上，覆盖一个此刻正被读着的名字会失败，而 read
+// 不取这把锁，所以那是常态而非异常。发布因此走 publishRename——它把这类失败当成
+// 争用等过去，等不出结果才报，且报出来的错误带着最后那次 rename 的原因。
+//
 // 整个操作在目录锁下进行，而且落盘的累积集是**磁盘上那份与 revoked 的并集**，
 // 不是直接拿 revoked 覆盖。两件事缺一不可：只加锁只能让两个写者排队，排在后面
 // 的那个仍会用自己的过期快照把前一个刚记下的撤销覆盖掉。取并集才是这个类型的
@@ -309,8 +326,9 @@ func (c *cache) mergeWithRecordedRevocations(revoked *revokedSet) (*revokedSet, 
 }
 
 // writeFileAtomically 把 data 发布成缓存目录里的 name：先写同目录下的临时文件、
-// Sync、再 rename 过去。rename 在同一目录内是原子的，所以读者要么看到旧的那份，
-// 要么看到完整的新的那份，不会看到半份。
+// Sync、再改名过去。改名在同一目录内是原子的，所以读者要么看到旧的那份，要么看到
+// 完整的新的那份，不会看到半份。改名本身走 publishRename——目标那个名字正被读着时
+// 它等过去，那是这个包的常规状态（见 publishRename）。
 //
 // 它是包级变量而不是方法，唯一的理由是让测试能把失败点精确钉在「发布哪一个文件」
 // 这一步上：write 的落盘顺序（先累积集、后清单）是一条硬性要求，而用目录权限之类
@@ -342,7 +360,7 @@ var writeFileAtomically = func(c *cache, name string, data []byte) error {
 	if err := os.Chmod(tmpName, 0o600); err != nil {
 		return fmt.Errorf("chmod %s: %w", name, err)
 	}
-	if err := os.Rename(tmpName, c.path(name)); err != nil {
+	if err := publishRename(tmpName, c.path(name)); err != nil {
 		return fmt.Errorf("publish %s: %w", name, err)
 	}
 	return nil

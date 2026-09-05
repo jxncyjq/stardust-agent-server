@@ -3,11 +3,13 @@ package trustlist
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stardust/legion-agent/internal/plugin/sign"
 )
@@ -180,6 +182,36 @@ func TestWriteOrdersRevocationsFirst(t *testing.T) {
 	}
 }
 
+// readRetrying 反复调用 read 直到成功，或者试满次数。
+//
+// read 不取目录锁，所以撞上一次正在进行的 write 时它**允许**失败——那是 read 的
+// 契约明写的代价，「这个窗口只有一次 write 那么长，且下一次 read 就好了」（见
+// cache.read）。撞上的形态不止一种：清单与签名之间读到一对配不上的文件会验签失败，
+// 而在 Windows 上，一次覆盖式改名对目标名的短暂占用会让读者的 open 失败于
+// ERROR_SHARING_VIOLATION。实测两个读者压着一个写者跑 15 秒，约 7 万次 read 里有
+// 几十次落在这个窗口里（这个比例与发布是否重试无关，两种实现下相同）。
+//
+// 所以并发用例里的 read 必须**重试**而不是直接判失败：一次落在窗口里的 read 说明
+// 不了任何事，而把它当成失败会让用例报出一句与它真正要守的规则毫无关系的话。重试
+// 而不是忽略错误：试满还不行就如实报出来，那才是真出了问题。
+func readRetrying(t *testing.T, c *cache) (Document, *revokedSet, error) {
+	t.Helper()
+
+	const attempts = 50
+	var err error
+	for i := 0; i < attempts; i++ {
+		var doc Document
+		var set *revokedSet
+		doc, set, err = c.read()
+		if err == nil {
+			return doc, set, nil
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	return Document{}, nil, fmt.Errorf("试了 %d 次都没读成功，这不是一次落在写窗口里的失败: %w",
+		attempts, err)
+}
+
 // TestConcurrentWritesNeverLoseARevocation：两个写者各自并入不同的撤销，
 // 并发写完之后两条都必须还在。
 //
@@ -205,7 +237,7 @@ func TestConcurrentWritesNeverLoseARevocation(t *testing.T) {
 		wg.Add(1)
 		go func(id sign.KeyID) {
 			defer wg.Done()
-			_, set, err := c.read()
+			_, set, err := readRetrying(t, c)
 			if err != nil {
 				t.Errorf("read: %v", err)
 				return
