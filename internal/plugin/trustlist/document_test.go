@@ -124,6 +124,52 @@ func TestParseDocument_RefusesMalformedDocuments(t *testing.T) {
 	}
 }
 
+// TestParseDocument_AcceptsAPublisherWhoseKeyIsRevoked：一个 key 即使在
+// keyring.revoked 里，只要它还在 keyring.keys 里，它的 publisher 条目就不算
+// 悬空——调用方要能说出「张三的这把钥匙已被撤销」，而不是退化成「未知钥匙」。
+func TestParseDocument_AcceptsAPublisherWhoseKeyIsRevoked(t *testing.T) {
+	t.Parallel()
+
+	// 需要一把不受影响的第二把钥匙：如果 keyring 里唯一的 key（dev-abc）被
+	// 撤销，sign.ParseKeyring 会把"每把钥匙都被撤销"当成空信任集直接拒绝，
+	// 那样就测不出"撤销了还能保留 publisher 条目"这条行为本身。
+	otherPub, _, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	otherEntry, err := sign.MarshalKeyEntry("dev-other", otherPub)
+	if err != nil {
+		t.Fatalf("MarshalKeyEntry: %v", err)
+	}
+	var otherEntryMap map[string]any
+	if err := json.Unmarshal(otherEntry, &otherEntryMap); err != nil {
+		t.Fatalf("unmarshal entry: %v", err)
+	}
+
+	data := testDoc(t, func(m map[string]any) {
+		keyring := m["keyring"].(map[string]any)
+		keyring["keys"] = append(keyring["keys"].([]any), otherEntryMap)
+		keyring["revoked"] = []any{
+			map[string]any{
+				"key_id":     "dev-abc",
+				"revoked_at": "2026-09-05T02:00:00Z",
+				"reason":     "laptop stolen",
+			},
+		}
+	})
+	doc, err := ParseDocument(data)
+	if err != nil {
+		t.Fatalf("ParseDocument: %v", err)
+	}
+	pub, ok := doc.Publishers["dev-abc"]
+	if !ok {
+		t.Fatal("已撤销 key 的 publisher 条目被当成悬空丢掉了")
+	}
+	if pub.DisplayName != "张三" {
+		t.Errorf("Publishers[dev-abc].DisplayName = %q, want 张三", pub.DisplayName)
+	}
+}
+
 func TestParseDocument_RefusesTrailingContent(t *testing.T) {
 	t.Parallel()
 
