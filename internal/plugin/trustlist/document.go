@@ -35,9 +35,9 @@ var ErrUntrustedList = errors.New("trustlist is not trusted")
 // maxPublishers 是一份清单里 publishers 条目数的上限。
 //
 // 它不是（也不能是）性能保护：本包的解析函数拿到的 data []byte 已经整个读进
-// 内存，不会也不该在这一层做文档体积限制——那是取回方（未来的 HTTP 客户端）
-// 的职责，将由取回代码以流式方式在读进内存之前强制（读到上限+1 字节即判定
-// 超限），此刻这道限制还不存在。这里限的只是 publishers 条目数：真实的登记
+// 内存，不会也不该在这一层做文档体积限制——那是取回方的职责：fetch.go 里的
+// fetchBytes 以流式方式在读进内存之前强制 maxListBytes / maxSigBytes（读到
+// 上限+1 字节即判定超限）。这里限的只是 publishers 条目数：真实的登记
 // 规模远小于这个数，而一份塞满条目的文档更像是有人在试探解析器，是一条
 // 「这份文档不像是我签的」的判据。
 const maxPublishers = 10000
