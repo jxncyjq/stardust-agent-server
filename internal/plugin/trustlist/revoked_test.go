@@ -4,13 +4,34 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stardust/legion-agent/internal/plugin/sign"
 )
 
+// revocation 是造清单用的一条撤销：key_id 之外还带上 revoked_at 与 reason，
+// 这样同一个 key 才能在两份清单里配不同的时间与理由——「先见到的记录胜出」
+// 这条规则只有在两条记录**内容不同**时才看得出来，keyringWith 里那份硬编码的
+// 时间与理由构造不出这种冲突。
+type revocation struct {
+	id     sign.KeyID
+	at     string
+	reason string
+}
+
 // keyringWith 造一份 keyring 文档：keys 里有 ids 列出的每一把，revoked 里有
-// revoked 列出的每一个。
+// revoked 列出的每一个，撤销时间与理由都用同一份缺省值。
 func keyringWith(t *testing.T, ids []sign.KeyID, revoked []sign.KeyID) json.RawMessage {
+	t.Helper()
+	rs := make([]revocation, 0, len(revoked))
+	for _, id := range revoked {
+		rs = append(rs, revocation{id: id, at: "2026-08-29T10:00:00Z", reason: "私钥泄漏"})
+	}
+	return keyringRevoking(t, ids, rs)
+}
+
+// keyringRevoking 与 keyringWith 相同，但每条撤销的时间与理由由调用方指定。
+func keyringRevoking(t *testing.T, ids []sign.KeyID, revoked []revocation) json.RawMessage {
 	t.Helper()
 	keys := make([]any, 0, len(ids))
 	for _, id := range ids {
@@ -31,11 +52,11 @@ func keyringWith(t *testing.T, ids []sign.KeyID, revoked []sign.KeyID) json.RawM
 	doc := map[string]any{"keys": keys}
 	if len(revoked) > 0 {
 		rs := make([]any, 0, len(revoked))
-		for _, id := range revoked {
+		for _, r := range revoked {
 			rs = append(rs, map[string]any{
-				"key_id":     string(id),
-				"revoked_at": "2026-08-29T10:00:00Z",
-				"reason":     "私钥泄漏",
+				"key_id":     string(r.id),
+				"revoked_at": r.at,
+				"reason":     r.reason,
 			})
 		}
 		doc["revoked"] = rs
@@ -113,6 +134,103 @@ func TestRevokedSetOnlyGrows(t *testing.T) {
 		t.Error("并入一份没有 revoked 的清单之后，a 从累积集里消失了")
 	} else if afterEntry != beforeEntry {
 		t.Errorf("a 的记录被改写了：%+v -> %+v", beforeEntry, afterEntry)
+	}
+}
+
+// laterAndEmpty 是一份「后来的清单」对同一个 key 写下的撤销：时间更晚、理由为空。
+// 它是合法的（sign.ParseKeyring 收得下：revoked_at 是 RFC 3339，reason 可省），
+// 正因为合法才危险——一旦被当成更新采纳，当初那句「私钥泄漏 / 2026-08-29」就被
+// 换成了一句什么都没说的拒绝理由。
+var laterAndEmpty = revocation{id: "k", at: "2030-01-01T00:00:00Z", reason: ""}
+
+// wantFirstRecord 断言 sign.Keyring 里 k 的撤销仍然是先见到的那条。
+func wantFirstRecord(t *testing.T, kr *sign.Keyring) {
+	t.Helper()
+	rev, ok := kr.Revoked("k")
+	if !ok {
+		t.Fatal("k 不再是撤销状态")
+	}
+	if rev.Reason != "私钥泄漏" {
+		t.Errorf("拒绝理由被后来的清单改写了：reason = %q, want 私钥泄漏", rev.Reason)
+	}
+	if got := rev.At.UTC().Format(time.RFC3339); got != "2026-08-29T10:00:00Z" {
+		t.Errorf("撤销时间被后来的清单改写了：at = %s, want 2026-08-29T10:00:00Z", got)
+	}
+}
+
+// TestMergeFromKeepsTheFirstRecord：先并入带理由的 A，再并入把同一个 key 的理由
+// 改空、时间改晚的 B，累积集里留的必须还是 A 那条。
+//
+// 这条守的是 mergeFrom 的「先见到的记录胜出」。改成 last-wins 不会让任何条目消失、
+// 条数也分毫不差，坏掉的只是拒绝理由的内容——sign.Keyring 正是用 reason 与
+// revoked_at 生成操作者能读的那句话，丢掉它们，撤销就退化成「未知钥匙」。
+func TestMergeFromKeepsTheFirstRecord(t *testing.T) {
+	t.Parallel()
+
+	set := newRevokedSet()
+	listA := keyringWith(t, []sign.KeyID{"k", "other"}, []sign.KeyID{"k"})
+	if err := set.mergeFrom(listA); err != nil {
+		t.Fatalf("mergeFrom(A): %v", err)
+	}
+	listB := keyringRevoking(t, []sign.KeyID{"k", "other"}, []revocation{laterAndEmpty})
+	if err := set.mergeFrom(listB); err != nil {
+		t.Fatalf("mergeFrom(B): %v", err)
+	}
+
+	got := set.entries["k"]
+	want := rawRevocationEntry{KeyID: "k", RevokedAt: "2026-08-29T10:00:00Z", Reason: "私钥泄漏"}
+	if got != want {
+		t.Errorf("两次 mergeFrom 之后 entries[k] = %+v, want %+v", got, want)
+	}
+
+	kr, err := assembleKeyring(listB, set)
+	if err != nil {
+		t.Fatalf("assembleKeyring: %v", err)
+	}
+	wantFirstRecord(t, kr)
+}
+
+// TestAssembleKeepsTheAccumulatedRecord：装配时清单自己的 revoked 段与累积集
+// 对同一个 key 说法不同，留的必须是累积集那条。
+//
+// 与上一条守的是同一条规则的另一个入口：这里**没有**先 mergeFrom(B)，冲突是在
+// assembleKeyring 内部的「累积集 vs 本清单 revoked 段」那次并入里发生的。两个入口
+// 各自都能把先见到的记录换掉，所以两个入口都得有用例。
+func TestAssembleKeepsTheAccumulatedRecord(t *testing.T) {
+	t.Parallel()
+
+	set := newRevokedSet()
+	if err := set.mergeFrom(keyringWith(t, []sign.KeyID{"k", "other"}, []sign.KeyID{"k"})); err != nil {
+		t.Fatalf("mergeFrom(A): %v", err)
+	}
+	listB := keyringRevoking(t, []sign.KeyID{"k", "other"}, []revocation{laterAndEmpty})
+
+	kr, err := assembleKeyring(listB, set)
+	if err != nil {
+		t.Fatalf("assembleKeyring: %v", err)
+	}
+	wantFirstRecord(t, kr)
+}
+
+// TestMergeFromRefusesWhatItCouldNotReadBack：写入侧与读取侧同严。
+//
+// mergeFrom 收下一个非 RFC 3339 的 revoked_at，marshal 就会把它写进
+// revoked-ever.json，而 parseRevokedSet 下次读不回来——这个类型自己写出的文件
+// 通不过自己的读入。错误还必须说清坏的是清单那一段，不是磁盘上的累积集文件。
+func TestMergeFromRefusesWhatItCouldNotReadBack(t *testing.T) {
+	t.Parallel()
+
+	set := newRevokedSet()
+	bad := keyringRevoking(t, []sign.KeyID{"k", "other"}, []revocation{{id: "k", at: "yesterday"}})
+	err := set.mergeFrom(bad)
+	if err == nil {
+		t.Fatal("mergeFrom 收下了一个 parseRevokedSet 读不回来的 revoked_at")
+	}
+	if !strings.Contains(err.Error(), `the manifest keyring's revoked[0] key "k" revoked_at "yesterday" is not RFC 3339`) {
+		t.Errorf("错误没指向清单 keyring 段里出问题的那条：%v", err)
+	}
+	if strings.Contains(err.Error(), "revoked-ever") {
+		t.Errorf("错误把操作者引去查 revoked-ever.json，坏的却是清单：%v", err)
 	}
 }
 
@@ -203,6 +321,11 @@ func TestParseRevokedSetRefusesGarbage(t *testing.T) {
 		{"未知字段", `{"revoked":[],"extra":1}`, ""},
 		{"key_id 为空", `{"revoked":[{"key_id":""}]}`, ""},
 		{"尾随内容", `{"revoked":[]} {"revoked":[]}`, ""},
+		// 缺了 revoked 键与 revoked 为 null：marshal 永远写出这个键（空数组也写），
+		// 所以这两种文件都不是本包写出来的，只可能来自外部改写或截断。读成空集
+		// 就是「这台机器从没见过任何撤销」——最坏的那句谎。
+		{"缺 revoked 键", `{}`, `parse revoked-ever: revoked-ever.json has no revoked key`},
+		{"revoked 是 null", `{"revoked":null}`, `parse revoked-ever: revoked-ever.json has no revoked key`},
 		{
 			"重复 key_id",
 			`{"revoked":[{"key_id":"x","revoked_at":"2026-08-29T10:00:00Z","reason":"私钥泄漏"},{"key_id":"x"}]}`,
@@ -211,7 +334,7 @@ func TestParseRevokedSetRefusesGarbage(t *testing.T) {
 		{
 			"revoked_at 不是 RFC 3339",
 			`{"revoked":[{"key_id":"x","revoked_at":"yesterday"}]}`,
-			`parse revoked-ever: key "x" revoked_at "yesterday" is not RFC 3339`,
+			`parse revoked-ever: revoked-ever.json revoked[0] key "x" revoked_at "yesterday" is not RFC 3339`,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -224,6 +347,35 @@ func TestParseRevokedSetRefusesGarbage(t *testing.T) {
 				t.Errorf("错误没指向 revoked-ever.json 里出问题的那条：%v", err)
 			}
 		})
+	}
+}
+
+// TestParseRevokedSetAcceptsAnEmptyList：`{"revoked":[]}` 是合法的正常状态——
+// 见过清单，但还没有任何撤销。它必须和「缺了 revoked 键」区分开，否则上一条
+// 用例只要把「拒绝缺键」写成「拒绝一切空集」就能作弊通过，而一台还没见过任何
+// 撤销的新机器从此再也起不来。
+//
+// 顺带守住 marshal 那一头：空累积集写出来的必须是这份能被自己读回来的字节。
+func TestParseRevokedSetAcceptsAnEmptyList(t *testing.T) {
+	t.Parallel()
+
+	set, err := parseRevokedSet([]byte(`{"revoked":[]}`))
+	if err != nil {
+		t.Fatalf("空撤销列表被拒了：%v", err)
+	}
+	if set.len() != 0 {
+		t.Errorf("空撤销列表读出了 %d 条", set.len())
+	}
+
+	data, err := newRevokedSet().marshal()
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(data), `"revoked": []`) {
+		t.Errorf("空累积集没写出 revoked 键，下次读回来会被当成损坏文件：%s", data)
+	}
+	if _, err := parseRevokedSet(data); err != nil {
+		t.Errorf("空累积集写出来的文件自己读不回来：%v", err)
 	}
 }
 

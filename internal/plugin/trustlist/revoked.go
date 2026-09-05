@@ -3,6 +3,7 @@ package trustlist
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -30,10 +31,10 @@ import (
 // 锁只会把一次响亮的 fatal error: concurrent map read and map write 换成一次静默
 // 的数据丢失，比不加锁更糟。
 //
-// 真正串行化这个复合操作的地方在这个类型之外：同进程内由 Store 用自己的互斥锁
-// 串行 Refresh，跨进程由缓存目录锁挡住。这两处都还没有编写（后续任务），本包目前
-// 也没有任何调用方。第一个跨 goroutine 共享 revokedSet 的调用方必须自己串行化
-// **整个 read-modify-write 序列**（读 → 改 → 写回），而不只是单次方法调用。
+// 真正串行化这个复合操作的责任在这个类型之外：凡是跨 goroutine 共享 revokedSet
+// 的调用方，都必须自己串行化**整个 read-modify-write 序列**（读 → 改 → 写回），
+// 而不只是单次方法调用；凡是跨进程共享同一份 revoked-ever.json 的地方，同样的
+// 序列还要被一把跨进程的锁罩住。
 type revokedSet struct {
 	entries map[sign.KeyID]rawRevocationEntry
 }
@@ -52,8 +53,36 @@ type rawRevocationEntry struct {
 	Reason    string     `json:"reason,omitempty"`
 }
 
+// validate 检查一条撤销条目**自身的形状**：key_id 不能为空，给了 revoked_at 就
+// 必须是 RFC 3339。这两条与 sign.ParseKeyring 对 keyring 文档 revoked 段的规则
+// 一字对齐，不是在这里新发明第二套规则。
+//
+// 它只管单条目，不管集合层面的事：同一个 key_id 出现两次是集合层面的问题（要看
+// 已经收了哪些条目才判得了），由 parseRevokedSet 与 mergeFrom 各自决定怎么处理。
+//
+// 返回的错误刻意不带来源前缀。同一条规则有两个入口——清单信封里的 keyring
+// revoked 段（mergeFrom）和磁盘上的 revoked-ever.json（parseRevokedSet）——
+// fail-loud 要求错误点可定位，操作者必须能从错误文本看出该去查哪一份，所以
+// 前缀由调用方各自补上。
+func (e rawRevocationEntry) validate() error {
+	if e.KeyID == "" {
+		return errors.New("has no key_id")
+	}
+	if e.RevokedAt != "" {
+		if _, err := time.Parse(time.RFC3339, e.RevokedAt); err != nil {
+			// 无法解析的时间戳会原样走进操作者用来判断一个包是否安全的那句话。
+			return fmt.Errorf("key %q revoked_at %q is not RFC 3339: %w", e.KeyID, e.RevokedAt, err)
+		}
+	}
+	return nil
+}
+
+// rawRevokedSet 是 revoked-ever.json 整个文件的形状。
+//
+// Revoked 是指针而不是切片，为的是把「缺了 revoked 键」与「revoked 是空数组」
+// 分开：前者报错，后者合法。理由见 parseRevokedSet 的注释。
 type rawRevokedSet struct {
-	Revoked []rawRevocationEntry `json:"revoked"`
+	Revoked *[]rawRevocationEntry `json:"revoked"`
 }
 
 // keyringShape 是本包从清单的 keyring 段里需要的部分：Revoked 给 mergeFrom 与
@@ -70,18 +99,25 @@ func newRevokedSet() *revokedSet {
 
 // parseRevokedSet 从 revoked-ever.json 的字节读回累积集。
 //
-// 它和这个包里其他解析器一样严格：未知字段、尾随内容、空 key_id、同一个 key_id
-// 出现两次、不是 RFC 3339 的 revoked_at，都拒绝。而这里的理由比别处更重：一个被
-// 静默当成空集的损坏文件，说的是「这台机器从没见过任何撤销」——这是这个文件能
-// 造成的最坏的谎。宁可报错让调用方去决定怎么办。
+// 它和这个包里其他解析器一样严格：未知字段、尾随内容、缺了 revoked 键、空
+// key_id、同一个 key_id 出现两次、不是 RFC 3339 的 revoked_at，都拒绝。而这里的
+// 理由比别处更重：一个被静默当成空集的损坏文件，说的是「这台机器从没见过任何
+// 撤销」——这是这个文件能造成的最坏的谎。宁可报错让调用方去决定怎么办。
 //
-// 后两条与 sign.ParseKeyring 对 keyring 文档 revoked 段的规则一字对齐，不是在这里
-// 新发明第二套规则，而是把同一条规则挪到 revoked-ever.json 自己的入口再执行一次。
-// 挪的理由是错误点要可定位：累积集只增不减，一个坏条目一旦进来就永不消失，此后
-// 每次 assembleKeyring 都会失败，而那时的错误文本写的是「assemble keyring: parse
-// keyring:」，会把操作者引去查清单，真正坏掉的却是 revoked-ever.json。经正常路径
-// 坏值进不来（清单的 keyring 段在 ParseDocument 里已由 sign.ParseKeyring 把过关），
-// 真正的入口是磁盘上这个文件被手改或损坏。
+// 缺了 revoked 键（`{}`）与 revoked 是 JSON null（`{"revoked":null}`）都算损坏，
+// 一并拒绝：marshal 永远写出 revoked 键（哪怕值是空数组），所以一份没有这个键的
+// 文件根本不是本包写出来的，它只可能来自外部改写或截断——正是最该报错的那种输入，
+// 而把它读成空集恰好就是上面那句最坏的谎。JSON null 与缺键在这里是同一件事的两种
+// 拼法。空数组 `{"revoked":[]}` 则是合法的正常状态：见过清单，但还没有任何撤销。
+//
+// 单条目的两条形状规则在 rawRevocationEntry.validate 里，与 sign.ParseKeyring 对
+// keyring 文档 revoked 段的规则一字对齐，不是在这里新发明第二套规则，而是把同一条
+// 规则挪到 revoked-ever.json 自己的入口再执行一次。挪的理由是错误点要可定位：
+// 累积集只增不减，一个坏条目一旦进来就永不消失，此后每次 assembleKeyring 都会失败，
+// 而那时的错误文本写的是「assemble keyring: parse keyring:」，会把操作者引去查清单，
+// 真正坏掉的却是 revoked-ever.json。经正常路径坏值进不来（清单的 keyring 段在
+// ParseDocument 里已由 sign.ParseKeyring 把过关），真正的入口是磁盘上这个文件被
+// 手改或损坏。
 func parseRevokedSet(data []byte) (*revokedSet, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
@@ -92,10 +128,16 @@ func parseRevokedSet(data []byte) (*revokedSet, error) {
 	if dec.More() {
 		return nil, fmt.Errorf("parse revoked-ever: unexpected content after the JSON document")
 	}
+	if raw.Revoked == nil {
+		return nil, fmt.Errorf("parse revoked-ever: revoked-ever.json has no revoked key (or it is null); " +
+			"this file always carries the key, even when the list is empty, so a missing one means the file " +
+			"was rewritten or truncated, and reading it as an empty set would claim this machine has never " +
+			"seen a revocation")
+	}
 	set := newRevokedSet()
-	for i, entry := range raw.Revoked {
-		if entry.KeyID == "" {
-			return nil, fmt.Errorf("parse revoked-ever: revoked[%d] has no key_id", i)
+	for i, entry := range *raw.Revoked {
+		if err := entry.validate(); err != nil {
+			return nil, fmt.Errorf("parse revoked-ever: revoked-ever.json revoked[%d] %w", i, err)
 		}
 		if _, dup := set.entries[entry.KeyID]; dup {
 			// 两条记录对应一个 id：哪条在生效、拒绝理由该引哪个时间戳，没有答案。
@@ -103,13 +145,6 @@ func parseRevokedSet(data []byte) (*revokedSet, error) {
 			// 字段正是这个文件必须保住的东西。
 			return nil, fmt.Errorf("parse revoked-ever: key id %q is revoked twice; a revocation must name "+
 				"each key once so the refusal can say when and why", entry.KeyID)
-		}
-		if entry.RevokedAt != "" {
-			if _, err := time.Parse(time.RFC3339, entry.RevokedAt); err != nil {
-				// 无法解析的时间戳会原样走进操作者用来判断一个包是否安全的那句话。
-				return nil, fmt.Errorf("parse revoked-ever: key %q revoked_at %q is not RFC 3339: %w",
-					entry.KeyID, entry.RevokedAt, err)
-			}
 		}
 		set.entries[entry.KeyID] = entry
 	}
@@ -120,14 +155,26 @@ func parseRevokedSet(data []byte) (*revokedSet, error) {
 // 累积集。已经在集合里的 key_id 保留**先见到的那条**记录，不被后来的覆盖：
 // 撤销时间与理由是操作者当时写下的事实，后一份清单把它改短、改空或改晚，
 // 都只会让拒绝理由变得更没用。
+//
+// 每条都过一遍 rawRevocationEntry.validate，与 parseRevokedSet 同一套形状规则。
+// 写入侧和读取侧必须同严，否则 mergeFrom 收下一个坏 revoked_at、marshal 把它写
+// 出去、parseRevokedSet 下次读不回来——这个类型自己的写出结果通不过自己的读入。
+//
+// 同一份清单内重复的 key_id 不报错，走的还是上面那条「先见到的胜出」。keyringRaw
+// 与 assembleKeyring 收的是同一段字节，因而背着同一条调用方义务：必须是已通过
+// sign.ParseKeyring 的那一段（即 Document.KeyringRaw）。sign.ParseKeyring 对「同一个
+// key 在 revoked 里出现两次」是硬拒的，所以重复条目只可能来自违反那条义务的调用方；
+// 真出现时第一条胜出，与跨清单的答案是同一个，不会让任何已经收下的记录被改写。
+// 这与 parseRevokedSet 硬拒重复并不矛盾：那边的文件是撤销的唯一底本、上游没有任何
+// 人校验过它，两条互相矛盾的记录无从裁决。
 func (s *revokedSet) mergeFrom(keyringRaw json.RawMessage) error {
 	var shape keyringShape
 	if err := json.Unmarshal(keyringRaw, &shape); err != nil {
 		return fmt.Errorf("merge revocations: %w", err)
 	}
 	for i, entry := range shape.Revoked {
-		if entry.KeyID == "" {
-			return fmt.Errorf("merge revocations: revoked[%d] has no key_id", i)
+		if err := entry.validate(); err != nil {
+			return fmt.Errorf("merge revocations: the manifest keyring's revoked[%d] %w", i, err)
 		}
 		if _, seen := s.entries[entry.KeyID]; seen {
 			continue
@@ -141,13 +188,16 @@ func (s *revokedSet) mergeFrom(keyringRaw json.RawMessage) error {
 //
 // 排序是为了让这个文件可 diff、可复现：一个每次写出来都不一样的文件，
 // 无法靠 diff 看出「这次刷新到底新撤销了谁」。
+//
+// entries 由 make 造出，永远非 nil，所以撤销为空时写出的是 "revoked": []
+// 而不是 "revoked": null——parseRevokedSet 把缺键与 null 都当损坏拒绝。
 func (s *revokedSet) marshal() ([]byte, error) {
 	entries := make([]rawRevocationEntry, 0, len(s.entries))
 	for _, e := range s.entries {
 		entries = append(entries, e)
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].KeyID < entries[j].KeyID })
-	data, err := json.MarshalIndent(rawRevokedSet{Revoked: entries}, "", "  ")
+	data, err := json.MarshalIndent(rawRevokedSet{Revoked: &entries}, "", "  ")
 	if err != nil {
 		return nil, fmt.Errorf("marshal revoked-ever: %w", err)
 	}
@@ -167,12 +217,12 @@ func (s *revokedSet) len() int { return len(s.entries) }
 // mergeFrom，本清单自己的撤销也会在这里被并进来，装配结果不会漏。已经在累积集里
 // 的 key_id 保留累积集那条（先见到的记录胜出，与 mergeFrom 同规则）。
 //
-// keyringRaw 必须是已经通过 sign.ParseKeyring 的那一段（即 Document.KeyringRaw）。
-// 这是调用方的义务，签名收的是裸 json.RawMessage，类型上约束不了；本包尚无调用方，
-// 第一个接它的调用方必须遵守。理由是上面那次并入顺带做了去重（同一个 key_id 只留
-// 一条），而 sign.ParseKeyring 对「同一个 key 在 revoked 里出现两次」是硬拒的——
-// 传进来一段未经校验的 keyring，这里的去重会把它那条规则悄悄消解掉。这里的去重只
-// 为「累积集优先」服务，不承担校验职责。
+// 凡是调用 assembleKeyring 的地方，keyringRaw 都必须是已经通过 sign.ParseKeyring
+// 的那一段（即 Document.KeyringRaw）。这是调用方的义务，签名收的是裸
+// json.RawMessage，类型上约束不了。理由是上面那次并入顺带做了去重（同一个 key_id
+// 只留一条），而 sign.ParseKeyring 对「同一个 key 在 revoked 里出现两次」是硬拒的
+// ——传进来一段未经校验的 keyring，这里的去重会把它那条规则悄悄消解掉。这里的去重
+// 只为「累积集优先」服务，不承担校验职责。
 //
 // sign.ParseKeyring 会拒绝「每把钥匙都被撤销」的信任集。合并后触发这一条是完全
 // 可能的真实情况（撤销累积到覆盖了当前清单的全部 keys），它的错误原样往上冒，
