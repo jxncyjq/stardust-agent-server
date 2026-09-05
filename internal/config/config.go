@@ -150,6 +150,42 @@ type PluginsConfig struct {
 	// Manifest is set: a convergence that waited forever would hold the task
 	// gate shut against every new task with no way for anyone to recover.
 	ApplyWaitMs int `json:"apply_wait_ms"`
+
+	// Trustlist 是这个部署从哪里取回官方信任清单、把它缓存在哪里、多久取一次。
+	//
+	// 它与 Keyring 是两条独立的路，并存而不互斥：Keyring 指向的本地文件服务于
+	// 内网与离线部署，远程清单服务于公开生态。二者的优先级由消费方决定，配置
+	// 层不替它们排序。
+	Trustlist PluginTrustlistConfig `json:"trustlist"`
+}
+
+// PluginTrustlistConfig 配置官方信任清单的取回。
+//
+// 空的 URL 就是「没有配置远程清单」，不另设一个布尔开关。理由是那个开关的
+// 未声明值没有安全上的正确答案：联网能让撤销到达（更安全），不联网不引入新的
+// 攻击面（也更安全）。用空串表达「没配」沿用 Keyring 的既有做法，把这个歧义
+// 整个绕开——而本仓其他安全开关（RequireSignature、AllowInsecureSources）之所以
+// 用指针，正是因为它们的未声明值有明确的安全一侧。
+type PluginTrustlistConfig struct {
+	// URL 是清单文档的地址。必须是 https：清单没有 digest 兜底，明文传输意味着
+	// 任何中间人都能换掉它。签名文档的地址由这个值推导（同目录、后缀换成 .sig），
+	// 不单独配置——两个可以各自配置的 URL 就有可以指向两份不匹配文档的配置。
+	URL string `json:"url"`
+
+	// Cache 是缓存目录。相对路径按进程工作目录解析，与 Manifest/Root 一致。
+	//
+	// URL 非空时它必须非空：清单没有落点，就等于每次启动前都有一段完全没有
+	// 信任集的窗口。
+	Cache string `json:"cache"`
+
+	// RefreshIntervalMs 是两次后台取回之间的间隔，毫秒。必须为正——0 在这里
+	// 没有「不限」或「只取一次」的读法。
+	RefreshIntervalMs int `json:"refresh_interval_ms"`
+}
+
+// Enabled 报告这个部署是否配置了远程信任清单。
+func (c PluginTrustlistConfig) Enabled() bool {
+	return strings.TrimSpace(c.URL) != ""
 }
 
 // SignatureRequired reports whether this deployment requires every plugin
@@ -670,6 +706,22 @@ func validatePlugins(cfg PluginsConfig) error {
 		return fmt.Errorf("plugins.fetch.max_bytes is %d; it must be positive, "+
 			"since zero does not mean unlimited here: it is the cap on bytes downloaded from a remote plugin source", cfg.Fetch.MaxBytes)
 	}
+	if cfg.Trustlist.Enabled() {
+		if !strings.HasPrefix(cfg.Trustlist.URL, "https://") {
+			return fmt.Errorf("plugins.trustlist.url is %q; it must be https, since a trustlist carries "+
+				"no digest of its own and plaintext transport lets any intermediary replace it",
+				cfg.Trustlist.URL)
+		}
+		if strings.TrimSpace(cfg.Trustlist.Cache) == "" {
+			return fmt.Errorf("plugins.trustlist.cache is empty while plugins.trustlist.url is %q; "+
+				"a trustlist with nowhere to land means every start has a window with no trust set at all",
+				cfg.Trustlist.URL)
+		}
+		if cfg.Trustlist.RefreshIntervalMs <= 0 {
+			return fmt.Errorf("plugins.trustlist.refresh_interval_ms is %d; it must be positive "+
+				"(zero has no 'never' or 'once' reading here)", cfg.Trustlist.RefreshIntervalMs)
+		}
+	}
 	return nil
 }
 
@@ -789,9 +841,22 @@ func defaultConfig() Config {
 			Fetch:       PluginFetchConfig{TimeoutMs: 30000, MaxBytes: 33554432},
 			Health:      PluginHealthConfig{MaxConsecutiveFaults: 5},
 			ApplyWaitMs: 60000,
+			// Trustlist.URL stays empty on purpose too, same reasoning as
+			// Manifest above: no remote trustlist until an operator names one.
+			// RefreshIntervalMs is defaulted here so that a config which names
+			// a url and a cache but says nothing about the interval still gets
+			// a positive one — encoding/json's struct merge leaves this default
+			// standing whenever the "refresh_interval_ms" key is absent from
+			// the file, and overwrites it only when the key is present.
+			Trustlist: PluginTrustlistConfig{RefreshIntervalMs: defaultTrustlistRefreshMs},
 		},
 	}
 }
+
+// defaultTrustlistRefreshMs 是 plugins.trustlist.refresh_interval_ms 未配置
+// 时使用的默认间隔：6 小时。撤销要多久到达用户机器，由这个值决定；再短就是
+// 在给 GitHub 发无谓的请求，再长会让一次紧急撤销拖太久。
+const defaultTrustlistRefreshMs = 21600000
 
 // applyEnv overlays environment variables onto cfg. It returns an error only
 // for security-relevant keys whose misspelling must not degrade silently into
