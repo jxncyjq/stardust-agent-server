@@ -30,23 +30,43 @@ const (
 	maxRedirects = 10
 )
 
-// sigURL 由清单地址推导签名地址：把路径结尾的 .json 换成 .sig。
+// sigURL 由清单地址推导签名地址：把地址结尾的 .json 换成 .sig。
 //
-// 判据落在解析后的 URL 上，不在地址字符串上：先 url.Parse，再要求 u.Path 以
-// .json 结尾，并单独要求 u.RawQuery、u.ForceQuery、u.Fragment 都表明地址不带
-// query、也不带 fragment。对整串做后缀替换是错的——`…/trustlist.json?fallback=
-// old.json` 整串确实以 .json 结尾，TrimSuffix 砍掉的却是 query 尾巴上的那截，
-// 推导出 `…/trustlist.json?fallback=old.sig` 这样一个既不是清单也不是签名的
-// 地址。推导可以拒绝，但不能沉默地拼错。
+// 推导做在**地址字符串**上：返回值就是 listURL 砍掉结尾那 5 个字符再接上 .sig，
+// 其余每一个字节原样保留。「两个地址只在结尾这一处不同」是这个函数的全部承诺，
+// 别处的任何差异都是拼错。所以这里不做 URL 归一化、也不重新序列化——url.Parse
+// 之后再 String 会改写 scheme 的大小写、会把路径里的转义换成另一种同义写法、会
+// 把非 ASCII 重新编码，每一处单独看都无害，合起来就让那条承诺不再成立。
+//
+// url.Parse 只用来判断，不参与构造。三条判据：
+//
+//  1. u.EscapedPath()（**未解码**的路径）必须以 .json 结尾。拿 u.Path 判是错的
+//     ——它是解码后的，`…/list%2Ejson` 的 u.Path 是 `/list.json`，据此推导会得出
+//     `…/list.sig`，而 `%2E` 与 `.` 在同一台服务器上是两个资源。
+//  2. u.RawQuery、u.ForceQuery、u.Fragment 必须都表明地址不带 query、也不带
+//     fragment。对整串做后缀替换而不看这些是错的——`…/trustlist.json?fallback=
+//     old.json` 整串确实以 .json 结尾，TrimSuffix 砍掉的却是 query 尾巴上的那截，
+//     推导出 `…/trustlist.json?fallback=old.sig` 这样一个既不是清单也不是签名的
+//     地址。推导可以拒绝，但不能沉默地拼错。
+//  3. 地址本身也必须逐字以 .json 结尾。前两条成立而这一条不成立，说的是地址尾部
+//     还挂着 url.Parse 吃掉了的字符：写成一个光杆 # 的空 fragment 就会落到这里
+//     ——它被解析成 Fragment == ""，第 2 条判据看不见它，而第 1 条看的是路径。
+//     没有这一条，构造就会从错误的位置下刀。
 //
 // 因此这里明确拒绝：
 //
-//   - 带 query 或 fragment 的清单地址（包括只写了一个 ? 的空 query）。「那截该
-//     不该跟到签名地址上」是个有安全含义的决定（凭据要不要外发给签名的来源），
-//     本函数不替调用方猜；
-//   - 路径不以 .json 结尾的地址，哪怕路径别处含 .json（如 /a.json.d/list.txt）；
+//   - 带 query 或 fragment 的清单地址，包括只写了一个 ? 的空 query 与只写了一个
+//     # 的空 fragment。「那截该不该跟到签名地址上」是个有安全含义的决定（凭据要
+//     不要外发给签名的来源），本函数不替调用方猜；
+//   - 未解码路径不以 .json 结尾的地址：哪怕路径别处含 .json（如 /a.json.d/list.txt），
+//     也哪怕解码之后才以 .json 结尾（如 /trust/list%2Ejson）；
 //   - 路径以大写 .JSON 结尾的地址。后缀比较区分大小写：URL 路径本来就区分大小
 //     写，同一台服务器上 .json 与 .JSON 是两个资源，猜一个就是猜。
+//
+// userinfo（`https://user:pass@host/…`）原样留在返回值里，与 query 的处理相反。
+// 两者的作用域不同：userinfo 属于 authority，而推导只动路径结尾，签名地址与清单
+// 地址的 authority 逐字相同，凭据去的还是同一个来源；query 属于资源，
+// `?fallback=old.json` 是否也描述签名那份文档，无从判断。
 //
 // 它不校验 scheme，也不要求地址可达——那些在 fetchBytes 里做。
 //
@@ -66,20 +86,25 @@ func sigURL(listURL string) (string, error) {
 	// 而 url.URL.Redacted 只挡 userinfo 里的口令，不挡 query。
 	bare := *u
 	bare.RawQuery, bare.ForceQuery, bare.Fragment, bare.RawFragment = "", false, "", ""
-	if !strings.HasSuffix(u.Path, listSuffix) {
-		return "", fmt.Errorf("trustlist url %s: path %q does not end in %s (the comparison is "+
-			"case-sensitive, so a path ending in .JSON is refused here too); the signature's address is "+
-			"derived from it by replacing that suffix, and guessing is not an option here",
-			bare.Redacted(), u.Path, listSuffix)
+	escaped := u.EscapedPath()
+	if !strings.HasSuffix(escaped, listSuffix) {
+		return "", fmt.Errorf("trustlist url %q: path %q does not end in %s (the comparison is "+
+			"case-sensitive and runs on the undecoded path, so a path ending in .JSON or in %%2Ejson is "+
+			"refused here too); the signature's address is derived from it by replacing that suffix, and "+
+			"guessing is not an option here", bare.Redacted(), escaped, listSuffix)
 	}
 	if u.ForceQuery || u.RawQuery != "" || u.Fragment != "" {
-		return "", fmt.Errorf("trustlist url %s carries a query or a fragment; the signature's address is "+
+		return "", fmt.Errorf("trustlist url %q carries a query or a fragment; the signature's address is "+
 			"derived from the path alone, and whether a query or a fragment belongs on the signature's "+
 			"address is not decidable here — configure a list url without either", bare.Redacted())
 	}
-	u.Path = strings.TrimSuffix(u.Path, listSuffix) + sigSuffix
-	u.RawPath = "" // Path 变了，原来的转义形式不再是它的编码，交给 URL.String 重新转义。
-	return u.String(), nil
+	if !strings.HasSuffix(listURL, listSuffix) {
+		return "", fmt.Errorf("trustlist url %q (shown without query or fragment) has trailing characters "+
+			"that url.Parse drops — a bare %q written as the whole fragment is one way to get here; the "+
+			"signature's address is derived by replacing the address's own trailing %s, so those characters "+
+			"would disappear from it without a trace", bare.Redacted(), "#", listSuffix)
+	}
+	return listURL[:len(listURL)-len(listSuffix)] + sigSuffix, nil
 }
 
 // fetchBytes 取回 rawURL 的响应体，至多 maxBytes 字节——强制的是**调用方传进来

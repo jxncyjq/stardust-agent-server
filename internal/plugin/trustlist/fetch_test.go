@@ -14,9 +14,21 @@ import (
 	"time"
 )
 
+// TestSigURLDerivesFromTheListURL 钉住这个函数的全部承诺：返回的签名地址与清单
+// 地址**只**在结尾那一处不同——砍掉 .json、接上 .sig，其余每一个字节原样保留。
+//
+// 带 %2F、%2E、%20、非 ASCII、+ 的路径都列在这里，因为它们正是「解析一遍再
+// 序列化回去」会被悄悄改写的那些形状：%2F 会被解成真斜杠而多出一层目录，非 ASCII
+// 会被重新百分号编码。每个 want 都手写出来（读的人一眼看得出推导做了什么），再由
+// 循环里那条自检把它与「只换结尾那个后缀」对上——手写的期望值本身写错了，用例
+// 就会先报自己写错了，而不是替一个错的实现背书。
 func TestSigURLDerivesFromTheListURL(t *testing.T) {
 	t.Parallel()
 
+	const (
+		listSuffix = ".json"
+		sigSuffix  = ".sig"
+	)
 	tests := []struct {
 		name string
 		in   string
@@ -26,37 +38,66 @@ func TestSigURLDerivesFromTheListURL(t *testing.T) {
 		// 路径别处含 .json 不影响推导：换掉的必须是结尾那一个。
 		{"路径别处也含 .json", "https://example.com/a.json/b/trustlist.json",
 			"https://example.com/a.json/b/trustlist.sig"},
+		// 段内转义斜杠：%2F 是路径段内的一个字符，不是分隔符。解码之后再序列化
+		// 回去会把它变成真斜杠，路径就多了一层目录——那是另一个资源。
+		{"段内转义斜杠", "https://example.com/a%2Fb/trustlist.json",
+			"https://example.com/a%2Fb/trustlist.sig"},
+		{"转义的普通字符", "https://example.com/tr%75stlist.json", "https://example.com/tr%75stlist.sig"},
+		{"转义的空格", "https://example.com/trust/my%20list.json", "https://example.com/trust/my%20list.sig"},
+		{"未转义的空格", "https://example.com/trust/my list.json", "https://example.com/trust/my list.sig"},
+		// 非 ASCII：逐字写的与百分号编码的都不能被改写成对方。
+		{"逐字非 ASCII", "https://example.com/中/trustlist.json", "https://example.com/中/trustlist.sig"},
+		{"编码后的非 ASCII", "https://example.com/%E4%B8%AD/trustlist.json",
+			"https://example.com/%E4%B8%AD/trustlist.sig"},
+		{"路径里的加号", "https://example.com/a+b/trustlist.json", "https://example.com/a+b/trustlist.sig"},
+		// scheme 与 host 的大小写、端口、userinfo、点段：都不归一化。
+		{"大写 scheme 与 host", "HTTPS://EXAMPLE.COM/Trust/TrustList.json",
+			"HTTPS://EXAMPLE.COM/Trust/TrustList.sig"},
+		{"端口", "https://example.com:8443/trustlist.json", "https://example.com:8443/trustlist.sig"},
+		// userinfo 跟随：它属于 authority，而推导只动路径结尾，签名地址与清单地址
+		// 的 authority 逐字相同——凭据去的还是同一个来源。
+		{"userinfo", "https://user:pass@example.com/trustlist.json",
+			"https://user:pass@example.com/trustlist.sig"},
+		{"IPv6", "https://[::1]:8443/trustlist.json", "https://[::1]:8443/trustlist.sig"},
+		{"点段不归一化", "https://example.com/p/../trustlist.json", "https://example.com/p/../trustlist.sig"},
+		{"整个文件名就是后缀", "https://example.com/.json", "https://example.com/.sig"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
+			if derived := tt.in[:len(tt.in)-len(listSuffix)] + sigSuffix; tt.want != derived {
+				t.Fatalf("用例自己写错了：want %q，而「只换结尾那个后缀」给出的是 %q", tt.want, derived)
+			}
 			got, err := sigURL(tt.in)
 			if err != nil {
 				t.Fatalf("sigURL(%q): %v", tt.in, err)
 			}
 			if got != tt.want {
-				t.Errorf("sigURL(%q) = %q, want %q", tt.in, got, tt.want)
+				t.Errorf("sigURL(%q) = %q, want %q——推导动了结尾那个后缀以外的字节", tt.in, got, tt.want)
 			}
 		})
 	}
 }
 
-// TestSigURLRefusesAnUnexpectedSuffix：清单地址必须**路径**以 .json 结尾且不带
-// query / fragment，否则推导出的签名地址就是猜的。给两个可以各自配置的 URL 才是
-// 真正的危险（两份不匹配的文档），但推导也必须是确定的，不能沉默地拼错。
+// TestSigURLRefusesAnUnexpectedSuffix：清单地址必须**未解码的路径**以 .json 结尾、
+// 地址本身也逐字以 .json 结尾、且不带 query / fragment，否则推导出的签名地址就是
+// 猜的。给两个可以各自配置的 URL 才是真正的危险（两份不匹配的文档），但推导也
+// 必须是确定的，不能沉默地拼错。
 //
-// 这里逐条钉住的正是「沉默地拼错」那条路：对整个地址字符串做后缀替换时，
+// 这里逐条钉住的正是「沉默地拼错」那几条路：对整个地址字符串做后缀替换时，
 // `…/trustlist.json?fallback=old.json` 会被当成合法输入，砍掉的是 query 尾巴上
-// 的 .json，推导出 `…/trustlist.json?fallback=old.sig`——既不是清单也不是签名。
-// 所以每个用例除了「被拒」还断言**拒绝的理由**：理由说错了，下一次编辑就会照着
-// 那句错话把判据改回整串后缀。
+// 的 .json，推导出 `…/trustlist.json?fallback=old.sig`——既不是清单也不是签名；
+// 拿解码后的 u.Path 判后缀时，`…/list%2Ejson` 会被当成清单，推导出 `…/list.sig`
+// ——另一个资源。所以每个用例除了「被拒」还断言**拒绝的理由**：三条判据的理由
+// 互不相同，理由说错了就说明判据挪了位置，而不是只挪了措辞。
 func TestSigURLRefusesAnUnexpectedSuffix(t *testing.T) {
 	t.Parallel()
 
 	const (
-		suffixReason = "does not end in .json"
-		queryReason  = "carries a query or a fragment"
+		suffixReason   = "does not end in .json"
+		queryReason    = "carries a query or a fragment"
+		trailingReason = "trailing characters that url.Parse drops"
 	)
 	tests := []struct {
 		name   string
@@ -69,6 +110,10 @@ func TestSigURLRefusesAnUnexpectedSuffix(t *testing.T) {
 		{"大写 .JSON", "https://example.com/trust/trustlist.JSON", suffixReason},
 		// 路径里别处含 .json、结尾却不是。
 		{"路径别处含 .json", "https://example.com/a.json.d/list.txt", suffixReason},
+		// 判据在**未解码**的路径上：解码后的 u.Path 是 /trust/list.json，据此推导
+		// 会得出 …/list.sig，而 %2E 与 . 在同一台服务器上是两个资源。理由若不是
+		// suffixReason，就说明判据回到了 u.Path。
+		{"解码之后才以 .json 结尾", "https://example.com/trust/list%2Ejson", suffixReason},
 		// 判据在路径上而不在整串上：整串确实以 .json 结尾，路径却不是。理由
 		// 若报成 queryReason，就说明判据又回到了整个字符串。
 		{"只有 query 以 .json 结尾", "https://example.com/x?a=b.json", suffixReason},
@@ -79,6 +124,10 @@ func TestSigURLRefusesAnUnexpectedSuffix(t *testing.T) {
 		{"fragment 也以 .json 结尾", "https://example.com/trustlist.json#a.json", queryReason},
 		// 只写一个问号：RawQuery 是空的，但地址确实带着 query。
 		{"空 query", "https://example.com/trustlist.json?", queryReason},
+		// 只写一个井号：Fragment 是空串，前两条判据都看不见它，而路径判据看的是
+		// 路径。少了第三条判据，推导就会从倒数第 5 个字节下刀，砍掉 `json#` 拼出
+		// `…/trustlist..sig` 这样一个谁也不是的地址。
+		{"空 fragment", "https://example.com/trustlist.json#", trailingReason},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -93,6 +142,54 @@ func TestSigURLRefusesAnUnexpectedSuffix(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tt.reason) {
 				t.Errorf("sigURL(%q) 的拒绝理由不是 %q: %v", tt.in, tt.reason, err)
+			}
+		})
+	}
+}
+
+// TestSigURLKeepsCredentialsOutOfItsErrors：拒绝理由里不得出现 query 与 fragment
+// 的内容，也不得出现 userinfo 里的口令。
+//
+// 凭据最常出现在 query 里（私有仓库的 raw 链接就是 `?token=…`），而 url.URL 的
+// Redacted 只挡 userinfo 里的口令、不挡 query——所以错误里提的必须是**去掉 query
+// 与 fragment 之后**的那份地址。这条规则光写在注释里守不住：把 bare.Redacted()
+// 换回 u.Redacted()（或者顺手改成打印原始的 listURL）不会让任何别的用例变红，
+// 而 `?token=…` 就此进了日志。三条拒绝路径各测一次，因为它们各自格式化一次地址。
+func TestSigURLKeepsCredentialsOutOfItsErrors(t *testing.T) {
+	t.Parallel()
+
+	const (
+		querySecret    = "QUERYSECRET"
+		fragmentSecret = "FRAGMENTSECRET"
+		passwordSecret = "PASSWORDSECRET"
+	)
+	tests := []struct {
+		name    string
+		in      string
+		secrets []string
+	}{
+		// 后缀分支：路径是 /x，不以 .json 结尾。
+		{"后缀分支", "https://user:" + passwordSecret + "@example.com/x?t=" + querySecret +
+			"#" + fragmentSecret, []string{querySecret, fragmentSecret, passwordSecret}},
+		// query / fragment 分支：路径合法，带着 query 与 fragment。
+		{"query 分支", "https://user:" + passwordSecret + "@example.com/trustlist.json?t=" + querySecret +
+			"#" + fragmentSecret, []string{querySecret, fragmentSecret, passwordSecret}},
+		// 尾部字符分支：空 fragment，所以这里只剩 userinfo 的口令可漏。
+		{"尾部字符分支", "https://user:" + passwordSecret + "@example.com/trustlist.json#",
+			[]string{passwordSecret}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := sigURL(tt.in)
+			if err == nil {
+				t.Fatalf("sigURL(%q) 被接受了，推导出 %q", tt.in, got)
+			}
+			for _, secret := range tt.secrets {
+				if strings.Contains(err.Error(), secret) {
+					t.Errorf("拒绝理由里出现了 %s：%v", secret, err)
+				}
 			}
 		})
 	}
