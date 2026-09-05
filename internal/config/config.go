@@ -671,13 +671,53 @@ func Load(ctx context.Context, opts Options) (Config, error) {
 	return cfg, nil
 }
 
-// validatePlugins checks the plugin section's internal consistency. An absent
-// plugins.manifest is the documented "plugins are off" state and needs no
-// other field; a present one makes Root, Limits.TimeoutMs and ApplyWaitMs
-// load-bearing, and each is rejected by name rather than left to fail later as
-// an unbounded HTTP request, an unconfined plugin source, or a convergence
-// that waits forever.
+// validatePlugins checks the plugin section's internal consistency.
+//
+// plugins.trustlist is checked first, and unconditionally: whether this
+// deployment fetches a remote trustlist is a separate question from whether
+// it also loads plugins off a local plugins.manifest, so a configured
+// trustlist is validated even when plugins.manifest is empty. Checking it
+// only when plugins.manifest is also set would let a trustlist section that
+// is wrong in every field at once (plaintext url, no cache, a non-positive
+// refresh interval) through Load, with the failure only surfacing later, on
+// the first background refresh, far from the configuration line that caused
+// it.
+//
+// An absent plugins.manifest is the documented "plugins are off" state for
+// everything below this point and needs no other field; a present one makes
+// Root, Limits.TimeoutMs and ApplyWaitMs load-bearing, and each is rejected by
+// name rather than left to fail later as an unbounded HTTP request, an
+// unconfined plugin source, or a convergence that waits forever.
 func validatePlugins(cfg PluginsConfig) error {
+	if cfg.Trustlist.Enabled() {
+		// Enabled() treats a whitespace-only URL as absent (TrimSpace'd), so a
+		// URL that Enabled() calls present but that still carries leading or
+		// trailing whitespace is rejected here by that name specifically,
+		// rather than falling through to the https check below and being
+		// reported as a scheme problem it does not have. Trimming the value
+		// instead of naming the defect would silently validate a different
+		// string than the one every later reader of cfg.Trustlist.URL
+		// (nothing else in this package normalizes it) actually uses.
+		if trimmed := strings.TrimSpace(cfg.Trustlist.URL); trimmed != cfg.Trustlist.URL {
+			return fmt.Errorf("plugins.trustlist.url (%q) has leading or trailing whitespace; "+
+				"write the address exactly as the trustlist host serves it, with nothing to trim off",
+				cfg.Trustlist.URL)
+		}
+		if !strings.HasPrefix(cfg.Trustlist.URL, "https://") {
+			return fmt.Errorf("plugins.trustlist.url is %q; it must be https, since a trustlist carries "+
+				"no digest of its own and plaintext transport lets any intermediary replace it",
+				cfg.Trustlist.URL)
+		}
+		if strings.TrimSpace(cfg.Trustlist.Cache) == "" {
+			return fmt.Errorf("plugins.trustlist.cache is empty while plugins.trustlist.url is %q; "+
+				"a trustlist with nowhere to land means every start has a window with no trust set at all",
+				cfg.Trustlist.URL)
+		}
+		if cfg.Trustlist.RefreshIntervalMs <= 0 {
+			return fmt.Errorf("plugins.trustlist.refresh_interval_ms is %d; it must be positive "+
+				"(zero has no 'never' or 'once' reading here)", cfg.Trustlist.RefreshIntervalMs)
+		}
+	}
 	if strings.TrimSpace(cfg.Manifest) == "" {
 		return nil
 	}
@@ -705,22 +745,6 @@ func validatePlugins(cfg PluginsConfig) error {
 	if cfg.Fetch.MaxBytes <= 0 {
 		return fmt.Errorf("plugins.fetch.max_bytes is %d; it must be positive, "+
 			"since zero does not mean unlimited here: it is the cap on bytes downloaded from a remote plugin source", cfg.Fetch.MaxBytes)
-	}
-	if cfg.Trustlist.Enabled() {
-		if !strings.HasPrefix(cfg.Trustlist.URL, "https://") {
-			return fmt.Errorf("plugins.trustlist.url is %q; it must be https, since a trustlist carries "+
-				"no digest of its own and plaintext transport lets any intermediary replace it",
-				cfg.Trustlist.URL)
-		}
-		if strings.TrimSpace(cfg.Trustlist.Cache) == "" {
-			return fmt.Errorf("plugins.trustlist.cache is empty while plugins.trustlist.url is %q; "+
-				"a trustlist with nowhere to land means every start has a window with no trust set at all",
-				cfg.Trustlist.URL)
-		}
-		if cfg.Trustlist.RefreshIntervalMs <= 0 {
-			return fmt.Errorf("plugins.trustlist.refresh_interval_ms is %d; it must be positive "+
-				"(zero has no 'never' or 'once' reading here)", cfg.Trustlist.RefreshIntervalMs)
-		}
 	}
 	return nil
 }

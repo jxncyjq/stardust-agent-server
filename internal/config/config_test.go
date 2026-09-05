@@ -1104,6 +1104,16 @@ func TestTrustlistIsDisabledByAnEmptyURL(t *testing.T) {
 	}
 }
 
+// TestTrustlistIsDisabledByAWhitespaceOnlyURL：url 只含空白字符（如 "   "）
+// 时，TrimSpace 之后是空串，与完全没写 url 同义，Enabled() 必须判为未启用。
+// Enabled() 的实现本身早已这样写，这里只是给这条边界补一条独立回归测试。
+func TestTrustlistIsDisabledByAWhitespaceOnlyURL(t *testing.T) {
+	cfg := PluginTrustlistConfig{URL: "   "}
+	if cfg.Enabled() {
+		t.Error("只含空白字符的 url 被当成启用了")
+	}
+}
+
 func TestValidatePluginsChecksTrustlist(t *testing.T) {
 	base := func() PluginsConfig {
 		return PluginsConfig{
@@ -1164,6 +1174,105 @@ func TestValidatePluginsChecksTrustlist(t *testing.T) {
 		cfg.Trustlist = PluginTrustlistConfig{}
 		if err := validatePlugins(cfg); err != nil {
 			t.Errorf("没启用远程清单的配置被拒了：%v", err)
+		}
+	})
+
+	// url 前导空白：Enabled() 用 TrimSpace 后的字符串判「是否启用」，判为已
+	// 启用；但 https 判据历史上判在未 TrimSpace 的原始字符串上，于是错误文案
+	// 会说「必须是 https」而真正的问题是前导空白。这里断言错误确实指名
+	// whitespace，而不是把诊断信息安在 https 头上。
+	t.Run("url 带前导空白", func(t *testing.T) {
+		cfg := base()
+		cfg.Trustlist = PluginTrustlistConfig{
+			URL:               " https://example.com/trust/trustlist.json",
+			Cache:             "trustlist",
+			RefreshIntervalMs: 21600000,
+		}
+		err := validatePlugins(cfg)
+		if err == nil {
+			t.Fatal("带前导空白的 url 被接受了")
+		}
+		if !strings.Contains(err.Error(), "whitespace") {
+			t.Errorf("错误没说是 whitespace 的问题：%v", err)
+		}
+	})
+
+	// url 带尾随空白，覆盖 TrimSpace 判据的另一侧。
+	t.Run("url 带尾随空白", func(t *testing.T) {
+		cfg := base()
+		cfg.Trustlist = PluginTrustlistConfig{
+			URL:               "https://example.com/trust/trustlist.json ",
+			Cache:             "trustlist",
+			RefreshIntervalMs: 21600000,
+		}
+		err := validatePlugins(cfg)
+		if err == nil {
+			t.Fatal("带尾随空白的 url 被接受了")
+		}
+		if !strings.Contains(err.Error(), "whitespace") {
+			t.Errorf("错误没说是 whitespace 的问题：%v", err)
+		}
+	})
+}
+
+// TestValidatePluginsChecksTrustlistEvenWithoutAManifest：plugins.trustlist
+// 说的是「这个部署信任哪些签名钥匙」，与有没有配 plugins.manifest（本地插件
+// 清单）是两件独立的事。validatePlugins 顶部有一条既有早退——manifest 未配
+// 就直接 return nil——这条早退只该管 Root/ApplyWaitMs/Limits/Fetch/Health 这些
+// 从属于本地清单的字段，trustlist 的三条校验必须在它之前就生效，不然一段
+// 只想预热信任缓存、暂不启用本地插件清单的部署，配一段彻底非法的 trustlist
+// （明文 url + 空 cache + refresh_interval_ms 非正）也会 Load 成功——真正的
+// 症状要等到第一次后台刷新才会出现，离配置错误的位置很远。
+//
+// 三种非法各测一条，Manifest 全部留空。
+func TestValidatePluginsChecksTrustlistEvenWithoutAManifest(t *testing.T) {
+	t.Run("http 明文", func(t *testing.T) {
+		cfg := PluginsConfig{
+			Trustlist: PluginTrustlistConfig{
+				URL:               "http://example.com/trust/trustlist.json",
+				Cache:             "trustlist",
+				RefreshIntervalMs: 21600000,
+			},
+		}
+		err := validatePlugins(cfg)
+		if err == nil {
+			t.Fatal("manifest 为空时，http:// 的 trustlist url 被接受了")
+		}
+		if !strings.Contains(err.Error(), "https") {
+			t.Errorf("错误没说是 scheme 的问题：%v", err)
+		}
+	})
+
+	t.Run("cache 为空", func(t *testing.T) {
+		cfg := PluginsConfig{
+			Trustlist: PluginTrustlistConfig{
+				URL:               "https://example.com/trust/trustlist.json",
+				RefreshIntervalMs: 21600000,
+			},
+		}
+		err := validatePlugins(cfg)
+		if err == nil {
+			t.Fatal("manifest 为空时，没有落点的 trustlist 被接受了")
+		}
+		if !strings.Contains(err.Error(), "cache") {
+			t.Errorf("错误没说是 cache 的问题：%v", err)
+		}
+	})
+
+	t.Run("refresh_interval_ms 非正", func(t *testing.T) {
+		cfg := PluginsConfig{
+			Trustlist: PluginTrustlistConfig{
+				URL:               "https://example.com/trust/trustlist.json",
+				Cache:             "trustlist",
+				RefreshIntervalMs: 0,
+			},
+		}
+		err := validatePlugins(cfg)
+		if err == nil {
+			t.Fatal("manifest 为空时，refresh_interval_ms=0 的 trustlist 被接受了")
+		}
+		if !strings.Contains(err.Error(), "refresh_interval_ms") {
+			t.Errorf("错误没说是 refresh_interval_ms 的问题：%v", err)
 		}
 	})
 }
