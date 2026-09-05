@@ -5372,6 +5372,20 @@ func (c *capturedLogs) find(msg string) (capturedRecord, bool) {
 	return capturedRecord{}, false
 }
 
+// count returns how many records carry the given message, so a test can watch
+// a repeating line stop repeating rather than only watch it appear once.
+func (c *capturedLogs) count(msg string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, rec := range c.records {
+		if rec.msg == msg {
+			n++
+		}
+	}
+	return n
+}
+
 // messages returns every message logged so far, so a failure report says what
 // DID happen rather than only what did not.
 func (c *capturedLogs) messages() []string {
@@ -5403,10 +5417,9 @@ func awaitLog(t *testing.T, logs *capturedLogs, msg string) capturedRecord {
 
 // refresherFunc drives runTrustlistRefreshLoop from a test.
 //
-// The loop's SUCCESS branch is unreachable through a real trustlist.Store from
-// this package: the Store accepts a list only if it carries a signature the
-// embedded root public key verifies, and the only entry point that replaces
-// that root lives in the trustlist package's own test files.
+// A real trustlist.Store cannot produce a successful round here: it adopts a
+// list only if the list carries a signature its embedded root public key
+// verifies, and this test holds no trustlist root private key to make one with.
 type refresherFunc func(context.Context) (trustlist.Trust, error)
 
 func (f refresherFunc) Refresh(ctx context.Context) (trustlist.Trust, error) { return f(ctx) }
@@ -5508,6 +5521,26 @@ func TestResolveTrustlistFailsLoudOnANonPositiveInterval(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "refresh_interval_ms") {
 		t.Errorf("error = %v, want it to name the field", err)
+	}
+}
+
+// TestResolveTrustlistFailsLoudOnAnEmptyCacheDir: a url with nowhere to land is
+// the third way a configured trustlist fails to build, and it is a state a
+// config can actually be in -- PluginTrustlistConfig.Enabled() reads the url
+// alone, so a url with an empty cache is "configured" and reaches NewStore.
+func TestResolveTrustlistFailsLoudOnAnEmptyCacheDir(t *testing.T) {
+	_, _, err := resolvePluginTrustlist(config.PluginsConfig{
+		Trustlist: config.PluginTrustlistConfig{
+			URL:               "https://example.com/trust/trustlist.json",
+			RefreshIntervalMs: 1000,
+		},
+	})
+	if err == nil {
+		t.Fatal("a trustlist configured with nowhere to land was accepted silently: every start would " +
+			"have a window with no trust set at all, and no line would say so")
+	}
+	if !strings.Contains(err.Error(), "trustlist") {
+		t.Errorf("error = %v, want it to name the configuration section", err)
 	}
 }
 
@@ -5618,6 +5651,15 @@ func TestRefreshLoopRaisesTheLevelForARefusedList(t *testing.T) {
 				t.Error("a refused list was ALSO logged as an ordinary failed refresh, which puts it " +
 					"back among the timeouts it was separated from")
 			}
+			// The same note the Warn line carries. A refused round reports
+			// still_* out of the state it STARTED from, exactly as the Warn
+			// line does, so an operator reading the loud line needs the same
+			// warning against reading still_* as a picture of the disk now.
+			if rec.attrs["reported_state"] == "" {
+				t.Error("the refusal line does not say that still_* is the state this round STARTED " +
+					"from, while the Warn line does; the louder of the two lines is the one an " +
+					"operator acts on, and it is the one left to be misread")
+			}
 		})
 	}
 }
@@ -5675,14 +5717,128 @@ func TestRefreshLoopDoesNotReportShutdownAsAFailedRefresh(t *testing.T) {
 	}
 }
 
+// TestRefreshLoopReportsARefusalThatCoincidesWithShutdown: a refusal is
+// classified before a stop is, and one round can satisfy both branches at once.
+//
+// A machine whose trustlist cache is damaged raises trustlist.ErrUntrustedList
+// on every round, the one still in flight when serve stops included -- and that
+// round's ctx is already cancelled. Whichever branch is examined first takes the
+// line. Examine the stop first and a real refusal is filed as a clean shutdown
+// at Info: the loudest event this loop can report disappears into the quietest.
+func TestRefreshLoopReportsARefusalThatCoincidesWithShutdown(t *testing.T) {
+	logs := &capturedLogs{}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		runTrustlistRefreshLoop(ctx, refresherFunc(func(context.Context) (trustlist.Trust, error) {
+			return trustlist.Trust{Status: trustlist.StatusUnavailable},
+				fmt.Errorf("trustlist cache is unusable: %w", trustlist.ErrUntrustedList)
+		}), time.Hour, slog.New(logs))
+	}()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the refresh loop did not return on an already-cancelled context")
+	}
+
+	// The loop has returned, so nothing further will be logged and find() sees
+	// the whole round rather than a moment of it.
+	rec, ok := logs.find(trustlistRefusedMsg)
+	if !ok {
+		t.Fatalf("a round that returned ErrUntrustedList while its context was cancelled logged no %q "+
+			"line; logged instead: %v", trustlistRefusedMsg, logs.messages())
+	}
+	if rec.level != slog.LevelError {
+		t.Errorf("level = %v, want Error: a refused list does not become routine by arriving during a "+
+			"stop", rec.level)
+	}
+	if stopped, found := logs.find(trustlistRefreshStoppedMsg); found {
+		t.Errorf("the same round also logged %q at %v; a stop that coincides with a refused list must "+
+			"not report the refusal as an ordinary shutdown", stopped.msg, stopped.level)
+	}
+}
+
+// TestRefreshLoopDoesNotBlameThePublisherForADamagedCache: the loud line must
+// not send whoever is paged by it to a part of the system that had no part in
+// the failure.
+//
+// trustlist.ErrUntrustedList is raised for a CACHED list that fails
+// verification exactly as it is for a served one, and the cache is examined
+// before anything is fetched -- so this round produces the Error line without a
+// byte leaving the machine. Wording that asserts a fetch is then false twice
+// over: nothing was fetched, and "this machine keeps the one it had" is
+// contradicted by still_status on the same line.
+//
+// The store here is a real one over a seeded, damaged cache rather than a stub,
+// because the point of the finding is that this classification is reachable
+// without a network at all.
+func TestRefreshLoopDoesNotBlameThePublisherForADamagedCache(t *testing.T) {
+	cacheDir := t.TempDir()
+	for name, body := range map[string]string{
+		"trustlist.json": "{}",
+		"trustlist.sig":  "this is not a signature",
+	} {
+		if err := os.WriteFile(filepath.Join(cacheDir, name), []byte(body), 0o600); err != nil {
+			t.Fatalf("seed cache %s: %v", name, err)
+		}
+	}
+	store, _, err := resolvePluginTrustlist(config.PluginsConfig{
+		Trustlist: config.PluginTrustlistConfig{
+			URL:               trustlistNeverFetchedURL,
+			Cache:             cacheDir,
+			RefreshIntervalMs: 3_600_000,
+		},
+	})
+	if err != nil {
+		t.Fatalf("resolvePluginTrustlist: %v", err)
+	}
+	logs := &capturedLogs{}
+	runLoopInBackground(t, store, time.Hour, logs)
+
+	rec := awaitLog(t, logs, trustlistRefusedMsg)
+	if rec.level != slog.LevelError {
+		t.Errorf("level = %v, want Error: an unusable cache is not a timeout either", rec.level)
+	}
+	if strings.Contains(rec.msg, "fetched") {
+		t.Errorf("message = %q for a round that never left this machine; it asserts a fetch that did "+
+			"not happen and points the reader at the publisher and the path in between, while what is "+
+			"broken is one file on this host", rec.msg)
+	}
+	if got := rec.attrs["still_status"]; got != "unavailable" {
+		t.Errorf("still_status = %q, want unavailable: a damaged cache leaves this machine nothing to "+
+			"trust", got)
+	}
+	if c := rec.attrs["consequence"]; strings.Contains(c, "keeps the one it had") {
+		t.Errorf("consequence = %q while still_status on the same line is %q; the line promises a list "+
+			"this machine does not have", c, rec.attrs["still_status"])
+	}
+	remedy := rec.attrs["remedy"]
+	cacheAt, urlAt := strings.Index(remedy, "cache"), strings.Index(remedy, "url")
+	if cacheAt < 0 || urlAt < 0 || cacheAt > urlAt {
+		t.Errorf("remedy = %q; it has to name this machine's cache before the url, because a refusal "+
+			"the url had no part in is the one an operator is least likely to look for there", remedy)
+	}
+}
+
 // trustlistServeConfig writes the smallest agent.json that configures a remote
-// trustlist at listURL and returns its path.
+// trustlist at listURL and returns its path. The interval is an hour, long
+// enough that only the round at startup happens while a test runs.
 func trustlistServeConfig(t *testing.T, listURL, cacheDir string) string {
 	t.Helper()
 
+	return trustlistServeConfigEvery(t, listURL, cacheDir, 3_600_000)
+}
+
+// trustlistServeConfigEvery is trustlistServeConfig with the refresh interval
+// spelled out, for a test that has to watch round after round go by.
+func trustlistServeConfigEvery(t *testing.T, listURL, cacheDir string, intervalMs int) string {
+	t.Helper()
+
 	return hardeningConfig(t, fmt.Sprintf(
-		`, "plugins": {"trustlist": {"url": %s, "cache": %s, "refresh_interval_ms": 3600000}}`,
-		jsonString(listURL), jsonString(cacheDir)))
+		`, "plugins": {"trustlist": {"url": %s, "cache": %s, "refresh_interval_ms": %d}}`,
+		jsonString(listURL), jsonString(cacheDir), intervalMs))
 }
 
 // trustlistNeverFetchedURL names a host under .invalid, the reserved top-level
@@ -5717,13 +5873,20 @@ func TestServeRefusesToStartOnATrustlistItCannotBuild(t *testing.T) {
 	}
 }
 
-// TestServeStartsTheTrustlistRefreshLoop pins the SECOND half: the loop is
-// actually started. Deleting the `go runTrustlistRefreshLoop(...)` line makes
-// this test fail and no other, which is the reason it exists.
+// TestServeStartsTheTrustlistRefreshLoop pins the SECOND half: assembly does
+// not merely build the Store, it starts the loop that refreshes through it. A
+// logged round is what makes the difference observable -- a Store nobody
+// refreshes through and a Store refreshed every hour look identical from
+// outside until one of them says so.
 //
-// It touches no network. The cache is seeded with a list and no signature,
-// which Store.Refresh classifies as a damaged cache and refuses to refresh
-// over, reporting the round as failed BEFORE it fetches anything.
+// The cache is seeded with a list and no signature, which Store.Refresh
+// classifies as a damaged cache and refuses to refresh over, so the round is
+// reported as failed BEFORE anything is fetched. That seeding is what keeps the
+// round off the network; the assertion does not rest on it, because the address
+// is one that never resolves and a round that did reach the fetch would report
+// the same failure. Should the seeded shape ever stop being classified as
+// damaged, this test would quietly begin resolving a name -- an unresolvable
+// one, which is why the address is chosen the way it is.
 func TestServeStartsTheTrustlistRefreshLoop(t *testing.T) {
 	cacheDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(cacheDir, "trustlist.json"), []byte("{}"), 0o600); err != nil {
@@ -5809,5 +5972,62 @@ func TestServeDoesNotWaitForTheFirstTrustlistFetch(t *testing.T) {
 	if waited := time.Since(started); waited > 10*time.Second {
 		t.Errorf("BuildServeService took %s with an unanswering trustlist host: the first fetch is being "+
 			"awaited, so an agent cannot start while the trustlist host is unreachable", waited)
+	}
+}
+
+// TestServeStopsTheTrustlistRefreshLoopWithItsContext pins the THIRD half of
+// the wiring: the loop assembly starts is given serve's own ctx.
+//
+// "The loop ends when the ctx it was handed ends" is a property of the loop
+// alone, and it is not this one: a loop handed a context that never ends
+// satisfies it perfectly and still outlives every serve on the machine, one
+// leaked goroutine and one leaked ticker per start. Which context serve hands
+// over is only visible from out here, by watching rounds stop happening.
+//
+// The interval is 50ms so several rounds land inside a test, and the cache is
+// seeded damaged so each round fails before it fetches -- the rounds are being
+// counted, not judged.
+func TestServeStopsTheTrustlistRefreshLoopWithItsContext(t *testing.T) {
+	cacheDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cacheDir, "trustlist.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+	logs := &capturedLogs{}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	result, err := BuildServeService(ctx, ServeOptions{
+		ConfigPath: trustlistServeConfigEvery(t, trustlistNeverFetchedURL, cacheDir, 50),
+		Addr:       "127.0.0.1:0",
+		Logger:     slog.New(logs),
+	})
+	if err != nil {
+		t.Fatalf("BuildServeService: %v", err)
+	}
+	t.Cleanup(result.Close)
+
+	// Wait until the loop is demonstrably ticking. Without this, a flat count
+	// after the cancel would also be what a loop that never started looks like.
+	deadline := time.Now().Add(30 * time.Second)
+	for logs.count(trustlistRefreshFailedMsg) < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("the loop logged %d round(s) in 30s at a 50ms interval; it is not ticking, so this "+
+				"test cannot tell a loop that stopped from one that never ran",
+				logs.count(trustlistRefreshFailedMsg))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	cancel()
+
+	// One second for the round that was already in flight to land, then a
+	// second window of the same length: twenty intervals, in which a loop still
+	// running would log about twenty more times.
+	time.Sleep(time.Second)
+	settled := logs.count(trustlistRefreshFailedMsg)
+	time.Sleep(time.Second)
+	if grew := logs.count(trustlistRefreshFailedMsg); grew != settled {
+		t.Errorf("the loop logged %d further round(s) a second after serve's context ended (%d -> %d); "+
+			"it is not running on serve's context, so it outlives the serve that started it",
+			grew-settled, settled, grew)
 	}
 }
