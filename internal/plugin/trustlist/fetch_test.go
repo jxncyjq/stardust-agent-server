@@ -17,23 +17,84 @@ import (
 func TestSigURLDerivesFromTheListURL(t *testing.T) {
 	t.Parallel()
 
-	got, err := sigURL("https://example.com/trust/trustlist.json")
-	if err != nil {
-		t.Fatalf("sigURL: %v", err)
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"寻常清单地址", "https://example.com/trust/trustlist.json", "https://example.com/trust/trustlist.sig"},
+		// 路径别处含 .json 不影响推导：换掉的必须是结尾那一个。
+		{"路径别处也含 .json", "https://example.com/a.json/b/trustlist.json",
+			"https://example.com/a.json/b/trustlist.sig"},
 	}
-	if want := "https://example.com/trust/trustlist.sig"; got != want {
-		t.Errorf("sigURL = %q, want %q", got, want)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := sigURL(tt.in)
+			if err != nil {
+				t.Fatalf("sigURL(%q): %v", tt.in, err)
+			}
+			if got != tt.want {
+				t.Errorf("sigURL(%q) = %q, want %q", tt.in, got, tt.want)
+			}
+		})
 	}
 }
 
-// TestSigURLRefusesAnUnexpectedSuffix：清单地址必须以 .json 结尾，否则推导出的
-// 签名地址就是猜的。给两个可以各自配置的 URL 才是真正的危险（两份不匹配的
-// 文档），但推导也必须是确定的，不能沉默地拼错。
+// TestSigURLRefusesAnUnexpectedSuffix：清单地址必须**路径**以 .json 结尾且不带
+// query / fragment，否则推导出的签名地址就是猜的。给两个可以各自配置的 URL 才是
+// 真正的危险（两份不匹配的文档），但推导也必须是确定的，不能沉默地拼错。
+//
+// 这里逐条钉住的正是「沉默地拼错」那条路：对整个地址字符串做后缀替换时，
+// `…/trustlist.json?fallback=old.json` 会被当成合法输入，砍掉的是 query 尾巴上
+// 的 .json，推导出 `…/trustlist.json?fallback=old.sig`——既不是清单也不是签名。
+// 所以每个用例除了「被拒」还断言**拒绝的理由**：理由说错了，下一次编辑就会照着
+// 那句错话把判据改回整串后缀。
 func TestSigURLRefusesAnUnexpectedSuffix(t *testing.T) {
 	t.Parallel()
 
-	if _, err := sigURL("https://example.com/trust/trustlist"); err == nil {
-		t.Fatal("不以 .json 结尾的清单地址被接受了")
+	const (
+		suffixReason = "does not end in .json"
+		queryReason  = "carries a query or a fragment"
+	)
+	tests := []struct {
+		name   string
+		in     string
+		reason string
+	}{
+		{"没有后缀", "https://example.com/trust/trustlist", suffixReason},
+		{"后缀之后还有斜杠", "https://example.com/trustlist.json/", suffixReason},
+		// 大小写：URL 路径区分大小写，同一台服务器上 .json 与 .JSON 是两个资源。
+		{"大写 .JSON", "https://example.com/trust/trustlist.JSON", suffixReason},
+		// 路径里别处含 .json、结尾却不是。
+		{"路径别处含 .json", "https://example.com/a.json.d/list.txt", suffixReason},
+		// 判据在路径上而不在整串上：整串确实以 .json 结尾，路径却不是。理由
+		// 若报成 queryReason，就说明判据又回到了整个字符串。
+		{"只有 query 以 .json 结尾", "https://example.com/x?a=b.json", suffixReason},
+		{"带 query", "https://example.com/trust/trustlist.json?token=abc", queryReason},
+		// 复审探针抓到的那一条：整串后缀替换会推导出 …?fallback=old.sig。
+		{"query 也以 .json 结尾", "https://example.com/trustlist.json?fallback=old.json", queryReason},
+		{"带 fragment", "https://example.com/trust/trustlist.json#frag", queryReason},
+		{"fragment 也以 .json 结尾", "https://example.com/trustlist.json#a.json", queryReason},
+		// 只写一个问号：RawQuery 是空的，但地址确实带着 query。
+		{"空 query", "https://example.com/trustlist.json?", queryReason},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := sigURL(tt.in)
+			if err == nil {
+				t.Fatalf("sigURL(%q) 被接受了，推导出 %q", tt.in, got)
+			}
+			if got != "" {
+				t.Errorf("sigURL(%q) 出错时还返回了 %q", tt.in, got)
+			}
+			if !strings.Contains(err.Error(), tt.reason) {
+				t.Errorf("sigURL(%q) 的拒绝理由不是 %q: %v", tt.in, tt.reason, err)
+			}
+		})
 	}
 }
 
@@ -263,6 +324,33 @@ func TestFetchRefusesANonPositiveMaxBytes(t *testing.T) {
 		// 伪装成了「对端发来的文档太大」，而这正是本函数从头到尾在防的那件事。
 		if !strings.Contains(err.Error(), "must be positive") {
 			t.Errorf("maxBytes=%d 的错误说的不是这个参数本身: %v", maxBytes, err)
+		}
+	}
+}
+
+// TestFetchRefusesANonPositiveTimeout：0 在这里不是「不限时」。把超时抽成参数
+// 之后，非正的 timeout 会让 WithTimeout 造出一个一出生就过期的 context，请求照
+// 样发出去，报回来的是 context deadline exceeded——一个越界的调用参数伪装成
+// 「对端太慢」，与 maxBytes<=0 那条是同一类错误，守卫也必须对称。
+func TestFetchRefusesANonPositiveTimeout(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("{}"))
+	}))
+	defer srv.Close()
+
+	for _, timeout := range []time.Duration{0, -time.Second} {
+		_, err := fetchBytesWithTimeout(context.Background(), srv.Client(), srv.URL, maxListBytes, timeout)
+		if err == nil {
+			t.Errorf("timeout=%s 被接受了", timeout)
+			continue
+		}
+		if !strings.Contains(err.Error(), "must be positive") {
+			t.Errorf("timeout=%s 的错误说的不是这个参数本身: %v", timeout, err)
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("timeout=%s 的参数错误伪装成了取回超时: %v", timeout, err)
 		}
 	}
 }
