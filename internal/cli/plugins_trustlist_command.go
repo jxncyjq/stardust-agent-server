@@ -63,7 +63,7 @@ func newTrustlistSignCommand(out io.Writer) *cobra.Command {
 			"before it is written.",
 		Args: cobra.NoArgs,
 		RunE: func(_ *cobra.Command, _ []string) error {
-			return runTrustlistSign(out, inPath, keyPath, outPath)
+			return runTrustlistSign(out, trustlist.VerifyDocument, inPath, keyPath, outPath)
 		},
 	}
 	cmd.Flags().StringVar(&inPath, "in", "", "the trustlist document to sign")
@@ -94,20 +94,36 @@ func newTrustlistSignCommand(out io.Writer) *cobra.Command {
 // it; anywhere else it surfaces as trustlist.ErrUntrustedList — "trustlist is
 // not trusted" — which points in an entirely wrong direction.
 //
-// The check runs through trustlist.VerifyDocument, against the embedded root
-// public key: the same function, and the same trust set, that
-// trustlist.Store applies to a list it fetches or reads back from its cache,
-// rather than a second verification path assembled here that could drift from
-// it. It therefore also refuses a key that is well formed and self-consistent
-// but simply is not the root key — the signature such a key makes is one no
-// verifier will accept.
+// The check runs through verify, whose contract is the one
+// trustlist.VerifyDocument holds to: check the signature against the embedded
+// root public key — the same trust set trustlist.Store applies to a list it
+// fetches or reads back from its cache, rather than a second verification
+// path assembled here that could drift from it. A verify that holds to that
+// contract therefore also refuses a key that is well formed and
+// self-consistent but simply is not the root key — the signature such a key
+// makes is one no verifier will accept.
+//
+// verify is a parameter rather than a fixed call because this package cannot
+// produce a signature the embedded root accepts: the root private key does
+// not live in the repository, by design, and a step that can never be run
+// through is a step whose success path nothing can check. Whatever is passed
+// must verify against the embedded root and nothing else; a verify that
+// accepts more than that turns every check documented above into a formality.
 //
 // NOTHING IS WRITTEN unless every step above passed. The signature goes out
 // through writeFileAtomically so that an interrupted write cannot leave a
 // truncated document where a good signature used to be; re-signing a
 // trustlist (a new serial supersedes the old one) is a normal operation, so
 // an existing file at --out is replaced.
-func runTrustlistSign(out io.Writer, inPath, keyPath, outPath string) error {
+func runTrustlistSign(
+	out io.Writer,
+	verify func(listData, sigData []byte) (trustlist.Document, error),
+	inPath, keyPath, outPath string,
+) error {
+	if verify == nil {
+		return errors.New("plugins trustlist sign: no verification step was supplied; signing without " +
+			"one would write a signature nothing has checked")
+	}
 	listPath := strings.TrimSpace(inPath)
 	privatePath := strings.TrimSpace(keyPath)
 	signaturePath := strings.TrimSpace(outPath)
@@ -149,7 +165,7 @@ func runTrustlistSign(out io.Writer, inPath, keyPath, outPath string) error {
 	if err != nil {
 		return fmt.Errorf("plugins trustlist sign: %w", err)
 	}
-	if _, err := trustlist.VerifyDocument(listData, sigData); err != nil {
+	if _, err := verify(listData, sigData); err != nil {
 		return fmt.Errorf("plugins trustlist sign: the signature this command just produced does not "+
 			"verify against the embedded root public key, so it was NOT written. Either --key is not "+
 			"the root key, or its two halves disagree (an Ed25519 private key is a seed followed by "+
@@ -193,6 +209,9 @@ func newTrustlistRefreshCommand(out io.Writer) *cobra.Command {
 			// bare error answers only the first and sends them to run show to
 			// learn the second.
 			printErr := printTrust(out, trust)
+			if printErr != nil {
+				printErr = fmt.Errorf("plugins trustlist refresh: %w", printErr)
+			}
 			if refreshErr != nil {
 				return errors.Join(fmt.Errorf("plugins trustlist refresh: %w", refreshErr), printErr)
 			}
@@ -237,7 +256,7 @@ func newTrustlistShowCommand(out io.Writer) *cobra.Command {
 			}
 			trust, readErr := store.Current()
 			if err := printTrust(out, trust); err != nil {
-				return err
+				return fmt.Errorf("plugins trustlist show: %w", err)
 			}
 			if readErr != nil {
 				if _, err := fmt.Fprintf(out, "note: %v\n", readErr); err != nil {
@@ -252,12 +271,13 @@ func newTrustlistShowCommand(out io.Writer) *cobra.Command {
 	return cmd
 }
 
-// printTrust renders one trustlist.Trust, and is shared by refresh and show
-// rather than duplicated in each.
+// printTrust renders one trustlist.Trust.
 //
-// The two commands report the same thing — what this machine trusts — and
-// saying it in two formats would leave an operator believing they are looking
-// at two different things.
+// It is meant to be the only rendering of a Trust in this package. Reporting
+// the same thing — what this machine trusts — in two formats would leave an
+// operator believing they are looking at two different things, so anything
+// that needs to report a Trust must render it here rather than grow a second
+// format of its own.
 func printTrust(out io.Writer, trust trustlist.Trust) error {
 	if _, err := fmt.Fprintf(out, "status: %s\n", trust.Status); err != nil {
 		return fmt.Errorf("write trustlist status: %w", err)
