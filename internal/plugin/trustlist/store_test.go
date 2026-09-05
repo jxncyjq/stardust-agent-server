@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -730,5 +731,250 @@ func TestRefreshReportsAWriteThatPublishedButFailedToUnlock(t *testing.T) {
 	}
 	if cached.Serial != 9 {
 		t.Errorf("磁盘上的 Serial = %d, want 9", cached.Serial)
+	}
+}
+
+// TestRefreshRejectsAListSignedByAnUnknownKey 守的是「取回这条路径确实走了
+// VerifyDocument」这条接线本身。
+//
+// 这份清单形状完全合法、serial 完全正常，只有签名是另一把私钥做的。少了这条
+// 用例，把取回路径上的 VerifyDocument 换成 ParseDocument 不会让本包任何测试变红：
+// 一份陌生私钥签的清单会被收下、装配成 StatusFresh，还会落盘顶掉本机的缓存。
+// document_test.go 考的是 VerifyDocument 自己，cache_test.go 的
+// TestCorruptCacheIsNeverSilentlyRepaired 考的是读缓存那条路径——两者都不经过
+// 取回这一条。
+func TestRefreshRejectsAListSignedByAnUnknownKey(t *testing.T) {
+	signer := newSigner(t)
+	list, _ := signer(7, nil)
+	// 陌生私钥：它不在 root 信任集里，冒用 root 的 key_id 也验不过。
+	_, impostor, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	forged, err := sign.Sign(impostor, "test-root", list)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	forgedSig, err := sign.MarshalSignature(forged)
+	if err != nil {
+		t.Fatalf("MarshalSignature: %v", err)
+	}
+
+	cur := newServeList(list, forgedSig)
+	srv := newListServer(t, cur)
+	cacheDir := t.TempDir()
+	store := newTestStore(t, srv, cacheDir, fixedNow)
+
+	trust, err := store.Refresh(context.Background())
+	if err == nil {
+		t.Fatal("一份陌生私钥签的清单被 Refresh 收下了")
+	}
+	if !errors.Is(err, ErrUntrustedList) {
+		t.Errorf("错误没裹 ErrUntrustedList：%v", err)
+	}
+	if trust.Status != StatusUnavailable {
+		t.Errorf("Status = %v, want StatusUnavailable", trust.Status)
+	}
+	if trust.Keyring != nil {
+		t.Error("被拒的清单却带回了一个非 nil 的 Keyring")
+	}
+	// 它也不能落盘：验签不过的清单一旦写进缓存，下一次读缓存要么把它当成可信的，
+	// 要么把整个缓存报成损坏——两个后果都不可接受。
+	if _, err := os.Stat(filepath.Join(cacheDir, listFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("被拒的清单被写进了缓存：stat %s = %v", listFileName, err)
+	}
+}
+
+// TestRefreshRefusesAnOversizedSignature 守的是「签名文档用的是 maxSigBytes」。
+//
+// 4 KiB 是签名文档唯一的内存/带宽防线，而清单那道是 1 MiB——差 256 倍。断言必须
+// 落在**错误的种类**上（错误里得有 4096 这道上限）：只断言「失败了」是不够的，
+// 把上限换成 maxListBytes 之后这 8 KiB 照样会失败，只是失败在后面的
+// sign.ParseSignature 那一步，用例会照绿。
+func TestRefreshRefusesAnOversizedSignature(t *testing.T) {
+	signer := newSigner(t)
+	list, _ := signer(7, nil)
+	cur := newServeList(list, bytes.Repeat([]byte("a"), 8<<10))
+	srv := newListServer(t, cur)
+	store := newTestStore(t, srv, t.TempDir(), fixedNow)
+
+	trust, err := store.Refresh(context.Background())
+	if err == nil {
+		t.Fatal("一份 8 KiB 的签名文档被收下了")
+	}
+	if want := "body exceeds 4096 bytes"; !strings.Contains(err.Error(), want) {
+		t.Errorf("错误里没有那道签名上限（%q）——取签名文档用的不是 maxSigBytes：%v", want, err)
+	}
+	if trust.Status != StatusUnavailable {
+		t.Errorf("Status = %v, want StatusUnavailable", trust.Status)
+	}
+}
+
+// TestRefreshDoesNotHoldTheListToTheSignatureLimit 是上一条的另一半：清单那道
+// 上限是 1 MiB，不是签名那 4 KiB。
+//
+// 两条取回只差一个参数，写反了不会有任何编译错误。一份登记了足够多发布者的清单
+// 会超过 4 KiB，所以这里端上 8 KiB 的清单：它必须走到验签才被拒，不能在体积那
+// 一关就被拦下。
+func TestRefreshDoesNotHoldTheListToTheSignatureLimit(t *testing.T) {
+	signer := newSigner(t)
+	_, sig := signer(7, nil)
+	cur := newServeList(bytes.Repeat([]byte("a"), 8<<10), sig)
+	srv := newListServer(t, cur)
+	store := newTestStore(t, srv, t.TempDir(), fixedNow)
+
+	_, err := store.Refresh(context.Background())
+	if err == nil {
+		t.Fatal("一份签名对不上的清单被收下了")
+	}
+	if !errors.Is(err, ErrUntrustedList) {
+		t.Errorf("8 KiB 的清单没走到验签就被拒了——取清单用的不是 maxListBytes：%v", err)
+	}
+	if strings.Contains(err.Error(), "body exceeds") {
+		t.Errorf("8 KiB 的清单被体积上限拦下了：%v", err)
+	}
+}
+
+// TestRefreshHonoursACancelledContext 守的是「ctx 一路传到取回」。
+//
+// 换成 context.Background() 不会有任何编译错误，后果是 Refresh 不再可取消：
+// 调用方的超时与关停信号都拦不住一次已经开始的取回。
+func TestRefreshHonoursACancelledContext(t *testing.T) {
+	signer := newSigner(t)
+	list, sig := signer(7, nil)
+	cur := newServeList(list, sig)
+	srv := newListServer(t, cur)
+	store := newTestStore(t, srv, t.TempDir(), fixedNow)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	trust, err := store.Refresh(ctx)
+	if err == nil {
+		t.Fatal("ctx 已经取消，Refresh 却照样取回并成功了")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("错误链里没有 context.Canceled：%v", err)
+	}
+	if trust.Status != StatusUnavailable {
+		t.Errorf("Status = %v, want StatusUnavailable", trust.Status)
+	}
+}
+
+// seedCacheThatCannotBeAssembled 把缓存目录置成「读得回来、却装不出信任集」：
+// 清单与签名都合法（cache.read 成功），而磁盘上那份撤销累积集撤掉了清单里唯一
+// 那把钥匙，于是 assemble 失败——sign.ParseKeyring 对「每把钥匙都被撤销」是硬拒的。
+//
+// Refresh 里的 fallbackErr 就是这一次 assemble 的错误，所以这个形态是下面两条
+// 用例的共同前提。
+func seedCacheThatCannotBeAssembled(t *testing.T, store *Store, cacheDir string) {
+	t.Helper()
+	if _, err := store.Refresh(context.Background()); err != nil {
+		t.Fatalf("填缓存的那次 Refresh: %v", err)
+	}
+	allRevoked := []byte(`{"revoked":[{"key_id":"dev-abc","revoked_at":"2026-08-29T10:00:00Z",` +
+		`"reason":"清单里唯一那把钥匙也被撤销了"}]}`)
+	if err := os.WriteFile(filepath.Join(cacheDir, revokedFileName), allRevoked, 0o600); err != nil {
+		t.Fatalf("seed %s: %v", revokedFileName, err)
+	}
+	// 夹具自检：这个状态必须是「读得回来、装不出来」，否则下面两条考的就不是它们
+	// 要考的东西。
+	if _, err := store.Current(); err == nil {
+		t.Fatal("夹具没造出预期状态：缓存居然还装得出信任集")
+	}
+}
+
+// TestRefreshCarriesTheCacheAssemblyFailureAlongsideTheFetchError 守的是
+// 「fallbackErr 跟着每一次失败一起交回去」。
+//
+// 缓存那份装不出信任集，这次又没拉到：调用方拿到的是一个 unavailable。只交回
+// 网络错误的话，它看到的就是「拉取失败」加一个说不清为什么是空的状态——而真正
+// 让状态变空的是缓存那份装不出来，那条才是要人来看的。
+func TestRefreshCarriesTheCacheAssemblyFailureAlongsideTheFetchError(t *testing.T) {
+	signer := newSigner(t)
+	list, sig := signer(7, nil)
+	cur := newServeList(list, sig)
+	srv := newListServer(t, cur)
+	cacheDir := t.TempDir()
+	store := newTestStore(t, srv, cacheDir, fixedNow)
+	seedCacheThatCannotBeAssembled(t, store, cacheDir)
+
+	srv.Close() // 断网：这一轮既拉不到，缓存那份也装不出来
+
+	trust, err := store.Refresh(context.Background())
+	if err == nil {
+		t.Fatal("既拉不到、缓存也装不出信任集，Refresh 却成功了")
+	}
+	if trust.Status != StatusUnavailable {
+		t.Errorf("Status = %v, want StatusUnavailable", trust.Status)
+	}
+	if !strings.Contains(err.Error(), "assemble keyring") {
+		t.Errorf("错误里没说明状态为什么是空的（缓存那份装不出信任集）：%v", err)
+	}
+	if !strings.Contains(err.Error(), listFileName) {
+		t.Errorf("错误里没说明这次是从哪个地址没拉到：%v", err)
+	}
+}
+
+// TestRefreshOnAnIdenticalListStillReportsAnUnusableCache 守的是「逐字相同」
+// 那一支也要把 fallbackErr 交回去。
+//
+// 清单确实没变，但缓存那份装不出信任集：返回一个 unavailable 却配 nil error，
+// 就是拿「清单没变」盖住「手上什么都没有」——调用方会以为这是一次正常的无变化。
+func TestRefreshOnAnIdenticalListStillReportsAnUnusableCache(t *testing.T) {
+	signer := newSigner(t)
+	list, sig := signer(7, nil)
+	cur := newServeList(list, sig)
+	srv := newListServer(t, cur)
+	cacheDir := t.TempDir()
+	store := newTestStore(t, srv, cacheDir, fixedNow)
+	seedCacheThatCannotBeAssembled(t, store, cacheDir)
+
+	// 服务端端上的还是那份逐字相同的清单。
+	trust, err := store.Refresh(context.Background())
+	if err == nil {
+		t.Fatal("清单逐字未变就被当成一次成功的刷新，可缓存那份根本装不出信任集")
+	}
+	if !strings.Contains(err.Error(), "assemble keyring") {
+		t.Errorf("错误里没说明缓存那份装不出信任集：%v", err)
+	}
+	if trust.Status != StatusUnavailable {
+		t.Errorf("Status = %v, want StatusUnavailable", trust.Status)
+	}
+	if trust.Keyring != nil {
+		t.Error("unavailable 却带回了一个非 nil 的 Keyring")
+	}
+}
+
+// TestRefreshHoldsItsLockAcrossTheFetch 守的是 Store 注释写成硬规则的那条：
+// 一次刷新是「读缓存 → 取回 → 比较 serial → 并入撤销 → 落盘」的读改写序列，两个
+// 并发的它会各自拿着一份取回前的快照去写，后写的那个把先写的成果盖掉。
+//
+// 判据落在取回上：请求正在被应答时——也就是这段序列走到一半时——那把锁必须已经
+// 被这次 Refresh 攥着。用 TryLock 而不是「起两个 goroutine 看会不会撞上」，是因为
+// 后者要靠调度撞出竞争，绿了不说明问题；TryLock 在两个方向上都是确定的。
+func TestRefreshHoldsItsLockAcrossTheFetch(t *testing.T) {
+	signer := newSigner(t)
+	list, sig := signer(7, nil)
+	cur := newServeList(list, sig)
+	srv := newListServer(t, cur)
+	store := newTestStore(t, srv, t.TempDir(), fixedNow)
+
+	// 钩子跑在 net/http 的处理 goroutine 上，锁由调用 Refresh 的那个 goroutine
+	// 持有——正是另一个并发刷新会看到的视角。
+	var lockWasFree atomic.Bool
+	cur.setOnRequest(func() {
+		if store.mu.TryLock() {
+			store.mu.Unlock()
+			lockWasFree.Store(true)
+		}
+	})
+
+	if _, err := store.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if lockWasFree.Load() {
+		t.Error("取回期间那把锁是空着的：另一个 Refresh 能同时挤进来，" +
+			"两个都拿着取回前的快照去写，后写的会把先写的成果盖掉")
 	}
 }

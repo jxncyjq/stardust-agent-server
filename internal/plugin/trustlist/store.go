@@ -84,8 +84,8 @@ type Config struct {
 // 跨进程的同一问题由缓存目录锁挡住（见 cache.write）。
 //
 // Current 刻意不取 mu：它只读缓存文件，而 Refresh 会在持锁期间等一次网络往返，
-// 让一条热路径去等那个是不必要的。缓存读取本来就要能撞上一次正在进行的写并把
-// 撞见的中间态报成错误（见 cache.read）。
+// 共享一把锁会把那次往返的时延加到每一次只读调用上。缓存读取本来就要能撞上一次
+// 正在进行的写并把撞见的中间态报成错误（见 cache.read）。
 type Store struct {
 	url    string
 	sigURL string
@@ -97,10 +97,11 @@ type Store struct {
 
 // NewStore 校验 cfg 并造出 Store，必要时把缓存目录建出来。
 //
-// 空 URL 直接报错而不是造一个「没配远端」的 Store：这个类型的每个方法都要那个
-// 地址，一个拿不到地址的 Store 只能在每次调用时再失败一次，错误点离配置错误
-// 更远。同理，签名地址在这里就推导好——一个推导不出签名地址的清单地址是配置
-// 错误，应当在装配期暴露，而不是等到第一次刷新。
+// 空 URL 直接报错而不是造一个「没配远端」的 Store：Refresh 要那个地址，而配置
+// 错误应当在装配期暴露，不是留到第一次刷新时才现形——那时错误点已经离配置错误
+// 很远。Current 不用那个地址（它只读缓存），但一个刷不出新清单的 Store 不是一个
+// 可用的 Store。同理，签名地址在这里就推导好：一个推导不出签名地址的清单地址
+// 同样是配置错误。
 func NewStore(cfg Config) (*Store, error) {
 	if strings.TrimSpace(cfg.URL) == "" {
 		return nil, errors.New("trustlist: url is empty; an empty url means the remote list is not " +
@@ -127,9 +128,10 @@ func NewStore(cfg Config) (*Store, error) {
 
 // Current 返回当前信任状态，只读缓存，**绝不发起网络请求**。
 //
-// 挂载插件那类热路径调用它。缓存缺失、损坏或装不出信任集时返回
-// StatusUnavailable 的 Trust 与一个 error——两者都返回，因为调用方既要知道出了
-// 什么事，也要一个能安全使用的零状态（Keyring 为 nil，见 Trust）。
+// 它只读本地文件、不取 Refresh 那把锁，因此它的时延不含任何网络往返。缓存缺失、
+// 损坏或装不出信任集时返回 StatusUnavailable 的 Trust 与一个 error——两者都返回，
+// 因为调用方既要知道出了什么事，也要一个能安全使用的零状态（Keyring 为 nil，
+// 见 Trust）。
 func (s *Store) Current() (Trust, error) {
 	doc, revoked, err := s.cache.read()
 	if err != nil {
