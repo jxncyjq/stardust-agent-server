@@ -137,12 +137,10 @@ EOF
 package trustlist
 
 import (
-	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stardust/legion-agent/internal/plugin/sign"
 )
@@ -273,15 +271,15 @@ func TestParseDocument_RefusesTrailingContent(t *testing.T) {
 
 // TestVerifyDocument_AcceptsOnlyTheRootKey 是这一层存在的全部理由。
 func TestVerifyDocument_AcceptsOnlyTheRootKey(t *testing.T) {
-	t.Parallel()
-
-	list := testDoc(t, nil)
-	_, priv, err := sign.GenerateKey()
+	// 先换上一把测试 root（signer 会做这件事），再用另一把完全不相干的钥匙、
+	// 冒用 root 的 key_id 去签——冒充。
+	signer := newSigner(t)
+	list, _ := signer(7, nil)
+	_, impostor, err := sign.GenerateKey()
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
 	}
-	// 用一把不是 root 的钥匙签，且用 root keyring 里那个 id——冒充。
-	sig, err := sign.Sign(priv, rootKeyID(t), list)
+	sig, err := sign.Sign(impostor, "test-root", list)
 	if err != nil {
 		t.Fatalf("Sign: %v", err)
 	}
@@ -299,18 +297,8 @@ func TestVerifyDocument_AcceptsOnlyTheRootKey(t *testing.T) {
 }
 
 func TestVerifyDocument_RefusesATamperedList(t *testing.T) {
-	t.Parallel()
-
-	list := testDoc(t, nil)
-	priv := testRootPrivateKey(t)
-	sig, err := sign.Sign(priv, rootKeyID(t), list)
-	if err != nil {
-		t.Fatalf("Sign: %v", err)
-	}
-	sigData, err := sign.MarshalSignature(sig)
-	if err != nil {
-		t.Fatalf("MarshalSignature: %v", err)
-	}
+	signer := newSigner(t)
+	list, sigData := signer(7, nil)
 	tampered := append([]byte(nil), list...)
 	tampered[len(tampered)/2] ^= 0x01
 
@@ -335,34 +323,53 @@ func TestRootKeyringParses(t *testing.T) {
 
 // --- 测试用的 root 私钥注入 ---------------------------------------------
 //
-// 生产的 root 私钥不在仓库里（按设计），所以需要签一份能验过的清单时，
-// 测试自己换掉内嵌的 root keyring。swapRootKeyring 在用例结束时还原。
+// 生产的 root 私钥不在仓库里（按设计），所以需要签一份能验过的清单时，测试
+// 自己换掉内嵌的 root keyring。swapRootKeyring 在用例结束时还原。
+//
+// newSigner 是后面几个任务（cache、store）也要用的那一个，定义在这里。
 
-func testRootPrivateKey(t *testing.T) ed25519.PrivateKey {
+// newSigner 把内嵌的 root 换成一把测试用的（用例结束自动还原），返回一个能用
+// 它签任意份清单的函数。
+//
+// **必须是「换一次 root，签多份清单」而不是「每签一份换一次 root」**：后者会让
+// 前一份已经落盘的清单在 root 被换掉之后再也验不过，于是任何「先缓存一份、
+// 再取回另一份」的用例都会在读缓存那一步就失败——而它要考的 serial 比较那段
+// 根本走不到，测试却是绿的。这是一条会静默失效的测试夹具，不是风格问题。
+//
+// 用了它的用例**不能** t.Parallel()：rootOverride 是包级变量。
+func newSigner(t *testing.T) func(serial int64, mutate func(m map[string]any)) (list, sigData []byte) {
 	t.Helper()
 	pub, priv, err := sign.GenerateKey()
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
 	}
-	data, err := sign.MarshalKeyring("test-root", pub)
+	krData, err := sign.MarshalKeyring("test-root", pub)
 	if err != nil {
 		t.Fatalf("MarshalKeyring: %v", err)
 	}
-	kr, err := sign.ParseKeyring(data)
+	kr, err := sign.ParseKeyring(krData)
 	if err != nil {
 		t.Fatalf("ParseKeyring: %v", err)
 	}
-	swapRootKeyring(t, kr, "test-root")
-	return priv
-}
+	swapRootKeyring(t, kr)
 
-func rootKeyID(t *testing.T) sign.KeyID {
-	t.Helper()
-	ids := rootKeyring().IDs()
-	if len(ids) == 0 {
-		t.Fatal("root keyring 是空的")
+	return func(serial int64, mutate func(m map[string]any)) ([]byte, []byte) {
+		list := testDoc(t, func(m map[string]any) {
+			m["serial"] = float64(serial)
+			if mutate != nil {
+				mutate(m)
+			}
+		})
+		sig, err := sign.Sign(priv, "test-root", list)
+		if err != nil {
+			t.Fatalf("Sign: %v", err)
+		}
+		sigData, err := sign.MarshalSignature(sig)
+		if err != nil {
+			t.Fatalf("MarshalSignature: %v", err)
+		}
+		return list, sigData
 	}
-	return ids[0]
 }
 ```
 
@@ -619,7 +626,7 @@ import (
 // 生产的 root 私钥按设计不在仓库里，所以测试无法用真的 root 签任何东西。
 // 换掉信任集是唯一能端到端跑通「签 → 验」的办法，而它只存在于 _test.go 里，
 // 生产路径没有任何入口能改动 root。
-func swapRootKeyring(t *testing.T, kr *sign.Keyring, _ sign.KeyID) {
+func swapRootKeyring(t *testing.T, kr *sign.Keyring) {
 	t.Helper()
 	previous := rootOverride
 	rootOverride = kr
@@ -627,7 +634,9 @@ func swapRootKeyring(t *testing.T, kr *sign.Keyring, _ sign.KeyID) {
 }
 ```
 
-注意：`rootOverride` 是包级变量，所以用到 `swapRootKeyring` 的用例**不能** `t.Parallel()`。上面测试里 `TestVerifyDocument_RefusesATamperedList` 和 `TestVerifyDocument_AcceptsOnlyTheRootKey` 调了它——把这两个用例的 `t.Parallel()` 删掉。
+注意：`rootOverride` 是包级变量，所以用到 `newSigner` / `swapRootKeyring` 的用例**不能** `t.Parallel()`——上面的测试代码里那两个用例已经没有 `t.Parallel()` 了，照抄时别加回去。后续任务（cache、store）的用例同理，一律不加。
+
+Go 的 `t.Parallel()` 语义保证了这样是安全的：并行用例会等所有非并行的顶层用例跑完才恢复，那时 `t.Cleanup` 已经把 `rootOverride` 还原。但这是一条**依赖调度语义的安全**，所以别在并行用例里碰它。
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -700,7 +709,6 @@ package trustlist
 
 import (
 	"encoding/json"
-	"errors"
 	"strings"
 	"testing"
 
@@ -859,7 +867,6 @@ func TestAssembleRefusesAnEmptyTrustSet(t *testing.T) {
 	if !strings.Contains(err.Error(), "revoked") {
 		t.Errorf("错误没说清是撤销导致的：%v", err)
 	}
-	_ = errors.Is(err, nil) // 保持 errors 被使用
 }
 ```
 
@@ -1121,25 +1128,12 @@ import (
 	"github.com/stardust/legion-agent/internal/plugin/sign"
 )
 
-// signedDoc 造一份用测试 root 签好的清单：返回清单字节、签名字节，并把
-// 内嵌 root 换成能验它的那一把（用例结束自动还原）。
-func signedDoc(t *testing.T, serial int64) (list, sigData []byte) {
-	t.Helper()
-	priv := testRootPrivateKey(t)
-	list = testDoc(t, func(m map[string]any) { m["serial"] = float64(serial) })
-	sig, err := sign.Sign(priv, rootKeyID(t), list)
-	if err != nil {
-		t.Fatalf("Sign: %v", err)
-	}
-	sigData, err = sign.MarshalSignature(sig)
-	if err != nil {
-		t.Fatalf("MarshalSignature: %v", err)
-	}
-	return list, sigData
-}
+// newSigner 定义在 Task 1 的 document_test.go 里（同一个包），直接用。
+// 它换一次 root、签多份清单；用了它的用例一律不加 t.Parallel()。
 
 func TestCacheRoundTrips(t *testing.T) {
-	list, sigData := signedDoc(t, 7)
+	signer := newSigner(t)
+	list, sigData := signer(7, nil)
 	doc, err := VerifyDocument(list, sigData)
 	if err != nil {
 		t.Fatalf("VerifyDocument: %v", err)
@@ -1225,7 +1219,8 @@ func TestCorruptCacheIsNeverSilentlyRepaired(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			list, sigData := signedDoc(t, 7)
+			signer := newSigner(t)
+			list, sigData := signer(7, nil)
 			doc, err := VerifyDocument(list, sigData)
 			if err != nil {
 				t.Fatalf("VerifyDocument: %v", err)
@@ -1259,7 +1254,8 @@ func TestCorruptCacheIsNeverSilentlyRepaired(t *testing.T) {
 // 然后断言清单没有被更新。
 func TestWriteOrdersRevocationsFirst(t *testing.T) {
 	dir := t.TempDir()
-	list7, sig7 := signedDoc(t, 7)
+	signer := newSigner(t)
+	list7, sig7 := signer(7, nil)
 	doc7, err := VerifyDocument(list7, sig7)
 	if err != nil {
 		t.Fatalf("VerifyDocument: %v", err)
@@ -1279,7 +1275,7 @@ func TestWriteOrdersRevocationsFirst(t *testing.T) {
 		t.Fatalf("mkdir: %v", err)
 	}
 
-	list9, sig9 := signedDoc(t, 9)
+	list9, sig9 := signer(9, nil)
 	doc9, err := VerifyDocument(list9, sig9)
 	if err != nil {
 		t.Fatalf("VerifyDocument: %v", err)
@@ -1310,7 +1306,8 @@ func TestConcurrentWritesNeverLoseARevocation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newCache: %v", err)
 	}
-	list, sigData := signedDoc(t, 7)
+	signer := newSigner(t)
+	list, sigData := signer(7, nil)
 	doc, err := VerifyDocument(list, sigData)
 	if err != nil {
 		t.Fatalf("VerifyDocument: %v", err)
@@ -2035,10 +2032,13 @@ EOF
 package trustlist
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -2087,7 +2087,8 @@ func fixedNow() time.Time { return time.Date(2026, 9, 10, 0, 0, 0, 0, time.UTC) 
 func afterExpiry() time.Time { return time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC) }
 
 func TestRefreshAcceptsAndCachesAFreshList(t *testing.T) {
-	list, sig := signedDoc(t, 7)
+	signer := newSigner(t)
+	list, sig := signer(7, nil)
 	cur := &serveList{list: list, sig: sig}
 	store := newTestStore(t, newListServer(t, cur), fixedNow)
 
@@ -2117,7 +2118,8 @@ func TestRefreshAcceptsAndCachesAFreshList(t *testing.T) {
 // TestRefreshRefusesASerialRollback 挡的是对这套机制最便宜的攻击：重放一份
 // 签名完全合法的旧清单，把用户挡在某次撤销之前。
 func TestRefreshRefusesASerialRollback(t *testing.T) {
-	list9, sig9 := signedDoc(t, 9)
+	signer := newSigner(t)
+	list9, sig9 := signer(9, nil)
 	cur := &serveList{list: list9, sig: sig9}
 	srv := newListServer(t, cur)
 	store := newTestStore(t, srv, fixedNow)
@@ -2125,8 +2127,8 @@ func TestRefreshRefusesASerialRollback(t *testing.T) {
 	if _, err := store.Refresh(context.Background()); err != nil {
 		t.Fatalf("Refresh(9): %v", err)
 	}
-	// 换成一份 serial 更小、但签名同样合法的清单。
-	list7, sig7 := signedDoc(t, 7)
+	// 换成一份 serial 更小、但签名同样合法的清单（同一把 root 签的）。
+	list7, sig7 := signer(7, nil)
 	cur.list, cur.sig = list7, sig7
 
 	trust, err := store.Refresh(context.Background())
@@ -2149,7 +2151,8 @@ func TestRefreshRefusesASerialRollback(t *testing.T) {
 // TestRefreshRefusesTheSameSerialWithDifferentContent：发布侧改了内容却没进
 // serial，是发布流程事故；无法判断哪一份才是当前的，所以拒绝。
 func TestRefreshRefusesTheSameSerialWithDifferentContent(t *testing.T) {
-	list, sig := signedDoc(t, 7)
+	signer := newSigner(t)
+	list, sig := signer(7, nil)
 	cur := &serveList{list: list, sig: sig}
 	srv := newListServer(t, cur)
 	store := newTestStore(t, srv, fixedNow)
@@ -2157,8 +2160,12 @@ func TestRefreshRefusesTheSameSerialWithDifferentContent(t *testing.T) {
 	if _, err := store.Refresh(context.Background()); err != nil {
 		t.Fatalf("Refresh: %v", err)
 	}
-	// 同一个 serial，但 keyring 里换了一把钥匙（signedDoc 每次都生成新钥匙）。
-	list2, sig2 := signedDoc(t, 7)
+	// 同一个 root 签的同一个 serial，但内容不同：换掉 publisher 的显示名。
+	list2, sig2 := signer(7, func(m map[string]any) {
+		m["publishers"] = []any{
+			map[string]any{"key_id": "dev-abc", "display_name": "李四", "contact": ""},
+		}
+	})
 	cur.list, cur.sig = list2, sig2
 
 	if _, err := store.Refresh(context.Background()); err == nil {
@@ -2169,7 +2176,8 @@ func TestRefreshRefusesTheSameSerialWithDifferentContent(t *testing.T) {
 // TestRefreshOnAFailureReturnsBothTheCachedTrustAndTheError：网络断了的时候，
 // 调用方两件事都需要知道——拉取失败了，以及手上还有一份能用的。
 func TestRefreshOnAFailureReturnsBothTheCachedTrustAndTheError(t *testing.T) {
-	list, sig := signedDoc(t, 7)
+	signer := newSigner(t)
+	list, sig := signer(7, nil)
 	cur := &serveList{list: list, sig: sig}
 	srv := newListServer(t, cur)
 	store := newTestStore(t, srv, fixedNow)
@@ -2218,7 +2226,8 @@ func TestNoCacheAndNoNetworkIsUnavailable(t *testing.T) {
 // TestAnExpiredListIsStaleButUsable：过期不作废。断网久了清单会过期，
 // 而作废意味着所有插件立刻失信——可用性代价大于收益。
 func TestAnExpiredListIsStaleButUsable(t *testing.T) {
-	list, sig := signedDoc(t, 7)
+	signer := newSigner(t)
+	list, sig := signer(7, nil)
 	cur := &serveList{list: list, sig: sig}
 	store := newTestStore(t, newListServer(t, cur), afterExpiry)
 
@@ -2234,39 +2243,72 @@ func TestAnExpiredListIsStaleButUsable(t *testing.T) {
 	}
 }
 
+// TestRefreshRefusesToOverwriteACorruptCache 守的是「撤销永不遗忘」在缓存损坏
+// 这条路径上的版本。
+//
+// 损坏时若继续取回，写回去的撤销累积集是**空的**——这台机器见过的每一条撤销
+// 一次抹掉，而它们按设计不会再从清单里回来（发布侧完全可能已经把那些条目移出
+// revoked 了）。所以损坏时必须停下，而不是靠一次成功的取回悄悄「修好」。
+func TestRefreshRefusesToOverwriteACorruptCache(t *testing.T) {
+	signer := newSigner(t)
+	list, sig := signer(7, nil)
+	cur := &serveList{list: list, sig: sig}
+	srv := newListServer(t, cur)
+	cacheDir := t.TempDir()
+	store, err := NewStore(Config{
+		URL: srv.URL + "/trustlist.json", CacheDir: cacheDir,
+		Client: srv.Client(), Now: fixedNow,
+	})
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	if _, err := store.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	// 记下这台机器已经见过的撤销条数，再把清单文件改坏。
+	if err := os.WriteFile(filepath.Join(cacheDir, "trustlist.json"),
+		[]byte(`{"serial":`), 0o600); err != nil {
+		t.Fatalf("corrupt: %v", err)
+	}
+	before, err := os.ReadFile(filepath.Join(cacheDir, "revoked-ever.json"))
+	if err != nil {
+		t.Fatalf("read revoked-ever: %v", err)
+	}
+
+	if _, err := store.Refresh(context.Background()); err == nil {
+		t.Fatal("缓存损坏时 Refresh 却成功了——它会用空的撤销累积集覆盖磁盘上那份")
+	}
+	after, err := os.ReadFile(filepath.Join(cacheDir, "revoked-ever.json"))
+	if err != nil {
+		t.Fatalf("read revoked-ever: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("撤销累积集在一次被拒的 Refresh 之后被改写了：\nbefore=%s\nafter=%s", before, after)
+	}
+}
+
 // TestRevocationSurvivesAcrossRefreshes 是端到端版本的「撤销永不遗忘」：
 // 走完整的取回 → 落盘 → 再取回 → 装配，确认撤销没有在这条链上丢掉。
 //
 // Task 2 的同名单元测试只覆盖内存里的合并；这一条覆盖它穿过缓存的往返。
 func TestRevocationSurvivesAcrossRefreshes(t *testing.T) {
-	priv := testRootPrivateKey(t)
-	id := rootKeyID(t)
-
+	signer := newSigner(t)
 	makeSigned := func(serial int64, revoked []sign.KeyID) ([]byte, []byte) {
-		list := testDoc(t, func(m map[string]any) {
-			m["serial"] = float64(serial)
-			kr := m["keyring"].(map[string]any)
-			if len(revoked) > 0 {
-				rs := make([]any, 0, len(revoked))
-				for _, r := range revoked {
-					rs = append(rs, map[string]any{
-						"key_id":     string(r),
-						"revoked_at": "2026-08-29T10:00:00Z",
-						"reason":     "私钥泄漏",
-					})
-				}
-				kr["revoked"] = rs
+		return signer(serial, func(m map[string]any) {
+			if len(revoked) == 0 {
+				return
 			}
+			kr := m["keyring"].(map[string]any)
+			rs := make([]any, 0, len(revoked))
+			for _, r := range revoked {
+				rs = append(rs, map[string]any{
+					"key_id":     string(r),
+					"revoked_at": "2026-08-29T10:00:00Z",
+					"reason":     "私钥泄漏",
+				})
+			}
+			kr["revoked"] = rs
 		})
-		sig, err := sign.Sign(priv, id, list)
-		if err != nil {
-			t.Fatalf("Sign: %v", err)
-		}
-		sigData, err := sign.MarshalSignature(sig)
-		if err != nil {
-			t.Fatalf("MarshalSignature: %v", err)
-		}
-		return list, sigData
 	}
 
 	// A：撤销 dev-abc（testDoc 的 keyring 里就是这把）。
@@ -2445,16 +2487,32 @@ func (s *Store) Refresh(ctx context.Context) (Trust, error) {
 	// 先把手上已有的读出来，它既是 serial 比较的基准，也是失败时要返回的东西。
 	cachedDoc, cachedRevoked, cacheErr := s.cache.read()
 	fallback := Trust{Status: StatusUnavailable}
-	haveCache := cacheErr == nil
-	if haveCache {
+	haveCache := false
+	switch {
+	case cacheErr == nil:
+		haveCache = true
 		if t, err := s.assemble(cachedDoc, cachedRevoked); err == nil {
 			fallback = t
-		} else {
-			// 缓存能读但装不出信任集（例如撤销累积到覆盖了全部 keys）。
-			// 这不是「没有缓存」，但也不是一个能用的状态。
-			haveCache = false
-			cacheErr = err
 		}
+		// 装不出信任集（例如撤销已累积到覆盖当前清单的全部 keys）时 fallback
+		// 保持 unavailable，但 haveCache 仍为 true：serial 基准与撤销累积集
+		// 都还是有效的，而一份新清单带进一把新钥匙就能重新装得出来。
+
+	case errors.Is(cacheErr, errNoCache):
+		// 全新安装。没有缓存是正常状态，撤销累积集从空开始也是正确的。
+
+	default:
+		// 缓存损坏。**到此为止，不继续取回**。
+		//
+		// 继续的后果不是「重新下载一份」——是下面会拿一个空的撤销累积集
+		// 覆盖掉磁盘上那份，把这台机器见过的每一条撤销一次抹掉。而撤销是
+		// 这套机制唯一的止血手段，且按设计它永远不会再从清单里回来（发布侧
+		// 完全可能已经把那些条目移出 revoked 了）。
+		//
+		// 损坏要人来看一眼，不能靠一次成功的取回悄悄「修好」。
+		return fallback, fmt.Errorf("trustlist cache at %s is unusable; refusing to refresh over it, "+
+			"because overwriting it would discard every revocation this machine has recorded: %w",
+			s.cache.dir, cacheErr)
 	}
 
 	listData, err := fetchBytes(ctx, s.client, s.url, maxListBytes)
@@ -2486,6 +2544,8 @@ func (s *Store) Refresh(ctx context.Context) (Trust, error) {
 		}
 	}
 
+	// cachedRevoked 只在 errNoCache（全新安装）时为 nil——损坏的情况上面已经
+	// 返回了，绝不会走到这里从空重建。
 	revoked := cachedRevoked
 	if revoked == nil {
 		revoked = newRevokedSet()
@@ -2529,15 +2589,25 @@ go test ./internal/plugin/trustlist/ -race -count=5
 
 预期：都 PASS。
 
-- [ ] **Step 5: 变异验证——把 serial 比较改成 `<=` 之外的方向，确认回滚用例必红**
+- [ ] **Step 5: 变异验证（两处，都必须做）**
 
-临时把 `case doc.Serial < cachedDoc.Serial:` 改成 `case false:`，跑：
+**(a) 去掉防回滚**：临时把 `case doc.Serial < cachedDoc.Serial:` 改成 `case false:`：
 
 ```bash
 go test ./internal/plugin/trustlist/ -run TestRefreshRefusesASerialRollback
 ```
 
 预期：**FAIL**。改回来，再跑确认 PASS。
+
+**(b) 让损坏的缓存被当成「没有缓存」**：临时把 `default:` 那个分支的 `return` 删掉（让它像 `errNoCache` 一样往下走）：
+
+```bash
+go test ./internal/plugin/trustlist/ -run TestRefreshRefusesToOverwriteACorruptCache
+```
+
+预期：**FAIL**，报「撤销累积集在一次被拒的 Refresh 之后被改写了」。改回来，再跑确认 PASS。
+
+这两处变异对应的都是**只在特定时序下才现形的数据丢失**：单靠读代码看不出来，单靠 happy path 测试也测不出来。
 
 - [ ] **Step 6: 提交**
 
@@ -2962,13 +3032,10 @@ go test ./internal/cli/ -run TestTrustlist -v
 package cli
 
 import (
-	"context"
-	"errors"
 	"fmt"
 	"io"
 	"os"
 	"sort"
-	"strings"
 
 	"github.com/spf13/cobra"
 
@@ -3179,13 +3246,8 @@ func printTrust(out io.Writer, trust trustlist.Trust) {
 		fmt.Fprintf(out, "%d revoked key(s) no longer listed in the current trustlist are still "+
 			"refused on this machine (revocations are never forgotten)\n", extra)
 	}
-	_ = strings.TrimSpace
-	_ = context.Background
-	_ = errors.New
 }
 ```
-
-实现完成后**删掉**文件末尾那三行 `_ =` 占位（它们只是为了让草稿编译；最终代码里不该有）。相应地，如果 `context`、`errors`、`strings` 最后没有被用到，把它们从 import 里删掉。
 
 在 `internal/cli/plugins_command.go` 第 715 行（`cmd.AddCommand(newPluginsCacheCommand(out))` 之后）加一行：
 
@@ -3574,7 +3636,11 @@ serial 4：把 `revoked` 整段删掉，`keys` 里也把 `dev-selftest` 删掉�
 
 **类型一致性**：`Document`、`Publisher`、`Trust`、`Status`、`revokedSet`、`cache`、`Store`、`Config` 在各任务间的字段与方法名逐处对过，一致。`sigURL`（Task 4）被 `NewStore`（Task 5）调用，签名一致。`assembleKeyring`（Task 2）被 `Store.assemble`（Task 5）调用，签名一致。
 
-**已知的一处粗糙**：Task 7 的实现代码末尾留了三行 `_ =` 占位以保证草稿可编译，步骤里明确要求删除并清理 import。实施者若忘记，`go vet` 不会报，但 code review 会看到——已在步骤文字里点名。
+**执行前的预检又抓到三条，已就地修掉**（记在这里，因为它们都是「计划自己带的缺陷」这一类）：
+
+1. **`Refresh` 在缓存损坏时会用空的撤销累积集覆盖磁盘上那份**——一次抹掉这台机器见过的全部撤销，正好违反本设计的核心不变量。已改为损坏时拒绝取回并报错，并补了 `TestRefreshRefusesToOverwriteACorruptCache` 与它的变异验证。
+2. **测试夹具会静默失效**：原来的 `signedDoc` 每次调用都换一把新 root，于是「先缓存一份、再取回另一份」的用例在读缓存那一步就失败，而它们要考的 serial 比较那段根本走不到——测试却是绿的。已换成 `newSigner`（换一次 root、签多份清单），并在注释里写明为什么不能反过来。
+3. Task 7 原本留了三行 `_ =` 占位让草稿可编译，已直接删除并清理 import，不再依赖实施者记得删。
 
 **Task 8 的 serve 装配点是 grep 出来的，不是写死的行号**：那个函数的位置会随其他改动漂移，写死行号比写查找命令更容易过期。
 
