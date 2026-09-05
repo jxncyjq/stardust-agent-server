@@ -55,9 +55,10 @@ var errNoRevocationRecord = errors.New("no revocation record")
 //
 // write 全程在目录锁下进行，落盘的累积集因此只增不减，跨进程也成立（见 write）。
 // read 不取锁，所以它返回的 *revokedSet 只是一份快照：另一个写者随时可能让它
-// 过期。凡是跨 goroutine 共享同一个 *revokedSet 的调用方，仍须自己串行化整个
-// read-modify-write 序列——revokedSet 本身不是并发安全的（理由见 revokedSet 的
-// 注释），而 cache 的目录锁只罩住 write 内部那一段。
+// 过期，而 write 的返回值是把这份快照补齐的途径（见 write）。凡是跨 goroutine
+// 共享同一个 *revokedSet 的调用方，仍须自己串行化整个 read-modify-write 序列
+// ——revokedSet 本身不是并发安全的（理由见 revokedSet 的注释），而 cache 的目录
+// 锁只罩住 write 内部那一段。
 type cache struct {
 	dir string
 }
@@ -88,7 +89,29 @@ func (c *cache) path(name string) string { return filepath.Join(c.dir, name) }
 // 清单走的是 VerifyDocument——与网络路径同一个函数。这不是多余的谨慎：如果
 // 缓存读取绕过验签，那么任何能写这个目录的东西就能给这台机器换一份信任集。
 //
-// 清单不存在报 errNoCache（裹上目录名，因为同一个进程可以有不止一个缓存目录）；
+// # 返回值契约（三种结果，调用方必须分开处理）
+//
+//	err == nil                  清单与累积集都读回来了，*revokedSet 非 nil。
+//	errors.Is(err, errNoCache)  清单文件不存在。此时 *revokedSet **仍然可能非
+//	                            nil**：只要 revoked-ever.json 还在且读得懂，这台
+//	                            机器已经记下的撤销就一并交回去，调用方必须拿它
+//	                            起步。只有连 revoked-ever.json 都不存在时才是 nil。
+//	其它 err                    缓存不完整或损坏，*revokedSet 为 nil。
+//
+// errNoCache 时仍然交回累积集，是因为「清单不在而累积集在」不是理论形态：一次
+// 首写崩溃、一次磁盘损坏，或者任何能写这个目录的东西删掉一个文件，都会造出它。
+// errNoCache 的语义是「从头重建是安全的」，而从头重建若以空集起步，一把这台机器
+// 早已记录为撤销的钥匙就会在这一轮里重新可信——落盘的记录救得回下一次启动，救不了
+// 这一轮。
+// 而 read 之所以坚持验签，用的正是同一个威胁模型：那个攻击者连伪造都不必，删掉
+// 一个文件就够了。
+//
+// 这里**不能**把「清单不在」改报成一个非 errNoCache 的错误：这两类错误的分界就是给
+// 调用方的开关——errNoCache 说「从头重建是安全的」，其它错误说「别刷新，保住磁盘上
+// 已经记下的撤销」。把一次首写崩溃归到后者，就永远写不出清单，缓存变成一块修不好
+// 的砖。
+//
+// 清单不存在时报的 errNoCache 裹上目录名，因为同一个进程可以有不止一个缓存目录；
 // 其余任何一个文件缺失或损坏都报错，且**不删除、不重建**：静默重建会抹掉判断
 // 「是磁盘坏了还是有人动过」的唯一现场，静默当成空缓存则等于宣告这台机器从没
 // 见过任何撤销。
@@ -102,7 +125,7 @@ func (c *cache) read() (Document, *revokedSet, error) {
 	listData, err := os.ReadFile(c.path(listFileName))
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return Document{}, nil, fmt.Errorf("%w in %s", errNoCache, c.dir)
+			return c.readWithoutList()
 		}
 		return Document{}, nil, fmt.Errorf("read cached trustlist %s: %w", c.path(listFileName), err)
 	}
@@ -130,6 +153,26 @@ func (c *cache) read() (Document, *revokedSet, error) {
 	return doc, revoked, nil
 }
 
+// readWithoutList 是 read 的「清单文件不存在」这一支：报 errNoCache，但把磁盘上
+// 已经记下的撤销一并交回去（理由见 read 的返回值契约）。
+//
+// 累积集在、却读不回来时报的是那份损坏错误而**不是** errNoCache。两个理由：这一
+// 条更精确，错误点落在真正坏掉的那个文件上；而且报成 errNoCache 也换不来一次成功
+// 的刷新——同一份读不懂的累积集会在 write 里再被 mergeWithRecordedRevocations
+// 拒绝一次，只是那时错误已经离现场远了一步。
+func (c *cache) readWithoutList() (Document, *revokedSet, error) {
+	noCache := fmt.Errorf("%w in %s", errNoCache, c.dir)
+	revoked, err := c.readRevoked()
+	if err != nil {
+		if errors.Is(err, errNoRevocationRecord) {
+			// 两个文件都不在：这台机器确实什么都没有，*revokedSet 为 nil。
+			return Document{}, nil, noCache
+		}
+		return Document{}, nil, err
+	}
+	return Document{}, revoked, noCache
+}
+
 // readRevoked 读回 revoked-ever.json。文件不存在报 errNoRevocationRecord——那是
 // 唯一一种「没有这份记录」与「记录说没有撤销」有区别的情况，两个调用方对它的
 // 归类不同（见 errNoRevocationRecord）。
@@ -153,7 +196,24 @@ func (c *cache) readRevoked() (*revokedSet, error) {
 	return revoked, nil
 }
 
-// write 落盘一份新接受的清单。
+// write 落盘一份新接受的清单，并返回它实际写进 revoked-ever.json 的那份并集。
+//
+// # 返回值契约
+//
+// err == nil 时返回的集合与刚落盘的 revoked-ever.json 逐条相同，且是这次调用新造
+// 的（不与 revoked 共享任何东西），调用方可以直接持有它。err != nil 时返回 nil：
+// 这一次刷新整体没成功，不该有任何东西被采信。
+//
+// 返回并集不是顺手：调用方手里的 revoked 是它某次 read 出来的快照，而那次 read
+// 不在锁里，另一个进程随时可能在这中间并入新的撤销。不把并集交回去，调用方接下来
+// 拿去装配信任集的就是那份偏少的快照——少掉的正好是撤销。
+//
+// revoked 为 nil 直接报错。read 在「清单与累积集都不在」时返回的正是 nil，一路
+// 传回来就会在 mergeWithRecordedRevocations 里解引用一个 nil map 而 panic；显式
+// 报出来，错误点才落在传错参数的那次调用上。没有已记下的撤销时应当传
+// newRevokedSet()——那说的是「已知没有撤销」，与「不知道」是两件事。
+//
+// # 落盘
 //
 // 顺序是**先写撤销累积集，成功后再写清单**。反过来会留下一个「清单已更新但
 // 撤销没记下」的窗口，而这个方向的丢失正是累积集存在要防的事。签名排在清单
@@ -166,44 +226,58 @@ func (c *cache) readRevoked() (*revokedSet, error) {
 // 就能修好，好过静默使用一份签名对不上的清单。
 //
 // 整个操作在目录锁下进行，而且落盘的累积集是**磁盘上那份与 revoked 的并集**，
-// 不是直接拿 revoked 覆盖。两件事缺一不可：调用方手里的 revoked 是它某个时刻
-// read 出来的快照，而那次 read 不在锁里，所以快照可能已经过期；只加锁只能让两个
-// 写者排队，排在后面的那个仍会用自己的过期快照把前一个刚记下的撤销覆盖掉。取并集
-// 才是这个类型的语义——累积集只增不减。冲突时保留磁盘上那条（先见到的记录胜出，
-// 与 mergeFrom 同规则）。
+// 不是直接拿 revoked 覆盖。两件事缺一不可：只加锁只能让两个写者排队，排在后面
+// 的那个仍会用自己的过期快照把前一个刚记下的撤销覆盖掉。取并集才是这个类型的
+// 语义——累积集只增不减。冲突时保留磁盘上那条（先见到的记录胜出，与 mergeFrom
+// 同规则）。
 //
-// 并集只保证**落盘的**记录不丢；它不会把调用方手里那份快照补新。跨 goroutine
-// 共享同一个 *revokedSet 的调用方仍须自己串行化整个 read-modify-write 序列。
-func (c *cache) write(doc Document, sigData []byte, revoked *revokedSet) (err error) {
+// 并集不改动调用方手里那份快照（那是它自己的）；补齐它走的是返回值。
+func (c *cache) write(doc Document, sigData []byte, revoked *revokedSet) (merged *revokedSet, err error) {
+	if revoked == nil {
+		return nil, errors.New("write cached trustlist: the revoked set is nil; pass newRevokedSet() " +
+			`when nothing has been recorded yet, so that "known to be empty" is never read as "unknown"`)
+	}
 	unlock, err := c.lock()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer func() {
-		if unlockErr := unlock(); unlockErr != nil && err == nil {
-			err = unlockErr
+		if unlockErr := unlock(); unlockErr != nil {
+			// 锁没放开的后果不是立刻可见的失败，而是此后每一次写都先等满
+			// lockWait 再报一个不存在的持锁者。所以主错误已经存在时也不能把
+			// 它丢掉——包里没有 logger，errors.Join 是让两件事都被看见的办法。
+			// 连同把 merged 清成 nil：契约是「err != nil 就什么都别采信」。
+			err = errors.Join(err, unlockErr)
+			merged = nil
 		}
 	}()
 
-	merged, err := c.mergeWithRecordedRevocations(revoked)
+	written, err := c.mergeWithRecordedRevocations(revoked)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	revokedData, err := merged.marshal()
+	revokedData, err := written.marshal()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if err := c.writeFileAtomically(revokedFileName, revokedData); err != nil {
-		return err
+	if err := writeFileAtomically(c, revokedFileName, revokedData); err != nil {
+		return nil, err
 	}
-	if err := c.writeFileAtomically(sigFileName, sigData); err != nil {
-		return err
+	if err := writeFileAtomically(c, sigFileName, sigData); err != nil {
+		return nil, err
 	}
-	return c.writeFileAtomically(listFileName, doc.Raw)
+	if err := writeFileAtomically(c, listFileName, doc.Raw); err != nil {
+		return nil, err
+	}
+	return written, nil
 }
 
 // mergeWithRecordedRevocations 返回「磁盘上已记下的撤销」与 revoked 的并集，
 // 冲突时保留磁盘上那条。只在持锁期间调用。
+//
+// 冲突保留磁盘那条不是「反正条数一样」：两条记录的差别在 revoked_at 与 reason，
+// 而 sign.Keyring 正是用这两个字段生成操作者能读的那句拒绝理由。后来者覆盖不会
+// 让任何条目消失，坏掉的是那句话。
 //
 // 磁盘上那份读不回来时报错而不是绕过去：覆盖一份读不懂的累积集，等于拿一份读得懂
 // 但更短的记录换掉它，而被换掉的恰好是无从恢复的撤销。这确实意味着一个损坏的
@@ -237,7 +311,13 @@ func (c *cache) mergeWithRecordedRevocations(revoked *revokedSet) (*revokedSet, 
 // writeFileAtomically 把 data 发布成缓存目录里的 name：先写同目录下的临时文件、
 // Sync、再 rename 过去。rename 在同一目录内是原子的，所以读者要么看到旧的那份，
 // 要么看到完整的新的那份，不会看到半份。
-func (c *cache) writeFileAtomically(name string, data []byte) error {
+//
+// 它是包级变量而不是方法，唯一的理由是让测试能把失败点精确钉在「发布哪一个文件」
+// 这一步上：write 的落盘顺序（先累积集、后清单）是一条硬性要求，而用目录权限之类
+// 的外部手段造出来的失败分不开「读磁盘上的累积集失败」与「发布清单失败」，顺序
+// 反转就没人抓得住。生产路径上它始终是下面这个实现，不带任何开关；改写它的入口
+// 只在 export_test.go 里。
+var writeFileAtomically = func(c *cache, name string, data []byte) error {
 	tmp, err := os.CreateTemp(c.dir, name+".tmp-*")
 	if err != nil {
 		return fmt.Errorf("create temp file for %s: %w", name, err)
@@ -270,10 +350,12 @@ func (c *cache) writeFileAtomically(name string, data []byte) error {
 
 // lock 取得缓存目录的排他锁，返回释放它的函数。
 //
-// 用 O_CREATE|O_EXCL 建一个哨兵文件作锁：它是唯一一种在「检查」与「创建」之间
-// 不会输掉竞争的做法。争用（见 lockCreateIsContended）会等待重试；等满 lockWait
-// 之后报错，且错误里带上最后看到的那个 create 错误——一把因为权限而真正打不开
-// 的锁，必须以权限问题的面目出现，而不是一个幽灵持锁者。
+// 用 O_CREATE|O_EXCL 建一个哨兵文件作锁：它是这里选用的做法——「检查」与「创建」
+// 在一次系统调用里完成，两者之间没有能输掉的竞争窗口。（mkdir、link、平台咨询锁
+// 是同一类做法，各有各的取舍；选哨兵文件是因为它在任何一台机器上都看得见、删得
+// 掉。）争用（见 lockCreateIsContended）会等待重试；等满 lockWait 之后报错，且
+// 错误里带上最后看到的那个 create 错误——一把因为权限而真正打不开的锁，必须以
+// 权限问题的面目出现，而不是一个幽灵持锁者。
 func (c *cache) lock() (func() error, error) {
 	path := c.path(lockFileName)
 	release := func() error {
