@@ -668,7 +668,7 @@ func refusePluginDeploymentChanged(cmdContext, manifestPath string, snapshot []b
 }
 
 // newPluginsCommand builds `agent plugins`, the operator's handle on the WASM
-// plugin deployment. Its seven subcommands fall into two groups that share
+// plugin deployment. Its subcommands fall into two groups that share
 // nothing but the noun:
 //
 //   - status and reload are a view of THIS PROCESS: both read the loader serve
@@ -699,7 +699,10 @@ func refusePluginDeploymentChanged(cmdContext, manifestPath string, snapshot []b
 //     grouped with status and reload instead. cache belongs to this group too:
 //     it reads the plugins config and works on the cache directory, and
 //     nothing it removes reaches a running process until the next reload
-//     re-fetches it.
+//     re-fetches it. trustlist sits with keygen and sign rather than with
+//     those three: it reads no config and writes no manifest. Its sign is the
+//     publisher's side of the official trust list, and its refresh and show
+//     act on the trustlist cache directory their own flags name.
 func newPluginsCommand(application *app.App, out io.Writer) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "plugins",
@@ -713,6 +716,7 @@ func newPluginsCommand(application *app.App, out io.Writer) *cobra.Command {
 	cmd.AddCommand(newPluginsKeygenCommand(out))
 	cmd.AddCommand(newPluginsSignCommand(out))
 	cmd.AddCommand(newPluginsCacheCommand(out))
+	cmd.AddCommand(newPluginsTrustlistCommand(out))
 	return cmd
 }
 
