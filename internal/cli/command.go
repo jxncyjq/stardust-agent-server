@@ -2855,6 +2855,33 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		pluginConsent = NewPluginConsentService(cfg.Plugins.Manifest, cfg.Plugins.Root, pluginApp.Plugins,
 			func() *sign.Keyring { return pluginKeyring }, pluginRemote, logger)
 	}
+	// The remote trustlist is the other half of the question the keyring
+	// answers -- what does this deployment trust -- so it is resolved here,
+	// beside it, rather than somewhere an operator would have to look for
+	// separately. A configured trustlist that cannot be built stops startup
+	// (see resolvePluginTrustlist); an unconfigured one yields no Store and no
+	// loop.
+	//
+	// It is resolved OUTSIDE the plugin-consent branch above, and so runs even
+	// when this deployment configured no plugins.manifest, which mirrors
+	// config.Load: validatePlugins checks the trustlist section before its
+	// "no manifest means plugins are off" early return, on the reasoning that
+	// fetching a remote trustlist and loading local plugins are separate
+	// questions.
+	trustStore, trustlistRefreshInterval, err := resolvePluginTrustlist(cfg.Plugins)
+	if err != nil {
+		cleanup()
+		return ServeResult{}, err
+	}
+	if trustStore != nil {
+		// Its own goroutine and its own ticker, for two reasons: the first
+		// fetch must not block startup (a network failure at start must not
+		// keep the agent from coming up, since a machine holding a cached list
+		// still works), and the background scheduler assembled below ticks
+		// every job it holds on one shared interval -- nothing like the hours
+		// between two trustlist fetches. The loop ends when ctx does.
+		go runTrustlistRefreshLoop(ctx, trustStore, trustlistRefreshInterval, logger)
+	}
 	liveTasks := task.NewSchedulerWithSink(taskSink)
 	httpTasks := server.TaskStore(liveTasks)
 	if taskStore != nil {

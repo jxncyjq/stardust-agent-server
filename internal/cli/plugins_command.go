@@ -29,6 +29,7 @@ import (
 	"github.com/stardust/legion-agent/internal/plugin/loader"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
 	"github.com/stardust/legion-agent/internal/plugin/sign"
+	"github.com/stardust/legion-agent/internal/plugin/trustlist"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/prompt"
 	"github.com/stardust/legion-agent/internal/taskgate"
@@ -582,6 +583,176 @@ func resolvePluginKeyring(cfg config.PluginsConfig) (*sign.Keyring, string, erro
 	return keyring, "", nil
 }
 
+// The messages the trustlist refresh loop logs. Each is a constant because a
+// message is what an operator greps for: spelled out as two separate literals
+// it can drift in one copy and not the other, leaving two spellings of the
+// same round that no single search brings back together.
+//
+// None of them names where a round's bytes came from. A round can be refused
+// over bytes the url served and over bytes that were already in this machine's
+// cache, and the error a refused round carries does not separate the two, so a
+// message that picked one would send an operator to the wrong half of the
+// system every time the other one happened.
+const (
+	trustlistRefreshedMsg      = "plugin trustlist refreshed"
+	trustlistRefreshFailedMsg  = "plugin trustlist refresh failed"
+	trustlistRefusedMsg        = "plugin trustlist refused a list"
+	trustlistRefreshStoppedMsg = "plugin trustlist refresh stopped by shutdown"
+
+	// trustlistReportedStateNote goes on every failure line. Refresh reports a
+	// failed round together with the trust state it can still offer, and that
+	// state is the one assembled from the cache as the round STARTED — not a
+	// reading of the cache as it stands now. Store.Refresh documents one case
+	// where the two differ: its cache write can publish all three files and
+	// then fail to release the directory lock, which it reports as a failed
+	// round even though the disk has advanced. Left unsaid, the still_* fields
+	// read as proof that nothing was written.
+	trustlistReportedStateNote = "still_status/still_serial are what this machine trusted when this round " +
+		"started; a failed round is not evidence that the cache on disk is unchanged"
+)
+
+// trustlistRefresher is the single operation runTrustlistRefreshLoop performs:
+// refresh the trustlist once, and report both the trust state that comes out of
+// it and whether the round itself worked.
+//
+// The loop takes this interface rather than the concrete *trustlist.Store
+// because a Store cannot produce a successful round without the trustlist
+// root's private key: it adopts a list only if the list carries a signature its
+// embedded root public key verifies. "Every round is logged" has to hold on the
+// rounds that worked too, and an interface is what makes a round that worked
+// expressible here at all.
+type trustlistRefresher interface {
+	Refresh(ctx context.Context) (trustlist.Trust, error)
+}
+
+// resolvePluginTrustlist turns the deployment's remote-trustlist configuration
+// into the Store its refresh loop fetches through, and the interval that loop
+// runs at. An unconfigured trustlist — an empty plugins.trustlist.url, which is
+// how config.PluginTrustlistConfig spells "no remote list" — yields
+// (nil, 0, nil).
+//
+// A CONFIGURED trustlist that cannot be built is an error, never a degradation.
+// Three things can go wrong: the cache path is empty, the cache directory
+// cannot be created (the path is a regular file, or the process cannot write
+// there), and the signature's address cannot be derived from the list's url.
+// Starting anyway would leave a deployment that believes it is receiving
+// revocations while it never fetches one — and that deployment is precisely the
+// one that went out of its way to configure a remote list, so it needs to hear
+// about this more than a deployment with no list at all does.
+//
+// The refresh interval is the one field re-checked here rather than left to
+// config.Load, and the reason is specific to it: a non-positive interval
+// reaches time.NewTicker inside a goroutine, which panics, so the process dies
+// with a stack that names a ticker and never the configuration field that set
+// it. Every other way this section can be wrong ends as a failed round in the
+// log instead, with the url it failed on right there in the line. config.Load's
+// validation already rejects a non-positive refresh_interval_ms whenever a url
+// is set, but a config.PluginsConfig built as a struct literal never passed
+// through it.
+func resolvePluginTrustlist(cfg config.PluginsConfig) (*trustlist.Store, time.Duration, error) {
+	if !cfg.Trustlist.Enabled() {
+		return nil, 0, nil
+	}
+	if cfg.Trustlist.RefreshIntervalMs <= 0 {
+		return nil, 0, fmt.Errorf("plugins.trustlist.refresh_interval_ms is %d while "+
+			"plugins.trustlist.url is %q; it must be positive, since zero has no \"never\" or \"once\" "+
+			"reading here", cfg.Trustlist.RefreshIntervalMs, cfg.Trustlist.URL)
+	}
+	store, err := trustlist.NewStore(trustlist.Config{
+		URL:      cfg.Trustlist.URL,
+		CacheDir: cfg.Trustlist.Cache,
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("plugins.trustlist: %w", err)
+	}
+	return store, time.Duration(cfg.Trustlist.RefreshIntervalMs) * time.Millisecond, nil
+}
+
+// runTrustlistRefreshLoop fetches once immediately and then once every
+// interval, until ctx ends. It returns only when ctx ends. interval must be
+// positive and logger must be non-nil.
+//
+// The first fetch belongs here, inside the loop, rather than at the assembly
+// that starts it: run in a goroutine it cannot hold up startup, and a network
+// failure at start must not keep the agent from coming up — a machine that
+// already has a cached list goes on working from it.
+//
+// EVERY round is logged, the successful ones included. A refresh loop that has
+// been failing silently for three months and no refresh loop at all are the
+// same deployment, and the log is the only thing that tells them apart.
+//
+// The levels say what an operator should do about a round:
+//
+//   - Error for a list that was REFUSED — trustlist.ErrSerialRegressed or
+//     trustlist.ErrUntrustedList. Either the bytes are not ones the trustlist
+//     root signed, or they carry a serial from before a revocation. Those bytes
+//     can be the ones the url served or the ones sitting in this machine's own
+//     cache, and the error does not say which, so neither the message nor the
+//     fields on this line claim one. Neither failure resembles a timeout and
+//     neither improves on a retry, so neither may be left among them.
+//   - Warn for every other failure. The round produced no list; the machine
+//     keeps the list it has and the next round may well succeed.
+//   - Info for a round that worked, and for the round that was still in flight
+//     when ctx ended. Shutdown is not a fault, and a Warn on every clean stop
+//     teaches operators to skip the line that reports a real one.
+//
+// A refusal is classified before shutdown is: a stop that happens to coincide
+// with a refused list must not hide the refusal.
+func runTrustlistRefreshLoop(ctx context.Context, refresher trustlistRefresher, interval time.Duration,
+	logger *slog.Logger) {
+	refresh := func() {
+		// Refresh returns a Trust alongside its error, and on failure that
+		// Trust is the state this machine can still offer. Both go into the
+		// line: an operator needs to know that this round failed AND what is
+		// still being trusted meanwhile.
+		trust, err := refresher.Refresh(ctx)
+		switch {
+		case err == nil:
+			logger.Info(trustlistRefreshedMsg,
+				"component", "cli",
+				"status", trust.Status.String(),
+				"serial", trust.Serial,
+				"expires", trust.ExpiresAt.Format(time.RFC3339))
+		case errors.Is(err, trustlist.ErrSerialRegressed) || errors.Is(err, trustlist.ErrUntrustedList):
+			logger.Error(trustlistRefusedMsg,
+				"component", "cli",
+				"error", err.Error(),
+				"still_status", trust.Status.String(),
+				"still_serial", trust.Serial,
+				"reported_state", trustlistReportedStateNote,
+				"consequence", "the list this round produced was NOT adopted; still_status/still_serial "+
+					"is what this machine has to go on",
+				"remedy", "inspect this machine's trustlist cache and the list the url serves, in that "+
+					"order; retrying changes neither outcome")
+		case ctx.Err() != nil:
+			logger.Info(trustlistRefreshStoppedMsg,
+				"component", "cli",
+				"error", err.Error(),
+				"still_status", trust.Status.String(),
+				"still_serial", trust.Serial)
+		default:
+			logger.Warn(trustlistRefreshFailedMsg,
+				"component", "cli",
+				"error", err.Error(),
+				"still_status", trust.Status.String(),
+				"still_serial", trust.Serial,
+				"reported_state", trustlistReportedStateNote)
+		}
+	}
+
+	refresh()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			refresh()
+		}
+	}
+}
+
 // pluginSignaturePolicy is the signature policy cfg asks for, in the comparable
 // form a running Loader reports through Loader.SignaturePolicy.
 //
@@ -668,7 +839,7 @@ func refusePluginDeploymentChanged(cmdContext, manifestPath string, snapshot []b
 }
 
 // newPluginsCommand builds `agent plugins`, the operator's handle on the WASM
-// plugin deployment. Its seven subcommands fall into two groups that share
+// plugin deployment. Its subcommands fall into two groups that share
 // nothing but the noun:
 //
 //   - status and reload are a view of THIS PROCESS: both read the loader serve
@@ -699,7 +870,10 @@ func refusePluginDeploymentChanged(cmdContext, manifestPath string, snapshot []b
 //     grouped with status and reload instead. cache belongs to this group too:
 //     it reads the plugins config and works on the cache directory, and
 //     nothing it removes reaches a running process until the next reload
-//     re-fetches it.
+//     re-fetches it. trustlist sits with keygen and sign rather than with
+//     those three: it reads no config and writes no manifest. Its sign is the
+//     publisher's side of the official trust list, and its refresh and show
+//     act on the trustlist cache directory their own flags name.
 func newPluginsCommand(application *app.App, out io.Writer) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "plugins",
@@ -713,6 +887,7 @@ func newPluginsCommand(application *app.App, out io.Writer) *cobra.Command {
 	cmd.AddCommand(newPluginsKeygenCommand(out))
 	cmd.AddCommand(newPluginsSignCommand(out))
 	cmd.AddCommand(newPluginsCacheCommand(out))
+	cmd.AddCommand(newPluginsTrustlistCommand(out))
 	return cmd
 }
 

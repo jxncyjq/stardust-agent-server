@@ -1087,3 +1087,226 @@ func TestDefaultConfigPathIfPresentIgnoresADirectoryOfThatName(t *testing.T) {
 		t.Errorf("DefaultConfigPathIfPresent() = %q, want \"\" for a directory", got)
 	}
 }
+
+// TestTrustlistIsDisabledByAnEmptyURL：url 为空就是「没配远程清单」。
+//
+// 不做布尔开关：「未声明的布尔值该取哪一边」在这里没有安全上的正确答案——
+// 联网能拿到撤销（更安全），不联网不引入新攻击面（也更安全）。用空串表达
+// 「没配」沿用 plugins.keyring 的既有做法，把这个歧义整个绕开。
+func TestTrustlistIsDisabledByAnEmptyURL(t *testing.T) {
+	var cfg PluginTrustlistConfig
+	if cfg.Enabled() {
+		t.Error("空 url 的 trustlist 被当成启用了")
+	}
+	cfg.URL = "https://example.com/trust/trustlist.json"
+	if !cfg.Enabled() {
+		t.Error("配了 url 的 trustlist 被当成没启用")
+	}
+}
+
+// TestTrustlistIsDisabledByAWhitespaceOnlyURL：url 只含空白字符（如 "   "）
+// 时，TrimSpace 之后是空串，与完全没写 url 同义，Enabled() 必须判为未启用。
+// Enabled() 的实现本身早已这样写，这里只是给这条边界补一条独立回归测试。
+func TestTrustlistIsDisabledByAWhitespaceOnlyURL(t *testing.T) {
+	cfg := PluginTrustlistConfig{URL: "   "}
+	if cfg.Enabled() {
+		t.Error("只含空白字符的 url 被当成启用了")
+	}
+}
+
+func TestValidatePluginsChecksTrustlist(t *testing.T) {
+	base := func() PluginsConfig {
+		return PluginsConfig{
+			Manifest:    "plugins.json",
+			Root:        "plugins",
+			ApplyWaitMs: 1000,
+			Limits:      PluginLimitsConfig{TimeoutMs: 1000},
+			Fetch:       PluginFetchConfig{TimeoutMs: 1000, MaxBytes: 1024},
+			Health:      PluginHealthConfig{MaxConsecutiveFaults: 3},
+		}
+	}
+
+	t.Run("配了 url 但没配 cache", func(t *testing.T) {
+		cfg := base()
+		cfg.Trustlist = PluginTrustlistConfig{
+			URL:               "https://example.com/trust/trustlist.json",
+			RefreshIntervalMs: 21600000,
+		}
+		err := validatePlugins(cfg)
+		if err == nil {
+			t.Fatal("没有落点的 trustlist 被接受了")
+		}
+		if !strings.Contains(err.Error(), "cache") {
+			t.Errorf("错误没说是 cache 的问题：%v", err)
+		}
+	})
+
+	t.Run("refresh_interval_ms 非正", func(t *testing.T) {
+		cfg := base()
+		cfg.Trustlist = PluginTrustlistConfig{
+			URL:               "https://example.com/trust/trustlist.json",
+			Cache:             "trustlist",
+			RefreshIntervalMs: 0,
+		}
+		if err := validatePlugins(cfg); err == nil {
+			t.Fatal("refresh_interval_ms=0 被接受了")
+		}
+	})
+
+	t.Run("url 不是 https", func(t *testing.T) {
+		cfg := base()
+		cfg.Trustlist = PluginTrustlistConfig{
+			URL:               "http://example.com/trust/trustlist.json",
+			Cache:             "trustlist",
+			RefreshIntervalMs: 21600000,
+		}
+		err := validatePlugins(cfg)
+		if err == nil {
+			t.Fatal("http:// 的清单地址被接受了")
+		}
+		if !strings.Contains(err.Error(), "https") {
+			t.Errorf("错误没说是 scheme 的问题：%v", err)
+		}
+	})
+
+	t.Run("没配 url 时其余字段不受检查", func(t *testing.T) {
+		cfg := base()
+		cfg.Trustlist = PluginTrustlistConfig{}
+		if err := validatePlugins(cfg); err != nil {
+			t.Errorf("没启用远程清单的配置被拒了：%v", err)
+		}
+	})
+
+	// url 前导空白：Enabled() 用 TrimSpace 后的字符串判「是否启用」，判为已
+	// 启用；但 https 判据历史上判在未 TrimSpace 的原始字符串上，于是错误文案
+	// 会说「必须是 https」而真正的问题是前导空白。这里断言错误确实指名
+	// whitespace，而不是把诊断信息安在 https 头上。
+	t.Run("url 带前导空白", func(t *testing.T) {
+		cfg := base()
+		cfg.Trustlist = PluginTrustlistConfig{
+			URL:               " https://example.com/trust/trustlist.json",
+			Cache:             "trustlist",
+			RefreshIntervalMs: 21600000,
+		}
+		err := validatePlugins(cfg)
+		if err == nil {
+			t.Fatal("带前导空白的 url 被接受了")
+		}
+		if !strings.Contains(err.Error(), "whitespace") {
+			t.Errorf("错误没说是 whitespace 的问题：%v", err)
+		}
+	})
+
+	// url 带尾随空白，覆盖 TrimSpace 判据的另一侧。
+	t.Run("url 带尾随空白", func(t *testing.T) {
+		cfg := base()
+		cfg.Trustlist = PluginTrustlistConfig{
+			URL:               "https://example.com/trust/trustlist.json ",
+			Cache:             "trustlist",
+			RefreshIntervalMs: 21600000,
+		}
+		err := validatePlugins(cfg)
+		if err == nil {
+			t.Fatal("带尾随空白的 url 被接受了")
+		}
+		if !strings.Contains(err.Error(), "whitespace") {
+			t.Errorf("错误没说是 whitespace 的问题：%v", err)
+		}
+	})
+}
+
+// TestValidatePluginsChecksTrustlistEvenWithoutAManifest：plugins.trustlist
+// 说的是「这个部署信任哪些签名钥匙」，与有没有配 plugins.manifest（本地插件
+// 清单）是两件独立的事。validatePlugins 顶部有一条既有早退——manifest 未配
+// 就直接 return nil——这条早退只该管 Root/ApplyWaitMs/Limits/Fetch/Health 这些
+// 从属于本地清单的字段，trustlist 的三条校验必须在它之前就生效，不然一段
+// 只想预热信任缓存、暂不启用本地插件清单的部署，配一段彻底非法的 trustlist
+// （明文 url + 空 cache + refresh_interval_ms 非正）也会 Load 成功——真正的
+// 症状要等到第一次后台刷新才会出现，离配置错误的位置很远。
+//
+// 三种非法各测一条，Manifest 全部留空。
+func TestValidatePluginsChecksTrustlistEvenWithoutAManifest(t *testing.T) {
+	t.Run("http 明文", func(t *testing.T) {
+		cfg := PluginsConfig{
+			Trustlist: PluginTrustlistConfig{
+				URL:               "http://example.com/trust/trustlist.json",
+				Cache:             "trustlist",
+				RefreshIntervalMs: 21600000,
+			},
+		}
+		err := validatePlugins(cfg)
+		if err == nil {
+			t.Fatal("manifest 为空时，http:// 的 trustlist url 被接受了")
+		}
+		if !strings.Contains(err.Error(), "https") {
+			t.Errorf("错误没说是 scheme 的问题：%v", err)
+		}
+	})
+
+	t.Run("cache 为空", func(t *testing.T) {
+		cfg := PluginsConfig{
+			Trustlist: PluginTrustlistConfig{
+				URL:               "https://example.com/trust/trustlist.json",
+				RefreshIntervalMs: 21600000,
+			},
+		}
+		err := validatePlugins(cfg)
+		if err == nil {
+			t.Fatal("manifest 为空时，没有落点的 trustlist 被接受了")
+		}
+		if !strings.Contains(err.Error(), "cache") {
+			t.Errorf("错误没说是 cache 的问题：%v", err)
+		}
+	})
+
+	t.Run("refresh_interval_ms 非正", func(t *testing.T) {
+		cfg := PluginsConfig{
+			Trustlist: PluginTrustlistConfig{
+				URL:               "https://example.com/trust/trustlist.json",
+				Cache:             "trustlist",
+				RefreshIntervalMs: 0,
+			},
+		}
+		err := validatePlugins(cfg)
+		if err == nil {
+			t.Fatal("manifest 为空时，refresh_interval_ms=0 的 trustlist 被接受了")
+		}
+		if !strings.Contains(err.Error(), "refresh_interval_ms") {
+			t.Errorf("错误没说是 refresh_interval_ms 的问题：%v", err)
+		}
+	})
+}
+
+// TestLoadDefaultsTrustlistRefreshIntervalMs：brief 里只给了 validatePlugins 的
+// 单元测试，没有覆盖 defaultConfig/Load 对 refresh_interval_ms 的默认值归一化
+// ——这条是本任务自己补的变异防护:「默认值写了但没人守着」的典型样子就是,
+// 实现者把默认值常量删掉或者忘记接进 defaultConfig(),而所有既有用例都不会
+// 因此变红。这里显式配置 url+cache、不写 refresh_interval_ms,断言 Load 之后
+// 它落在文档承诺的 6 小时（21600000ms）上,而不是 0。
+func TestLoadDefaultsTrustlistRefreshIntervalMs(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "agent.json")
+	if err := os.WriteFile(path, []byte(`{
+		"plugins": {
+			"manifest": "plugins.json",
+			"root": "plugins",
+			"apply_wait_ms": 1000,
+			"limits": {"timeout_ms": 1000},
+			"fetch": {"timeout_ms": 1000, "max_bytes": 1024},
+			"health": {"max_consecutive_faults": 3},
+			"trustlist": {"url": "https://example.com/trust/trustlist.json", "cache": "trustlist"}
+		}
+	}`), 0o644); err != nil {
+		t.Fatalf("WriteFile error = %v, want nil", err)
+	}
+
+	cfg, err := Load(ctx, Options{Path: path})
+	if err != nil {
+		t.Fatalf("Load(%q) error = %v, want nil", path, err)
+	}
+	if cfg.Plugins.Trustlist.RefreshIntervalMs != 21600000 {
+		t.Errorf("Load(%q).Plugins.Trustlist.RefreshIntervalMs = %d, want the default 21600000 when the key is omitted",
+			path, cfg.Plugins.Trustlist.RefreshIntervalMs)
+	}
+}
