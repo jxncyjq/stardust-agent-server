@@ -178,6 +178,24 @@ func parseRevokedSet(data []byte) (*revokedSet, error) {
 // 通过一次成功的 Decode：那之后字节已是合法 JSON，这里再遇到语法错误就属于不该
 // 发生的情况，照样报出来而不是当成没有重复键。同理，递归深度由那次 Decode 认可
 // 的形状封顶，不是由输入随意决定的。
+// duplicateKeyConsequence spells out what a duplicate of this particular key
+// would have cost, for the one key where the cost is the whole point of this
+// scan: a repeated top-level "revoked" makes the file read as an empty set,
+// which is the claim that this machine has never seen a revocation.
+//
+// Every other duplicate is refused for the same underlying reason (the second
+// key silently replaces the first) but does not carry that specific meaning,
+// so it gets no clause rather than a borrowed one. Naming the "revoked" case
+// on a duplicated "reason" would send the reader hunting for a repeat they do
+// not have.
+func duplicateKeyConsequence(at, key string) string {
+	if at == revokedFileName && key == "revoked" {
+		return ", and a duplicated \"revoked\" reads this file as an empty set — " +
+			"the claim that this machine has never seen a revocation"
+	}
+	return ""
+}
+
 func refuseDuplicateKeys(dec *json.Decoder, at string) error {
 	tok, err := dec.Token()
 	if err != nil {
@@ -202,10 +220,13 @@ func refuseDuplicateKeys(dec *json.Decoder, at string) error {
 					"%T, not a string", at, keyTok)
 			}
 			if _, dup := seen[key]; dup {
+				// The consequence named here has to match the key that was actually
+				// duplicated. Spelling out the top-level "revoked" case regardless of
+				// which key repeated sends the reader looking for a duplicate they do
+				// not have — the same defect this scan exists to stop, one level up.
 				return fmt.Errorf("%s names %q twice; Go's JSON decoder keeps only the last one, so the "+
-					"second key silently replaces everything the first one carried, and a duplicated "+
-					"\"revoked\" reads this file as an empty set — the claim that this machine has never "+
-					"seen a revocation", at, key)
+					"second key silently replaces everything the first one carried%s",
+					at, key, duplicateKeyConsequence(at, key))
 			}
 			seen[key] = struct{}{}
 			if err := refuseDuplicateKeys(dec, at+"."+key); err != nil {

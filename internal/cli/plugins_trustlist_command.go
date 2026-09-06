@@ -194,7 +194,11 @@ func runTrustlistSign(
 			"document was NOT signed. Published as it stands, every user machine would refuse it and "+
 			"report that the serial went backwards — which reads like an attack rather than a "+
 			"forgotten serial bump, and an urgent revocation would silently fail to arrive while "+
-			"everyone looked for a man in the middle", listPath, doc.Serial, published)
+			"everyone looked for a man in the middle. If the two numbers are equal, the other "+
+			"explanation is that this exact document is already committed — re-signing a published "+
+			"list (a lost or damaged .sig, a re-sign after fixing line endings, or simply committing "+
+			"before signing) lands here too, and advancing the serial by one is the way through",
+			listPath, doc.Serial, published)
 	}
 
 	keyData, err := os.ReadFile(privatePath)
@@ -234,11 +238,20 @@ func runTrustlistSign(
 	return nil
 }
 
-// gitLookupTimeout bounds each git subprocess. A publisher's repository is
-// small and the lookup reads one blob out of it, so a git command that has not
-// answered by now is stuck — on a lock another process holds, on a credential
+// gitLookupTimeout bounds the whole HEAD lookup — both git subprocesses share
+// this one budget, they are not given it each. A publisher's repository is
+// small and the lookup reads one blob out of it, so a lookup that has not
+// finished by now is stuck — on a lock another process holds, on a credential
 // prompt, on a filesystem that stopped responding — and a signing command that
 // hangs forever is worse than one that says what it was waiting for.
+//
+// Sharing the budget is the deliberate choice: what a publisher waiting at the
+// terminal cares about is how long the command can hang in total, not how the
+// time is divided between two invocations they cannot see. The cost is that a
+// slow first call leaves the second one less room, which shows up as the second
+// call being cancelled rather than the whole lookup timing out cleanly; the
+// error names the git command that was running when the deadline passed, so
+// that case is still diagnosable.
 const gitLookupTimeout = 30 * time.Second
 
 // gitHeadSerial reports the serial carried by the version of listPath that is
