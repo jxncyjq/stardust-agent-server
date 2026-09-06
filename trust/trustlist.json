@@ -1,17 +1,26 @@
 {
-  "serial": 1,
-  "issued_at": "2026-09-06T02:36:15Z",
-  "expires_at": "2026-10-06T02:36:15Z",
+  "serial": 3,
+  "issued_at": "2026-09-06T02:48:41Z",
+  "expires_at": "2026-10-06T02:48:41Z",
   "keyring": {
     "keys": [
       {
         "id": "dev-selftest",
         "algorithm": "ed25519",
         "public_key": "uHP9D5LbB8DWAUuN4h+gNUzV6pzTwetu2YlKFkCEf/w="
+      },
+      {
+        "id": "dev-second",
+        "algorithm": "ed25519",
+        "public_key": "O2A7xCRE7Nl3Nw6V3/c6UUjg2p0kBJ7JXAWYVEtpIV4="
       }
+    ],
+    "revoked": [
+      { "key_id": "dev-selftest", "revoked_at": "2026-09-06T02:48:41Z", "reason": "真机验证：模拟私钥泄漏" }
     ]
   },
   "publishers": [
-    { "key_id": "dev-selftest", "display_name": "自检用钥匙", "contact": "" }
+    { "key_id": "dev-selftest", "display_name": "自检用钥匙", "contact": "" },
+    { "key_id": "dev-second", "display_name": "第二位开发者", "contact": "dev2@example.com" }
   ]
 }

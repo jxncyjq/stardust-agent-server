@@ -1,5 +1,5 @@
 {
   "key_id": "root-2026",
   "algorithm": "ed25519",
-  "signature": "pkm2hEUgDwv+xUs3rg+Vl1AX0nqIV+cLow2IEgow3hfFx/c3IPbGZGVF1OIjrop6c1r+SbPv6KM/ex5MBNlvCg=="
+  "signature": "cqNb9ZydpGrDuxMyppwICdoz1XBb/eGxBNKcOWA3J6olFsrU4cpF8KPnwkQxHRvgpyFpntnxtOecXvdj3HFnCw=="
 }
