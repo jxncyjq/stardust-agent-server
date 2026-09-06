@@ -100,9 +100,10 @@ func newRevokedSet() *revokedSet {
 // parseRevokedSet 从 revoked-ever.json 的字节读回累积集。
 //
 // 它和这个包里其他解析器一样严格：未知字段、尾随内容、缺了 revoked 键、空
-// key_id、同一个 key_id 出现两次、不是 RFC 3339 的 revoked_at，都拒绝。而这里的
-// 理由比别处更重：一个被静默当成空集的损坏文件，说的是「这台机器从没见过任何
-// 撤销」——这是这个文件能造成的最坏的谎。宁可报错让调用方去决定怎么办。
+// key_id、同一个 key_id 出现两次、同一个 JSON 键在同一层出现两次、不是 RFC 3339
+// 的 revoked_at，都拒绝。而这里的理由比别处更重：一个被静默当成空集的损坏文件，
+// 说的是「这台机器从没见过任何撤销」——这是这个文件能造成的最坏的谎。宁可报错让
+// 调用方去决定怎么办。
 //
 // 缺了 revoked 键（`{}`）与 revoked 是 JSON null（`{"revoked":null}`）都算损坏，
 // 一并拒绝：marshal 永远写出 revoked 键（哪怕值是空数组），所以一份没有这个键的
@@ -128,6 +129,14 @@ func parseRevokedSet(data []byte) (*revokedSet, error) {
 	if dec.More() {
 		return nil, fmt.Errorf("parse revoked-ever: unexpected content after the JSON document")
 	}
+	// 重复键要单独再走一遍字节。上面那次 Decode 看不见它：encoding/json 对同一层
+	// 重复出现的键取最后一个，DisallowUnknownFields 只看键名认不认得、dec.More()
+	// 只看文档之后还有没有内容，两条规则都与「同一个键出现了几次」无关。放在
+	// Decode 成功之后是有意的：那时字节已经是合法 JSON，语法层面的抱怨由 Decode
+	// 用它更贴切的错误说完，这里只回答重复键这一个问题。
+	if err := refuseDuplicateKeys(json.NewDecoder(bytes.NewReader(data)), "revoked-ever.json"); err != nil {
+		return nil, fmt.Errorf("parse revoked-ever: %w", err)
+	}
 	if raw.Revoked == nil {
 		return nil, fmt.Errorf("parse revoked-ever: revoked-ever.json has no revoked key (or it is null); " +
 			"this file always carries the key, even when the list is empty, so a missing one means the file " +
@@ -149,6 +158,74 @@ func parseRevokedSet(data []byte) (*revokedSet, error) {
 		set.entries[entry.KeyID] = entry
 	}
 	return set, nil
+}
+
+// refuseDuplicateKeys 从 dec 读**一个** JSON 值，逐层拒绝同一个对象里出现两次的
+// 键。at 是这个值在文档里的位置，用来让错误指得出是哪一层重复了。
+//
+// 为什么需要它：encoding/json 对同一个对象里重复出现的键取**最后一个**，而且不
+// 报错。落在 revoked-ever.json 上，`{"revoked":[…真实记录…],"revoked":[]}` 会被
+// 解成一个 err == nil 的空集——「这台机器从没见过任何撤销」，这个文件能造成的最坏
+// 的谎；而它是唯一一种不响亮的坏法（删除、截断、`{}`、`null`、乱码、重复 key_id
+// 全都当场报错）。更糟的是它自我抹除：空集顺着一次刷新写回磁盘，那条撤销就永久
+// 消失，事后连取证都做不了。
+//
+// 逐层做而不是只查顶层：条目里重复的 key_id（`{"key_id":"被撤销的",
+// "key_id":"无关的"}`）走的是同一条 last-wins 规则，后果是一条撤销无声换了主人，
+// 被撤销的那把钥匙就此不再被拒。两层是同一个洞的两个位置。
+//
+// 它靠 Token() 走字节流，所以看得见解码器丢掉的那些键。调用方必须先让同一段字节
+// 通过一次成功的 Decode：那之后字节已是合法 JSON，这里再遇到语法错误就属于不该
+// 发生的情况，照样报出来而不是当成没有重复键。同理，递归深度由那次 Decode 认可
+// 的形状封顶，不是由输入随意决定的。
+func refuseDuplicateKeys(dec *json.Decoder, at string) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return fmt.Errorf("re-reading %s to look for duplicate keys: %w", at, err)
+	}
+	delim, isDelim := tok.(json.Delim)
+	if !isDelim {
+		// 标量（字符串、数字、true/false/null）：没有键可重复。
+		return nil
+	}
+	switch delim {
+	case '{':
+		seen := make(map[string]struct{})
+		for dec.More() {
+			keyTok, err := dec.Token()
+			if err != nil {
+				return fmt.Errorf("re-reading %s to look for duplicate keys: %w", at, err)
+			}
+			key, ok := keyTok.(string)
+			if !ok {
+				return fmt.Errorf("re-reading %s to look for duplicate keys: an object key came back as "+
+					"%T, not a string", at, keyTok)
+			}
+			if _, dup := seen[key]; dup {
+				return fmt.Errorf("%s names %q twice; Go's JSON decoder keeps only the last one, so the "+
+					"second key silently replaces everything the first one carried, and a duplicated "+
+					"\"revoked\" reads this file as an empty set — the claim that this machine has never "+
+					"seen a revocation", at, key)
+			}
+			seen[key] = struct{}{}
+			if err := refuseDuplicateKeys(dec, at+"."+key); err != nil {
+				return err
+			}
+		}
+	case '[':
+		for i := 0; dec.More(); i++ {
+			if err := refuseDuplicateKeys(dec, fmt.Sprintf("%s[%d]", at, i)); err != nil {
+				return err
+			}
+		}
+	default:
+		return fmt.Errorf("re-reading %s to look for duplicate keys: a value started with %q", at, delim)
+	}
+	// 吃掉收尾的 } 或 ]，好让调用者的 dec.More() 问的是外层还有没有内容。
+	if _, err := dec.Token(); err != nil {
+		return fmt.Errorf("re-reading %s to look for duplicate keys: %w", at, err)
+	}
+	return nil
 }
 
 // mergeFrom 把 keyringRaw（清单信封里那段 keyring 文档）的 revoked 条目并进

@@ -1,7 +1,11 @@
 package trustlist
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -336,6 +340,22 @@ func TestParseRevokedSetRefusesGarbage(t *testing.T) {
 			`{"revoked":[{"key_id":"x","revoked_at":"yesterday"}]}`,
 			`parse revoked-ever: revoked-ever.json revoked[0] key "x" revoked_at "yesterday" is not RFC 3339`,
 		},
+		// 重复的键走的是 encoding/json 的 last-wins：第二个 revoked 键把第一个
+		// 整段顶掉，解码器不报错，DisallowUnknownFields 与 dec.More() 也都不管。
+		// 读成空集就是「这台机器从没见过任何撤销」——最坏的那句谎，而且是唯一一种
+		// 不响亮的坏法。
+		{
+			"revoked 键出现两次",
+			`{"revoked":[{"key_id":"x","revoked_at":"2026-08-29T10:00:00Z","reason":"私钥泄漏"}],"revoked":[]}`,
+			`parse revoked-ever: revoked-ever.json names "revoked" twice`,
+		},
+		// 同一条 last-wins 规则在条目里同样成立：重复的 key_id 让一条撤销无声
+		// 换了主人，被撤销的那把钥匙就此不再被拒。
+		{
+			"条目里的 key_id 出现两次",
+			`{"revoked":[{"key_id":"被撤销的","key_id":"无关的"}]}`,
+			`parse revoked-ever: revoked-ever.json.revoked[0] names "key_id" twice`,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -395,5 +415,99 @@ func TestAssembleRefusesAnEmptyTrustSet(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "revoked") {
 		t.Errorf("错误没说清是撤销导致的：%v", err)
+	}
+}
+
+// withADuplicateRevokedKey 在一份真实的 revoked-ever.json 后面再补一个空的
+// revoked 键，其余字节一个不动。
+//
+// 它刻意不重新构造整份文件：这条用例要证的是「一份**已经记着真实撤销**的文件被
+// 补上一个重复键之后会怎样」，重新构造会把那条记录换成夹具自己造的东西，也就不
+// 再是同一件事了。
+func withADuplicateRevokedKey(t *testing.T, record []byte) []byte {
+	t.Helper()
+	trimmed := strings.TrimRight(string(record), " \t\r\n")
+	if !strings.HasSuffix(trimmed, "}") {
+		t.Fatalf("revoked-ever.json 不是以 } 收尾，夹具改不动它：%s", record)
+	}
+	return []byte(trimmed[:len(trimmed)-1] + `,"revoked":[]}` + "\n")
+}
+
+// TestADamagedRevocationRecordIsNeverReadAsAnEmptySet 把三组对照放在同一条生产
+// 链路（Store.Current / Store.Refresh / 磁盘上的字节）上走一遍：
+//
+//	A 删掉 revoked-ever.json —— Current 必须响亮
+//	B revoked 键写两次       —— Current 同样必须响亮
+//	C B 之后再来一份 revoked 段为空的新清单 —— 必须被拒，且磁盘上那份记录一个字节都不许变
+//
+// C 才是这三组的要害。encoding/json 对同一层重复出现的键取最后一个，于是
+// `{"revoked":[…真实记录…],"revoked":[]}` 曾经被读成一个 err == nil 的空集；
+// 空集顺着 Refresh 走下去会被当成「这台机器从没见过任何撤销」写回磁盘，
+// 累积集就此永久消失，事后连取证都做不了——本期第一不变量上唯一一条安静的破口。
+//
+// A 是对照组：它证明这个文件的其余坏法本来就是响亮的，B 的静默不是「这类损坏
+// 一律如此」，而是单独漏掉的一条。
+func TestADamagedRevocationRecordIsNeverReadAsAnEmptySet(t *testing.T) {
+	signer := newSigner(t)
+	list, sig := signer(7, withSecondKeyRevoking(t, "dev-abc"))
+	cur := newServeList(list, sig)
+	srv := newListServer(t, cur)
+	cacheDir := t.TempDir()
+	store := newTestStore(t, srv, cacheDir, fixedNow)
+	if _, err := store.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+
+	recordPath := filepath.Join(cacheDir, revokedFileName)
+	recorded, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", revokedFileName, err)
+	}
+	if !strings.Contains(string(recorded), "dev-abc") {
+		t.Fatalf("夹具没造出要保护的那条记录：%s", recorded)
+	}
+
+	// A：文件没了。
+	if err := os.Remove(recordPath); err != nil {
+		t.Fatalf("remove %s: %v", revokedFileName, err)
+	}
+	if _, err := store.Current(); err == nil {
+		t.Error("A：revoked-ever.json 被删掉，Current 却报告一切正常")
+	}
+
+	// B：文件在，但 revoked 键写了两次，真实那条记录还原样躺在里面。
+	duplicated := withADuplicateRevokedKey(t, recorded)
+	if !strings.Contains(string(duplicated), "dev-abc") {
+		t.Fatalf("夹具把要保护的那条记录弄丢了：%s", duplicated)
+	}
+	if err := os.WriteFile(recordPath, duplicated, 0o600); err != nil {
+		t.Fatalf("write %s: %v", revokedFileName, err)
+	}
+	// B 与 C 之间刻意不用 t.Fatal 断开：C 才是这条破口真正的后果，B 一失守就停下
+	// 会让 C 永远没机会说话，而两者是各自独立的性质（读的时候响不响亮 / 磁盘上那
+	// 份记录还在不在）。
+	switch _, currentErr := store.Current(); {
+	case currentErr == nil:
+		t.Error("B：revoked 键写了两次，Current 却把它读成了「这台机器从没见过任何撤销」")
+	case !strings.Contains(currentErr.Error(), `names "revoked" twice`):
+		t.Errorf("B：错误没点明坏在重复的 revoked 键上：%v", currentErr)
+	}
+
+	// C：一份 serial 更大、签名完全合法、revoked 段为空的清单。正常路径下它会被
+	// 接受并把并集写回磁盘——那一写就是撤销永久消失的那一刻。
+	list9, sig9 := signer(9, withSecondKeyRevoking(t))
+	cur.set(list9, sig9)
+	if _, err := store.Refresh(context.Background()); err == nil {
+		t.Error("C：累积集读不回来，Refresh 却成功了——它写回去的是一个空集")
+	}
+	after, err := os.ReadFile(recordPath)
+	if err != nil {
+		t.Fatalf("read %s: %v", revokedFileName, err)
+	}
+	if !bytes.Equal(after, duplicated) {
+		t.Errorf("C：那次被拒的刷新改写了累积集：\nbefore=%s\nafter=%s", duplicated, after)
+	}
+	if !strings.Contains(string(after), "dev-abc") {
+		t.Errorf("C：磁盘上那条撤销记录没了，此后连取证都做不了：%s", after)
 	}
 }
