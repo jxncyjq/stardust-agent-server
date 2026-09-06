@@ -227,7 +227,9 @@ func (s *PluginConsentService) List(ctx context.Context) ([]server.PluginView, e
 			views = append(views, view)
 			continue
 		}
-		pm, _, loadErr := manifest.LoadPackage(dir, keyring)
+		// 三态在 Task 6 接线（PluginView 的 trust_state / trust_publisher /
+		// trust_detail 三个字段）：Provenance 在这里被丢弃。
+		pm, _, _, loadErr := manifest.LoadPackage(dir, manifest.TrustInput{Keyring: keyring})
 		if loadErr != nil {
 			view.DeclaredUnresolved = true
 			view.DeclaredUnresolvedReason = server.DeclaredUnresolvedLoadFailed
@@ -375,7 +377,8 @@ func (s *PluginConsentService) Grant(ctx context.Context, name string, req serve
 	if err != nil {
 		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w", name, err)
 	}
-	pm, _, err := manifest.LoadPackage(dir, s.keyringFn())
+	// 三态在 Task 6 接线（授权响应也要带上信任状态）：Provenance 在这里被丢弃。
+	pm, _, _, err := manifest.LoadPackage(dir, manifest.TrustInput{Keyring: s.keyringFn()})
 	if err != nil {
 		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w", name, err)
 	}
@@ -498,7 +501,10 @@ func (s *PluginConsentService) Resolve(ctx context.Context, name string) (server
 	if err != nil {
 		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w", name, err)
 	}
-	pm, _, err := manifest.LoadPackage(dir, s.keyringFn())
+	// 三态在 Task 6 接线（PluginView 的三个信任字段）：Provenance 在这里被丢弃，
+	// 所以下面的 ErrUntrustedPackage 分支只会命中签名对不上那一类，不再命中缺
+	// 签名与未知钥匙——它们现在是判定。
+	pm, _, _, err := manifest.LoadPackage(dir, manifest.TrustInput{Keyring: s.keyringFn()})
 	if err != nil {
 		if errors.Is(err, manifest.ErrUntrustedPackage) {
 			// The bytes just failed signature verification, so they do not

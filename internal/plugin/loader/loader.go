@@ -1112,7 +1112,11 @@ func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string)
 	// goes through l.fail like every other one, so the entry lands in
 	// StateFailed with a LastError naming the signature, and the other entries
 	// keep converging.
-	pm, wasm, err := manifest.LoadPackage(dir, l.keyring)
+	// 三态在 Task 4 接线：Provenance 在这里被丢弃，所以本次收敛只按 LoadPackage
+	// 仍然返回的错误判定（签名对不上、plugin.json 与 plugin.wasm 的 sha256 对不
+	// 上）。缺签名与「签它的 key 不在信任集里」现在都是 ProvenanceUnsigned 判定，
+	// 不再是错误——l.keyring 非 nil 时它们不再被这里拦下。
+	pm, wasm, _, err := manifest.LoadPackage(dir, manifest.TrustInput{Keyring: l.keyring})
 	if err != nil {
 		// An untrusted package does not belong in the cache: the bytes just
 		// failed signature verification, and leaving them there means every

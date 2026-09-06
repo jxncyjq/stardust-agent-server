@@ -1348,12 +1348,13 @@ func writePluginStatus(w io.Writer, manifestPath, root string, rows []pluginStat
 //  1. fetch.Fetch — the digest gates the bytes; mismatched bytes never reach
 //     disk.
 //  2. remote.Cache.Put — unpack and atomic placement in the plugin cache.
-//  3. manifest.LoadPackage(dir, keyring) — SIGNATURE VERIFICATION, but only
-//     when this deployment's plugins config sets "require_signature": true;
-//     with it false, LoadPackage skips signature checking entirely and only
-//     the wasm sha256 check runs (the command's own output says so on that
-//     path — see the "signature NOT verified" line in runPluginsInstall).
-//     Nothing past this step runs if verification that DID run fails.
+//  3. manifest.LoadPackage(dir, manifest.TrustInput{...}) — reads the package
+//     and judges its provenance. It refuses a plugin.sig that is malformed or
+//     that does not verify against the trusted key it names, and refuses a
+//     plugin.wasm that does not match plugin.json's sha256; a MISSING
+//     signature, or one made by a key the deployment's trust set does not
+//     name, is a Provenance verdict rather than a refusal. Nothing past this
+//     step runs if step 3 returns an error.
 //  4. manifest.DraftEntry -> manifest.AddEntry -> manifest.WriteDeployment.
 //
 // Nothing is ever written to plugins.json before step 3 succeeds: a
@@ -1573,7 +1574,9 @@ func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag
 	// this fails, which holds simply because nothing below this line has run
 	// yet: no Deployment has been mutated, and WriteDeployment has not been
 	// called.
-	pm, _, err := manifest.LoadPackage(dir, keyring)
+	// 三态在 Task 5 接线（--accept-unsigned）：Provenance 在这里被丢弃，所以本次
+	// 安装只按 LoadPackage 仍然返回的错误判定。
+	pm, _, _, err := manifest.LoadPackage(dir, manifest.TrustInput{Keyring: keyring})
 	if err != nil {
 		return fmt.Errorf("plugins install: %w", err)
 	}
@@ -1953,7 +1956,9 @@ func runPluginsGrant(ctx context.Context, out io.Writer, nameArg, capabilitiesFl
 	if err != nil {
 		return fmt.Errorf("plugins grant: %w", err)
 	}
-	pm, _, err := manifest.LoadPackage(dir, keyring)
+	// 三态在 Task 6 接线（计划 §6.3：grant 不做信任校验，但要把信任状态带上）：
+	// Provenance 在这里被丢弃。
+	pm, _, _, err := manifest.LoadPackage(dir, manifest.TrustInput{Keyring: keyring})
 	if err != nil {
 		return fmt.Errorf("plugins grant: %w", err)
 	}

@@ -2790,7 +2790,7 @@ func simulateInstall(ctx context.Context, remote RemoteConfig, keyring *sign.Key
 	// when this fails: no Deployment has been read or mutated, and
 	// WriteDeployment has not been called — which is what makes "plugins.json
 	// unchanged on a signature failure" hold.
-	pm, _, err := manifest.LoadPackage(dir, keyring)
+	pm, _, _, err := manifest.LoadPackage(dir, manifest.TrustInput{Keyring: keyring})
 	if err != nil {
 		return installOutcome{}, fmt.Errorf("simulate install: %w", err)
 	}
@@ -3542,7 +3542,7 @@ func (a *e2eConsentAdapter) List(_ context.Context) ([]server.PluginView, error)
 		if err != nil {
 			return nil, err
 		}
-		pm, _, err := manifest.LoadPackage(dir, nil)
+		pm, _, _, err := manifest.LoadPackage(dir, manifest.TrustInput{})
 		if err != nil {
 			return nil, fmt.Errorf("plugin consent: load declared manifest for %q: %w", entry.Name, err)
 		}
@@ -3573,7 +3573,7 @@ func (a *e2eConsentAdapter) Resolve(_ context.Context, name string) (server.Plug
 	if err != nil {
 		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w", name, err)
 	}
-	pm, _, err := manifest.LoadPackage(dir, nil)
+	pm, _, _, err := manifest.LoadPackage(dir, manifest.TrustInput{})
 	if err != nil {
 		if errors.Is(err, manifest.ErrUntrustedPackage) {
 			return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w: %w", name, server.ErrPluginUntrusted, err)
@@ -3614,7 +3614,7 @@ func (a *e2eConsentAdapter) Grant(ctx context.Context, name string, req server.G
 	if err != nil {
 		return server.ConsentResult{}, fmt.Errorf("%s: %w", e2eConsentGrantActor, err)
 	}
-	pm, _, err := manifest.LoadPackage(dir, nil)
+	pm, _, _, err := manifest.LoadPackage(dir, manifest.TrustInput{})
 	if err != nil {
 		return server.ConsentResult{}, fmt.Errorf("%s: %w", e2eConsentGrantActor, err)
 	}
