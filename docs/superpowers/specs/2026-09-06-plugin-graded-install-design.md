@@ -43,19 +43,23 @@ S2 让它落地：**已登记 → 显示开发者名直接装；未签名 → �
 `LoadPackage` 改成返回一个**判定**，而不是「过 / 不过」：
 
 ```go
-// TrustState 是一个插件包在这台机器上的信任判定。
-type TrustState int
+// ProvenanceState 是一个插件包在这台机器上的来源判定。
+//
+// 命名刻意不叫 Trust：loader 与 cli 会同时 import 本包与 internal/plugin/trustlist，
+// 而那个包已经有一个 Trust（清单本身的时效状态 fresh/stale/unavailable）。两个不同
+// 概念同名出现在同一份 import 里，是最容易读错的那种形状。
+type ProvenanceState int
 
 const (
-    // TrustUnsigned：没有 plugin.sig，或签名的 key 不在信任集里。
-    TrustUnsigned TrustState = iota
-    TrustRegistered
-    TrustRevoked
+    // ProvenanceUnsigned：没有 plugin.sig，或签名的 key 不在信任集里。
+    ProvenanceUnsigned ProvenanceState = iota
+    ProvenanceRegistered
+    ProvenanceRevoked
 )
 
-// Trust 是 LoadPackage 对一个包的信任判定。它只报告，不裁决。
-type Trust struct {
-    State     TrustState
+// Provenance 是 LoadPackage 对一个包的来源判定。它只报告，不裁决。
+type Provenance struct {
+    State     ProvenanceState
     KeyID     sign.KeyID // Registered 与 Revoked 时有值
     Publisher string     // 已登记发布者的显示名，来自清单的 publishers
     Reason    string     // Revoked 时：当初写下的撤销理由
@@ -74,7 +78,7 @@ type Trust struct {
 ### 为什么「签了但 key 不在信任集」归到 Unsigned
 
 它对用户的意义与「压根没签」**完全相同**：没有任何已登记的开发者为这份字节背书。多一态只会
-让策略表多一行而不多一个决定。`Trust.KeyID` 在这种情况下**留空**——那把 key 这台机器不认识，
+让策略表多一行而不多一个决定。`Provenance.KeyID` 在这种情况下**留空**——那把 key 这台机器不认识，
 把它显示出来只会让操作者以为它有意义。
 
 ### 边界：LoadPackage 只报告，不裁决
@@ -292,7 +296,7 @@ var ErrRevokedPublisher = errors.New("plugin package is signed by a revoked key"
 
 | 用例 | 断言 |
 |---|---|
-| 已登记的包 | 挂载，`Trust.Publisher` 是清单里的显示名 |
+| 已登记的包 | 挂载，`Provenance.Publisher` 是清单里的显示名 |
 | 未签名 + 无确认 | 拒绝挂载，错误裹 `ErrUnsignedNotAccepted` |
 | 未签名 + 确认摘要一致 | 挂载 |
 | 未签名 + 确认摘要**不一致** | 拒绝，且错误文本与「从未认过」**可区分** |
