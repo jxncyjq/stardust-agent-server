@@ -2,10 +2,12 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -14,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -91,7 +94,10 @@ func TestTrustlistSignRefusesAMalformedDocumentBeforeItReadsTheKey(t *testing.T)
 // 自验调用里——删掉自验，这条用例就会红——但「两半对不上」这一支只有拿着真
 // root 私钥时才走得到，那属于人工验证的范围。
 func TestTrustlistSignRefusesAnInconsistentPrivateKey(t *testing.T) {
-	dir := t.TempDir()
+	// 走完整命令路径的用例要落在一个 git 仓库里：生产的 sign 会去 HEAD 取
+	// 已发布的那一版 serial，不在仓库里就到不了它真正想考的那一步。这里的
+	// HEAD 不含清单文件，于是已发布的 serial 是 0，任何合法清单都过得去。
+	dir := newGitWorkTree(t)
 	in := filepath.Join(dir, "trustlist.json")
 	if err := os.WriteFile(in, validTrustlistJSON(t), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
@@ -120,7 +126,10 @@ func TestTrustlistSignRefusesAnInconsistentPrivateKey(t *testing.T) {
 // 把自验换成任何一种只拿这把钥匙自己的公钥去验的检查，上一条仍然红（那把钥匙
 // 本来就自相矛盾），这一条会绿——而那正是把一份没人能用的签名写到磁盘上。
 func TestTrustlistSignRefusesAKeyThatIsNotTheEmbeddedRoot(t *testing.T) {
-	dir := t.TempDir()
+	// 走完整命令路径的用例要落在一个 git 仓库里：生产的 sign 会去 HEAD 取
+	// 已发布的那一版 serial，不在仓库里就到不了它真正想考的那一步。这里的
+	// HEAD 不含清单文件，于是已发布的 serial 是 0，任何合法清单都过得去。
+	dir := newGitWorkTree(t)
 	in := filepath.Join(dir, "trustlist.json")
 	if err := os.WriteFile(in, validTrustlistJSON(t), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
@@ -406,7 +415,8 @@ func TestTrustlistSignWritesASignatureOverExactlyTheDocumentItVerified(t *testin
 	}
 
 	var buf bytes.Buffer
-	if err := runTrustlistSign(&buf, verify, in, keyPath, out); err != nil {
+	if err := runTrustlistSign(context.Background(), &buf, verify, firstPublication, in, keyPath,
+		out); err != nil {
 		t.Fatalf("sign: %v", err)
 	}
 
@@ -441,7 +451,10 @@ func TestTrustlistSignWritesASignatureOverExactlyTheDocumentItVerified(t *testin
 // trustlist.VerifyDocument 会给出这个错误。把命令构造时传的换成一个永远成功的
 // 桩（或任何别的检查），这条随即变红。
 func TestTrustlistSignCommandVerifiesThroughTheEmbeddedRoot(t *testing.T) {
-	dir := t.TempDir()
+	// 走完整命令路径的用例要落在一个 git 仓库里：生产的 sign 会去 HEAD 取
+	// 已发布的那一版 serial，不在仓库里就到不了它真正想考的那一步。这里的
+	// HEAD 不含清单文件，于是已发布的 serial 是 0，任何合法清单都过得去。
+	dir := newGitWorkTree(t)
 	in := filepath.Join(dir, "trustlist.json")
 	if err := os.WriteFile(in, validTrustlistJSON(t), 0o600); err != nil {
 		t.Fatalf("write: %v", err)
@@ -478,7 +491,7 @@ func TestTrustlistSignRefusesAMissingVerification(t *testing.T) {
 	writeTestPrivateKey(t, keyPath, "root-test")
 	out := filepath.Join(dir, "trustlist.sig")
 
-	err := runTrustlistSign(io.Discard, nil, in, keyPath, out)
+	err := runTrustlistSign(context.Background(), io.Discard, nil, firstPublication, in, keyPath, out)
 	if err == nil {
 		t.Fatal("没有自验也签了")
 	}
@@ -517,7 +530,8 @@ func TestTrustlistSignRefusesEmptyPaths(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			err := runTrustlistSign(io.Discard, verify, tc.in, tc.key, tc.out)
+			err := runTrustlistSign(context.Background(), io.Discard, verify, firstPublication,
+				tc.in, tc.key, tc.out)
 			if err == nil {
 				t.Fatalf("%s 是空串也签了", name)
 			}
@@ -693,6 +707,14 @@ func writeInconsistentPrivateKey(t *testing.T, path string, id sign.KeyID) {
 
 func validTrustlistJSON(t *testing.T) []byte {
 	t.Helper()
+	return trustlistJSONWithSerial(t, 1)
+}
+
+// trustlistJSONWithSerial 造一份除 serial 之外与 validTrustlistJSON 相同的合法
+// 清单。serial 单独拎出来，是因为「新的必须严格大于已发布的那一版」这条规则
+// 只有在两份 serial 能各自指定时才考得了。
+func trustlistJSONWithSerial(t *testing.T, serial int64) []byte {
+	t.Helper()
 	pub, _, err := sign.GenerateKey()
 	if err != nil {
 		t.Fatalf("GenerateKey: %v", err)
@@ -706,7 +728,7 @@ func validTrustlistJSON(t *testing.T) []byte {
 		t.Fatalf("unmarshal: %v", err)
 	}
 	data, err := json.Marshal(map[string]any{
-		"serial":     1,
+		"serial":     serial,
 		"issued_at":  "2026-09-05T02:00:00Z",
 		"expires_at": "2026-10-05T02:00:00Z",
 		"keyring":    map[string]any{"keys": []any{entryMap}},
@@ -780,4 +802,324 @@ func newSilentTLSServer(t *testing.T) *httptest.Server {
 	srv.StartTLS()
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// firstPublication 是「HEAD 里还没有这份清单」的 previousSerial 桩：任何合法清单
+// （serial 至少为 1）都严格大于它，于是不关心 serial 的用例可以照常走完全程。
+func firstPublication(context.Context, string) (int64, error) { return 0, nil }
+
+// runTestGit 在 dir 里跑一条 git 命令，失败即终止用例。
+//
+// 身份与签名设置用 -c 就地给定，不依赖跑测试这台机器的全局配置：一台开了
+// commit.gpgsign 的机器会让夹具在提交那一步卡住或失败，而那与被测的东西无关。
+//
+// 找不到 git 是响亮的失败而不是跳过。这一组用例考的正是「serial 与 git HEAD 里
+// 那一版比对」，没有 git 就没有 HEAD，跳过等于让这条规则在无人察觉的情况下重新
+// 变成没人守的。
+func runTestGit(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	full := append([]string{
+		"-c", "user.email=trustlist-test@example.invalid",
+		"-c", "user.name=trustlist test",
+		"-c", "commit.gpgsign=false",
+	}, args...)
+	cmd := exec.Command("git", full...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s in %s: %v\n%s", strings.Join(args, " "), dir, err, out)
+	}
+}
+
+// newGitWorkTree 造一个已经有一次提交、但 HEAD 里还没有任何清单文件的 git 仓库。
+func newGitWorkTree(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	runTestGit(t, dir, "init", "-q")
+	if err := os.WriteFile(filepath.Join(dir, ".gitkeep"), nil, 0o600); err != nil {
+		t.Fatalf("write .gitkeep: %v", err)
+	}
+	runTestGit(t, dir, "add", "--", ".gitkeep")
+	runTestGit(t, dir, "commit", "-q", "-m", "init")
+	return dir
+}
+
+// commitTrustlistAt 把 data 写到仓库里的 rel（斜杠分隔）并提交，返回它的绝对路径。
+func commitTrustlistAt(t *testing.T, repo, rel string, data []byte) string {
+	t.Helper()
+	path := filepath.Join(repo, filepath.FromSlash(rel))
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write %s: %v", rel, err)
+	}
+	runTestGit(t, repo, "add", "--", rel)
+	runTestGit(t, repo, "commit", "-q", "-m", "publish "+rel)
+	return path
+}
+
+// TestTrustlistSignRefusesASerialThatDidNotAdvance：新清单的 serial 必须严格大于
+// 已发布的那一版，否则不签、不写 .sig。
+//
+// 相等和更小分开考：一个只判「更小才拒」的实现会放过「改了内容却忘了进 serial」
+// ——那正是这条规则要抓的那个错，而且是两者里更常见的一个。
+//
+// 错误里必须同时出现两个数字。只说「serial 回退」而不说这一份是几、已发布的是几，
+// 操作者得自己去翻 git 才知道该填几；而这条命令刚刚才读过那个数。
+func TestTrustlistSignRefusesASerialThatDidNotAdvance(t *testing.T) {
+	for name, tc := range map[string]struct{ published, serial int64 }{
+		"与已发布的相等": {published: 7, serial: 7},
+		"比已发布的更小": {published: 9, serial: 7},
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			in := filepath.Join(dir, "trustlist.json")
+			if err := os.WriteFile(in, trustlistJSONWithSerial(t, tc.serial), 0o600); err != nil {
+				t.Fatalf("write: %v", err)
+			}
+			keyPath := filepath.Join(dir, "root.json")
+			writeTestPrivateKey(t, keyPath, "root-test")
+			out := filepath.Join(dir, "trustlist.sig")
+
+			verified := 0
+			verify := func(list, _ []byte) (trustlist.Document, error) {
+				verified++
+				return trustlist.ParseDocument(list)
+			}
+			published := func(context.Context, string) (int64, error) { return tc.published, nil }
+
+			err := runTrustlistSign(context.Background(), io.Discard, verify, published,
+				in, keyPath, out)
+			if err == nil {
+				t.Fatalf("已发布的 serial 是 %d，serial %d 的清单却被签了", tc.published, tc.serial)
+			}
+			if !strings.Contains(err.Error(), fmt.Sprint(tc.serial)) ||
+				!strings.Contains(err.Error(), fmt.Sprint(tc.published)) {
+				t.Errorf("错误没同时给出这一份和已发布那一份的 serial：%v", err)
+			}
+			if verified != 0 {
+				t.Errorf("serial 没进却仍然签了一遍拿去自验（%d 次）", verified)
+			}
+			if _, statErr := os.Stat(out); statErr == nil {
+				t.Error("拒绝之后仍然写出了 .sig 文件")
+			}
+		})
+	}
+}
+
+// TestTrustlistSignAcceptsAStrictlyGreaterSerial：严格大于就放行。
+//
+// 没有这条，上一条用例只要把「拒绝没进的 serial」写成「拒绝一切」就能作弊通过，
+// 而那样这条命令再也签不出任何东西。
+func TestTrustlistSignAcceptsAStrictlyGreaterSerial(t *testing.T) {
+	dir := t.TempDir()
+	in := filepath.Join(dir, "trustlist.json")
+	if err := os.WriteFile(in, trustlistJSONWithSerial(t, 7), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	keyPath := filepath.Join(dir, "root.json")
+	writeTestPrivateKey(t, keyPath, "root-test")
+	out := filepath.Join(dir, "trustlist.sig")
+
+	verify := func(list, _ []byte) (trustlist.Document, error) { return trustlist.ParseDocument(list) }
+	published := func(context.Context, string) (int64, error) { return 6, nil }
+
+	if err := runTrustlistSign(context.Background(), io.Discard, verify, published,
+		in, keyPath, out); err != nil {
+		t.Fatalf("serial 7 严格大于已发布的 6，却没签：%v", err)
+	}
+	if _, err := os.Stat(out); err != nil {
+		t.Errorf("命令报告成功，磁盘上却没有 %s：%v", out, err)
+	}
+}
+
+// TestTrustlistSignRefusesWhenThePublishedSerialCannotBeRead：读不到已发布的
+// serial 就不签。
+//
+// 这一步读的是 git 历史，而它会在好几种「环境不是设想的样子」的情况下失败：清单
+// 不在仓库里、仓库还没有 HEAD、机器上没有 git。任何一种都不能退化成「当作 0 继续」
+// ——那恰好是在发布者的环境已经不对的时候，把唯一能抓住忘记进 serial 的检查关掉。
+func TestTrustlistSignRefusesWhenThePublishedSerialCannotBeRead(t *testing.T) {
+	dir := t.TempDir()
+	in := filepath.Join(dir, "trustlist.json")
+	if err := os.WriteFile(in, validTrustlistJSON(t), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	keyPath := filepath.Join(dir, "root.json")
+	writeTestPrivateKey(t, keyPath, "root-test")
+	out := filepath.Join(dir, "trustlist.sig")
+
+	verify := func(list, _ []byte) (trustlist.Document, error) { return trustlist.ParseDocument(list) }
+	boom := errors.New("this machine has no git")
+	published := func(context.Context, string) (int64, error) { return 0, boom }
+
+	err := runTrustlistSign(context.Background(), io.Discard, verify, published, in, keyPath, out)
+	if err == nil {
+		t.Fatal("读不到已发布的 serial，却照签不误")
+	}
+	if !errors.Is(err, boom) {
+		t.Errorf("原因没被带上来，操作者看不出是哪一步失败的：%v", err)
+	}
+	if _, statErr := os.Stat(out); statErr == nil {
+		t.Error("拒绝之后仍然写出了 .sig 文件")
+	}
+}
+
+// TestTrustlistSignRefusesAMissingPublishedSerialLookup：这一步是可传入的，于是
+// 「一个都不传」成了一种可能的状态。它必须当场报错，而不是往下走到签出一份没有
+// 任何人拿它比过 serial 的清单。
+func TestTrustlistSignRefusesAMissingPublishedSerialLookup(t *testing.T) {
+	dir := t.TempDir()
+	in := filepath.Join(dir, "trustlist.json")
+	if err := os.WriteFile(in, validTrustlistJSON(t), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	keyPath := filepath.Join(dir, "root.json")
+	writeTestPrivateKey(t, keyPath, "root-test")
+	out := filepath.Join(dir, "trustlist.sig")
+
+	verify := func(list, _ []byte) (trustlist.Document, error) { return trustlist.ParseDocument(list) }
+	err := runTrustlistSign(context.Background(), io.Discard, verify, nil, in, keyPath, out)
+	if err == nil {
+		t.Fatal("没有 serial 比对这一步也签了")
+	}
+	if !strings.Contains(err.Error(), "previous-serial") {
+		t.Errorf("错误没点明缺的是哪一步：%v", err)
+	}
+	if _, statErr := os.Stat(out); statErr == nil {
+		t.Error("拒绝之后仍然写出了 .sig 文件")
+	}
+}
+
+// TestTrustlistSignChecksTheDocumentBeforeTheSerial：格式校验排在 serial 比对
+// 之前。
+//
+// 一份根本不是清单的文档没有值得比的 serial，而 serial 那一步要跑一个子进程去读
+// git 历史；顺序反过来，操作者会先收到一句关于 git 的抱怨，修完才发现真正的问题
+// 在文档本身。这条断言那一步**根本没被调用**，而不只是断言错误文本——后者换个
+// 措辞就能作弊过关。
+func TestTrustlistSignChecksTheDocumentBeforeTheSerial(t *testing.T) {
+	dir := t.TempDir()
+	in := filepath.Join(dir, "trustlist.json")
+	if err := os.WriteFile(in, []byte(`{"serial":0}`), 0o600); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	keyPath := filepath.Join(dir, "root.json")
+	writeTestPrivateKey(t, keyPath, "root-test")
+	out := filepath.Join(dir, "trustlist.sig")
+
+	asked := 0
+	published := func(context.Context, string) (int64, error) {
+		asked++
+		return 0, nil
+	}
+	verify := func(list, _ []byte) (trustlist.Document, error) { return trustlist.ParseDocument(list) }
+
+	err := runTrustlistSign(context.Background(), io.Discard, verify, published, in, keyPath, out)
+	if err == nil {
+		t.Fatal("格式非法的清单被签了")
+	}
+	if asked != 0 {
+		t.Errorf("文档还没通过校验就去读 git 历史了（%d 次）", asked)
+	}
+	if !strings.Contains(err.Error(), "not a valid trustlist") {
+		t.Errorf("报的不是清单格式的问题：%v", err)
+	}
+}
+
+// TestGitHeadSerialReadsWhatIsCommitted 逐条钉住 gitHeadSerial 的四种答案。
+//
+// 「工作区里那一份不算数」是其中最要紧的一条：这一步存在的全部意义就是把手上正要
+// 签的这一份与**已经发布出去**的那一份比。读工作区的实现每次都会拿到自己，于是
+// 永远相等、永远拒绝。
+func TestGitHeadSerialReadsWhatIsCommitted(t *testing.T) {
+	t.Run("HEAD 里那一版的 serial，不是工作区里那一份", func(t *testing.T) {
+		repo := newGitWorkTree(t)
+		path := commitTrustlistAt(t, repo, "trust/trustlist.json", trustlistJSONWithSerial(t, 5))
+		// 工作区改成 6 并且不提交：读对了应当仍然是 5。
+		if err := os.WriteFile(path, trustlistJSONWithSerial(t, 6), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		got, err := gitHeadSerial(context.Background(), path)
+		if err != nil {
+			t.Fatalf("gitHeadSerial: %v", err)
+		}
+		if got != 5 {
+			t.Errorf("gitHeadSerial = %d, want 5（6 是工作区里那一份，不是已发布的）", got)
+		}
+	})
+
+	t.Run("HEAD 里没有这份文件算第一次发布", func(t *testing.T) {
+		repo := newGitWorkTree(t)
+		path := filepath.Join(repo, "trust", "trustlist.json")
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatalf("mkdir: %v", err)
+		}
+		if err := os.WriteFile(path, trustlistJSONWithSerial(t, 1), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		got, err := gitHeadSerial(context.Background(), path)
+		if err != nil {
+			t.Fatalf("第一次发布被报成了失败：%v", err)
+		}
+		if got != 0 {
+			t.Errorf("gitHeadSerial = %d, want 0", got)
+		}
+	})
+
+	t.Run("不在 git 仓库里就报错", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "trustlist.json")
+		if err := os.WriteFile(path, trustlistJSONWithSerial(t, 1), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if _, err := gitHeadSerial(context.Background(), path); err == nil {
+			t.Error("不在 git 仓库里，却报了一个 serial 出来（若这台机器的临时目录恰好" +
+				"落在某个 git 仓库内部，这条会以「HEAD 里没有这份文件」的名义答 0，" +
+				"那时该换一个临时目录，而不是放宽这条断言）")
+		}
+	})
+
+	t.Run("HEAD 里那一版不是合法清单就报错", func(t *testing.T) {
+		repo := newGitWorkTree(t)
+		path := commitTrustlistAt(t, repo, "trust/trustlist.json", []byte(`{"serial":`))
+		if _, err := gitHeadSerial(context.Background(), path); err == nil {
+			t.Error("HEAD 里那一版根本解析不出来，却报了一个 serial 出来")
+		}
+	})
+}
+
+// TestTrustlistSignCommandReadsThePublishedSerialFromGit：命令本身接的必须是真的
+// 去读 git 历史的那一个，不是一个永远答 0 的替身。
+//
+// 上面那些用例传的是桩，桩不证明命令接了什么。这条走完整的 cobra 路径，在一个
+// HEAD 里已有 serial 9 的仓库里去签一份同样是 9 的清单：接了真实现就会在 serial
+// 这一步被拒并报出那个 9；换成任何一个答 0 的替身，命令会一路走到自验，那里因为
+// 钥匙不是 root 而失败——错误变成 trustlist.ErrUntrustedList，这条随即变红。
+func TestTrustlistSignCommandReadsThePublishedSerialFromGit(t *testing.T) {
+	repo := newGitWorkTree(t)
+	in := commitTrustlistAt(t, repo, "trust/trustlist.json", trustlistJSONWithSerial(t, 9))
+	keyPath := filepath.Join(repo, "not-root.json")
+	writeTestPrivateKey(t, keyPath, "not-the-root-key")
+	out := filepath.Join(repo, "trustlist.sig")
+
+	var buf bytes.Buffer
+	cmd := newPluginsTrustlistCommand(&buf)
+	cmd.SetArgs([]string{"sign", "--in", in, "--key", keyPath, "--out", out})
+	cmd.SetOut(&buf)
+	cmd.SetErr(&buf)
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("serial 与 HEAD 里那一版相等，却签了")
+	}
+	if errors.Is(err, trustlist.ErrUntrustedList) {
+		t.Fatalf("命令走到了自验，说明 serial 那一步没有真的去读 git 历史：%v", err)
+	}
+	if !strings.Contains(err.Error(), "serial 9") {
+		t.Errorf("错误没报出 HEAD 里那一版的 serial：%v", err)
+	}
+	if _, statErr := os.Stat(out); statErr == nil {
+		t.Error("拒绝之后仍然写出了 .sig 文件")
+	}
 }

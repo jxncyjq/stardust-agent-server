@@ -1,12 +1,17 @@
 package cli
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -59,11 +64,14 @@ func newTrustlistSignCommand(out io.Writer) *cobra.Command {
 		Long: "Sign a trustlist document with the root private key.\n\n" +
 			"The document is fully validated before it is signed: signing a document the verifier\n" +
 			"would reject teaches everyone that verification is broken, which is worse than not\n" +
-			"signing at all. The signature is then checked against the embedded root public key\n" +
-			"before it is written.",
+			"signing at all. Its serial must then be strictly greater than the serial of the version\n" +
+			"in git HEAD, because a list published without advancing the serial is refused by every\n" +
+			"user machine with an error that reads like an attack. The signature is finally checked\n" +
+			"against the embedded root public key before it is written.",
 		Args: cobra.NoArgs,
-		RunE: func(_ *cobra.Command, _ []string) error {
-			return runTrustlistSign(out, trustlist.VerifyDocument, inPath, keyPath, outPath)
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			return runTrustlistSign(cmd.Context(), out, trustlist.VerifyDocument, gitHeadSerial,
+				inPath, keyPath, outPath)
 		},
 	}
 	cmd.Flags().StringVar(&inPath, "in", "", "the trustlist document to sign")
@@ -75,14 +83,33 @@ func newTrustlistSignCommand(out io.Writer) *cobra.Command {
 	return cmd
 }
 
-// runTrustlistSign validates, signs, verifies its own output and only then
-// writes it. The order is not interchangeable.
+// runTrustlistSign validates, checks that the serial advanced, signs, verifies
+// its own output and only then writes it. The order is not interchangeable.
 //
 // Validation comes first because signing a document the verifier would reject
 // teaches everyone that verification is broken, which is worse than not
 // signing at all — and it is checked before the key file is even read, so an
 // operator with two problems is told about the one they can fix without
-// touching a private key.
+// touching a private key. The serial check follows it for the same reason: a
+// document that is not a trustlist has no serial worth comparing, and the
+// answer an operator can act on is the earlier of the two problems.
+//
+// The serial check (step 2) asks previousSerial for the serial of the version
+// already published, and refuses anything that is not strictly greater.
+// Forgetting to advance the serial is the easiest and most hidden mistake in
+// this flow: nothing about the resulting file looks wrong, every user machine
+// refuses it, and the error those machines report says the serial went
+// backwards — which reads like a rollback attack rather than a forgotten
+// bump, so an emergency revocation silently fails to arrive while everyone
+// looks for a man in the middle.
+//
+// previousSerial is a parameter for the same reason verify is: the serial
+// already published is recorded in git history, and a step that can only run
+// where a repository already carries the document is a step whose refusals and
+// whose success path nothing can exercise. Whatever is passed must answer with
+// the serial of the version already published, and must report every other
+// outcome as an error; one that answers with a number it did not read turns
+// this check into a formality.
 //
 // The self-check (step 4) is not a formality. sign.ParsePrivateKey's
 // documentation states that it does not check whether a private key's two
@@ -116,13 +143,20 @@ func newTrustlistSignCommand(out io.Writer) *cobra.Command {
 // trustlist (a new serial supersedes the old one) is a normal operation, so
 // an existing file at --out is replaced.
 func runTrustlistSign(
+	ctx context.Context,
 	out io.Writer,
 	verify func(listData, sigData []byte) (trustlist.Document, error),
+	previousSerial func(ctx context.Context, listPath string) (int64, error),
 	inPath, keyPath, outPath string,
 ) error {
 	if verify == nil {
 		return errors.New("plugins trustlist sign: no verification step was supplied; signing without " +
 			"one would write a signature nothing has checked")
+	}
+	if previousSerial == nil {
+		return errors.New("plugins trustlist sign: no previous-serial lookup was supplied; signing " +
+			"without one would let a forgotten serial bump through, and every user machine would then " +
+			"refuse the list with an error that says the serial went backwards")
 	}
 	listPath := strings.TrimSpace(inPath)
 	privatePath := strings.TrimSpace(keyPath)
@@ -144,6 +178,23 @@ func runTrustlistSign(
 	if err != nil {
 		return fmt.Errorf("plugins trustlist sign: %s is not a valid trustlist, so it will not be "+
 			"signed: %w", listPath, err)
+	}
+
+	published, err := previousSerial(ctx, listPath)
+	if err != nil {
+		return fmt.Errorf("plugins trustlist sign: the serial already published for %s could not be "+
+			"read, so the document will NOT be signed. This step exists because a list published "+
+			"without advancing its serial is refused by every user machine, with an error that says "+
+			"the serial went backwards and therefore reads like an attack; skipping the check when it "+
+			"cannot be answered would hand out exactly that: %w", listPath, err)
+	}
+	if doc.Serial <= published {
+		return fmt.Errorf("plugins trustlist sign: %s carries serial %d, but the version already "+
+			"published carries serial %d; a new list must carry a strictly greater one, so this "+
+			"document was NOT signed. Published as it stands, every user machine would refuse it and "+
+			"report that the serial went backwards — which reads like an attack rather than a "+
+			"forgotten serial bump, and an urgent revocation would silently fail to arrive while "+
+			"everyone looked for a man in the middle", listPath, doc.Serial, published)
 	}
 
 	keyData, err := os.ReadFile(privatePath)
@@ -181,6 +232,84 @@ func runTrustlistSign(
 		return fmt.Errorf("plugins trustlist sign: write output: %w", err)
 	}
 	return nil
+}
+
+// gitLookupTimeout bounds each git subprocess. A publisher's repository is
+// small and the lookup reads one blob out of it, so a git command that has not
+// answered by now is stuck — on a lock another process holds, on a credential
+// prompt, on a filesystem that stopped responding — and a signing command that
+// hangs forever is worse than one that says what it was waiting for.
+const gitLookupTimeout = 30 * time.Second
+
+// gitHeadSerial reports the serial carried by the version of listPath that is
+// committed in git HEAD, or 0 when HEAD does not carry that path at all.
+//
+// Zero is the answer for a first publication, and it is a safe one to give
+// rather than a special case to plumb through: a trustlist document is only
+// valid with a serial of 1 or greater, so "greater than 0" admits every first
+// list and nothing else.
+//
+// Every other way of not getting an answer is an error — not in a git
+// repository, no HEAD to read, git missing from PATH, a committed version that
+// no longer parses. Answering 0 in those cases would silently disable the one
+// check that catches a forgotten serial bump, and would do it in exactly the
+// situations where the publisher's setup is already not what it is assumed to
+// be.
+//
+// Presence is asked with ls-tree rather than by reading the blob, because
+// ls-tree separates the two answers that matter here: it exits successfully
+// with no output when HEAD simply does not carry the path, and fails when the
+// question could not be asked at all. Reading the blob conflates them into one
+// non-zero exit.
+func gitHeadSerial(ctx context.Context, listPath string) (int64, error) {
+	dir := filepath.Dir(listPath)
+	name := filepath.Base(listPath)
+	ctx, cancel := context.WithTimeout(ctx, gitLookupTimeout)
+	defer cancel()
+
+	listed, err := runGit(ctx, dir, "ls-tree", "HEAD", "--", name)
+	if err != nil {
+		return 0, err
+	}
+	if len(bytes.TrimSpace(listed)) == 0 {
+		return 0, nil
+	}
+	// HEAD:./name resolves name against the directory git runs in, which is
+	// the directory holding the document.
+	committed, err := runGit(ctx, dir, "show", "HEAD:./"+name)
+	if err != nil {
+		return 0, err
+	}
+	doc, err := trustlist.ParseDocument(committed)
+	if err != nil {
+		return 0, fmt.Errorf("the version of %s committed in git HEAD is not a valid trustlist, so it "+
+			"carries no serial to compare against: %w", name, err)
+	}
+	return doc.Serial, nil
+}
+
+// runGit runs one git command in dir and returns its standard output.
+//
+// git explains a failure on stderr, so an error carrying only the exit status
+// would leave an operator holding "exit status 128" and nothing else; the
+// stderr text goes into the error instead. A deadline that fired is named as
+// well, because a subprocess killed by one reports how it died and never why
+// it was killed.
+func runGit(ctx context.Context, dir string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	stdout, err := cmd.Output()
+	if err != nil {
+		detail := strings.TrimSpace(stderr.String())
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, fmt.Errorf("git %s in %s: %w (%v) %s",
+				strings.Join(args, " "), dir, err, ctxErr, detail)
+		}
+		return nil, fmt.Errorf("git %s in %s: %w %s", strings.Join(args, " "), dir, err, detail)
+	}
+	return stdout, nil
 }
 
 // newTrustlistRefreshCommand builds `agent plugins trustlist refresh`, which
