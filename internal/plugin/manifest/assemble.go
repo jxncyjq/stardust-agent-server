@@ -66,8 +66,16 @@ var riskLevelRank = map[string]int{
 // deliberate: any "decode, then re-encode, then sign" scheme requires
 // byte-identical JSON encoding on the signing and the verifying side, which
 // is a classic exploitable ambiguity. LoadPackage therefore checks the
-// signature against the bytes it read from disk, and does so BEFORE parsing
-// them — authenticate first, interpret second.
+// signature against the bytes it read from disk, never against a re-encoded
+// copy.
+//
+// Checking the signature before calling ParsePlugin is not itself a security
+// boundary: ParsePlugin is a plain JSON decode plus field validation, with no
+// side effects, and it runs on manifestData regardless of what Provenance
+// comes back — including ProvenanceUnsigned, where no signature was even
+// found to check. The order only decides which of two simultaneous failures
+// (a malformed signature and a malformed manifest) is the one LoadPackage
+// reports; either order still refuses to load the package.
 //
 // # What LoadPackage decides, and what it leaves to the caller
 //

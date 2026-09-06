@@ -166,6 +166,10 @@ func TestProvenanceUnsignedWhenTheKeyIsUnknown(t *testing.T) {
 
 // TestProvenanceRevoked：撤销的判定必须带上当初写下的时间与理由——
 // sign.Keyring 保留它们正是为了让拒绝能说明自己，丢掉就退化成「未知钥匙」。
+//
+// 它同样必须带上 Publisher：一把被撤销的钥匙，界面上要能说出「谁的钥匙」被撤销了，
+// 而不是只甩一个 key id——TrustInput.Publishers 里有名字时，Revoked 判定不能把它
+// 丢在半路，退化成跟「未知钥匙」一样只剩一个 id。
 func TestProvenanceRevoked(t *testing.T) {
 	pub, priv, err := sign.GenerateKey()
 	if err != nil {
@@ -176,7 +180,10 @@ func TestProvenanceRevoked(t *testing.T) {
 		map[sign.KeyID]ed25519.PublicKey{"dev-gone": pub, "dev-live": pub},
 		[]sign.KeyID{"dev-gone"})
 
-	_, _, prov, err := LoadPackage(dir, TrustInput{Keyring: kr})
+	_, _, prov, err := LoadPackage(dir, TrustInput{
+		Keyring:    kr,
+		Publishers: map[sign.KeyID]string{"dev-gone": "张三"},
+	})
 	if err != nil {
 		t.Fatalf("LoadPackage: %v", err)
 	}
@@ -185,6 +192,9 @@ func TestProvenanceRevoked(t *testing.T) {
 	}
 	if prov.KeyID != "dev-gone" {
 		t.Errorf("KeyID = %q, want dev-gone", prov.KeyID)
+	}
+	if prov.Publisher != "张三" {
+		t.Errorf("Publisher = %q, want 张三", prov.Publisher)
 	}
 	if prov.Reason != "私钥泄漏" {
 		t.Errorf("Reason = %q, want 私钥泄漏", prov.Reason)
