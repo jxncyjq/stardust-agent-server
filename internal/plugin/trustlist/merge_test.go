@@ -1,8 +1,11 @@
 package trustlist
 
 import (
+	"crypto/ed25519"
 	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stardust/legion-agent/internal/plugin/sign"
 )
@@ -193,20 +196,204 @@ func TestMergeRefusesInputItCannotAccountFor(t *testing.T) {
 
 		full := trustFrom(t, keyringWith(t, []sign.KeyID{"dev"}, nil), nil)
 
+		// 两个子用例都断言错误文本，不只断言「有错」。缺了这一条时，两支硬拒
+		// 里「只有 Keyring」那一支其实是被偶然守住的：把它短路掉，
+		// keyEntriesOf(nil, "trust list") 里的 json.Unmarshal(nil) 照样会报错，
+		// 用例照样绿——分不出「函数显式拒绝了这个形状」和「撞上了一个 JSON
+		// 解码错误」。而这两者对操作者是完全不同的两句话。
 		t.Run("只有 Keyring", func(t *testing.T) {
 			t.Parallel()
 
-			if _, _, err := Merge(nil, Trust{Keyring: full.Keyring, Status: StatusFresh}); err == nil {
+			_, _, err := Merge(nil, Trust{Keyring: full.Keyring, Status: StatusFresh})
+			if err == nil {
 				t.Fatal("缺了 KeyringRaw 的 Trust 被接受了；清单那一侧的公钥会整个消失")
+			}
+			if !strings.Contains(err.Error(), "its public keys live only in the document") {
+				t.Errorf("错误文本没说清缺的是哪一半，operator 无从下手：%v", err)
 			}
 		})
 
 		t.Run("只有 KeyringRaw", func(t *testing.T) {
 			t.Parallel()
 
-			if _, _, err := Merge(nil, Trust{KeyringRaw: full.KeyringRaw, Status: StatusFresh}); err == nil {
+			_, _, err := Merge(nil, Trust{KeyringRaw: full.KeyringRaw, Status: StatusFresh})
+			if err == nil {
 				t.Fatal("缺了 Keyring 的 Trust 被接受了；清单那一侧的撤销会整个消失")
+			}
+			if !strings.Contains(err.Error(), "its revocations live only in the parsed one") {
+				t.Errorf("错误文本没说清缺的是哪一半，operator 无从下手：%v", err)
 			}
 		})
 	})
+}
+
+// keyringOf 造一份 keyring 文档，keys 段登记的公钥由调用方给出。
+//
+// 它与 keyringWith 的分工是：keyringWith 每把钥匙现生成一对，谁也不知道公钥是哪
+// 一把；而「同一个 id 两侧登记了不同公钥、合并后留下的是哪一把」这个问题，只有
+// 在调用方手里握着那两把公钥（以及其中一把的私钥）时才问得出来。
+func keyringOf(t *testing.T, keys map[sign.KeyID]ed25519.PublicKey) json.RawMessage {
+	t.Helper()
+	entries := make([]json.RawMessage, 0, len(keys))
+	for _, id := range sortedIDs(keys) {
+		entry, err := sign.MarshalKeyEntry(id, keys[id])
+		if err != nil {
+			t.Fatalf("MarshalKeyEntry %q: %v", id, err)
+		}
+		entries = append(entries, entry)
+	}
+	data, err := json.Marshal(struct {
+		Keys []json.RawMessage `json:"keys"`
+	}{Keys: entries})
+	if err != nil {
+		t.Fatalf("marshal keyring: %v", err)
+	}
+	return data
+}
+
+// TestMergeKeepsARevocationThisMachineAccumulatedThatTheListNoLongerNames 守的是
+// 「撤销永不遗忘」这条不变量在合并这一层的投影。
+//
+// 本机的撤销累积集（revoked-ever.json）只在 assembleKeyring 装配 Trust.Keyring 时
+// 被并进去；Trust.KeyringRaw 的 revoked 段里只有当前这一份清单自己写下的那些。
+// 于是「清单侧的撤销从哪个字段取」不是风格问题：取 KeyringRaw 就意味着每次合并
+// 都把本机累积了几个月的撤销静默清空——而那些撤销正是断网/重放绕不过去的那道闸。
+//
+// 夹具刻意让两个字段**内容不同**（这正是生产里 Store.assemble 每次产出的形状），
+// 否则用例在原理上分辨不出撤销取自哪一边；下面两条前提断言把这个「不同」钉死，
+// 将来夹具要是退化成两边相等，这条用例会先响亮地失败，而不是悄悄失去分辨力。
+func TestMergeKeepsARevocationThisMachineAccumulatedThatTheListNoLongerNames(t *testing.T) {
+	t.Parallel()
+
+	// 上一份清单撤销了 old；这一份清单的 revoked 段是空的（发布侧误删，或者被诱导）。
+	previous := keyringWith(t, []sign.KeyID{"live", "old"}, []sign.KeyID{"old"})
+	ever := newRevokedSet()
+	if err := ever.mergeFrom(previous); err != nil {
+		t.Fatalf("mergeFrom(previous): %v", err)
+	}
+	current := keyringWith(t, []sign.KeyID{"live", "old"}, nil)
+
+	keyring, err := assembleKeyring(current, ever)
+	if err != nil {
+		t.Fatalf("assembleKeyring: %v", err)
+	}
+
+	// 前提一：当前清单的 revoked 段确实是空的。
+	var shape keyringShape
+	if err := json.Unmarshal(current, &shape); err != nil {
+		t.Fatalf("unmarshal current: %v", err)
+	}
+	if len(shape.Revoked) != 0 {
+		t.Fatalf("夹具坏了：当前清单自己写了 %d 条撤销，这条用例就分辨不出撤销取自哪个字段了",
+			len(shape.Revoked))
+	}
+	// 前提二：装配出来的 Keyring 里确实有 old——两个字段带的东西不一样。
+	if _, gone := keyring.Revoked("old"); !gone {
+		t.Fatalf("夹具坏了：累积集里的 old 没有进到 Keyring 里，撤销集是 %v", keyring.RevokedIDs())
+	}
+
+	merged, _, err := Merge(nil, Trust{Keyring: keyring, KeyringRaw: current, Status: StatusFresh})
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	if _, gone := merged.Revoked("old"); !gone {
+		t.Fatalf("本机累积的撤销 old 在合并后消失了；merged 的撤销集是 %v", merged.RevokedIDs())
+	}
+}
+
+// TestMergeKeepsTheLocalPublicKeyWhenTheListAlsoRegistersThatID：两侧登记同一个
+// id 时，落地的必须是本地那把公钥。
+//
+// 这是一条安全优先级：谁能改写 keys[id] 的公钥，谁就能让自己签的包在本机验签通过。
+// 断言方式是拿本地那把私钥签一段消息、要求合并后的信任集验得过——直接问「留下的
+// 是哪一把公钥」，而不是数一数 id 的个数（两侧登记同一个 id 时，覆盖与否 id 数
+// 完全一样）。
+func TestMergeKeepsTheLocalPublicKeyWhenTheListAlsoRegistersThatID(t *testing.T) {
+	t.Parallel()
+
+	localPub, localPriv, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey(local): %v", err)
+	}
+	listPub, _, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey(list): %v", err)
+	}
+	otherPub, _, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey(other): %v", err)
+	}
+
+	local := keyringOf(t, map[sign.KeyID]ed25519.PublicKey{"k": localPub})
+	listTrust := trustFrom(t, keyringOf(t, map[sign.KeyID]ed25519.PublicKey{
+		"k":         listPub,
+		"dev-other": otherPub,
+	}), nil)
+
+	merged, _, err := Merge(local, listTrust)
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+
+	message := []byte("一个由本机记下的那把私钥签出来的包")
+	sig, err := sign.Sign(localPriv, "k", message)
+	if err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	if err := merged.Verify(sig, message); err != nil {
+		t.Fatalf("合并后 k 验不过本机那把私钥的签名——联网清单改写了操作者写在这台机器上的公钥：%v", err)
+	}
+}
+
+// TestMergeKeepsTheLocalRevocationRecordWhenBothSidesRevokeTheSameKey：两侧都撤销
+// 同一个 key 时，留下的撤销时间与理由必须是本地那条。
+//
+// 撤销的时间与理由是操作者当时写下的事实，不是可以被后来的文档改写的意见；它们
+// 会原样出现在拒绝一个包时给操作者看的那句话里（sign.Revocation.describe）。
+func TestMergeKeepsTheLocalRevocationRecordWhenBothSidesRevokeTheSameKey(t *testing.T) {
+	t.Parallel()
+
+	local := keyringRevoking(t, []sign.KeyID{"k", "live"}, []revocation{
+		{id: "k", at: "2026-01-02T03:04:05Z", reason: "本机操作者当时写下的理由"},
+	})
+	listTrust := trustFrom(t, keyringRevoking(t, []sign.KeyID{"k", "dev-live"}, []revocation{
+		{id: "k", at: "2026-05-06T07:08:09Z", reason: "清单后来写下的理由"},
+	}), nil)
+
+	merged, _, err := Merge(local, listTrust)
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	record, gone := merged.Revoked("k")
+	if !gone {
+		t.Fatalf("k 在合并后不再是撤销状态；撤销集是 %v", merged.RevokedIDs())
+	}
+	if record.Reason != "本机操作者当时写下的理由" {
+		t.Errorf("reason = %q，本地那条被清单改写了", record.Reason)
+	}
+	if got := record.At.Format(time.RFC3339); got != "2026-01-02T03:04:05Z" {
+		t.Errorf("revoked_at = %q，本地那条被清单改写了", got)
+	}
+}
+
+// TestMergeNamesTheLocalDocumentWhenItsRevocationIsMalformed：本地文档里一条坏掉的
+// revoked_at，错误必须指向**本地那份文档的第几条**。
+//
+// 少了入口处这次校验仍然会失败（末尾的 sign.ParseKeyring 会挡下），但错误会变成
+// 一句关于「合并出来的那份文档」的话——那份文档没有任何人写过，operator 拿着它
+// 无处可去。这正是 merge.go 里那条注释声明要避免的事，所以它需要一条用例。
+func TestMergeNamesTheLocalDocumentWhenItsRevocationIsMalformed(t *testing.T) {
+	t.Parallel()
+
+	local := keyringRevoking(t, []sign.KeyID{"k", "live"}, []revocation{
+		{id: "k", at: "上周二", reason: "私钥泄漏"},
+	})
+
+	_, _, err := Merge(local, Trust{Status: StatusUnavailable})
+	if err == nil {
+		t.Fatal("坏掉的 revoked_at 被接受了")
+	}
+	if !strings.Contains(err.Error(), "the local keyring's revoked[0]") {
+		t.Errorf("错误没指向本地文档的那一条，operator 会被指到一份没人写过的文档上：%v", err)
+	}
 }

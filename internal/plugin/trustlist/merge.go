@@ -124,6 +124,33 @@ func sortedIDs[V any](m map[sign.KeyID]V) []sign.KeyID {
 // revocation this machine has recorded since — exactly the weakening the
 // union above exists to prevent. A Trust carrying one field without the other
 // is refused rather than half-used, for the same reason.
+//
+// # localRaw must already have been through sign.ParseKeyring
+//
+// Wherever Merge is called, localRaw has to be a keyring document that has
+// already been parsed by sign.ParseKeyring. That is an obligation on the
+// caller; the parameter is a bare json.RawMessage, so nothing about the type
+// enforces it. The reason is the de-duplication above: it keeps one entry per
+// id and one revocation per key_id, while sign.ParseKeyring hard-refuses a
+// document that registers the same id twice ("key id %q appears twice") or
+// revokes the same key_id twice ("key id %q is revoked twice"). Hand this
+// function an unvetted keyring document and the de-duplication quietly
+// dissolves those two rules, because the second copy is dropped here before
+// sign.ParseKeyring ever sees the pair. The de-duplication exists only to
+// serve "the record already held wins"; it takes on no validation duty.
+// assembleKeyring carries the identical obligation for the same reason.
+//
+// # Every key revoked is an error, not an empty trust set
+//
+// sign.ParseKeyring refuses a trust set in which every registered key is
+// revoked. The union taken here can produce exactly that: the revocations
+// reaching this function are cumulative — t.Keyring carries every revocation
+// this machine has recorded, not only the ones the current list names — while
+// the keys are whatever the two documents register today, so the revoked side
+// can come to cover all of them. Merge returns that error rather than
+// swallowing it. The error must not be read as the nil result above: nil means
+// no trust set at all because neither half was present, while this error means
+// a half was present and what the halves add up to is not a trust set.
 func Merge(localRaw json.RawMessage, t Trust) (*sign.Keyring, map[sign.KeyID]string, error) {
 	switch {
 	case t.Keyring == nil && len(t.KeyringRaw) > 0:
@@ -211,9 +238,14 @@ func Merge(localRaw json.RawMessage, t Trust) (*sign.Keyring, map[sign.KeyID]str
 		return nil, map[sign.KeyID]string{}, nil
 	}
 
-	// Both arrays go out sorted by id, for the reason revokedSet.marshal sorts
-	// its own: a document that comes out in a different order every run cannot
-	// be diffed, and diffing it is how an operator sees what a merge changed.
+	// Both arrays go out sorted by id so this document is a deterministic
+	// function of the two halves. Go randomises map iteration order, so
+	// unsorted they would come out in a different byte order on every run over
+	// the same inputs — and that order is observable, because sign.ParseKeyring
+	// below walks each array in order and refuses at the first entry it cannot
+	// accept. Which of several unacceptable entries gets named, and therefore
+	// which error this merge fails with, would otherwise be decided afresh on
+	// every run.
 	keyList := make([]json.RawMessage, 0, len(keys))
 	for _, id := range sortedIDs(keys) {
 		keyList = append(keyList, keys[id])
