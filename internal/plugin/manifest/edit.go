@@ -97,6 +97,11 @@ func UpdateEntry(dep Deployment, name string, mutate func(Entry) (Entry, error))
 //     "config" key) without changing what a round trip decodes back to:
 //     an omitted "digest"/"config" and an empty-string/nil one decode to
 //     the same Go zero value either way.
+//   - AcceptedUnsigned is tagged omitempty for the same reason: an empty
+//     value means nobody has ever accepted this package (see
+//     Entry.AcceptedUnsigned), which is the common case for every entry
+//     that carries no such acceptance, and an omitted "accepted_unsigned"
+//     decodes back to that same empty string either way.
 //   - Grant is `*GrantDecl` with `omitempty`, mirroring rawEntry.Grant
 //     (manifest.go): MarshalDeployment sets this pointer only when
 //     Entry.GrantStated is true, so the "grant" key is omitted entirely —
@@ -113,13 +118,14 @@ func UpdateEntry(dep Deployment, name string, mutate func(Entry) (Entry, error))
 //     omitempty here would only change output shape, not correctness, so
 //     it is left off.
 type entryDoc struct {
-	Name    string          `json:"name"`
-	Source  string          `json:"source"`
-	Digest  string          `json:"digest,omitempty"`
-	Enabled bool            `json:"enabled"`
-	Grant   *GrantDecl      `json:"grant,omitempty"`
-	Tools   []ToolAccept    `json:"tools"`
-	Config  json.RawMessage `json:"config,omitempty"`
+	Name             string          `json:"name"`
+	Source           string          `json:"source"`
+	Digest           string          `json:"digest,omitempty"`
+	Enabled          bool            `json:"enabled"`
+	Grant            *GrantDecl      `json:"grant,omitempty"`
+	AcceptedUnsigned string          `json:"accepted_unsigned,omitempty"`
+	Tools            []ToolAccept    `json:"tools"`
+	Config           json.RawMessage `json:"config,omitempty"`
 }
 
 // deploymentDoc is the encode-side counterpart of rawDeployment
@@ -160,12 +166,13 @@ func MarshalDeployment(dep Deployment) ([]byte, error) {
 				entry.Grant.AllowedPaths)
 		}
 		ed := entryDoc{
-			Name:    entry.Name,
-			Source:  entry.Source,
-			Digest:  entry.Digest,
-			Enabled: entry.Enabled,
-			Tools:   entry.Tools,
-			Config:  entry.Config,
+			Name:             entry.Name,
+			Source:           entry.Source,
+			Digest:           entry.Digest,
+			Enabled:          entry.Enabled,
+			AcceptedUnsigned: entry.AcceptedUnsigned,
+			Tools:            entry.Tools,
+			Config:           entry.Config,
 		}
 		// Only a STATED grant is written at all — see entryDoc's doc
 		// comment. entry.Grant is copied into its own local rather than
