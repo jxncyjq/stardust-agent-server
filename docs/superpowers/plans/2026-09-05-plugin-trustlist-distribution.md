@@ -3655,3 +3655,150 @@ Plan complete and saved to `docs/superpowers/plans/2026-09-05-plugin-trustlist-d
 **2. Inline Execution** —— 在当前会话里按 executing-plans 批量执行，带检查点
 
 注意 **Task 0 必须由人先做**（生成 root 密钥对），两种方式都一样。
+
+---
+
+## 真机验证记录（Task 9，2026-09-06）
+
+七步全部执行，实际输出逐条抄录如下。**冻结二进制** `sha256 3a8a585234a3e51844d4b6c0a6a006cde70b94a83acf4e5ca0b82455bc507842`，Step 5–7 全程复用它，不再重新编译——这是「不发新版也能换清单」这句话成立的前提。
+
+发布落点：`jxncyjq/stardust-agent-server`（**PUBLIC**，raw 可匿名取回）。验证走的是分支 ref
+`refs/heads/spec/plugin-trustlist-distribution`，而非计划里写的 `master`——本期工作尚未合并，
+合并后同一份文件落到 master，只差 ref 那一段。spec 要求 URL 指向**分支**而非 commit SHA，
+所以这样验证是忠于机制的。
+
+### Step 1–4：造清单 → 签 → 推送 → 从真实 URL 取回
+
+```
+signed trust/trustlist.json (serial 1, expires 2026-10-06) with key "root-2026" -> trust/trustlist.sig
+
+status: fresh
+serial: 1
+issued: 2026-09-06 02:36:15Z
+expires: 2026-10-06 02:36:15Z
+publishers (1):
+  自检用钥匙 (dev-selftest)
+```
+
+三个缓存文件全部落盘：`trustlist.json` / `trustlist.sig` / `revoked-ever.json`。
+
+### Step 5：不发新版也能换清单 —— **通过**
+
+```
+=== 二进制未变 ===
+3a8a585234a3e51844d4b6c0a6a006cde70b94a83acf4e5ca0b82455bc507842
+status: fresh
+serial: 2
+publishers (2):
+  第二位开发者 (dev-second)
+  自检用钥匙 (dev-selftest)
+```
+
+同一个二进制，清单从 serial 1 换到 serial 2，新登记的开发者出现。**D-2 的核心诉求在真机上成立。**
+
+### Step 6：防回滚 —— **通过**
+
+远端被替换成一份 **签名完全合法** 的旧清单（serial 1）：
+
+```
+退出码 = 1
+stdout: status: fresh / serial: 2 / publishers (2)…
+stderr: plugins trustlist refresh: trustlist at <url> has serial 1 but this machine has
+        already seen 2; refusing a list that would undo revocations recorded since then:
+        trustlist serial regressed
+```
+
+磁盘缓存**未被覆盖**，仍是 serial 2。「先把手上那份可用状态打到 stdout、失败原因打到 stderr」
+这条设计在真机上也验到了。
+
+### Step 7：撤销永不遗忘 —— **通过（本期唯一只有真机能验的一条）**
+
+serial 3 撤销 `dev-selftest`：
+
+```
+publishers (2):
+  第二位开发者 (dev-second)
+  自检用钥匙 (dev-selftest) [REVOKED]
+```
+
+serial 4 把它从 `keys` 里**彻底删除**、`revoked` 段整个拿掉（`grep -c dev-selftest` = **0**）：
+
+```
+status: fresh
+serial: 4
+publishers (1):
+  第二位开发者 (dev-second)
+1 revoked key(s) no longer listed in the current trustlist are still refused on this machine
+(revocations are never forgotten)
+```
+
+`revoked-ever.json` 仍完整保留：
+
+```json
+{ "revoked": [ { "key_id": "dev-selftest",
+                 "revoked_at": "2026-09-06T02:48:41Z",
+                 "reason": "真机验证：模拟私钥泄漏" } ] }
+```
+
+这条跨越 4 次真实网络取回与多次落盘。**理由与时间必须留着**——`sign.Keyring` 靠它们生成人能读的
+拒绝语，丢掉就退化成「未知钥匙」。
+
+---
+
+## 真机才暴露出来的三件事（计划里都没有）
+
+### 一、GitHub raw 有 CDN 缓存，且**边缘节点会不一致**
+
+```
+Cache-Control: max-age=300
+X-Cache: HIT      Source-Age: 67
+```
+
+实测翻页耗时：serial 2 用 225 秒、serial 1（回滚）255 秒、serial 3 约 225 秒、serial 4 约 280 秒。
+
+更要紧的是**节点间不一致**：轮询用的 curl 已经看到 serial 3，紧接着 Go 那次取回却拿到 serial 1
+——两者打到了不同的缓存节点。第一次重试即恢复。
+
+**对生产的含义**：`max-age=300` 不是「5 分钟后所有人都能看到新的」，而是「5 分钟后各节点**陆续**
+翻页，期间不同用户拿到的版本可能不同」。默认 6 小时刷新间隔下无所谓，但**紧急撤销的到达时间要
+把这一段算进去**。
+
+**这个抖动伤不到安全性**：serial 单调恰好把它挡住了——一台已见过 serial 2 的机器被喂 serial 1 时
+会拒绝而不是回退。CDN 抖动在这套设计下表现为「慢」，不是「错」。
+
+### 二、CRLF 差一点踩响（已修）
+
+git 每次提交都警告 `LF will be replaced by CRLF`。签名覆盖的是 `trustlist.json` 的**确切字节**，
+行尾一旦被转换，GitHub 吐出来的就与签名时的不是同一份。
+
+本次逐份核对 sha256（远端 / git blob / 工作区）**三者一致**，没有踩响。但这是迟早的事，已加
+`trust/.gitattributes`：
+
+```
+*.json -text
+*.sig  -text
+```
+
+用 `-text` 而非 `eol=lf`：后者只统一工作区，而这里要的是**工作区、git blob、raw 服务的字节三者恒等**。
+加上之后 CRLF 警告消失。
+
+若将来真踩响，症状是**所有用户机器同时报「清单不可信」**，而排查方向会被指向发布侧或中间人
+——真正的原因却是 git 在 checkout 时改了字节。
+
+### 三、我自己的一次测量错误，记下来免得下次再犯
+
+Step 6 我一度报「退出码 0」，判断刷新失败却没有非零退出。**是测错了**：命令被管道接到 `tail`，
+`$?` 取的是管道末端的状态。去掉管道重测是 **1**，行为本来就对。
+
+**判据**：要测一个命令的退出码，就不要把它接进管道。
+
+---
+
+## 遗留的一个待决事项
+
+当前 `trust/trustlist.json`（serial 4）登记的是**测试用**发布者 `dev-second / 第二位开发者`，
+而它的私钥已作为临时文件删除。这份文件一旦随本分支合并到 master，就成了**正式**的官方信任清单
+——里面躺着一个假发布者。
+
+`sign.ParseKeyring` 拒绝空的 `keys`，所以「一份不登记任何人的初始清单」在当前设计下是非法的。
+合并前需要决定：是等到有第一位真实开发者再发布 `trust/`，还是先接受一个占位条目。
