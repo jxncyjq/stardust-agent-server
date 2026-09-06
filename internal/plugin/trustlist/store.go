@@ -3,6 +3,7 @@ package trustlist
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -25,8 +26,8 @@ type Status int
 
 const (
 	// StatusUnavailable：没有可用的清单——从没成功取得过，或缓存损坏，或装配
-	// 信任集失败。此时 Trust.Keyring 是 nil、Trust.Publishers 是 nil，调用方
-	// 必须把所有插件按「未登记」处理。
+	// 信任集失败。此时 Trust.Keyring、Trust.KeyringRaw 与 Trust.Publishers 都是
+	// nil，调用方必须把所有插件按「未登记」处理。
 	StatusUnavailable Status = iota
 	// StatusStale：验签通过但已过 expires_at（多半是长期断网）。信任集照常
 	// 可用，撤销照常生效。
@@ -51,11 +52,22 @@ func (s Status) String() string {
 
 // Trust 是一次装配的结果：信任集、发布者名录，以及它有多新。
 //
-// Status 为 StatusUnavailable 时 Keyring 与 Publishers 都是 nil。这不是「留空
-// 待填」——它是让「拿不到清单就先放行」在类型层面做不到：没有信任集，就没有
-// 任何东西可以用来判一个插件可信。
+// Status 为 StatusUnavailable 时 Keyring、KeyringRaw 与 Publishers 都是 nil。
+// 这不是「留空待填」——它是让「拿不到清单就先放行」在类型层面做不到：没有信任集，
+// 就没有任何东西可以用来判一个插件可信。
+//
+// Keyring 与 KeyringRaw 各带一半、缺一不可，因为两者装的不是同一份事实：
+//
+//   - KeyringRaw 是清单信封里那段 keyring 文档的原始字节，是这里**唯一**还留着
+//     公钥的地方——sign.Keyring 的导出面（IDs / RevokedIDs / Revoked / Verify）
+//     没有按 id 取公钥的方法，所以一个 *sign.Keyring 没法把自己的登记贡献给另一
+//     份 keyring 文档；
+//   - Keyring 装的撤销集比 KeyringRaw 里那段宽：assembleKeyring 把本机的撤销
+//     累积集（revoked-ever.json）并了进去，而原始字节里只有这一份清单自己写下的
+//     那些。
 type Trust struct {
 	Keyring    *sign.Keyring
+	KeyringRaw json.RawMessage
 	Publishers map[sign.KeyID]Publisher
 	Status     Status
 	Serial     int64
@@ -274,6 +286,7 @@ func (s *Store) assemble(doc Document, revoked *revokedSet) (Trust, error) {
 	}
 	return Trust{
 		Keyring:    keyring,
+		KeyringRaw: doc.KeyringRaw,
 		Publishers: doc.Publishers,
 		Status:     status,
 		Serial:     doc.Serial,
