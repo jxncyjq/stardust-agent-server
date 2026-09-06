@@ -383,6 +383,19 @@ type Entry struct {
 	// again.
 	GrantStated bool
 
+	// AcceptedUnsigned is the digest of the exact plugin.json bytes an
+	// operator accepted at install time for a package no registered
+	// publisher endorses. Format: "sha256:" followed by 64 hex digits
+	// (digestPattern). Empty means nobody has ever accepted this package.
+	//
+	// It is bound to the bytes, not to the plugin's name: an acceptance
+	// says "I trust THIS build", and a name-scoped one would hand every
+	// later build — including one somebody else swapped in — the same
+	// permission. Pinning plugin.json is enough to pin the code, because
+	// plugin.json carries plugin.wasm's sha256, and LoadPackage compares
+	// the wasm bytes against that declared digest on every load.
+	AcceptedUnsigned string
+
 	Tools  []ToolAccept
 	Config json.RawMessage
 }
@@ -712,13 +725,14 @@ func validateServiceCapabilities(
 // constructs the public Entry (see Entry.Enabled's and Entry.GrantStated's
 // own doc comments for why neither is a fallback).
 type rawEntry struct {
-	Name    string          `json:"name"`
-	Source  string          `json:"source"`
-	Digest  string          `json:"digest"`
-	Enabled *bool           `json:"enabled"`
-	Grant   *GrantDecl      `json:"grant"`
-	Tools   []ToolAccept    `json:"tools"`
-	Config  json.RawMessage `json:"config"`
+	Name             string          `json:"name"`
+	Source           string          `json:"source"`
+	Digest           string          `json:"digest"`
+	Enabled          *bool           `json:"enabled"`
+	Grant            *GrantDecl      `json:"grant"`
+	AcceptedUnsigned string          `json:"accepted_unsigned,omitempty"`
+	Tools            []ToolAccept    `json:"tools"`
+	Config           json.RawMessage `json:"config"`
 }
 
 // rawDeployment mirrors Deployment's JSON shape for decoding; see rawEntry.
@@ -744,7 +758,9 @@ type rawDeployment struct {
 //     carries userinfo (see Entry.Digest and Entry.RemoteURL);
 //   - a local entry (any other Source) that carries a Digest — a field
 //     that would never be checked, which would mislead a reader into
-//     thinking it is (see Entry.Digest).
+//     thinking it is (see Entry.Digest);
+//   - a non-empty AcceptedUnsigned that is not "sha256:" followed by 64
+//     hex digits (see Entry.AcceptedUnsigned).
 //
 // Reconciling an entry's Grant/Tools against the plugin's own
 // PluginManifest — checking that a granted capability was actually
@@ -797,14 +813,15 @@ func ParseDeployment(data []byte) (Deployment, error) {
 			enabled = *re.Enabled
 		}
 		entry := Entry{
-			Name:        re.Name,
-			Source:      re.Source,
-			Digest:      re.Digest,
-			Enabled:     enabled,
-			Grant:       grant,
-			GrantStated: grantStated,
-			Tools:       re.Tools,
-			Config:      re.Config,
+			Name:             re.Name,
+			Source:           re.Source,
+			Digest:           re.Digest,
+			Enabled:          enabled,
+			Grant:            grant,
+			GrantStated:      grantStated,
+			AcceptedUnsigned: re.AcceptedUnsigned,
+			Tools:            re.Tools,
+			Config:           re.Config,
 		}
 
 		if err := validateEntrySource(entry); err != nil {
@@ -840,8 +857,18 @@ func rejectForeignScheme(name, source string) error {
 // validateEntrySource enforces Entry.Digest's pairing rules against an
 // already-classified Entry (see IsRemote): a remote entry must carry a
 // Digest matching digestPattern and a URL that RemoteURL accepts (parses,
-// no userinfo); a local entry must carry no Digest at all.
+// no userinfo); a local entry must carry no Digest at all. It also checks
+// AcceptedUnsigned's shape, a rule that applies to every entry regardless
+// of IsRemote: a non-empty AcceptedUnsigned must match digestPattern, the
+// same "sha256:" plus 64 hex digits shape Digest is held to.
 func validateEntrySource(e Entry) error {
+	if e.AcceptedUnsigned != "" && !digestPattern.MatchString(e.AcceptedUnsigned) {
+		return fmt.Errorf("parse deployment manifest: plugin %q accepted_unsigned %q is not \"sha256:\" "+
+			"followed by 64 hex digits; a malformed value can never match the package it is meant to pin, "+
+			"and the mismatch would be reported as the package having changed — a configuration mistake "+
+			"wearing a tampering alarm's clothes", e.Name, e.AcceptedUnsigned)
+	}
+
 	if !e.IsRemote() {
 		if e.Digest != "" {
 			return fmt.Errorf("parse deployment manifest: plugin %q has digest %q but source %q is a local "+
