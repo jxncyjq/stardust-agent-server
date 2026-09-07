@@ -112,6 +112,10 @@ func TestProvenanceRegistered(t *testing.T) {
 	if prov.Publisher != "张三" {
 		t.Errorf("Publisher = %q, want 张三", prov.Publisher)
 	}
+	if prov.UnrecognizedKeyID != "" {
+		t.Errorf("UnrecognizedKeyID = %q, want 空——这把钥匙是认得的，两个字段同时有值就把"+
+			"「认出来了」和「没认出来」搅成了一件事", prov.UnrecognizedKeyID)
+	}
 }
 
 // TestProvenanceUnsignedWhenThereIsNoSignature：没有 plugin.sig 不是错误，
@@ -135,12 +139,22 @@ func TestProvenanceUnsignedWhenThereIsNoSignature(t *testing.T) {
 	if prov.KeyID != "" {
 		t.Errorf("KeyID = %q, want 空——没有签名就没有 key 可报", prov.KeyID)
 	}
+	if prov.UnrecognizedKeyID != "" {
+		t.Errorf("UnrecognizedKeyID = %q, want 空——压根没有 plugin.sig，就不存在「自称由谁签名」这回事；"+
+			"这里非空会让拒绝反过来暗示存在一份签名", prov.UnrecognizedKeyID)
+	}
 }
 
 // TestProvenanceUnsignedWhenTheKeyIsUnknown：签了，但签它的 key 这台机器不认识。
 // 对用户的意义与「压根没签」完全相同：没有任何已登记的开发者为这份字节背书。
 //
-// KeyID 必须留空：把一把这台机器不认识的 key id 显示出来，只会让操作者以为它有意义。
+// 那个 id 报在 UnrecognizedKeyID 而**不是** KeyID：两者分开，才使「读到 KeyID」
+// 永远等于「这台机器有这把钥匙的记录」。混着填等于把一个陌生字符串放进一个
+// 表示「已认出」的字段里，读到它的人无从分辨。
+//
+// 同时 UnrecognizedKeyID 必须非空：「有人签了但我们不知道是谁」严格弱于
+// 「dev-stranger 签的，而我们不认识 dev-stranger」——过期的登记、写错的 key id、
+// 攻击者是三种不同的应对，只有那个 id 能把它们分开。
 func TestProvenanceUnsignedWhenTheKeyIsUnknown(t *testing.T) {
 	known, _, err := sign.GenerateKey()
 	if err != nil {
@@ -162,6 +176,13 @@ func TestProvenanceUnsignedWhenTheKeyIsUnknown(t *testing.T) {
 	}
 	if prov.KeyID != "" {
 		t.Errorf("KeyID = %q, want 空", prov.KeyID)
+	}
+	if prov.UnrecognizedKeyID != "dev-stranger" {
+		t.Errorf("UnrecognizedKeyID = %q, want dev-stranger——拒绝必须说得出这个包自称由谁签名",
+			prov.UnrecognizedKeyID)
+	}
+	if prov.Publisher != "" {
+		t.Errorf("Publisher = %q, want 空——信任集外的 key 不该有展示名", prov.Publisher)
 	}
 }
 
@@ -202,6 +223,10 @@ func TestProvenanceRevoked(t *testing.T) {
 	}
 	if prov.RevokedAt.IsZero() {
 		t.Error("RevokedAt 是零值——撤销时间丢了")
+	}
+	if prov.UnrecognizedKeyID != "" {
+		t.Errorf("UnrecognizedKeyID = %q, want 空——被撤销的钥匙是这台机器认得的一把，"+
+			"它不属于「不认识的 key」那一栏", prov.UnrecognizedKeyID)
 	}
 }
 
@@ -290,6 +315,10 @@ func TestNoTrustSetMeansUnsignedNotUnchecked(t *testing.T) {
 	}
 	if prov.State != ProvenanceUnsigned {
 		t.Errorf("State = %v, want ProvenanceUnsigned", prov.State)
+	}
+	if prov.UnrecognizedKeyID != "" {
+		t.Errorf("UnrecognizedKeyID = %q, want 空——没有信任集时 plugin.sig 根本没被读过，"+
+			"报出一个 id 等于报告一次从未发生的比对", prov.UnrecognizedKeyID)
 	}
 }
 

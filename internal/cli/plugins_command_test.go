@@ -2888,8 +2888,8 @@ func (f *pluginFixture) requireStatusExplains(when, want string) {
 //	point plugins.json at them -> serve assembly mounts them ->
 //	  flip one byte of plugin.wasm            -> reload refused on the sha256
 //	  edit plugin.json, keep the digest right -> reload refused on the signature
-//	  re-sign with a key the keyring lacks    -> reload refused: nobody this
-//	                                             deployment knows endorses it
+//	  re-sign with a key the keyring lacks    -> reload refused, naming both the
+//	                                             key offered and the key trusted
 //	  re-sign with the trusted key            -> reload converges again
 //
 // The signature policy is never written down: require_signature is left out of
@@ -2994,19 +2994,25 @@ func TestSignedDeploymentAcceptanceFromKeygenThroughEveryTamper(t *testing.T) {
 	if err == nil {
 		t.Fatal("plugins reload error = nil for a package signed by an untrusted key, want a refusal")
 	}
-	// The refusal does NOT name rogue-2026, and that is a decision rather than
-	// an omission: manifest.Provenance.KeyID is filled in only for a key this
-	// machine recognises, so a signature made by an unknown one arrives with no
-	// id attached at all — printing it would hand the reader an
-	// attacker-chosen string dressed up as something this deployment knows.
-	// What an operator acts on is the file to go and read and the key an
-	// endorsement would have had to come from, and both are here.
+	// The refusal has to name rogue-2026 — the key the package says signed it —
+	// as well as ops-2026, the key this deployment would have believed. Neither
+	// stands in for the other: without the first, an operator is told only that
+	// nobody they know endorsed this, which fits a lapsed registration, an id
+	// typed wrong, and an attacker equally well, and those are three different
+	// things to go and do. Without the second, the id has nothing to be
+	// contrasted against and reads like a credential rather than like a claim
+	// this deployment could not place. The plugin.sig path is the third thing:
+	// the file to go and read.
+	if !strings.Contains(err.Error(), "rogue-2026") {
+		t.Errorf("plugins reload error = %v, want it to name the key id the signature was made with", err)
+	}
 	if !strings.Contains(err.Error(), "plugin.sig") {
 		t.Errorf("plugins reload error = %v, want it to name the file whose signature could not be placed", err)
 	}
 	if !strings.Contains(err.Error(), "ops-2026") {
 		t.Errorf("plugins reload error = %v, want it to name the key this deployment does trust", err)
 	}
+	f.requireStatusExplains("after the untrusted signature was refused", "rogue-2026")
 	f.requireStatusExplains("after the untrusted signature was refused", "ops-2026")
 	f.requireBothPluginsStillMounted("after the untrusted signature was refused", "1.2.0")
 

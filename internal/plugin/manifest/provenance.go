@@ -92,17 +92,38 @@ type Provenance struct {
 
 	// KeyID names the key that signed the package, and is set only when this
 	// machine recognises that key — that is, for ProvenanceRegistered and
-	// ProvenanceRevoked.
+	// ProvenanceRevoked. It stays empty for ProvenanceUnsigned even when a
+	// plugin.sig was present.
 	//
-	// It stays empty for ProvenanceUnsigned even when a plugin.sig was
-	// present, because the id in that file names a key this machine knows
-	// nothing about; showing it would invite the reader to treat it as
-	// meaningful.
+	// An id that came out of a plugin.sig this machine could not place lands
+	// in UnrecognizedKeyID instead, never here. The two are separate fields so
+	// that the difference is a matter of which field was read rather than of
+	// remembering to check State first: a non-empty KeyID is always a key this
+	// machine has a record of.
 	KeyID sign.KeyID
+
+	// UnrecognizedKeyID names the key a plugin.sig claims to have been made
+	// with, when this machine's trust set holds no such key. It is set only
+	// for ProvenanceUnsigned, and only when a plugin.sig was present and
+	// parsed; a package carrying no signature leaves it empty, and so does a
+	// deployment with no trust set to place a signature against.
+	//
+	// It is NOT an endorsement and NOT a fact this machine can corroborate:
+	// whoever wrote plugin.sig chose the string, and nothing here vouches for
+	// it. It is carried anyway because a refusal that cannot say which key was
+	// offered cannot tell a registration that lapsed, a key id typed wrong,
+	// and an attacker apart, and those three ask for three different
+	// responses. Rendering it therefore has to say, in the same breath, that
+	// this machine does not know the key — the alternative to naming it is not
+	// a safer message but a message that fits all three cases equally badly.
+	//
+	// See KeyID for why this is a field of its own rather than that one.
+	UnrecognizedKeyID sign.KeyID
 
 	// Publisher is the display name TrustInput.Publishers carries for KeyID.
 	// It is empty when that map has no name for the key, and always empty for
-	// ProvenanceUnsigned, which has no KeyID to look up.
+	// ProvenanceUnsigned: that state has no KeyID, and UnrecognizedKeyID is by
+	// definition outside the trust set the names go with.
 	Publisher string
 
 	// Reason and RevokedAt are what the operator wrote down when the key was
@@ -202,7 +223,9 @@ func assessProvenance(dir string, manifestData []byte, trust TrustInput) (Proven
 	if trust.Keyring == nil {
 		// No trust set: nothing can be verified against anything, so no key
 		// can be recognised. plugin.sig is not even read — with no keys, its
-		// contents could not change the verdict.
+		// contents could not change the verdict — which is also why
+		// UnrecognizedKeyID stays empty here: naming a key that was never
+		// looked at would report a comparison that never happened.
 		return Provenance{State: ProvenanceUnsigned}, nil
 	}
 
@@ -246,8 +269,12 @@ func assessProvenance(dir string, manifestData []byte, trust TrustInput) (Proven
 	}
 	if !slices.Contains(trust.Keyring.IDs(), sig.KeyID) {
 		// Signed by a key this machine does not know. Same verdict as no
-		// signature at all, and KeyID stays empty — see Provenance.KeyID.
-		return Provenance{State: ProvenanceUnsigned}, nil
+		// signature at all — no registered publisher stands behind these bytes
+		// either way — so KeyID stays empty and the offered id is reported as
+		// UnrecognizedKeyID. That field is what keeps the two ways of reaching
+		// this verdict distinguishable to whoever has to act on it: see
+		// Provenance.UnrecognizedKeyID.
+		return Provenance{State: ProvenanceUnsigned, UnrecognizedKeyID: sig.KeyID}, nil
 	}
 	if err := trust.Keyring.Verify(sig, manifestData); err != nil {
 		return Provenance{}, fmt.Errorf("verify plugin.json signature: %w: %w", ErrUntrustedPackage, err)

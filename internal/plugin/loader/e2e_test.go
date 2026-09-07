@@ -1928,17 +1928,28 @@ func TestE2ESignedDeploymentKeepsServingTheVerifiedInstanceThroughEveryTamper(t 
 	if err == nil {
 		t.Fatal("Apply() error = nil for a package signed by an untrusted key, want a refusal")
 	}
-	// The refusal does NOT name the rogue key id, and that is a decision rather
-	// than an omission: manifest.Provenance.KeyID is filled in only for a key
-	// this machine recognises, so a signature made by an unknown one arrives
-	// with no id attached at all — printing it would hand the reader an
-	// attacker-chosen string dressed up as something this deployment knows.
-	// What the refusal must carry instead is the file to go and read and the
-	// keys an endorsement would have had to come from, which is what an
-	// operator acts on.
+	// Four things are demanded of this one refusal, and no three of them cover
+	// the fourth.
+	//
+	// The rogue key id, because "somebody signed it and we do not know who" is
+	// strictly weaker than "rogue-key signed it and we do not know rogue-key":
+	// a lapsed registration, a mistyped id, and an attacker are three
+	// different situations asking for three different responses, and only the
+	// offered id tells them apart. The id is a string the package chose, so
+	// the message carries it as a claim — which is what the trusted-key
+	// assertion below pins: naming it alone would let it read like a
+	// credential.
+	//
+	// The plugin.sig path, because that is the file to go and read. The
+	// trusted key ids, because that is what this deployment would have
+	// believed. And the sentinel, because telling this refusal apart from a
+	// revocation must not come down to matching on prose.
 	if !errors.Is(err, manifest.ErrUnsignedNotAccepted) {
 		t.Errorf("Apply() error = %v, want it to wrap manifest.ErrUnsignedNotAccepted: no registered "+
 			"publisher endorses this package any more", err)
+	}
+	if !strings.Contains(err.Error(), string(rogueKeyID)) {
+		t.Errorf("Apply() error = %v, want it to name the key id the signature was made with", err)
 	}
 	if !strings.Contains(err.Error(), "plugin.sig") {
 		t.Errorf("Apply() error = %v, want it to name the file whose signature this deployment could not place", err)
@@ -1946,6 +1957,7 @@ func TestE2ESignedDeploymentKeepsServingTheVerifiedInstanceThroughEveryTamper(t 
 	if !strings.Contains(err.Error(), string(testKeyID)) {
 		t.Errorf("Apply() error = %v, want it to name the keys this deployment does trust", err)
 	}
+	h.requireEchoFailureSays("after the untrusted signature was refused", string(rogueKeyID))
 	h.requireEchoFailureSays("after the untrusted signature was refused", string(testKeyID))
 	h.requireRefusedConvergenceLeftEverythingAlone(ctx, "after the untrusted signature was refused")
 

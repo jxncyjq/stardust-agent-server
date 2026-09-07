@@ -1347,10 +1347,9 @@ func (l *Loader) admit(entry manifest.Entry, dir string, trust manifest.TrustInp
 				"plugin", entry.Name, "digest", digest)
 			return nil
 		case entry.AcceptedUnsigned == "":
-			return fmt.Errorf("plugin %q is endorsed by no registered publisher — %s is absent, or names a "+
-				"key outside this deployment's trust set (trusted keys: %s) — and nobody has accepted these "+
-				"bytes either; its plugin.json hashes to %s: %w",
-				entry.Name, filepath.Join(dir, "plugin.sig"), trustedKeyIDs(trust), digest,
+			return fmt.Errorf("plugin %q is endorsed by no registered publisher — %s — and nobody has "+
+				"accepted these bytes either; its plugin.json hashes to %s: %w",
+				entry.Name, describeMissingEndorsement(dir, trust, prov), digest,
 				manifest.ErrUnsignedNotAccepted)
 		default:
 			return fmt.Errorf("plugin %q changed since it was accepted: the acceptance on record covers %s, "+
@@ -1368,6 +1367,40 @@ func (l *Loader) admit(entry manifest.Entry, dir string, trust manifest.TrustInp
 		return fmt.Errorf("plugin %q has provenance state %s, which this deployment does not know how to "+
 			"judge: %w", entry.Name, prov.State, manifest.ErrUnsignedNotAccepted)
 	}
+}
+
+// describeMissingEndorsement renders WHY a package counts as unendorsed, as a
+// clause meant to sit inside a sentence that has already said no registered
+// publisher stands behind it.
+//
+// The two renderings are two different facts, not two phrasings of one. "There
+// is nothing here this deployment recognises as an endorsement" and "this
+// package claims dev-abc signed it, and dev-abc means nothing here" send an
+// operator to different places: the second says somebody did sign it, and the
+// question is why that key is not registered — a registration that lapsed, an
+// id typed wrong, and an attacker all produce it, and they ask for three
+// different responses. The offered id is the only thing that separates them,
+// so it is printed, and printed as a claim rather than as a name this machine
+// knows: manifest.Provenance.UnrecognizedKeyID is a string the package chose,
+// and a message that let it read like a credential would be worse than one
+// that omitted it.
+//
+// Both renderings name the keys this deployment does trust, because "who it
+// says signed it" and "who this deployment would have believed" are
+// complementary: one alone never shows that the two sets do not meet.
+func describeMissingEndorsement(dir string, trust manifest.TrustInput, prov manifest.Provenance) string {
+	sigPath := filepath.Join(dir, "plugin.sig")
+	if prov.UnrecognizedKeyID == "" {
+		// Deliberately not "plugin.sig is absent": this branch is also reached
+		// by a deployment with no trust set at all, where a plugin.sig may well
+		// exist and simply never got placed against anything. Reporting it as
+		// missing would send an operator looking for a file that is right
+		// there.
+		return fmt.Sprintf("no endorsement this deployment recognises is attached at %s (trusted keys: %s)",
+			sigPath, trustedKeyIDs(trust))
+	}
+	return fmt.Sprintf("%s claims a signature by key %q, which this deployment's trust set does not hold "+
+		"(trusted keys: %s)", sigPath, prov.UnrecognizedKeyID, trustedKeyIDs(trust))
 }
 
 // trustedKeyIDs renders the key ids an endorsement would have had to come from,
