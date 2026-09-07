@@ -238,6 +238,7 @@ type grantConsentResponse struct {
 	State              string   `json:"state"`
 	Detail             string   `json:"detail"`
 	Tools              []string `json:"tools"`
+	TrustState         string   `json:"trust_state"`
 	PendingConvergence bool     `json:"pending_convergence"`
 	ConvergenceDetail  string   `json:"convergence_detail"`
 }
@@ -262,6 +263,36 @@ func adminGrantRequest(t *testing.T, path string, body any) *http.Request {
 	req.Header.Set("X-Company-ID", "company-1")
 	req.Header.Set("X-Role", "admin")
 	return req
+}
+
+// TestGrantResponseShowsTheTrustState pins the wire-format half of Task 6:
+// PluginView.TrustState travels through pluginConsentResponse's embedding to
+// the top-level "trust_state" key in POST /v1/plugins/{name}/grant's JSON
+// body, exactly like State and Detail already do. This matters here on
+// purpose -- Grant deliberately does not validate trust before authorizing a
+// plugin (see PluginConsent's own doc comment), so this response is the one
+// place an operator granting a package sees whether anybody recognisable
+// signed it, rather than a check Grant would otherwise have to duplicate.
+func TestGrantResponseShowsTheTrustState(t *testing.T) {
+	t.Parallel()
+	fake := &fakePluginConsent{grantResult: ConsentResult{
+		View: PluginView{Name: "jira", State: "loaded", TrustState: "unsigned"},
+	}}
+	srv := NewHTTPServer(Config{Plugins: fake, AdminToken: "token"})
+
+	req := adminGrantRequest(t, "/v1/plugins/jira/grant", GrantRequest{Capabilities: []string{"log"}})
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("POST /v1/plugins/jira/grant status = %d, want %d body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var resp grantConsentResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode response: %v body=%s", err, rec.Body.String())
+	}
+	if resp.TrustState != "unsigned" {
+		t.Errorf("trust_state = %q, want %q", resp.TrustState, "unsigned")
+	}
 }
 
 // TestPluginsGrantWriteFailureReportsErrorStatus is outcome 1 of the

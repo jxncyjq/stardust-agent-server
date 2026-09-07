@@ -222,6 +222,37 @@ type PluginView struct {
 	GrantedHosts             []string `json:"granted_allowed_hosts"`
 	GrantedPaths             []string `json:"granted_allowed_paths"`
 	GrantedExtensions        []string `json:"granted_extensions"`
+
+	// TrustState is what this machine's trust set says about who stands
+	// behind the package's bytes -- manifest.ProvenanceState.String() from
+	// the manifest.Provenance verdict LoadPackage returned for this package,
+	// so exactly one of "registered", "unsigned" or "revoked". That mapping
+	// is written once, in ProvenanceState.String(); a caller filling this
+	// field must use that string directly rather than writing a second table
+	// that translates the same three values, which is exactly the kind of
+	// duplicate that drifts when a fourth state is ever added. It is empty
+	// for a view produced without ever loading the package at all --
+	// PluginConsent.Deny deliberately skips that (see
+	// DeclaredUnresolvedNotInspected), so its view has no verdict to report,
+	// which is a fourth condition rather than a guess at one of the three.
+	TrustState string `json:"trust_state"`
+	// TrustPublisher is the registered publisher's display name for the key
+	// that signed the package -- manifest.Provenance.Publisher from the same
+	// verdict. It is empty whenever TrustState is not "registered", and it
+	// may also be empty when TrustState IS "registered": Provenance.Publisher
+	// itself is empty whenever the trust input behind the verdict carries no
+	// display name for that key (see manifest.TrustInput.Publishers's own
+	// doc comment) -- a missing name is decoration lost, not a different
+	// verdict.
+	TrustPublisher string `json:"trust_publisher,omitempty"`
+	// TrustDetail carries what a refusal would say about this package's
+	// provenance -- for a revoked key, the time it was revoked and the
+	// reason an operator recorded, rendered by manifest.DescribeRevocation.
+	// It is empty whenever TrustState is not "revoked", and it may also be
+	// empty when TrustState IS "revoked": both the time and the reason are
+	// optional in a revocation record, and DescribeRevocation renders "" when
+	// a record carries neither.
+	TrustDetail string `json:"trust_detail,omitempty"`
 }
 
 // DeclaredUnresolvedNotCached is the PluginView.DeclaredUnresolvedReason for

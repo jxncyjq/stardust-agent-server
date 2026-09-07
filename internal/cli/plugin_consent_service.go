@@ -85,18 +85,24 @@ type PluginConsentService struct {
 // keyring document merged with the fetched trust list, publishers included (see
 // resolvePluginTrustInput). So a package endorsed by a key only the fetched list
 // registers is, to this service, endorsed by nobody it recognises. Every
-// manifest.LoadPackage call in this file discards the Provenance it returns, and
-// an unrecognised key id on a well-formed plugin.sig comes back as
-// ProvenanceUnsigned rather than as an error, so on that one path the two trust
-// sets already agree today. They do NOT agree when plugin.sig is malformed or
-// fails verification: assessProvenance wraps that in manifest.ErrUntrustedPackage
-// whenever its TrustInput carries a non-nil Keyring, but it never reads
-// plugin.sig at all when the Keyring is nil, which is exactly what keyringFn
-// returns for a deployment with require_signature: false (see
-// resolvePluginKeyring). Under that policy, a plugin.sig a mount or install
-// would refuse as untrusted instead loads through this service with no error at
-// all. That gap already exists today; Task 6, which is meant to surface a
-// trust verdict to a reader through this service, would only make it visible.
+// manifest.LoadPackage call in this file now surfaces the Provenance it
+// returns through PluginView's TrustState/TrustPublisher/TrustDetail (see
+// trustFieldsFor) -- but this TrustInput never carries a Publishers map, so
+// TrustPublisher stays empty through this service regardless of state; a
+// display name is all that gap costs, never the verdict itself, which is
+// TrustState and comes from Provenance.State alone. An unrecognised key id on
+// a well-formed plugin.sig comes back as ProvenanceUnsigned rather than as an
+// error, so on that one path the two trust sets already agree today. They do
+// NOT agree when plugin.sig is malformed or fails verification:
+// assessProvenance wraps that in manifest.ErrUntrustedPackage whenever its
+// TrustInput carries a non-nil Keyring, but it never reads plugin.sig at all
+// when the Keyring is nil, which is exactly what keyringFn returns for a
+// deployment with require_signature: false (see resolvePluginKeyring). Under
+// that policy, a plugin.sig a mount or install would refuse as untrusted
+// instead loads through this service with no error at all, reported now as
+// TrustState "unsigned" -- the same verdict a package that never carried a
+// plugin.sig would get, because to a nil-Keyring TrustInput the two cases are
+// indistinguishable.
 //
 // remote is the resolved remote-source policy (config.PluginsConfig's Cache,
 // HTTP client and fetch/unpack limits, see resolvePluginRemote) this
@@ -124,6 +130,30 @@ func NewPluginConsentService(manifestPath, root string, pluginsFn func() *loader
 		remote:       remote,
 		logger:       logger,
 	}
+}
+
+// trustFieldsFor translates one manifest.Provenance verdict -- LoadPackage's
+// judgment about who, if anyone, stands behind a package's bytes -- into the
+// three server.PluginView trust fields List, Grant and Resolve each fill.
+//
+// TrustState is prov.State.String() and nothing else: manifest.ProvenanceState
+// already renders exactly "registered"/"unsigned"/"revoked" (see its own
+// String method), and writing a second table here that maps the same three
+// values is exactly the kind of duplicate rule this repository keeps losing
+// sync on when a state is added to one copy and not the other.
+//
+// publisher and detail are populated only for the one state each describes --
+// see PluginView.TrustPublisher and PluginView.TrustDetail's own doc comments
+// for why either may still come back empty even in that state.
+func trustFieldsFor(prov manifest.Provenance) (state, publisher, detail string) {
+	state = prov.State.String()
+	if prov.State == manifest.ProvenanceRegistered {
+		publisher = prov.Publisher
+	}
+	if prov.State == manifest.ProvenanceRevoked {
+		detail = manifest.DescribeRevocation(prov)
+	}
+	return state, publisher, detail
 }
 
 // List reads the deployment manifest and this process's loader status, and
@@ -245,9 +275,10 @@ func (s *PluginConsentService) List(ctx context.Context) ([]server.PluginView, e
 			views = append(views, view)
 			continue
 		}
-		// 三态在 Task 6 接线（PluginView 的 trust_state / trust_publisher /
-		// trust_detail 三个字段）：Provenance 在这里被丢弃。
-		pm, _, _, loadErr := manifest.LoadPackage(dir, manifest.TrustInput{Keyring: keyring})
+		// prov is translated into view.TrustState/TrustPublisher/TrustDetail by
+		// trustFieldsFor below -- see that function's own doc comment for why
+		// TrustState comes from prov.State.String() and nowhere else.
+		pm, _, prov, loadErr := manifest.LoadPackage(dir, manifest.TrustInput{Keyring: keyring})
 		if loadErr != nil {
 			view.DeclaredUnresolved = true
 			view.DeclaredUnresolvedReason = server.DeclaredUnresolvedLoadFailed
@@ -259,6 +290,7 @@ func (s *PluginConsentService) List(ctx context.Context) ([]server.PluginView, e
 		view.DeclaredHosts = pm.Network.AllowedHosts
 		view.DeclaredPaths = pm.Filesystem.AllowedPaths
 		view.DeclaredExtensions = pm.Extensions
+		view.TrustState, view.TrustPublisher, view.TrustDetail = trustFieldsFor(prov)
 		views = append(views, view)
 	}
 	return views, nil
@@ -395,8 +427,11 @@ func (s *PluginConsentService) Grant(ctx context.Context, name string, req serve
 	if err != nil {
 		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w", name, err)
 	}
-	// 三态在 Task 6 接线（授权响应也要带上信任状态）：Provenance 在这里被丢弃。
-	pm, _, _, err := manifest.LoadPackage(dir, manifest.TrustInput{Keyring: s.keyringFn()})
+	// prov is reported back to the caller in the response below, via
+	// trustFieldsFor -- this design deliberately does not gate the grant on
+	// it (see this method's own doc comment for why), so the operator sees
+	// the verdict here rather than nowhere at all.
+	pm, _, prov, err := manifest.LoadPackage(dir, manifest.TrustInput{Keyring: s.keyringFn()})
 	if err != nil {
 		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w", name, err)
 	}
@@ -475,6 +510,7 @@ func (s *PluginConsentService) Grant(ctx context.Context, name string, req serve
 	result.View.DeclaredHosts = pm.Network.AllowedHosts
 	result.View.DeclaredPaths = pm.Filesystem.AllowedPaths
 	result.View.DeclaredExtensions = pm.Extensions
+	result.View.TrustState, result.View.TrustPublisher, result.View.TrustDetail = trustFieldsFor(prov)
 	return result, nil
 }
 
@@ -519,10 +555,13 @@ func (s *PluginConsentService) Resolve(ctx context.Context, name string) (server
 	if err != nil {
 		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w", name, err)
 	}
-	// 三态在 Task 6 接线（PluginView 的三个信任字段）：Provenance 在这里被丢弃，
-	// 所以下面的 ErrUntrustedPackage 分支只会命中签名对不上那一类，不再命中缺
-	// 签名与未知钥匙——它们现在是判定。
-	pm, _, _, err := manifest.LoadPackage(dir, manifest.TrustInput{Keyring: s.keyringFn()})
+	// prov is reported through the returned PluginView's trust fields (via
+	// trustFieldsFor) on the success path below. The ErrUntrustedPackage
+	// branch just below only ever fires for a signature that does not
+	// verify -- a missing signature and an unrecognised key id are verdicts
+	// (ProvenanceUnsigned), not errors, so they fall through to that success
+	// path instead.
+	pm, _, prov, err := manifest.LoadPackage(dir, manifest.TrustInput{Keyring: s.keyringFn()})
 	if err != nil {
 		if errors.Is(err, manifest.ErrUntrustedPackage) {
 			// The bytes just failed signature verification, so they do not
@@ -539,11 +578,11 @@ func (s *PluginConsentService) Resolve(ctx context.Context, name string) (server
 		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w", name, err)
 	}
 
-	// Only Declared*/Granted*/Name are filled: Resolve never touches the
-	// loader (no Apply, no Status() merge, unlike Grant/Deny), so it has no
-	// honest State/Detail/Tools to report -- those stay at their zero value
-	// rather than being guessed at.
-	return server.PluginView{
+	// Only Declared*/Granted*/Name/Trust* are filled: Resolve never touches
+	// the loader (no Apply, no Status() merge, unlike Grant/Deny), so it has
+	// no honest State/Detail/Tools to report -- those stay at their zero
+	// value rather than being guessed at.
+	view := server.PluginView{
 		Name:               name,
 		GrantedCaps:        entry.Grant.Capabilities,
 		GrantedHosts:       entry.Grant.AllowedHosts,
@@ -553,7 +592,9 @@ func (s *PluginConsentService) Resolve(ctx context.Context, name string) (server
 		DeclaredHosts:      pm.Network.AllowedHosts,
 		DeclaredPaths:      pm.Filesystem.AllowedPaths,
 		DeclaredExtensions: pm.Extensions,
-	}, nil
+	}
+	view.TrustState, view.TrustPublisher, view.TrustDetail = trustFieldsFor(prov)
+	return view, nil
 }
 
 // Deny implements server.PluginConsent: it revokes the deployment entry

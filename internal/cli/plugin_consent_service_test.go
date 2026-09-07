@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -1781,5 +1782,174 @@ func TestGrantsResponseCarriesNoLogfmtLabelsEither(t *testing.T) {
 			t.Errorf("Deny 回的 detail 以 %q 开头：logfmt 标签跑到了给人看的字段上\n%s",
 				label, result.View.Detail)
 		}
+	}
+}
+
+// --- Task 6: PluginView trust fields ----------------------------------------
+
+// revokedTrustFixtureReason is the revocation reason newRevokedTrustFixture
+// records, so every subtest asserting on it names the exact same string.
+const revokedTrustFixtureReason = "laptop stolen"
+
+// newRevokedTrustFixture builds a single local, disabled plugin entry signed
+// with a key this deployment's own keyring has since revoked, so a
+// manifest.LoadPackage call against it comes back manifest.ProvenanceRevoked
+// with a Reason and RevokedAt -- one verdict, reachable without a network
+// fetch, that exercises two of PluginView's three trust fields at once
+// (TrustState and TrustDetail; see TestAssemblePluginsRefusesARevokedKeyEvenWithSignaturesOff
+// for why the keyring registers a second, unrelated key: sign.ParseKeyring
+// refuses a document whose every registered key is revoked).
+//
+// The entry is left disabled (enabled: false, omitGrant: true) so that
+// assemble() never attempts to activate -- and so never itself judges the
+// signature of -- this entry: assemble() resolves its OWN trust set from the
+// fixture's config file, entirely separate from the keyring this function
+// hands to NewPluginConsentService, and a disabled entry keeps those two
+// paths from interacting.
+func newRevokedTrustFixture(t *testing.T) (*pluginFixture, *sign.Keyring) {
+	t.Helper()
+
+	f := newPluginFixture(t, 30_000)
+
+	signingPub, signingPriv, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	sparePub, _, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	keyringPath := filepath.Join(f.dir, "keyring.json")
+	writeKeyringDoc(t, keyringPath, []map[string]string{
+		{"id": string(testPluginKeyID), "algorithm": "ed25519",
+			"public_key": base64.StdEncoding.EncodeToString(signingPub)},
+		{"id": "spare", "algorithm": "ed25519",
+			"public_key": base64.StdEncoding.EncodeToString(sparePub)},
+	}, []map[string]string{{"key_id": string(testPluginKeyID), "reason": revokedTrustFixtureReason}})
+	keyringData, err := os.ReadFile(keyringPath)
+	if err != nil {
+		t.Fatalf("read keyring %s: %v", keyringPath, err)
+	}
+	keyring, err := sign.ParseKeyring(keyringData)
+	if err != nil {
+		t.Fatalf("parse keyring %s: %v", keyringPath, err)
+	}
+
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.0.0", nil, []string{testEchoTool})
+	f.signPackage("echo", signingPriv)
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+	return f, keyring
+}
+
+// TestPluginViewCarriesTheTrustState is Task 6's own guard: List, Grant and
+// Resolve each run their OWN manifest.LoadPackage call and must each
+// translate its Provenance into the view they return -- filling only one of
+// the three would mean the same plugin shows a different trust verdict
+// depending on which endpoint the GUI asked, which is exactly the drift this
+// field exists to prevent. See the mutation test right after this one for the
+// proof that each path is independently guarded.
+func TestPluginViewCarriesTheTrustState(t *testing.T) {
+	wantState := manifest.ProvenanceRevoked.String()
+
+	t.Run("List", func(t *testing.T) {
+		f, keyring := newRevokedTrustFixture(t)
+		svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
+			func() *sign.Keyring { return keyring }, loader.RemoteConfig{}, testConsentLogger())
+
+		views, err := svc.List(context.Background())
+		if err != nil {
+			t.Fatalf("List() error = %v, want nil", err)
+		}
+		if len(views) != 1 {
+			t.Fatalf("len(views) = %d, want 1: %+v", len(views), views)
+		}
+		got := views[0]
+		if got.TrustState != wantState {
+			t.Errorf("TrustState = %q, want %q", got.TrustState, wantState)
+		}
+		if !strings.Contains(got.TrustDetail, revokedTrustFixtureReason) {
+			t.Errorf("TrustDetail = %q, want it to name the revocation reason %q", got.TrustDetail, revokedTrustFixtureReason)
+		}
+	})
+
+	t.Run("Grant", func(t *testing.T) {
+		f, keyring := newRevokedTrustFixture(t)
+		svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
+			func() *sign.Keyring { return keyring }, loader.RemoteConfig{}, testConsentLogger())
+
+		result, err := svc.Grant(context.Background(), testEchoPlugin, server.GrantRequest{})
+		if err != nil {
+			t.Fatalf("Grant() error = %v, want nil: this design deliberately does not gate Grant on trust", err)
+		}
+		if result.View.TrustState != wantState {
+			t.Errorf("Grant() View.TrustState = %q, want %q", result.View.TrustState, wantState)
+		}
+		if !strings.Contains(result.View.TrustDetail, revokedTrustFixtureReason) {
+			t.Errorf("Grant() View.TrustDetail = %q, want it to name the revocation reason %q",
+				result.View.TrustDetail, revokedTrustFixtureReason)
+		}
+	})
+
+	t.Run("Resolve", func(t *testing.T) {
+		f, keyring := newRevokedTrustFixture(t)
+		svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
+			func() *sign.Keyring { return keyring }, loader.RemoteConfig{}, testConsentLogger())
+
+		view, err := svc.Resolve(context.Background(), testEchoPlugin)
+		if err != nil {
+			t.Fatalf("Resolve() error = %v, want nil: a revoked verdict is a Provenance state, not manifest.ErrUntrustedPackage", err)
+		}
+		if view.TrustState != wantState {
+			t.Errorf("Resolve() TrustState = %q, want %q", view.TrustState, wantState)
+		}
+		if !strings.Contains(view.TrustDetail, revokedTrustFixtureReason) {
+			t.Errorf("Resolve() TrustDetail = %q, want it to name the revocation reason %q", view.TrustDetail, revokedTrustFixtureReason)
+		}
+	})
+}
+
+// TestTrustFieldsForRegisteredCarriesThePublisherName exercises the one
+// PluginView.TrustPublisher-populating branch of trustFieldsFor directly
+// against a synthetic manifest.Provenance, rather than through a real signed
+// package: PluginConsentService's own TrustInput never carries a Publishers
+// map (see NewPluginConsentService's own doc comment), so a Provenance that
+// actually reaches ProvenanceRegistered through this service's LoadPackage
+// calls always has an empty Publisher today. That gap belongs to a later
+// task's wiring, not to trustFieldsFor's own translation, which this test
+// pins independently of it.
+func TestTrustFieldsForRegisteredCarriesThePublisherName(t *testing.T) {
+	prov := manifest.Provenance{State: manifest.ProvenanceRegistered, Publisher: "Acme Corp"}
+	state, publisher, detail := trustFieldsFor(prov)
+	if state != "registered" {
+		t.Errorf("state = %q, want %q", state, "registered")
+	}
+	if publisher != "Acme Corp" {
+		t.Errorf("publisher = %q, want %q", publisher, "Acme Corp")
+	}
+	if detail != "" {
+		t.Errorf("detail = %q, want empty: a registered verdict carries no refusal to explain", detail)
+	}
+}
+
+// TestTrustFieldsForUnsignedCarriesNeitherPublisherNorDetail pins the third
+// state: ProvenanceUnsigned reports only TrustState, since neither a
+// publisher name nor a refusal detail applies to a package nobody
+// recognisable endorsed.
+func TestTrustFieldsForUnsignedCarriesNeitherPublisherNorDetail(t *testing.T) {
+	prov := manifest.Provenance{State: manifest.ProvenanceUnsigned, UnrecognizedKeyID: "some-key"}
+	state, publisher, detail := trustFieldsFor(prov)
+	if state != "unsigned" {
+		t.Errorf("state = %q, want %q", state, "unsigned")
+	}
+	if publisher != "" {
+		t.Errorf("publisher = %q, want empty: ProvenanceUnsigned never carries a publisher", publisher)
+	}
+	if detail != "" {
+		t.Errorf("detail = %q, want empty: ProvenanceUnsigned is not a refusal to explain", detail)
 	}
 }
