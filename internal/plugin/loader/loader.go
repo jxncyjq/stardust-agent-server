@@ -120,6 +120,17 @@ const (
 	// NOBODY asked for — an operator reading plugin/unloaded needs to tell it
 	// from a manifest edit at a glance.
 	reasonHealth = "health"
+
+	// reasonRevoked is the unload a WITHDRAWN ENDORSEMENT forces: the entry is
+	// still enabled, its package still reads, and what changed is that this
+	// deployment now revokes the key that endorses it.
+	//
+	// It is spelled out as a distinct reason because the entry it names is one
+	// the operator still has enabled in their manifest: reporting "disabled"
+	// or "manifest-removed" for an entry they never touched would send them to
+	// the wrong file, and the remedy is a different one too — a package a live
+	// key endorses, not a manifest edit.
+	reasonRevoked = "revoked"
 )
 
 // The reasons a plugin is mounted, as they appear in a RuntimeEventLoaded
@@ -503,6 +514,31 @@ type instance struct {
 type failure struct {
 	version string
 	err     string
+
+	// unconfirmedDisposal is set when this entry was unloaded because its
+	// endorsement was revoked AND that unload's disposal reported a failure:
+	// the deployment asked for the revoked plugin's resources to be released
+	// and was not told they were.
+	//
+	// It is carried across convergences (see fail) rather than recomputed,
+	// because it is a fact about an unload that already happened and no later
+	// convergence can either confirm or disprove it — the instance it belonged
+	// to is gone. A record that dropped it would answer "this plugin is
+	// refused" on the second convergence and every one after, which is the
+	// answer for a revocation that WAS cleanly unmounted.
+	unconfirmedDisposal string
+}
+
+// explanation is everything this record has to say, as one string: the failure
+// itself and, when there is one, the disposal that was never confirmed.
+//
+// They are joined here rather than at the point either is recorded so that the
+// worse half cannot be overwritten by a later convergence rewriting the first.
+func (f failure) explanation() string {
+	if f.unconfirmedDisposal == "" {
+		return f.err
+	}
+	return f.err + "; " + f.unconfirmedDisposal
 }
 
 // Loader converges the running plugin set toward a target state. Use New to
@@ -915,6 +951,10 @@ func (l *Loader) RemotePolicy() RemotePolicy {
 //	                                            identical action
 //	entry's content changed                  -> unload the old, activate the new
 //	entry's content is unchanged             -> nothing at all
+//	entry's package is signed by a key this
+//	deployment has revoked                   -> refuse it AND unload whatever
+//	                                            is running under its name
+//	                                            (revoked)
 //
 // "Content" is the plugin package's sha256 and version plus the entry's own
 // grant, accepted tools and config — see fingerprintOf for why each is in
@@ -924,9 +964,11 @@ func (l *Loader) RemotePolicy() RemotePolicy {
 //
 //  1. Every desired entry's package is read, checked, assembled and fingerprinted.
 //     Nothing running is touched, so an entry whose package is broken fails on
-//     its own and leaves its running instance alone.
-//  2. EVERY unload this convergence performs runs — both the entries that left
-//     the target state and the old instances of entries whose content changed.
+//     its own and leaves its running instance alone. A REVOCATION is the one
+//     verdict that does not stop there — see pass 2.
+//  2. EVERY unload this convergence performs runs — the entries that left the
+//     target state, the old instances of entries whose content changed, and the
+//     entries this deployment has revoked the endorsement of.
 //  3. Every entry that needs one is activated.
 //
 // Pass 2 is why a tool name moving from one plugin to another converges in a
@@ -1038,10 +1080,26 @@ func (l *Loader) converge(ctx context.Context, wanted []manifest.Entry, declared
 	// Pass 1: work out what each desired entry needs, touching nothing.
 	plans := make([]*convergePlan, 0, len(wanted))
 	planFor := make(map[string]*convergePlan, len(wanted))
+	// revocations holds the refusals pass 2 must act on rather than merely
+	// report: one entry per desired plugin whose package is signed by a key
+	// this deployment has revoked, keyed by name and carrying the refusal
+	// itself, which is the explanation the unloaded entry keeps afterwards.
+	revocations := make(map[string]error)
 	for _, entry := range wanted {
 		plan, err := l.prepare(ctx, entry, root)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("converge plugin %q: %w", entry.Name, err))
+			if errors.Is(err, manifest.ErrRevokedPublisher) {
+				revocations[entry.Name] = err
+				// Said again on EVERY convergence, not only on the one that
+				// first recorded it: an unload whose disposal was reported
+				// once and never again reads, from the second convergence on,
+				// exactly like an unload that succeeded.
+				if note := l.failures[entry.Name].unconfirmedDisposal; note != "" {
+					l.logger.Error("a revoked plugin's unload was never confirmed",
+						"plugin", entry.Name, "detail", note)
+				}
+			}
 			continue
 		}
 		if plan == nil {
@@ -1074,10 +1132,11 @@ func (l *Loader) converge(ctx context.Context, wanted []manifest.Entry, declared
 	}
 
 	// Pass 2: free everything this convergence frees — the entries that left the
-	// target state AND the previous instances of the entries that changed —
-	// before pass 3 activates anything. A replaced instance's own unload belongs
-	// here and not next to its activation, so that a tool name it releases is
-	// available to whichever entry claims it next, in this same Apply.
+	// target state, the previous instances of the entries that changed, AND the
+	// entries whose endorsement this deployment has revoked — before pass 3
+	// activates anything. A replaced instance's own unload belongs here and not
+	// next to its activation, so that a tool name it releases is available to
+	// whichever entry claims it next, in this same Apply.
 	mounted := make([]string, 0, len(l.instances))
 	for name := range l.instances {
 		mounted = append(mounted, name)
@@ -1089,6 +1148,24 @@ func (l *Loader) converge(ctx context.Context, wanted []manifest.Entry, declared
 		switch {
 		case plan != nil && plan.prev != nil:
 			reason = reasonReplaced
+		case revocations[name] != nil:
+			// A revocation is the ONE pass-1 refusal that takes the running
+			// instance down with it, and it is checked before the desired case
+			// below precisely because the entry is still desired.
+			//
+			// Every other refusal leaves that instance alone, for the reason
+			// prepare's doc comment gives: a package that will not load is a
+			// REPLACEMENT that failed, and unmounting a working plugin for a
+			// replacement that never existed helps nobody.
+			//
+			// A revocation is not a statement about a replacement. It says this
+			// deployment has withdrawn its trust from the key that endorses
+			// this entry's package, and while that is so, nothing serves under
+			// this entry's name — including an instance that was mounted before
+			// the withdrawal. Leaving that instance up would put the arrival of
+			// an emergency revocation at "whenever this process next restarts",
+			// which is the case it can least afford to miss.
+			reason = reasonRevoked
 		case desired[name]:
 			continue
 		case declared[name]:
@@ -1107,6 +1184,9 @@ func (l *Loader) converge(ctx context.Context, wanted []manifest.Entry, declared
 			plan.revoked = revoked
 			plan.unloadErr = err
 			continue
+		}
+		if cause := revocations[name]; cause != nil {
+			l.recordRevokedUnload(name, inst.version, cause, err)
 		}
 		if err != nil {
 			errs = append(errs, err)
@@ -1130,6 +1210,38 @@ func (l *Loader) converge(ctx context.Context, wanted []manifest.Entry, declared
 		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
+}
+
+// recordRevokedUnload files the Status record of an entry pass 2 has just
+// unloaded because this deployment revoked the key that endorses its package.
+// It is called with l.mu held.
+//
+// It exists because that entry would otherwise vanish from Status entirely: the
+// refusal was recorded by fail while the instance was still mounted, so it went
+// onto the instance record — and pass 2 has just discarded that record. An
+// entry that is enabled, refused and invisible is the one outcome a revocation
+// must not produce.
+//
+// The version is the one that WAS running rather than the one the package on
+// disk now declares, because that is what the unload took down and what an
+// operator has to match against their own inventory of where that code ran.
+//
+// unloadErr is the disposal's own answer and is kept apart from the refusal:
+// "this deployment revoked the endorsement of this plugin" and "and its
+// resources were never confirmed released" are two facts, the second strictly
+// worse than the first, and folding them into one sentence is how the worse one
+// stops being read. The note it leaves behind outlives this convergence — see
+// failure.unconfirmedDisposal.
+func (l *Loader) recordRevokedUnload(name, version string, cause, unloadErr error) {
+	record := failure{version: version, err: cause.Error()}
+	if unloadErr != nil {
+		record.unconfirmedDisposal = fmt.Sprintf("the unload this revocation forced reported a failure, so "+
+			"the revoked plugin's resources were never confirmed released and its code may still be "+
+			"running in this process: %v", unloadErr)
+		l.logger.Error("a revoked plugin's unload reported a failure",
+			"plugin", name, "version", version, "reason", reasonRevoked, "error", unloadErr)
+	}
+	l.failures[name] = record
 }
 
 // Status reports what every entry the Loader has seen actually came to, sorted
@@ -1172,7 +1284,7 @@ func (l *Loader) Status() []InstanceStatus {
 			Name:      name,
 			Version:   f.version,
 			State:     StateFailed,
-			LastError: f.err,
+			LastError: f.explanation(),
 		})
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -1211,6 +1323,14 @@ type convergePlan struct {
 // digest no longer matches its plugin.json leaves the current instance running
 // and reports the failure, instead of unmounting a working plugin for a
 // replacement that never existed.
+//
+// One refusal is not covered by that reasoning, and converge acts on it
+// separately: a package signed by a key this deployment has REVOKED. That
+// verdict is not "this replacement is unfit to mount", it is "this deployment
+// no longer trusts what endorses this entry" — and an entry under withdrawn
+// trust serves nothing, so pass 2 unloads whatever is mounted under its name
+// (see reasonRevoked). Every other refusal this function reports keeps the
+// sentence above, the unreadable and the mis-signed alike.
 func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string) (*convergePlan, error) {
 	// The two kinds of source differ HERE and nowhere else: a local entry
 	// resolves against the deployment root, a remote one is fetched into the
@@ -1595,7 +1715,17 @@ func (l *Loader) fail(
 	if running, ok := l.instances[name]; ok {
 		running.lastError = joined.Error()
 	} else {
-		l.failures[name] = failure{version: version, err: joined.Error()}
+		l.failures[name] = failure{
+			version: version,
+			err:     joined.Error(),
+			// Carried across, not dropped. For an entry whose
+			// revocation-forced unload was never confirmed this is that
+			// record being rewritten by a later convergence, and the refusal
+			// recorded here says nothing about that disposal either way. For
+			// every other entry there is nothing to carry. See
+			// failure.unconfirmedDisposal.
+			unconfirmedDisposal: l.failures[name].unconfirmedDisposal,
+		}
 	}
 
 	l.logger.Error("plugin activation failed",
