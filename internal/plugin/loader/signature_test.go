@@ -295,25 +295,25 @@ func TestNewSaysSoWhenTheDeploymentRequiresNoEndorsement(t *testing.T) {
 // TestSignaturePolicyDistinguishesADifferentTrustSet pins what a policy
 // comparison has to notice, and it is not just "on or off": `agent plugins
 // reload` refuses to converge when the config's policy differs from the running
-// Loader's, and a comparison that looked only at Enforced (or only at the
-// number of keys) would call a ROTATED trust set unchanged -- quietly
+// Loader's, and a comparison that looked only at KeyringConfigured (or only at
+// the number of keys) would call a ROTATED trust set unchanged -- quietly
 // converging new plugins against keys the operator has already retired.
 func TestSignaturePolicyDistinguishesADifferentTrustSet(t *testing.T) {
 	_, keyring := newTestKey(t)
 	_, rotated := newTestKeyWithID(t, sign.KeyID("rotated-key"))
 
-	if off := SignaturePolicyOf(nil); off.Enforced || len(off.KeyIDs) != 0 {
-		t.Errorf("SignaturePolicyOf(nil) = %+v, want the unenforced policy with no keys", off)
+	if off := SignaturePolicyOf(nil); off.KeyringConfigured || len(off.KeyIDs) != 0 {
+		t.Errorf("SignaturePolicyOf(nil) = %+v, want the policy with no local keyring and no keys", off)
 	}
 	on := SignaturePolicyOf(keyring)
-	if !on.Enforced || len(on.KeyIDs) != 1 || on.KeyIDs[0] != testKeyID {
-		t.Fatalf("SignaturePolicyOf(keyring) = %+v, want it enforced over exactly %q", on, testKeyID)
+	if !on.KeyringConfigured || len(on.KeyIDs) != 1 || on.KeyIDs[0] != testKeyID {
+		t.Fatalf("SignaturePolicyOf(keyring) = %+v, want a configured keyring holding exactly %q", on, testKeyID)
 	}
 	if !on.Equal(SignaturePolicyOf(keyring)) {
 		t.Errorf("SignaturePolicyOf(keyring).Equal(itself) = false, want true")
 	}
 	if on.Equal(SignaturePolicyOf(nil)) {
-		t.Errorf("an enforcing policy compares equal to the unenforced one; reload would apply a policy change silently")
+		t.Errorf("a configured keyring compares equal to no keyring at all; reload would apply a policy change silently")
 	}
 	if on.Equal(SignaturePolicyOf(rotated)) {
 		t.Errorf("two trust sets of the same size but different key ids compare equal; a key rotation would look like no change")
@@ -321,8 +321,42 @@ func TestSignaturePolicyDistinguishesADifferentTrustSet(t *testing.T) {
 	if got := SignaturePolicyOf(rotated).String(); !strings.Contains(got, "rotated-key") {
 		t.Errorf("SignaturePolicy.String() = %q, want it to name the trusted key so a changed trust set is visible", got)
 	}
-	if got := SignaturePolicyOf(nil).String(); !strings.Contains(got, "not required") {
-		t.Errorf("SignaturePolicy.String() = %q, want it to say signatures are not required", got)
+}
+
+// TestSignaturePolicyStringDescribesTheKeyringAndNotTheRequirement is the
+// task-4 review's Important #1: the type was narrowed to cover only the LOCAL
+// KEYRING, but its rendering still spoke about whether signatures are
+// "required" — a sentence about Config.RequireSignature, which this type does
+// not carry.
+//
+// The two come apart in exactly one deployment: a keyring is configured and
+// endorsements are not required. Rendering "signatures required" there puts a
+// false statement in front of the operator of a `plugins reload` refusal, which
+// is the one place they have to be able to believe what they read. So the
+// rendering must name the keyring and must NOT claim anything about the
+// requirement, in either direction.
+func TestSignaturePolicyStringDescribesTheKeyringAndNotTheRequirement(t *testing.T) {
+	_, keyring := newTestKey(t)
+
+	configured := SignaturePolicyOf(keyring).String()
+	if !strings.Contains(configured, "keyring") {
+		t.Errorf("SignaturePolicy.String() = %q for a configured keyring, want it to say a local keyring is "+
+			"what it describes", configured)
+	}
+	if strings.Contains(configured, "required") {
+		t.Errorf("SignaturePolicy.String() = %q, want it NOT to speak about a signature REQUIREMENT: this type "+
+			"holds no Config.RequireSignature, and a deployment may configure a keyring without requiring an "+
+			"endorsement", configured)
+	}
+
+	none := SignaturePolicyOf(nil).String()
+	if !strings.Contains(none, "no local keyring") {
+		t.Errorf("SignaturePolicy.String() = %q for no keyring, want it to say there is no local keyring", none)
+	}
+	if strings.Contains(none, "required") {
+		t.Errorf("SignaturePolicy.String() = %q, want it NOT to say signatures are or are not required: a "+
+			"deployment with no local keyring may still set Config.RequireSignature, and it is that field "+
+			"rather than the keyring that decides whether an unendorsed package mounts", none)
 	}
 }
 
@@ -338,8 +372,9 @@ func TestLoaderReportsThePolicyItWasBuiltWith(t *testing.T) {
 			got, SignaturePolicyOf(keyring))
 	}
 
-	if got := newHarness(t).loader.SignaturePolicy(); got.Enforced {
-		t.Errorf("Loader.SignaturePolicy() = %+v for a Loader built with no keyring, want the unenforced policy", got)
+	if got := newHarness(t).loader.SignaturePolicy(); got.KeyringConfigured {
+		t.Errorf("Loader.SignaturePolicy() = %+v for a Loader built with no keyring, want the policy with no "+
+			"local keyring", got)
 	}
 }
 
@@ -395,11 +430,11 @@ func TestSignaturePolicyDistinguishesARevocation(t *testing.T) {
 		t.Fatalf("SignaturePolicyOf(...).RevokedIDs = %v, want [%s]", policy.RevokedIDs, revokedID)
 	}
 
-	// Same enforcement, same trusted ids, different revocations: this MUST
-	// compare unequal, or the reload guard never fires.
+	// A keyring on both sides, same trusted ids, different revocations: this
+	// MUST compare unequal, or the reload guard never fires.
 	sameKeysNoRevocation := SignaturePolicy{
-		Enforced: true,
-		KeyIDs:   policy.KeyIDs,
+		KeyringConfigured: true,
+		KeyIDs:            policy.KeyIDs,
 	}
 	if policy.Equal(sameKeysNoRevocation) {
 		t.Error("a policy with a revocation compares equal to one without; reload would converge " +
@@ -717,10 +752,17 @@ const unendorsedMountWarning = "plugin package is admitted with no endorsement b
 // its unendorsed plugins, and does not silently lose them all on the release
 // that introduced acceptances.
 //
-// It also pins that the warning is per MOUNT rather than once per Loader. A
-// deployment running unendorsed code should be reminded every time it does so;
-// a single startup line scrolls away and then never appears again, however many
-// plugins mount afterwards.
+// It also pins that the warning is written for every enabled entry on every
+// convergence, rather than once per Loader. converge's pass 1 runs prepare for
+// each enabled entry, and prepare runs admit before it fingerprints anything —
+// so an entry whose package has not changed is judged, and warned about, again.
+// A deployment running unendorsed code should be reminded every time it
+// converges over one; a single startup line scrolls away and then never appears
+// again, however many plugins mount afterwards.
+//
+// The two convergences below change the package each time, so they assert the
+// weaker half of that: two convergences, two warnings. The code satisfies the
+// stronger half as well.
 func TestRequireSignatureFalseMountsUnsigned(t *testing.T) {
 	logs := &bytes.Buffer{}
 	h := newHarnessWithOptions(t, defaultTestApplyWait, trustOptions{
@@ -890,5 +932,149 @@ func TestAdmitRefusesAProvenanceStateItDoesNotKnow(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), unknown.State.String()) {
 		t.Errorf("admit() error = %v, want it to name the state it could not judge (%s)", err, unknown.State)
+	}
+}
+
+// endorsedMountLog is the message the Loader logs on every convergence over a
+// package a registered publisher endorses.
+const endorsedMountLog = "plugin package is endorsed by a registered publisher"
+
+// testPublisher is the display name the trust set carries for testKeyID. It has
+// a space in it on purpose: a log handler quotes such a value, so a test that
+// finds it has found the VALUE and not an accidental substring of a key name.
+const testPublisher = "Acme Plugin Works"
+
+// TestAnEndorsedMountIsLoggedWithItsPublisherAndKey is the task-4 review's
+// Important #3. The graded-install policy table says a package a registered
+// publisher endorses mounts AND that the mount is recorded with the publisher
+// and the key id — and the second half had no guard at all: deleting the log
+// line left all three packages green.
+//
+// The line is not decoration. It is the only record that says WHICH key an
+// endorsed package was admitted on, so it is what an operator reads after a
+// key turns out to have been compromised, when the question is which mounts
+// have to be undone. A record that names neither the publisher nor the key
+// answers that question with "some of them".
+func TestAnEndorsedMountIsLoggedWithItsPublisherAndKey(t *testing.T) {
+	priv, keyring := newTestKey(t)
+	logs := &bytes.Buffer{}
+	h := newHarnessWithOptions(t, defaultTestApplyWait, trustOptions{
+		local: keyring,
+		trustSet: func() (manifest.TrustInput, error) {
+			return manifest.TrustInput{
+				Keyring:    keyring,
+				Publishers: map[sign.KeyID]string{testKeyID: testPublisher},
+			}, nil
+		},
+		requireSignature: true,
+		logger:           slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelInfo})),
+	}, RemoteConfig{})
+	entry := h.writeEcho("1.0.0")
+	signPackage(t, filepath.Join(h.root, "echo"), priv)
+
+	h.apply(entry)
+	if row := h.statusOf(echoPluginName); row.State != StateLoaded {
+		t.Fatalf("plugin %q: State = %q, want %q (LastError %q): an unmounted package would make every "+
+			"assertion below vacuous", echoPluginName, row.State, StateLoaded, row.LastError)
+	}
+
+	written := logs.String()
+	if !strings.Contains(written, endorsedMountLog) {
+		t.Fatalf("the mount of an endorsed package logged nothing saying so, want %q\nlogs:\n%s",
+			endorsedMountLog, written)
+	}
+	// The field NAMES are asserted as well as the values: a line that carried
+	// the right ids under different keys would be one nothing greps for.
+	for _, want := range []string{"key_id", string(testKeyID), "publisher", testPublisher} {
+		if !strings.Contains(written, want) {
+			t.Errorf("the endorsed-mount log does not mention %q, so it cannot say which key admitted this "+
+				"package\nlogs:\n%s", want, written)
+		}
+	}
+}
+
+// TestAnUnendorsedRefusalDoesNotImplyASignatureExists is the task-4 review's
+// Important #4, and the rule it guards is the one describeMissingEndorsement
+// spends five lines arguing for.
+//
+// The refusal for a package carrying no signature at all must not be worded as
+// though one were there. "This package claims dev-abc signed it" sends an
+// operator to find out why dev-abc is not registered; there is no dev-abc here
+// and no plugin.sig either, so that sentence would send them looking for
+// something that does not exist. The mirror-image mistake is asserting the file
+// is ABSENT: this same branch is reached by a deployment that recognises no key
+// at all, where a plugin.sig may well be sitting right there and simply never
+// got placed against anything.
+//
+// Neither claim is checkable from what the branch has in hand, so the message
+// must make neither.
+func TestAnUnendorsedRefusalDoesNotImplyASignatureExists(t *testing.T) {
+	_, keyring := newTestKey(t)
+	h := newHarnessWith(t, defaultTestApplyWait, keyring)
+	entry := h.writeEcho("1.0.0")
+
+	// Not signPackage: this package really carries no plugin.sig, which is what
+	// makes the wording below a lie rather than a debatable phrasing.
+	sigPath := filepath.Join(h.root, "echo", "plugin.sig")
+	if _, statErr := os.Stat(sigPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("os.Stat(%q) error = %v, want fs.ErrNotExist: this test proves nothing unless the package "+
+			"under it carries no signature", sigPath, statErr)
+	}
+
+	err := h.loader.Apply(context.Background(), manifest.Deployment{Plugins: []manifest.Entry{entry}}, h.root)
+	if err == nil {
+		t.Fatal("Apply() error = nil, want a refusal: nobody endorses this package and nobody has accepted it")
+	}
+	msg := err.Error()
+
+	// Nothing signed it, so nothing may be reported as having signed it.
+	for _, forbidden := range []string{"claims a signature", "claims to be signed", "claims a key"} {
+		if strings.Contains(msg, forbidden) {
+			t.Errorf("Apply() error = %v, want it NOT to contain %q: no plugin.sig exists, so there is no "+
+				"claimed signer, and an operator would go looking for a key nobody offered", err, forbidden)
+		}
+	}
+	// And the file's absence is not something this branch knows either.
+	for _, forbidden := range []string{"is absent", "is missing", "does not exist", "was not found"} {
+		if strings.Contains(msg, forbidden) {
+			t.Errorf("Apply() error = %v, want it NOT to contain %q: this branch is also reached by a "+
+				"deployment that recognises no key, where plugin.sig may be right there", err, forbidden)
+		}
+	}
+	// What it must say instead: where an endorsement would have to live, and
+	// which keys it would have to come from.
+	for _, want := range []string{sigPath, string(testKeyID)} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("Apply() error = %v, want it to mention %q", err, want)
+		}
+	}
+}
+
+// TestARefusalSpellsOutADeploymentThatRecognisesNoKey is the task-4 review's
+// Minor #1. trustedKeyIDs spells the nil-keyring case out in words instead of
+// rendering an empty list, and nothing held it to that.
+//
+// "trusted keys: []" reads like a keyring that failed to load, which is a
+// different place to go and look than a deployment that was configured to
+// recognise nobody. The refusal is the only thing an operator sees, so the
+// difference has to survive into it.
+func TestARefusalSpellsOutADeploymentThatRecognisesNoKey(t *testing.T) {
+	h := newHarnessWithOptions(t, defaultTestApplyWait, trustOptions{
+		trustSet:         func() (manifest.TrustInput, error) { return manifest.TrustInput{}, nil },
+		requireSignature: true,
+	}, RemoteConfig{})
+	entry := h.writeEcho("1.0.0")
+
+	err := h.loader.Apply(context.Background(), manifest.Deployment{Plugins: []manifest.Entry{entry}}, h.root)
+	if err == nil {
+		t.Fatal("Apply() error = nil, want a refusal: this deployment recognises no signing key and requires " +
+			"an endorsement")
+	}
+	if strings.Contains(err.Error(), "trusted keys: []") {
+		t.Errorf("Apply() error = %v, want the empty trust set spelled out rather than rendered as an empty "+
+			"list: [] reads like a keyring that failed to load", err)
+	}
+	if !strings.Contains(err.Error(), "no signing key") {
+		t.Errorf("Apply() error = %v, want it to say this deployment recognises no signing key at all", err)
 	}
 }

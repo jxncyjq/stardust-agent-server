@@ -167,6 +167,12 @@ type TrustInput struct {
 // Hashing plugin.json is enough to pin the code that will run, because
 // plugin.json carries plugin.wasm's sha256 and LoadPackage compares the wasm
 // bytes against that declared digest on every load.
+//
+// The name stutters as manifest.ManifestDigest, and it keeps the stutter on
+// purpose: this package already has an Entry.Digest, which is a REMOTE
+// ARCHIVE's sha256 and a different quantity entirely. Shortening this one to
+// manifest.Digest would put two unrelated digests under one word in one
+// package, which costs a reader more than the repeated "manifest" does.
 func ManifestDigest(dir string) (string, error) {
 	path := filepath.Join(dir, "plugin.json")
 	data, err := os.ReadFile(path)
@@ -188,8 +194,9 @@ func ManifestDigest(dir string) (string, error) {
 // says everything a refusal must say.
 //
 // It is a function here rather than a rendering each refusal writes for itself
-// so that every refusal about a revoked key reads the same, whether it comes
-// from a convergence or from an install.
+// so that every refusal about a revoked key reads the same wherever it is
+// written: an operator who has learned to read one of them has learned to read
+// all of them.
 func DescribeRevocation(prov Provenance) string {
 	switch {
 	case !prov.RevokedAt.IsZero() && prov.Reason != "":

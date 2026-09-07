@@ -574,8 +574,9 @@ func resolvePluginKeyring(cfg config.PluginsConfig) (*sign.Keyring, string, erro
 		}
 		if keyring == nil {
 			// sign.ParseKeyring's contract is a non-nil keyring on a nil
-			// error. A nil here would travel on as "signatures not required",
-			// so it is an invariant violation rather than a case to handle.
+			// error. A nil here would travel on as "no keyring is configured"
+			// for a deployment that configured one, so it is an invariant
+			// violation rather than a case to handle.
 			panic("cli: sign.ParseKeyring returned a nil keyring and a nil error")
 		}
 	}
@@ -769,9 +770,9 @@ func runTrustlistRefreshLoop(ctx context.Context, refresher trustlistRefresher, 
 //
 // It resolves the keyring through resolvePluginKeyring, so it applies exactly
 // the rules serve assembly applies: a keyring that will not read still fails
-// here, and "signatures required" with no keyring still fails here. A leniently
-// computed policy would be worse than none — it could report "unchanged" for a
-// config serve would refuse to start on.
+// here, and a config that requires an endorsement while naming no keyring still
+// fails here. A leniently computed policy would be worse than none — it could
+// report "unchanged" for a config serve would refuse to start on.
 func pluginSignaturePolicy(cfg config.PluginsConfig) (loader.SignaturePolicy, error) {
 	// The "configured but not enforced" note belongs to whoever ASSEMBLES a
 	// loader; startup already logged it, and repeating it on every reload of an
@@ -967,15 +968,20 @@ func newPluginsReloadCommand(application *app.App, out io.Writer) *cobra.Command
 				return err
 			}
 			// The manifest and root below come from the config just read, but
-			// the trust set does NOT: it was frozen when serve assembled this
-			// Loader, and there is no way to swap it under a running one. So an
-			// operator who tightened the policy and reloaded would get their new
-			// manifest converged under their OLD trust set, with no warning
-			// replayed and every log line looking normal — the exact silent
-			// degradation signature verification exists to prevent. Refuse
-			// instead, and say what has to happen: a security control that is
-			// partly applied is worse than one that is not, because it looks
-			// applied.
+			// the LOCAL KEYRING does NOT: loader.New copies Config.LocalKeyring
+			// into the Loader once, and the type exposes no way to replace it
+			// afterwards, so a keyring change cannot reach a Loader that is
+			// already running. An operator who tightened the policy and reloaded would
+			// therefore get their new manifest converged under their OLD
+			// keyring, with no warning replayed and every log line looking
+			// normal — the exact silent degradation signature verification
+			// exists to prevent. Refuse instead, and say what has to happen: a
+			// security control that is partly applied is worse than one that is
+			// not, because it looks applied.
+			//
+			// loader.SignaturePolicy covers exactly that half and no more; see
+			// its type comment for why what Config.TrustSet answers is
+			// deliberately left out of the comparison.
 			//
 			// limits and apply_wait are frozen the same way and are NOT checked
 			// here. They are resource settings; a stale ceiling is a performance
@@ -985,9 +991,9 @@ func newPluginsReloadCommand(application *app.App, out io.Writer) *cobra.Command
 				return err
 			}
 			if running := pluginLoader.SignaturePolicy(); !running.Equal(wanted) {
-				return fmt.Errorf("reload plugin deployment %q: the config now says %s, but this process is enforcing %s; "+
-					"the trust set is fixed when serve starts, so restart serve to apply a signature-policy change "+
-					"(reloading now would converge the new manifest under the old policy)",
+				return fmt.Errorf("reload plugin deployment %q: the config now asks for %s, but this process was "+
+					"built with %s; the local keyring is fixed when serve starts, so restart serve to apply a "+
+					"signature-policy change (reloading now would converge the new manifest under the old keyring)",
 					cfg.Plugins.Manifest, wanted, running)
 			}
 			// The remote-source policy is frozen the same way and is refused
