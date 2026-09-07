@@ -694,6 +694,15 @@ func resolvePluginKeyring(cfg config.PluginsConfig) (*sign.Keyring, string, erro
 // and a silent degradation.
 func resolvePluginTrustInput(localRaw json.RawMessage, store *trustlist.Store,
 	reportUnavailable func(error)) (manifest.TrustInput, error) {
+	if reportUnavailable == nil {
+		// An invariant violation, not a state to handle: this parameter is the
+		// whole reason an unreadable trust list cannot pass unrecorded. Checked
+		// here rather than left to the nil call below, which runs only on a
+		// machine whose trustlist cache cannot be read -- the rarest path
+		// through this function, and the one whose bare nil dereference would
+		// say least about what was actually missing.
+		panic("cli: resolvePluginTrustInput: reportUnavailable is nil; a trust list that cannot be read would go unrecorded")
+	}
 	var listed trustlist.Trust
 	if store != nil {
 		current, err := store.Current()
@@ -714,6 +723,16 @@ func resolvePluginTrustInput(localRaw json.RawMessage, store *trustlist.Store,
 // an operator greps for, and because a test that spelled it out a second time
 // could go on passing while the line an operator searches for changed.
 const pluginTrustlistUnavailableMsg = "plugin trust list is unavailable; only the local keyring is in force"
+
+// pluginInstallTrustlistUnavailableMsg is the same report on the command's own
+// output stream, where a person is present and is about to accept or refuse a
+// package. It is a constant for the reason pluginTrustlistUnavailableMsg is —
+// spelled a second time in a test, it would go on passing while the line an
+// operator reads changed — and it is a SEPARATE constant because the two are
+// read in different places by different people: this one addresses whoever is
+// running the command, the other one whoever is reading a startup log.
+const pluginInstallTrustlistUnavailableMsg = "warning: this deployment's trust list is unavailable, so only " +
+	"the local keyring judged this package"
 
 // pluginTrustSet is the provider a Loader reads its trust set from on every
 // mount.
@@ -1790,8 +1809,7 @@ func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag
 		// unrecognised and a revocation it carries goes unapplied, and an
 		// operator deciding whether to accept a package has to know that is
 		// the trust set the decision was taken against.
-		if _, werr := fmt.Fprintf(out, "warning: this deployment's trust list is unavailable, so only the "+
-			"local keyring judged this package: %v\n", trustlistErr); werr != nil {
+		if _, werr := fmt.Fprintf(out, "%s: %v\n", pluginInstallTrustlistUnavailableMsg, trustlistErr); werr != nil {
 			return fmt.Errorf("write plugins install output: %w", werr)
 		}
 	}

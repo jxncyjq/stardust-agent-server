@@ -80,6 +80,19 @@ type PluginConsentService struct {
 // signatures, see resolvePluginKeyring), not a per-call re-resolution of
 // cfg.Plugins.Keyring.
 //
+// It is also the POLICY-ENFORCED keyring, which is NOT the trust set a mount or
+// an `agent plugins install` judges a package against: that one is the local
+// keyring document merged with the fetched trust list, publishers included (see
+// resolvePluginTrustInput). So a package endorsed by a key only the fetched list
+// registers is, to this service, endorsed by nobody it recognises. That changes
+// no answer this service gives today, because every manifest.LoadPackage call in
+// this file discards the Provenance it returns and LoadPackage reports an
+// unrecognised key id as ProvenanceUnsigned rather than as an error — the two
+// trust sets fail and succeed on exactly the same packages here. It would start
+// to matter the moment a trust verdict reaches a reader through this service:
+// what the interface showed and what the mount enforced would then be two
+// different judgements.
+//
 // remote is the resolved remote-source policy (config.PluginsConfig's Cache,
 // HTTP client and fetch/unpack limits, see resolvePluginRemote) this
 // process's serve assembly built its loader with. List uses it only to

@@ -3920,6 +3920,105 @@ func TestPluginsInstallRecordsTheAcceptedDigest(t *testing.T) {
 	}
 }
 
+// TestPluginsInstallReportsAnUnavailableTrustList is the task-5 review's
+// Important #2. resolvePluginTrustInput's contract makes recording an
+// unreadable trust list mandatory -- reportUnavailable is a required parameter
+// precisely so the "the list half was empty" case cannot pass in silence -- and
+// serve's half of that obligation is pinned by
+// TestServeGivesThePluginLoaderTheTrustlistItRefreshes. install's half had
+// nothing watching it: the whole warning could be deleted with every test in
+// this package still green.
+//
+// install is the half where it matters most. A person is present and is
+// deciding, with --accept-unsigned, whether to trust these bytes; "the trust
+// set that judged this package was missing its published half" is a fact that
+// decision turns on, and it is worth more here than in a startup log nobody is
+// reading at the time.
+//
+// The trustlist cache is EMPTY -- no list has ever been fetched -- so
+// Store.Current answers "unavailable" plus an error. The url is the
+// never-resolving one: install reads the cache and never refreshes, so a
+// request leaving this machine would be a bug in itself.
+func TestPluginsInstallReportsAnUnavailableTrustList(t *testing.T) {
+	// installUnsigned installs one unendorsed package under the given extra
+	// plugins settings and returns the command's output.
+	installUnsigned := func(t *testing.T, extra ...string) string {
+		t.Helper()
+
+		f := newPluginFixture(t, 30_000)
+		f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+		f.signPackageWithAnyKey("staging")
+		archive := f.archivePackage("staging")
+		digest := digestOfArchive(archive)
+		srv := serveArchive(t, archive)
+		settings := append([]string{
+			fmt.Sprintf("\"cache\": %s", jsonString(filepath.Join(f.dir, "plugin-cache"))),
+			`"allow_insecure_sources": true`,
+		}, extra...)
+		f.writeSignatureConfig(30_000, signaturePolicy{requireSignature: boolPtr(false)}, settings...)
+		f.writeManifest()
+
+		out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--accept-unsigned")
+		if err != nil {
+			t.Fatalf("plugins install --accept-unsigned error = %v, want nil", err)
+		}
+		// The install has to have HAPPENED. A warning printed by a command that
+		// refused the package would be a different thing entirely, and a test
+		// that only matched the string could not tell the two apart.
+		f.requireEntry(f.readDeployment(), testEchoPlugin)
+		return out
+	}
+
+	t.Run("an unreadable trust list is reported", func(t *testing.T) {
+		out := installUnsigned(t, fmt.Sprintf(`"trustlist": {"url": %s, "cache": %s, "refresh_interval_ms": 3600000}`,
+			jsonString(trustlistNeverFetchedURL), jsonString(filepath.Join(t.TempDir(), "trustlist-cache"))))
+		if !strings.Contains(out, pluginInstallTrustlistUnavailableMsg) {
+			t.Errorf("plugins install output = %q, want %q: this package was judged against a trust set "+
+				"missing its published half, and the operator accepting it was not told",
+				out, pluginInstallTrustlistUnavailableMsg)
+		}
+	})
+
+	t.Run("a deployment with no trust list is not warned at", func(t *testing.T) {
+		// The control. A warning printed unconditionally would satisfy the
+		// assertion above while telling every operator on every install that
+		// something is wrong -- which is how a real one stops being read.
+		// A deployment that configured no remote list has no missing half.
+		out := installUnsigned(t)
+		if strings.Contains(out, pluginInstallTrustlistUnavailableMsg) {
+			t.Errorf("plugins install output = %q for a deployment that configured no trust list at all, "+
+				"want no unavailability warning: nothing is missing here", out)
+		}
+	})
+}
+
+// TestResolvePluginTrustInputRefusesANilReporter is the task-5 review's Minor
+// #2. reportUnavailable is documented as required, and it is required for a
+// reason: it is the only channel through which an unreadable trust list is
+// reported at all. Left unchecked, a nil one surfaces as a bare nil dereference
+// inside the branch that runs only on a machine whose trustlist cache cannot be
+// read, with a stack that names this function and nothing about which wiring
+// forgot the argument.
+//
+// The store here is nil, so the reporting branch is not even reachable: the
+// refusal has to be an entry check, not a crash that waits for the rare input.
+func TestResolvePluginTrustInputRefusesANilReporter(t *testing.T) {
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			t.Fatal("resolvePluginTrustInput with a nil reportUnavailable returned normally, want a panic: " +
+				"a deployment wired this way reports nothing when its trust list cannot be read")
+		}
+		msg, ok := recovered.(string)
+		if !ok || !strings.Contains(msg, "reportUnavailable") {
+			t.Errorf("panic value = %v, want a message naming the missing parameter", recovered)
+		}
+	}()
+
+	//nolint:errcheck // the call panics; nothing after it runs.
+	_, _ = resolvePluginTrustInput(nil, nil, nil)
+}
+
 // TestAnInstallTimeAcceptanceMountsUnderAStrictPolicy is the acceptance's whole
 // point, end to end and through the commands an operator types: `agent plugins
 // install --accept-unsigned` writes a record, and the loader READS THAT RECORD
