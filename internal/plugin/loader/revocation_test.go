@@ -1031,6 +1031,99 @@ func TestARollbackRefusedAsRevokedStillReportsAnUnconfirmedDisposal(t *testing.T
 	}
 }
 
+// TestARollbackRefusedAsRevokedRepeatsTheUnconfirmedDisposalNote pins the log
+// side of the same scenario TestARollbackRefusedAsRevokedStillReportsAnUnconfirmedDisposal
+// pins on the row.
+//
+// The rollback-refused-as-revoked path is a second way (besides prepare
+// refusing the entry outright) that a convergence can leave an entry unmounted
+// while an earlier convergence's unconfirmed disposal note is still sitting on
+// it. "Said again on EVERY convergence that leaves this entry unmounted, not
+// only on the one that first recorded it" is a promise about EVERY such way,
+// not just the one pass 1 handles — so the second convergence here, which
+// finds the same broken package failing activation for the same reason and the
+// rollback refused for the same reason, must say the note aloud again, exactly
+// as it would if prepare itself had refused the entry.
+//
+// It must NOT say "a revoked plugin's unload reported a failure" again on that
+// second convergence: that sentence is filed once, by the convergence whose
+// own unload actually failed, and re-filing it every convergence after would
+// read like the disposal kept failing anew rather than having failed once and
+// never been confirmed.
+func TestARollbackRefusedAsRevokedRepeatsTheUnconfirmedDisposalNote(t *testing.T) {
+	h, broken, logs := mountRevokedEchoWithABrokenLiveSignedReplacement(t)
+	h.ledger.Add(ownerFor(echoPluginName, "1.0.0"), "test-failing-disposer", func() error {
+		return errors.New("boom")
+	})
+
+	if err := h.loader.Apply(context.Background(),
+		manifest.Deployment{Plugins: []manifest.Entry{broken}}, h.root); err == nil {
+		t.Fatal("Apply() error = nil, want the disposal failure, the activation failure and the refused " +
+			"rollback")
+	}
+	if got := logs.String(); !strings.Contains(got, "a revoked plugin's unload reported a failure") {
+		t.Fatalf("the first convergence never said the disposal failed:\n%s", got)
+	}
+	if got := logs.String(); strings.Contains(got, "a revoked plugin's unload was never confirmed") {
+		t.Errorf("the convergence that just filed the disposal failure ALSO announced it as one carried "+
+			"over from an earlier convergence, which double-counts the same fact under two different "+
+			"sentences on the very convergence that found it:\n%s", got)
+	}
+
+	logs.Reset()
+	if err := h.loader.Apply(context.Background(),
+		manifest.Deployment{Plugins: []manifest.Entry{broken}}, h.root); err == nil {
+		t.Fatal("Apply() error = nil on the second convergence, want the activation and the rollback to " +
+			"fail again")
+	}
+	got := logs.String()
+	if !strings.Contains(got, "a revoked plugin's unload was never confirmed") {
+		t.Errorf("the second convergence said nothing about the unconfirmed disposal, though the row "+
+			"still carries it (see the sibling test on the row):\n%s", got)
+	}
+	if strings.Contains(got, "a revoked plugin's unload reported a failure") {
+		t.Errorf("the second convergence re-filed the disposal failure as if it just happened; it should "+
+			"only ever be filed once, by the convergence whose own unload failed:\n%s", got)
+	}
+}
+
+// TestARollbackRefusedAsRevokedNamesTheVersionThatWasRevoked pins the row's
+// Version against the same object its own LastError explains.
+//
+// revokedInstanceRefusal's text names the version that was mounted under the
+// revoked key — prev, the instance the rollback refused to put back — and
+// nothing else on the row may name a different one. The version that never
+// activated, the broken replacement, has never mounted a single instance under
+// this name; an operator comparing the row's Version against their own
+// inventory of where the revoked code ran must not be handed that version
+// instead. See recordRevokedUnload for why the plain-revocation path (no
+// replacement in flight) already gets this right — this pins the rollback path
+// getting it right too.
+func TestARollbackRefusedAsRevokedNamesTheVersionThatWasRevoked(t *testing.T) {
+	h, broken, _ := mountRevokedEchoWithABrokenLiveSignedReplacement(t)
+
+	if err := h.loader.Apply(context.Background(),
+		manifest.Deployment{Plugins: []manifest.Entry{broken}}, h.root); err == nil {
+		t.Fatal("Apply() error = nil when a replacement failed to activate over a revoked instance, " +
+			"want a refusal")
+	}
+
+	row := h.statusOf(echoPluginName)
+	if row.State != StateFailed {
+		t.Fatalf("plugin %q: State = %q, want %q (LastError %q)",
+			echoPluginName, row.State, StateFailed, row.LastError)
+	}
+	if row.Version != "1.0.0" {
+		t.Errorf("plugin %q: Version = %q, want 1.0.0: the row must name the version this deployment "+
+			"revoked and took down, never 2.0.0, the replacement that failed to activate and never "+
+			"mounted a single instance under this name", echoPluginName, row.Version)
+	}
+	if !strings.Contains(row.LastError, "version 1.0.0 was mounted under key") {
+		t.Errorf("plugin %q: LastError = %q, want it to explain the SAME version 1.0.0 that the row's "+
+			"own Version field names", echoPluginName, row.LastError)
+	}
+}
+
 // TestATrustSetThatCannotBeReadSaysNothingAboutAnEmptyMountedSet is the other
 // half of TestATrustSetThatCannotBeReadJudgesNoMountedInstance.
 //

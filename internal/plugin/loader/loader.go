@@ -1149,22 +1149,12 @@ func (l *Loader) converge(ctx context.Context, wanted []manifest.Entry, declared
 		plan, err := l.prepare(ctx, entry, root, trust)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("converge plugin %q: %w", entry.Name, err))
-			// Said again on EVERY convergence that leaves this entry
-			// unmounted, not only on the one that first recorded it: an unload
-			// whose disposal was reported once and never again reads, from the
-			// second convergence on, exactly like an unload that succeeded.
-			//
-			// It hangs on "this entry failed again", not on which failure:
-			// the package that succeeds a revoked one may fail an entirely
-			// unrelated check, and the resources the revoked mount never
-			// released are no less unaccounted for. The record read here is
-			// still the previous convergence's — pass 2 has not run yet — so
-			// the convergence that first files the note does not also say it
-			// twice.
-			if note := l.failures[entry.Name].unconfirmedDisposal; note != "" {
-				l.logger.Error("a revoked plugin's unload was never confirmed",
-					"plugin", entry.Name, "detail", note)
-			}
+			// The record read here is still the previous convergence's — pass
+			// 2 has not run yet — so an unconfirmedDisposal note found here is
+			// always one an earlier convergence filed, never one this call is
+			// about to file itself. See noteUnconfirmedDisposalIfCarried for
+			// why that earns it a re-announcement on this convergence too.
+			l.noteUnconfirmedDisposalIfCarried(entry.Name, l.failures[entry.Name].unconfirmedDisposal)
 			continue
 		}
 		if plan == nil {
@@ -1375,6 +1365,29 @@ func unconfirmedDisposalNote(unloadErr error) string {
 	return fmt.Sprintf("the unload this revocation forced reported a failure, so the revoked plugin's "+
 		"resources were never confirmed released and its code may still be running in this process: %v",
 		unloadErr)
+}
+
+// noteUnconfirmedDisposalIfCarried says that a revoked plugin's unload was
+// never confirmed, for note found already sitting on the entry rather than one
+// this call is about to file itself — a no-op when note is empty, i.e. there
+// is nothing carried to say.
+//
+// Said again on EVERY convergence that leaves this entry unmounted, not only
+// on the one that first recorded it: an unload whose disposal was reported
+// once and never again reads, from the second convergence on, exactly like an
+// unload that succeeded. It hangs on "this entry failed again", not on which
+// failure: the package that succeeds a revoked one may fail an entirely
+// unrelated check — at prepare, as pass 1 does, or at activation with its
+// rollback then refused as revoked, as fail does — and the resources the
+// revoked mount never released are no less unaccounted for either way. Both
+// callers are the ones responsible for telling carried apart from
+// just-filed: this function only ever repeats what it is handed.
+func (l *Loader) noteUnconfirmedDisposalIfCarried(name, note string) {
+	if note == "" {
+		return
+	}
+	l.logger.Error("a revoked plugin's unload was never confirmed",
+		"plugin", name, "detail", note)
 }
 
 // Status reports what every entry the Loader has seen actually came to, sorted
@@ -2040,9 +2053,31 @@ func (l *Loader) fail(
 			unconfirmed = unconfirmedDisposalNote(plan.unloadErr)
 			l.logger.Error("a revoked plugin's unload reported a failure",
 				"plugin", name, "version", prev.version, "reason", reasonRevoked, "error", plan.unloadErr)
+		} else {
+			// Whatever unconfirmed holds here was filed by an earlier
+			// convergence: the branch above is fail's only place that files a
+			// fresh one, and it did not run. See noteUnconfirmedDisposalIfCarried
+			// for why an earlier note earns a re-announcement here too, exactly
+			// as pass 1 gives one to the entry it never got as far as
+			// activating.
+			l.noteUnconfirmedDisposalIfCarried(name, unconfirmed)
+		}
+		// The version this row names is the one the explanation above is
+		// about. For every other failure that is the version this call was
+		// asked to activate (the caller's version). But a rollback refused as
+		// revoked names a version that never mounted a single instance —
+		// prev's replacement — while the explanation joined into err is about
+		// prev itself (see revokedInstanceRefusal), so the row would otherwise
+		// carry two different versions for one plugin. recordRevokedUnload
+		// already names prev's own version for the plain revocation that never
+		// had a replacement in flight; this keeps the rollback-refused case
+		// consistent with it.
+		recordedVersion := version
+		if endorsementWithdrawn {
+			recordedVersion = prev.version
 		}
 		l.failures[name] = failure{
-			version:             version,
+			version:             recordedVersion,
 			err:                 joined.Error(),
 			unconfirmedDisposal: unconfirmed,
 		}
