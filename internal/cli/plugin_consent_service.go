@@ -452,10 +452,16 @@ func (s *PluginConsentService) Grant(ctx context.Context, name string, req serve
 	// step 6 writes anything: a trust set that cannot be assembled stops the
 	// authorization with the manifest untouched, rather than letting it finish
 	// and report a provenance verdict nothing stood behind.
+	//
+	// server.ErrPluginTrustSet classifies it as what it is: the deployment's
+	// own keyring document or trust list cache is unreadable, which is a fault
+	// on this machine and not a defect in the request that arrived. Without the
+	// sentinel it lands in pluginConsentStatus's default branch and the panel
+	// is told 400, sending an operator to inspect a request that was fine.
 	trust, err := s.trustFn()
 	if err != nil {
 		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: read the trust set to judge "+
-			"the package against: %w", name, err)
+			"the package against: %w: %w", name, server.ErrPluginTrustSet, err)
 	}
 	// prov is reported back to the caller in the response below, via
 	// trustFieldsFor -- this design deliberately does not gate the grant on
@@ -587,23 +593,29 @@ func (s *PluginConsentService) Resolve(ctx context.Context, name string) (server
 	// A trust set that cannot be assembled is reported rather than stood in
 	// for: judging this package against an empty set would report it as
 	// endorsed by nobody, which is a verdict, and no verdict is available
-	// while the set itself is unreadable.
+	// while the set itself is unreadable. server.ErrPluginTrustSet is what
+	// separates that from a verdict on the HTTP side -- see the same read in
+	// Grant for why the class matters.
 	trust, err := s.trustFn()
 	if err != nil {
 		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: read the trust set to judge "+
-			"the package against: %w", name, err)
+			"the package against: %w: %w", name, server.ErrPluginTrustSet, err)
 	}
 	// prov is reported through the returned PluginView's trust fields (via
 	// trustFieldsFor) on the success path below. The ErrUntrustedPackage
-	// branch just below only ever fires for a signature that does not
-	// verify -- a missing signature and an unrecognised key id are verdicts
+	// branch just below fires for bytes and signature that disagree -- a
+	// signature that does not verify, and a plugin.sig that does not parse
+	// (see manifest's assessProvenance, which wraps both). A missing
+	// signature and an unrecognised key id are verdicts
 	// (ProvenanceUnsigned), not errors, so they fall through to that success
 	// path instead.
 	pm, _, prov, err := manifest.LoadPackage(dir, trust)
 	if err != nil {
 		if errors.Is(err, manifest.ErrUntrustedPackage) {
-			// The bytes just failed signature verification, so they do not
-			// belong in a directory this deployment reads from. Only a REMOTE
+			// The bytes and the signature beside them just contradicted each
+			// other -- the signature did not verify, or plugin.sig would not
+			// parse -- so they do not belong in a directory this deployment
+			// reads from. Only a REMOTE
 			// entry's package lives in the cache — a local entry's directory
 			// is the operator's own tree — and only a trust failure earns
 			// eviction: a package that merely will not load is re-downloaded

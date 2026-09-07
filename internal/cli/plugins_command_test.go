@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -503,17 +504,28 @@ func (f *pluginFixture) assemble() error {
 func (f *pluginFixture) assembleWithLogger(logger *slog.Logger) error {
 	f.t.Helper()
 
+	_, err := f.assembleTrustSet(logger)
+	return err
+}
+
+// assembleTrustSet is the assembly again, handing back the loader.TrustSet the
+// assembly built its loader with -- the value serve carries on to the consent
+// service (see BuildServeService), and the one a test needs when the question
+// is what the panel judges a package against rather than whether the manifest
+// converged.
+func (f *pluginFixture) assembleTrustSet(logger *slog.Logger) (loader.TrustSet, error) {
+	f.t.Helper()
+
 	cfg, err := config.Load(context.Background(), config.Options{Path: f.configPath})
 	if err != nil {
 		f.t.Fatalf("load config %s: %v", f.configPath, err)
 	}
-	_, err = assemblePlugins(context.Background(), f.application, cfg, pluginHostDeps{
+	return assemblePlugins(context.Background(), f.application, cfg, pluginHostDeps{
 		Audit:  adapter.NewMemoryAuditLog(),
 		Events: adapter.NewMemoryEventBus(),
 		Logger: logger,
 		Gate:   f.gate,
 	})
-	return err
 }
 
 // run executes one `agent plugins ...` invocation against the fixture's App and
@@ -3973,10 +3985,10 @@ func TestPluginsInstallReportsAnUnavailableTrustList(t *testing.T) {
 	t.Run("an unreadable trust list is reported", func(t *testing.T) {
 		out := installUnsigned(t, fmt.Sprintf(`"trustlist": {"url": %s, "cache": %s, "refresh_interval_ms": 3600000}`,
 			jsonString(trustlistNeverFetchedURL), jsonString(filepath.Join(t.TempDir(), "trustlist-cache"))))
-		if !strings.Contains(out, pluginInstallTrustlistUnavailableMsg) {
+		if !strings.Contains(out, pluginCommandTrustlistUnavailableMsg) {
 			t.Errorf("plugins install output = %q, want %q: this package was judged against a trust set "+
 				"missing its published half, and the operator accepting it was not told",
-				out, pluginInstallTrustlistUnavailableMsg)
+				out, pluginCommandTrustlistUnavailableMsg)
 		}
 	})
 
@@ -3986,11 +3998,62 @@ func TestPluginsInstallReportsAnUnavailableTrustList(t *testing.T) {
 		// something is wrong -- which is how a real one stops being read.
 		// A deployment that configured no remote list has no missing half.
 		out := installUnsigned(t)
-		if strings.Contains(out, pluginInstallTrustlistUnavailableMsg) {
+		if strings.Contains(out, pluginCommandTrustlistUnavailableMsg) {
 			t.Errorf("plugins install output = %q for a deployment that configured no trust list at all, "+
 				"want no unavailability warning: nothing is missing here", out)
 		}
 	})
+}
+
+// TestResolvePluginTrustInputHandsBackTheMergesPublishers pins the second half
+// of what this function assembles. Its Keyring half is watched everywhere a
+// verdict is: a package judged against a dropped keyring comes back
+// ProvenanceUnsigned and a dozen tests notice. Its Publishers half had nobody
+// watching it at all -- deleting `Publishers: publishers` from the returned
+// manifest.TrustInput left the whole suite green (task-6 review, Important-1,
+// mutation b2'), because the display names it carries only ever become visible
+// through a package signed by a key the FETCHED trust list registers, and this
+// package's tests hold no fetched list: trustlist.Store adopts a list only
+// after it verifies against the embedded root keyring, whose private half is
+// deliberately not in this repository.
+//
+// So the assertion is made where it can be made: against trustlist.Merge's own
+// second return value, computed here from the same inputs. A deployment with
+// no fetched list makes that an EMPTY map rather than a nil one, and empty is
+// not the same value as dropped -- only the merge decides which of the two
+// this function is supposed to return, and this test says it must return
+// whichever the merge produced rather than a value of its own.
+func TestResolvePluginTrustInputHandsBackTheMergesPublishers(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	_, keyringPath := f.newKeyring("keyring.json")
+	localRaw, err := os.ReadFile(keyringPath)
+	if err != nil {
+		t.Fatalf("read keyring %s: %v", keyringPath, err)
+	}
+
+	_, wantPublishers, err := trustlist.Merge(localRaw, trustlist.Trust{})
+	if err != nil {
+		t.Fatalf("trustlist.Merge: %v", err)
+	}
+	if wantPublishers == nil {
+		t.Fatal("trustlist.Merge returned a nil publishers map for a local keyring document; this test " +
+			"compares against that map, so a nil one would make every assertion below vacuous")
+	}
+
+	got, err := resolvePluginTrustInput(localRaw, nil, func(error) {
+		t.Error("reportUnavailable was called for a deployment that configured no trust list at all")
+	})
+	if err != nil {
+		t.Fatalf("resolvePluginTrustInput() error = %v, want nil", err)
+	}
+	if got.Publishers == nil {
+		t.Fatal("TrustInput.Publishers is nil while the merge produced a map: the publishers half was " +
+			"dropped on the way out, and every display name a fetched trust list registers would be " +
+			"lost with it -- the panel would show \"registered\" with nobody's name beside it")
+	}
+	if !maps.Equal(got.Publishers, wantPublishers) {
+		t.Errorf("TrustInput.Publishers = %v, want the merge's own map %v", got.Publishers, wantPublishers)
+	}
 }
 
 // TestResolvePluginTrustInputRefusesANilReporter is the task-5 review's Minor

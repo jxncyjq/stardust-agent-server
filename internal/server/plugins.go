@@ -14,7 +14,7 @@ import (
 // ErrPluginNotFound is what PluginConsent.Grant/.Deny/.Resolve report when the
 // deployment manifest holds no entry under the requested name.
 //
-// The five sentinels declared here exist so the HTTP handlers can turn a
+// The six sentinels declared here exist so the HTTP handlers can turn a
 // failure into a status code by CLASS instead of by matching on error text,
 // which is the thing that really drifts. They are declared in this package,
 // not in the implementation's, because the status contract is this package's
@@ -43,6 +43,20 @@ var ErrPluginStorage = errors.New("the plugin deployment manifest could not be r
 // was detached mid-shutdown, say). The request is well formed and may
 // succeed later, which is exactly what a 503 says and a 400 does not.
 var ErrPluginUnavailable = errors.New("no plugin loader is attached to this process")
+
+// ErrPluginTrustSet is what PluginConsent.Grant/.Resolve report when the trust
+// set this deployment judges plugin packages against could not be assembled at
+// all -- a keyring document that does not parse, a trust list cache that
+// cannot be read into one. It is a fault in this deployment's own
+// configuration or on-disk state, in the same class as ErrPluginStorage and
+// reported the same way, so an operator is sent to the machine rather than to
+// a request that was never the problem.
+//
+// It is NOT a verdict about the package. A package no registered publisher
+// endorses is reported through PluginView.TrustState as "unsigned"; this
+// sentinel says no verdict is available, because the set every verdict would
+// be measured against is missing.
+var ErrPluginTrustSet = errors.New("the plugin trust set could not be assembled")
 
 // ErrPluginUntrusted is what PluginConsent.Resolve reports when the package
 // was obtained but is not trustworthy — unsigned, corruptly signed, or signed
@@ -78,9 +92,10 @@ type PluginConsent interface {
 	//
 	// An error that belongs to one of the classes this package declares
 	// (ErrPluginNotFound, ErrPluginDeploymentChanged, ErrPluginStorage,
-	// ErrPluginUnavailable) must be returned wrapping that sentinel, so the
-	// handler can map it to a status code without reading its text. An error
-	// carrying none of them is a rejected request and reports 400.
+	// ErrPluginUnavailable, ErrPluginTrustSet) must be returned wrapping
+	// that sentinel, so the handler can map it to a status code without
+	// reading its text. An error carrying none of them is a rejected
+	// request and reports 400.
 	Grant(ctx context.Context, name string, req GrantRequest) (ConsentResult, error)
 
 	// Deny revokes the deployment entry named name's authorization to run.
@@ -109,7 +124,10 @@ type PluginConsent interface {
 	// reports a package that was obtained but is not trustworthy (unsigned,
 	// corruptly signed, or signed by an untrusted key) as distinct from one
 	// that merely could not be obtained, so a caller does not offer a retry
-	// that can never succeed.
+	// that can never succeed. ErrPluginTrustSet is the opposite report and
+	// Grant returns it too: not "this package is untrustworthy" but "this
+	// deployment cannot say", because the trust set itself would not
+	// assemble.
 	Resolve(ctx context.Context, name string) (PluginView, error)
 }
 
@@ -230,11 +248,16 @@ type PluginView struct {
 	// is written once, in ProvenanceState.String(); a caller filling this
 	// field must use that string directly rather than writing a second table
 	// that translates the same three values, which is exactly the kind of
-	// duplicate that drifts when a fourth state is ever added. It is empty
-	// for a view produced without ever loading the package at all --
-	// PluginConsent.Deny deliberately skips that (see
-	// DeclaredUnresolvedNotInspected), so its view has no verdict to report,
-	// which is a fourth condition rather than a guess at one of the three.
+	// duplicate that drifts when a fourth state is ever added.
+	//
+	// It is empty for a view produced without a package ever being loaded
+	// for it, which is a fourth condition rather than a guess at one of the
+	// three. That covers a load nobody attempted -- PluginConsent.Deny skips
+	// it deliberately, see DeclaredUnresolvedNotInspected -- and equally one
+	// that was attempted and did not produce a package: every List row
+	// reporting DeclaredUnresolved carries an empty TrustState for that
+	// reason, as does a row no manifest entry backs at all. The rule is the
+	// load, not any particular way of missing it.
 	TrustState string `json:"trust_state"`
 	// TrustPublisher is the registered publisher's display name for the key
 	// that signed the package -- manifest.Provenance.Publisher from the same
@@ -463,6 +486,8 @@ func pluginConsentStatus(err error) int {
 	case errors.Is(err, ErrPluginDeploymentChanged):
 		return http.StatusConflict
 	case errors.Is(err, ErrPluginStorage):
+		return http.StatusInternalServerError
+	case errors.Is(err, ErrPluginTrustSet):
 		return http.StatusInternalServerError
 	case errors.Is(err, ErrPluginUnavailable):
 		return http.StatusServiceUnavailable

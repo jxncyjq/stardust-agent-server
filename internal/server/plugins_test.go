@@ -639,6 +639,10 @@ func TestPluginsConsentErrorClassSelectsStatus(t *testing.T) {
 		{"unknown plugin", fmt.Errorf("grant %q: %w", "jira", ErrPluginNotFound), http.StatusNotFound},
 		{"concurrent edit", fmt.Errorf("grant %q: %w", "jira", ErrPluginDeploymentChanged), http.StatusConflict},
 		{"manifest I/O", fmt.Errorf("grant %q: %w", "jira", ErrPluginStorage), http.StatusInternalServerError},
+		// A trust set that will not assemble is this deployment's own keyring
+		// document or trust list cache, not the request: reported as 400 it
+		// sends an operator to inspect a request that was fine.
+		{"trust set unreadable", fmt.Errorf("grant %q: %w", "jira", ErrPluginTrustSet), http.StatusInternalServerError},
 		{"no loader attached", fmt.Errorf("grant %q: %w", "jira", ErrPluginUnavailable), http.StatusServiceUnavailable},
 		{"rejected request", errors.New(`names capability "http", which plugin "jira" does not declare`), http.StatusBadRequest},
 	}
@@ -801,6 +805,27 @@ func TestPluginsResolveReportsAnUntrustedPackageAs422(t *testing.T) {
 	srv.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("status = %d, want 422 for an untrusted package; body=%s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestPluginsResolveReportsAnUnassemblableTrustSetAs500 is the other side of
+// the test above, and the pair is the point: "this package is not
+// trustworthy" and "this deployment cannot say what it trusts" are different
+// answers and must not arrive as one status. The first is about the package
+// and no retry helps (422); the second is about this machine's own keyring or
+// trust list cache, which is a server fault (500) and not the caller's
+// request (400).
+func TestPluginsResolveReportsAnUnassemblableTrustSetAs500(t *testing.T) {
+	t.Parallel()
+	fake := &fakePluginConsent{resolveErr: fmt.Errorf("resolve: %w", ErrPluginTrustSet)}
+	srv := NewHTTPServer(Config{Plugins: fake, AdminToken: "token"})
+
+	req := adminGrantRequest(t, "/v1/plugins/weather/resolve", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500 for a trust set that would not assemble; body=%s",
+			rec.Code, rec.Body.String())
 	}
 }
 

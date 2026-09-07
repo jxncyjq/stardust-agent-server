@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -2114,6 +2115,218 @@ func TestPluginViewCarriesThePublisherName(t *testing.T) {
 	})
 }
 
+// --- the panel and the mount judge against ONE trust set ----------------------
+
+// newRegisteredPackageServeFixture writes the deployment every test below runs
+// against: one LOCAL entry whose package is signed by a key the configured
+// keyring registers, under "require_signature": false.
+//
+// That policy is the interesting one, not an incidental setting. It is the
+// deployment where the POLICY-enforced keyring is nil (enforcedPluginKeyring)
+// while the trust set is not (resolvePluginTrustInput), so the two answer
+// differently about this exact package: judged against the merged set it is
+// ProvenanceRegistered, and judged against the policy keyring it is
+// ProvenanceUnsigned. Any surface that reads the wrong one of the two says so
+// out loud here instead of agreeing by accident.
+//
+// The entry is left unauthorized (no grant block) so nothing mounts during the
+// assembly; each test decides for itself whether to authorize it.
+func newRegisteredPackageServeFixture(t *testing.T) *pluginFixture {
+	t.Helper()
+
+	f := newPluginFixture(t, 30_000)
+	priv, keyringPath := f.newKeyring("keyring.json")
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.0.0", nil, []string{testEchoTool})
+	f.signPackage("echo", priv)
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(false)})
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+	return f
+}
+
+// TestTheServedPanelJudgesPackagesAgainstTheAssemblysTrustSet is the guard the
+// wiring it watches never had. Every other test of the trust fields injects a
+// loader.TrustSet the test itself wrote; this one injects nothing. It goes
+// through the real chain -- resolvePluginTrustInput -> pluginTrustSet ->
+// newPluginLoader -> assemblePlugins -> BuildServeService ->
+// NewPluginConsentService -> GET /v1/plugins -- and reads the verdict off the
+// HTTP response, so the trust set under it is whatever that assembly actually
+// built.
+//
+// The property: a package signed by a key the deployment's own keyring
+// document registers is reported "registered" by the panel. Under
+// "require_signature": false the local keyring document is the ONLY half of
+// the trust set present (there is no fetched list here), so a panel judging
+// against anything but the assembly's own merged set -- a second provider
+// missing that half, the policy keyring, an empty set stood in for a failure
+// -- reports "unsigned" instead, which is precisely the "endorsed here,
+// unsigned there" split this wiring exists to make impossible.
+func TestTheServedPanelJudgesPackagesAgainstTheAssemblysTrustSet(t *testing.T) {
+	f := newRegisteredPackageServeFixture(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	result, err := BuildServeService(ctx, ServeOptions{
+		ConfigPath: f.configPath,
+		Addr:       "127.0.0.1:0",
+		Logger:     slog.New(slog.NewTextHandler(io.Discard, nil)),
+		App:        f.application,
+	})
+	if err != nil {
+		t.Fatalf("BuildServeService() error = %v, want nil", err)
+	}
+	t.Cleanup(result.Close)
+	runServeInBackground(t, &result)
+
+	views := getPluginViews(t, result.BaseURL, result.Token)
+	if len(views) != 1 {
+		t.Fatalf("GET /v1/plugins returned %d rows, want 1: %+v", len(views), views)
+	}
+	got := views[0]
+	if got.TrustState != manifest.ProvenanceRegistered.String() {
+		t.Errorf("GET /v1/plugins trust_state = %q, want %q.\nThe package is signed by a key this "+
+			"deployment's keyring document registers, and that document is the only half of the trust "+
+			"set there is here -- so a panel reporting anything else is judging against a set the "+
+			"assembly did not build, and the mount that DOES use it will disagree with the screen.\n"+
+			"row = %+v", got.TrustState, manifest.ProvenanceRegistered.String(), got)
+	}
+}
+
+// getPluginViews performs the panel's own GET /v1/plugins against a running
+// serve and decodes the rows out of it.
+func getPluginViews(t *testing.T, baseURL, token string) []server.PluginView {
+	t.Helper()
+
+	req, err := http.NewRequest(http.MethodGet, baseURL+"/v1/plugins", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	req.Header.Set("Origin", baseURL)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s/v1/plugins: %v", baseURL, err)
+	}
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			t.Errorf("close body: %v", err)
+		}
+	}()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /v1/plugins status = %d, want 200: %s", resp.StatusCode, body)
+	}
+	var decoded struct {
+		Plugins []server.PluginView `json:"plugins"`
+	}
+	if err := json.Unmarshal(body, &decoded); err != nil {
+		t.Fatalf("decode /v1/plugins body %s: %v", body, err)
+	}
+	return decoded.Plugins
+}
+
+// TestTheCLIAndThePanelGrantJudgeOnePackageAlike is the task-6 review's
+// Important-2. `agent plugins grant` and the panel's POST
+// /v1/plugins/{name}/grant are two doors onto one decision, and until this
+// test they could give an operator two different answers about one package
+// under one config: the panel read the merged trust set, the command read the
+// POLICY keyring, and under "require_signature": false that one is nil.
+//
+// A nil keyring makes manifest.LoadPackage judge every package unsigned
+// without reading plugin.sig at all, so the command sailed past a signature
+// the panel refused with 400 -- same package, same config, same operator.
+//
+// Both subtests therefore assert AGREEMENT rather than a particular outcome:
+// what must not happen is one door opening while the other closes. The
+// refusing subtest is where the split was; the accepting one is here so a
+// command that started refusing everything could not pass by agreeing on
+// "no".
+func TestTheCLIAndThePanelGrantJudgeOnePackageAlike(t *testing.T) {
+	// grantBothWays authorizes one entry through both doors, panel first, and
+	// returns what each of them said.
+	grantBothWays := func(t *testing.T, f *pluginFixture) (panelErr, cliErr error) {
+		t.Helper()
+
+		trust, err := f.assembleTrustSet(slog.New(slog.NewTextHandler(io.Discard, nil)))
+		if err != nil {
+			t.Fatalf("assemblePlugins() error = %v, want nil", err)
+		}
+		svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
+			trust, loader.RemoteConfig{}, testConsentLogger())
+		_, panelErr = svc.Grant(context.Background(), testEchoPlugin, server.GrantRequest{})
+
+		_, cliErr = f.run("grant", testEchoPlugin)
+		return panelErr, cliErr
+	}
+
+	t.Run("a signature that does not verify", func(t *testing.T) {
+		f := newPluginFixture(t, 30_000)
+		_, keyringPath := f.newKeyring("keyring.json")
+		f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.0.0", nil, []string{testEchoTool})
+		// Signed by a key that is NOT the one the keyring registers, under the
+		// id that keyring DOES register: the signature is checked and fails,
+		// which is a refusal rather than a verdict.
+		f.signPackageWithAnyKey("echo")
+		f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(false)})
+		f.writeManifest(manifestEntry{
+			name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+		})
+		before, err := os.ReadFile(f.manifestPath)
+		if err != nil {
+			t.Fatalf("read plugins.json: %v", err)
+		}
+
+		panelErr, cliErr := grantBothWays(t, f)
+
+		if panelErr == nil {
+			t.Fatalf("panel Grant() error = nil for a package whose signature does not verify, want a " +
+				"refusal: the rest of this subtest compares the command against it")
+		}
+		if cliErr == nil {
+			t.Errorf("`agent plugins grant` error = nil while the panel refused the SAME package under the "+
+				"SAME config with: %v\nOne operator, two doors, two answers -- the command is judging "+
+				"against a different trust set than the panel and the mount do.", panelErr)
+		}
+		if cliErr != nil && !errors.Is(cliErr, manifest.ErrUntrustedPackage) {
+			t.Errorf("`agent plugins grant` error = %v, want it to wrap manifest.ErrUntrustedPackage, the "+
+				"same refusal the panel gave: agreeing on \"no\" for unrelated reasons is not agreement", cliErr)
+		}
+		after, err := os.ReadFile(f.manifestPath)
+		if err != nil {
+			t.Fatalf("re-read plugins.json: %v", err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Errorf("plugins.json changed while both doors were refusing:\nbefore: %s\nafter:  %s", before, after)
+		}
+	})
+
+	t.Run("an endorsed package", func(t *testing.T) {
+		f := newRegisteredPackageServeFixture(t)
+
+		panelErr, cliErr := grantBothWays(t, f)
+
+		if panelErr != nil {
+			t.Errorf("panel Grant() error = %v, want nil: the package is signed by a key this deployment's "+
+				"keyring registers", panelErr)
+		}
+		if cliErr != nil {
+			t.Errorf("`agent plugins grant` error = %v, want nil: the panel authorized this same package "+
+				"under this same config, and a command that refuses what the panel accepts is the same "+
+				"split in the other direction", cliErr)
+		}
+		entry := f.requireEntry(f.readDeployment(), testEchoPlugin)
+		if !entry.Enabled {
+			t.Error("the entry is still disabled after both doors reported success")
+		}
+	})
+}
+
 // errConsentTrustSetUnavailable is what failingConsentTrustSet reports, so the
 // assertions below can match that exact error rather than any error.
 var errConsentTrustSetUnavailable = errors.New("the trust list cache cannot be read")
@@ -2185,6 +2398,48 @@ func TestConsentPathsRefuseAnUnreadableTrustSet(t *testing.T) {
 		_, svc := newSvc(t)
 		if _, err := svc.Resolve(context.Background(), testEchoPlugin); !errors.Is(err, errConsentTrustSetUnavailable) {
 			t.Fatalf("Resolve() error = %v, want it to wrap the provider's own error", err)
+		}
+	})
+}
+
+// TestATrustSetThatWillNotAssembleIsAServerSideFault is the task-6 review's
+// Important-3. A trust set that cannot be assembled is this deployment's own
+// keyring document or trust list cache being unreadable -- a fault on the
+// machine, not a defect in the request that arrived. Carrying no class at all,
+// it landed in pluginConsentStatus's default branch and the panel was told
+// 400 Bad Request, which sends an operator to inspect a request that was
+// never the problem while the actual fault sits in the config or the cache.
+//
+// The status mapping itself is internal/server's
+// (TestPluginsConsentErrorClassSelectsStatus); what this side owes is the
+// class on the error.
+func TestATrustSetThatWillNotAssembleIsAServerSideFault(t *testing.T) {
+	newSvc := func(t *testing.T) *PluginConsentService {
+		t.Helper()
+		f := newPluginFixture(t, 30_000)
+		f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.0.0", nil, []string{testEchoTool})
+		f.writeManifest(manifestEntry{
+			name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+		})
+		if err := f.assemble(); err != nil {
+			t.Fatalf("assemblePlugins() error = %v, want nil", err)
+		}
+		return NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
+			failingConsentTrustSet, loader.RemoteConfig{}, testConsentLogger())
+	}
+
+	t.Run("Grant", func(t *testing.T) {
+		_, err := newSvc(t).Grant(context.Background(), testEchoPlugin, server.GrantRequest{})
+		if !errors.Is(err, server.ErrPluginTrustSet) {
+			t.Errorf("Grant() error = %v, want it to carry server.ErrPluginTrustSet: without a class the "+
+				"handler reports 400 and the panel tells the operator their request was malformed", err)
+		}
+	})
+
+	t.Run("Resolve", func(t *testing.T) {
+		_, err := newSvc(t).Resolve(context.Background(), testEchoPlugin)
+		if !errors.Is(err, server.ErrPluginTrustSet) {
+			t.Errorf("Resolve() error = %v, want it to carry server.ErrPluginTrustSet", err)
 		}
 	})
 }

@@ -751,14 +751,18 @@ func resolvePluginTrustInput(localRaw json.RawMessage, store *trustlist.Store,
 // could go on passing while the line an operator searches for changed.
 const pluginTrustlistUnavailableMsg = "plugin trust list is unavailable; only the local keyring is in force"
 
-// pluginInstallTrustlistUnavailableMsg is the same report on the command's own
-// output stream, where a person is present and is about to accept or refuse a
-// package. It is a constant for the reason pluginTrustlistUnavailableMsg is —
+// pluginCommandTrustlistUnavailableMsg is the same report on an `agent plugins`
+// command's own output stream, where a person is present and is about to accept
+// or authorize a package. One constant covers every such command rather than
+// one per command: the situation an operator has to understand is identical
+// whichever of them they typed, and a second wording of it would only be a
+// second thing to learn. It is a constant for the reason
+// pluginTrustlistUnavailableMsg is —
 // spelled a second time in a test, it would go on passing while the line an
 // operator reads changed — and it is a SEPARATE constant because the two are
 // read in different places by different people: this one addresses whoever is
 // running the command, the other one whoever is reading a startup log.
-const pluginInstallTrustlistUnavailableMsg = "warning: this deployment's trust list is unavailable, so only " +
+const pluginCommandTrustlistUnavailableMsg = "warning: this deployment's trust list is unavailable, so only " +
 	"the local keyring judged this package"
 
 // pluginTrustSet is the provider a Loader reads its trust set from on every
@@ -1836,7 +1840,7 @@ func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag
 		// unrecognised and a revocation it carries goes unapplied, and an
 		// operator deciding whether to accept a package has to know that is
 		// the trust set the decision was taken against.
-		if _, werr := fmt.Fprintf(out, "%s: %v\n", pluginInstallTrustlistUnavailableMsg, trustlistErr); werr != nil {
+		if _, werr := fmt.Fprintf(out, "%s: %v\n", pluginCommandTrustlistUnavailableMsg, trustlistErr); werr != nil {
 			return fmt.Errorf("write plugins install output: %w", werr)
 		}
 	}
@@ -2323,30 +2327,74 @@ func runPluginsGrant(ctx context.Context, out io.Writer, nameArg, capabilitiesFl
 	// install — and a running serve — agree on what "the plugin's own
 	// declaration" means and where its package comes from. A cache hit costs no
 	// network, exactly like install's own remote path.
-	//
-	// The keyring here is the POLICY-enforced one, which is NOT the trust set
-	// install and serve judge a package against (that one is built whatever the
-	// policy says — see resolvePluginTrustInput). The difference is the
-	// unfinished half this file's "Task 6" note below marks: grant discards the
-	// Provenance it gets back, so under "require_signature": false it reads a
-	// revoked package's declaration without comment. Nothing is authorized past
-	// what plugin.json declares and the mount still refuses the package, so the
-	// gap is a missing warning rather than an escalation.
 	remote, err := resolvePluginRemote(cfg.Plugins)
 	if err != nil {
 		return err
 	}
-	keyring, _, err := resolvePluginKeyring(cfg.Plugins)
+
+	// The trust set this package is judged against, assembled out of the same
+	// function install and serve assemble theirs out of
+	// (resolvePluginTrustInput): the keyring document merged with whatever the
+	// fetched trust list currently holds.
+	//
+	// The POLICY-enforced keyring is deliberately NOT it. That one goes nil
+	// under "require_signature": false (enforcedPluginKeyring), and a nil
+	// keyring makes manifest.LoadPackage judge every package
+	// ProvenanceUnsigned without reading plugin.sig at all — so this command
+	// would authorize, in silence, a package whose signature the plugin panel
+	// (PluginConsentService.Grant, which reads the merged set) and the mount
+	// both refuse. One operator, one config, one package, two answers
+	// depending on which surface they used.
+	//
+	// enforcedPluginKeyring is still called, for its POLICY rule alone and
+	// exactly as install calls it: a deployment that requires an endorsement
+	// while naming no keyring is refused here as it is refused at startup, so
+	// an entry cannot be authorized through a config serve would not come up
+	// on.
+	localKeyring, localRaw, err := resolvePluginLocalKeyring(cfg.Plugins)
 	if err != nil {
 		return err
 	}
+	if _, _, err := enforcedPluginKeyring(cfg.Plugins, localKeyring); err != nil {
+		return err
+	}
+	// The fetched trust list's cache, if this deployment has one. grant reads
+	// it and never refreshes it, for install's reason: a refresh is the running
+	// serve's job, and a command that fetched a list of its own would judge
+	// this package against a trust set no mount will ever see.
+	trustStore, _, err := resolvePluginTrustlist(cfg.Plugins)
+	if err != nil {
+		return err
+	}
+	var trustlistErr error
+	trust, err := resolvePluginTrustInput(localRaw, trustStore, func(unavailable error) {
+		trustlistErr = unavailable
+	})
+	if err != nil {
+		return fmt.Errorf("plugins grant: %w", err)
+	}
+	if trustlistErr != nil {
+		// On this command's own output, where the person deciding to authorize
+		// is standing: a trust list this machine cannot read means a publisher
+		// it registers goes unrecognised and a revocation it carries goes
+		// unapplied, and that is the trust set this authorization is being
+		// taken against.
+		if _, werr := fmt.Fprintf(out, "%s: %v\n", pluginCommandTrustlistUnavailableMsg, trustlistErr); werr != nil {
+			return fmt.Errorf("write plugins grant output: %w", werr)
+		}
+	}
+
 	dir, err := resolvePluginPackageDir(ctx, entry, remote, cfg.Plugins.Root)
 	if err != nil {
 		return fmt.Errorf("plugins grant: %w", err)
 	}
-	// 三态在 Task 6 接线（计划 §6.3：grant 不做信任校验，但要把信任状态带上）：
-	// Provenance 在这里被丢弃。
-	pm, _, _, err := manifest.LoadPackage(dir, manifest.TrustInput{Keyring: keyring})
+	// The Provenance verdict is not read here, per the graded-install plan
+	// §6.3: grant applies no trust rule of its own, so an entry is authorized
+	// whether its package comes back registered, unsigned or revoked. What the
+	// trust set above changes is not that, but what LoadPackage answers with —
+	// including the refusal it raises when a signature and the bytes under it
+	// disagree, which reaches this command as an error rather than a verdict.
+	pm, _, _, err := manifest.LoadPackage(dir, trust)
 	if err != nil {
 		return fmt.Errorf("plugins grant: %w", err)
 	}
