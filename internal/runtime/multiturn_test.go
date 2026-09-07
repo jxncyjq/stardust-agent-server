@@ -34,6 +34,19 @@ func (m *recordingRoundsMaas) Generate(_ context.Context, req port.InferenceRequ
 	return port.InferenceResponse{Text: "done"}, nil
 }
 
+func (m *recordingRoundsMaas) sawText(substr string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, req := range m.requests {
+		for _, msg := range req.Messages {
+			if strings.Contains(msg.Content, substr) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // loopingMaas always asks for the same tool call with the same arguments — the
 // exact behaviour observed on 2026-07-23, when one task read hello.txt 152
 // times. It answers in text only once no tools are offered.
