@@ -1130,15 +1130,16 @@ func (r *SQLiteRepository) MarkAgentMessageRead(ctx context.Context, messageID s
 
 func (r *SQLiteRepository) SaveTaskRun(ctx context.Context, run domain.TaskRun) error {
 	_, err := r.db.ExecContext(ctx, `
-		INSERT INTO task_runs (id, task_id, agent_id, started_at, ended_at, result)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO task_runs (id, task_id, agent_id, started_at, ended_at, result, stop_reason)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			task_id = excluded.task_id,
 			agent_id = excluded.agent_id,
 			started_at = excluded.started_at,
 			ended_at = excluded.ended_at,
-			result = excluded.result
-	`, run.ID, run.TaskID, run.AgentID, formatTime(run.StartedAt), formatTime(run.EndedAt), run.Result)
+			result = excluded.result,
+			stop_reason = excluded.stop_reason
+	`, run.ID, run.TaskID, run.AgentID, formatTime(run.StartedAt), formatTime(run.EndedAt), run.Result, string(run.StopReason))
 	if err != nil {
 		return fmt.Errorf("save task run %q: %w", run.ID, err)
 	}
@@ -1147,7 +1148,7 @@ func (r *SQLiteRepository) SaveTaskRun(ctx context.Context, run domain.TaskRun) 
 
 func (r *SQLiteRepository) ListTaskRuns(ctx context.Context, taskID string) ([]domain.TaskRun, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, task_id, agent_id, started_at, ended_at, result
+		SELECT id, task_id, agent_id, started_at, ended_at, result, stop_reason
 		FROM task_runs
 		WHERE task_id = ?
 		ORDER BY started_at, id
@@ -1162,7 +1163,8 @@ func (r *SQLiteRepository) ListTaskRuns(ctx context.Context, taskID string) ([]d
 		var run domain.TaskRun
 		var startedAt string
 		var endedAt string
-		if err := rows.Scan(&run.ID, &run.TaskID, &run.AgentID, &startedAt, &endedAt, &run.Result); err != nil {
+		var stopReason string
+		if err := rows.Scan(&run.ID, &run.TaskID, &run.AgentID, &startedAt, &endedAt, &run.Result, &stopReason); err != nil {
 			return nil, fmt.Errorf("scan task run for %q: %w", taskID, err)
 		}
 		parsedStartedAt, err := parseTime(startedAt)
@@ -1175,6 +1177,7 @@ func (r *SQLiteRepository) ListTaskRuns(ctx context.Context, taskID string) ([]d
 		}
 		run.StartedAt = parsedStartedAt
 		run.EndedAt = parsedEndedAt
+		run.StopReason = domain.StopReason(stopReason)
 		runs = append(runs, run)
 	}
 	if err := rows.Err(); err != nil {
@@ -1934,6 +1937,11 @@ var columnMigrations = []columnMigration{
 	// default backfills them correctly rather than leaving a blank that reads
 	// as "unknown".
 	{table: "audit_events", column: "origin", stmt: `ALTER TABLE audit_events ADD COLUMN origin TEXT NOT NULL DEFAULT 'agent'`},
+	{
+		table:  "task_runs",
+		column: "stop_reason",
+		stmt:   `ALTER TABLE task_runs ADD COLUMN stop_reason TEXT NOT NULL DEFAULT ''`,
+	},
 }
 
 // applyColumnMigrations runs the additive ALTER TABLE migrations idempotently.
