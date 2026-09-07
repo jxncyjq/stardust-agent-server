@@ -157,6 +157,12 @@ func NewPluginConsentService(manifestPath, root string, pluginsFn func() *loader
 // publisher and detail are populated only for the one state each describes --
 // see PluginView.TrustPublisher and PluginView.TrustDetail's own doc comments
 // for why either may still come back empty even in that state.
+//
+// The verdict it translates is always about ONE package: the one its caller
+// loaded. For List that is the package this entry declares on disk, which need
+// not be the package the loader has mounted under the same name -- see the
+// LoadPackage call in List for what that means for a caller rendering these
+// three fields next to a row's State.
 func trustFieldsFor(prov manifest.Provenance) (state, publisher, detail string) {
 	state = prov.State.String()
 	if prov.State == manifest.ProvenanceRegistered {
@@ -299,6 +305,22 @@ func (s *PluginConsentService) List(ctx context.Context) ([]server.PluginView, e
 		// prov is translated into view.TrustState/TrustPublisher/TrustDetail by
 		// trustFieldsFor below -- see that function's own doc comment for why
 		// TrustState comes from prov.State.String() and nowhere else.
+		//
+		// It is the DECLARED package that is judged here -- the one resolved
+		// just above, from this entry's source -- and that is not always the
+		// package the loader has mounted under this name. An operator who
+		// drops a newer package into the deployment directory has two: the one
+		// serving requests and the one the next convergence refused. So a row
+		// may legitimately carry State "loaded" beside TrustState "revoked",
+		// and the two are describing different packages rather than
+		// contradicting each other. Which is which is said in the row's own
+		// Detail, by the loader that refused it: its explanation for such a
+		// refusal names the refused package's version and says it is a
+		// replacement (see internal/plugin/loader's
+		// sayWhichPackageWasRevoked). Nothing is decided here from that
+		// difference -- the Declared* family reports the package on disk, as
+		// it always has -- but a caller rendering these fields must not read
+		// TrustState as a verdict on the running plugin.
 		pm, _, prov, loadErr := manifest.LoadPackage(dir, trust)
 		if loadErr != nil {
 			view.DeclaredUnresolved = true

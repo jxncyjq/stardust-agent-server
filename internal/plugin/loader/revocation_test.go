@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -215,6 +216,15 @@ func TestARevocationUnloadsAPluginThatIsAlreadyMounted(t *testing.T) {
 // a way to take a healthy, trusted plugin offline by dropping in a package
 // signed by a revoked key — while dropping in a plainly corrupt one, which
 // every other test here pins as harmless, would not.
+//
+// The row this leaves behind is "loaded" with an explanation that names a
+// revocation, and the explanation has to say WHICH package that revocation is
+// about or the row means two opposite things at once. That is what the last
+// assertion here pins, and it is the reason
+// TestNoRowIsLoadedWhileItsOwnEndorsementIsRevoked judges the mounted
+// instance's own key rather than looking for the word "revoked" in the same
+// explanation: the two would otherwise be asserting opposite things about this
+// one row.
 func TestARevokedReplacementLeavesTheTrustedRunningInstanceServing(t *testing.T) {
 	revokedPriv, livePriv, live, revoked := newRevokableTestKey(t)
 	current := live
@@ -260,10 +270,18 @@ func TestARevokedReplacementLeavesTheTrustedRunningInstanceServing(t *testing.T)
 			echoPluginName, row.Version)
 	}
 	// The refusal is still reported — this is a rejected replacement, not a
-	// convergence that noticed nothing.
-	if !strings.Contains(row.LastError, revokedReason) {
-		t.Errorf("plugin %q: LastError = %q, want it to name the revocation reason %q that refused the "+
-			"replacement", echoPluginName, row.LastError, revokedReason)
+	// convergence that noticed nothing — and it reports it UNAMBIGUOUSLY. A row
+	// that reads "loaded" while its explanation says "revoked" has to say which
+	// of the two packages was revoked, or an operator cannot tell whether the
+	// plugin they can watch serving requests is the revoked one. So the
+	// explanation names the refused package by its own version, says it is a
+	// replacement, and names the version that stays mounted.
+	for _, want := range []string{revokedReason, "1.0.1", "REPLACEMENT", "1.0.0 stays mounted"} {
+		if !strings.Contains(row.LastError, want) {
+			t.Errorf("plugin %q reports State=%q with LastError = %q, want it to mention %q: a loaded row "+
+				"whose explanation says \"revoked\" has to say which package that is about",
+				echoPluginName, row.State, row.LastError, want)
+		}
 	}
 
 	// Still serving, in both places a call has to pass through.
@@ -370,35 +388,91 @@ func TestAnUnconfirmedDisposalSurvivesTheEntryMountingAgain(t *testing.T) {
 	}
 }
 
-// TestARevokedPluginIsNeverReportedAsLoadedAndRevokedAtOnce is the second
-// symptom of the same finding, in the two fields a plugin panel puts side by
-// side.
+// TestNoRowIsLoadedWhileItsOwnEndorsementIsRevoked is the second symptom of the
+// same finding, stated against the thing that actually decides it.
 //
-// server.PluginView.State is mergePluginStatus's copy of THIS row's State, and
-// its Detail is that row's explanation, so a row that is loaded while its
-// explanation says the deployment revoked it renders as "running" and "revoked"
-// at the same time, with nothing on screen to say which is true. The two must
-// agree, and after a revocation they agree by the plugin not running.
-func TestARevokedPluginIsNeverReportedAsLoadedAndRevokedAtOnce(t *testing.T) {
-	h, revoke, _, _ := newRevocationHarness(t)
+// server.PluginView.State is mergePluginStatus's copy of THIS row's State, so a
+// row reporting "loaded" is this process telling an operator that the plugin is
+// serving. What must never be true of such a row is that the key it was MOUNTED
+// under — instance.keyID, the endorsement this deployment accepted when it let
+// that code in — is one this deployment has since revoked. A panel that shows a
+// running plugin under a withdrawn endorsement has nothing left to warn anybody
+// with, and the emergency revocation has landed nowhere.
+//
+// It is deliberately NOT "no loaded row may mention a revocation in its
+// explanation". A loaded row legitimately explains a REPLACEMENT that was
+// refused as revoked while the trusted instance it failed to replace keeps
+// serving — see TestARevokedReplacementLeavesTheTrustedRunningInstanceServing,
+// which pins that row and the words that keep it unambiguous. Asserting the
+// wording here instead of the endorsement would make these two tests demand
+// opposite things of the same row, and each would go on passing only because
+// its own scenario never produced the other's.
+//
+// The deployment converged here holds one entry whose key is revoked and one
+// whose key is not, so both a loaded row and a failed row are examined; a
+// convergence that produced only one kind would make this vacuous, which the
+// counts at the end refuse.
+func TestNoRowIsLoadedWhileItsOwnEndorsementIsRevoked(t *testing.T) {
+	priv, spare, live, revokedKeyring := newRevokableTestKey(t)
+	current := live
+	h := newHarnessWithOptions(t, defaultTestApplyWait, trustOptions{
+		local: live,
+		trustSet: func() (manifest.TrustInput, error) {
+			return manifest.TrustInput{Keyring: current}, nil
+		},
+		requireSignature: true,
+	}, RemoteConfig{})
 
-	revoke()
-	if err := applyEcho(t, h); err == nil {
-		t.Fatal("Apply() error = nil after the signing key was revoked, want a refusal")
+	echo := h.writeEcho("1.0.0")
+	proxy := h.writeProxy("1.0.0")
+	signPackage(t, filepath.Join(h.root, "echo"), priv)
+	signPackageAs(t, filepath.Join(h.root, "proxy"), spare, "spare-key")
+	h.apply(echo, proxy)
+
+	current = revokedKeyring
+	if err := h.loader.Apply(context.Background(),
+		manifest.Deployment{Plugins: []manifest.Entry{echo, proxy}}, h.root); err == nil {
+		t.Fatal("Apply() error = nil after one entry's signing key was revoked, want a refusal")
 	}
 
+	// The deployment's own answer, asked of the same provider the convergence
+	// asked: the invariant is about what THIS deployment currently revokes, not
+	// about a keyring the test happens to be holding.
+	trust, err := h.loader.trustSet()
+	if err != nil {
+		t.Fatalf("read the trust set to judge the rows against: %v", err)
+	}
+	if trust.Keyring == nil {
+		t.Fatal("the trust set carries no keyring, so it revokes nothing and every assertion below is vacuous")
+	}
+
+	loaded, failed := 0, 0
 	for _, row := range h.loader.Status() {
-		revokedExplanation := strings.Contains(row.LastError, revokedReason)
-		if row.State == StateLoaded && revokedExplanation {
-			t.Fatalf("plugin %q reports State=%q while its explanation says it was revoked (%q); "+
-				"a panel showing both has no way to say which one is true",
-				row.Name, row.State, row.LastError)
+		switch row.State {
+		case StateLoaded:
+			loaded++
+			inst := h.loader.instances[row.Name]
+			if inst == nil {
+				t.Fatalf("plugin %q reports State=%q with no instance behind it", row.Name, row.State)
+			}
+			if _, gone := trust.Keyring.Revoked(inst.keyID); gone {
+				t.Fatalf("plugin %q reports State=%q while the key it was mounted under (%q) is one this "+
+					"deployment has revoked; a panel showing a running plugin under a withdrawn "+
+					"endorsement has nothing left to warn anybody with (LastError %q)",
+					row.Name, row.State, inst.keyID, row.LastError)
+			}
+		case StateFailed:
+			failed++
+			if !strings.Contains(row.LastError, revokedReason) {
+				t.Errorf("plugin %q reports State=%q with no revocation in its explanation (%q); "+
+					"the state and the reason for it must come from the same verdict",
+					row.Name, row.State, row.LastError)
+			}
 		}
-		if row.State == StateFailed && !revokedExplanation {
-			t.Errorf("plugin %q reports State=%q with no revocation in its explanation (%q); "+
-				"the state and the reason for it must come from the same verdict",
-				row.Name, row.State, row.LastError)
-		}
+	}
+	if loaded == 0 || failed == 0 {
+		t.Fatalf("examined %d loaded and %d failed rows, want at least one of each: this convergence was "+
+			"supposed to revoke one entry's key and leave the other's alone", loaded, failed)
 	}
 }
 
@@ -508,4 +582,202 @@ func TestARevocationLeavesTheOtherEntriesConverged(t *testing.T) {
 	}
 	wantStrings(t, "registered tools", h.toolNames(), []string{proxyToolName})
 	wantStrings(t, "ledger owners", h.owners(), []string{"plugin:" + proxyPluginName + "@1.0.0"})
+}
+
+// TestARevokedInstanceIsUnloadedWhenTheReplacementFailsAnEarlierCheck is the
+// shape a revocation has to survive: the package on disk is refused for a
+// reason that has nothing to do with trust, so no revoked verdict is ever
+// reached for THAT package, while the instance whose own key this deployment
+// has just revoked is still mounted.
+//
+// Only plugin.wasm is corrupted. plugin.json and plugin.sig are the bytes that
+// mounted, so the signature still verifies and the digest check — which runs
+// before any policy is applied — is what refuses the package. A convergence
+// that discovered revocations only through that refusal would find none, and
+// one byte written into the deployment directory would buy an attacker
+// "the revoked plugin keeps serving until this process restarts", which is
+// exactly what publishing the revocation was meant to prevent.
+func TestARevokedInstanceIsUnloadedWhenTheReplacementFailsAnEarlierCheck(t *testing.T) {
+	h, revoke, _, _ := newRevocationHarness(t)
+
+	corrupted := appendCustomSection(t, fixtureWasm(t, echoWasmFile), "tampered")
+	if err := os.WriteFile(filepath.Join(h.root, "echo", echoWasmFile), corrupted, 0o644); err != nil {
+		t.Fatalf("overwrite plugin.wasm: %v", err)
+	}
+
+	revoke()
+	err := applyEcho(t, h)
+
+	if err == nil {
+		t.Fatal("Apply() error = nil after the signing key was revoked, want a refusal")
+	}
+	// The premise, asserted rather than assumed: if the package on disk were
+	// refused AS REVOKED, this test would be a second copy of
+	// TestARevocationUnloadsAPluginThatIsAlreadyMounted and would prove nothing
+	// about a revocation reached without such a verdict.
+	if !strings.Contains(err.Error(), "sha256 mismatch") {
+		t.Fatalf("Apply() error = %v, want the digest check to be what refused the package on disk", err)
+	}
+	if !errors.Is(err, manifest.ErrRevokedPublisher) {
+		t.Errorf("Apply() error = %v, want it to wrap manifest.ErrRevokedPublisher: an instance taken down "+
+			"because its endorsement was withdrawn is a revocation, whatever the package on disk did", err)
+	}
+
+	row := h.statusOf(echoPluginName)
+	if row.State != StateFailed {
+		t.Fatalf("plugin %q: State = %q, want %q: the instance's own key was revoked, and a package on "+
+			"disk that fails an earlier check does not buy it another convergence (LastError %q)",
+			echoPluginName, row.State, StateFailed, row.LastError)
+	}
+	if row.Version != "1.0.0" {
+		t.Errorf("plugin %q: Version = %q, want 1.0.0: the record must name the version that was taken down",
+			echoPluginName, row.Version)
+	}
+	if !strings.Contains(row.LastError, revokedReason) {
+		t.Errorf("plugin %q: LastError = %q, want it to name the revocation reason %q rather than only the "+
+			"digest mismatch: the revocation is why this plugin stopped running",
+			echoPluginName, row.LastError, revokedReason)
+	}
+
+	if got := h.toolNames(); len(got) != 0 {
+		t.Errorf("registered tools = %v, want none: a revoked plugin's tools stay callable", got)
+	}
+	if toolauth.IsGateable(echoToolName) {
+		t.Errorf("IsGateable(%q) = true, want false: a revoked plugin still offers its tool", echoToolName)
+	}
+	if got := h.owners(); len(got) != 0 {
+		t.Errorf("ledger owners = %v, want none: the revoked instance's resources are still filed", got)
+	}
+	unloaded := h.eventsOfType(RuntimeEventUnloaded)
+	if len(unloaded) != 1 {
+		t.Fatalf("want one %s event, got %v", RuntimeEventUnloaded, unloaded)
+	}
+	if !strings.Contains(unloaded[0].Message, "reason="+reasonRevoked) {
+		t.Errorf("%s = %q, want reason=%s", RuntimeEventUnloaded, unloaded[0].Message, reasonRevoked)
+	}
+}
+
+// TestATrustSetThatCannotBeReadJudgesNoMountedInstance pins the honest answer
+// to "is this plugin's endorsement still good?" when the deployment cannot read
+// what it trusts.
+//
+// The answer is NOT "not revoked". A provider that fails says this deployment
+// does not know what it trusts (see the TrustSet type), and unloading every
+// mounted plugin over a corrupt cache would be a far worse cure than the
+// disease — so the instances are left exactly as they are. What must not happen
+// is that this passes quietly: the entries report the failure they always did,
+// and the one thing no entry can report — that the mounted set went unjudged
+// this convergence — is said once, at ERROR.
+func TestATrustSetThatCannotBeReadJudgesNoMountedInstance(t *testing.T) {
+	priv, _, live, _ := newRevokableTestKey(t)
+	broken := errors.New("the trust list cache is corrupt")
+	answerable := true
+	logs := &bytes.Buffer{}
+	h := newHarnessWithOptions(t, defaultTestApplyWait, trustOptions{
+		local: live,
+		trustSet: func() (manifest.TrustInput, error) {
+			if !answerable {
+				return manifest.TrustInput{}, broken
+			}
+			return manifest.TrustInput{Keyring: live}, nil
+		},
+		requireSignature: true,
+		logger:           slog.New(slog.NewTextHandler(logs, nil)),
+	}, RemoteConfig{})
+
+	entry := h.writeEcho("1.0.0")
+	signPackage(t, filepath.Join(h.root, "echo"), priv)
+	h.apply(entry)
+	if row := h.statusOf(echoPluginName); row.State != StateLoaded {
+		t.Fatalf("plugin %q: State = %q, want %q before the provider breaks (LastError %q)",
+			echoPluginName, row.State, StateLoaded, row.LastError)
+	}
+
+	logs.Reset()
+	answerable = false
+	err := applyEcho(t, h)
+
+	if err == nil {
+		t.Fatal("Apply() error = nil when the trust set could not be read, want a refusal")
+	}
+	if !errors.Is(err, broken) {
+		t.Errorf("Apply() error = %v, want it to wrap the provider's own error", err)
+	}
+
+	// The instance is exactly where it was: this convergence judged it against
+	// nothing, so it decided nothing about it.
+	row := h.statusOf(echoPluginName)
+	if row.State != StateLoaded {
+		t.Fatalf("plugin %q: State = %q, want %q: a trust set that could not be read is not a verdict about "+
+			"anything that is running (LastError %q)", echoPluginName, row.State, StateLoaded, row.LastError)
+	}
+	if row.Version != "1.0.0" {
+		t.Errorf("plugin %q: Version = %q, want 1.0.0", echoPluginName, row.Version)
+	}
+	wantStrings(t, "registered tools", h.toolNames(), []string{echoToolName})
+	if !toolauth.IsGateable(echoToolName) {
+		t.Errorf("IsGateable(%q) = false, want true: the mounted instance stopped offering its tool",
+			echoToolName)
+	}
+	wantStrings(t, "ledger owners", h.owners(), []string{"plugin:" + echoPluginName + "@1.0.0"})
+	if got := h.eventsOfType(RuntimeEventUnloaded); len(got) != 0 {
+		t.Errorf("%s events = %v, want none: nothing was judged, so nothing was unloaded",
+			RuntimeEventUnloaded, got)
+	}
+
+	// Not passed over in silence, in either place. The row says the entry could
+	// not be judged, and the convergence says the mounted set could not be.
+	if !strings.Contains(row.LastError, "read the trust set to judge plugin") {
+		t.Errorf("plugin %q: LastError = %q, want it to report that the trust set could not be read",
+			echoPluginName, row.LastError)
+	}
+	if got := logs.String(); !strings.Contains(got,
+		"this convergence cannot judge whether a mounted plugin's endorsement was revoked") {
+		t.Errorf("the convergence said nothing about being unable to judge its mounted plugins:\n%s", got)
+	}
+}
+
+// TestARevocationDoesNotResurrectAnEntryThatLeftTheTargetState pins the one
+// name a revocation has nothing to add to: an entry the operator has removed
+// from the deployment, whose mounted instance happens to be endorsed by a key
+// the same convergence revokes.
+//
+// It is unloaded either way — that is what leaving the target state means — and
+// what must not change is the account of it. An entry that is no longer
+// supposed to be running is not a diagnosis, so converge deletes its failure
+// record and Status stops reporting it altogether. Taking it down as REVOKED
+// instead would file a record the same convergence has just deleted, and an
+// operator who removed a plugin would find it back on the panel, failed,
+// explaining a revocation they never needed to act on.
+func TestARevocationDoesNotResurrectAnEntryThatLeftTheTargetState(t *testing.T) {
+	h, revoke, _, _ := newRevocationHarness(t)
+
+	revoke()
+	if err := h.loader.Apply(context.Background(), manifest.Deployment{}, h.root); err != nil {
+		t.Fatalf("Apply() error = %v, want nil: an entry that left the target state is unloaded, not "+
+			"refused", err)
+	}
+
+	for _, row := range h.loader.Status() {
+		if row.Name == echoPluginName {
+			t.Fatalf("plugin %q is still reported (State=%q, LastError=%q) after it left the target "+
+				"state; an entry that is not supposed to be running is not a diagnosis",
+				row.Name, row.State, row.LastError)
+		}
+	}
+
+	unloaded := h.eventsOfType(RuntimeEventUnloaded)
+	if len(unloaded) != 1 {
+		t.Fatalf("want one %s event, got %v", RuntimeEventUnloaded, unloaded)
+	}
+	if !strings.Contains(unloaded[0].Message, "reason="+reasonManifestRemoved) {
+		t.Errorf("%s = %q, want reason=%s: the entry was removed from the deployment, which is why it "+
+			"went down", RuntimeEventUnloaded, unloaded[0].Message, reasonManifestRemoved)
+	}
+	if got := h.toolNames(); len(got) != 0 {
+		t.Errorf("registered tools = %v, want none", got)
+	}
+	if got := h.owners(); len(got) != 0 {
+		t.Errorf("ledger owners = %v, want none", got)
+	}
 }

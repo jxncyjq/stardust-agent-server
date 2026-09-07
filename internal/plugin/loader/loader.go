@@ -1104,38 +1104,50 @@ func (l *Loader) converge(ctx context.Context, wanted []manifest.Entry, declared
 		}
 	}
 
+	// The trust set is read ONCE for this whole convergence, before pass 1
+	// touches anything, and it is what every judgement below is taken against:
+	// which packages may mount (pass 1) and which mounted instances lost the
+	// endorsement they were mounted under (pass 2). See trustReading for why
+	// one reading rather than one per judgement.
+	//
+	// A provider that cannot answer does not become "no trust set". Each entry
+	// reports it as its own activation failure, exactly as it did when this
+	// read lived inside prepare, and the ONE thing that cannot be reported per
+	// entry is said here: this convergence cannot tell whether a mounted
+	// instance's endorsement has been withdrawn, so it leaves every mounted
+	// instance as it is. Left unsaid, that silence would read like "nothing
+	// was revoked", which is the one answer a deployment that does not know
+	// what it trusts must not give.
+	trust := trustReading{}
+	trust.input, trust.err = l.trustSet()
+	if trust.err != nil {
+		l.logger.Error("this convergence cannot judge whether a mounted plugin's endorsement was revoked",
+			"detail", "the trust set could not be read, so every mounted instance is left as it is",
+			"mounted", len(l.instances), "error", trust.err)
+	}
+
 	// Pass 1: work out what each desired entry needs, touching nothing.
 	plans := make([]*convergePlan, 0, len(wanted))
 	planFor := make(map[string]*convergePlan, len(wanted))
-	// revocations holds the refusals pass 2 must act on rather than merely
-	// report: one entry per desired plugin whose package is signed by a key
-	// this deployment has revoked, keyed by name.
-	revocations := make(map[string]revocation)
 	for _, entry := range wanted {
-		plan, keyring, err := l.prepare(ctx, entry, root)
+		plan, err := l.prepare(ctx, entry, root, trust)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("converge plugin %q: %w", entry.Name, err))
-			if errors.Is(err, manifest.ErrRevokedPublisher) {
-				if keyring == nil {
-					// Unreachable by construction — the revoked verdict comes
-					// from admit, which only ever sees a provenance a keyring
-					// produced — and reported rather than assumed away,
-					// because the alternative is to judge the running instance
-					// against nothing and call it "not revoked".
-					errs = append(errs, fmt.Errorf("converge plugin %q: refused as revoked with no keyring "+
-						"to judge the running instance against; a revocation verdict can only come from a "+
-						"trust set that holds the revocation", entry.Name))
-					continue
-				}
-				revocations[entry.Name] = revocation{cause: err, keyring: keyring}
-				// Said again on EVERY convergence, not only on the one that
-				// first recorded it: an unload whose disposal was reported
-				// once and never again reads, from the second convergence on,
-				// exactly like an unload that succeeded.
-				if note := l.failures[entry.Name].unconfirmedDisposal; note != "" {
-					l.logger.Error("a revoked plugin's unload was never confirmed",
-						"plugin", entry.Name, "detail", note)
-				}
+			// Said again on EVERY convergence that leaves this entry
+			// unmounted, not only on the one that first recorded it: an unload
+			// whose disposal was reported once and never again reads, from the
+			// second convergence on, exactly like an unload that succeeded.
+			//
+			// It hangs on "this entry failed again", not on which failure:
+			// the package that succeeds a revoked one may fail an entirely
+			// unrelated check, and the resources the revoked mount never
+			// released are no less unaccounted for. The record read here is
+			// still the previous convergence's — pass 2 has not run yet — so
+			// the convergence that first files the note does not also say it
+			// twice.
+			if note := l.failures[entry.Name].unconfirmedDisposal; note != "" {
+				l.logger.Error("a revoked plugin's unload was never confirmed",
+					"plugin", entry.Name, "detail", note)
 			}
 			continue
 		}
@@ -1182,33 +1194,52 @@ func (l *Loader) converge(ctx context.Context, wanted []manifest.Entry, declared
 	for _, name := range mounted {
 		plan := planFor[name]
 		inst := l.instances[name]
+		// Asked of the instance's OWN key and of this convergence's one trust
+		// reading, and of nothing else — see the reasonRevoked branch below.
+		withdrawn, endorsementRevoked := trust.withdrewTrustFrom(inst.keyID)
 		var reason string
 		switch {
 		case plan != nil && plan.prev != nil:
 			reason = reasonReplaced
-		case revocations[name].withdrewTrustFrom(inst.keyID):
-			// A revocation is the ONE pass-1 refusal that takes the running
-			// instance down with it, and it is checked before the desired case
-			// below precisely because the entry is still desired.
+		case desired[name] && endorsementRevoked:
+			// The key that endorsed THIS RUNNING INSTANCE — the one
+			// manifest.LoadPackage named for the package this mount was built
+			// from, see instance.keyID — is one this convergence's trust set
+			// has revoked. While that is so, and for as long as this
+			// convergence can read a trust set at all, nothing that key
+			// endorses serves under this entry's name: a package it signs is
+			// refused by admit, and an instance it endorsed is unloaded here
+			// however long ago it was mounted. Leaving that instance up would
+			// put the arrival of an emergency revocation at "whenever this
+			// process next restarts", which is the case it can least afford to
+			// miss.
 			//
-			// Every other refusal leaves that instance alone, for the reason
-			// prepare's doc comment gives: a package that will not load is a
-			// REPLACEMENT that failed, and unmounting a working plugin for a
-			// replacement that never existed helps nobody.
+			// The question is the instance's own endorsement against the trust
+			// set and NOTHING else — not whether the package now on disk
+			// mounted, was refused, or was refused for some unrelated reason.
+			// Both independences are load-bearing. Judging the package on disk
+			// would hand anyone who can write into the deployment directory a
+			// way to take a healthy, trusted plugin down by dropping in a
+			// package signed by a revoked key. And reaching this only when the
+			// package on disk was refused AS REVOKED would let a package that
+			// fails an EARLIER check — a plugin.wasm whose sha256 no longer
+			// matches the plugin.json describing it, say — keep a revoked
+			// instance serving until the next restart, which is the shape an
+			// attacker gets for free by corrupting one byte.
 			//
-			// A revocation is not a statement about a replacement. It says this
-			// deployment has withdrawn its trust from a key, and while that is
-			// so, nothing this key endorses serves under this entry's name —
-			// including an instance that was mounted before the withdrawal.
-			// Leaving that instance up would put the arrival of an emergency
-			// revocation at "whenever this process next restarts", which is the
-			// case it can least afford to miss.
+			// It is checked before the desired case below precisely because the
+			// entry is still desired. Every OTHER refusal leaves the running
+			// instance alone, for the reason prepare's doc comment gives: a
+			// package that will not load is a REPLACEMENT that failed, and
+			// unmounting a working plugin for a replacement that never existed
+			// helps nobody.
 			//
-			// What is judged is the RUNNING instance's own endorsement, not the
-			// package on disk that was refused: see revocation.withdrewTrustFrom.
-			// A package the operator dropped into the deployment directory under
-			// a revoked key is an unfit replacement like any other, and it leaves
-			// the instance it failed to replace running.
+			// Only for a DESIRED entry, because a name that left the target
+			// state is unloaded by the branches below anyway — and unloaded
+			// WITHOUT a failure record, which is what "an entry that is not
+			// supposed to be running is not a diagnosis" means in Status.
+			// Taking it down as revoked instead would file a record the top of
+			// this convergence has just deleted.
 			reason = reasonRevoked
 		case desired[name]:
 			continue
@@ -1229,7 +1260,18 @@ func (l *Loader) converge(ctx context.Context, wanted []manifest.Entry, declared
 			continue
 		}
 		if reason == reasonRevoked {
-			l.recordRevokedUnload(name, inst.version, revocations[name].cause, err)
+			// Reported as well as filed. Pass 1 may or may not have refused
+			// the package on disk — an entry whose package is unchanged and
+			// merely re-signed passes pass 1 outright — and an unload nobody
+			// asked for that Apply returns nil about is an emergency
+			// revocation that reached a running plugin silently. When pass 1
+			// DID refuse, the two sentences are two facts: that package was
+			// refused, and this instance was taken down. They coincide only
+			// when the refused package is the one this instance was built
+			// from.
+			cause := revokedInstanceRefusal(name, inst, withdrawn)
+			errs = append(errs, fmt.Errorf("converge plugin %q: %w", name, cause))
+			l.recordRevokedUnload(name, inst.version, cause, err)
 		}
 		if err != nil {
 			errs = append(errs, err)
@@ -1363,65 +1405,90 @@ type convergePlan struct {
 	revoked   int
 }
 
-// revocation is pass 1's finding that a desired entry's package on disk is
-// signed by a key this deployment has revoked, together with the trust set that
-// said so. Its zero value is "no such finding for this entry", which is what a
-// lookup of a name pass 1 did not refuse returns.
-type revocation struct {
-	// cause is the refusal itself, which is the explanation an entry unloaded
-	// over it keeps afterwards.
-	cause error
-
-	// keyring is the trust set THIS convergence already read for this entry
-	// (see Loader.prepare), not a second reading taken for the unload
-	// decision. One convergence asks the trust-set provider once per entry and
-	// judges everything about that entry against the answer it got: a provider
-	// is free to answer differently on every call, so a second reading could
-	// disagree with the one that produced cause, and an entry refused under one
-	// trust set and unloaded under another would be converging toward no state
-	// anybody declared.
-	keyring *sign.Keyring
+// trustReading is the ONE answer this convergence got from its trust-set
+// provider: the input every package it reads is judged against, or the
+// provider's own failure to answer.
+//
+// One reading per convergence rather than one per judgement, because the
+// provider is free to answer differently on every call (see the TrustSet
+// type). A convergence that asked twice could refuse a package under one trust
+// set and decide the fate of the instance mounted under that name against
+// another, and would be converging toward a state nobody ever declared.
+//
+// Both fields come from one read of the provider: input is what it answered,
+// err is why it could not answer. A failure is carried rather than folded into
+// "no trust set", because a deployment that does not KNOW what it trusts is not
+// a deployment that trusts nobody — see TrustSet. A reading that failed is one
+// every entry reports as its own activation failure, and one no mounted
+// instance is judged against at all.
+type trustReading struct {
+	input manifest.TrustInput
+	err   error
 }
 
-// withdrewTrustFrom reports whether keyID — the key that endorsed the instance
-// currently mounted under this entry's name — is one this convergence's trust
-// set has revoked.
+// withdrewTrustFrom reports the revocation this convergence's trust set holds
+// for keyID, if it holds one.
 //
-// This is the question the unload turns on, and it is deliberately not "was the
-// package on disk refused as revoked". Those are two different packages
-// whenever the operator has put a new one in place, and answering with the
-// second would let anyone who can write into the deployment directory take a
-// healthy, trusted plugin down by dropping in a package signed by a revoked
-// key. A replacement signed by a revoked key is an unfit replacement, and pass
-// 2 leaves the instance it failed to replace exactly where every other unfit
-// replacement leaves it: running.
+// It answers about a KEY, never about a package: the key that endorsed the
+// instance mounted under some name (see instance.keyID) is the one this
+// convergence has to ask about, and the answer comes from the reading it
+// already took rather than from a second one.
 //
-// An empty keyID is an instance that mounted with no registered endorsement
-// (manifest.ProvenanceUnsigned carries no key id). Revoking a key withdraws
-// trust from that key, and there is no key here for any revocation to name, so
-// the answer is no.
-func (r revocation) withdrewTrustFrom(keyID sign.KeyID) bool {
-	if r.cause == nil || keyID == "" {
-		return false
+// Three inputs answer "no", each for its own reason. A reading that failed
+// judges nothing — the convergence has already reported that it cannot judge,
+// and answering "not revoked" here is precisely what that report exists to
+// prevent. A deployment whose reading carries no keyring holds no revocations
+// to find (manifest.TrustInput.Keyring is a pointer, and nil is how "no trust
+// set" is spelled). And an empty keyID is a mount with no registered
+// endorsement — manifest.ProvenanceUnsigned carries no key id — so there is no
+// key here for any revocation to name: revoking a key withdraws trust from
+// that key, and this mount was endorsed by none.
+func (t trustReading) withdrewTrustFrom(keyID sign.KeyID) (sign.Revocation, bool) {
+	if t.err != nil || t.input.Keyring == nil || keyID == "" {
+		return sign.Revocation{}, false
 	}
-	_, revoked := r.keyring.Revoked(keyID)
-	return revoked
+	return t.input.Keyring.Revoked(keyID)
+}
+
+// revokedInstanceRefusal explains an unload forced by this deployment revoking
+// the key a mounted instance was endorsed by (see reasonRevoked).
+//
+// It names the INSTANCE — the version that was running and the key it was
+// mounted under — rather than any package now sitting on disk, because the
+// instance is what was taken down and its version is what an operator matches
+// against their own inventory of where that code ran. The package on disk may
+// be a different package signed by a different key, and a refusal of THAT one
+// is reported separately, in its own sentence.
+//
+// It wraps manifest.ErrRevokedPublisher because it is the same refusal admit
+// makes about a package, reached at the other end of the mount's life: a caller
+// asking errors.Is whether a revocation was what happened gets the same answer
+// whether the package was stopped at the door or the instance was taken down
+// afterwards.
+//
+// The revocation's own recorded context is rendered by
+// manifest.DescribeRevocation, which reads exactly the two optional fields
+// carried here and renders "" when a record holds neither.
+func revokedInstanceRefusal(name string, inst *instance, withdrawn sign.Revocation) error {
+	described := manifest.DescribeRevocation(manifest.Provenance{
+		RevokedAt: withdrawn.At,
+		Reason:    withdrawn.Reason,
+	})
+	return fmt.Errorf("plugin %q version %s was mounted under key %q, which this deployment revoked%s, "+
+		"so it was unloaded: %w", name, inst.version, inst.keyID, described, manifest.ErrRevokedPublisher)
 }
 
 // prepare works out what one entry needs, without touching anything that is
 // running. It returns a nil plan and a nil error when the entry did not change.
 // It is called with l.mu held.
 //
-// The second return is the keyring this entry was judged against on THIS
-// convergence, so that a caller acting on the verdict acts on the same trust
-// set the verdict came from rather than reading the provider a second time (see
-// revocation.keyring). It is nil in two cases: the failures reached before the
-// trust set is read at all — resolving the entry's source, fetching a remote
-// package, and the trust-set provider's own failure — and a deployment whose
-// trust set holds no keyring (manifest.TrustInput.Keyring is a pointer, and
-// nil is how "no trust set" is spelled). Neither can produce a revocation
-// verdict: manifest.LoadPackage reports ProvenanceUnsigned when there is no
-// keyring, so nothing reaches admit's revoked branch.
+// trust is one convergence's reading of its trust-set provider, handed in
+// rather than read here so that every entry and every mounted instance is
+// judged against one answer (see trustReading). A reading that FAILED fails
+// this entry, after its source is resolved and before its package is read: a
+// deployment that does not know what it trusts must not mount anything, and
+// reading the failure as "no trust set" would turn a broken cache into a
+// deployment where nobody endorses anything.
 //
 // The package is read, checked and assembled BEFORE anything running is torn
 // down, which is what makes a broken new package safe: a plugin.wasm whose
@@ -1429,14 +1496,16 @@ func (r revocation) withdrewTrustFrom(keyID sign.KeyID) bool {
 // and reports the failure, instead of unmounting a working plugin for a
 // replacement that never existed.
 //
-// One refusal is not covered by that reasoning, and converge acts on it
-// separately: a package signed by a key this deployment has REVOKED. That
-// verdict is not "this replacement is unfit to mount", it is "this deployment
-// no longer trusts what endorses this entry" — and an entry under withdrawn
-// trust serves nothing, so pass 2 unloads whatever is mounted under its name
-// (see reasonRevoked). Every other refusal this function reports keeps the
-// sentence above, the unreadable and the mis-signed alike.
-func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string) (*convergePlan, *sign.Keyring, error) {
+// EVERY refusal this function reports keeps that sentence, a package signed by
+// a revoked key included: what a refusal says is that this package is unfit to
+// mount, and a package that never mounted cannot be the reason a running
+// instance goes down. Whether the instance mounted under this name survives is
+// a separate question about the key IT was mounted under, asked of this same
+// trust reading and answered without reference to anything on disk (see
+// reasonRevoked). The one thing a revoked refusal does here is say WHICH of the
+// two packages it is about, for the row that has to carry both — see
+// sayWhichPackageWasRevoked.
+func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string, trust trustReading) (*convergePlan, error) {
 	// The two kinds of source differ HERE and nowhere else: a local entry
 	// resolves against the deployment root, a remote one is fetched into the
 	// cache. Everything from LoadPackage down is one path — that is the whole
@@ -1446,25 +1515,23 @@ func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string)
 	if entry.IsRemote() {
 		dir, err = l.remoteDir(ctx, entry)
 		if err != nil {
-			return nil, nil, l.fail(ctx, entry.Name, "", stepFetch, err, nil)
+			return nil, l.fail(ctx, entry.Name, "", stepFetch, err, nil)
 		}
 	} else {
 		dir, err = packageDir(entry.Name, root, entry.Source)
 		if err != nil {
-			return nil, nil, l.fail(ctx, entry.Name, "", stepSource, err, nil)
+			return nil, l.fail(ctx, entry.Name, "", stepSource, err, nil)
 		}
 	}
 
-	// The trust set is read HERE, once per entry per convergence, rather than
-	// captured when this Loader was built: see the TrustSet type. A provider
-	// that cannot answer fails the entry — a deployment that does not know
-	// what it trusts must not mount anything, and reading the failure as "no
-	// trust set" would turn a broken cache into a deployment where nobody
-	// endorses anything.
-	trust, err := l.trustSet()
-	if err != nil {
-		return nil, nil, l.fail(ctx, entry.Name, "", stepLoadPackage,
-			fmt.Errorf("read the trust set to judge plugin %q against: %w", entry.Name, err), nil)
+	// The provider's own failure is reported HERE, after the entry's source is
+	// resolved and before its package is read, so that each entry reports the
+	// first thing that actually stopped it: an entry whose source does not
+	// resolve reports that, and one whose source does resolve reports that this
+	// deployment does not know what it trusts.
+	if trust.err != nil {
+		return nil, l.fail(ctx, entry.Name, "", stepLoadPackage,
+			fmt.Errorf("read the trust set to judge plugin %q against: %w", entry.Name, trust.err), nil)
 	}
 
 	// LoadPackage answers who stands behind the package and leaves what that
@@ -1476,7 +1543,7 @@ func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string)
 	// activation failure — it goes through l.fail like every other one, so the
 	// entry lands in StateFailed with a LastError naming the check, and the
 	// other entries keep converging.
-	pm, wasm, prov, err := manifest.LoadPackage(dir, trust)
+	pm, wasm, prov, err := manifest.LoadPackage(dir, trust.input)
 	if err != nil {
 		// An untrusted package does not belong in the cache: the bytes just
 		// failed signature verification, and leaving them there means every
@@ -1490,16 +1557,17 @@ func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string)
 		if errors.Is(err, manifest.ErrUntrustedPackage) && entry.IsRemote() {
 			fetch.EvictUntrusted(l.remote.Cache, entry.Digest, l.logger)
 		}
-		return nil, trust.Keyring, l.fail(ctx, entry.Name, "", stepLoadPackage, err, nil)
+		return nil, l.fail(ctx, entry.Name, "", stepLoadPackage, err, nil)
 	}
-	if err := l.admit(entry, dir, trust, prov); err != nil {
+	if err := l.admit(entry, dir, trust.input, prov); err != nil {
 		// The version is the one the refused package declares, which is a
 		// version this convergence read rather than a blank a reader has to
 		// guess at. It is also what keeps the version on the record of an entry
 		// a revocation unloaded: recordRevokedUnload files the version that was
 		// running, and every convergence after it rewrites that record from
 		// here.
-		return nil, trust.Keyring, l.fail(ctx, entry.Name, pm.Version, stepLoadPackage, err, nil)
+		return nil, l.fail(ctx, entry.Name, pm.Version, stepLoadPackage,
+			l.sayWhichPackageWasRevoked(entry.Name, pm.Version, trust, err), nil)
 	}
 	if pm.Name != entry.Name {
 		// The deployment entry's name and the plugin's own name are two
@@ -1509,12 +1577,12 @@ func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string)
 		// panic in the registry rather than an error anyone can report.
 		mismatch := fmt.Errorf("deployment entry %q loads plugin %q from %s; an entry must be named after "+
 			"the plugin it installs", entry.Name, pm.Name, dir)
-		return nil, trust.Keyring, l.fail(ctx, entry.Name, pm.Version, stepIdentity, mismatch, nil)
+		return nil, l.fail(ctx, entry.Name, pm.Version, stepIdentity, mismatch, nil)
 	}
 
 	spec, err := manifest.AssembleSpec(pm, entry, l.deployLimits)
 	if err != nil {
-		return nil, trust.Keyring, l.fail(ctx, entry.Name, pm.Version, stepAssembleSpec, err, nil)
+		return nil, l.fail(ctx, entry.Name, pm.Version, stepAssembleSpec, err, nil)
 	}
 
 	// The shape of the configuration is the PLUGIN's declaration (plugin.json's
@@ -1530,7 +1598,7 @@ func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string)
 	// A plugin that declares no schema passes through untouched (see
 	// manifest.ValidateEntryConfig), which is every plugin written so far.
 	if err := manifest.ValidateEntryConfig(pm, entry.Config); err != nil {
-		return nil, trust.Keyring, l.fail(ctx, entry.Name, pm.Version, stepConfigSchema, err, nil)
+		return nil, l.fail(ctx, entry.Name, pm.Version, stepConfigSchema, err, nil)
 	}
 	spec.Wasm = wasm
 
@@ -1544,7 +1612,7 @@ func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string)
 		missing := fmt.Errorf("plugin %q: Config.Deps returned host.Deps with a nil Tools registry; "+
 			"it is where the plugin's tools are registered, so activating it would mount a plugin "+
 			"nothing can call", entry.Name)
-		return nil, trust.Keyring, l.fail(ctx, entry.Name, pm.Version, stepDependencies, missing, nil)
+		return nil, l.fail(ctx, entry.Name, pm.Version, stepDependencies, missing, nil)
 	}
 	// Health accounting is wired here rather than inside host.Deps' factory
 	// because it belongs to the MOUNT, not to the deployment's dependency
@@ -1569,16 +1637,53 @@ func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string)
 
 	digest, err := fingerprintOf(entry, pm, spec)
 	if err != nil {
-		return nil, trust.Keyring, l.fail(ctx, entry.Name, pm.Version, stepFingerprint, err, nil)
+		return nil, l.fail(ctx, entry.Name, pm.Version, stepFingerprint, err, nil)
 	}
 
 	prev := l.instances[entry.Name]
 	if prev != nil && prev.fingerprint == digest {
-		return nil, trust.Keyring, nil
+		return nil, nil
 	}
 	return &convergePlan{
 		entry: entry, dir: dir, pm: pm, spec: spec, digest: digest, prev: prev, keyID: prov.KeyID,
-	}, trust.Keyring, nil
+	}, nil
+}
+
+// sayWhichPackageWasRevoked adds, to a refusal of a package this deployment has
+// revoked, the one thing the status row cannot say on its own: WHICH of two
+// packages the refusal is about. It returns cause unchanged for every other
+// refusal and whenever there is no second package to confuse it with. It is
+// called with l.mu held.
+//
+// A row carries one state and one explanation. When an instance is mounted
+// under this name and its OWN endorsement was not withdrawn, converge's pass 2
+// leaves it running — it asks this same trustReading about that instance's own
+// key — so the row reads "loaded" while its explanation says "revoked", and a
+// reader has no way to tell whether the revoked thing is the plugin they can
+// watch serving requests or the package somebody just dropped into the
+// deployment directory to replace it. The refusal therefore says so itself: the
+// refused package is the one this entry DECLARES, at the version that package
+// declares, and the mounted version is named next to it.
+//
+// It leaves cause alone when the mounted instance's own endorsement was
+// withdrawn too, because that instance does not survive this convergence:
+// recordRevokedUnload replaces the whole record with pass 2's own account of
+// the unload, and nothing written here would be read.
+//
+// Only for a revoked refusal. Every other refusal a mounted instance survives
+// already reads as what it is — the replacement did not load — while this one
+// reads as a statement about the plugin that is running.
+func (l *Loader) sayWhichPackageWasRevoked(name, version string, trust trustReading, cause error) error {
+	inst := l.instances[name]
+	if inst == nil || !errors.Is(cause, manifest.ErrRevokedPublisher) {
+		return cause
+	}
+	if _, endorsementRevoked := trust.withdrewTrustFrom(inst.keyID); endorsementRevoked {
+		return cause
+	}
+	return fmt.Errorf("the package this entry declares, version %s, was refused: %w; it is a REPLACEMENT, "+
+		"and version %s stays mounted under this name because its own endorsement was not withdrawn",
+		version, cause, inst.version)
 }
 
 // admit applies this deployment's policy to a package's provenance: it is where
