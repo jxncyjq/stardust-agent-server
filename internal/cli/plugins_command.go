@@ -128,6 +128,16 @@ type pluginHostDeps struct {
 	// loader to read state without ever running a task, and a registry nobody
 	// inherits from is the correct shape there.
 	PluginTools *tool.Registry
+
+	// Trustlist is the fetched trust list's Store, and it MUST be the same one
+	// the refresh loop writes through: the loader reads it on every mount (see
+	// pluginTrustSet), so a Store of its own would answer out of a cache
+	// directory nobody is refreshing.
+	//
+	// Nil is the deployment that configured no remote trust list
+	// (resolvePluginTrustlist returns nil for it), and the trust set is then
+	// the local keyring alone.
+	Trustlist *trustlist.Store
 }
 
 // assemblePlugins builds this process's plugin loader from cfg.Plugins,
@@ -332,11 +342,18 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 		return nil, errors.New("new plugin loader: Logger is nil; the signature policy would be decided with no record of it")
 	}
 
-	// The trust set, or the deliberate nil that says this deployment does not
-	// require signatures. Anything else -- a keyring that would not read, a
-	// requirement with nothing to check against -- fails here rather than
-	// mounting plugins nobody verified.
-	keyring, unenforcedKeyring, err := resolvePluginKeyring(cfg.Plugins)
+	// The keyring document this deployment configured, read once and used for
+	// two different questions below: the trust set a package's provenance is
+	// judged against (localRaw, which the policy does not reach), and the
+	// signature policy itself (keyring, which is nil exactly when the
+	// deployment does not require an endorsement). Anything else -- a keyring
+	// that would not read, a requirement with nothing to check against --
+	// fails here rather than mounting plugins nobody judged.
+	localKeyring, localRaw, err := resolvePluginLocalKeyring(cfg.Plugins)
+	if err != nil {
+		return nil, err
+	}
+	keyring, unenforcedKeyring, err := enforcedPluginKeyring(cfg.Plugins, localKeyring)
 	if err != nil {
 		return nil, err
 	}
@@ -345,12 +362,15 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 		// sentence is loader.New's to say, once, and two warnings meaning the
 		// same thing are how an operator learns to skip both. This one carries
 		// only what the assembly knows and the loader cannot -- that a trust
-		// set was configured, and which file it is.
-		logger.Warn("plugin trust keyring is configured but not enforced",
+		// set was configured, which file it is, and how much of it this policy
+		// still acts on.
+		logger.Warn("plugin trust keyring is configured while no endorsement is required",
 			"component", "cli",
 			"keyring", unenforcedKeyring,
-			"consequence", `the keys in it are loaded and then dropped, because the config says "require_signature": false`,
-			"remedy", `remove "require_signature": false to enforce the trust set that is already configured`)
+			"consequence", `a package no key in it endorses still mounts, because the config says `+
+				`"require_signature": false; the keys are still used to recognise a publisher, and a `+
+				"package signed by a key this keyring revokes is still refused",
+			"remedy", `remove "require_signature": false to also refuse packages nobody has endorsed`)
 	}
 
 	remote, err := resolvePluginRemote(cfg.Plugins)
@@ -387,16 +407,18 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 		ApplyWait:            time.Duration(cfg.Plugins.ApplyWaitMs) * time.Millisecond,
 		MaxConsecutiveFaults: cfg.Plugins.Health.MaxConsecutiveFaults,
 		LocalKeyring:         keyring,
-		// The trust set this Loader judges packages against is the local
-		// keyring alone, answered identically on every mount.
+		// The trust set is built from the keyring document this deployment
+		// configured merged with the fetched trust list, and it is built
+		// whatever the signature policy says -- see resolvePluginTrustInput for
+		// why a deployment that requires no endorsement still needs one.
 		//
-		// RequireSignature is derived from it rather than read separately
-		// because resolvePluginKeyring already collapses the two: it returns a
-		// non-nil keyring only for a deployment whose config requires a
-		// signature, and nil for one that does not. Reading
+		// RequireSignature is derived from the enforced keyring rather than
+		// read separately because enforcedPluginKeyring already collapses the
+		// two: it returns a non-nil keyring only for a deployment whose config
+		// requires an endorsement, and nil for one that does not. Reading
 		// cfg.Plugins.SignatureRequired() here as well would be a second,
 		// drifting answer to a question that function has already answered.
-		TrustSet:         func() (manifest.TrustInput, error) { return manifest.TrustInput{Keyring: keyring}, nil },
+		TrustSet:         pluginTrustSet(localRaw, deps.Trustlist, logger),
 		RequireSignature: keyring != nil,
 		Remote:           remote,
 	})
@@ -528,71 +550,183 @@ func checkRemoteSources(deployment manifest.Deployment, cfg config.PluginsConfig
 	return nil
 }
 
-// resolvePluginKeyring turns the deployment's signature POLICY into the trust
-// set the Loader will verify with, and is the only place a nil keyring may be
-// produced. Every caller that builds a loader.Config must obtain its Keyring
-// from here.
+// resolvePluginLocalKeyring reads the keyring document this deployment
+// CONFIGURED and parses it, and consults no policy at all. It returns the
+// parsed keyring together with the document's raw bytes, or (nil, nil, nil)
+// when "plugins.keyring" names no file.
 //
-// The rules, and why each one fails loudly rather than degrading:
+// Both halves are returned because each is the only way to carry one thing:
+// the parsed *sign.Keyring is the only place the revocations survive, and the
+// raw bytes are the only place the public keys survive — sign.Keyring exposes
+// no way to read a key back out, which is why trustlist.Merge takes the local
+// half as a document rather than as a keyring (see its doc comment). The raw
+// bytes returned here have always been through sign.ParseKeyring, which is the
+// obligation Merge places on its caller.
 //
-//   - A configured keyring path is always read and parsed, whatever the policy
-//     says. An unreadable or unparseable one fails assembly with the path
-//     named — the same "configured means you meant it" rule the manifest path
-//     follows. This is deliberately checked even when signatures are turned
-//     off: an operator who wrote down both a keyring and
-//     "require_signature": false wrote two contradictory things, and quietly
-//     dropping the broken file is exactly the silent degradation this whole
-//     control exists to prevent.
-//   - Signatures required (the default, see config.PluginsConfig.
-//     SignatureRequired) with NO keyring configured fails assembly. "Verify
-//     every package" with nothing to verify against is not a deployment worth
-//     starting, and the error names both ways out of it.
-//   - Signatures explicitly NOT required returns nil, and only then. nil is
-//     what tells manifest.LoadPackage to skip verification, so it must be
-//     reachable from one deliberate statement and from nothing else: not from
-//     a file that would not open, not from a forgotten field, not from an
-//     error someone decided to tolerate. A keyring that loaded fine is still
-//     dropped here — the policy, not the presence of a file, is what decides.
-//
-// The second return value is the path of a keyring that loaded successfully and
-// was then dropped by policy, or "" when there was none. It is returned rather
-// than logged here because this function has two callers with different jobs:
-// serve assembly reports it (a deployment holding a trust set it does not
-// enforce is worth a line in the log), while `plugins reload` only compares
-// policies and has nothing new to say about one that has not changed.
-func resolvePluginKeyring(cfg config.PluginsConfig) (*sign.Keyring, string, error) {
+// A configured path is always read and parsed, whatever the signature policy
+// says. An unreadable or unparseable one is an error with the path named — the
+// same "configured means you meant it" rule the manifest path follows. That
+// holds even when signatures are turned off: an operator who wrote down both a
+// keyring and "require_signature": false wrote two contradictory things, and
+// quietly dropping the broken file is exactly the silent degradation this whole
+// control exists to prevent.
+func resolvePluginLocalKeyring(cfg config.PluginsConfig) (*sign.Keyring, json.RawMessage, error) {
 	path := strings.TrimSpace(cfg.Keyring)
-	var keyring *sign.Keyring
-	if path != "" {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil, "", fmt.Errorf("read plugin trust keyring %q: %w", path, err)
-		}
-		keyring, err = sign.ParseKeyring(data)
-		if err != nil {
-			return nil, "", fmt.Errorf("parse plugin trust keyring %q: %w", path, err)
-		}
-		if keyring == nil {
-			// sign.ParseKeyring's contract is a non-nil keyring on a nil
-			// error. A nil here would travel on as "no keyring is configured"
-			// for a deployment that configured one, so it is an invariant
-			// violation rather than a case to handle.
-			panic("cli: sign.ParseKeyring returned a nil keyring and a nil error")
-		}
+	if path == "" {
+		return nil, nil, nil
 	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read plugin trust keyring %q: %w", path, err)
+	}
+	keyring, err := sign.ParseKeyring(data)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse plugin trust keyring %q: %w", path, err)
+	}
+	if keyring == nil {
+		// sign.ParseKeyring's contract is a non-nil keyring on a nil error. A
+		// nil here would travel on as "no keyring is configured" for a
+		// deployment that configured one, so it is an invariant violation
+		// rather than a case to handle.
+		panic("cli: sign.ParseKeyring returned a nil keyring and a nil error")
+	}
+	return keyring, json.RawMessage(data), nil
+}
+
+// enforcedPluginKeyring applies the deployment's signature POLICY to a keyring
+// resolvePluginLocalKeyring already read, and is the only place a nil keyring
+// may be produced for a deployment that configured one.
+//
+// What "enforced" means here is narrow, and narrower than it used to be: this
+// is the keyring reported through loader.SignaturePolicy and the one
+// loader.Config.RequireSignature is derived from — the answer to "does an
+// unendorsed package need an install-time acceptance". It is NOT the trust set
+// a package's provenance is judged against; that one is built by
+// pluginTrustSet, which does not consult the policy at all.
+//
+// The two rules:
+//
+//   - Signatures required (the default, see config.PluginsConfig.
+//     SignatureRequired) with NO keyring configured is an error. "Refuse every
+//     package no registered publisher endorses" with no registered publishers
+//     to speak of is not a deployment worth starting, and the error names both
+//     ways out of it.
+//   - Signatures explicitly NOT required returns nil, and only then. nil is a
+//     deliberate policy statement, so it must be reachable from one deliberate
+//     sentence in the config and from nothing else: not from a file that would
+//     not open, not from a forgotten field, not from an error someone decided
+//     to tolerate.
+//
+// The second return value is the path of a keyring that is configured while the
+// policy does not require an endorsement, or "" when there is none. It is
+// returned rather than logged here because this function has two callers with
+// different jobs: serve assembly reports it (see newPluginLoader for what that
+// deployment still does and no longer does), while `plugins reload` only
+// compares policies and has nothing new to say about one that has not changed.
+func enforcedPluginKeyring(cfg config.PluginsConfig, local *sign.Keyring) (*sign.Keyring, string, error) {
 	if !cfg.SignatureRequired() {
 		unenforced := ""
-		if keyring != nil {
-			unenforced = path
+		if local != nil {
+			unenforced = strings.TrimSpace(cfg.Keyring)
 		}
 		return nil, unenforced, nil
 	}
-	if keyring == nil {
+	if local == nil {
 		return nil, "", fmt.Errorf("plugins.keyring is not configured while plugin signatures are required: "+
 			"either configure a keyring of trusted public keys, or turn the requirement off explicitly with "+
 			`"require_signature": false in the plugins config (manifest %q)`, cfg.Manifest)
 	}
-	return keyring, "", nil
+	return local, "", nil
+}
+
+// resolvePluginKeyring is resolvePluginLocalKeyring followed by
+// enforcedPluginKeyring: the keyring this deployment's signature POLICY keeps.
+// Every caller that fills loader.Config.LocalKeyring, or compares a signature
+// policy, must obtain its keyring from here.
+//
+// A caller that also needs the trust set a package is judged against calls the
+// two halves itself, so that the keyring document is read from disk exactly
+// once (newPluginLoader and runPluginsInstall both do).
+func resolvePluginKeyring(cfg config.PluginsConfig) (*sign.Keyring, string, error) {
+	local, _, err := resolvePluginLocalKeyring(cfg)
+	if err != nil {
+		return nil, "", err
+	}
+	return enforcedPluginKeyring(cfg, local)
+}
+
+// resolvePluginTrustInput assembles the trust set a plugin package's provenance
+// is judged against: the local keyring document merged with whatever the
+// fetched trust list currently holds (trustlist.Merge).
+//
+// It does NOT consult "require_signature". That switch answers one question —
+// may a package no registered publisher endorses mount — and it is answered
+// against this set, not instead of it. Building the set for a deployment that
+// answers "yes" is not that switch being quietly turned back on: an unsigned
+// package still mounts (see loader.Loader.admit), and all the set adds is that
+// a package CAN come out ProvenanceRegistered or ProvenanceRevoked at all. The
+// second of those is the point — refusing a revoked key is what the graded
+// install spec requires unconditionally, and "I do not require an endorsement"
+// is not the same sentence as "I am willing to run code that was withdrawn".
+// Resolving the keyring only when the policy required one is what left that
+// refusal unreachable for every deployment with the switch off.
+//
+// store may be nil, which is the deployment that configured no remote trust
+// list; the merge then has only the local half.
+//
+// reportUnavailable receives the error from a trust list whose cache cannot be
+// read, and must not be nil. Store.Current returns a usable Trust AND an error
+// in that case (see its doc comment): the Trust is StatusUnavailable, which is
+// the contract's own "safe to use, the list half is empty" state. Propagating
+// the error instead would fail every mount on a machine that has simply not
+// completed its first fetch yet, and dropping it would be the silent
+// degradation the fail-loud rule forbids — so the list half is taken as
+// unavailable and the error is handed to the caller to record. Both callers do
+// record it: serve logs it at Warn, install prints it above its own result.
+func resolvePluginTrustInput(localRaw json.RawMessage, store *trustlist.Store,
+	reportUnavailable func(error)) (manifest.TrustInput, error) {
+	var listed trustlist.Trust
+	if store != nil {
+		current, err := store.Current()
+		if err != nil {
+			reportUnavailable(err)
+		}
+		listed = current
+	}
+	merged, publishers, err := trustlist.Merge(localRaw, listed)
+	if err != nil {
+		return manifest.TrustInput{}, fmt.Errorf("assemble the plugin trust set: %w", err)
+	}
+	return manifest.TrustInput{Keyring: merged, Publishers: publishers}, nil
+}
+
+// pluginTrustlistUnavailableMsg is what a mount logs when the trust list half
+// of the trust set cannot be read. It is a constant because a message is what
+// an operator greps for, and because a test that spelled it out a second time
+// could go on passing while the line an operator searches for changed.
+const pluginTrustlistUnavailableMsg = "plugin trust list is unavailable; only the local keyring is in force"
+
+// pluginTrustSet is the provider a Loader reads its trust set from on every
+// mount.
+//
+// The local half is resolved once, at assembly, because it is configuration:
+// changing it is a config change, and `agent plugins reload` refuses to
+// converge across one (see loader.SignaturePolicy). The list half is read on
+// every call, because it refreshes underneath this process — that is the whole
+// reason loader.TrustSet is a function rather than a value.
+//
+// logger must be non-nil: a trust list this process cannot read is exactly the
+// thing that must not pass unrecorded.
+func pluginTrustSet(localRaw json.RawMessage, store *trustlist.Store, logger *slog.Logger) loader.TrustSet {
+	return func() (manifest.TrustInput, error) {
+		return resolvePluginTrustInput(localRaw, store, func(err error) {
+			logger.Warn(pluginTrustlistUnavailableMsg,
+				"component", "cli",
+				"error", err,
+				"consequence", "a key the list registers is unrecognised, and a revocation the list "+
+					"carries is not applied, until a refresh succeeds")
+		})
+	}
 }
 
 // The messages the trustlist refresh loop logs. Each is a constant because a

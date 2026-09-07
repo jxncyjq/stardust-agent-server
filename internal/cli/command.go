@@ -2801,6 +2801,31 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	pluginToolRoot := cfg.ContextFiles.Root
 	pluginTools := tool.NewFileReadWriteWorkspaceRegistry(pluginToolRoot, auditLog,
 		tool.WithProjectRoot(pluginToolRoot))
+	// The remote trustlist is the other half of the question the local keyring
+	// answers -- what does this deployment trust -- so it is resolved here,
+	// beside it, rather than somewhere an operator would have to look for
+	// separately. A configured trustlist that cannot be built stops startup
+	// (see resolvePluginTrustlist); an unconfigured one yields no Store and no
+	// loop.
+	//
+	// It is resolved BEFORE assemblePlugins because the loader reads this same
+	// Store on every mount (pluginHostDeps.Trustlist -> pluginTrustSet): a
+	// Store built after the assembly could only have reached the loader as a
+	// second one, answering out of the same cache directory while the refresh
+	// loop wrote through the first.
+	//
+	// It is resolved OUTSIDE any "are plugins configured" branch, and so runs
+	// even when this deployment configured no plugins.manifest, which mirrors
+	// config.Load: validatePlugins checks the trustlist section before its
+	// "no manifest means plugins are off" early return, on the reasoning that
+	// fetching a remote trustlist and loading local plugins are separate
+	// questions.
+	trustStore, trustlistRefreshInterval, err := resolvePluginTrustlist(cfg.Plugins)
+	if err != nil {
+		// Nothing is mounted yet, so there is no plugin state to unwind.
+		closeStore()
+		return ServeResult{}, err
+	}
 	if err := assemblePlugins(ctx, pluginApp, cfg, pluginHostDeps{
 		Audit:          auditLog,
 		Events:         workflowEvents,
@@ -2808,6 +2833,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		Gate:           taskGate,
 		PromptSegments: pluginPromptSegments,
 		PluginTools:    pluginTools,
+		Trustlist:      trustStore,
 	}); err != nil {
 		// Nothing is mounted on this path: assemblePlugins only returns an error
 		// before it converges anything, so there is no plugin state to unwind.
@@ -2855,24 +2881,8 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		pluginConsent = NewPluginConsentService(cfg.Plugins.Manifest, cfg.Plugins.Root, pluginApp.Plugins,
 			func() *sign.Keyring { return pluginKeyring }, pluginRemote, logger)
 	}
-	// The remote trustlist is the other half of the question the keyring
-	// answers -- what does this deployment trust -- so it is resolved here,
-	// beside it, rather than somewhere an operator would have to look for
-	// separately. A configured trustlist that cannot be built stops startup
-	// (see resolvePluginTrustlist); an unconfigured one yields no Store and no
-	// loop.
-	//
-	// It is resolved OUTSIDE the plugin-consent branch above, and so runs even
-	// when this deployment configured no plugins.manifest, which mirrors
-	// config.Load: validatePlugins checks the trustlist section before its
-	// "no manifest means plugins are off" early return, on the reasoning that
-	// fetching a remote trustlist and loading local plugins are separate
-	// questions.
-	trustStore, trustlistRefreshInterval, err := resolvePluginTrustlist(cfg.Plugins)
-	if err != nil {
-		cleanup()
-		return ServeResult{}, err
-	}
+	// The trustlist Store was resolved above, before the plugin assembly that
+	// reads it; only its refresh loop is started here.
 	if trustStore != nil {
 		// Its own goroutine and its own ticker, for two reasons: the first
 		// fetch must not block startup (a network failure at start must not

@@ -2004,22 +2004,25 @@ func TestPluginsReloadConvergesWhenTheSignaturePolicyIsUnchanged(t *testing.T) {
 	}
 }
 
-// TestAssemblePluginsDropsALoadedKeyringWhenSignaturesAreExplicitlyOff is the
-// a5a-task-3 review's Minor #3: the branch where a keyring loads FINE and is
-// then discarded by policy had no test at all -- the three "off" tests either
-// configured no keyring or one that would not read. A valid keyring plus an
-// unsigned package is what tells the two apart: if the keyring were kept, this
-// package could not mount.
+// TestAnUnsignedPackageStillMountsWithAKeyringConfiguredAndSignaturesOff is the
+// a5a-task-3 review's Minor #3: the branch where a keyring loads FINE while the
+// policy requires no endorsement had no test at all -- the three "off" tests
+// either configured no keyring or one that would not read. A valid keyring plus
+// an unsigned package is what exercises it: an unsigned package mounts here
+// because "require_signature": false says an endorsement is not required, and
+// for no other reason. The keyring itself is NOT discarded (see
+// resolvePluginTrustInput) -- what it still decides is covered by
+// TestAssemblePluginsRefusesARevokedKeyEvenWithSignaturesOff.
 //
 // It also pins Minor #4: exactly one line in a startup log says this deployment
-// verifies nothing. The cli's warning carries only what the cli knows (a trust
-// set is configured, and which file), because two warnings meaning the same
-// thing teach an operator to skip both.
-func TestAssemblePluginsDropsALoadedKeyringWhenSignaturesAreExplicitlyOff(t *testing.T) {
+// requires no endorsement. The cli's warning carries only what the cli knows (a
+// trust set is configured, and which file), because two warnings meaning the
+// same thing teach an operator to skip both.
+func TestAnUnsignedPackageStillMountsWithAKeyringConfiguredAndSignaturesOff(t *testing.T) {
 	f := newPluginFixture(t, 30_000)
 	_, keyringPath := f.newKeyring("keyring.json")
 	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(false)})
-	// Written and never signed: it mounts only if the keyring was truly dropped.
+	// Written and never signed: it mounts only if an endorsement is truly not required.
 	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
 	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
 
@@ -2028,13 +2031,22 @@ func TestAssemblePluginsDropsALoadedKeyringWhenSignaturesAreExplicitlyOff(t *tes
 		t.Fatalf("assemblePlugins() error = %v, want nil: a valid keyring plus an explicit off is a legal deployment", err)
 	}
 	if !toolauth.IsGateable(testEchoTool) {
-		t.Fatalf("IsGateable(%q) = false, want true: an unsigned package mounting is what proves the keyring was discarded",
+		t.Fatalf("IsGateable(%q) = false, want true: an unsigned package mounting is what proves the switch switched",
 			testEchoTool)
 	}
 
 	log := logs.String()
-	if !strings.Contains(log, "plugin trust keyring is configured but not enforced") {
-		t.Errorf("startup log = %q, want the cli to report the trust set it loaded and dropped", log)
+	if !strings.Contains(log, "plugin trust keyring is configured while no endorsement is required") {
+		t.Errorf("startup log = %q, want the cli to report the trust set it loaded and what this policy does with it", log)
+	}
+	// The warning has to say BOTH halves, or it re-tells the old story in which
+	// the keys were loaded and dropped: an unendorsed package still mounts, and
+	// a revoked key is still refused.
+	if !strings.Contains(log, "still mounts") {
+		t.Errorf("startup log = %q, want the warning to say an unendorsed package still mounts under this policy", log)
+	}
+	if !strings.Contains(log, "revokes is still refused") {
+		t.Errorf("startup log = %q, want the warning to say a revoked key is still refused under this policy", log)
 	}
 	if !strings.Contains(log, "keyring.json") {
 		t.Errorf("startup log = %q, want it to name the keyring file that is not being enforced", log)
@@ -2044,6 +2056,60 @@ func TestAssemblePluginsDropsALoadedKeyringWhenSignaturesAreExplicitlyOff(t *tes
 		t.Errorf("startup log says %q %d times, want exactly 1 (the loader's): a second warning saying the same thing "+
 			"is how an operator learns to ignore both.\nlog = %q", loaderWarning, got, log)
 	}
+}
+
+// TestAssemblePluginsRefusesARevokedKeyEvenWithSignaturesOff closes I2, and it
+// runs through the REAL assembly path -- newPluginFixture -> assemble ->
+// newPluginLoader -> the TrustSet closure that assembly builds -- rather than
+// handing a manifest.TrustInput to a loader harness.
+//
+// That distinction is the whole test. The loader's own policy table already has
+// two Revoked cases, and both inject a TrustInput directly; the one segment
+// that could lose it is the assembly, which used to resolve the trust set
+// through the SIGNATURE POLICY and so produced no trust set at all for a
+// deployment with "require_signature": false. A package signed by a revoked key
+// then came back ProvenanceUnsigned -- there were no keys to place its
+// signature against -- and mounted. "require_signature: false does not reach a
+// revocation" was true of the Loader and false of the deployment.
+//
+// The keyring registers a second, unrelated key on purpose: sign.ParseKeyring
+// refuses a document whose every registered key is revoked, so a one-key
+// keyring would fail to parse and this test would pass for the wrong reason.
+func TestAssemblePluginsRefusesARevokedKeyEvenWithSignaturesOff(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+
+	signingPub, signingPriv, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	sparePub, _, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	keyringPath := filepath.Join(f.dir, "keyring.json")
+	writeKeyringDoc(t, keyringPath, []map[string]string{
+		{"id": string(testPluginKeyID), "algorithm": "ed25519",
+			"public_key": base64.StdEncoding.EncodeToString(signingPub)},
+		{"id": "spare", "algorithm": "ed25519",
+			"public_key": base64.StdEncoding.EncodeToString(sparePub)},
+	}, []map[string]string{{"key_id": string(testPluginKeyID), "reason": "laptop stolen"}})
+
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(false)})
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.signPackage("echo", signingPriv)
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+
+	// One refused entry is not a refused startup: the deployment comes up and
+	// reports the entry as failed, the same as any other activation failure.
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil: one refused entry must not stop startup", err)
+	}
+	if toolauth.IsGateable(testEchoTool) {
+		t.Fatalf("IsGateable(%q) = true, want false: a package signed by a revoked key must not mount, and "+
+			`"require_signature": false is not a statement about revoked keys`, testEchoTool)
+	}
+	f.requireStatusExplains("after a revoked-key package was refused", "revoked")
+	f.requireStatusExplains("after a revoked-key package was refused", string(testPluginKeyID))
 }
 
 // TestAssemblePluginsFailsWhenTheKeyringPathIsADirectory is the a5a-task-3
@@ -5987,6 +6053,59 @@ func TestServeDoesNotWaitForTheFirstTrustlistFetch(t *testing.T) {
 	if waited := time.Since(started); waited > 10*time.Second {
 		t.Errorf("BuildServeService took %s with an unanswering trustlist host: the first fetch is being "+
 			"awaited, so an agent cannot start while the trustlist host is unreachable", waited)
+	}
+}
+
+// TestServeGivesThePluginLoaderTheTrustlistItRefreshes pins the FOURTH half of
+// the serve wiring, and it is the one that had nothing watching it: the Store
+// serve resolves reaches the plugin LOADER too, not only the refresh loop.
+//
+// The two halves are wired in different places and neither implies the other. A
+// serve that started the loop and handed the loader no Store would refresh a
+// trust list into a cache directory that nothing judging a package ever reads:
+// every revocation published after startup would land on disk and change
+// nothing. That is invisible from the loop's own logs, which report perfectly
+// successful rounds either way.
+//
+// It is observable here because the trustlist cache is EMPTY -- no list has
+// ever been fetched -- so Store.Current answers "unavailable" plus an error,
+// and the mount records that error. A loader holding no Store never asks, and
+// so never writes that line. The url is the never-resolving one: the mount's
+// read is of the cache alone, and the refresh loop's own round failing in the
+// background is a different message.
+func TestServeGivesThePluginLoaderTheTrustlistItRefreshes(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	cacheDir := filepath.Join(f.dir, "trustlist-cache")
+	f.writeSignatureConfig(30_000, signaturePolicy{requireSignature: boolPtr(false)},
+		fmt.Sprintf(`"trustlist": {"url": %s, "cache": %s, "refresh_interval_ms": 3600000}`,
+			jsonString(trustlistNeverFetchedURL), jsonString(cacheDir)))
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	logs := &capturedLogs{}
+	result, err := BuildServeService(ctx, ServeOptions{
+		ConfigPath: f.configPath,
+		Addr:       "127.0.0.1:0",
+		Logger:     slog.New(logs),
+		App:        f.application,
+	})
+	if err != nil {
+		t.Fatalf("BuildServeService() error = %v, want nil", err)
+	}
+	t.Cleanup(result.Close)
+
+	// The mount itself must still have happened: a trust list nobody could read
+	// is not a reason to refuse a package under a policy that requires no
+	// endorsement, and a test that passed on an assembly which mounted nothing
+	// would be asserting the wrong thing entirely.
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Fatalf("IsGateable(%q) = false after serve assembly, want true", testEchoTool)
+	}
+	if _, ok := logs.find(pluginTrustlistUnavailableMsg); !ok {
+		t.Errorf("startup log has no %q record: the plugin loader was handed no trustlist Store, so a "+
+			"revocation published to the list this serve refreshes would never reach a mount", pluginTrustlistUnavailableMsg)
 	}
 }
 
