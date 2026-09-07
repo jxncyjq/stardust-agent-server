@@ -82,18 +82,43 @@ type Task struct {
 	Images []string `json:"images,omitempty"`
 }
 
+// StopReason says why a task's tool loop stopped. It is recorded at the one
+// place a successful TaskRun is assembled, so every finished run carries one.
+//
+// The empty string is NOT a reason: it means nobody set one, which is a
+// programming error rather than a kind of ending. It must never be read as
+// StopReasonCompleted — a run that stopped for an unrecorded reason is
+// indistinguishable from one that finished, and that is exactly the confusion
+// this type exists to remove.
+type StopReason string
+
+const (
+	// StopReasonCompleted is the model answering with no pending tool calls.
+	StopReasonCompleted StopReason = "completed"
+	// StopReasonMaxRounds is the round budget running out with calls still pending.
+	StopReasonMaxRounds StopReason = "max_rounds"
+	// StopReasonToolLoopCap is one tool NAME exhausting its per-task allowance.
+	StopReasonToolLoopCap StopReason = "tool_loop_cap"
+	// StopReasonRepeatLoopBroken is the model repeating one identical call until
+	// the repeat guard cut the loop.
+	StopReasonRepeatLoopBroken StopReason = "repeat_loop_broken"
+)
+
 type TaskRun struct {
-	ID               string    `json:"id"`
-	TaskID           string    `json:"task_id"`
-	AgentID          string    `json:"agent_id"`
-	StartedAt        time.Time `json:"started_at"`
-	EndedAt          time.Time `json:"ended_at"`
-	Result           string    `json:"result"`
-	ReasoningSummary string    `json:"reasoning_summary,omitempty"`
-	PromptTokens     int       `json:"prompt_tokens,omitempty"`
-	CompletionTokens int       `json:"completion_tokens,omitempty"`
-	CachedTokens     int       `json:"cached_tokens,omitempty"`
-	TotalTokens      int       `json:"total_tokens,omitempty"`
+	ID        string    `json:"id"`
+	TaskID    string    `json:"task_id"`
+	AgentID   string    `json:"agent_id"`
+	StartedAt time.Time `json:"started_at"`
+	EndedAt   time.Time `json:"ended_at"`
+	Result    string    `json:"result"`
+	// StopReason is why this run's tool loop stopped. Always set on a run that
+	// was assembled successfully; see StopReason for why empty is not a value.
+	StopReason       StopReason `json:"stop_reason,omitempty"`
+	ReasoningSummary string     `json:"reasoning_summary,omitempty"`
+	PromptTokens     int        `json:"prompt_tokens,omitempty"`
+	CompletionTokens int        `json:"completion_tokens,omitempty"`
+	CachedTokens     int        `json:"cached_tokens,omitempty"`
+	TotalTokens      int        `json:"total_tokens,omitempty"`
 	// GeneratedFiles are workspace-relative paths of files the task produced via
 	// write_file. Empty when the task wrote no files.
 	GeneratedFiles []string `json:"generated_files,omitempty"`

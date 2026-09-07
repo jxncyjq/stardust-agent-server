@@ -255,6 +255,11 @@ type loopState struct {
 	started    time.Time
 	basePrompt string
 	round      int
+	// stopReason is why the tool loop ended. It is set at each of the loop's
+	// terminal points and read by finishRun, alongside the token counters that
+	// accumulate the same way. It replaced a loopCut bool that could only tell
+	// "the model repeated itself" from "everything else".
+	stopReason domain.StopReason
 	// convo is the append-only multi-turn exchange sent to the model each round
 	// (see messages.go). It replaced a single re-sent prompt string whose tool
 	// results were deduplicated by (name, arguments), which hid the model's own
@@ -900,10 +905,6 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 	// call, so the exchange the model sees grows monotonically and its repeated
 	// calls stay visible to it.
 	//
-	// loopCut records that the loop ended because the model kept repeating one
-	// call rather than because it ran out of rounds; the two need different
-	// closing instructions.
-	loopCut := false
 	// stepOpen tracks whether a step is currently open -- a step/start with no
 	// step/end yet. On entry one always is: whoever produced st.resp (RunTask's
 	// initial generateStep, the resumed step, or an earlier iteration's
@@ -1061,7 +1062,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 			}
 			r.logger.Warn("tool loop broken: per-tool call cap reached",
 				"task_id", task.ID, "tool", capHit, "cap", toolLoopCap)
-			loopCut = true
+			st.stopReason = domain.StopReasonToolLoopCap
 			break
 		}
 		if streak >= repeatAbortStreak || repeatCount >= repeatAbortCount {
@@ -1085,7 +1086,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 			}
 			r.logger.Warn("tool loop broken: identical call repeated",
 				"task_id", task.ID, "streak", streak, "repeat_count", repeatCount, "calls", callsKey(calls))
-			loopCut = true
+			st.stopReason = domain.StopReasonRepeatLoopBroken
 			break
 		}
 		if streak >= repeatWarnStreak || repeatCount >= repeatWarnCount {
@@ -1118,7 +1119,19 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 			}
 		}
 	}
+	// loopCut mirrors, for the closing-message choice below, exactly the two
+	// break points above that set st.stopReason before reaching here: true
+	// when the loop broke on the per-tool-name cap or the repeat guard, false
+	// for a plain round-budget exhaustion. This is the same distinction the
+	// removed loopCut bool tracked, now read off st.stopReason instead of a
+	// separate variable.
+	loopCut := st.stopReason == domain.StopReasonToolLoopCap || st.stopReason == domain.StopReasonRepeatLoopBroken
 	if len(st.resp.ToolCalls) > 0 {
+		// Both breaks above and a plain round-budget exhaustion arrive here.
+		// The breaks already named their reason; an unnamed one is the budget.
+		if st.stopReason == "" {
+			st.stopReason = domain.StopReasonMaxRounds
+		}
 		// Two different situations reach here with pending calls, and only one
 		// of them has a step to close.
 		//
@@ -1167,6 +1180,9 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		st.cachedTokens += final.CachedTokens
 		st.totalTokens += final.TotalTokens
 		st.resp = final
+	} else {
+		// The loop ended with nothing pending: the model gave its answer.
+		st.stopReason = domain.StopReasonCompleted
 	}
 	// Whatever step is currently open at this point -- the loop's normal-exit
 	// trailing response (no more tool calls requested), the step this function
@@ -1269,6 +1285,7 @@ func (r *Runtime) finishRun(ctx context.Context, requestID string, agent domain.
 		StartedAt:        st.started,
 		EndedAt:          ended,
 		Result:           st.resp.Text,
+		StopReason:       st.stopReason,
 		ReasoningSummary: st.resp.ReasoningSummary,
 		PromptTokens:     st.promptTokens,
 		CompletionTokens: st.completionTokens,
