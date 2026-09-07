@@ -1928,13 +1928,25 @@ func TestE2ESignedDeploymentKeepsServingTheVerifiedInstanceThroughEveryTamper(t 
 	if err == nil {
 		t.Fatal("Apply() error = nil for a package signed by an untrusted key, want a refusal")
 	}
-	if !strings.Contains(err.Error(), string(rogueKeyID)) {
-		t.Errorf("Apply() error = %v, want it to name the key id the signature was made with", err)
+	// The refusal does NOT name the rogue key id, and that is a decision rather
+	// than an omission: manifest.Provenance.KeyID is filled in only for a key
+	// this machine recognises, so a signature made by an unknown one arrives
+	// with no id attached at all — printing it would hand the reader an
+	// attacker-chosen string dressed up as something this deployment knows.
+	// What the refusal must carry instead is the file to go and read and the
+	// keys an endorsement would have had to come from, which is what an
+	// operator acts on.
+	if !errors.Is(err, manifest.ErrUnsignedNotAccepted) {
+		t.Errorf("Apply() error = %v, want it to wrap manifest.ErrUnsignedNotAccepted: no registered "+
+			"publisher endorses this package any more", err)
+	}
+	if !strings.Contains(err.Error(), "plugin.sig") {
+		t.Errorf("Apply() error = %v, want it to name the file whose signature this deployment could not place", err)
 	}
 	if !strings.Contains(err.Error(), string(testKeyID)) {
 		t.Errorf("Apply() error = %v, want it to name the keys this deployment does trust", err)
 	}
-	h.requireEchoFailureSays("after the untrusted signature was refused", string(rogueKeyID))
+	h.requireEchoFailureSays("after the untrusted signature was refused", string(testKeyID))
 	h.requireRefusedConvergenceLeftEverythingAlone(ctx, "after the untrusted signature was refused")
 
 	// Round 4 (Apply 5 of 5): the control, and the regression test for the

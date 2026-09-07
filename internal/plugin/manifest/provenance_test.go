@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stardust/legion-agent/internal/plugin/sign"
 )
@@ -308,5 +309,73 @@ func TestProvenanceStateString(t *testing.T) {
 		if got := c.state.String(); got != c.want {
 			t.Errorf("ProvenanceState(%d).String() = %q, want %q", int(c.state), got, c.want)
 		}
+	}
+}
+
+// TestManifestDigestHashesTheBytesOnDisk：摘要必须是 plugin.json 磁盘字节的
+// sha256，而不是任何一次「解码再编码」的结果——一份会因为字段顺序变化而变化的
+// 摘要，会对没人动过的包报警。格式也一并钉住：它要与 Entry.AcceptedUnsigned
+// 完全一致，否则一份存下来的确认永远读不回。
+func TestManifestDigestHashesTheBytesOnDisk(t *testing.T) {
+	dir := provenancePackageDir(t, nil, "")
+	raw, err := os.ReadFile(filepath.Join(dir, "plugin.json"))
+	if err != nil {
+		t.Fatalf("read plugin.json: %v", err)
+	}
+	sum := sha256.Sum256(raw)
+	want := "sha256:" + hex.EncodeToString(sum[:])
+
+	got, err := ManifestDigest(dir)
+	if err != nil {
+		t.Fatalf("ManifestDigest: %v", err)
+	}
+	if got != want {
+		t.Errorf("ManifestDigest = %q, want %q", got, want)
+	}
+	if !digestPattern.MatchString(got) {
+		t.Errorf("ManifestDigest = %q，不符合 Entry.AcceptedUnsigned 的形状（digestPattern）", got)
+	}
+}
+
+// TestManifestDigestReportsAMissingManifest：读不到就报错，绝不回落成空串。
+// 一个空摘要会与「从没人认过」撞在一起，把一次读盘失败变成一句「去认一下这个
+// 包」——那是对着错误的问题给出的补救。
+func TestManifestDigestReportsAMissingManifest(t *testing.T) {
+	dir := t.TempDir()
+
+	got, err := ManifestDigest(dir)
+	if err == nil {
+		t.Fatalf("ManifestDigest = %q, error = nil，want 一个错误：目录里没有 plugin.json", got)
+	}
+	if got != "" {
+		t.Errorf("ManifestDigest 出错时返回了 %q，want 空串", got)
+	}
+	if !strings.Contains(err.Error(), "plugin.json") {
+		t.Errorf("ManifestDigest error = %v, want 它指出读的是哪个文件", err)
+	}
+}
+
+// TestDescribeRevocation：撤销记录里的两个字段都是可选的，四种组合各有一种读法，
+// 两个都没有时返回空串——那不是兜底，是「操作者什么都没写下来」这个合法状态，
+// 而它被附加到的那句话本身已经说清了 key 被撤销了。
+func TestDescribeRevocation(t *testing.T) {
+	at := time.Date(2026, 8, 29, 10, 0, 0, 0, time.UTC)
+	cases := []struct {
+		name string
+		prov Provenance
+		want string
+	}{
+		{name: "both", prov: Provenance{RevokedAt: at, Reason: "laptop stolen"},
+			want: " at 2026-08-29T10:00:00Z (laptop stolen)"},
+		{name: "time only", prov: Provenance{RevokedAt: at}, want: " at 2026-08-29T10:00:00Z"},
+		{name: "reason only", prov: Provenance{Reason: "laptop stolen"}, want: " (laptop stolen)"},
+		{name: "neither", prov: Provenance{}, want: ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := DescribeRevocation(c.prov); got != c.want {
+				t.Errorf("DescribeRevocation = %q, want %q", got, c.want)
+			}
+		})
 	}
 }

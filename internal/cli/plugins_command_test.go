@@ -2039,9 +2039,10 @@ func TestAssemblePluginsDropsALoadedKeyringWhenSignaturesAreExplicitlyOff(t *tes
 	if !strings.Contains(log, "keyring.json") {
 		t.Errorf("startup log = %q, want it to name the keyring file that is not being enforced", log)
 	}
-	if got := strings.Count(log, "signature verification is"); got != 1 {
+	const loaderWarning = "does not require a publisher endorsement"
+	if got := strings.Count(log, loaderWarning); got != 1 {
 		t.Errorf("startup log says %q %d times, want exactly 1 (the loader's): a second warning saying the same thing "+
-			"is how an operator learns to ignore both.\nlog = %q", "signature verification is", got, log)
+			"is how an operator learns to ignore both.\nlog = %q", loaderWarning, got, log)
 	}
 }
 
@@ -2887,7 +2888,8 @@ func (f *pluginFixture) requireStatusExplains(when, want string) {
 //	point plugins.json at them -> serve assembly mounts them ->
 //	  flip one byte of plugin.wasm            -> reload refused on the sha256
 //	  edit plugin.json, keep the digest right -> reload refused on the signature
-//	  re-sign with a key the keyring lacks    -> reload refused by key id
+//	  re-sign with a key the keyring lacks    -> reload refused: nobody this
+//	                                             deployment knows endorses it
 //	  re-sign with the trusted key            -> reload converges again
 //
 // The signature policy is never written down: require_signature is left out of
@@ -2992,13 +2994,20 @@ func TestSignedDeploymentAcceptanceFromKeygenThroughEveryTamper(t *testing.T) {
 	if err == nil {
 		t.Fatal("plugins reload error = nil for a package signed by an untrusted key, want a refusal")
 	}
-	if !strings.Contains(err.Error(), "rogue-2026") {
-		t.Errorf("plugins reload error = %v, want it to name the key id the signature was made with", err)
+	// The refusal does NOT name rogue-2026, and that is a decision rather than
+	// an omission: manifest.Provenance.KeyID is filled in only for a key this
+	// machine recognises, so a signature made by an unknown one arrives with no
+	// id attached at all — printing it would hand the reader an
+	// attacker-chosen string dressed up as something this deployment knows.
+	// What an operator acts on is the file to go and read and the key an
+	// endorsement would have had to come from, and both are here.
+	if !strings.Contains(err.Error(), "plugin.sig") {
+		t.Errorf("plugins reload error = %v, want it to name the file whose signature could not be placed", err)
 	}
 	if !strings.Contains(err.Error(), "ops-2026") {
 		t.Errorf("plugins reload error = %v, want it to name the key this deployment does trust", err)
 	}
-	f.requireStatusExplains("after the untrusted signature was refused", "rogue-2026")
+	f.requireStatusExplains("after the untrusted signature was refused", "ops-2026")
 	f.requireBothPluginsStillMounted("after the untrusted signature was refused", "1.2.0")
 
 	// Convergence 5 of 5: the control. Re-signed by the trusted key, with

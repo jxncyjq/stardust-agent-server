@@ -549,6 +549,7 @@ func baseTestConfig(remote RemoteConfig) Config {
 		Gate:                 taskgate.NewTaskGate(),
 		ApplyWait:            defaultTestApplyWait,
 		MaxConsecutiveFaults: defaultTestMaxFaults,
+		TrustSet:             noTrustSet,
 		Remote:               remote,
 	}
 }

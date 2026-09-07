@@ -1,6 +1,8 @@
 package manifest
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
@@ -129,6 +131,55 @@ type TrustInput struct {
 	// verdict, and a missing one costs a reader some context but changes no
 	// decision.
 	Publishers map[sign.KeyID]string
+}
+
+// ManifestDigest returns the digest of dir/plugin.json's raw bytes, in the
+// exact format Entry.AcceptedUnsigned is held to: the literal "sha256:"
+// followed by 64 lowercase hex digits (digestPattern).
+//
+// It hashes the bytes as they are on disk rather than a re-encoded manifest,
+// for the same reason assessProvenance verifies a signature over the raw bytes:
+// a decode-then-re-encode round trip is only stable if both sides agree on a
+// byte-identical JSON encoding, and an acceptance that moved when a field was
+// reordered would alarm about a package nobody changed.
+//
+// Hashing plugin.json is enough to pin the code that will run, because
+// plugin.json carries plugin.wasm's sha256 and LoadPackage compares the wasm
+// bytes against that declared digest on every load.
+func ManifestDigest(dir string) (string, error) {
+	path := filepath.Join(dir, "plugin.json")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("digest plugin manifest %q: %w", path, err)
+	}
+	sum := sha256.Sum256(data)
+	return "sha256:" + hex.EncodeToString(sum[:]), nil
+}
+
+// DescribeRevocation renders what an operator wrote down about a revocation, as
+// a phrase meant to be appended to a sentence that has already said the key was
+// revoked — " at 2026-08-29T10:00:00Z (laptop stolen)", or the empty string
+// when the record carries neither.
+//
+// The empty string is not a fallback: Provenance.Reason and Provenance.RevokedAt
+// are both optional in a revocation record (see sign.Revocation), so a record
+// with neither is a legitimate one, and the sentence it is appended to still
+// says everything a refusal must say.
+//
+// It is a function here rather than a rendering each refusal writes for itself
+// so that every refusal about a revoked key reads the same, whether it comes
+// from a convergence or from an install.
+func DescribeRevocation(prov Provenance) string {
+	switch {
+	case !prov.RevokedAt.IsZero() && prov.Reason != "":
+		return fmt.Sprintf(" at %s (%s)", prov.RevokedAt.Format(time.RFC3339), prov.Reason)
+	case !prov.RevokedAt.IsZero():
+		return fmt.Sprintf(" at %s", prov.RevokedAt.Format(time.RFC3339))
+	case prov.Reason != "":
+		return fmt.Sprintf(" (%s)", prov.Reason)
+	default:
+		return ""
+	}
 }
 
 // assessProvenance reads dir/plugin.sig, if any, and judges what it says about

@@ -278,11 +278,11 @@ func newHarnessWithApplyWait(t *testing.T, applyWait time.Duration) *harness {
 	return newHarnessWith(t, applyWait, nil)
 }
 
-// newHarnessWith is the one harness constructor the other two delegate to. Its
-// keyring is the deployment's trust set, exactly as loader.Config.Keyring
-// documents it: nil is the "this deployment does not require signatures"
-// statement every test but signature_test.go's makes, and a non-nil one makes
-// every package this harness loads have to carry a signature it verifies.
+// newHarnessWith is the harness constructor for a deployment whose whole trust
+// set is one keyring, fixed for the harness's life. nil is the "this deployment
+// does not require an endorsement" statement every test but signature_test.go's
+// makes, and a non-nil one makes every package this harness loads have to be
+// endorsed by a key in it — see staticTrust for the mapping onto Config.
 func newHarnessWith(t *testing.T, applyWait time.Duration, keyring *sign.Keyring) *harness {
 	t.Helper()
 
@@ -299,11 +299,62 @@ func newHarnessWithRemote(t *testing.T, keyring *sign.Keyring, remote RemoteConf
 	return newHarnessWithRemoteAndWait(t, defaultTestApplyWait, keyring, remote)
 }
 
-// newHarnessWithRemoteAndWait is the one harness constructor every other one
-// delegates to.
+// newHarnessWithRemoteAndWait is newHarnessWithOptions for a deployment whose
+// trust set is one fixed keyring.
 func newHarnessWithRemoteAndWait(t *testing.T, applyWait time.Duration, keyring *sign.Keyring, remote RemoteConfig) *harness {
 	t.Helper()
 
+	return newHarnessWithOptions(t, applyWait, staticTrust(keyring), remote)
+}
+
+// trustOptions is the trust half of a harness Loader's configuration, kept
+// together so a test that cares about one part of it does not have to restate
+// the other two. See staticTrust for the shape almost every test wants.
+type trustOptions struct {
+	// local is Config.LocalKeyring: the local keyring configuration, which
+	// decides only what Loader.SignaturePolicy reports.
+	local *sign.Keyring
+
+	// trustSet is Config.TrustSet, the provider a mount judges a package
+	// against. It is what a test wanting to change the trust set BETWEEN two
+	// mounts varies.
+	trustSet TrustSet
+
+	// requireSignature is Config.RequireSignature.
+	requireSignature bool
+
+	// logger, when non-nil, is the Loader's logger, for a test whose subject
+	// is what the convergence said rather than what it did. A nil one
+	// discards, which is what every other test wants.
+	logger *slog.Logger
+}
+
+// staticTrust is the trust configuration of a deployment whose whole trust set
+// is one keyring that never changes: the keyring is both the local
+// configuration and every mount's answer, and a non-nil one is a deployment
+// that requires an endorsement.
+//
+// The last part is what keeps the pre-graded-install tests meaning what they
+// meant: "a keyring is configured" and "an unendorsed package is refused" used
+// to be one statement, and this is where the two are re-joined for the tests
+// that were written when they were.
+func staticTrust(keyring *sign.Keyring) trustOptions {
+	return trustOptions{
+		local:            keyring,
+		trustSet:         func() (manifest.TrustInput, error) { return manifest.TrustInput{Keyring: keyring}, nil },
+		requireSignature: keyring != nil,
+	}
+}
+
+// newHarnessWithOptions is the one harness constructor every other one
+// delegates to.
+func newHarnessWithOptions(t *testing.T, applyWait time.Duration, trust trustOptions, remote RemoteConfig) *harness {
+	t.Helper()
+
+	logger := trust.logger
+	if logger == nil {
+		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
 	h := &harness{
 		t:        t,
 		root:     t.TempDir(),
@@ -316,12 +367,14 @@ func newHarnessWithRemoteAndWait(t *testing.T, applyWait time.Duration, keyring 
 		Ledger:               h.ledger,
 		Deps:                 h.deps,
 		Events:               &harnessBus{h: h},
-		Logger:               slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Logger:               logger,
 		DeployLimits:         manifest.Limits{TimeoutMs: 5000, MaxMemoryPages: 64, MaxInstances: 1},
 		Gate:                 h.gate,
 		ApplyWait:            applyWait,
 		MaxConsecutiveFaults: defaultTestMaxFaults,
-		Keyring:              keyring,
+		LocalKeyring:         trust.local,
+		TrustSet:             trust.trustSet,
+		RequireSignature:     trust.requireSignature,
 		Remote:               remote,
 	})
 	if err != nil {
@@ -498,6 +551,11 @@ func wantStrings(t *testing.T, what string, got, want []string) {
 	}
 }
 
+// noTrustSet is the provider of a deployment that recognises no signing key at
+// all. It is what a New test that is about some OTHER field hands
+// Config.TrustSet, which New requires before it will build anything.
+func noTrustSet() (manifest.TrustInput, error) { return manifest.TrustInput{}, nil }
+
 func TestNewRequiresEveryDependency(t *testing.T) {
 	full := func() Config {
 		return Config{
@@ -508,6 +566,7 @@ func TestNewRequiresEveryDependency(t *testing.T) {
 			Gate:                 taskgate.NewTaskGate(),
 			ApplyWait:            defaultTestApplyWait,
 			MaxConsecutiveFaults: defaultTestMaxFaults,
+			TrustSet:             noTrustSet,
 		}
 	}
 	cases := []struct {
@@ -525,6 +584,12 @@ func TestNewRequiresEveryDependency(t *testing.T) {
 		{name: "no logger", corrupt: func(c *Config) { c.Logger = nil }, field: "Logger"},
 		{name: "no gate", corrupt: func(c *Config) { c.Gate = nil }, field: "Gate"},
 		{name: "no apply wait", corrupt: func(c *Config) { c.ApplyWait = 0 }, field: "ApplyWait"},
+		// A deployment states "no endorsement required" with
+		// RequireSignature; it has no way to state "do not ask what I trust".
+		// So a nil provider is a wiring mistake, and defaulting it to an empty
+		// trust set would turn a forgotten field into a deployment in which no
+		// package is endorsed by anybody.
+		{name: "no trust set", corrupt: func(c *Config) { c.TrustSet = nil }, field: "TrustSet"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1208,6 +1273,7 @@ func TestApplyReportsADepsFactoryWithNoRegistry(t *testing.T) {
 		Gate:                 taskgate.NewTaskGate(),
 		ApplyWait:            defaultTestApplyWait,
 		MaxConsecutiveFaults: defaultTestMaxFaults,
+		TrustSet:             noTrustSet,
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)

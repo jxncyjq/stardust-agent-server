@@ -386,8 +386,19 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 		Gate:                 deps.Gate,
 		ApplyWait:            time.Duration(cfg.Plugins.ApplyWaitMs) * time.Millisecond,
 		MaxConsecutiveFaults: cfg.Plugins.Health.MaxConsecutiveFaults,
-		Keyring:              keyring,
-		Remote:               remote,
+		LocalKeyring:         keyring,
+		// The trust set this Loader judges packages against is the local
+		// keyring alone, answered identically on every mount.
+		//
+		// RequireSignature is derived from it rather than read separately
+		// because resolvePluginKeyring already collapses the two: it returns a
+		// non-nil keyring only for a deployment whose config requires a
+		// signature, and nil for one that does not. Reading
+		// cfg.Plugins.SignatureRequired() here as well would be a second,
+		// drifting answer to a question that function has already answered.
+		TrustSet:         func() (manifest.TrustInput, error) { return manifest.TrustInput{Keyring: keyring}, nil },
+		RequireSignature: keyring != nil,
+		Remote:           remote,
 	})
 }
 

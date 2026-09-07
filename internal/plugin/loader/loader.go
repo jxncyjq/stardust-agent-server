@@ -189,16 +189,32 @@ const (
 	StateFailed = "failed"
 )
 
-// Config is everything a Loader needs. Every field except DeployLimits and
-// Keyring is required; New reports a missing one by name rather than defaulting
-// it, because each missing field would turn into a nil dereference or a
-// silently unrecorded convergence at the first Apply.
+// TrustSet reports the trust set one mount judges a package against.
 //
-// The two exceptions are exceptions for opposite reasons: a zero DeployLimits
-// is simply "this deployment sets no ceiling of its own", while a nil Keyring
-// is a POLICY STATEMENT ("this deployment does not require signatures") that
-// New cannot tell apart from a forgotten field — which is why the field's own
-// doc puts the burden of never letting nil arise by accident on the caller.
+// It is a function rather than a value because the fetched trust list refreshes
+// in the background while this process runs: a set captured when the Loader was
+// assembled would leave a revocation that arrived after startup with no way to
+// reach the plugins it was published to stop, until somebody restarted the
+// agent. Reading it per mount costs one merge and buys "an emergency revocation
+// lands without a restart".
+//
+// Returning a zero manifest.TrustInput (no keyring) is a deployment with no
+// trust set. See manifest.TrustInput for why that is not the same as unchecked.
+// Returning an error is a deployment that does not KNOW what it trusts, which
+// is not the same as either: the mount fails.
+type TrustSet func() (manifest.TrustInput, error)
+
+// Config is everything a Loader needs. Every field except DeployLimits,
+// LocalKeyring and RequireSignature is required; New reports a missing one by
+// name rather than defaulting it, because each missing field would turn into a
+// nil dereference or a silently unrecorded convergence at the first Apply.
+//
+// The three exceptions are exceptions for different reasons: a zero
+// DeployLimits is simply "this deployment sets no ceiling of its own"; a nil
+// LocalKeyring is "no keyring file is configured", which decides nothing on its
+// own; and a false RequireSignature is a POLICY STATEMENT ("this deployment
+// does not require an endorsement") that New cannot tell apart from a forgotten
+// field — which is why it is announced at Warn instead.
 type Config struct {
 	// Ledger is where every activation files its revocation handles, and what
 	// an unload disposes. It is the single source of "what is actually
@@ -261,24 +277,45 @@ type Config struct {
 	// zero is refused by New rather than read as "never unload".
 	MaxConsecutiveFaults int
 
-	// Keyring is the deployment's trust set: the public keys a plugin
-	// package's detached signature (plugin.sig) must verify against before
-	// anything is mounted from it. It is handed to manifest.LoadPackage on
-	// every convergence.
+	// TrustSet is where every mount reads the trust set it judges a package
+	// against: the public keys whose signature over plugin.json makes a
+	// package one a registered publisher endorses. It is handed to
+	// manifest.LoadPackage on every convergence, freshly, and it is REQUIRED —
+	// see the TrustSet type for why it is a function and what its two
+	// non-answers mean.
 	//
-	// A nil Keyring means THIS DEPLOYMENT DOES NOT REQUIRE SIGNATURES, and it
-	// is the one field here whose absence is a legitimate configuration rather
-	// than a wiring mistake — which is exactly why it is dangerous, and why
-	// the caller that builds this Config must let nil arise ONLY from an
-	// explicit "not required" statement. A nil that arrived because a keyring
-	// file could not be read, or because a field was forgotten, is a security
-	// control that switched itself off while the logs looked normal; the
-	// assembly is required to fail loudly in those cases instead of passing
-	// nil (see cli.resolvePluginKeyring, the only place that decides this).
+	// A trust set that recognises no key does NOT relax
+	// manifest.LoadPackage's sha256 check, which runs either way, and it does
+	// not by itself let an unendorsed package mount either: that is
+	// RequireSignature's and Entry.AcceptedUnsigned's decision.
+	TrustSet TrustSet
+
+	// LocalKeyring is the deployment's LOCAL keyring configuration — the
+	// keyring document on this machine, as opposed to the fetched trust list
+	// that TrustSet also draws on.
 	//
-	// nil does NOT relax manifest.LoadPackage's sha256 check, which runs
-	// either way.
-	Keyring *sign.Keyring
+	// It decides nothing about whether a package may mount; that judgement
+	// reads TrustSet. Its whole job is to be reported through SignaturePolicy,
+	// which is why "no keyring file is configured" is an ordinary nil here
+	// rather than a policy statement.
+	LocalKeyring *sign.Keyring
+
+	// RequireSignature is whether a package no registered publisher endorses
+	// needs an install-time acceptance (Entry.AcceptedUnsigned) before it may
+	// mount.
+	//
+	// False is a deployment's explicit statement that it does not require an
+	// endorsement, and it is honoured for exactly that: unendorsed packages
+	// mount, with a warning every time one is admitted. It does NOT extend to
+	// revoked keys — "I do not require an endorsement" and "I am willing to
+	// run code that was withdrawn" are different sentences, and only the first
+	// one was said. Nor does it extend to an acceptance that no longer matches: that
+	// says the package CHANGED, which is not a statement about endorsements at
+	// all.
+	//
+	// Its zero value is the permissive side, which New cannot tell apart from
+	// a forgotten field — so New says so at Warn.
+	RequireSignature bool
 
 	// Remote is how an entry whose source is a URL gets its package onto disk:
 	// the cache it is filed in, the client it is fetched with, the bounds both
@@ -479,10 +516,16 @@ type Loader struct {
 	// mounted plugin is unloaded for repeatedly failing to answer.
 	maxConsecutiveFaults int
 
-	// keyring is Config.Keyring, verbatim: the deployment's trust set, or nil
-	// when it has explicitly stated that it does not require signatures. See
-	// Config.Keyring for why nil may only ever mean that.
-	keyring *sign.Keyring
+	// trustSet is Config.TrustSet, verbatim: where a mount reads the trust set
+	// it judges a package against. It is never nil — New refuses that.
+	trustSet TrustSet
+
+	// localKeyring is Config.LocalKeyring, verbatim: the local keyring
+	// configuration, which SignaturePolicy reports and nothing else reads.
+	localKeyring *sign.Keyring
+
+	// requireSignature is Config.RequireSignature, verbatim.
+	requireSignature bool
 
 	// remote is Config.Remote, verbatim. Its zero value is the deployment that
 	// configured no remote source at all; see RemoteConfig.
@@ -517,19 +560,27 @@ func New(cfg Config) (*Loader, error) {
 		return nil, fmt.Errorf("new plugin loader: Config.MaxConsecutiveFaults is %d; it must be positive, "+
 			"since zero has no 'never unload' reading: a deployment that tolerates more failures states a "+
 			"larger number (see config.PluginHealthConfig)", cfg.MaxConsecutiveFaults)
+	case cfg.TrustSet == nil:
+		// A deployment states "no endorsement required" with
+		// RequireSignature. It has no way to state "do not ask what I trust",
+		// so a nil provider is a wiring mistake — and defaulting it to an
+		// empty trust set would turn a forgotten field into a deployment in
+		// which no package is endorsed by anyone.
+		return nil, errors.New("new plugin loader: Config.TrustSet is nil; there is nowhere to read the trust " +
+			"set a package is judged against, and an empty one would make every package unendorsed")
 	}
 	if err := validateRemote(cfg.Remote); err != nil {
 		return nil, err
 	}
-	if cfg.Keyring == nil {
+	if !cfg.RequireSignature {
 		// The one state this constructor cannot tell apart from a mistake, said
-		// out loud once per Loader. A deployment that verifies nothing is a
-		// legitimate choice; a deployment that verifies nothing because a field
+		// out loud once per Loader. A deployment that requires no endorsement is
+		// a legitimate choice; a deployment that requires none because a field
 		// was forgotten looks exactly the same from in here, and the difference
 		// has to be visible somewhere an operator can find it.
-		cfg.Logger.Warn("plugin signature verification is disabled",
+		cfg.Logger.Warn("this deployment does not require a publisher endorsement for a plugin package",
 			"component", "plugin-loader",
-			"consequence", "packages are accepted on their sha256 alone, which travels inside the very manifest it describes")
+			"consequence", "a package no registered publisher endorses mounts with nothing recorded about who accepted it")
 	}
 	return &Loader{
 		ledger:               cfg.Ledger,
@@ -540,7 +591,9 @@ func New(cfg Config) (*Loader, error) {
 		gate:                 cfg.Gate,
 		applyWait:            cfg.ApplyWait,
 		maxConsecutiveFaults: cfg.MaxConsecutiveFaults,
-		keyring:              cfg.Keyring,
+		trustSet:             cfg.TrustSet,
+		localKeyring:         cfg.LocalKeyring,
+		requireSignature:     cfg.RequireSignature,
 		remote:               cfg.Remote,
 		instances:            make(map[string]*instance),
 		failures:             make(map[string]failure),
@@ -582,9 +635,9 @@ func validateRemote(remote RemoteConfig) error {
 	return nil
 }
 
-// SignaturePolicy is a Loader's signature-verification policy in comparable
-// form: whether a trust set is in force at all, and exactly which keys are in
-// it.
+// SignaturePolicy is a Loader's LOCAL KEYRING CONFIGURATION in comparable
+// form: whether a local keyring is configured at all, and exactly which keys
+// are in it.
 //
 // It exists for one caller: a command that re-reads the deployment config
 // while a Loader is already running (`agent plugins reload` does) has to be
@@ -593,10 +646,26 @@ func validateRemote(remote RemoteConfig) error {
 // Loader, so converging a new manifest without that comparison would apply the
 // operator's new manifest under their old trust set — a signature policy that
 // looks applied and is not.
+//
+// # What it does NOT describe
+//
+// It covers only the local keyring (Config.LocalKeyring). It says nothing
+// about the fetched trust list that Config.TrustSet also draws on, and it does
+// not need to: the list half is read afresh on every mount, so there is no
+// "converged under the old trust set" to catch there — a list that changed a
+// second ago is already in force for the next mount, with or without a reload.
+//
+// Putting the list half in here would make things worse rather than more
+// complete. It refreshes in the background, so a comparison over it would fail
+// whenever a reload happened to land just after a refresh: a guard that
+// refuses at random is worse than no guard at all, because people learn to
+// pass it by reflex and stop reading what it says.
+//
+// It says nothing about Config.RequireSignature either, which is a separate
+// statement about what may mount rather than about which keys are known.
 type SignaturePolicy struct {
-	// Enforced is whether this Loader verifies signatures at all. False is the
-	// deployment's deliberate "signatures are not required" statement, which
-	// is the only way a nil keyring may arise (see Config.Keyring).
+	// Enforced is whether a local keyring is configured at all. False means
+	// Config.LocalKeyring was nil.
 	Enforced bool
 
 	// KeyIDs are the ids of the trusted keys, sorted (sign.Keyring.IDs). It is
@@ -617,9 +686,9 @@ type SignaturePolicy struct {
 	RevokedIDs []sign.KeyID
 }
 
-// SignaturePolicyOf describes the policy a Loader built with keyring enforces.
-// A nil keyring — the one legitimate "this deployment does not require
-// signatures" value — is the unenforced policy.
+// SignaturePolicyOf describes the local keyring configuration a Loader built
+// with keyring reports. A nil keyring — no keyring file configured — is the
+// unenforced policy.
 //
 // It is exported so that a caller which has resolved a keyring from a config
 // but has not built a Loader from it (reload does exactly that) computes the
@@ -684,14 +753,15 @@ func (p SignaturePolicy) String() string {
 		strings.Join(ids, " "), strings.Join(revoked, " "))
 }
 
-// SignaturePolicy returns the policy this Loader is enforcing right now.
+// SignaturePolicy returns this Loader's local keyring configuration, in the
+// comparable form SignaturePolicy documents.
 //
-// No lock is taken: keyring is written once in New and never again, so there
-// is nothing here for a concurrent Apply to race with. The returned KeyIDs
-// slice is freshly built by sign.Keyring.IDs on every call, so a caller cannot
-// reach into the Loader's trust set through it.
+// No lock is taken: localKeyring is written once in New and never again, so
+// there is nothing here for a concurrent Apply to race with. The returned
+// KeyIDs slice is freshly built by sign.Keyring.IDs on every call, so a caller
+// cannot reach into the Loader's keyring through it.
 func (l *Loader) SignaturePolicy() SignaturePolicy {
-	return SignaturePolicyOf(l.keyring)
+	return SignaturePolicyOf(l.localKeyring)
 }
 
 // RemotePolicy is a Loader's remote-source policy in comparable form: where
@@ -1105,18 +1175,28 @@ func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string)
 		}
 	}
 
-	// l.keyring is the deployment's trust set, or nil when the deployment has
-	// EXPLICITLY stated that it does not require signatures (Config.Keyring).
-	// Either way LoadPackage's sha256 check runs; a non-nil keyring adds the
-	// signature check, whose failure is an ordinary activation failure — it
-	// goes through l.fail like every other one, so the entry lands in
-	// StateFailed with a LastError naming the signature, and the other entries
-	// keep converging.
-	// 三态在 Task 4 接线：Provenance 在这里被丢弃，所以本次收敛只按 LoadPackage
-	// 仍然返回的错误判定（签名对不上、plugin.json 与 plugin.wasm 的 sha256 对不
-	// 上）。缺签名与「签它的 key 不在信任集里」现在都是 ProvenanceUnsigned 判定，
-	// 不再是错误——l.keyring 非 nil 时它们不再被这里拦下。
-	pm, wasm, _, err := manifest.LoadPackage(dir, manifest.TrustInput{Keyring: l.keyring})
+	// The trust set is read HERE, once per entry per convergence, rather than
+	// captured when this Loader was built: see the TrustSet type. A provider
+	// that cannot answer fails the entry — a deployment that does not know
+	// what it trusts must not mount anything, and reading the failure as "no
+	// trust set" would turn a broken cache into a deployment where nobody
+	// endorses anything.
+	trust, err := l.trustSet()
+	if err != nil {
+		return nil, l.fail(ctx, entry.Name, "", stepLoadPackage,
+			fmt.Errorf("read the trust set to judge plugin %q against: %w", entry.Name, err), nil)
+	}
+
+	// LoadPackage answers who stands behind the package and leaves what that
+	// permits to admit, below. What it still returns as an ERROR is everything
+	// that is not a verdict: a plugin.sig that is malformed or does not verify
+	// against a key this trust set names, a plugin.wasm whose sha256 disagrees
+	// with the plugin.json describing it, a manifest that will not parse, and
+	// the plain read failures underneath all three. Each is an ordinary
+	// activation failure — it goes through l.fail like every other one, so the
+	// entry lands in StateFailed with a LastError naming the check, and the
+	// other entries keep converging.
+	pm, wasm, prov, err := manifest.LoadPackage(dir, trust)
 	if err != nil {
 		// An untrusted package does not belong in the cache: the bytes just
 		// failed signature verification, and leaving them there means every
@@ -1130,6 +1210,9 @@ func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string)
 		if errors.Is(err, manifest.ErrUntrustedPackage) && entry.IsRemote() {
 			fetch.EvictUntrusted(l.remote.Cache, entry.Digest, l.logger)
 		}
+		return nil, l.fail(ctx, entry.Name, "", stepLoadPackage, err, nil)
+	}
+	if err := l.admit(entry, dir, trust, prov); err != nil {
 		return nil, l.fail(ctx, entry.Name, "", stepLoadPackage, err, nil)
 	}
 	if pm.Name != entry.Name {
@@ -1208,6 +1291,97 @@ func (l *Loader) prepare(ctx context.Context, entry manifest.Entry, root string)
 		return nil, nil
 	}
 	return &convergePlan{entry: entry, dir: dir, pm: pm, spec: spec, digest: digest, prev: prev}, nil
+}
+
+// admit applies this deployment's policy to a package's provenance. Every
+// graded-install decision a convergence makes is taken here; nothing above it
+// reads a Provenance.
+//
+// The three outcomes are not symmetric. A package a registered publisher
+// endorses loads. An unendorsed one loads only if an operator accepted these
+// exact bytes, or if the deployment has said it does not require an
+// endorsement. A revoked one never loads, whatever else is configured — see
+// Config.RequireSignature for why that switch does not reach it.
+//
+// The one case worth spelling out is an acceptance that does not match while
+// RequireSignature is false. It is REFUSED, like every other mismatched
+// acceptance: a record covering different bytes says this package changed since
+// somebody looked at it, and that is a fact about the package rather than a
+// statement about endorsements — which is all the switch ever conceded. An
+// operator who never wanted endorsements still wants to be told their plugin
+// was swapped.
+//
+// dir is the package directory, and trust is the set the verdict was reached
+// against — the second only so that a refusal can say which keys an endorsement
+// would have had to come from.
+func (l *Loader) admit(entry manifest.Entry, dir string, trust manifest.TrustInput, prov manifest.Provenance) error {
+	switch prov.State {
+	case manifest.ProvenanceRevoked:
+		return fmt.Errorf("plugin %q is signed by key %q, which this deployment revoked%s: %w",
+			entry.Name, prov.KeyID, manifest.DescribeRevocation(prov), manifest.ErrRevokedPublisher)
+
+	case manifest.ProvenanceRegistered:
+		l.logger.Info("plugin package is endorsed by a registered publisher",
+			"plugin", entry.Name, "key_id", prov.KeyID, "publisher", prov.Publisher)
+		return nil
+
+	case manifest.ProvenanceUnsigned:
+		digest, err := manifest.ManifestDigest(dir)
+		if err != nil {
+			return fmt.Errorf("judge unendorsed plugin %q: %w", entry.Name, err)
+		}
+		switch {
+		// EqualFold, not ==: manifest.ManifestDigest writes lowercase hex, but
+		// Entry.AcceptedUnsigned is validated against a pattern that accepts
+		// either case, so a hand-written acceptance may legitimately arrive
+		// upper-cased. Comparing byte for byte would report that one as a
+		// CHANGED package — a tampering alarm about a package nothing happened
+		// to. It is the same comparison LoadPackage makes against the wasm
+		// digest plugin.json declares, for the same reason.
+		case strings.EqualFold(entry.AcceptedUnsigned, digest):
+			l.logger.Info("plugin package is unendorsed and is admitted on an install-time acceptance",
+				"plugin", entry.Name, "accepted_digest", digest)
+			return nil
+		case entry.AcceptedUnsigned == "" && !l.requireSignature:
+			l.logger.Warn("plugin package is admitted with no endorsement because this deployment does not require one",
+				"plugin", entry.Name, "digest", digest)
+			return nil
+		case entry.AcceptedUnsigned == "":
+			return fmt.Errorf("plugin %q is endorsed by no registered publisher — %s is absent, or names a "+
+				"key outside this deployment's trust set (trusted keys: %s) — and nobody has accepted these "+
+				"bytes either; its plugin.json hashes to %s: %w",
+				entry.Name, filepath.Join(dir, "plugin.sig"), trustedKeyIDs(trust), digest,
+				manifest.ErrUnsignedNotAccepted)
+		default:
+			return fmt.Errorf("plugin %q changed since it was accepted: the acceptance on record covers %s, "+
+				"and the package in %s hashes to %s. These are not the bytes anyone approved: %w",
+				entry.Name, entry.AcceptedUnsigned, dir, digest, manifest.ErrUnsignedNotAccepted)
+		}
+
+	default:
+		// A state this function does not know how to judge must not be admitted
+		// by falling through: an unhandled enum value is a programming error,
+		// and treating it as "fine" is the exact shape of silent trust
+		// escalation. It is a refusal rather than a panic because a convergence
+		// covers many entries, and one entry nobody can judge is not a reason
+		// to take the process down.
+		return fmt.Errorf("plugin %q has provenance state %s, which this deployment does not know how to "+
+			"judge: %w", entry.Name, prov.State, manifest.ErrUnsignedNotAccepted)
+	}
+}
+
+// trustedKeyIDs renders the key ids an endorsement would have had to come from,
+// for a refusal that has to tell an operator what this machine would accept.
+//
+// A nil keyring is spelled out rather than rendered as an empty list: "trusted
+// keys: []" reads like a configuration that failed to load, and this one is a
+// deployment that recognises nobody, which is a different thing to go and look
+// at.
+func trustedKeyIDs(trust manifest.TrustInput) string {
+	if trust.Keyring == nil {
+		return "none, this deployment recognises no signing key at all"
+	}
+	return fmt.Sprintf("%v", trust.Keyring.IDs())
 }
 
 // activate mounts one prepared plan. Its predecessor, if it had one, is already
