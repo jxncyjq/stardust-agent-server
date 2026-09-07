@@ -84,14 +84,19 @@ type PluginConsentService struct {
 // an `agent plugins install` judges a package against: that one is the local
 // keyring document merged with the fetched trust list, publishers included (see
 // resolvePluginTrustInput). So a package endorsed by a key only the fetched list
-// registers is, to this service, endorsed by nobody it recognises. That changes
-// no answer this service gives today, because every manifest.LoadPackage call in
-// this file discards the Provenance it returns and LoadPackage reports an
-// unrecognised key id as ProvenanceUnsigned rather than as an error — the two
-// trust sets fail and succeed on exactly the same packages here. It would start
-// to matter the moment a trust verdict reaches a reader through this service:
-// what the interface showed and what the mount enforced would then be two
-// different judgements.
+// registers is, to this service, endorsed by nobody it recognises. Every
+// manifest.LoadPackage call in this file discards the Provenance it returns, and
+// an unrecognised key id on a well-formed plugin.sig comes back as
+// ProvenanceUnsigned rather than as an error, so on that one path the two trust
+// sets already agree today. They do NOT agree when plugin.sig is malformed or
+// fails verification: assessProvenance wraps that in manifest.ErrUntrustedPackage
+// whenever its TrustInput carries a non-nil Keyring, but it never reads
+// plugin.sig at all when the Keyring is nil, which is exactly what keyringFn
+// returns for a deployment with require_signature: false (see
+// resolvePluginKeyring). Under that policy, a plugin.sig a mount or install
+// would refuse as untrusted instead loads through this service with no error at
+// all. That gap already exists today; Task 6, which is meant to surface a
+// trust verdict to a reader through this service, would only make it visible.
 //
 // remote is the resolved remote-source policy (config.PluginsConfig's Cache,
 // HTTP client and fetch/unpack limits, see resolvePluginRemote) this
