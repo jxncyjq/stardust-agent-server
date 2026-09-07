@@ -128,6 +128,16 @@ type pluginHostDeps struct {
 	// loader to read state without ever running a task, and a registry nobody
 	// inherits from is the correct shape there.
 	PluginTools *tool.Registry
+
+	// Trustlist is the fetched trust list's Store, and it MUST be the same one
+	// the refresh loop writes through: the loader reads it on every mount (see
+	// pluginTrustSet), so a Store of its own would answer out of a cache
+	// directory nobody is refreshing.
+	//
+	// Nil is the deployment that configured no remote trust list
+	// (resolvePluginTrustlist returns nil for it), and the trust set is then
+	// the local keyring alone.
+	Trustlist *trustlist.Store
 }
 
 // assemblePlugins builds this process's plugin loader from cfg.Plugins,
@@ -153,9 +163,20 @@ type pluginHostDeps struct {
 // that cancels on shutdown releases it. In practice the wait is not spent:
 // this runs before the service starts, with no task in flight, so there is no
 // path here that parks a goroutine on a gate nobody will release.
-func assemblePlugins(ctx context.Context, application *app.App, cfg config.Config, deps pluginHostDeps) error {
+//
+// The loader.TrustSet returned is the provider the loader it built judges every
+// mount against (newPluginLoader). It is handed back rather than kept private
+// so that anything else in this process which has to judge the same packages
+// judges them against the SAME set: a second provider assembled from the same
+// config is not the same set, because each half of the merge can move under one
+// copy and not the other, and the first symptom of that is one plugin reported
+// as endorsed in one place and unsigned in another. It is nil, together with a
+// nil error, on exactly the "plugins are not enabled" return described above --
+// nothing was built, so there is no set to judge anything against.
+func assemblePlugins(ctx context.Context, application *app.App, cfg config.Config,
+	deps pluginHostDeps) (loader.TrustSet, error) {
 	if application == nil {
-		return errors.New("assemble plugins: application is nil; there is no lifecycle ledger to file activations under")
+		return nil, errors.New("assemble plugins: application is nil; there is no lifecycle ledger to file activations under")
 	}
 	if strings.TrimSpace(cfg.Plugins.Manifest) == "" {
 		if strings.TrimSpace(cfg.Plugins.Keyring) != "" {
@@ -166,7 +187,7 @@ func assemblePlugins(ctx context.Context, application *app.App, cfg config.Confi
 			// because nothing is mounted here, but the operator gets to hear
 			// that the file they configured is doing nothing.
 			if deps.Logger == nil {
-				return errors.New("assemble plugins: Logger is nil; a configured keyring that is not in use would go unreported")
+				return nil, errors.New("assemble plugins: Logger is nil; a configured keyring that is not in use would go unreported")
 			}
 			deps.Logger.Warn("plugin trust keyring is configured but plugins are not enabled",
 				"component", "cli",
@@ -174,22 +195,22 @@ func assemblePlugins(ctx context.Context, application *app.App, cfg config.Confi
 				"consequence", `no "plugins.manifest" is configured, so nothing is loaded and this keyring is never read or validated`,
 				"remedy", `configure "plugins.manifest" to enable plugins, or remove "plugins.keyring"`)
 		}
-		return nil
+		return nil, nil
 	}
 	switch {
 	case deps.Audit == nil:
-		return errors.New("assemble plugins: Audit is nil; a plugin's tool calls would be recorded nowhere")
+		return nil, errors.New("assemble plugins: Audit is nil; a plugin's tool calls would be recorded nowhere")
 	case deps.Events == nil:
-		return errors.New("assemble plugins: Events is nil; a convergence that published nothing would be invisible")
+		return nil, errors.New("assemble plugins: Events is nil; a convergence that published nothing would be invisible")
 	case deps.Logger == nil:
-		return errors.New("assemble plugins: Logger is nil; a convergence that logged nothing would be unexplainable")
+		return nil, errors.New("assemble plugins: Logger is nil; a convergence that logged nothing would be unexplainable")
 	case deps.Gate == nil:
-		return errors.New("assemble plugins: Gate is nil; a convergence with no task-boundary gate would land in the middle of a running task")
+		return nil, errors.New("assemble plugins: Gate is nil; a convergence with no task-boundary gate would land in the middle of a running task")
 	}
 
 	deployment, err := readPluginDeployment(cfg.Plugins.Manifest)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// The deployment's remote entries are checked against the deployment's
 	// remote POLICY before a loader exists: both failures here are statements
@@ -197,16 +218,16 @@ func assemblePlugins(ctx context.Context, application *app.App, cfg config.Confi
 	// put it", "you named a plaintext source and did not turn plaintext on"),
 	// and neither is repairable by letting the rest of the manifest converge.
 	if err := checkRemoteSources(deployment, cfg.Plugins, deps.Logger); err != nil {
-		return err
+		return nil, err
 	}
-	pluginLoader, err := newPluginLoader(application, cfg, deps)
+	pluginLoader, trustSet, err := newPluginLoader(application, cfg, deps)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Attached before the convergence, not after: an Apply that fails outright
 	// must still leave a loader whose Status answers "why is nothing mounted?".
 	if err := application.SetPlugins(pluginLoader); err != nil {
-		return err
+		return nil, err
 	}
 	if err := pluginLoader.Apply(ctx, deployment, cfg.Plugins.Root); err != nil {
 		// Loud, and startup continues. The alternative — refusing to serve at
@@ -220,7 +241,7 @@ func assemblePlugins(ctx context.Context, application *app.App, cfg config.Confi
 			"consequence", "the failed entries stay visible in `agent plugins status`",
 			"error", err)
 	}
-	return nil
+	return trustSet, nil
 }
 
 // drainPlugins unmounts every plugin the loader attached to application has
@@ -306,11 +327,17 @@ func drainPlugins(application *app.App, root string, logger *slog.Logger) {
 // The link is a reference, so `plugins reload` reaches task registries that
 // already exist; and a task registry's OWN registrations shadow same-named
 // inherited ones, so a plugin cannot silently replace write_file.
-func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDeps) (*loader.Loader, error) {
+//
+// The second return value is the loader.TrustSet the Loader was built with,
+// returned so the same provider -- not a second one built from the same config
+// -- can be read by anything else that has to judge these packages. See
+// assemblePlugins, which passes it on for the same reason.
+func newPluginLoader(application *app.App, cfg config.Config,
+	deps pluginHostDeps) (*loader.Loader, loader.TrustSet, error) {
 	toolRoot := cfg.ContextFiles.Root
 	absRoot, err := filepath.Abs(toolRoot)
 	if err != nil {
-		return nil, fmt.Errorf("resolve plugin workspace root %q: %w", toolRoot, err)
+		return nil, nil, fmt.Errorf("resolve plugin workspace root %q: %w", toolRoot, err)
 	}
 	registry := deps.PluginTools
 	if registry == nil {
@@ -329,36 +356,54 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 		// Logger -- but the signature policy is reported through this logger
 		// below, and a policy decision made with nowhere to report it is the
 		// silent degradation this whole path exists to prevent.
-		return nil, errors.New("new plugin loader: Logger is nil; the signature policy would be decided with no record of it")
+		return nil, nil, errors.New("new plugin loader: Logger is nil; the signature policy would be decided with no record of it")
 	}
 
-	// The trust set, or the deliberate nil that says this deployment does not
-	// require signatures. Anything else -- a keyring that would not read, a
-	// requirement with nothing to check against -- fails here rather than
-	// mounting plugins nobody verified.
-	keyring, unenforcedKeyring, err := resolvePluginKeyring(cfg.Plugins)
+	// The keyring document this deployment configured, read once and used for
+	// two different questions below: the trust set a package's provenance is
+	// judged against (localRaw), and the signature policy this loader reports
+	// (localKeyring, the document as read). Anything else -- a keyring that
+	// would not read, a requirement with nothing to check against -- fails here
+	// rather than mounting plugins nobody judged.
+	localKeyring, localRaw, err := resolvePluginLocalKeyring(cfg.Plugins)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
+	}
+	// enforcedPluginKeyring is called for its POLICY rule and its warning, not
+	// for the keyring it returns: a deployment that requires an endorsement
+	// while naming no keyring is refused here rather than started.
+	_, unenforcedKeyring, err := enforcedPluginKeyring(cfg.Plugins, localKeyring)
+	if err != nil {
+		return nil, nil, err
 	}
 	if unenforcedKeyring != "" {
 		// Deliberately NOT a second "this deployment verifies nothing": that
 		// sentence is loader.New's to say, once, and two warnings meaning the
 		// same thing are how an operator learns to skip both. This one carries
 		// only what the assembly knows and the loader cannot -- that a trust
-		// set was configured, and which file it is.
-		logger.Warn("plugin trust keyring is configured but not enforced",
+		// set was configured, which file it is, and how much of it this policy
+		// still acts on.
+		logger.Warn("plugin trust keyring is configured while no endorsement is required",
 			"component", "cli",
 			"keyring", unenforcedKeyring,
-			"consequence", `the keys in it are loaded and then dropped, because the config says "require_signature": false`,
-			"remedy", `remove "require_signature": false to enforce the trust set that is already configured`)
+			"consequence", `a package no key in it endorses still mounts, because the config says `+
+				`"require_signature": false; the keys are still used to recognise a publisher, and a `+
+				"package signed by a key this keyring revokes is still refused",
+			"remedy", `remove "require_signature": false to also refuse packages nobody has endorsed`)
 	}
 
 	remote, err := resolvePluginRemote(cfg.Plugins)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return loader.New(loader.Config{
+	// Built once and handed out twice: the Loader below reads it on every
+	// mount, and it is also this function's second return value. Building a
+	// second provider for the second reader would be two trust sets rather
+	// than one -- see this function's own doc comment.
+	trustSet := pluginTrustSet(localRaw, deps.Trustlist, logger)
+
+	pluginLoader, err := loader.New(loader.Config{
 		Ledger: application.PluginLedger(),
 		Deps: func(name string, pluginConfig json.RawMessage) host.Deps {
 			if len(pluginConfig) == 0 {
@@ -386,9 +431,28 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 		Gate:                 deps.Gate,
 		ApplyWait:            time.Duration(cfg.Plugins.ApplyWaitMs) * time.Millisecond,
 		MaxConsecutiveFaults: cfg.Plugins.Health.MaxConsecutiveFaults,
-		Keyring:              keyring,
-		Remote:               remote,
+		// The keyring document AS READ, not one the requirement has been
+		// applied to: this field is what loader.SignaturePolicy reports, and a
+		// keyring that went nil whenever no endorsement is required would make
+		// that policy the zero value for every such deployment -- a revocation
+		// added to the document would then compare unchanged, and converge (see
+		// loader.SignaturePolicyOf).
+		LocalKeyring: localKeyring,
+		// The trust set is built from the keyring document this deployment
+		// configured merged with the fetched trust list, and it is built
+		// whatever the signature policy says -- see resolvePluginTrustInput for
+		// why a deployment that requires no endorsement still needs one.
+		TrustSet: trustSet,
+		// The requirement is read from the config directly, because it is now a
+		// separate field of the policy rather than something a nil keyring
+		// stands in for.
+		RequireSignature: cfg.Plugins.SignatureRequired(),
+		Remote:           remote,
 	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return pluginLoader, trustSet, nil
 }
 
 // The bounds one fetched plugin package is unpacked under. They bound the
@@ -517,70 +581,247 @@ func checkRemoteSources(deployment manifest.Deployment, cfg config.PluginsConfig
 	return nil
 }
 
-// resolvePluginKeyring turns the deployment's signature POLICY into the trust
-// set the Loader will verify with, and is the only place a nil keyring may be
-// produced. Every caller that builds a loader.Config must obtain its Keyring
-// from here.
+// resolvePluginLocalKeyring reads the keyring document this deployment
+// CONFIGURED and parses it, and consults no policy at all. It returns the
+// parsed keyring together with the document's raw bytes, or (nil, nil, nil)
+// when "plugins.keyring" names no file.
 //
-// The rules, and why each one fails loudly rather than degrading:
+// Both halves are returned because each is the only way to carry one thing:
+// the parsed *sign.Keyring is the only place the revocations survive, and the
+// raw bytes are the only place the public keys survive — sign.Keyring exposes
+// no way to read a key back out, which is why trustlist.Merge takes the local
+// half as a document rather than as a keyring (see its doc comment). The raw
+// bytes returned here have always been through sign.ParseKeyring, which is the
+// obligation Merge places on its caller.
 //
-//   - A configured keyring path is always read and parsed, whatever the policy
-//     says. An unreadable or unparseable one fails assembly with the path
-//     named — the same "configured means you meant it" rule the manifest path
-//     follows. This is deliberately checked even when signatures are turned
-//     off: an operator who wrote down both a keyring and
-//     "require_signature": false wrote two contradictory things, and quietly
-//     dropping the broken file is exactly the silent degradation this whole
-//     control exists to prevent.
-//   - Signatures required (the default, see config.PluginsConfig.
-//     SignatureRequired) with NO keyring configured fails assembly. "Verify
-//     every package" with nothing to verify against is not a deployment worth
-//     starting, and the error names both ways out of it.
-//   - Signatures explicitly NOT required returns nil, and only then. nil is
-//     what tells manifest.LoadPackage to skip verification, so it must be
-//     reachable from one deliberate statement and from nothing else: not from
-//     a file that would not open, not from a forgotten field, not from an
-//     error someone decided to tolerate. A keyring that loaded fine is still
-//     dropped here — the policy, not the presence of a file, is what decides.
-//
-// The second return value is the path of a keyring that loaded successfully and
-// was then dropped by policy, or "" when there was none. It is returned rather
-// than logged here because this function has two callers with different jobs:
-// serve assembly reports it (a deployment holding a trust set it does not
-// enforce is worth a line in the log), while `plugins reload` only compares
-// policies and has nothing new to say about one that has not changed.
-func resolvePluginKeyring(cfg config.PluginsConfig) (*sign.Keyring, string, error) {
+// A configured path is always read and parsed, whatever the signature policy
+// says. An unreadable or unparseable one is an error with the path named — the
+// same "configured means you meant it" rule the manifest path follows. That
+// holds even when signatures are turned off: an operator who wrote down both a
+// keyring and "require_signature": false wrote two contradictory things, and
+// quietly dropping the broken file is exactly the silent degradation this whole
+// control exists to prevent.
+func resolvePluginLocalKeyring(cfg config.PluginsConfig) (*sign.Keyring, json.RawMessage, error) {
 	path := strings.TrimSpace(cfg.Keyring)
-	var keyring *sign.Keyring
-	if path != "" {
-		data, err := os.ReadFile(path)
-		if err != nil {
-			return nil, "", fmt.Errorf("read plugin trust keyring %q: %w", path, err)
-		}
-		keyring, err = sign.ParseKeyring(data)
-		if err != nil {
-			return nil, "", fmt.Errorf("parse plugin trust keyring %q: %w", path, err)
-		}
-		if keyring == nil {
-			// sign.ParseKeyring's contract is a non-nil keyring on a nil
-			// error. A nil here would travel on as "signatures not required",
-			// so it is an invariant violation rather than a case to handle.
-			panic("cli: sign.ParseKeyring returned a nil keyring and a nil error")
-		}
+	if path == "" {
+		return nil, nil, nil
 	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read plugin trust keyring %q: %w", path, err)
+	}
+	keyring, err := sign.ParseKeyring(data)
+	if err != nil {
+		return nil, nil, fmt.Errorf("parse plugin trust keyring %q: %w", path, err)
+	}
+	if keyring == nil {
+		// sign.ParseKeyring's contract is a non-nil keyring on a nil error. A
+		// nil here would travel on as "no keyring is configured" for a
+		// deployment that configured one, so it is an invariant violation
+		// rather than a case to handle.
+		panic("cli: sign.ParseKeyring returned a nil keyring and a nil error")
+	}
+	return keyring, json.RawMessage(data), nil
+}
+
+// enforcedPluginKeyring applies the deployment's signature POLICY to a keyring
+// resolvePluginLocalKeyring already read, and is the only place a nil keyring
+// may be produced for a deployment that configured one.
+//
+// What "enforced" means here is narrow: the keyring the POLICY keeps, which is
+// the configured document when an endorsement is required and nil when none is.
+//
+// It is NOT the signature policy in comparable form. That one is built from the
+// keyring document as read, with the requirement as a field of its own, because
+// a keyring that goes nil under a relaxed requirement cannot report a change to
+// itself — see loader.SignaturePolicyOf. It is NOT the trust set a package's
+// provenance is judged against either; that one is built by pluginTrustSet,
+// which does not consult the policy at all.
+//
+// The two rules:
+//
+//   - Signatures required (the default, see config.PluginsConfig.
+//     SignatureRequired) with NO keyring configured is an error. "Refuse every
+//     package no registered publisher endorses" with no registered publishers
+//     to speak of is not a deployment worth starting, and the error names both
+//     ways out of it.
+//   - Signatures explicitly NOT required returns nil, and only then. nil is a
+//     deliberate policy statement, so it must be reachable from one deliberate
+//     sentence in the config and from nothing else: not from a file that would
+//     not open, not from a forgotten field, not from an error someone decided
+//     to tolerate.
+//
+// The second return value is the path of a keyring that is configured while the
+// policy does not require an endorsement, or "" when there is none. It is
+// returned rather than logged here because this function has no idea whether
+// the answer is worth reporting: a deployment holding a trust set it does not
+// demand an endorsement from is worth a line when it is being assembled, and
+// worth nothing at all when the question being asked is only "did the policy
+// change".
+func enforcedPluginKeyring(cfg config.PluginsConfig, local *sign.Keyring) (*sign.Keyring, string, error) {
 	if !cfg.SignatureRequired() {
 		unenforced := ""
-		if keyring != nil {
-			unenforced = path
+		if local != nil {
+			unenforced = strings.TrimSpace(cfg.Keyring)
 		}
 		return nil, unenforced, nil
 	}
-	if keyring == nil {
+	if local == nil {
 		return nil, "", fmt.Errorf("plugins.keyring is not configured while plugin signatures are required: "+
 			"either configure a keyring of trusted public keys, or turn the requirement off explicitly with "+
 			`"require_signature": false in the plugins config (manifest %q)`, cfg.Manifest)
 	}
-	return keyring, "", nil
+	return local, "", nil
+}
+
+// resolvePluginKeyring is resolvePluginLocalKeyring followed by
+// enforcedPluginKeyring in one step: the keyring this deployment's signature
+// POLICY keeps, read from disk and then filtered by that policy.
+//
+// It returns the policy's answer alone, so the raw keyring bytes the merged
+// trust set is assembled out of (resolvePluginTrustInput) do not survive it.
+// Needing both answers means calling the two halves directly instead, which
+// reads the keyring document from disk exactly once for the pair.
+func resolvePluginKeyring(cfg config.PluginsConfig) (*sign.Keyring, string, error) {
+	local, _, err := resolvePluginLocalKeyring(cfg)
+	if err != nil {
+		return nil, "", err
+	}
+	return enforcedPluginKeyring(cfg, local)
+}
+
+// resolvePluginTrustInput assembles the trust set a plugin package's provenance
+// is judged against: the local keyring document merged with whatever the
+// fetched trust list currently holds (trustlist.Merge).
+//
+// It does NOT consult "require_signature". That switch answers one question —
+// may a package no registered publisher endorses mount — and it is answered
+// against this set, not instead of it. Building the set for a deployment that
+// answers "yes" is not that switch being quietly turned back on: an unsigned
+// package still mounts (see loader.Loader.admit), and all the set adds is that
+// a package CAN come out ProvenanceRegistered or ProvenanceRevoked at all. The
+// second of those is the point — refusing a revoked key is what the graded
+// install spec requires unconditionally, and "I do not require an endorsement"
+// is not the same sentence as "I am willing to run code that was withdrawn".
+// Resolving the keyring only when the policy required one is what left that
+// refusal unreachable for every deployment with the switch off.
+//
+// store may be nil, which is the deployment that configured no remote trust
+// list; the merge then has only the local half.
+//
+// reportUnavailable receives the error from a trust list whose cache cannot be
+// read, and must not be nil. Store.Current returns a usable Trust AND an error
+// in that case (see its doc comment): the Trust is StatusUnavailable, which is
+// the contract's own "safe to use, the list half is empty" state. Propagating
+// the error instead would fail every mount on a machine that has simply not
+// completed its first fetch yet, and dropping it would be the silent
+// degradation the fail-loud rule forbids — so the list half is taken as
+// unavailable and the error is handed back to be recorded. Recording it is not
+// optional: it is the only thing standing between "the list half was empty"
+// and a silent degradation.
+//
+// # The one trust list failure that is not degraded
+//
+// "Unavailable, keep going" is right because Store.Current keeps this machine's
+// recorded REVOCATIONS in that Trust even when the list document is gone: the
+// registrations shrink to the local keyring, which is exactly "mount on the
+// conclusion recorded at install time", while a key this machine has seen
+// revoked stays refused. Both halves of that sentence hold, so degrading is
+// safe.
+//
+// trustlist.ErrRevocationsUnknown is the case where the second half does not
+// hold: the revocation record itself could not be read, so this deployment
+// cannot tell whether a key has been withdrawn. Degrading would answer that
+// question with "no". It is returned as an error instead, which fails the mount
+// rather than mounting something nobody could judge.
+func resolvePluginTrustInput(localRaw json.RawMessage, store *trustlist.Store,
+	reportUnavailable func(error)) (manifest.TrustInput, error) {
+	if reportUnavailable == nil {
+		// An invariant violation, not a state to handle: this parameter is the
+		// whole reason an unreadable trust list cannot pass unrecorded. Checked
+		// here rather than left to the nil call below, which runs only on a
+		// machine whose trustlist cache cannot be read -- the rarest path
+		// through this function, and the one whose bare nil dereference would
+		// say least about what was actually missing.
+		panic("cli: resolvePluginTrustInput: reportUnavailable is nil; a trust list that cannot be read would go unrecorded")
+	}
+	var listed trustlist.Trust
+	if store != nil {
+		current, err := store.Current()
+		if err != nil {
+			if errors.Is(err, trustlist.ErrRevocationsUnknown) {
+				// The one trust list failure that must NOT degrade. Everything
+				// else Store.Current reports leaves the registrations short and
+				// the revocations intact, which is the documented "mount on the
+				// conclusion recorded at install time" behaviour. This one says
+				// the machine cannot tell whether a key has been revoked at
+				// all, and continuing would answer that question with "no" —
+				// the fail-open this whole record exists to stop.
+				return manifest.TrustInput{}, fmt.Errorf("assemble the plugin trust set: %w", err)
+			}
+			reportUnavailable(err)
+		}
+		listed = current
+	}
+	merged, publishers, err := trustlist.Merge(localRaw, listed)
+	if err != nil {
+		return manifest.TrustInput{}, fmt.Errorf("assemble the plugin trust set: %w", err)
+	}
+	return manifest.TrustInput{Keyring: merged, Publishers: publishers}, nil
+}
+
+// pluginTrustlistUnavailableMsg is what a mount logs when the trust list half
+// of the trust set cannot be read. It is a constant because a message is what
+// an operator greps for, and because a test that spelled it out a second time
+// could go on passing while the line an operator searches for changed.
+const pluginTrustlistUnavailableMsg = "plugin trust list is unavailable; only the local keyring is in force"
+
+// pluginCommandTrustlistUnavailableMsg is the same report on an `agent plugins`
+// command's own output stream, where a person is present and is about to accept
+// or authorize a package. One constant covers every such command rather than
+// one per command: the situation an operator has to understand is identical
+// whichever of them they typed, and a second wording of it would only be a
+// second thing to learn. It is a constant for the reason
+// pluginTrustlistUnavailableMsg is —
+// spelled a second time in a test, it would go on passing while the line an
+// operator reads changed — and it is a SEPARATE constant because the two are
+// read in different places by different people: this one addresses whoever is
+// running the command, the other one whoever is reading a startup log.
+const pluginCommandTrustlistUnavailableMsg = "warning: this deployment's trust list is unavailable, so only " +
+	"the local keyring judged this package"
+
+// pluginTrustSet is the provider a Loader reads its trust set from on every
+// mount.
+//
+// The local half is captured once, when this provider is built, because the
+// keyring document is configuration and a Loader's configuration is frozen the
+// same way. The list half is read on every call, because it refreshes
+// underneath this process — that is the whole reason loader.TrustSet is a
+// function rather than a value.
+//
+// The asymmetry has a consequence worth naming. A keyring edited on disk
+// reaches a running process only when one is assembled again, so a revocation
+// added to the local keyring document takes effect at the next serve start
+// rather than at a reload. What a reload does with such an edit is REFUSE:
+// loader.SignaturePolicy carries the local keyring's revocations and the
+// endorsement requirement, and `agent plugins reload` compares the config's
+// policy against the running one and stops rather than converging under the old
+// keyring — under "require_signature": false exactly as under the default. A
+// revocation arriving through the trust list has neither the delay nor the
+// refusal, which is what that half is for.
+//
+// logger must be non-nil: a trust list this process cannot read is exactly the
+// thing that must not pass unrecorded.
+func pluginTrustSet(localRaw json.RawMessage, store *trustlist.Store, logger *slog.Logger) loader.TrustSet {
+	return func() (manifest.TrustInput, error) {
+		return resolvePluginTrustInput(localRaw, store, func(err error) {
+			logger.Warn(pluginTrustlistUnavailableMsg,
+				"component", "cli",
+				"error", err,
+				"consequence", "a key the list registers is unrecognised, and a revocation the list "+
+					"carries is not applied, until a refresh succeeds")
+		})
+	}
 }
 
 // The messages the trustlist refresh loop logs. Each is a constant because a
@@ -756,20 +997,32 @@ func runTrustlistRefreshLoop(ctx context.Context, refresher trustlistRefresher, 
 // pluginSignaturePolicy is the signature policy cfg asks for, in the comparable
 // form a running Loader reports through Loader.SignaturePolicy.
 //
-// It resolves the keyring through resolvePluginKeyring, so it applies exactly
-// the rules serve assembly applies: a keyring that will not read still fails
-// here, and "signatures required" with no keyring still fails here. A leniently
+// The policy is computed from the keyring document AS READ and from
+// cfg.SignatureRequired() — the same two values an assembly puts into
+// loader.Config. Computing it from the POLICY-ENFORCED keyring instead (nil
+// whenever no endorsement is required) is what made this comparison vacuous for
+// every deployment with the requirement off: two zero policies, equal to each
+// other however the keyring document had changed in between, so a revocation
+// added to it converged with "loaded" on screen.
+//
+// The rules serve assembly applies still apply here, because a leniently
 // computed policy would be worse than none — it could report "unchanged" for a
-// config serve would refuse to start on.
+// config serve would refuse to start on. A keyring that will not read fails
+// here, and so does a config that requires an endorsement while naming no
+// keyring: enforcedPluginKeyring is called for that second rule alone, and the
+// keyring it hands back is deliberately not what the policy is built from.
 func pluginSignaturePolicy(cfg config.PluginsConfig) (loader.SignaturePolicy, error) {
-	// The "configured but not enforced" note belongs to whoever ASSEMBLES a
-	// loader; startup already logged it, and repeating it on every reload of an
-	// unchanged policy would say nothing new.
-	keyring, _, err := resolvePluginKeyring(cfg)
+	local, _, err := resolvePluginLocalKeyring(cfg)
 	if err != nil {
 		return loader.SignaturePolicy{}, err
 	}
-	return loader.SignaturePolicyOf(keyring), nil
+	// The "configured while no endorsement is required" note belongs to whoever
+	// ASSEMBLES a loader; startup already logged it, and repeating it on every
+	// reload of an unchanged policy would say nothing new.
+	if _, _, err := enforcedPluginKeyring(cfg, local); err != nil {
+		return loader.SignaturePolicy{}, err
+	}
+	return loader.SignaturePolicyOf(local, cfg.SignatureRequired()), nil
 }
 
 // pluginRemotePolicy is the remote-source policy cfg asks for, in the
@@ -856,9 +1109,10 @@ func refusePluginDeploymentChanged(cmdContext, manifestPath string, snapshot []b
 //     to make one has exactly one option left, turning the requirement off,
 //     which is the outcome signature verification exists to prevent. install,
 //     grant and deny are the odd members: each DOES read the plugins config
-//     (to resolve the same cache, fetch limits, remote-source policy and
-//     trust set a running serve would use — see resolvePluginRemote and
-//     resolvePluginKeyring) and each DOES write the deployment manifest.
+//     (to resolve the same cache, fetch limits and remote-source policy a
+//     running serve would use — see resolvePluginRemote — and, for install,
+//     the same trust set as well, see resolvePluginTrustInput) and each DOES
+//     write the deployment manifest.
 //     install appends one verified entry, disabled unless --grant names the
 //     plugin's complete capability set (in which case it is written already
 //     authorized, in the same step); grant authorizes an existing entry to
@@ -956,15 +1210,20 @@ func newPluginsReloadCommand(application *app.App, out io.Writer) *cobra.Command
 				return err
 			}
 			// The manifest and root below come from the config just read, but
-			// the trust set does NOT: it was frozen when serve assembled this
-			// Loader, and there is no way to swap it under a running one. So an
-			// operator who tightened the policy and reloaded would get their new
-			// manifest converged under their OLD trust set, with no warning
-			// replayed and every log line looking normal — the exact silent
-			// degradation signature verification exists to prevent. Refuse
-			// instead, and say what has to happen: a security control that is
-			// partly applied is worse than one that is not, because it looks
-			// applied.
+			// the LOCAL KEYRING does NOT: loader.New copies Config.LocalKeyring
+			// into the Loader once, and the type exposes no way to replace it
+			// afterwards, so a keyring change cannot reach a Loader that is
+			// already running. An operator who tightened the policy and reloaded would
+			// therefore get their new manifest converged under their OLD
+			// keyring, with no warning replayed and every log line looking
+			// normal — the exact silent degradation signature verification
+			// exists to prevent. Refuse instead, and say what has to happen: a
+			// security control that is partly applied is worse than one that is
+			// not, because it looks applied.
+			//
+			// loader.SignaturePolicy covers exactly that half and no more; see
+			// its type comment for why what Config.TrustSet answers is
+			// deliberately left out of the comparison.
 			//
 			// limits and apply_wait are frozen the same way and are NOT checked
 			// here. They are resource settings; a stale ceiling is a performance
@@ -974,9 +1233,9 @@ func newPluginsReloadCommand(application *app.App, out io.Writer) *cobra.Command
 				return err
 			}
 			if running := pluginLoader.SignaturePolicy(); !running.Equal(wanted) {
-				return fmt.Errorf("reload plugin deployment %q: the config now says %s, but this process is enforcing %s; "+
-					"the trust set is fixed when serve starts, so restart serve to apply a signature-policy change "+
-					"(reloading now would converge the new manifest under the old policy)",
+				return fmt.Errorf("reload plugin deployment %q: the config now asks for %s, but this process was "+
+					"built with %s; the local keyring is fixed when serve starts, so restart serve to apply a "+
+					"signature-policy change (reloading now would converge the new manifest under the old keyring)",
 					cfg.Plugins.Manifest, wanted, running)
 			}
 			// The remote-source policy is frozen the same way and is refused
@@ -1348,27 +1607,43 @@ func writePluginStatus(w io.Writer, manifestPath, root string, rows []pluginStat
 //  1. fetch.Fetch — the digest gates the bytes; mismatched bytes never reach
 //     disk.
 //  2. remote.Cache.Put — unpack and atomic placement in the plugin cache.
-//  3. manifest.LoadPackage(dir, keyring) — SIGNATURE VERIFICATION, but only
-//     when this deployment's plugins config sets "require_signature": true;
-//     with it false, LoadPackage skips signature checking entirely and only
-//     the wasm sha256 check runs (the command's own output says so on that
-//     path — see the "signature NOT verified" line in runPluginsInstall).
-//     Nothing past this step runs if verification that DID run fails.
-//  4. manifest.DraftEntry -> manifest.AddEntry -> manifest.WriteDeployment.
+//  3. manifest.LoadPackage(dir, trust) — reads the package and judges its
+//     provenance. It refuses a plugin.sig that is malformed or that does not
+//     verify against the trusted key it names, and refuses a plugin.wasm that
+//     does not match plugin.json's sha256; a MISSING signature, or one made by
+//     a key the deployment's trust set does not name, is a Provenance verdict
+//     rather than a refusal. Nothing past this step runs if step 3 returns an
+//     error.
+//  4. admitInstalledProvenance — this command's policy over that verdict, and
+//     the only place --accept-unsigned is consulted. It also decides the
+//     acceptance the entry will carry.
+//  5. manifest.DraftEntry -> manifest.AddEntry -> manifest.WriteDeployment.
 //
-// Nothing is ever written to plugins.json before step 3 succeeds: a
-// verification failure — bad signature, a missing one under a required
-// policy, or a digest mismatch caught even earlier, in step 1 — leaves the
-// deployment manifest byte-for-byte untouched, and leaves nothing behind in
-// the plugin cache either.
+// Nothing is ever written to plugins.json before steps 3 and 4 both pass: a
+// verification failure — bad signature, a package nobody endorses with no
+// --accept-unsigned, a revoked key, or a digest mismatch caught even earlier,
+// in step 1 — leaves the deployment manifest byte-for-byte untouched, and
+// leaves nothing behind in the plugin cache either.
 //
 // install shares its cache, HTTP client, fetch/unpack limits and
-// insecure-source policy with a running serve through resolvePluginRemote,
-// and its trust set through resolvePluginKeyring — the same two functions
-// newPluginLoader calls to build the loader `agent serve` runs. Deriving its
-// own copies of either here would let a package install cleanly through this
-// command and then have serve refuse to fetch or load it, with the
-// contradiction invisible in both commands' output.
+// insecure-source policy with a running serve through resolvePluginRemote, and
+// it assembles its trust set through resolvePluginLocalKeyring and
+// resolvePluginTrustInput — the two functions serve's own assembly builds its
+// TrustSet provider out of. Deriving its own copies of either here would let a
+// package install cleanly through this command and then have serve refuse to
+// fetch or load it, with the contradiction invisible in both commands' output.
+//
+// Where install differs is only in how it reaches the trust list's Store: it
+// resolves one of its own from the config (resolvePluginTrustlist) and reads
+// the cache, where serve is handed the Store its refresh loop writes through.
+// install never refreshes: fetching a list of its own would judge this package
+// against a trust set no mount will ever see.
+//
+// The one thing install does NOT take from that shared resolution is
+// "require_signature". That switch says whether an unendorsed package may
+// MOUNT with no acceptance on record; install refuses an unendorsed package
+// without --accept-unsigned whatever it says — see admitInstalledProvenance
+// for why the two questions are separate.
 //
 // With no --grant, the written entry keeps "enabled": false and NO "grant"
 // block at all — not an empty "grant.capabilities", the whole key is
@@ -1404,15 +1679,23 @@ func newPluginsInstallCommand(out io.Writer) *cobra.Command {
 	var configPath string
 	var digestFlag string
 	var grantFlag string
+	var acceptUnsigned bool
 	cmd := &cobra.Command{
 		Use:   "install <url>",
 		Short: "Fetch, verify and register a remote plugin package, authorizing it only if --grant is given",
 		Long: "Fetch, verify and register a remote plugin package.\n\n" +
 			"install fetches the package at <url>, checks its bytes against --digest, unpacks it into the\n" +
-			"configured plugin cache, and, if this deployment's plugins config sets \"require_signature\": true,\n" +
-			"verifies its signature under the deployment's trust set (with it false, NOTHING is verified --\n" +
-			"only the wasm sha256 check runs, and the command's own output says so). Only once verification\n" +
-			"that DID run passes does it append an entry to plugins.json.\n\n" +
+			"configured plugin cache, and judges who stands behind it against this deployment's trust set\n" +
+			"(the configured keyring merged with the fetched trust list). Only once that judgement admits\n" +
+			"the package does it append an entry to plugins.json:\n\n" +
+			"  - a package a registered publisher endorses installs, and the output names the key;\n" +
+			"  - a package NOBODY endorses is refused unless --accept-unsigned is given, which records the\n" +
+			"    digest of these exact plugin.json bytes in the entry it writes;\n" +
+			"  - a package signed by a key this deployment REVOKED is refused outright. --accept-unsigned\n" +
+			"    does not apply to it: that flag accepts a package nobody endorsed, and a revoked key is an\n" +
+			"    endorsement that was withdrawn.\n\n" +
+			"\"require_signature\": false says an unendorsed package may MOUNT without an acceptance on\n" +
+			"record; it does not make install register one silently.\n\n" +
 			"With no --grant, the entry is written \"enabled\": false with NO \"grant\" block at all:\n" +
 			"install registers the package without authorizing it; run `agent plugins grant` to authorize it.\n\n" +
 			"With --grant naming EXACTLY the capabilities the plugin declares in plugin.json (not a subset --\n" +
@@ -1425,12 +1708,15 @@ func newPluginsInstallCommand(out io.Writer) *cobra.Command {
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return runPluginsInstall(cmd.Context(), out, args[0], digestFlag, grantFlag,
-				cmd.Flags().Changed("grant"), configPath)
+				cmd.Flags().Changed("grant"), acceptUnsigned, configPath)
 		},
 	}
 	cmd.Flags().StringVar(&digestFlag, "digest", "",
 		`sha256 digest the fetched package must match, as "sha256:<hex>" (required: a remote entry is `+
 			"never installed unverified)")
+	cmd.Flags().BoolVar(&acceptUnsigned, "accept-unsigned", false,
+		"install a package that no registered publisher endorses, recording an acceptance of these exact "+
+			"bytes; it does NOT apply to a package signed by a key this deployment revoked")
 	cmd.Flags().StringVar(&grantFlag, "grant", "",
 		"comma-separated capabilities to grant; must name EXACTLY the set the plugin declares in plugin.json "+
 			"(not a subset), and authorizes the entry immediately (\"enabled\": true); allowed hosts and paths "+
@@ -1443,7 +1729,7 @@ func newPluginsInstallCommand(out io.Writer) *cobra.Command {
 // command's doc comment for the order of operations this function follows
 // and why it is not negotiable.
 func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag, grantFlag string,
-	grantFlagChanged bool, configPath string) error {
+	grantFlagChanged, acceptUnsigned bool, configPath string) error {
 	source := strings.TrimSpace(sourceArg)
 	if source == "" {
 		return errors.New("plugins install: the source URL is empty")
@@ -1537,17 +1823,51 @@ func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag
 			`turned on explicitly with "allow_insecure_sources": true in the plugins config`, source)
 	}
 
-	// The ONLY sanctioned constructor for the trust set — see
-	// resolvePluginKeyring's own doc comment. Unlike newPluginLoader (which
-	// Warns once, at the assembly that drops an unenforced keyring), install
-	// neither builds nor holds a Loader to log through — so the second
-	// return value (droppedKeyringPath, the path of a keyring that loaded
-	// but this policy does not enforce) is kept here instead, to fold into
-	// the "signature NOT verified" line in this command's own success
-	// output below, the only channel install has for a warning at all.
-	keyring, droppedKeyringPath, err := resolvePluginKeyring(cfg.Plugins)
+	// The keyring document, read once, and then put to the two separate uses
+	// serve's assembly also puts it to (see newPluginLoader).
+	//
+	// enforcedPluginKeyring is called for its POLICY rule alone: a deployment
+	// that requires an endorsement while naming no keyring is refused here
+	// exactly as it is refused at startup, so a package cannot install through
+	// a config serve would not come up on. Its returned keyring is deliberately
+	// NOT what this package is judged against — that is the trust set below,
+	// which the policy does not reach. droppedKeyringPath (a keyring configured
+	// while the policy requires no endorsement) is folded into this command's
+	// own output, the only channel install has for a warning at all.
+	localKeyring, localRaw, err := resolvePluginLocalKeyring(cfg.Plugins)
 	if err != nil {
 		return err
+	}
+	_, droppedKeyringPath, err := enforcedPluginKeyring(cfg.Plugins, localKeyring)
+	if err != nil {
+		return err
+	}
+	// The fetched trust list, if this deployment has one. install reads the
+	// cache and never refreshes it: a refresh is the running serve's job, and a
+	// command that fetched a list of its own would judge this package against a
+	// trust set no mount will ever see.
+	trustStore, _, err := resolvePluginTrustlist(cfg.Plugins)
+	if err != nil {
+		return err
+	}
+	// The SAME assembly serve's loader mounts through — one function, so a
+	// package install admits cannot be one serve then refuses, or the reverse.
+	var trustlistErr error
+	trust, err := resolvePluginTrustInput(localRaw, trustStore, func(unavailable error) {
+		trustlistErr = unavailable
+	})
+	if err != nil {
+		return fmt.Errorf("plugins install: %w", err)
+	}
+	if trustlistErr != nil {
+		// Reported before anything is fetched, and reported at all: a trust
+		// list this machine cannot read means a publisher it registers goes
+		// unrecognised and a revocation it carries goes unapplied, and an
+		// operator deciding whether to accept a package has to know that is
+		// the trust set the decision was taken against.
+		if _, werr := fmt.Fprintf(out, "%s: %v\n", pluginCommandTrustlistUnavailableMsg, trustlistErr); werr != nil {
+			return fmt.Errorf("write plugins install output: %w", werr)
+		}
 	}
 
 	u, err := probe.RemoteURL()
@@ -1573,9 +1893,23 @@ func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag
 	// this fails, which holds simply because nothing below this line has run
 	// yet: no Deployment has been mutated, and WriteDeployment has not been
 	// called.
-	pm, _, err := manifest.LoadPackage(dir, keyring)
+	pm, _, prov, err := manifest.LoadPackage(dir, trust)
 	if err != nil {
 		return fmt.Errorf("plugins install: %w", err)
+	}
+	// The digest an acceptance is written as, and the one a refusal shows. It
+	// comes from manifest.ManifestDigest — the same function
+	// (*loader.Loader).admit reads an acceptance back with — because an
+	// acceptance is only worth writing if the side that judges it computes the
+	// identical value over the identical bytes. Computing it here a second way
+	// is how an entry gets written that every later mount refuses as changed.
+	manifestDigest, err := manifest.ManifestDigest(dir)
+	if err != nil {
+		return fmt.Errorf("plugins install: %w", err)
+	}
+	acceptedDigest, err := admitInstalledProvenance(source, prov, manifestDigest, acceptUnsigned)
+	if err != nil {
+		return err
 	}
 
 	// Rule 5: granting a capability the plugin never declared is a config
@@ -1598,6 +1932,11 @@ func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag
 	if err != nil {
 		return fmt.Errorf("plugins install: %w", err)
 	}
+	// The acceptance admitInstalledProvenance decided on, written into the
+	// entry that is about to land. It is "" for an endorsed package, and the
+	// assignment is unconditional so that the one grade which needs a record
+	// cannot lose it to a branch somebody adds above.
+	entry.AcceptedUnsigned = acceptedDigest
 	// D9: a non-empty --grant IS an authorization decision, not a draft of
 	// one — resolveInstallGrants above already refused anything but a grant
 	// naming EXACTLY pm.Capabilities, so this can never write an entry that
@@ -1659,23 +1998,96 @@ func runPluginsInstall(ctx context.Context, out io.Writer, sourceArg, digestFlag
 		return fmt.Errorf("write plugins install output: %w", err)
 	}
 
-	// F4: the help text and doc comments only promise verification when this
-	// deployment's policy actually requires one. keyring is nil here exactly
-	// when it did not run, so this is the one line that lets an operator
-	// tell a verified install apart from an unverified one without reading
-	// the config -- and it names the dropped keyring too, when one WAS
-	// configured but this policy does not enforce it.
-	if keyring == nil {
-		msg := `signature NOT verified: this deployment sets "require_signature": false`
-		if droppedKeyringPath != "" {
-			msg = fmt.Sprintf(`signature NOT verified: this deployment configured a keyring (%s) but sets `+
-				`"require_signature": false, so it was not enforced`, droppedKeyringPath)
+	// F4: which grade this package installed under, on screen, so an operator
+	// can tell an endorsed install from an accepted one without reading the
+	// config or the manifest back. admitInstalledProvenance refused every other
+	// outcome above, so these are the only two states that reach here.
+	var msg string
+	switch prov.State {
+	case manifest.ProvenanceRegistered:
+		// prov.Publisher is a display name the fetched trust list carries for
+		// the key; a deployment whose trust set is a local keyring alone has
+		// none, and the id is then the whole of what it can name.
+		msg = fmt.Sprintf("endorsed by the publisher registered as key %q; its signature over plugin.json "+
+			"verified against this deployment's trust set.", prov.KeyID)
+		if prov.Publisher != "" {
+			msg = fmt.Sprintf("endorsed by %q (key %q); its signature over plugin.json verified against "+
+				"this deployment's trust set.", prov.Publisher, prov.KeyID)
 		}
-		if _, err := fmt.Fprintln(out, msg); err != nil {
-			return fmt.Errorf("write plugins install output: %w", err)
+	default:
+		msg = fmt.Sprintf("NOT endorsed by any registered publisher; --accept-unsigned recorded an "+
+			"acceptance of plugin.json %s in this entry.", acceptedDigest)
+		if droppedKeyringPath != "" {
+			// Worth saying here and not only at startup: this deployment holds
+			// a trust set AND has said an endorsement is not required, so the
+			// acceptance just recorded is not what lets this entry mount --
+			// it would have mounted anyway. It is the record of who said yes.
+			msg += fmt.Sprintf(` This deployment configured a keyring (%s) but sets "require_signature": `+
+				`false, so no endorsement is required at mount time either.`, droppedKeyringPath)
 		}
 	}
+	if _, err := fmt.Fprintln(out, msg); err != nil {
+		return fmt.Errorf("write plugins install output: %w", err)
+	}
 	return nil
+}
+
+// admitInstalledProvenance applies the graded-install policy to what
+// manifest.LoadPackage judged about a package's origin, and returns the
+// acceptance to record in the entry install is about to write: manifestDigest
+// for a package accepted with --accept-unsigned, and "" for one a registered
+// publisher endorses.
+//
+// The three grades are not symmetric, and the asymmetry is the point:
+//
+//   - Registered installs with no flag. An endorsement is the thing
+//     --accept-unsigned substitutes for, so demanding both would be asking an
+//     operator to vouch for bytes somebody already vouched for.
+//   - Unsigned installs only with --accept-unsigned, and the refusal names the
+//     flag and shows the digest that flag would record. It is refused whatever
+//     "require_signature" says: that switch answers whether an unendorsed
+//     package may MOUNT, and this is the separate question of whether install
+//     registers one with nobody's name on it. Reading the switch here would
+//     erase this grade in exactly the deployments that turned endorsements off
+//     — the deployments with the least else standing between a download and a
+//     wasm module that runs.
+//   - Revoked is refused, and --accept-unsigned does not lift it. The flag's
+//     name is unsigned; a revocation is not an absence of a signature but an
+//     endorsement that was given and then withdrawn. One flag that waved both
+//     through would put two decisions behind one switch, and an operator who
+//     typed it made only one of them. The error says so outright, because an
+//     operator who has just been told to add a flag will otherwise add it
+//     again.
+//
+// A state this function cannot grade is refused rather than admitted: an
+// unhandled enum value is a programming error, and treating one as "fine" is
+// the exact shape of silent trust escalation. It mirrors
+// (*loader.Loader).admit's own default branch, which refuses for the same
+// reason.
+func admitInstalledProvenance(source string, prov manifest.Provenance, manifestDigest string,
+	acceptUnsigned bool) (string, error) {
+	switch prov.State {
+	case manifest.ProvenanceRegistered:
+		return "", nil
+
+	case manifest.ProvenanceUnsigned:
+		if !acceptUnsigned {
+			return "", fmt.Errorf("plugins install: %s carries no endorsement from any registered "+
+				"publisher; its plugin.json hashes to %s. Re-run with --accept-unsigned to record that "+
+				"you accept these exact bytes: %w", source, manifestDigest, manifest.ErrUnsignedNotAccepted)
+		}
+		return manifestDigest, nil
+
+	case manifest.ProvenanceRevoked:
+		return "", fmt.Errorf("plugins install: %s is signed by key %q, which this deployment revoked%s. "+
+			"--accept-unsigned does not apply: that flag accepts a package nobody has endorsed, while this "+
+			"one carries an endorsement that was withdrawn: %w",
+			source, prov.KeyID, manifest.DescribeRevocation(prov), manifest.ErrRevokedPublisher)
+
+	default:
+		return "", fmt.Errorf("plugins install: %s has provenance state %s, which this command does not "+
+			"know how to grade: %w", source, prov.State, manifest.ErrUnsignedNotAccepted)
+	}
 }
 
 // resolveInstallGrants parses --grant's comma-separated capability list via
@@ -1936,24 +2348,78 @@ func runPluginsGrant(ctx context.Context, out io.Writer, nameArg, capabilitiesFl
 		return fmt.Errorf("plugins grant: %w", err)
 	}
 
-	// The same two resolvers install uses (resolvePluginRemote,
-	// resolvePluginKeyring), so grant and install — and a running serve —
-	// agree on what "the plugin's own declaration" means and under what
-	// trust set it is read. A cache hit costs no network, exactly like
-	// install's own remote path.
+	// resolvePluginRemote is the same resolver install uses, so grant and
+	// install — and a running serve — agree on what "the plugin's own
+	// declaration" means and where its package comes from. A cache hit costs no
+	// network, exactly like install's own remote path.
 	remote, err := resolvePluginRemote(cfg.Plugins)
 	if err != nil {
 		return err
 	}
-	keyring, _, err := resolvePluginKeyring(cfg.Plugins)
+
+	// The trust set this package is judged against, assembled out of the same
+	// function install and serve assemble theirs out of
+	// (resolvePluginTrustInput): the keyring document merged with whatever the
+	// fetched trust list currently holds.
+	//
+	// The POLICY-enforced keyring is deliberately NOT it. That one goes nil
+	// under "require_signature": false (enforcedPluginKeyring), and a nil
+	// keyring makes manifest.LoadPackage judge every package
+	// ProvenanceUnsigned without reading plugin.sig at all — so this command
+	// would authorize, in silence, a package whose signature the plugin panel
+	// (PluginConsentService.Grant, which reads the merged set) and the mount
+	// both refuse. One operator, one config, one package, two answers
+	// depending on which surface they used.
+	//
+	// enforcedPluginKeyring is still called, for its POLICY rule alone and
+	// exactly as install calls it: a deployment that requires an endorsement
+	// while naming no keyring is refused here as it is refused at startup, so
+	// an entry cannot be authorized through a config serve would not come up
+	// on.
+	localKeyring, localRaw, err := resolvePluginLocalKeyring(cfg.Plugins)
 	if err != nil {
 		return err
 	}
+	if _, _, err := enforcedPluginKeyring(cfg.Plugins, localKeyring); err != nil {
+		return err
+	}
+	// The fetched trust list's cache, if this deployment has one. grant reads
+	// it and never refreshes it, for install's reason: a refresh is the running
+	// serve's job, and a command that fetched a list of its own would judge
+	// this package against a trust set no mount will ever see.
+	trustStore, _, err := resolvePluginTrustlist(cfg.Plugins)
+	if err != nil {
+		return err
+	}
+	var trustlistErr error
+	trust, err := resolvePluginTrustInput(localRaw, trustStore, func(unavailable error) {
+		trustlistErr = unavailable
+	})
+	if err != nil {
+		return fmt.Errorf("plugins grant: %w", err)
+	}
+	if trustlistErr != nil {
+		// On this command's own output, where the person deciding to authorize
+		// is standing: a trust list this machine cannot read means a publisher
+		// it registers goes unrecognised and a revocation it carries goes
+		// unapplied, and that is the trust set this authorization is being
+		// taken against.
+		if _, werr := fmt.Fprintf(out, "%s: %v\n", pluginCommandTrustlistUnavailableMsg, trustlistErr); werr != nil {
+			return fmt.Errorf("write plugins grant output: %w", werr)
+		}
+	}
+
 	dir, err := resolvePluginPackageDir(ctx, entry, remote, cfg.Plugins.Root)
 	if err != nil {
 		return fmt.Errorf("plugins grant: %w", err)
 	}
-	pm, _, err := manifest.LoadPackage(dir, keyring)
+	// The Provenance verdict is not read here, per the graded-install plan
+	// §6.3: grant applies no trust rule of its own, so an entry is authorized
+	// whether its package comes back registered, unsigned or revoked. What the
+	// trust set above changes is not that, but what LoadPackage answers with —
+	// including the refusal it raises when a signature and the bytes under it
+	// disagree, which reaches this command as an error rather than a verdict.
+	pm, _, _, err := manifest.LoadPackage(dir, trust)
 	if err != nil {
 		return fmt.Errorf("plugins grant: %w", err)
 	}

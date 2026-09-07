@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -35,7 +36,6 @@ import (
 	"github.com/stardust/legion-agent/internal/manualgate"
 	"github.com/stardust/legion-agent/internal/memory"
 	"github.com/stardust/legion-agent/internal/observability"
-	"github.com/stardust/legion-agent/internal/plugin/sign"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/prompt"
 	"github.com/stardust/legion-agent/internal/quality"
@@ -2801,14 +2801,45 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	pluginToolRoot := cfg.ContextFiles.Root
 	pluginTools := tool.NewFileReadWriteWorkspaceRegistry(pluginToolRoot, auditLog,
 		tool.WithProjectRoot(pluginToolRoot))
-	if err := assemblePlugins(ctx, pluginApp, cfg, pluginHostDeps{
+	// The remote trustlist is the other half of the question the local keyring
+	// answers -- what does this deployment trust -- so it is resolved here,
+	// beside it, rather than somewhere an operator would have to look for
+	// separately. A configured trustlist that cannot be built stops startup
+	// (see resolvePluginTrustlist); an unconfigured one yields no Store and no
+	// loop.
+	//
+	// It is resolved BEFORE assemblePlugins because the loader reads this same
+	// Store on every mount (pluginHostDeps.Trustlist -> pluginTrustSet): a
+	// Store built after the assembly could only have reached the loader as a
+	// second one, answering out of the same cache directory while the refresh
+	// loop wrote through the first.
+	//
+	// It is resolved OUTSIDE any "are plugins configured" branch, and so runs
+	// even when this deployment configured no plugins.manifest, which mirrors
+	// config.Load: validatePlugins checks the trustlist section before its
+	// "no manifest means plugins are off" early return, on the reasoning that
+	// fetching a remote trustlist and loading local plugins are separate
+	// questions.
+	trustStore, trustlistRefreshInterval, err := resolvePluginTrustlist(cfg.Plugins)
+	if err != nil {
+		// Nothing is mounted yet, so there is no plugin state to unwind.
+		closeStore()
+		return ServeResult{}, err
+	}
+	// pluginTrust is the one trust set this process judges plugin packages
+	// against: the provider the loader assembled below reads on every mount.
+	// It is carried down to the consent service rather than rebuilt there --
+	// see NewPluginConsentService's trustFn for what a second one would cost.
+	pluginTrust, err := assemblePlugins(ctx, pluginApp, cfg, pluginHostDeps{
 		Audit:          auditLog,
 		Events:         workflowEvents,
 		Logger:         logger,
 		Gate:           taskGate,
 		PromptSegments: pluginPromptSegments,
 		PluginTools:    pluginTools,
-	}); err != nil {
+		Trustlist:      trustStore,
+	})
+	if err != nil {
 		// Nothing is mounted on this path: assemblePlugins only returns an error
 		// before it converges anything, so there is no plugin state to unwind.
 		closeStore()
@@ -2829,23 +2860,31 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// "plugins.manifest" configured -- so the endpoint reports 404 naming
 	// that instead of an empty list, which would read as "no plugins
 	// installed" rather than "plugins are not enabled" (see
-	// handleListPlugins). The keyring and remote-source policy are each
-	// resolved once, here, rather than inside a closure PluginConsentService
-	// calls later: resolvePluginKeyring/resolvePluginRemote can fail, and
-	// NewPluginConsentService has nowhere to return such an error to -- so a
-	// failure has to surface as a loud startup error now, not a swallowed
-	// one at request time. Both are guaranteed to succeed here: assemblePlugins
-	// above already resolved them once (inside newPluginLoader) on this same
-	// cfg.Plugins to build the running loader, so a second, identical
-	// resolution failing would be a contradiction, not a real config problem
-	// -- but each is still checked and returned rather than assumed, per the
-	// fail-loud rule.
+	// handleListPlugins). The remote-source policy is resolved once, here,
+	// rather than inside a closure PluginConsentService calls later:
+	// resolvePluginRemote can fail, and NewPluginConsentService has nowhere to
+	// return such an error to -- so a failure has to surface as a loud startup
+	// error now, not a swallowed one at request time. It is guaranteed to
+	// succeed here: assemblePlugins above already resolved it once (inside
+	// newPluginLoader) on this same cfg.Plugins to build the running loader, so
+	// a second, identical resolution failing would be a contradiction, not a
+	// real config problem -- but it is still checked and returned rather than
+	// assumed, per the fail-loud rule.
+	//
+	// The trust set is NOT resolved a second time. It is pluginTrust, the very
+	// provider the running loader judges every mount against, so the panel and
+	// the mount cannot come to different conclusions about the same package.
 	var pluginConsent server.PluginConsent
 	if pluginApp.Plugins() != nil {
-		pluginKeyring, _, err := resolvePluginKeyring(cfg.Plugins)
-		if err != nil {
+		if pluginTrust == nil {
+			// A loader is attached but no trust set came back with it, which
+			// means this App arrived carrying plugins from an assembly that is
+			// not this one. Building the consent service around a nil provider
+			// would defer the failure to the first request; refusing here keeps
+			// it at the assembly that is actually wrong.
 			cleanup()
-			return ServeResult{}, fmt.Errorf("plugin consent service: resolve trust keyring: %w", err)
+			return ServeResult{}, errors.New("plugin consent service: a plugin loader is attached but this " +
+				"assembly built no trust set for it; the consent service would have nothing to judge packages against")
 		}
 		pluginRemote, err := resolvePluginRemote(cfg.Plugins)
 		if err != nil {
@@ -2853,26 +2892,10 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 			return ServeResult{}, fmt.Errorf("plugin consent service: resolve remote source policy: %w", err)
 		}
 		pluginConsent = NewPluginConsentService(cfg.Plugins.Manifest, cfg.Plugins.Root, pluginApp.Plugins,
-			func() *sign.Keyring { return pluginKeyring }, pluginRemote, logger)
+			pluginTrust, pluginRemote, logger)
 	}
-	// The remote trustlist is the other half of the question the keyring
-	// answers -- what does this deployment trust -- so it is resolved here,
-	// beside it, rather than somewhere an operator would have to look for
-	// separately. A configured trustlist that cannot be built stops startup
-	// (see resolvePluginTrustlist); an unconfigured one yields no Store and no
-	// loop.
-	//
-	// It is resolved OUTSIDE the plugin-consent branch above, and so runs even
-	// when this deployment configured no plugins.manifest, which mirrors
-	// config.Load: validatePlugins checks the trustlist section before its
-	// "no manifest means plugins are off" early return, on the reasoning that
-	// fetching a remote trustlist and loading local plugins are separate
-	// questions.
-	trustStore, trustlistRefreshInterval, err := resolvePluginTrustlist(cfg.Plugins)
-	if err != nil {
-		cleanup()
-		return ServeResult{}, err
-	}
+	// The trustlist Store was resolved above, before the plugin assembly that
+	// reads it; only its refresh loop is started here.
 	if trustStore != nil {
 		// Its own goroutine and its own ticker, for two reasons: the first
 		// fetch must not block startup (a network failure at start must not

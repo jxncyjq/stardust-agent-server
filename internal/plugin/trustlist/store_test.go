@@ -978,3 +978,264 @@ func TestRefreshHoldsItsLockAcrossTheFetch(t *testing.T) {
 			"两个都拿着取回前的快照去写，后写的会把先写的成果盖掉")
 	}
 }
+
+// --- 清单不可用时，本机的撤销累积集仍然生效 ------------------------------------
+//
+// 规格 §三③ / §八：清单 StatusUnavailable 时并集里只剩本地 keyring 那一半，
+// 但撤销累积集仍然可用——它是本地文件，「撤销永不遗忘」不依赖联网。这是「断网
+// 按安装期结论挂载」这条产品拍板能成立的基础：登记可以随清单不可用而降级，
+// 撤销不行。
+
+// recordedRevocationReason 是下面这些用例写进 revoked-ever.json 的理由。它与
+// 清单里可能写的理由（withSecondKeyRevoking 用的「私钥泄漏」）刻意不同：断言
+// 读到的是这一条，才证明这条撤销确实来自磁盘上那份累积记录，而不是来自某份清单。
+const recordedRevocationReason = "这台机器早就记下了"
+
+// seedRecordedRevocations 往缓存目录写一份 revoked-ever.json，撤销 ids。
+// 不写 trustlist.json / trustlist.sig：这几个用例考的就是没有清单的那一侧。
+func seedRecordedRevocations(t *testing.T, cacheDir string, ids ...sign.KeyID) {
+	t.Helper()
+
+	entries := make([]any, 0, len(ids))
+	for _, id := range ids {
+		entries = append(entries, map[string]any{
+			"key_id":     string(id),
+			"revoked_at": "2026-08-29T10:00:00Z",
+			"reason":     recordedRevocationReason,
+		})
+	}
+	data, err := json.Marshal(map[string]any{"revoked": entries})
+	if err != nil {
+		t.Fatalf("marshal %s: %v", revokedFileName, err)
+	}
+	if err := os.WriteFile(filepath.Join(cacheDir, revokedFileName), data, 0o600); err != nil {
+		t.Fatalf("seed %s: %v", revokedFileName, err)
+	}
+}
+
+// damageCachedList 把一份读得出来但通不过验签的清单写进缓存目录，也就是
+// cache.read 归到「损坏」（非 errNoCache）的那一支。
+func damageCachedList(t *testing.T, cacheDir string) {
+	t.Helper()
+
+	for name, body := range map[string]string{
+		listFileName: `{"serial":1}`,
+		sigFileName:  "this is not a signature",
+	} {
+		if err := os.WriteFile(filepath.Join(cacheDir, name), []byte(body), 0o600); err != nil {
+			t.Fatalf("damage cache %s: %v", name, err)
+		}
+	}
+}
+
+// currentOnlyStore 造一个只拿来问 Current 的 Store。Current 从不发请求，所以这里
+// 不需要一个测试服务端；地址落在 .invalid（RFC 2606 保证不解析）之下，万一哪次
+// 改动让它真去取回，也出不了这台机器。
+func currentOnlyStore(t *testing.T, cacheDir string) *Store {
+	t.Helper()
+
+	store, err := NewStore(Config{
+		URL:      "https://never-fetched.invalid/trust/trustlist.json",
+		CacheDir: cacheDir,
+		Now:      fixedNow,
+	})
+	if err != nil {
+		t.Fatalf("NewStore: %v", err)
+	}
+	return store
+}
+
+// requireRecordedRevocationSurvives 断言这份 unavailable 的 Trust 合并之后，撤销
+// 那一半还在、登记那一半照常降级成只剩本地 keyring。
+//
+// 断言走 Merge 而不是只看 trust.revocations，因为规格要的是「被撤销钥匙签的包挂
+// 不上」，而判定用的是 Merge 出来的那个 *sign.Keyring；只看字段会漏掉「字段填了
+// 但没人并进去」这条接缝——本期最该防的形状。
+func requireRecordedRevocationSurvives(t *testing.T, when string, trust Trust) {
+	t.Helper()
+
+	if trust.Status != StatusUnavailable {
+		t.Fatalf("%s：Status = %v, want StatusUnavailable", when, trust.Status)
+	}
+	if trust.Keyring != nil {
+		t.Errorf("%s：unavailable 却带回了一个非 nil 的 Keyring", when)
+	}
+	// 本地 keyring 同时登记了 dev-abc（被撤销的那把）与 ops-local。第二把不是
+	// 装饰：sign.ParseKeyring 拒绝「每把钥匙都被撤销」的信任集，只登记 dev-abc
+	// 的话合并会卡在解析那一步，考不到这里真正想考的东西。
+	local := keyringWith(t, []sign.KeyID{"dev-abc", "ops-local"}, nil)
+	merged, _, err := Merge(local, trust)
+	if err != nil {
+		t.Fatalf("%s：Merge: %v", when, err)
+	}
+	if merged == nil {
+		t.Fatalf("%s：合并出来的信任集是 nil，可本地 keyring 登记了两把钥匙", when)
+	}
+	rev, ok := merged.Revoked("dev-abc")
+	if !ok {
+		t.Fatalf("%s：合并后的信任集不认 dev-abc 的撤销——清单那一侧不可用，就把这台"+
+			"机器已经记下的撤销一起丢了；那样删掉一个文件即可绕过撤销", when)
+	}
+	if rev.Reason != recordedRevocationReason {
+		t.Errorf("%s：撤销理由 = %q, want %q（读到的不是磁盘那份累积记录）",
+			when, rev.Reason, recordedRevocationReason)
+	}
+	// 登记那一半照常降级：本地 keyring 仍然全数在册，这是拍板 #1 的前半句。
+	if len(merged.IDs()) != 2 {
+		t.Errorf("%s：IDs = %v, want 本地那两把都在——降级只该发生在清单那一侧，"+
+			"不该殃及本地 keyring", when, merged.IDs())
+	}
+}
+
+// TestCurrentKeepsRecordedRevocationsWhenTheListFileIsMissing：trustlist.json
+// 不在（一次首写崩溃、一次磁盘损坏，或者任何能写这个目录的东西删掉一个文件），
+// 而 revoked-ever.json 还在。
+//
+// 这一支是 cache.read 的 errNoCache：它按契约把磁盘上那份撤销记录一并交回，
+// Current 必须把它带进 Trust，否则删掉一个文件就是一个能用的「解除撤销」手段
+// ——而伪造正是 S1 花大力气防住的那件事，这条路连伪造都不必。
+func TestCurrentKeepsRecordedRevocationsWhenTheListFileIsMissing(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	seedRecordedRevocations(t, cacheDir, "dev-abc")
+
+	trust, err := currentOnlyStore(t, cacheDir).Current()
+	if err == nil {
+		t.Fatal("清单文件不在时 Current 却没有报错")
+	}
+	if !errors.Is(err, errNoCache) {
+		t.Errorf("err = %v, want 裹着 errNoCache", err)
+	}
+	requireRecordedRevocationSurvives(t, "trustlist.json 缺失", trust)
+}
+
+// TestCurrentKeepsRecordedRevocationsWhenTheCachedListIsDamaged 是上一条的另一
+// 半：清单文件**在**，但通不过验签。
+//
+// 分开写是因为两条走的是 cache.read 的不同分支，而只有 errNoCache 那一支会把撤销
+// 记录交回来；损坏这一支交回的是 nil，Current 必须自己去读一次 revoked-ever.json。
+// 一个只照顾了 errNoCache 的实现在这里会红。
+func TestCurrentKeepsRecordedRevocationsWhenTheCachedListIsDamaged(t *testing.T) {
+	t.Parallel()
+
+	cacheDir := t.TempDir()
+	seedRecordedRevocations(t, cacheDir, "dev-abc")
+	damageCachedList(t, cacheDir)
+
+	trust, err := currentOnlyStore(t, cacheDir).Current()
+	if err == nil {
+		t.Fatal("缓存损坏时 Current 却没有报错")
+	}
+	if errors.Is(err, errNoCache) {
+		t.Errorf("err = %v, want 一条损坏错误而不是 errNoCache：两者的分界是给调用方"+
+			"的开关，混起来会让一次损坏被当成全新安装", err)
+	}
+	requireRecordedRevocationSurvives(t, "trustlist.json 损坏", trust)
+}
+
+// TestCurrentRefusesWhenTheRevocationRecordCannotBeRead：撤销累积集**自己**读不
+// 出来。
+//
+// 那不是「没有撤销」，是判不了。上面两条用例的降级之所以安全，靠的正是撤销那一半
+// 仍然成立；这一条里它不成立，所以必须裹 ErrRevocationsUnknown 硬错，让调用方拒绝
+// 而不是降级。当成空集接着跑，就是 parseRevokedSet 注释里说的「这个文件能造成的
+// 最坏的谎」。
+func TestCurrentRefusesWhenTheRevocationRecordCannotBeRead(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, cacheDir string)
+	}{
+		{
+			name: "记录损坏",
+			setup: func(t *testing.T, cacheDir string) {
+				t.Helper()
+				path := filepath.Join(cacheDir, revokedFileName)
+				if err := os.WriteFile(path, []byte(`{"revoked":"这不是一个数组"}`), 0o600); err != nil {
+					t.Fatalf("seed %s: %v", revokedFileName, err)
+				}
+			},
+		},
+		{
+			// 清单文件在（只是不可信）而撤销记录不在，正是 cache.read 判为「缓存
+			// 不可用，而不是这台机器从没撤销过任何东西」的那个形态。
+			name:  "记录不存在而清单文件在",
+			setup: func(t *testing.T, cacheDir string) { t.Helper() },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			cacheDir := t.TempDir()
+			tc.setup(t, cacheDir)
+			damageCachedList(t, cacheDir)
+
+			trust, err := currentOnlyStore(t, cacheDir).Current()
+			if err == nil {
+				t.Fatal("撤销累积集读不出来，Current 却没有报错")
+			}
+			if !errors.Is(err, ErrRevocationsUnknown) {
+				t.Fatalf("err = %v, want 裹着 ErrRevocationsUnknown：调用方必须能把"+
+					"「判不了撤销」与「清单不可用」分开，前者拒绝、后者降级", err)
+			}
+			if trust.revocations != nil {
+				t.Error("判不了撤销的那份 Trust 却带回了一个撤销集合；nil 是这里唯一" +
+					"诚实的答案，它的意思是「不知道」")
+			}
+		})
+	}
+}
+
+// TestCurrentSaysKnownEmptyRatherThanUnknownOnAnEmptyCache：缓存目录里什么都没
+// 有——全新安装，两个文件都不在。
+//
+// 这台机器确实一条撤销都没记过，所以答案是一个**非 nil 的空集合**（「已知没有
+// 撤销」），不是 nil（「不知道」）。两者混起来，要么让第一次启动的每一次挂载都
+// 失败，要么让「本该有却读不到」被当成「没有可并的」——后者正是要防的那件事。
+func TestCurrentSaysKnownEmptyRatherThanUnknownOnAnEmptyCache(t *testing.T) {
+	t.Parallel()
+
+	trust, err := currentOnlyStore(t, t.TempDir()).Current()
+	if err == nil {
+		t.Fatal("空缓存上的 Current 却没有报错")
+	}
+	if errors.Is(err, ErrRevocationsUnknown) {
+		t.Fatalf("err = %v；全新安装不是「判不了」，那会让第一次启动的每一次挂载都失败", err)
+	}
+	if trust.revocations == nil {
+		t.Fatal("空缓存上的 revocations 是 nil，want 一个空集合：nil 的意思是「不知道」")
+	}
+	if n := trust.revocations.len(); n != 0 {
+		t.Errorf("空缓存上却读出了 %d 条撤销", n)
+	}
+}
+
+// TestCurrentKeepsRecordedRevocationsWhenTheTrustSetWillNotAssemble：清单读得出
+// 来、验得过，但装不出信任集（撤销已经累积到覆盖了这份清单的全部 keys）。
+//
+// 这一支的 Trust 同样是 unavailable，同样必须带着撤销累积集走。而且这里最不能丢：
+// 把这台机器判成「没有信任集」的原因就是那些撤销，丢掉它们等于用「撤销太多」换来
+// 「一条撤销都不认」。
+func TestCurrentKeepsRecordedRevocationsWhenTheTrustSetWillNotAssemble(t *testing.T) {
+	signer := newSigner(t)
+	list, sig := signer(7, nil)
+	cur := newServeList(list, sig)
+	srv := newListServer(t, cur)
+	cacheDir := t.TempDir()
+	store := newTestStore(t, srv, cacheDir, fixedNow)
+	if _, err := store.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	// 这份清单的 keys 里只有 dev-abc（testDoc 的默认形状），把它撤销掉，
+	// assembleKeyring 下一次就装不出信任集了。
+	seedRecordedRevocations(t, cacheDir, "dev-abc")
+
+	trust, err := store.Current()
+	if err == nil {
+		t.Fatal("每把钥匙都被撤销时 Current 却没有报错")
+	}
+	requireRecordedRevocationSurvives(t, "信任集装不出来", trust)
+}

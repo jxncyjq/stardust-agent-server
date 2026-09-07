@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
@@ -14,7 +13,6 @@ import (
 
 	"github.com/stardust/legion-agent/internal/plugin/host"
 	"github.com/stardust/legion-agent/internal/plugin/perm"
-	"github.com/stardust/legion-agent/internal/plugin/sign"
 	"github.com/stardust/legion-agent/internal/tool"
 )
 
@@ -39,9 +37,9 @@ var riskLevelRank = map[string]int{
 }
 
 // LoadPackage reads one plugin package directory — exactly plugin.json,
-// plugin.wasm and, when the deployment requires signatures, plugin.sig; no
-// other layout is recognized — and returns the plugin's validated manifest
-// together with its wasm bytes.
+// plugin.wasm and, when trust names a trust set, plugin.sig; no other layout
+// is recognized — and returns the plugin's validated manifest, its wasm
+// bytes, and a Provenance saying who stands behind them.
 //
 // It verifies that the wasm bytes' sha256 digest matches the one plugin.json
 // declares, refusing to return anything if they disagree: a plugin.wasm that
@@ -68,55 +66,72 @@ var riskLevelRank = map[string]int{
 // deliberate: any "decode, then re-encode, then sign" scheme requires
 // byte-identical JSON encoding on the signing and the verifying side, which
 // is a classic exploitable ambiguity. LoadPackage therefore checks the
-// signature against the bytes it read from disk, and does so BEFORE parsing
-// them — authenticate first, interpret second.
+// signature against the bytes it read from disk, never against a re-encoded
+// copy.
 //
-// keyring decides whether that check happens at all, and is the one optional
-// this contract declares:
+// Checking the signature before calling ParsePlugin is not itself a security
+// boundary: ParsePlugin is a plain JSON decode plus field validation, with no
+// side effects, and it runs on manifestData regardless of what Provenance
+// comes back — including ProvenanceUnsigned, where no signature was even
+// found to check. The order only decides which of two simultaneous failures
+// (a malformed signature and a malformed manifest) is the one LoadPackage
+// reports; either order still refuses to load the package.
 //
-//   - a non-nil keyring is the deployment's trust set: dir/plugin.sig must
-//     exist, must parse, and must verify against a key in it, or LoadPackage
-//     refuses the package with an error naming the directory and what
-//     failed (an unknown key id names that id and the trusted ones; a bad
-//     signature names the key it was checked against);
-//   - a nil keyring means THIS DEPLOYMENT DOES NOT REQUIRE SIGNATURES:
-//     verification is skipped and plugin.sig is not read at all. The sha256
-//     check is NOT part of that concession — it still runs and still refuses
-//     a plugin.wasm that does not match its manifest. Deciding when a
-//     deployment may pass nil is the caller's policy call, deliberately not
-//     this function's.
-func LoadPackage(dir string, keyring *sign.Keyring) (PluginManifest, []byte, error) {
+// # What LoadPackage decides, and what it leaves to the caller
+//
+// LoadPackage does not decide whether a package may be used. It answers one
+// question — who stands behind these bytes — and returns that answer as a
+// Provenance: ProvenanceRegistered, ProvenanceUnsigned or ProvenanceRevoked
+// (see assessProvenance for exactly how each is reached). A missing
+// dir/plugin.sig is therefore a verdict, not an error; so is a signature made
+// by a key trust does not name. What either of those may load is policy, and
+// policy belongs to the caller.
+//
+// Two things are NOT verdicts and remain errors:
+//
+//   - a plugin.sig that is present but malformed, or one whose signature does
+//     not verify against the trusted key it names. Provenance says who
+//     endorses the bytes; this says the bytes were CHANGED after being
+//     endorsed. Reporting tampering as a state would let a policy that
+//     tolerates unsigned packages also tolerate altered ones;
+//   - the sha256 check above, which is not part of any concession about
+//     signatures: it runs for every package, under every TrustInput,
+//     including the zero one.
+//
+// A zero TrustInput (no keyring) is a deployment with no trust set. Every
+// package then comes back ProvenanceUnsigned, which is not the same as
+// "checked and fine" — see TrustInput's own doc comment.
+func LoadPackage(dir string, trust TrustInput) (PluginManifest, []byte, Provenance, error) {
 	manifestPath := filepath.Join(dir, "plugin.json")
 	manifestData, err := os.ReadFile(manifestPath)
 	if err != nil {
-		return PluginManifest{}, nil, fmt.Errorf("load plugin package %q: read plugin.json: %w", dir, err)
+		return PluginManifest{}, nil, Provenance{}, fmt.Errorf("load plugin package %q: read plugin.json: %w", dir, err)
 	}
-	if keyring != nil {
-		if err := verifyManifestSignature(dir, manifestData, keyring); err != nil {
-			return PluginManifest{}, nil, fmt.Errorf("load plugin package %q: %w", dir, err)
-		}
+	prov, err := assessProvenance(dir, manifestData, trust)
+	if err != nil {
+		return PluginManifest{}, nil, Provenance{}, fmt.Errorf("load plugin package %q: %w", dir, err)
 	}
 	pm, err := ParsePlugin(manifestData)
 	if err != nil {
-		return PluginManifest{}, nil, fmt.Errorf("load plugin package %q: %w", dir, err)
+		return PluginManifest{}, nil, Provenance{}, fmt.Errorf("load plugin package %q: %w", dir, err)
 	}
 
 	wasmPath := filepath.Join(dir, "plugin.wasm")
 	wasm, err := os.ReadFile(wasmPath)
 	if err != nil {
-		return PluginManifest{}, nil, fmt.Errorf("load plugin package %q: read plugin.wasm: %w", dir, err)
+		return PluginManifest{}, nil, Provenance{}, fmt.Errorf("load plugin package %q: read plugin.wasm: %w", dir, err)
 	}
 
 	sum := sha256.Sum256(wasm)
 	actual := hex.EncodeToString(sum[:])
 	if !strings.EqualFold(actual, pm.SHA256) {
-		return PluginManifest{}, nil, fmt.Errorf(
+		return PluginManifest{}, nil, Provenance{}, fmt.Errorf(
 			"load plugin package %q: plugin %q sha256 mismatch: plugin.json declares %s, plugin.wasm actually hashes to %s",
 			dir, pm.Name, pm.SHA256, actual,
 		)
 	}
 
-	return pm, wasm, nil
+	return pm, wasm, prov, nil
 }
 
 // ErrUntrustedPackage marks the failures that mean "this package is not
@@ -130,44 +145,6 @@ func LoadPackage(dir string, keyring *sign.Keyring) (PluginManifest, []byte, err
 // source-site timeout — retrying it is meaningful — and folding it in here
 // would devalue the signal for the failures that really are trust verdicts.
 var ErrUntrustedPackage = errors.New("plugin package is not trusted")
-
-// verifyManifestSignature reads dir/plugin.sig and checks it against keyring
-// over manifestData — plugin.json's raw bytes, exactly as read from disk.
-//
-// A missing, unreadable, malformed, untrusted or non-verifying plugin.sig is
-// an error naming which of those it was; none of them is ever answered with
-// a zero value or a skipped package, because "this package has no valid
-// signature" and "this deployment does not require signatures" must never be
-// the same outcome. The second is expressed only by LoadPackage's caller
-// passing a nil keyring, in which case this function is not called at all.
-//
-// The missing case (fs.ErrNotExist) is reported with its own wording,
-// distinct from an unreadable-but-present plugin.sig (a permission error, or
-// plugin.sig existing as something other than a regular file): the two are
-// deliberately kept apart so that a future caller can never key on
-// errors.Is(err, fs.ErrNotExist) — which is otherwise also true for a
-// missing plugin.json or plugin.wasm — and downgrade "no signature" into
-// "package not present, skip it".
-func verifyManifestSignature(dir string, manifestData []byte, keyring *sign.Keyring) error {
-	sigPath := filepath.Join(dir, "plugin.sig")
-	sigData, err := os.ReadFile(sigPath)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return fmt.Errorf("plugin.sig is missing: this deployment requires a signed package: %w: %w",
-				ErrUntrustedPackage, err)
-		}
-		// NOT ErrUntrustedPackage: see that sentinel's doc comment.
-		return fmt.Errorf("read plugin.sig: %w", err)
-	}
-	sig, err := sign.ParseSignature(sigData)
-	if err != nil {
-		return fmt.Errorf("parse plugin.sig: %w: %w", ErrUntrustedPackage, err)
-	}
-	if err := keyring.Verify(sig, manifestData); err != nil {
-		return fmt.Errorf("verify plugin.json signature: %w: %w", ErrUntrustedPackage, err)
-	}
-	return nil
-}
 
 // AssembleSpec reconciles a plugin's own declaration (pm) against one
 // deployment entry's authorization (entry) and the deployment's own

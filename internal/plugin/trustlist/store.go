@@ -3,6 +3,7 @@ package trustlist
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -20,13 +21,23 @@ import (
 // 某次撤销之前。它值得比一次超时高得多的告警级别，而且重试绝不会让它变好。
 var ErrSerialRegressed = errors.New("trustlist serial regressed")
 
+// ErrRevocationsUnknown 标记「这台机器已经记下的撤销读不出来」。
+//
+// 它与「没有可用的清单」是必须分开的两件事，因为对它们的正确反应相反。清单读
+// 不出来时降级是设计好的行为：登记那一半只剩本地 keyring，按安装期已经记下的
+// 结论继续挂载。而撤销累积集读不出来时，这台机器无从回答「这把钥匙是不是已经
+// 被撤销了」——把它读成「没有撤销」正是「删掉一个文件就绕过撤销」那条路，也正是
+// 这份记录存在要挡的事。所以它是哨兵：调用方必须认得出这一种失败并**拒绝**，
+// 而不是像清单不可用那样降级。
+var ErrRevocationsUnknown = errors.New("trustlist revocation record is unknown")
+
 // Status 是手上这份清单的时效状态。
 type Status int
 
 const (
 	// StatusUnavailable：没有可用的清单——从没成功取得过，或缓存损坏，或装配
-	// 信任集失败。此时 Trust.Keyring 是 nil、Trust.Publishers 是 nil，调用方
-	// 必须把所有插件按「未登记」处理。
+	// 信任集失败。此时 Trust.Keyring、Trust.KeyringRaw 与 Trust.Publishers 都是
+	// nil，调用方必须把所有插件按「未登记」处理。
 	StatusUnavailable Status = iota
 	// StatusStale：验签通过但已过 expires_at（多半是长期断网）。信任集照常
 	// 可用，撤销照常生效。
@@ -51,16 +62,48 @@ func (s Status) String() string {
 
 // Trust 是一次装配的结果：信任集、发布者名录，以及它有多新。
 //
-// Status 为 StatusUnavailable 时 Keyring 与 Publishers 都是 nil。这不是「留空
-// 待填」——它是让「拿不到清单就先放行」在类型层面做不到：没有信任集，就没有
-// 任何东西可以用来判一个插件可信。
+// Status 为 StatusUnavailable 时 Keyring、KeyringRaw 与 Publishers 都是 nil。
+// 这不是「留空待填」——它是让「拿不到清单就先放行」在类型层面做不到：没有信任集，
+// 就没有任何东西可以用来判一个插件可信。
+//
+// Keyring 与 KeyringRaw 各带一半、缺一不可，因为两者装的不是同一份事实：
+//
+//   - KeyringRaw 是清单信封里那段 keyring 文档的原始字节，是这里**唯一**还留着
+//     公钥的地方——sign.Keyring 的导出面（IDs / RevokedIDs / Revoked / Verify）
+//     没有按 id 取公钥的方法，所以一个 *sign.Keyring 没法把自己的登记贡献给另一
+//     份 keyring 文档；
+//   - Keyring 装的撤销集比 KeyringRaw 里那段宽：assembleKeyring 把本机的撤销
+//     累积集（revoked-ever.json）并了进去，而原始字节里只有这一份清单自己写下的
+//     那些。
 type Trust struct {
 	Keyring    *sign.Keyring
+	KeyringRaw json.RawMessage
 	Publishers map[sign.KeyID]Publisher
 	Status     Status
 	Serial     int64
 	IssuedAt   time.Time
 	ExpiresAt  time.Time
+
+	// revocations 是随这份 Trust 一起交回的撤销累积集：这台机器见过的全部撤销。
+	//
+	// 它与上面三个 nil 掉的字段并列存在，是因为**撤销的可用性必须与清单文档的
+	// 可用性解耦**。清单过期不作废（否则一断网所有插件立刻失信），所以断网不能
+	// 成为绕过撤销的办法；如果一个缺失或损坏的 trustlist.json 反而能把这台机器
+	// 攒了几个月的撤销一起带走，那么「删掉一个文件」就重新变成了那个办法——攻击
+	// 者连伪造都不必。这正是 S1 的「撤销单调，登记不单调」：登记可以随清单不可用
+	// 而降级，撤销不行。
+	//
+	// Keyring 非 nil 时这份集合已经被 assembleKeyring 并进 Keyring 里，两处说的
+	// 是同一批撤销；Keyring 为 nil 时它是撤销仅剩的载体，也是 Merge 唯一还能从
+	// 这一侧读到撤销的地方。
+	//
+	// nil 说的是「这份 Trust 不携带任何撤销记录」，**不是**「这台机器没有撤销」。
+	// 后者的表达是一个非 nil 的空集合。Current 只在裹 ErrRevocationsUnknown 硬错
+	// 的时候交回一份 revocations 为 nil 的 Trust（见 Current）。
+	//
+	// 它不导出：这个集合的语义（只增不减、并集时先见到的胜出、空与 nil 有别）
+	// 由本包持有，而包外唯一需要它的地方是 Merge，就在本包内。
+	revocations *revokedSet
 }
 
 // Config 是造一个 Store 需要的东西。
@@ -130,14 +173,59 @@ func NewStore(cfg Config) (*Store, error) {
 //
 // 它只读本地文件、不取 Refresh 那把锁，因此它的时延不含任何网络往返。缓存缺失、
 // 损坏或装不出信任集时返回 StatusUnavailable 的 Trust 与一个 error——两者都返回，
-// 因为调用方既要知道出了什么事，也要一个能安全使用的零状态（Keyring 为 nil，
-// 见 Trust）。
+// 因为调用方既要知道出了什么事，也要一个仍然能安全使用的状态。
+//
+// 「能安全使用」在这里有两半，缺一半就不安全：Keyring 为 nil（没有任何东西可以
+// 用来把一个插件判成可信，见 Trust），而这份 Trust **仍然携带这台机器已知的撤销
+// 累积集**。少了后一半，一个缺失或损坏的 trustlist.json 就会让这台机器忘掉它已经
+// 记下的每一条撤销，被撤销的钥匙签的包重新挂得上去——理由见 Trust.revocations。
+//
+// 累积集本身读不出来是另一回事：那不是「没有撤销」，是判不了。这时返回的错误裹
+// ErrRevocationsUnknown（与清单那半的错误 join 在一起，两条链都保住），Trust 的
+// revocations 为 nil。调用方必须认出这个哨兵并拒绝，不得当成「清单不可用」降级。
 func (s *Store) Current() (Trust, error) {
 	doc, revoked, err := s.cache.read()
-	if err != nil {
-		return Trust{Status: StatusUnavailable}, err
+	if err == nil {
+		return s.assemble(doc, revoked)
 	}
-	return s.assemble(doc, revoked)
+	known, knownErr := s.knownRevocations(revoked, err)
+	if knownErr != nil {
+		return Trust{Status: StatusUnavailable}, errors.Join(err, knownErr)
+	}
+	return Trust{Status: StatusUnavailable, revocations: known}, err
+}
+
+// knownRevocations 在清单那一半已经不可用之后回答「这台机器已经记下了哪些撤销」。
+// fromRead 与 cause 是 cache.read 这一次的第二、第三个返回值。
+//
+// 三条路各有各的理由：
+//
+//   - fromRead 非 nil：cache.read 已经读过盘并按它的返回值契约把记录交了回来
+//     （errNoCache 那一支就是这样）。直接用它，不再读第二次——两次读之间磁盘可能
+//     被另一个进程改写，而这一轮该用的是这一次读到的那份。
+//   - fromRead 为 nil 且 cause 是 errNoCache：按 cache.read 的契约，那意味着清单
+//     与撤销记录两个文件都不在，也就是这台机器确实一条撤销都没记过。返回一个非
+//     nil 的**空集合**而不是 nil：空集说的是「已知没有撤销」，nil 说的是「不知道」，
+//     而这里是知道的。
+//   - 其余（缓存损坏）：cache.read 在这一支不交回记录，所以单独读一次
+//     revoked-ever.json。读不到就报 ErrRevocationsUnknown，**文件不存在也算**——
+//     清单文件在（只是不可信）而撤销记录不在，正是 cache.read 判为「缓存不可用，
+//     而不是这台机器从没撤销过任何东西」的那个形态，这里不另立一套更松的说法。
+func (s *Store) knownRevocations(fromRead *revokedSet, cause error) (*revokedSet, error) {
+	if fromRead != nil {
+		return fromRead, nil
+	}
+	if errors.Is(cause, errNoCache) {
+		return newRevokedSet(), nil
+	}
+	revoked, err := s.cache.readRevoked()
+	if err != nil {
+		return nil, fmt.Errorf("read the revocations recorded in %s while the cached trustlist is "+
+			"unusable; without them there is no way to tell whether a key has been revoked, and reading "+
+			"that as \"nothing was revoked\" is the bypass this record exists to stop: %w: %w",
+			s.cache.dir, ErrRevocationsUnknown, err)
+	}
+	return revoked, nil
 }
 
 // Refresh 取回一次，通过全部校验后落盘，返回新的状态。
@@ -260,24 +348,28 @@ func (s *Store) Refresh(ctx context.Context) (Trust, error) {
 
 // assemble 把一份文档与撤销累积集装配成 Trust，并按当前时间判定 fresh/stale。
 //
-// 装配失败时返回 StatusUnavailable 的空 Trust 与错误，不吞掉换一个空信任集：
+// 装配失败时返回 StatusUnavailable 的 Trust 与错误，不吞掉换一个空信任集：
 // 「合并后每把钥匙都被撤销」是真实可能的状态（见 assembleKeyring），而它的正确
-// 表达是「没有可用的信任集」，不是「一个谁都不认的信任集」。
+// 表达是「没有可用的信任集」，不是「一个谁都不认的信任集」。那份 Trust 的
+// Keyring 为 nil，但撤销累积集照样带着走——装不出信任集与「这台机器忘了它记下的
+// 撤销」是两件事，而后一件在「每把钥匙都被撤销」这个状态下恰恰最不能发生。
 func (s *Store) assemble(doc Document, revoked *revokedSet) (Trust, error) {
 	keyring, err := assembleKeyring(doc.KeyringRaw, revoked)
 	if err != nil {
-		return Trust{Status: StatusUnavailable}, err
+		return Trust{Status: StatusUnavailable, revocations: revoked}, err
 	}
 	status := StatusFresh
 	if !s.now().Before(doc.ExpiresAt) {
 		status = StatusStale
 	}
 	return Trust{
-		Keyring:    keyring,
-		Publishers: doc.Publishers,
-		Status:     status,
-		Serial:     doc.Serial,
-		IssuedAt:   doc.IssuedAt,
-		ExpiresAt:  doc.ExpiresAt,
+		Keyring:     keyring,
+		KeyringRaw:  doc.KeyringRaw,
+		Publishers:  doc.Publishers,
+		Status:      status,
+		Serial:      doc.Serial,
+		IssuedAt:    doc.IssuedAt,
+		ExpiresAt:   doc.ExpiresAt,
+		revocations: revoked,
 	}, nil
 }

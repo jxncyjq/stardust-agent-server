@@ -1928,13 +1928,37 @@ func TestE2ESignedDeploymentKeepsServingTheVerifiedInstanceThroughEveryTamper(t 
 	if err == nil {
 		t.Fatal("Apply() error = nil for a package signed by an untrusted key, want a refusal")
 	}
+	// Four things are demanded of this one refusal, and no three of them cover
+	// the fourth.
+	//
+	// The rogue key id, because "somebody signed it and we do not know who" is
+	// strictly weaker than "rogue-key signed it and we do not know rogue-key":
+	// a lapsed registration, a mistyped id, and an attacker are three
+	// different situations asking for three different responses, and only the
+	// offered id tells them apart. The id is a string the package chose, so
+	// the message carries it as a claim — which is what the trusted-key
+	// assertion below pins: naming it alone would let it read like a
+	// credential.
+	//
+	// The plugin.sig path, because that is the file to go and read. The
+	// trusted key ids, because that is what this deployment would have
+	// believed. And the sentinel, because telling this refusal apart from a
+	// revocation must not come down to matching on prose.
+	if !errors.Is(err, manifest.ErrUnsignedNotAccepted) {
+		t.Errorf("Apply() error = %v, want it to wrap manifest.ErrUnsignedNotAccepted: no registered "+
+			"publisher endorses this package any more", err)
+	}
 	if !strings.Contains(err.Error(), string(rogueKeyID)) {
 		t.Errorf("Apply() error = %v, want it to name the key id the signature was made with", err)
+	}
+	if !strings.Contains(err.Error(), "plugin.sig") {
+		t.Errorf("Apply() error = %v, want it to name the file whose signature this deployment could not place", err)
 	}
 	if !strings.Contains(err.Error(), string(testKeyID)) {
 		t.Errorf("Apply() error = %v, want it to name the keys this deployment does trust", err)
 	}
 	h.requireEchoFailureSays("after the untrusted signature was refused", string(rogueKeyID))
+	h.requireEchoFailureSays("after the untrusted signature was refused", string(testKeyID))
 	h.requireRefusedConvergenceLeftEverythingAlone(ctx, "after the untrusted signature was refused")
 
 	// Round 4 (Apply 5 of 5): the control, and the regression test for the
@@ -2790,7 +2814,7 @@ func simulateInstall(ctx context.Context, remote RemoteConfig, keyring *sign.Key
 	// when this fails: no Deployment has been read or mutated, and
 	// WriteDeployment has not been called — which is what makes "plugins.json
 	// unchanged on a signature failure" hold.
-	pm, _, err := manifest.LoadPackage(dir, keyring)
+	pm, _, _, err := manifest.LoadPackage(dir, manifest.TrustInput{Keyring: keyring})
 	if err != nil {
 		return installOutcome{}, fmt.Errorf("simulate install: %w", err)
 	}
@@ -3510,8 +3534,8 @@ type e2eConsentAdapter struct {
 	// else. It is the barrier TestE2EHTTPGrantRefusesAConcurrentEditWithoutRevertingIt
 	// uses to land a second writer's edit deterministically, in the same
 	// single-goroutine spot internal/cli's
-	// TestPluginConsentServiceConcurrentGrantsDoNotRevertEachOther uses
-	// keyringFn for. A nil hook (every other test in this section) changes
+	// TestPluginConsentServiceConcurrentGrantsDoNotRevertEachOther uses its
+	// trust set provider for. A nil hook (every other test in this section) changes
 	// nothing.
 	afterSnapshot func()
 }
@@ -3542,7 +3566,7 @@ func (a *e2eConsentAdapter) List(_ context.Context) ([]server.PluginView, error)
 		if err != nil {
 			return nil, err
 		}
-		pm, _, err := manifest.LoadPackage(dir, nil)
+		pm, _, _, err := manifest.LoadPackage(dir, manifest.TrustInput{})
 		if err != nil {
 			return nil, fmt.Errorf("plugin consent: load declared manifest for %q: %w", entry.Name, err)
 		}
@@ -3573,7 +3597,7 @@ func (a *e2eConsentAdapter) Resolve(_ context.Context, name string) (server.Plug
 	if err != nil {
 		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w", name, err)
 	}
-	pm, _, err := manifest.LoadPackage(dir, nil)
+	pm, _, _, err := manifest.LoadPackage(dir, manifest.TrustInput{})
 	if err != nil {
 		if errors.Is(err, manifest.ErrUntrustedPackage) {
 			return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w: %w", name, server.ErrPluginUntrusted, err)
@@ -3614,7 +3638,7 @@ func (a *e2eConsentAdapter) Grant(ctx context.Context, name string, req server.G
 	if err != nil {
 		return server.ConsentResult{}, fmt.Errorf("%s: %w", e2eConsentGrantActor, err)
 	}
-	pm, _, err := manifest.LoadPackage(dir, nil)
+	pm, _, _, err := manifest.LoadPackage(dir, manifest.TrustInput{})
 	if err != nil {
 		return server.ConsentResult{}, fmt.Errorf("%s: %w", e2eConsentGrantActor, err)
 	}
@@ -4233,8 +4257,8 @@ func TestE2EHTTPGrantRefusesHTTPCapabilityWithNoAllowedHostsWhenThePluginDeclare
 // vulnerable to a second writer (another process, or the same operator's
 // second browser tab) landing an edit in the window between the snapshot
 // read and the write — the same "barrier point" pattern internal/cli's
-// TestPluginConsentServiceConcurrentGrantsDoNotRevertEachOther uses keyringFn
-// for, and TestPluginConsentServiceGrantRefusesAConcurrentEditDuringTheDownload
+// TestPluginConsentServiceConcurrentGrantsDoNotRevertEachOther uses its trust
+// set provider for, and TestPluginConsentServiceGrantRefusesAConcurrentEditDuringTheDownload
 // uses a blocked-on httptest.Server handler for.
 //
 // Bound: no goroutine, no channel, no loop — the concurrent edit is written

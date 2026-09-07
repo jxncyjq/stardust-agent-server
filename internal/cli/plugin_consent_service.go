@@ -11,7 +11,6 @@ import (
 	"github.com/stardust/legion-agent/internal/plugin/fetch"
 	"github.com/stardust/legion-agent/internal/plugin/loader"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
-	"github.com/stardust/legion-agent/internal/plugin/sign"
 	"github.com/stardust/legion-agent/internal/server"
 	"github.com/stardust/legion-agent/internal/taskgate"
 )
@@ -33,7 +32,7 @@ type PluginConsentService struct {
 	manifestPath string
 	root         string
 	pluginsFn    func() *loader.Loader
-	keyringFn    func() *sign.Keyring
+	trustFn      loader.TrustSet
 	remote       loader.RemoteConfig
 	logger       *slog.Logger
 
@@ -72,13 +71,43 @@ type PluginConsentService struct {
 // pluginsFn is a closure rather than a plain value so that a caller which
 // re-assembles serve in the same process (drainPlugins, then a fresh
 // assemblePlugins) is read through to the CURRENT loader, not the one that
-// existed when NewPluginConsentService was first called. keyringFn is a
-// closure for signature symmetry with pluginsFn, but it is NOT similarly
-// live: it is wired by the caller to return a keyring resolved once, up
-// front (see BuildServeService), so it reflects the trust set this
-// deployment started with (nil when this deployment does not require
-// signatures, see resolvePluginKeyring), not a per-call re-resolution of
-// cfg.Plugins.Keyring.
+// existed when NewPluginConsentService was first called.
+//
+// trustFn is the trust set every manifest.LoadPackage call in this file judges
+// a package against. It is loader.TrustSet -- the same type, and it MUST be the
+// same provider, a mount reads on every convergence. Sharing one provider is
+// the requirement, not an optimisation: two trust sets assembled separately
+// from one config are not one set, because either half of the merge can move
+// under one copy and not the other, and the first thing an operator would see
+// of that is a package this panel calls endorsed and a mount calls unsigned.
+// What the provider merges is the local keyring document and whatever the
+// fetched trust list currently holds, publishers included (see
+// resolvePluginTrustInput), which is also where TrustPublisher's display names
+// come from.
+//
+// Its two halves therefore refresh here exactly as they do for a mount: the
+// fetched list is re-read on every call, so a revocation that arrives after
+// this process started is in force without a restart, while the local keyring
+// document is captured when the provider is built and an edit to it takes
+// effect at the next assembly instead (see pluginTrustSet).
+//
+// A trust set is NOT the deployment's signature POLICY. Whether a package no
+// registered publisher endorses may MOUNT is answered against this set rather
+// than by leaving keys out of it (see resolvePluginTrustInput), and no path in
+// this file turns a Provenance verdict into a refusal at all -- Grant
+// authorizes a package whatever its provenance says, and the one refusal here
+// that concerns trust at all, Resolve's, keys on manifest.ErrUntrustedPackage,
+// which is an error and not a verdict. What the set buys here is the verdict
+// itself, surfaced through PluginView's TrustState/TrustPublisher/TrustDetail
+// (see trustFieldsFor).
+//
+// A deployment holding neither a keyring document nor a fetched list still
+// yields a nil Keyring, and every package is then ProvenanceUnsigned -- see
+// manifest.TrustInput for why that is not the same as unchecked. A provider
+// that cannot ANSWER is a third state again, and List, Grant and Resolve each
+// report it as an error rather than reading it as an empty set: "this
+// deployment does not know what it trusts" must not be rendered as "this
+// deployment recognises nobody".
 //
 // remote is the resolved remote-source policy (config.PluginsConfig's Cache,
 // HTTP client and fetch/unpack limits, see resolvePluginRemote) this
@@ -94,18 +123,55 @@ type PluginConsentService struct {
 // changed nothing indistinguishable from one that worked. A nil logger is a
 // wiring mistake at the call site, not a state to tolerate, so it panics
 // rather than silently discarding those records.
-func NewPluginConsentService(manifestPath, root string, pluginsFn func() *loader.Loader, keyringFn func() *sign.Keyring, remote loader.RemoteConfig, logger *slog.Logger) *PluginConsentService {
+func NewPluginConsentService(manifestPath, root string, pluginsFn func() *loader.Loader, trustFn loader.TrustSet, remote loader.RemoteConfig, logger *slog.Logger) *PluginConsentService {
 	if logger == nil {
 		panic("cli: NewPluginConsentService: logger is nil; a convergence that reported errors would be recorded nowhere")
+	}
+	if trustFn == nil {
+		// Not deferrable to the first request: a nil provider means this
+		// service has no trust set to judge anything against, which is a
+		// wiring mistake at the call site rather than a state to report per
+		// request.
+		panic("cli: NewPluginConsentService: trustFn is nil; there would be no trust set to judge plugin packages against")
 	}
 	return &PluginConsentService{
 		manifestPath: manifestPath,
 		root:         root,
 		pluginsFn:    pluginsFn,
-		keyringFn:    keyringFn,
+		trustFn:      trustFn,
 		remote:       remote,
 		logger:       logger,
 	}
+}
+
+// trustFieldsFor translates one manifest.Provenance verdict -- LoadPackage's
+// judgment about who, if anyone, stands behind a package's bytes -- into the
+// three server.PluginView trust fields List, Grant and Resolve each fill.
+//
+// TrustState is prov.State.String() and nothing else: manifest.ProvenanceState
+// already renders exactly "registered"/"unsigned"/"revoked" (see its own
+// String method), and writing a second table here that maps the same three
+// values is exactly the kind of duplicate rule this repository keeps losing
+// sync on when a state is added to one copy and not the other.
+//
+// publisher and detail are populated only for the one state each describes --
+// see PluginView.TrustPublisher and PluginView.TrustDetail's own doc comments
+// for why either may still come back empty even in that state.
+//
+// The verdict it translates is always about ONE package: the one its caller
+// loaded. For List that is the package this entry declares on disk, which need
+// not be the package the loader has mounted under the same name -- see the
+// LoadPackage call in List for what that means for a caller rendering these
+// three fields next to a row's State.
+func trustFieldsFor(prov manifest.Provenance) (state, publisher, detail string) {
+	state = prov.State.String()
+	if prov.State == manifest.ProvenanceRegistered {
+		publisher = prov.Publisher
+	}
+	if prov.State == manifest.ProvenanceRevoked {
+		detail = manifest.DescribeRevocation(prov)
+	}
+	return state, publisher, detail
 }
 
 // List reads the deployment manifest and this process's loader status, and
@@ -149,9 +215,11 @@ func NewPluginConsentService(manifestPath, root string, pluginsFn func() *loader
 // unreachable, defeating that guarantee two files away. Every OTHER row
 // still renders normally, and the entry's own State/Detail (from
 // mergePluginStatus, set above regardless of how this loop ends) is
-// unaffected. Only a failure that breaks every row alike -- reading or
-// parsing plugins.json itself -- fails List outright; see
-// TestPluginConsentServiceListErrorsWhenManifestUnreadable.
+// unaffected. Only a failure that breaks every row alike fails List outright:
+// reading or parsing plugins.json itself (see
+// TestPluginConsentServiceListErrorsWhenManifestUnreadable), and a trust set
+// this process cannot assemble, which would leave every row's provenance
+// unjudgeable rather than any one row unreadable.
 //
 // ctx is accepted for symmetry with server.PluginConsent and future
 // cancellation; every operation List performs today is local disk I/O (a
@@ -166,7 +234,14 @@ func (s *PluginConsentService) List(ctx context.Context) ([]server.PluginView, e
 	if err != nil {
 		return nil, err
 	}
-	keyring := s.keyringFn()
+	// Read once for the whole list rather than per row: every row is judged
+	// against the same set, and a provider that cannot answer breaks all of
+	// them alike, which is this method's own criterion for failing outright
+	// (see its doc comment) rather than degrading row by row.
+	trust, err := s.trustFn()
+	if err != nil {
+		return nil, fmt.Errorf("plugin consent: read the trust set to judge these plugin packages against: %w", err)
+	}
 
 	rows := mergePluginStatus(deployment, pluginLoader.Status())
 	views := make([]server.PluginView, 0, len(rows))
@@ -227,7 +302,26 @@ func (s *PluginConsentService) List(ctx context.Context) ([]server.PluginView, e
 			views = append(views, view)
 			continue
 		}
-		pm, _, loadErr := manifest.LoadPackage(dir, keyring)
+		// prov is translated into view.TrustState/TrustPublisher/TrustDetail by
+		// trustFieldsFor below -- see that function's own doc comment for why
+		// TrustState comes from prov.State.String() and nowhere else.
+		//
+		// It is the DECLARED package that is judged here -- the one resolved
+		// just above, from this entry's source -- and that is not always the
+		// package the loader has mounted under this name. An operator who
+		// drops a newer package into the deployment directory has two: the one
+		// serving requests and the one the next convergence refused. So a row
+		// may legitimately carry State "loaded" beside TrustState "revoked",
+		// and the two are describing different packages rather than
+		// contradicting each other. Which is which is said in the row's own
+		// Detail, by the loader that refused it: its explanation for such a
+		// refusal names the refused package's version and says it is a
+		// replacement (see internal/plugin/loader's
+		// sayWhichPackageWasRevoked). Nothing is decided here from that
+		// difference -- the Declared* family reports the package on disk, as
+		// it always has -- but a caller rendering these fields must not read
+		// TrustState as a verdict on the running plugin.
+		pm, _, prov, loadErr := manifest.LoadPackage(dir, trust)
 		if loadErr != nil {
 			view.DeclaredUnresolved = true
 			view.DeclaredUnresolvedReason = server.DeclaredUnresolvedLoadFailed
@@ -239,6 +333,7 @@ func (s *PluginConsentService) List(ctx context.Context) ([]server.PluginView, e
 		view.DeclaredHosts = pm.Network.AllowedHosts
 		view.DeclaredPaths = pm.Filesystem.AllowedPaths
 		view.DeclaredExtensions = pm.Extensions
+		view.TrustState, view.TrustPublisher, view.TrustDetail = trustFieldsFor(prov)
 		views = append(views, view)
 	}
 	return views, nil
@@ -375,7 +470,25 @@ func (s *PluginConsentService) Grant(ctx context.Context, name string, req serve
 	if err != nil {
 		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w", name, err)
 	}
-	pm, _, err := manifest.LoadPackage(dir, s.keyringFn())
+	// Read inside step 3, before the package's own declaration and well before
+	// step 6 writes anything: a trust set that cannot be assembled stops the
+	// authorization with the manifest untouched, rather than letting it finish
+	// and report a provenance verdict nothing stood behind.
+	//
+	// server.ErrPluginTrustSet classifies it as what it is: the deployment's
+	// own keyring document or trust list cache is unreadable, which is a fault
+	// on this machine and not a defect in the request that arrived. Without the
+	// sentinel it lands in pluginConsentStatus's default branch and the panel
+	// is told 400, sending an operator to inspect a request that was fine.
+	trust, err := s.trustFn()
+	if err != nil {
+		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: read the trust set to judge "+
+			"the package against: %w: %w", name, server.ErrPluginTrustSet, err)
+	}
+	// prov is reported back to the caller in the response below, via
+	// trustFieldsFor -- this design deliberately does not gate the grant on
+	// it, so the operator sees the verdict here rather than nowhere at all.
+	pm, _, prov, err := manifest.LoadPackage(dir, trust)
 	if err != nil {
 		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w", name, err)
 	}
@@ -454,6 +567,7 @@ func (s *PluginConsentService) Grant(ctx context.Context, name string, req serve
 	result.View.DeclaredHosts = pm.Network.AllowedHosts
 	result.View.DeclaredPaths = pm.Filesystem.AllowedPaths
 	result.View.DeclaredExtensions = pm.Extensions
+	result.View.TrustState, result.View.TrustPublisher, result.View.TrustDetail = trustFieldsFor(prov)
 	return result, nil
 }
 
@@ -498,11 +612,32 @@ func (s *PluginConsentService) Resolve(ctx context.Context, name string) (server
 	if err != nil {
 		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w", name, err)
 	}
-	pm, _, err := manifest.LoadPackage(dir, s.keyringFn())
+	// A trust set that cannot be assembled is reported rather than stood in
+	// for: judging this package against an empty set would report it as
+	// endorsed by nobody, which is a verdict, and no verdict is available
+	// while the set itself is unreadable. server.ErrPluginTrustSet is what
+	// separates that from a verdict on the HTTP side -- see the same read in
+	// Grant for why the class matters.
+	trust, err := s.trustFn()
+	if err != nil {
+		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: read the trust set to judge "+
+			"the package against: %w: %w", name, server.ErrPluginTrustSet, err)
+	}
+	// prov is reported through the returned PluginView's trust fields (via
+	// trustFieldsFor) on the success path below. The ErrUntrustedPackage
+	// branch just below fires for bytes and signature that disagree -- a
+	// signature that does not verify, and a plugin.sig that does not parse
+	// (see manifest's assessProvenance, which wraps both). A missing
+	// signature and an unrecognised key id are verdicts
+	// (ProvenanceUnsigned), not errors, so they fall through to that success
+	// path instead.
+	pm, _, prov, err := manifest.LoadPackage(dir, trust)
 	if err != nil {
 		if errors.Is(err, manifest.ErrUntrustedPackage) {
-			// The bytes just failed signature verification, so they do not
-			// belong in a directory this deployment reads from. Only a REMOTE
+			// The bytes and the signature beside them just contradicted each
+			// other -- the signature did not verify, or plugin.sig would not
+			// parse -- so they do not belong in a directory this deployment
+			// reads from. Only a REMOTE
 			// entry's package lives in the cache — a local entry's directory
 			// is the operator's own tree — and only a trust failure earns
 			// eviction: a package that merely will not load is re-downloaded
@@ -515,11 +650,11 @@ func (s *PluginConsentService) Resolve(ctx context.Context, name string) (server
 		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w", name, err)
 	}
 
-	// Only Declared*/Granted*/Name are filled: Resolve never touches the
-	// loader (no Apply, no Status() merge, unlike Grant/Deny), so it has no
-	// honest State/Detail/Tools to report -- those stay at their zero value
-	// rather than being guessed at.
-	return server.PluginView{
+	// Only Declared*/Granted*/Name/Trust* are filled: Resolve never touches
+	// the loader (no Apply, no Status() merge, unlike Grant/Deny), so it has
+	// no honest State/Detail/Tools to report -- those stay at their zero
+	// value rather than being guessed at.
+	view := server.PluginView{
 		Name:               name,
 		GrantedCaps:        entry.Grant.Capabilities,
 		GrantedHosts:       entry.Grant.AllowedHosts,
@@ -529,7 +664,9 @@ func (s *PluginConsentService) Resolve(ctx context.Context, name string) (server
 		DeclaredHosts:      pm.Network.AllowedHosts,
 		DeclaredPaths:      pm.Filesystem.AllowedPaths,
 		DeclaredExtensions: pm.Extensions,
-	}, nil
+	}
+	view.TrustState, view.TrustPublisher, view.TrustDetail = trustFieldsFor(prov)
+	return view, nil
 }
 
 // Deny implements server.PluginConsent: it revokes the deployment entry

@@ -945,6 +945,59 @@ func TestParseDeployment_ForeignSchemeRejected_MutationTarget(t *testing.T) {
 	requireErrorContains(t, err, "file")
 }
 
+// TestEntryAcceptedUnsignedRoundTrips：这个字段是操作者在安装期认下的那份
+// 字节的摘要，它必须原样往返——写进去什么，读出来就是什么。
+func TestEntryAcceptedUnsignedRoundTrips(t *testing.T) {
+	const digest = "sha256:" +
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	doc := `{"plugins":[{"name":"p","source":"./p","enabled":true,` +
+		`"accepted_unsigned":"` + digest + `"}]}`
+
+	dep, err := ParseDeployment([]byte(doc))
+	if err != nil {
+		t.Fatalf("ParseDeployment: %v", err)
+	}
+	if got := dep.Plugins[0].AcceptedUnsigned; got != digest {
+		t.Errorf("AcceptedUnsigned = %q, want %q", got, digest)
+	}
+}
+
+// TestEntryAcceptedUnsignedIsOptional：绝大多数条目（已登记的包）根本不需要
+// 它，缺省必须合法，且读出来是空串——空串的意思是「从没人认过」。
+func TestEntryAcceptedUnsignedIsOptional(t *testing.T) {
+	dep, err := ParseDeployment([]byte(`{"plugins":[{"name":"p","source":"./p","enabled":true}]}`))
+	if err != nil {
+		t.Fatalf("ParseDeployment: %v", err)
+	}
+	if got := dep.Plugins[0].AcceptedUnsigned; got != "" {
+		t.Errorf("AcceptedUnsigned = %q, want 空串", got)
+	}
+}
+
+// TestEntryAcceptedUnsignedRefusesAMalformedDigest：形状不对的值必须在解析期
+// 就被拒。放它进来的后果是运行期拿它去比对时永远不相等，而报出来的会是
+// 「这个包变了」——把一个配置错误伪装成一次篡改警报，排查方向完全错。
+func TestEntryAcceptedUnsignedRefusesAMalformedDigest(t *testing.T) {
+	for _, tc := range []struct{ name, value string }{
+		{"缺前缀", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+		{"长度不足", "sha256:aaaa"},
+		{"非十六进制", "sha256:" + "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz"},
+		{"别的算法", "sha512:" + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc := `{"plugins":[{"name":"p","source":"./p","enabled":true,` +
+				`"accepted_unsigned":"` + tc.value + `"}]}`
+			_, err := ParseDeployment([]byte(doc))
+			if err == nil {
+				t.Fatalf("%s 被接受了", tc.name)
+			}
+			if !strings.Contains(err.Error(), "accepted_unsigned") {
+				t.Errorf("错误没点名是哪个字段：%v", err)
+			}
+		})
+	}
+}
+
 func equalStrings(got, want []string) bool {
 	if len(got) != len(want) {
 		return false

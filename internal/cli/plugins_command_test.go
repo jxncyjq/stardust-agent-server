@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"maps"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -33,6 +34,7 @@ import (
 	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/app"
 	"github.com/stardust/legion-agent/internal/config"
+	"github.com/stardust/legion-agent/internal/plugin/fetch"
 	"github.com/stardust/legion-agent/internal/plugin/loader"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
 	"github.com/stardust/legion-agent/internal/plugin/sign"
@@ -83,6 +85,12 @@ type pluginFixture struct {
 	configPath   string
 	application  *app.App
 	gate         *taskgate.TaskGate
+
+	// trustlist is the fetched trust list's Store the assembly is handed, the
+	// same field serve fills in (see pluginHostDeps.Trustlist). Nil is the
+	// deployment that configured no remote list, which is what every test in
+	// this file but the trust-list ones is; useTrustlistCache fills it in.
+	trustlist *trustlist.Store
 }
 
 // newPluginFixture writes a config with a plugins section pointing at a
@@ -224,6 +232,16 @@ func (f *pluginFixture) signPackage(source string, priv ed25519.PrivateKey) {
 // plugin.sig file physically present: archivePackage requires all three
 // files fetch.Unpack insists an archive holds, plugin.sig among them,
 // regardless of whether the deployment ever checks it.
+//
+// A package signed this way is ProvenanceUnsigned to every deployment: no
+// keyring registers the key, so nobody it recognises stands behind the bytes.
+// That is why every `agent plugins install` test built on this helper passes
+// --accept-unsigned -- install refuses an unendorsed package without it,
+// whatever "require_signature" says. The refusal itself is pinned by
+// TestPluginsInstallRefusesAnUnsignedPackageWithoutTheFlag; the tests that
+// merely pass the flag are about grants, duplicate names and concurrent edits,
+// and each of them has to get past the endorsement gate first, exactly as an
+// operator would.
 func (f *pluginFixture) signPackageWithAnyKey(source string) {
 	f.t.Helper()
 
@@ -492,15 +510,28 @@ func (f *pluginFixture) assemble() error {
 func (f *pluginFixture) assembleWithLogger(logger *slog.Logger) error {
 	f.t.Helper()
 
+	_, err := f.assembleTrustSet(logger)
+	return err
+}
+
+// assembleTrustSet is the assembly again, handing back the loader.TrustSet the
+// assembly built its loader with -- the value serve carries on to the consent
+// service (see BuildServeService), and the one a test needs when the question
+// is what the panel judges a package against rather than whether the manifest
+// converged.
+func (f *pluginFixture) assembleTrustSet(logger *slog.Logger) (loader.TrustSet, error) {
+	f.t.Helper()
+
 	cfg, err := config.Load(context.Background(), config.Options{Path: f.configPath})
 	if err != nil {
 		f.t.Fatalf("load config %s: %v", f.configPath, err)
 	}
 	return assemblePlugins(context.Background(), f.application, cfg, pluginHostDeps{
-		Audit:  adapter.NewMemoryAuditLog(),
-		Events: adapter.NewMemoryEventBus(),
-		Logger: logger,
-		Gate:   f.gate,
+		Audit:     adapter.NewMemoryAuditLog(),
+		Events:    adapter.NewMemoryEventBus(),
+		Logger:    logger,
+		Gate:      f.gate,
+		Trustlist: f.trustlist,
 	})
 }
 
@@ -2004,22 +2035,25 @@ func TestPluginsReloadConvergesWhenTheSignaturePolicyIsUnchanged(t *testing.T) {
 	}
 }
 
-// TestAssemblePluginsDropsALoadedKeyringWhenSignaturesAreExplicitlyOff is the
-// a5a-task-3 review's Minor #3: the branch where a keyring loads FINE and is
-// then discarded by policy had no test at all -- the three "off" tests either
-// configured no keyring or one that would not read. A valid keyring plus an
-// unsigned package is what tells the two apart: if the keyring were kept, this
-// package could not mount.
+// TestAnUnsignedPackageStillMountsWithAKeyringConfiguredAndSignaturesOff is the
+// a5a-task-3 review's Minor #3: the branch where a keyring loads FINE while the
+// policy requires no endorsement had no test at all -- the three "off" tests
+// either configured no keyring or one that would not read. A valid keyring plus
+// an unsigned package is what exercises it: an unsigned package mounts here
+// because "require_signature": false says an endorsement is not required, and
+// for no other reason. The keyring itself is NOT discarded (see
+// resolvePluginTrustInput) -- what it still decides is covered by
+// TestAssemblePluginsRefusesARevokedKeyEvenWithSignaturesOff.
 //
 // It also pins Minor #4: exactly one line in a startup log says this deployment
-// verifies nothing. The cli's warning carries only what the cli knows (a trust
-// set is configured, and which file), because two warnings meaning the same
-// thing teach an operator to skip both.
-func TestAssemblePluginsDropsALoadedKeyringWhenSignaturesAreExplicitlyOff(t *testing.T) {
+// requires no endorsement. The cli's warning carries only what the cli knows (a
+// trust set is configured, and which file), because two warnings meaning the
+// same thing teach an operator to skip both.
+func TestAnUnsignedPackageStillMountsWithAKeyringConfiguredAndSignaturesOff(t *testing.T) {
 	f := newPluginFixture(t, 30_000)
 	_, keyringPath := f.newKeyring("keyring.json")
 	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(false)})
-	// Written and never signed: it mounts only if the keyring was truly dropped.
+	// Written and never signed: it mounts only if an endorsement is truly not required.
 	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
 	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
 
@@ -2028,21 +2062,85 @@ func TestAssemblePluginsDropsALoadedKeyringWhenSignaturesAreExplicitlyOff(t *tes
 		t.Fatalf("assemblePlugins() error = %v, want nil: a valid keyring plus an explicit off is a legal deployment", err)
 	}
 	if !toolauth.IsGateable(testEchoTool) {
-		t.Fatalf("IsGateable(%q) = false, want true: an unsigned package mounting is what proves the keyring was discarded",
+		t.Fatalf("IsGateable(%q) = false, want true: an unsigned package mounting is what proves the switch switched",
 			testEchoTool)
 	}
 
 	log := logs.String()
-	if !strings.Contains(log, "plugin trust keyring is configured but not enforced") {
-		t.Errorf("startup log = %q, want the cli to report the trust set it loaded and dropped", log)
+	if !strings.Contains(log, "plugin trust keyring is configured while no endorsement is required") {
+		t.Errorf("startup log = %q, want the cli to report the trust set it loaded and what this policy does with it", log)
+	}
+	// The warning has to say BOTH halves, or it re-tells the old story in which
+	// the keys were loaded and dropped: an unendorsed package still mounts, and
+	// a revoked key is still refused.
+	if !strings.Contains(log, "still mounts") {
+		t.Errorf("startup log = %q, want the warning to say an unendorsed package still mounts under this policy", log)
+	}
+	if !strings.Contains(log, "revokes is still refused") {
+		t.Errorf("startup log = %q, want the warning to say a revoked key is still refused under this policy", log)
 	}
 	if !strings.Contains(log, "keyring.json") {
 		t.Errorf("startup log = %q, want it to name the keyring file that is not being enforced", log)
 	}
-	if got := strings.Count(log, "signature verification is"); got != 1 {
+	const loaderWarning = "does not require a publisher endorsement"
+	if got := strings.Count(log, loaderWarning); got != 1 {
 		t.Errorf("startup log says %q %d times, want exactly 1 (the loader's): a second warning saying the same thing "+
-			"is how an operator learns to ignore both.\nlog = %q", "signature verification is", got, log)
+			"is how an operator learns to ignore both.\nlog = %q", loaderWarning, got, log)
 	}
+}
+
+// TestAssemblePluginsRefusesARevokedKeyEvenWithSignaturesOff closes I2, and it
+// runs through the REAL assembly path -- newPluginFixture -> assemble ->
+// newPluginLoader -> the TrustSet closure that assembly builds -- rather than
+// handing a manifest.TrustInput to a loader harness.
+//
+// That distinction is the whole test. The loader's own policy table already has
+// two Revoked cases, and both inject a TrustInput directly; the one segment
+// that could lose it is the assembly, which used to resolve the trust set
+// through the SIGNATURE POLICY and so produced no trust set at all for a
+// deployment with "require_signature": false. A package signed by a revoked key
+// then came back ProvenanceUnsigned -- there were no keys to place its
+// signature against -- and mounted. "require_signature: false does not reach a
+// revocation" was true of the Loader and false of the deployment.
+//
+// The keyring registers a second, unrelated key on purpose: sign.ParseKeyring
+// refuses a document whose every registered key is revoked, so a one-key
+// keyring would fail to parse and this test would pass for the wrong reason.
+func TestAssemblePluginsRefusesARevokedKeyEvenWithSignaturesOff(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+
+	signingPub, signingPriv, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	sparePub, _, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	keyringPath := filepath.Join(f.dir, "keyring.json")
+	writeKeyringDoc(t, keyringPath, []map[string]string{
+		{"id": string(testPluginKeyID), "algorithm": "ed25519",
+			"public_key": base64.StdEncoding.EncodeToString(signingPub)},
+		{"id": "spare", "algorithm": "ed25519",
+			"public_key": base64.StdEncoding.EncodeToString(sparePub)},
+	}, []map[string]string{{"key_id": string(testPluginKeyID), "reason": "laptop stolen"}})
+
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(false)})
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.signPackage("echo", signingPriv)
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+
+	// One refused entry is not a refused startup: the deployment comes up and
+	// reports the entry as failed, the same as any other activation failure.
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil: one refused entry must not stop startup", err)
+	}
+	if toolauth.IsGateable(testEchoTool) {
+		t.Fatalf("IsGateable(%q) = true, want false: a package signed by a revoked key must not mount, and "+
+			`"require_signature": false is not a statement about revoked keys`, testEchoTool)
+	}
+	f.requireStatusExplains("after a revoked-key package was refused", "revoked")
+	f.requireStatusExplains("after a revoked-key package was refused", string(testPluginKeyID))
 }
 
 // TestAssemblePluginsFailsWhenTheKeyringPathIsADirectory is the a5a-task-3
@@ -2157,7 +2255,7 @@ func TestAssemblePluginsReportsAConfiguredKeyringWhilePluginsAreOff(t *testing.T
 	}
 
 	logs := &bytes.Buffer{}
-	if err := assemblePlugins(context.Background(), app.New(), cfg, pluginHostDeps{
+	if _, err := assemblePlugins(context.Background(), app.New(), cfg, pluginHostDeps{
 		Audit:  adapter.NewMemoryAuditLog(),
 		Events: adapter.NewMemoryEventBus(),
 		Logger: slog.New(slog.NewTextHandler(logs, nil)),
@@ -2887,7 +2985,8 @@ func (f *pluginFixture) requireStatusExplains(when, want string) {
 //	point plugins.json at them -> serve assembly mounts them ->
 //	  flip one byte of plugin.wasm            -> reload refused on the sha256
 //	  edit plugin.json, keep the digest right -> reload refused on the signature
-//	  re-sign with a key the keyring lacks    -> reload refused by key id
+//	  re-sign with a key the keyring lacks    -> reload refused, naming both the
+//	                                             key offered and the key trusted
 //	  re-sign with the trusted key            -> reload converges again
 //
 // The signature policy is never written down: require_signature is left out of
@@ -2992,13 +3091,26 @@ func TestSignedDeploymentAcceptanceFromKeygenThroughEveryTamper(t *testing.T) {
 	if err == nil {
 		t.Fatal("plugins reload error = nil for a package signed by an untrusted key, want a refusal")
 	}
+	// The refusal has to name rogue-2026 — the key the package says signed it —
+	// as well as ops-2026, the key this deployment would have believed. Neither
+	// stands in for the other: without the first, an operator is told only that
+	// nobody they know endorsed this, which fits a lapsed registration, an id
+	// typed wrong, and an attacker equally well, and those are three different
+	// things to go and do. Without the second, the id has nothing to be
+	// contrasted against and reads like a credential rather than like a claim
+	// this deployment could not place. The plugin.sig path is the third thing:
+	// the file to go and read.
 	if !strings.Contains(err.Error(), "rogue-2026") {
 		t.Errorf("plugins reload error = %v, want it to name the key id the signature was made with", err)
+	}
+	if !strings.Contains(err.Error(), "plugin.sig") {
+		t.Errorf("plugins reload error = %v, want it to name the file whose signature could not be placed", err)
 	}
 	if !strings.Contains(err.Error(), "ops-2026") {
 		t.Errorf("plugins reload error = %v, want it to name the key this deployment does trust", err)
 	}
 	f.requireStatusExplains("after the untrusted signature was refused", "rogue-2026")
+	f.requireStatusExplains("after the untrusted signature was refused", "ops-2026")
 	f.requireBothPluginsStillMounted("after the untrusted signature was refused", "1.2.0")
 
 	// Convergence 5 of 5: the control. Re-signed by the trusted key, with
@@ -3662,7 +3774,7 @@ func TestPluginsInstallWithoutGrantRegistersWithNoCapabilitiesAndStaysDisabled(t
 	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
 	f.writeManifest()
 
-	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest)
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--accept-unsigned")
 	if err != nil {
 		t.Fatalf("plugins install error = %v, want nil", err)
 	}
@@ -3711,6 +3823,445 @@ func TestPluginsInstallWithoutGrantRegistersWithNoCapabilitiesAndStaysDisabled(t
 	}
 }
 
+// TestPluginsInstallRefusesAnUnsignedPackageWithoutTheFlag is the graded
+// install's middle grade: a package no registered publisher endorses is not
+// refused outright and is not installed silently either -- it is refused with
+// the one flag that changes the answer named in the refusal. An error that only
+// said "no" would leave an operator guessing at a flag they have never seen.
+//
+// The deployment here sets "require_signature": false, deliberately. That
+// switch answers what may MOUNT; it is not an answer to "may install register a
+// package nobody stands behind", which is a decision a person is present for.
+// Reading the switch here instead would collapse the middle grade to nothing in
+// exactly the deployments that opted out of endorsements.
+func TestPluginsInstallRefusesAnUnsignedPackageWithoutTheFlag(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.signPackageWithAnyKey("staging")
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
+	f.writeManifest()
+	before, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json before install: %v", err)
+	}
+
+	_, refusal := f.run("install", srv.URL+"/echo.tgz", "--digest", digest)
+	if refusal == nil {
+		t.Fatal("plugins install of an unendorsed package = nil error, want a refusal")
+	}
+	if !errors.Is(refusal, manifest.ErrUnsignedNotAccepted) {
+		t.Errorf("plugins install error = %v, want it to wrap manifest.ErrUnsignedNotAccepted", refusal)
+	}
+	if !strings.Contains(refusal.Error(), "--accept-unsigned") {
+		t.Errorf("plugins install error = %v, want it to name the flag that would change the answer", refusal)
+	}
+	// The refusal has to show the digest it is talking about: that string is
+	// what an operator compares against whatever they were told to expect, and
+	// it is the exact value --accept-unsigned would record.
+	cache, err := fetch.NewCache(cacheDir)
+	if err != nil {
+		t.Fatalf("open plugin cache: %v", err)
+	}
+	wantDigest, err := manifest.ManifestDigest(cache.Dir(digest))
+	if err != nil {
+		t.Fatalf("ManifestDigest: %v", err)
+	}
+	if !strings.Contains(refusal.Error(), wantDigest) {
+		t.Errorf("plugins install error = %v, want it to show the plugin.json digest %s", refusal, wantDigest)
+	}
+
+	after, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json after install: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("plugins.json changed on a refused install:\nbefore = %s\nafter  = %s", before, after)
+	}
+}
+
+// TestPluginsInstallRecordsTheAcceptedDigest is this task's wiring guard, and
+// the assertion that matters is the one comparing against
+// manifest.ManifestDigest: the digest install writes into plugins.json must be
+// the value that function computes over the same package directory -- the same
+// function the loader judges an acceptance with.
+//
+// Two sides each hashing "the package" their own way is how an acceptance comes
+// to be written and never read back: install would report success, and every
+// later mount would refuse the entry as changed since somebody approved it,
+// with both sides individually defensible.
+func TestPluginsInstallRecordsTheAcceptedDigest(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.signPackageWithAnyKey("staging")
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
+	f.writeManifest()
+
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--accept-unsigned")
+	if err != nil {
+		t.Fatalf("plugins install --accept-unsigned error = %v, want nil", err)
+	}
+
+	cache, err := fetch.NewCache(cacheDir)
+	if err != nil {
+		t.Fatalf("open plugin cache: %v", err)
+	}
+	want, err := manifest.ManifestDigest(cache.Dir(digest))
+	if err != nil {
+		t.Fatalf("ManifestDigest: %v", err)
+	}
+	entry := f.requireEntry(f.readDeployment(), testEchoPlugin)
+	if entry.AcceptedUnsigned == "" {
+		t.Fatalf("entry.AcceptedUnsigned is empty after --accept-unsigned: nothing recorded what was accepted, "+
+			"so every later mount refuses this entry as unendorsed (want %s)", want)
+	}
+	if entry.AcceptedUnsigned != want {
+		t.Errorf("entry.AcceptedUnsigned = %q, want %q: install and the loader must hash the same bytes",
+			entry.AcceptedUnsigned, want)
+	}
+	// The written shape too, not only the parsed field: an acceptance that does
+	// not survive MarshalDeployment is an acceptance nobody can read back.
+	raw, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json after install: %v", err)
+	}
+	if !strings.Contains(string(raw), want) {
+		t.Errorf("plugins.json = %s, want the accepted digest %s written into it", raw, want)
+	}
+	if !strings.Contains(out, want) {
+		t.Errorf("plugins install output = %q, want it to say which bytes were accepted (%s)", out, want)
+	}
+}
+
+// TestPluginsInstallReportsAnUnavailableTrustList is the task-5 review's
+// Important #2. resolvePluginTrustInput's contract makes recording an
+// unreadable trust list mandatory -- reportUnavailable is a required parameter
+// precisely so the "the list half was empty" case cannot pass in silence -- and
+// serve's half of that obligation is pinned by
+// TestServeGivesThePluginLoaderTheTrustlistItRefreshes. install's half had
+// nothing watching it: the whole warning could be deleted with every test in
+// this package still green.
+//
+// install is the half where it matters most. A person is present and is
+// deciding, with --accept-unsigned, whether to trust these bytes; "the trust
+// set that judged this package was missing its published half" is a fact that
+// decision turns on, and it is worth more here than in a startup log nobody is
+// reading at the time.
+//
+// The trustlist cache is EMPTY -- no list has ever been fetched -- so
+// Store.Current answers "unavailable" plus an error. The url is the
+// never-resolving one: install reads the cache and never refreshes, so a
+// request leaving this machine would be a bug in itself.
+func TestPluginsInstallReportsAnUnavailableTrustList(t *testing.T) {
+	// installUnsigned installs one unendorsed package under the given extra
+	// plugins settings and returns the command's output.
+	installUnsigned := func(t *testing.T, extra ...string) string {
+		t.Helper()
+
+		f := newPluginFixture(t, 30_000)
+		f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+		f.signPackageWithAnyKey("staging")
+		archive := f.archivePackage("staging")
+		digest := digestOfArchive(archive)
+		srv := serveArchive(t, archive)
+		settings := append([]string{
+			fmt.Sprintf("\"cache\": %s", jsonString(filepath.Join(f.dir, "plugin-cache"))),
+			`"allow_insecure_sources": true`,
+		}, extra...)
+		f.writeSignatureConfig(30_000, signaturePolicy{requireSignature: boolPtr(false)}, settings...)
+		f.writeManifest()
+
+		out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--accept-unsigned")
+		if err != nil {
+			t.Fatalf("plugins install --accept-unsigned error = %v, want nil", err)
+		}
+		// The install has to have HAPPENED. A warning printed by a command that
+		// refused the package would be a different thing entirely, and a test
+		// that only matched the string could not tell the two apart.
+		f.requireEntry(f.readDeployment(), testEchoPlugin)
+		return out
+	}
+
+	t.Run("an unreadable trust list is reported", func(t *testing.T) {
+		out := installUnsigned(t, fmt.Sprintf(`"trustlist": {"url": %s, "cache": %s, "refresh_interval_ms": 3600000}`,
+			jsonString(trustlistNeverFetchedURL), jsonString(filepath.Join(t.TempDir(), "trustlist-cache"))))
+		if !strings.Contains(out, pluginCommandTrustlistUnavailableMsg) {
+			t.Errorf("plugins install output = %q, want %q: this package was judged against a trust set "+
+				"missing its published half, and the operator accepting it was not told",
+				out, pluginCommandTrustlistUnavailableMsg)
+		}
+	})
+
+	t.Run("a deployment with no trust list is not warned at", func(t *testing.T) {
+		// The control. A warning printed unconditionally would satisfy the
+		// assertion above while telling every operator on every install that
+		// something is wrong -- which is how a real one stops being read.
+		// A deployment that configured no remote list has no missing half.
+		out := installUnsigned(t)
+		if strings.Contains(out, pluginCommandTrustlistUnavailableMsg) {
+			t.Errorf("plugins install output = %q for a deployment that configured no trust list at all, "+
+				"want no unavailability warning: nothing is missing here", out)
+		}
+	})
+}
+
+// TestResolvePluginTrustInputHandsBackTheMergesPublishers pins the second half
+// of what this function assembles. Its Keyring half is watched everywhere a
+// verdict is: a package judged against a dropped keyring comes back
+// ProvenanceUnsigned and a dozen tests notice. Its Publishers half had nobody
+// watching it at all -- deleting `Publishers: publishers` from the returned
+// manifest.TrustInput left the whole suite green (task-6 review, Important-1,
+// mutation b2'), because the display names it carries only ever become visible
+// through a package signed by a key the FETCHED trust list registers, and this
+// package's tests hold no fetched list: trustlist.Store adopts a list only
+// after it verifies against the embedded root keyring, whose private half is
+// deliberately not in this repository.
+//
+// So the assertion is made where it can be made: against trustlist.Merge's own
+// second return value, computed here from the same inputs. A deployment with
+// no fetched list makes that an EMPTY map rather than a nil one, and empty is
+// not the same value as dropped -- only the merge decides which of the two
+// this function is supposed to return, and this test says it must return
+// whichever the merge produced rather than a value of its own.
+func TestResolvePluginTrustInputHandsBackTheMergesPublishers(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	_, keyringPath := f.newKeyring("keyring.json")
+	localRaw, err := os.ReadFile(keyringPath)
+	if err != nil {
+		t.Fatalf("read keyring %s: %v", keyringPath, err)
+	}
+
+	_, wantPublishers, err := trustlist.Merge(localRaw, trustlist.Trust{})
+	if err != nil {
+		t.Fatalf("trustlist.Merge: %v", err)
+	}
+	if wantPublishers == nil {
+		t.Fatal("trustlist.Merge returned a nil publishers map for a local keyring document; this test " +
+			"compares against that map, so a nil one would make every assertion below vacuous")
+	}
+
+	got, err := resolvePluginTrustInput(localRaw, nil, func(error) {
+		t.Error("reportUnavailable was called for a deployment that configured no trust list at all")
+	})
+	if err != nil {
+		t.Fatalf("resolvePluginTrustInput() error = %v, want nil", err)
+	}
+	if got.Publishers == nil {
+		t.Fatal("TrustInput.Publishers is nil while the merge produced a map: the publishers half was " +
+			"dropped on the way out, and every display name a fetched trust list registers would be " +
+			"lost with it -- the panel would show \"registered\" with nobody's name beside it")
+	}
+	if !maps.Equal(got.Publishers, wantPublishers) {
+		t.Errorf("TrustInput.Publishers = %v, want the merge's own map %v", got.Publishers, wantPublishers)
+	}
+}
+
+// TestResolvePluginTrustInputRefusesANilReporter is the task-5 review's Minor
+// #2. reportUnavailable is documented as required, and it is required for a
+// reason: it is the only channel through which an unreadable trust list is
+// reported at all. Left unchecked, a nil one surfaces as a bare nil dereference
+// inside the branch that runs only on a machine whose trustlist cache cannot be
+// read, with a stack that names this function and nothing about which wiring
+// forgot the argument.
+//
+// The store here is nil, so the reporting branch is not even reachable: the
+// refusal has to be an entry check, not a crash that waits for the rare input.
+func TestResolvePluginTrustInputRefusesANilReporter(t *testing.T) {
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			t.Fatal("resolvePluginTrustInput with a nil reportUnavailable returned normally, want a panic: " +
+				"a deployment wired this way reports nothing when its trust list cannot be read")
+		}
+		msg, ok := recovered.(string)
+		if !ok || !strings.Contains(msg, "reportUnavailable") {
+			t.Errorf("panic value = %v, want a message naming the missing parameter", recovered)
+		}
+	}()
+
+	//nolint:errcheck // the call panics; nothing after it runs.
+	_, _ = resolvePluginTrustInput(nil, nil, nil)
+}
+
+// TestAnInstallTimeAcceptanceMountsUnderAStrictPolicy is the acceptance's whole
+// point, end to end and through the commands an operator types: `agent plugins
+// install --accept-unsigned` writes a record, and the loader READS THAT RECORD
+// BACK and mounts on it -- under "require_signature" left at its strict
+// default, which is the only policy under which an acceptance decides anything.
+//
+// TestPluginsInstallRecordsTheAcceptedDigest pins the two sides computing the
+// same digest; this pins that the digest is enough. An entry whose acceptance
+// is written correctly and rejected anyway is still an entry nobody can run,
+// and neither side's own tests can see that.
+func TestAnInstallTimeAcceptanceMountsUnderAStrictPolicy(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	// A keyring is configured and the strict default policy stands, so an
+	// unendorsed package mounts on an acceptance and on nothing else.
+	//
+	// The key it registers is deliberately NOT the id signPackageWithAnyKey
+	// signs under: an unknown id is ProvenanceUnsigned (nobody this deployment
+	// recognises stands behind the bytes), while the same id signed by another
+	// key pair would be a signature that does not verify -- a tampering report,
+	// which no acceptance may lift and which this test is not about.
+	registeredPub, _, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	keyringPath := filepath.Join(f.dir, "keyring.json")
+	writeKeyringDoc(t, keyringPath, []map[string]string{{
+		"id": "ops-2026", "algorithm": "ed25519",
+		"public_key": base64.StdEncoding.EncodeToString(registeredPub),
+	}}, nil)
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.signPackageWithAnyKey("staging")
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	f.writeInstallConfig(signaturePolicy{keyring: keyringPath}, filepath.Join(f.dir, "plugin-cache"))
+	f.writeManifest()
+
+	if _, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest,
+		"--grant", "log", "--accept-unsigned"); err != nil {
+		t.Fatalf("plugins install --accept-unsigned error = %v, want nil", err)
+	}
+	entry := f.requireEntry(f.readDeployment(), testEchoPlugin)
+	if entry.AcceptedUnsigned == "" {
+		t.Fatalf("entry.AcceptedUnsigned is empty after --accept-unsigned; nothing was recorded to mount on")
+	}
+
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Fatalf("IsGateable(%q) = false, want true: the acceptance install wrote (%s) did not admit the "+
+			"package it was written for", testEchoTool, entry.AcceptedUnsigned)
+	}
+}
+
+// TestPluginsInstallRefusesARevokedPackageEvenWithTheFlag is the grade
+// --accept-unsigned does not reach. The flag's name is unsigned, and a
+// revocation is not an absence of a signature: it is an endorsement that was
+// given and then withdrawn. One flag that waved both through would be two
+// decisions behind one switch, and only one of them was ever put to the
+// operator.
+func TestPluginsInstallRefusesARevokedPackageEvenWithTheFlag(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+
+	signingPub, signingPriv, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	// A second, unrelated key: sign.ParseKeyring refuses a document whose every
+	// registered key is revoked, so a one-key keyring would never parse and this
+	// test would refuse the install for the wrong reason.
+	sparePub, _, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	keyringPath := filepath.Join(f.dir, "keyring.json")
+	writeKeyringDoc(t, keyringPath, []map[string]string{
+		{"id": string(testPluginKeyID), "algorithm": "ed25519",
+			"public_key": base64.StdEncoding.EncodeToString(signingPub)},
+		{"id": "spare", "algorithm": "ed25519",
+			"public_key": base64.StdEncoding.EncodeToString(sparePub)},
+	}, []map[string]string{{"key_id": string(testPluginKeyID), "reason": "laptop stolen"}})
+
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.signPackage("staging", signingPriv)
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	f.writeInstallConfig(signaturePolicy{keyring: keyringPath}, filepath.Join(f.dir, "plugin-cache"))
+	f.writeManifest()
+	before, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json before install: %v", err)
+	}
+
+	_, err = f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--accept-unsigned")
+	if err == nil {
+		t.Fatal("plugins install --accept-unsigned of a revoked-key package = nil error, want a refusal: " +
+			"the flag accepts a package nobody endorsed, not one whose endorsement was withdrawn")
+	}
+	if !errors.Is(err, manifest.ErrRevokedPublisher) {
+		t.Errorf("plugins install error = %v, want it to wrap manifest.ErrRevokedPublisher", err)
+	}
+	if errors.Is(err, manifest.ErrUnsignedNotAccepted) {
+		t.Errorf("plugins install error = %v, want it NOT to wrap manifest.ErrUnsignedNotAccepted: a revoked "+
+			"key is not an unsigned package, and a caller that cannot tell them apart offers the wrong remedy", err)
+	}
+	if !strings.Contains(err.Error(), string(testPluginKeyID)) {
+		t.Errorf("plugins install error = %v, want it to name the revoked key", err)
+	}
+	if !strings.Contains(err.Error(), "laptop stolen") {
+		t.Errorf("plugins install error = %v, want it to carry what the operator wrote down about the revocation", err)
+	}
+	if !strings.Contains(err.Error(), "--accept-unsigned") {
+		t.Errorf("plugins install error = %v, want it to say, in so many words, that --accept-unsigned does not "+
+			"apply here -- an operator who just typed that flag will otherwise try it again", err)
+	}
+
+	after, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json after install: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("plugins.json changed on a refused install:\nbefore = %s\nafter  = %s", before, after)
+	}
+}
+
+// TestPluginsInstallShowsThePublisherForARegisteredPackage is the top grade:
+// an endorsed package installs with no flag at all, and install says who
+// endorsed it. Without that line the two grades that DO install are
+// indistinguishable on screen, and "it installed fine" stops carrying any
+// information about who stands behind the code.
+//
+// The key id is what this deployment can name. A display name lives in the
+// fetched trust list's publisher records (trustlist.Merge carries them into
+// TrustInput.Publishers); a local keyring document registers ids and public
+// keys and no names at all, so a deployment with only a local keyring has no
+// name to print, and the id is the whole of what it knows.
+func TestPluginsInstallShowsThePublisherForARegisteredPackage(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	priv, keyringPath := f.newKeyring("keyring.json")
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.signPackage("staging", priv)
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	f.writeInstallConfig(signaturePolicy{keyring: keyringPath}, filepath.Join(f.dir, "plugin-cache"))
+	f.writeManifest()
+
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest)
+	if err != nil {
+		t.Fatalf("plugins install of an endorsed package error = %v, want nil: no flag is needed for a package "+
+			"a registered publisher signed", err)
+	}
+	if !strings.Contains(out, string(testPluginKeyID)) {
+		t.Errorf("plugins install output = %q, want it to name the key that endorsed the package (%s)",
+			out, testPluginKeyID)
+	}
+	if !strings.Contains(out, "endorsed") {
+		t.Errorf("plugins install output = %q, want it to say the package is endorsed", out)
+	}
+
+	// An endorsed package records NO acceptance: an acceptance is the thing an
+	// operator writes down in place of an endorsement, and writing one here
+	// would pin the entry to today's bytes for a publisher who is free to
+	// re-sign a new version.
+	entry := f.requireEntry(f.readDeployment(), testEchoPlugin)
+	if entry.AcceptedUnsigned != "" {
+		t.Errorf("entry.AcceptedUnsigned = %q for an endorsed package, want empty", entry.AcceptedUnsigned)
+	}
+}
+
 // TestPluginsInstallRefusesAGrantForAnUndeclaredCapability is rule 5:
 // granting a capability the plugin's own plugin.json never declared is a
 // config error, not generosity, and it must be refused by name — with
@@ -3732,7 +4283,7 @@ func TestPluginsInstallRefusesAGrantForAnUndeclaredCapability(t *testing.T) {
 		t.Fatalf("read plugins.json before install: %v", err)
 	}
 
-	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "http")
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "http", "--accept-unsigned")
 	if err == nil {
 		t.Fatalf("plugins install output = %q, error = nil, want an error: the plugin only declares \"log\"", out)
 	}
@@ -3786,7 +4337,7 @@ func TestPluginsInstallRefusesAPartialGrantThatCanNeverMount(t *testing.T) {
 		t.Fatalf("read plugins.json before install: %v", err)
 	}
 
-	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "log")
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "log", "--accept-unsigned")
 	if err == nil {
 		t.Fatalf("plugins install output = %q, error = nil, want an error: the plugin declares log AND http, "+
 			"--grant only named log", out)
@@ -3828,7 +4379,7 @@ func TestPluginsInstallWithACompleteGrantAuthorizesTheEntryImmediately(t *testin
 	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
 	f.writeManifest()
 
-	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "log,http")
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "log,http", "--accept-unsigned")
 	if err != nil {
 		t.Fatalf("plugins install error = %v, want nil", err)
 	}
@@ -3900,7 +4451,7 @@ func TestPluginsInstallRefusesAnExplicitlyEmptyGrant(t *testing.T) {
 				t.Fatalf("read plugins.json before install: %v", err)
 			}
 
-			out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", grantValue)
+			out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", grantValue, "--accept-unsigned")
 			if err == nil {
 				t.Fatalf("plugins install output = %q, error = nil, want an error: --grant was explicitly "+
 					"given but empty", out)
@@ -3943,7 +4494,7 @@ func TestPluginsInstallRefusesADuplicateName(t *testing.T) {
 		t.Fatalf("read plugins.json before install: %v", err)
 	}
 
-	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest)
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--accept-unsigned")
 	if err == nil {
 		t.Fatalf("plugins install output = %q, error = nil, want an error: %q is already in plugins.json",
 			out, testEchoPlugin)
@@ -4107,7 +4658,7 @@ func TestPluginsInstallRefusesAConcurrentEditDuringTheDownload(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest)
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--accept-unsigned")
 	if err == nil {
 		t.Fatalf("plugins install output = %q, error = nil, want an error: plugins.json changed while this "+
 			"package was downloading", out)
@@ -4834,7 +5385,7 @@ func TestPluginsInstallRefusesADuplicateGrantCapability(t *testing.T) {
 		t.Fatalf("read plugins.json before install: %v", err)
 	}
 
-	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "log,log")
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "log,log", "--accept-unsigned")
 	if err == nil {
 		t.Fatalf("plugins install output = %q, error = nil, want an error: \"log\" is named twice", out)
 	}
@@ -4910,7 +5461,7 @@ func TestPluginsInstallRefusesAnHTTPGrantWithoutAllowedHosts(t *testing.T) {
 		t.Fatalf("read plugins.json before install: %v", err)
 	}
 
-	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "http")
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "http", "--accept-unsigned")
 	if err == nil {
 		t.Fatalf("plugins install output = %q, error = nil, want an error: --grant names \"http\" but names no "+
 			"allowed hosts, and the plugin declares some", out)
@@ -4951,7 +5502,7 @@ func TestPluginsInstallRefusesAnFSGrantWithoutAllowedPaths(t *testing.T) {
 		t.Fatalf("read plugins.json before install: %v", err)
 	}
 
-	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "fs")
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "fs", "--accept-unsigned")
 	if err == nil {
 		t.Fatalf("plugins install output = %q, error = nil, want an error: --grant names \"fs\" but names no "+
 			"allowed paths, and the plugin declares some", out)
@@ -5233,6 +5784,178 @@ func TestPluginsReloadRefusesAfterAKeyIsRevoked(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), string(testPluginKeyID)) {
 		t.Errorf("plugins reload error = %v, want it to name the revoked key", err)
+	}
+}
+
+// revocableKeyringFixture writes a keyring document holding two keys into the
+// fixture directory and returns the private half of the first one along with
+// the document's path and the key list it was written from, so a test can
+// rewrite the same document with a revocation added.
+//
+// TWO keys, always: sign.ParseKeyring refuses a document whose every registered
+// key is revoked, so a one-key keyring would stop parsing the moment a test
+// revoked it and the test would fail for a reason it is not about.
+func revocableKeyringFixture(t *testing.T, dir string) (ed25519.PrivateKey, string, []map[string]string) {
+	t.Helper()
+
+	signingPub, signingPriv, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	sparePub, _, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	keys := []map[string]string{
+		{"id": string(testPluginKeyID), "algorithm": "ed25519",
+			"public_key": base64.StdEncoding.EncodeToString(signingPub)},
+		{"id": "spare", "algorithm": "ed25519",
+			"public_key": base64.StdEncoding.EncodeToString(sparePub)},
+	}
+	path := filepath.Join(dir, "keyring.json")
+	writeKeyringDoc(t, path, keys, nil)
+	return signingPriv, path, keys
+}
+
+// TestPluginsReloadRefusesAfterAKeyIsRevokedWithSignaturesOff closes C1, and it
+// is the same guard TestPluginsReloadRefusesAfterAKeyIsRevoked pins one policy
+// over: a revocation added to the local keyring document must stop a reload,
+// under "require_signature": false exactly as under the strict default.
+//
+// That policy used to be the hole. The comparison was computed over the
+// POLICY-ENFORCED keyring, which is nil whenever no endorsement is required, so
+// both sides were the zero policy and compared equal however the document had
+// changed. A reload then converged the new manifest under the keyring frozen at
+// startup, printed "loaded", and mounted a package signed by a key the operator
+// had just revoked.
+//
+// The manifest entry starts DISABLED and is enabled only after the revocation
+// is written, so the package's first chance to mount is the reload under test.
+// A test that mounted it beforehand could only observe the refusal, never the
+// mount the refusal prevents.
+//
+// The keyring's trusted ids are IDENTICAL before and after: only a revocation
+// is added. A comparison that noticed the key list alone would pass this test
+// while leaving revocations out of the policy entirely.
+func TestPluginsReloadRefusesAfterAKeyIsRevokedWithSignaturesOff(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	signingPriv, keyringPath, keys := revocableKeyringFixture(t, f.dir)
+
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(false)})
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.signPackage("echo", signingPriv)
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+	if toolauth.IsGateable(testEchoTool) {
+		t.Fatalf("IsGateable(%q) = true after an assembly of a disabled entry, want false", testEchoTool)
+	}
+
+	// The operator revokes the signing key, then enables the entry.
+	writeKeyringDoc(t, keyringPath, keys,
+		[]map[string]string{{"key_id": string(testPluginKeyID), "reason": "laptop stolen"}})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+
+	out, err := f.run("reload")
+	if err == nil {
+		t.Fatalf("plugins reload after a revocation under \"require_signature\": false = nil error, want a "+
+			"refusal: this process still trusts the revoked key.\nreload output = %q", out)
+	}
+	if !strings.Contains(err.Error(), "restart") {
+		t.Errorf("plugins reload error = %v, want it to say serve must be restarted", err)
+	}
+	if !strings.Contains(err.Error(), string(testPluginKeyID)) {
+		t.Errorf("plugins reload error = %v, want it to name the revoked key", err)
+	}
+	// The point of the refusal, and not a restatement of it: the package signed
+	// by the revoked key did not mount.
+	if toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = true, want false: the reload mounted a package signed by a key this "+
+			"operator had already revoked.\nreload output = %q", testEchoTool, out)
+	}
+}
+
+// TestPluginsReloadConvergesWithSignaturesOffWhenTheKeyringIsUnchanged is the
+// other direction, and it is not optional. A guard that refuses a reload the
+// keyring did not change is a guard operators learn to route around, and the
+// fix that closed C1 -- comparing over the keyring document as read rather than
+// over the policy-filtered one -- is exactly the kind of change that turns a
+// silent guard into a permanently-firing one: computing the two sides from
+// different keyrings would make every reload of this deployment fail.
+//
+// Same shape as the test above, minus the revocation.
+func TestPluginsReloadConvergesWithSignaturesOffWhenTheKeyringIsUnchanged(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	signingPriv, keyringPath, _ := revocableKeyringFixture(t, f.dir)
+
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(false)})
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.signPackage("echo", signingPriv)
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+	if _, err := f.run("reload"); err != nil {
+		t.Fatalf("plugins reload error = %v, want nil: the keyring document and the requirement are both "+
+			"exactly what this process was assembled with", err)
+	}
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = false after a reload that was allowed through, want true: the entry the "+
+			"reload was supposed to converge onto never mounted", testEchoTool)
+	}
+}
+
+// TestPluginsReloadRefusesWhenTheEndorsementRequirementIsTurnedOff pins the
+// half of the signature policy that no keyring comparison can reach.
+//
+// The keyring document is BYTE-IDENTICAL on both sides; only
+// "require_signature" moves, from its strict default to false. That is a
+// relaxation -- every package that needed an endorsement stops needing one --
+// and a reload cannot apply it, because the requirement is frozen when serve
+// assembles the Loader. Without the requirement in the compared policy the two
+// sides are the same keyring and compare equal, so the reload would converge
+// and report success while the running process went on requiring endorsements
+// the config no longer asks for.
+func TestPluginsReloadRefusesWhenTheEndorsementRequirementIsTurnedOff(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	signingPriv, keyringPath, _ := revocableKeyringFixture(t, f.dir)
+
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath})
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.signPackage("echo", signingPriv)
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Fatalf("IsGateable(%q) = false after startup apply, want true", testEchoTool)
+	}
+
+	// Same keyring file, untouched; only the requirement is relaxed.
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(false)})
+
+	out, err := f.run("reload")
+	if err == nil {
+		t.Fatalf("plugins reload after \"require_signature\" was turned off = nil error, want a refusal: the "+
+			"requirement this process enforces is frozen at assembly.\nreload output = %q", out)
+	}
+	if !strings.Contains(err.Error(), "restart") {
+		t.Errorf("plugins reload error = %v, want it to say serve must be restarted", err)
+	}
+	// The refusal has to SHOW what moved. Both renderings in one message is
+	// what tells an operator which direction the change went; a message that
+	// printed the same keyring twice would report a difference it does not name.
+	msg := err.Error()
+	if !strings.Contains(msg, "no endorsement is required") || !strings.Contains(msg, "an endorsement is required") {
+		t.Errorf("plugins reload error = %v, want it to render both the requirement the config now asks for "+
+			"and the one this process was built with", err)
+	}
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = false, want true: a refused reload must leave the running deployment alone",
+			testEchoTool)
 	}
 }
 
@@ -5975,6 +6698,59 @@ func TestServeDoesNotWaitForTheFirstTrustlistFetch(t *testing.T) {
 	}
 }
 
+// TestServeGivesThePluginLoaderTheTrustlistItRefreshes pins the FOURTH half of
+// the serve wiring, and it is the one that had nothing watching it: the Store
+// serve resolves reaches the plugin LOADER too, not only the refresh loop.
+//
+// The two halves are wired in different places and neither implies the other. A
+// serve that started the loop and handed the loader no Store would refresh a
+// trust list into a cache directory that nothing judging a package ever reads:
+// every revocation published after startup would land on disk and change
+// nothing. That is invisible from the loop's own logs, which report perfectly
+// successful rounds either way.
+//
+// It is observable here because the trustlist cache is EMPTY -- no list has
+// ever been fetched -- so Store.Current answers "unavailable" plus an error,
+// and the mount records that error. A loader holding no Store never asks, and
+// so never writes that line. The url is the never-resolving one: the mount's
+// read is of the cache alone, and the refresh loop's own round failing in the
+// background is a different message.
+func TestServeGivesThePluginLoaderTheTrustlistItRefreshes(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	cacheDir := filepath.Join(f.dir, "trustlist-cache")
+	f.writeSignatureConfig(30_000, signaturePolicy{requireSignature: boolPtr(false)},
+		fmt.Sprintf(`"trustlist": {"url": %s, "cache": %s, "refresh_interval_ms": 3600000}`,
+			jsonString(trustlistNeverFetchedURL), jsonString(cacheDir)))
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	logs := &capturedLogs{}
+	result, err := BuildServeService(ctx, ServeOptions{
+		ConfigPath: f.configPath,
+		Addr:       "127.0.0.1:0",
+		Logger:     slog.New(logs),
+		App:        f.application,
+	})
+	if err != nil {
+		t.Fatalf("BuildServeService() error = %v, want nil", err)
+	}
+	t.Cleanup(result.Close)
+
+	// The mount itself must still have happened: a trust list nobody could read
+	// is not a reason to refuse a package under a policy that requires no
+	// endorsement, and a test that passed on an assembly which mounted nothing
+	// would be asserting the wrong thing entirely.
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Fatalf("IsGateable(%q) = false after serve assembly, want true", testEchoTool)
+	}
+	if _, ok := logs.find(pluginTrustlistUnavailableMsg); !ok {
+		t.Errorf("startup log has no %q record: the plugin loader was handed no trustlist Store, so a "+
+			"revocation published to the list this serve refreshes would never reach a mount", pluginTrustlistUnavailableMsg)
+	}
+}
+
 // TestServeStopsTheTrustlistRefreshLoopWithItsContext pins the THIRD half of
 // the wiring: the loop assembly starts is given serve's own ctx.
 //
@@ -6029,5 +6805,294 @@ func TestServeStopsTheTrustlistRefreshLoopWithItsContext(t *testing.T) {
 		t.Errorf("the loop logged %d further round(s) a second after serve's context ended (%d -> %d); "+
 			"it is not running on serve's context, so it outlives the serve that started it",
 			grew-settled, settled, grew)
+	}
+}
+
+// --- 清单不可用时，本机的撤销累积集仍然生效（真机装配路径） ---------------------
+//
+// 规格 §三③ / §八 与产品拍板 #1 的后半句：清单拉不到时按安装期记下的结论挂载，
+// 但撤销仍硬拒。撤销累积集（revoked-ever.json）是本地文件，不依赖联网，也不该
+// 随着一个缺失或损坏的 trustlist.json 一起消失——否则删掉一个文件就是一个能用的
+// 「解除撤销」手段，而伪造正是 S1 花大力气防住的那件事。
+//
+// 下面这些用例走的是**真机装配路径**（newPluginFixture -> assemble ->
+// newPluginLoader -> 装配自己建出来的那个 TrustSet 闭包），不是给 loader 夹具直接
+// 塞一个 manifest.TrustInput：会丢掉撤销的正是装配这一段。
+
+// trustlistCacheFixtureReason 是这些用例写进 revoked-ever.json 的理由。断言状态行
+// 里出现它，才证明拒绝所依据的那条撤销来自磁盘上那份累积记录。
+const trustlistCacheFixtureReason = "recorded on this machine months ago"
+
+// seedRecordedRevocation 在 cacheDir 里写一份只有 revoked-ever.json 的缓存：撤销
+// keyID，没有 trustlist.json，也没有 trustlist.sig。
+//
+// 这正是复审实证二里那个形态，也是 cache.go 自己列成真实可能的那个（「一次首写
+// 崩溃、一次磁盘损坏，或者任何能写这个目录的东西删掉一个文件」）。
+func seedRecordedRevocation(t *testing.T, cacheDir string, keyID sign.KeyID) {
+	t.Helper()
+
+	data, err := json.Marshal(map[string]any{"revoked": []map[string]string{{
+		"key_id":     string(keyID),
+		"revoked_at": "2026-08-29T10:00:00Z",
+		"reason":     trustlistCacheFixtureReason,
+	}}})
+	if err != nil {
+		t.Fatalf("encode revoked-ever.json: %v", err)
+	}
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		t.Fatalf("create trustlist cache dir %s: %v", cacheDir, err)
+	}
+	if err := os.WriteFile(filepath.Join(cacheDir, "revoked-ever.json"), data, 0o600); err != nil {
+		t.Fatalf("write revoked-ever.json: %v", err)
+	}
+}
+
+// damageCachedTrustlist 往 cacheDir 里写一份读得出来但通不过验签的清单，也就是
+// trustlist.Store 归到「缓存损坏」（而不是「还没取过」）的那一支。
+func damageCachedTrustlist(t *testing.T, cacheDir string) {
+	t.Helper()
+
+	for name, body := range map[string]string{
+		"trustlist.json": `{"serial":1}`,
+		"trustlist.sig":  "this is not a signature",
+	} {
+		if err := os.WriteFile(filepath.Join(cacheDir, name), []byte(body), 0o600); err != nil {
+			t.Fatalf("damage cache %s: %v", name, err)
+		}
+	}
+}
+
+// useTrustlistCache 把一个远程信任清单配进 fixture 的 agent.json，并按 serve 的
+// 做法建出那个 Store 交给装配：serve 走的是 resolvePluginTrustlist，然后把结果放进
+// pluginHostDeps.Trustlist（command.go），这里一字照做。
+//
+// 地址落在 .invalid 之下（RFC 2606 保证不解析），并且这些用例都不跑刷新循环，
+// 所以取回从不发生——考的是缓存这一侧。
+func (f *pluginFixture) useTrustlistCache(policy signaturePolicy, cacheDir string) {
+	f.t.Helper()
+
+	f.writeSignatureConfig(30_000, policy, fmt.Sprintf(
+		`"trustlist": {"url": %s, "cache": %s, "refresh_interval_ms": 3600000}`,
+		jsonString(trustlistNeverFetchedURL), jsonString(cacheDir)))
+
+	store, _, err := resolvePluginTrustlist(config.PluginsConfig{
+		Trustlist: config.PluginTrustlistConfig{
+			URL:               trustlistNeverFetchedURL,
+			Cache:             cacheDir,
+			RefreshIntervalMs: 3_600_000,
+		},
+	})
+	if err != nil {
+		f.t.Fatalf("resolvePluginTrustlist: %v", err)
+	}
+	if store == nil {
+		f.t.Fatal("resolvePluginTrustlist returned no Store for a configured trustlist")
+	}
+	f.trustlist = store
+}
+
+// writeLocalKeyringRegistering 写一份只**登记**（不撤销任何东西）的本地 keyring：
+// 签名用的那把，外加一把无关的 spare。
+//
+// spare 不是装饰：sign.ParseKeyring 拒绝「每把钥匙都被撤销」的信任集，只登记签名
+// 那一把的话，合并会卡在解析那一步，用例就会因为别的原因而通过。
+//
+// 撤销刻意不写进这份文件：这些用例要证明的是那条撤销**只**存在于 revoked-ever.json
+// 时仍然生效，写进本地 keyring 就等于让另一条通道替它把话说了。
+func writeLocalKeyringRegistering(t *testing.T, dir string) (ed25519.PrivateKey, string) {
+	t.Helper()
+
+	signingPub, signingPriv, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	sparePub, _, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	path := filepath.Join(dir, "keyring.json")
+	writeKeyringDoc(t, path, []map[string]string{
+		{"id": string(testPluginKeyID), "algorithm": "ed25519",
+			"public_key": base64.StdEncoding.EncodeToString(signingPub)},
+		{"id": "spare", "algorithm": "ed25519",
+			"public_key": base64.StdEncoding.EncodeToString(sparePub)},
+	}, nil)
+	return signingPriv, path
+}
+
+// TestAssembleRefusesAKeyRevokedOnlyInTheRecordWhenTheTrustlistIsUnavailable 是
+// 复审 Critical-1 的必红用例：撤销只存在于 revoked-ever.json，清单文件缺失或损坏，
+// require_signature 用默认值（true）。
+//
+// 三个子用例把拍板 #1 的两半各钉一次：撤销那一半在清单不可用时**不降级**（前两
+// 条），登记那一半照常降级到只剩本地 keyring、包照常挂载（第三条）。少了第三条，
+// 一个「清单读不出来就全线拒绝」的实现也能让前两条变绿，而那违反拍板 #1 的前半句。
+func TestAssembleRefusesAKeyRevokedOnlyInTheRecordWhenTheTrustlistIsUnavailable(t *testing.T) {
+	cases := []struct {
+		name string
+		// damage 在缓存目录上再动一次手，模拟清单不可用的另一种形态。
+		damage func(t *testing.T, cacheDir string)
+		// revoke 是写进 revoked-ever.json 的那个 key id。
+		revoke      sign.KeyID
+		wantMounted bool
+	}{
+		{
+			name:   "清单文件缺失",
+			damage: func(t *testing.T, cacheDir string) { t.Helper() },
+			revoke: testPluginKeyID,
+		},
+		{
+			name:   "清单文件损坏",
+			damage: damageCachedTrustlist,
+			revoke: testPluginKeyID,
+		},
+		{
+			// 累积集里那条撤销与这个包无关：登记那一半降级成只剩本地 keyring，
+			// 包照常挂载。这是拍板 #1 的前半句。
+			name:        "清单文件缺失但撤销与这个包无关",
+			damage:      func(t *testing.T, cacheDir string) { t.Helper() },
+			revoke:      "some-other-publisher",
+			wantMounted: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newPluginFixture(t, 30_000)
+			signingPriv, keyringPath := writeLocalKeyringRegistering(t, f.dir)
+			cacheDir := filepath.Join(f.dir, "trustlist-cache")
+			seedRecordedRevocation(t, cacheDir, tc.revoke)
+			tc.damage(t, cacheDir)
+			// requireSignature 留 nil：走配置的默认值（要求背书），也就是复审
+			// 实证二用的那个策略。
+			f.useTrustlistCache(signaturePolicy{keyring: keyringPath}, cacheDir)
+
+			f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+			f.signPackage("echo", signingPriv)
+			f.writeManifest(manifestEntry{
+				name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool},
+			})
+
+			if err := f.assemble(); err != nil {
+				t.Fatalf("assemblePlugins() error = %v, want nil：一个被拒的条目不等于一次被拒的启动", err)
+			}
+			if got := toolauth.IsGateable(testEchoTool); got != tc.wantMounted {
+				if tc.wantMounted {
+					t.Fatalf("IsGateable(%q) = false, want true：清单不可用只该让登记那一半"+
+						"降级到本地 keyring，不该连一个没被撤销的包也拒掉", testEchoTool)
+				}
+				t.Fatalf("IsGateable(%q) = true, want false：这台机器已经记下这把钥匙被撤销，"+
+					"而一个缺失或损坏的 trustlist.json 把那条记录一起丢了——删掉一个文件"+
+					"就成了解除撤销的办法", testEchoTool)
+			}
+			if !tc.wantMounted {
+				f.requireStatusExplains("被撤销钥匙签名的包被拒之后", "revoked")
+				f.requireStatusExplains("被撤销钥匙签名的包被拒之后", trustlistCacheFixtureReason)
+			}
+		})
+	}
+}
+
+// TestResolvePluginTrustInputRefusesWhenTheRevocationRecordCannotBeRead 守的是
+// 「降级」与「判不了」的分界。
+//
+// 清单读不出来时降级是对的：登记那一半只剩本地 keyring，而撤销那一半仍然成立。
+// 撤销累积集自己读不出来时那个前提没了——继续走等于替这台机器回答「没有撤销」，
+// 正是这份记录存在要挡的 fail-open。所以这里必须返回错误，且**不得**走
+// reportUnavailable 那条降级路径。
+func TestResolvePluginTrustInputRefusesWhenTheRevocationRecordCannotBeRead(t *testing.T) {
+	cacheDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cacheDir, "revoked-ever.json"),
+		[]byte(`{"revoked":"this is not an array"}`), 0o600); err != nil {
+		t.Fatalf("write revoked-ever.json: %v", err)
+	}
+	damageCachedTrustlist(t, cacheDir)
+
+	store, _, err := resolvePluginTrustlist(config.PluginsConfig{
+		Trustlist: config.PluginTrustlistConfig{
+			URL:               trustlistNeverFetchedURL,
+			Cache:             cacheDir,
+			RefreshIntervalMs: 3_600_000,
+		},
+	})
+	if err != nil {
+		t.Fatalf("resolvePluginTrustlist: %v", err)
+	}
+
+	degraded := 0
+	_, err = resolvePluginTrustInput(nil, store, func(error) { degraded++ })
+	if err == nil {
+		t.Fatal("撤销累积集读不出来，信任集却照样装出来了")
+	}
+	if !errors.Is(err, trustlist.ErrRevocationsUnknown) {
+		t.Errorf("err = %v, want 裹着 trustlist.ErrRevocationsUnknown", err)
+	}
+	if degraded != 0 {
+		t.Errorf("走了 %d 次降级路径，want 0：「判不了撤销」被当成了「清单不可用」，"+
+			"于是这次挂载会在一个没人能判撤销的信任集上继续", degraded)
+	}
+}
+
+// TestTheAssemblysTrustSetIsReadAgainOnEveryMount 是复审 Important-1：拍板 #4
+// 「信任集动态读，下一次挂载即生效」在**生产装配层**有人守。
+//
+// loader 包里已有的 TestTrustSetIsReadOnEveryMount 注入的是它自己的 TrustSet，
+// 证的是 Loader 会调用提供者，与装配建出来的那个提供者无关。缺的正是这一段接线：
+// 把 pluginTrustSet 改成第一次调用后缓存答案，整棵树没有一条用例会红——serve 建
+// 出来的提供者就此把答案冻在第一次挂载上，后台刷到的紧急撤销再也到不了任何一次
+// 收敛。
+//
+// 用例拿的是 assemblePlugins 交回来的那个 TrustSet（serve 也是把它转交给面板的
+// 那一个），两次调用之间改动缓存目录：第二次的答案必须变。
+func TestTheAssemblysTrustSetIsReadAgainOnEveryMount(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	_, keyringPath := writeLocalKeyringRegistering(t, f.dir)
+	cacheDir := filepath.Join(f.dir, "trustlist-cache")
+	// 起步时这台机器一条撤销都没记过（空数组是合法状态：见过清单，但没有撤销）。
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		t.Fatalf("create trustlist cache dir: %v", err)
+	}
+	recordPath := filepath.Join(cacheDir, "revoked-ever.json")
+	if err := os.WriteFile(recordPath, []byte(`{"revoked":[]}`), 0o600); err != nil {
+		t.Fatalf("write revoked-ever.json: %v", err)
+	}
+	f.useTrustlistCache(signaturePolicy{keyring: keyringPath}, cacheDir)
+	f.writeManifest()
+
+	trustSet, err := f.assembleTrustSet(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("assemblePlugins: %v", err)
+	}
+	if trustSet == nil {
+		t.Fatal("assemblePlugins 没有交回 TrustSet")
+	}
+
+	first, err := trustSet()
+	if err != nil {
+		t.Fatalf("第一次读信任集：%v", err)
+	}
+	if first.Keyring == nil {
+		t.Fatal("第一次读到的信任集是空的，可本地 keyring 登记了两把钥匙")
+	}
+	if _, revoked := first.Keyring.Revoked(testPluginKeyID); revoked {
+		t.Fatalf("%q 在第一次读时就已是撤销状态，用例考不到「答案变了」", testPluginKeyID)
+	}
+
+	// 这一步就是后台刷新落盘的那件事：磁盘上的撤销记录变了。
+	seedRecordedRevocation(t, cacheDir, testPluginKeyID)
+
+	second, err := trustSet()
+	if err != nil {
+		t.Fatalf("第二次读信任集：%v", err)
+	}
+	if second.Keyring == nil {
+		t.Fatal("第二次读到的信任集是空的")
+	}
+	rev, revoked := second.Keyring.Revoked(testPluginKeyID)
+	if !revoked {
+		t.Fatalf("%q 在磁盘上的记录改过之后仍然不是撤销状态：这个提供者把答案冻在了"+
+			"第一次调用上，后台刷到的紧急撤销再也到不了任何一次收敛", testPluginKeyID)
+	}
+	if rev.Reason != trustlistCacheFixtureReason {
+		t.Errorf("撤销理由 = %q, want %q", rev.Reason, trustlistCacheFixtureReason)
 	}
 }

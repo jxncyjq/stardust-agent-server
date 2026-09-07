@@ -307,6 +307,47 @@ func TestMarshalDeployment_RoundTrip_PreservesRemoteEntryDigest(t *testing.T) {
 	}
 }
 
+// TestMarshalDeployment_RoundTrip_PreservesAcceptedUnsigned pins the Critical
+// this file's review found: entryDoc/MarshalDeployment never carried
+// AcceptedUnsigned, so it silently vanished on the most basic
+// Marshal/Parse round trip even though ParseDeployment has always been
+// willing to read it back in (see TestEntryAcceptedUnsignedRoundTrips in
+// manifest_test.go, which only exercises the read side). Without this test,
+// `agent plugins install --accept-unsigned` could report success while the
+// acceptance it just recorded never reached disk.
+func TestMarshalDeployment_RoundTrip_PreservesAcceptedUnsigned(t *testing.T) {
+	original := Deployment{
+		Plugins: []Entry{
+			{
+				Name:             "legion-unsigned",
+				Source:           "./plugins/legion-unsigned",
+				Enabled:          true,
+				Grant:            GrantDecl{Capabilities: []string{}},
+				GrantStated:      true,
+				AcceptedUnsigned: validDigest,
+				Tools:            []ToolAccept{{Name: "do_thing"}},
+			},
+		},
+	}
+
+	marshaled, err := MarshalDeployment(original)
+	if err != nil {
+		t.Fatalf("MarshalDeployment: %v", err)
+	}
+
+	roundTripped, err := ParseDeployment(marshaled)
+	if err != nil {
+		t.Fatalf("ParseDeployment(MarshalDeployment(original)): %v\nmarshaled:\n%s", err, marshaled)
+	}
+
+	requireDeploymentsEquivalent(t, roundTripped, original)
+
+	if got, want := roundTripped.Plugins[0].AcceptedUnsigned, original.Plugins[0].AcceptedUnsigned; got != want {
+		t.Fatalf("AcceptedUnsigned = %q after a Marshal/Parse round trip, want %q\nmarshaled:\n%s",
+			got, want, marshaled)
+	}
+}
+
 // --- Part A: GrantStated governs whether "grant" is written at all --------
 
 // TestMarshalDeployment_OmitsGrantBlockWhenNotStated is Part A's core

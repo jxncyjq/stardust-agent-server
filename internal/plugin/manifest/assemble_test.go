@@ -472,7 +472,7 @@ func TestAssembleSpec_TimeoutMsOverflowsDuration_Fails(t *testing.T) {
 // --- LoadPackage -------------------------------------------------------------
 
 func TestLoadPackage_ValidFixture(t *testing.T) {
-	pm, wasm, err := LoadPackage("testdata/pkg", nil)
+	pm, wasm, _, err := LoadPackage("testdata/pkg", TrustInput{})
 	if err != nil {
 		t.Fatalf("LoadPackage: unexpected error: %v", err)
 	}
@@ -502,7 +502,7 @@ func TestLoadPackage_SHA256Mismatch(t *testing.T) {
 		"tools": [{"name": "t", "group": "g", "timeout_ms": 1000}]
 	}`, mustReadWasmFixture(t))
 
-	_, _, err := LoadPackage(dir, nil)
+	_, _, _, err := LoadPackage(dir, TrustInput{})
 	requireErrorContains(t, err, "sha256")
 	requireErrorContains(t, err, validSHA256) // expected digest named
 	// actual digest of the real fixture wasm must also be named
@@ -515,7 +515,7 @@ func TestLoadPackage_MissingWasm(t *testing.T) {
 		t.Fatalf("write plugin.json: %v", err)
 	}
 
-	_, _, err := LoadPackage(dir, nil)
+	_, _, _, err := LoadPackage(dir, TrustInput{})
 	requireErrorContains(t, err, "plugin.wasm")
 }
 
@@ -525,7 +525,7 @@ func TestLoadPackage_MissingManifest(t *testing.T) {
 		t.Fatalf("write plugin.wasm: %v", err)
 	}
 
-	_, _, err := LoadPackage(dir, nil)
+	_, _, _, err := LoadPackage(dir, TrustInput{})
 	requireErrorContains(t, err, "plugin.json")
 }
 
@@ -624,9 +624,18 @@ func signedPackage(t *testing.T) (string, *sign.Keyring) {
 func TestLoadPackage_ValidSignatureLoads(t *testing.T) {
 	dir, kr := signedPackage(t)
 
-	pm, wasm, err := LoadPackage(dir, kr)
+	pm, wasm, prov, err := LoadPackage(dir, TrustInput{Keyring: kr})
 	if err != nil {
 		t.Fatalf("LoadPackage: unexpected error: %v", err)
+	}
+	// A signature by a trusted, unrevoked key is the one input that earns
+	// ProvenanceRegistered; asserting only "no error" would leave every other
+	// verdict passing this test too.
+	if prov.State != ProvenanceRegistered {
+		t.Errorf("State = %v, want ProvenanceRegistered", prov.State)
+	}
+	if prov.KeyID != "ops-2026" {
+		t.Errorf("KeyID = %q, want ops-2026", prov.KeyID)
 	}
 	if pm.Name != "legion-jira" {
 		t.Errorf("Name = %q, want %q", pm.Name, "legion-jira")
@@ -648,21 +657,35 @@ func TestLoadPackage_ValidSignatureLoads(t *testing.T) {
 	}
 }
 
+// TestLoadPackage_MissingSignatureWithKeyring pins the contract this test
+// used to pin in the opposite direction. It asserted that a missing plugin.sig
+// under a non-nil keyring is an ERROR reading "plugin.sig is missing"; a
+// missing signature is now a VERDICT (ProvenanceUnsigned), because whether an
+// unsigned package may load is the caller's policy and LoadPackage has no way
+// to know it.
+//
+// What must not be lost in that move is the distinction the old wording
+// carried: "no signature" must still be distinguishable from an
+// unreadable-but-present plugin.sig (see TestLoadPackage_UnreadableSignatureFile,
+// which still demands an error) and must never read as "package absent, skip".
+// A verdict of ProvenanceUnsigned with no error is exactly that distinction,
+// stated in a type rather than in a string.
 func TestLoadPackage_MissingSignatureWithKeyring(t *testing.T) {
 	dir, kr := signedPackage(t)
 	if err := os.Remove(filepath.Join(dir, "plugin.sig")); err != nil {
 		t.Fatalf("remove plugin.sig: %v", err)
 	}
 
-	_, _, err := LoadPackage(dir, kr)
-	if err == nil {
-		t.Fatal("LoadPackage: want an error for a package with no plugin.sig, got nil")
+	_, _, prov, err := LoadPackage(dir, TrustInput{Keyring: kr})
+	if err != nil {
+		t.Fatalf("LoadPackage on a package with no plugin.sig = %v, want a verdict rather than an error", err)
 	}
-	// The missing case has its own wording, distinct from an
-	// unreadable-but-present plugin.sig (see
-	// TestLoadPackage_UnreadableSignatureFile) — a future caller must never
-	// be able to key on "not exist" and treat it as "package absent, skip".
-	requireErrorContains(t, err, "plugin.sig is missing")
+	if prov.State != ProvenanceUnsigned {
+		t.Errorf("State = %v, want ProvenanceUnsigned", prov.State)
+	}
+	if prov.KeyID != "" {
+		t.Errorf("KeyID = %q, want empty: there is no signature, so there is no key to report", prov.KeyID)
+	}
 }
 
 // TestLoadPackage_UnreadableSignatureFile pins the missing/unreadable
@@ -680,7 +703,7 @@ func TestLoadPackage_UnreadableSignatureFile(t *testing.T) {
 		t.Fatalf("mkdir plugin.sig: %v", err)
 	}
 
-	_, _, err := LoadPackage(dir, kr)
+	_, _, _, err := LoadPackage(dir, TrustInput{Keyring: kr})
 	if err == nil {
 		t.Fatal("LoadPackage: want an error for a plugin.sig that exists but cannot be read, got nil")
 	}
@@ -707,7 +730,7 @@ func TestLoadPackage_SignatureAlteredByOneByte(t *testing.T) {
 	sig.Value[0] ^= 0x01
 	writeSignatureDoc(t, dir, sig)
 
-	_, _, err = LoadPackage(dir, kr)
+	_, _, _, err = LoadPackage(dir, TrustInput{Keyring: kr})
 	if err == nil {
 		t.Fatal("LoadPackage: want an error for a signature altered by one byte, got nil")
 	}
@@ -715,33 +738,54 @@ func TestLoadPackage_SignatureAlteredByOneByte(t *testing.T) {
 	requireErrorContains(t, err, "ops-2026")
 }
 
+// TestLoadPackage_SignedByUntrustedKey is the other verdict this change
+// inverts. It asserted that a real signature made by a key the keyring never
+// trusted is an error naming that id and "not in the keyring"; it is now the
+// ProvenanceUnsigned verdict, because to whoever has to decide it says exactly
+// what no signature at all says — no registered publisher stands behind these
+// bytes.
+//
+// The old assertion that the unknown id appears in the message is deliberately
+// inverted rather than dropped: KeyID must come back EMPTY. Reporting a key id
+// this machine knows nothing about would invite a reader to treat it as
+// meaningful, and the id is attacker-controlled text.
 func TestLoadPackage_SignedByUntrustedKey(t *testing.T) {
 	dir, kr := signedPackage(t)
 	// A second, perfectly valid key pair that the keyring does not trust. Its
 	// own keyring is discarded on purpose: the point is that a real signature
-	// made by a key we never trusted is refused.
+	// made by a key we never trusted earns no endorsement.
 	_, attackerPriv := newKeyring(t, "attacker-2027")
 	writeSignature(t, dir, attackerPriv, "attacker-2027", mustReadFixture(t, "pkg/plugin.json"))
 
-	_, _, err := LoadPackage(dir, kr)
-	if err == nil {
-		t.Fatal("LoadPackage: want an error for a package signed by an untrusted key, got nil")
+	_, _, prov, err := LoadPackage(dir, TrustInput{Keyring: kr})
+	if err != nil {
+		t.Fatalf("LoadPackage on a package signed by an unknown key = %v, want a verdict rather than an error", err)
 	}
-	requireErrorContains(t, err, "attacker-2027")
-	requireErrorContains(t, err, "not in the keyring")
+	if prov.State != ProvenanceUnsigned {
+		t.Errorf("State = %v, want ProvenanceUnsigned", prov.State)
+	}
+	if prov.KeyID != "" {
+		t.Errorf("KeyID = %q, want empty: a key id this machine does not know must not be reported "+
+			"as if it meant something", prov.KeyID)
+	}
 }
 
 // TestLoadPackage_ImpersonationWithTrustedKeyID covers the attack shape
 // TestLoadPackage_SignedByUntrustedKey does not: there, the key id itself is
-// untrusted, so refusal comes from sign.Keyring.Verify's unknown-id branch.
+// unknown, so the package earns the ProvenanceUnsigned verdict and no error.
 // Here an attacker who holds no trusted key signs with their OWN key but
 // labels the signature with a key_id the keyring DOES trust ("ops-2026"),
-// hoping the id alone is enough. It is not: Verify resolves the named id to
-// its one trusted public key and checks strictly against that key, so this
-// must be refused by the cryptographic branch — the same one
-// TestLoadPackage_SignatureAlteredByOneByte exercises — giving Task 1's
-// "Verify never iterates keys hoping one works" guarantee a package-level
-// witness for the impersonation case specifically, not just bit-flip.
+// hoping the id alone is enough. It is not: the id resolves, so the signature
+// is checked, and Verify resolves the named id to its one trusted public key
+// and checks strictly against that key. This must therefore be refused by the
+// cryptographic branch — the same one TestLoadPackage_SignatureAlteredByOneByte
+// exercises — giving Task 1's "Verify never iterates keys hoping one works"
+// guarantee a package-level witness for the impersonation case specifically,
+// not just bit-flip.
+//
+// It is also the boundary between a verdict and an error: an unknown id is a
+// statement about endorsement, a resolvable id whose signature does not check
+// out is a statement that the bytes changed.
 func TestLoadPackage_ImpersonationWithTrustedKeyID(t *testing.T) {
 	dir, kr := signedPackage(t)
 	// A second, real key pair the keyring does not trust.
@@ -751,7 +795,7 @@ func TestLoadPackage_ImpersonationWithTrustedKeyID(t *testing.T) {
 	// one key signedPackage's keyring actually trusts.
 	writeSignature(t, dir, attackerPriv, "ops-2026", manifestData)
 
-	_, _, err := LoadPackage(dir, kr)
+	_, _, _, err := LoadPackage(dir, TrustInput{Keyring: kr})
 	if err == nil {
 		t.Fatal("LoadPackage: want an error for a signature made by an untrusted key but labeled " +
 			"with a trusted key id, got nil")
@@ -779,7 +823,7 @@ func TestLoadPackage_ManifestAlteredByOneByte(t *testing.T) {
 		t.Fatalf("write altered plugin.json: %v", err)
 	}
 
-	_, _, err := LoadPackage(dir, kr)
+	_, _, _, err := LoadPackage(dir, TrustInput{Keyring: kr})
 	if err == nil {
 		t.Fatal("LoadPackage: want an error for a plugin.json altered after signing, got nil")
 	}
@@ -798,7 +842,7 @@ func TestLoadPackage_WasmAlteredWithManifestAndSignatureIntact(t *testing.T) {
 		t.Fatalf("write altered plugin.wasm: %v", err)
 	}
 
-	_, _, err := LoadPackage(dir, kr)
+	_, _, _, err := LoadPackage(dir, TrustInput{Keyring: kr})
 	if err == nil {
 		t.Fatal("LoadPackage: want an error for an altered plugin.wasm, got nil")
 	}
@@ -806,20 +850,28 @@ func TestLoadPackage_WasmAlteredWithManifestAndSignatureIntact(t *testing.T) {
 	requireErrorContains(t, err, "legion-jira")
 }
 
-// TestLoadPackage_NilKeyringSkipsVerificationNotDigest pins the contract's one
-// declared optional: a nil keyring means this deployment does not require
-// signatures, so an unsigned package loads — but the sha256 check is NOT part
-// of that concession and still refuses a mismatched binary.
+// TestLoadPackage_NilKeyringSkipsVerificationNotDigest pins what a zero
+// TrustInput does and does not concede. With no trust set nothing can be
+// verified against anything, so a package comes back ProvenanceUnsigned and
+// loads — but the sha256 check is NOT part of that concession and still
+// refuses a mismatched binary.
+//
+// ProvenanceUnsigned is asserted, not ignored: "no trust set" must never
+// arrive as a verdict that reads like "checked and fine", which is the one
+// thing Provenance has no way to say.
 func TestLoadPackage_NilKeyringSkipsVerificationNotDigest(t *testing.T) {
 	unsigned := t.TempDir()
 	writePackage(t, unsigned, string(mustReadFixture(t, "pkg/plugin.json")), mustReadWasmFixture(t))
 
-	pm, _, err := LoadPackage(unsigned, nil)
+	pm, _, prov, err := LoadPackage(unsigned, TrustInput{})
 	if err != nil {
-		t.Fatalf("LoadPackage with a nil keyring: unexpected error: %v", err)
+		t.Fatalf("LoadPackage with no trust set: unexpected error: %v", err)
 	}
 	if pm.Name != "legion-jira" {
 		t.Errorf("Name = %q, want %q", pm.Name, "legion-jira")
+	}
+	if prov.State != ProvenanceUnsigned {
+		t.Errorf("State = %v, want ProvenanceUnsigned", prov.State)
 	}
 
 	corrupted := t.TempDir()
@@ -827,24 +879,24 @@ func TestLoadPackage_NilKeyringSkipsVerificationNotDigest(t *testing.T) {
 	wasm[0] ^= 0xff
 	writePackage(t, corrupted, string(mustReadFixture(t, "pkg/plugin.json")), wasm)
 
-	_, _, err = LoadPackage(corrupted, nil)
+	_, _, _, err = LoadPackage(corrupted, TrustInput{})
 	if err == nil {
-		t.Fatal("LoadPackage with a nil keyring: want a sha256 error for an altered plugin.wasm, got nil")
+		t.Fatal("LoadPackage with no trust set: want a sha256 error for an altered plugin.wasm, got nil")
 	}
 	requireErrorContains(t, err, "sha256")
 }
 
-// TestLoadPackage_MalformedSignatureDocument covers the remaining refusal in
-// verifyManifestSignature: a plugin.sig that is present but is not a
-// signature document at all must be refused, not read as "no signature" and
-// certainly not as a valid one.
+// TestLoadPackage_MalformedSignatureDocument covers one of assessProvenance's
+// two error paths: a plugin.sig that is present but is not a signature
+// document at all must be refused, not read as "no signature" — which is now a
+// verdict that loads — and certainly not as a valid one.
 func TestLoadPackage_MalformedSignatureDocument(t *testing.T) {
 	dir, kr := signedPackage(t)
 	if err := os.WriteFile(filepath.Join(dir, "plugin.sig"), []byte("not a signature document"), 0o644); err != nil {
 		t.Fatalf("write malformed plugin.sig: %v", err)
 	}
 
-	_, _, err := LoadPackage(dir, kr)
+	_, _, _, err := LoadPackage(dir, TrustInput{Keyring: kr})
 	if err == nil {
 		t.Fatal("LoadPackage: want an error for a malformed plugin.sig, got nil")
 	}
@@ -855,15 +907,16 @@ func TestLoadPackage_MalformedSignatureDocument(t *testing.T) {
 // refused the same way any other malformed document is (sign.ParseSignature
 // sees io.EOF from json.Decoder), and — more importantly — that it is NOT
 // treated the same as a missing plugin.sig: the file is present, so this
-// must go through verifyManifestSignature's parse failure, never through the
-// fs.ErrNotExist branch os.ReadFile would take for a genuinely absent file.
+// must go through assessProvenance's parse failure, never through the
+// fs.ErrNotExist branch os.ReadFile would take for a genuinely absent file —
+// which would turn a corrupt signature into the ProvenanceUnsigned verdict.
 func TestLoadPackage_EmptySignatureFile(t *testing.T) {
 	dir, kr := signedPackage(t)
 	if err := os.WriteFile(filepath.Join(dir, "plugin.sig"), []byte{}, 0o644); err != nil {
 		t.Fatalf("truncate plugin.sig: %v", err)
 	}
 
-	_, _, err := LoadPackage(dir, kr)
+	_, _, _, err := LoadPackage(dir, TrustInput{Keyring: kr})
 	if err == nil {
 		t.Fatal("LoadPackage: want an error for a zero-byte plugin.sig, got nil")
 	}
@@ -875,11 +928,15 @@ func TestLoadPackage_EmptySignatureFile(t *testing.T) {
 
 // --- LoadPackage: ErrUntrustedPackage classification -------------------------
 //
-// These pin which of verifyManifestSignature's four failure paths must be
-// identifiable via errors.Is(err, ErrUntrustedPackage) and which must not.
-// The three trust verdicts (missing signature, corrupt signature, signature
-// that does not verify) get the sentinel; an I/O fault while reading
-// plugin.sig deliberately does not — see ErrUntrustedPackage's doc comment.
+// These pin which of assessProvenance's failure paths must be identifiable
+// via errors.Is(err, ErrUntrustedPackage) and which must not. A corrupt
+// plugin.sig and a signature that does not verify get the sentinel; an I/O
+// fault while reading plugin.sig deliberately does not — see
+// ErrUntrustedPackage's doc comment.
+//
+// A missing signature and an unknown signing key are no longer on this list at
+// all: they are verdicts now (ProvenanceUnsigned), not failures, so there is
+// no error for a sentinel to classify.
 
 // writeTestPackage writes a complete, valid, but unsigned plugin package
 // (plugin.json and plugin.wasm copied from testdata/pkg) into a fresh
@@ -913,16 +970,24 @@ func signTestPackageWithForeignKey(t *testing.T, dir string) {
 	writeSignature(t, dir, foreignPriv, "foreign-key", mustReadFixture(t, "pkg/plugin.json"))
 }
 
+// TestLoadPackageMarksAnUnsignedPackageUntrusted 原本断言「有 keyring 但没有
+// plugin.sig」是一个裹着 ErrUntrustedPackage 的错误。缺签名现在是**判定**
+// （ProvenanceUnsigned）而不是错误，所以这里反过来钉住：既不许报错，也不许把这
+// 份包说成「已登记」。
+//
+// 断言没有被削弱，而是换了个更强的落点：原来只能说「它错了」，现在能说清它错在
+// 哪一态——ProvenanceRegistered 与 ProvenanceUnsigned 之间的差别，正是后面策略
+// 唯一能依据的东西。
 func TestLoadPackageMarksAnUnsignedPackageUntrusted(t *testing.T) {
-	// 包齐全但没有 plugin.sig，且部署要求签名（keyring 非 nil）
+	// 包齐全但没有 plugin.sig，且部署配了信任集（keyring 非 nil）
 	dir := writeTestPackage(t) // 既有夹具助手：写 plugin.json + plugin.wasm
 	kr := testKeyring(t)       // 既有夹具助手
-	_, _, err := LoadPackage(dir, kr)
-	if err == nil {
-		t.Fatal("LoadPackage on an unsigned package = nil error, want an untrusted-package error")
+	_, _, prov, err := LoadPackage(dir, TrustInput{Keyring: kr})
+	if err != nil {
+		t.Fatalf("LoadPackage on an unsigned package = %v, want a verdict rather than an error", err)
 	}
-	if !errors.Is(err, ErrUntrustedPackage) {
-		t.Errorf("LoadPackage error = %v, want it to wrap ErrUntrustedPackage", err)
+	if prov.State != ProvenanceUnsigned {
+		t.Errorf("State = %v, want ProvenanceUnsigned", prov.State)
 	}
 }
 
@@ -932,20 +997,35 @@ func TestLoadPackageMarksACorruptSignatureUntrusted(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "plugin.sig"), []byte("{not json"), 0o644); err != nil {
 		t.Fatalf("write corrupt plugin.sig: %v", err)
 	}
-	_, _, err := LoadPackage(dir, kr)
+	_, _, _, err := LoadPackage(dir, TrustInput{Keyring: kr})
 	if !errors.Is(err, ErrUntrustedPackage) {
 		t.Errorf("LoadPackage error = %v, want it to wrap ErrUntrustedPackage", err)
 	}
 }
 
+// TestLoadPackageMarksAWrongSignatureUntrusted 原本断言「用一把 keyring 不认识
+// 的密钥签的包」裹 ErrUntrustedPackage。signTestPackageWithForeignKey 用的 key id
+// 是 "foreign-key"，而 testKeyring 的信任集里只有 "ops-2026"——这是**未知钥匙**，
+// 不是签名对不上，所以它现在是 ProvenanceUnsigned 判定。
+//
+// 「签名对不上」那一条并没有失去覆盖：它由
+// TestLoadPackage_ImpersonationWithTrustedKeyID 与
+// TestLoadPackage_SignatureAlteredByOneByte 钉住——两者的 key id 都在信任集里，
+// 于是签名真的被验，验不过仍然是裹 ErrUntrustedPackage 的错误。
 func TestLoadPackageMarksAWrongSignatureUntrusted(t *testing.T) {
 	dir := writeTestPackage(t)
 	kr := testKeyring(t)
-	// 用一把 keyring 不信任的密钥签名
-	signTestPackageWithForeignKey(t, dir) // 见 Step 3 说明；若既有助手可用则复用
-	_, _, err := LoadPackage(dir, kr)
-	if !errors.Is(err, ErrUntrustedPackage) {
-		t.Errorf("LoadPackage error = %v, want it to wrap ErrUntrustedPackage", err)
+	// 用一把 keyring 不认识的密钥签名（key id 也不在信任集里）
+	signTestPackageWithForeignKey(t, dir)
+	_, _, prov, err := LoadPackage(dir, TrustInput{Keyring: kr})
+	if err != nil {
+		t.Fatalf("LoadPackage signed by an unknown key = %v, want a verdict rather than an error", err)
+	}
+	if prov.State != ProvenanceUnsigned {
+		t.Errorf("State = %v, want ProvenanceUnsigned", prov.State)
+	}
+	if prov.KeyID != "" {
+		t.Errorf("KeyID = %q, want empty", prov.KeyID)
 	}
 }
 
@@ -957,7 +1037,7 @@ func TestLoadPackageDoesNotMarkAnIOFailureUntrusted(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(dir, "plugin.sig"), 0o755); err != nil {
 		t.Fatalf("mkdir plugin.sig: %v", err)
 	}
-	_, _, err := LoadPackage(dir, kr)
+	_, _, _, err := LoadPackage(dir, TrustInput{Keyring: kr})
 	if err == nil {
 		t.Fatal("LoadPackage with an unreadable plugin.sig = nil error, want an I/O error")
 	}
@@ -968,20 +1048,19 @@ func TestLoadPackageDoesNotMarkAnIOFailureUntrusted(t *testing.T) {
 }
 
 // TestLoadPackage_RevokedKeyIsUntrusted pins the classification a revocation
-// depends on: a package signed by a key the deployment has revoked must come
-// back as UNTRUSTED, not merely "failed to load".
+// depends on. It used to demand an error carrying both ErrUntrustedPackage and
+// sign.ErrRevokedKey; a revocation is now the ProvenanceRevoked verdict, so
+// the same three facts the old assertions protected are asserted on the
+// verdict instead of scraped out of a message:
 //
-// The distinction is load-bearing three times over — every one of these hangs
-// off ErrUntrustedPackage:
-//
-//   - the HTTP layer answers 422 rather than 400;
-//   - the GUI offers no retry (retrying a revoked key never stops being
-//     revoked);
-//   - the cache EVICTS the package, which is exactly what a revocation is for.
-//
-// The revocation sentinel must survive the wrapping too, or the message
-// degrades to "does not verify" — which is false: the signature is
-// mathematically fine, the key is not.
+//   - the outcome is REVOKED specifically, not "unknown key" and not
+//     "registered" — the whole point of sign keeping a revoked key's public
+//     half is that the two never collapse into each other;
+//   - the key id is named;
+//   - the time and the reason the operator wrote down survive, which is what
+//     lets a refusal explain itself instead of degrading to "does not verify"
+//     — a statement that would be false here, since the signature is
+//     mathematically fine and the key is not.
 func TestLoadPackage_RevokedKeyIsUntrusted(t *testing.T) {
 	dir := t.TempDir()
 	manifestData := mustReadFixture(t, "pkg/plugin.json")
@@ -1009,17 +1088,20 @@ func TestLoadPackage_RevokedKeyIsUntrusted(t *testing.T) {
 	}
 	writeSignature(t, dir, priv, "leaked", manifestData)
 
-	_, _, err = LoadPackage(dir, kr)
-	if err == nil {
-		t.Fatal("LoadPackage with a revoked signing key = nil error, want a refusal")
+	_, _, prov, err := LoadPackage(dir, TrustInput{Keyring: kr})
+	if err != nil {
+		t.Fatalf("LoadPackage with a revoked signing key = %v, want a verdict rather than an error", err)
 	}
-	if !errors.Is(err, ErrUntrustedPackage) {
-		t.Errorf("error = %v, want it to wrap ErrUntrustedPackage (422, no retry, cache eviction all key on it)", err)
+	if prov.State != ProvenanceRevoked {
+		t.Fatalf("State = %v, want ProvenanceRevoked", prov.State)
 	}
-	if !errors.Is(err, sign.ErrRevokedKey) {
-		t.Errorf("error = %v, want it to keep sign.ErrRevokedKey: the signature verifies, the key is revoked", err)
+	if prov.KeyID != "leaked" {
+		t.Errorf("KeyID = %q, want leaked", prov.KeyID)
 	}
-	if !strings.Contains(err.Error(), "leaked") || !strings.Contains(err.Error(), "laptop stolen") {
-		t.Errorf("error = %v, want it to name the key and why it was revoked", err)
+	if prov.Reason != "laptop stolen" {
+		t.Errorf("Reason = %q, want %q: without it a refusal cannot explain itself", prov.Reason, "laptop stolen")
+	}
+	if prov.RevokedAt.IsZero() {
+		t.Error("RevokedAt is zero: the time the operator wrote down was dropped")
 	}
 }
