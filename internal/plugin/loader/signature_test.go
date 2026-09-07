@@ -949,9 +949,20 @@ func TestTrustSetIsReadOnEveryMount(t *testing.T) {
 		t.Errorf("the trust set was read %d times across two mounts, want 2: a set read once and kept cannot "+
 			"see a revocation that arrives afterwards", calls)
 	}
-	if row := h.statusOf(echoPluginName); row.Version != "1.0.0" {
-		t.Errorf("plugin %q: Version = %q, want 1.0.0: the revoked 1.0.1 package became the mounted one",
-			echoPluginName, row.Version)
+	// What this row is depends on the running instance, and here BOTH the
+	// package on disk and the mounted 1.0.0 are endorsed by the same key id —
+	// the one this trust set has just revoked. So the revocation reaches the
+	// instance itself: it is unloaded, and the row is the failure record that
+	// unload left behind, naming the version that was taken down. Either way
+	// the 1.0.1 the trust set refused is not what this deployment is running.
+	row := h.statusOf(echoPluginName)
+	if row.State != StateFailed {
+		t.Errorf("plugin %q: State = %q, want %q: the revoked key endorsed the running instance too",
+			echoPluginName, row.State, StateFailed)
+	}
+	if row.Version != "1.0.0" {
+		t.Errorf("plugin %q: Version = %q, want 1.0.0: the row must name the 1.0.0 that was taken down, "+
+			"never the refused 1.0.1", echoPluginName, row.Version)
 	}
 }
 
