@@ -719,6 +719,21 @@ func resolvePluginKeyring(cfg config.PluginsConfig) (*sign.Keyring, string, erro
 // unavailable and the error is handed back to be recorded. Recording it is not
 // optional: it is the only thing standing between "the list half was empty"
 // and a silent degradation.
+//
+// # The one trust list failure that is not degraded
+//
+// "Unavailable, keep going" is right because Store.Current keeps this machine's
+// recorded REVOCATIONS in that Trust even when the list document is gone: the
+// registrations shrink to the local keyring, which is exactly "mount on the
+// conclusion recorded at install time", while a key this machine has seen
+// revoked stays refused. Both halves of that sentence hold, so degrading is
+// safe.
+//
+// trustlist.ErrRevocationsUnknown is the case where the second half does not
+// hold: the revocation record itself could not be read, so this deployment
+// cannot tell whether a key has been withdrawn. Degrading would answer that
+// question with "no". It is returned as an error instead, which fails the mount
+// rather than mounting something nobody could judge.
 func resolvePluginTrustInput(localRaw json.RawMessage, store *trustlist.Store,
 	reportUnavailable func(error)) (manifest.TrustInput, error) {
 	if reportUnavailable == nil {
@@ -734,6 +749,16 @@ func resolvePluginTrustInput(localRaw json.RawMessage, store *trustlist.Store,
 	if store != nil {
 		current, err := store.Current()
 		if err != nil {
+			if errors.Is(err, trustlist.ErrRevocationsUnknown) {
+				// The one trust list failure that must NOT degrade. Everything
+				// else Store.Current reports leaves the registrations short and
+				// the revocations intact, which is the documented "mount on the
+				// conclusion recorded at install time" behaviour. This one says
+				// the machine cannot tell whether a key has been revoked at
+				// all, and continuing would answer that question with "no" —
+				// the fail-open this whole record exists to stop.
+				return manifest.TrustInput{}, fmt.Errorf("assemble the plugin trust set: %w", err)
+			}
 			reportUnavailable(err)
 		}
 		listed = current

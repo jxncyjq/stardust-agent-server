@@ -397,3 +397,92 @@ func TestMergeNamesTheLocalDocumentWhenItsRevocationIsMalformed(t *testing.T) {
 		t.Errorf("错误没指向本地文档的那一条，operator 会被指到一份没人写过的文档上：%v", err)
 	}
 }
+
+// recordedRevocations 造一份「这台机器已经记下的撤销」，用来填 Trust 那个不导出
+// 的字段——也就是清单文档已经不可用、而撤销仍然已知的那种 Trust。
+//
+// 它走 parseRevokedSet 而不是直接拼一个 revokedSet，因为磁盘上那份记录进内存只有
+// 这一条路；绕过它就是在测试里另造一份形状，而形状对不上正是这个类型最容易坏的
+// 地方。
+func recordedRevocations(t *testing.T, ids ...sign.KeyID) *revokedSet {
+	t.Helper()
+
+	entries := make([]any, 0, len(ids))
+	for _, id := range ids {
+		entries = append(entries, map[string]any{
+			"key_id":     string(id),
+			"revoked_at": "2026-08-29T10:00:00Z",
+			"reason":     "磁盘上那份累积记录",
+		})
+	}
+	data, err := json.Marshal(map[string]any{"revoked": entries})
+	if err != nil {
+		t.Fatalf("marshal revoked-ever: %v", err)
+	}
+	set, err := parseRevokedSet(data)
+	if err != nil {
+		t.Fatalf("parseRevokedSet: %v", err)
+	}
+	return set
+}
+
+// TestMergeKeepsRecordedRevocationsWhenTheListHalfHasNoKeyring 守的是第三种合法
+// 形状：清单那一侧既没有 Keyring 也没有 KeyringRaw（两条守卫都不触发），但这台
+// 机器已经记下的撤销仍然必须并进来。
+//
+// 这是「清单拉不到时按安装期结论挂载，**但撤销仍硬拒**」这条产品拍板的后半句落在
+// 合并层的样子。没有它，一个缺失的 trustlist.json 就会让并集里只剩本地那一半，
+// 而少掉的正好是撤销。
+func TestMergeKeepsRecordedRevocationsWhenTheListHalfHasNoKeyring(t *testing.T) {
+	t.Parallel()
+
+	// live 是那把没被撤销的钥匙：sign.ParseKeyring 拒绝「每把钥匙都被撤销」的信任
+	// 集，只登记 k 的话这条用例会卡在解析那一步，考的就不是这条性质了。
+	local := keyringWith(t, []sign.KeyID{"k", "live"}, nil)
+	listed := Trust{Status: StatusUnavailable, revocations: recordedRevocations(t, "k")}
+
+	merged, _, err := Merge(local, listed)
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	if merged == nil {
+		t.Fatal("merged = nil，可本地 keyring 登记了两把钥匙")
+	}
+	rev, ok := merged.Revoked("k")
+	if !ok {
+		t.Fatal("清单那一侧没有 keyring 文档时，这台机器已经记下的撤销被丢掉了")
+	}
+	if rev.Reason != "磁盘上那份累积记录" {
+		t.Errorf("撤销理由 = %q，读到的不是那份累积记录", rev.Reason)
+	}
+	if len(merged.IDs()) != 2 {
+		t.Errorf("IDs = %v, want 本地那两把都在：撤销并进来不该顺手改动登记那一半",
+			merged.IDs())
+	}
+}
+
+// TestMergePrefersTheListsRevocationRecordOverTheRecordedOne 钉住这条通道的优先
+// 级：清单那一侧的 Keyring 与累积集说的是同一条撤销时，保留先见到的那条。
+//
+// 「先见到的胜出」是本函数与 mergeFrom、assembleKeyring 共用的一条规则，两条记录
+// 的差别在 revoked_at 与 reason ——也就是操作者读到的那句拒绝理由。新开的这条通道
+// 如果掉过头来覆盖它，规则就分了家。
+func TestMergePrefersTheListsRevocationRecordOverTheRecordedOne(t *testing.T) {
+	t.Parallel()
+
+	local := keyringWith(t, []sign.KeyID{"live"}, nil)
+	listTrust := trustFrom(t, keyringWith(t, []sign.KeyID{"k", "live"}, []sign.KeyID{"k"}), nil)
+	listTrust.revocations = recordedRevocations(t, "k")
+
+	merged, _, err := Merge(local, listTrust)
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	rev, ok := merged.Revoked("k")
+	if !ok {
+		t.Fatal("k 不再是撤销状态")
+	}
+	if rev.Reason != "私钥泄漏" {
+		t.Errorf("撤销理由 = %q, want 清单那一侧先见到的那条（私钥泄漏）", rev.Reason)
+	}
+}

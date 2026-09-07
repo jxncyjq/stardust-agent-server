@@ -95,6 +95,29 @@ func sortedIDs[V any](m map[sign.KeyID]V) []sign.KeyID {
 // key_id is present, unique and that revoked_at, when given, is RFC 3339), and
 // dropping it would make "delete the public key" an antidote to revoking it.
 //
+// # Three shapes the list half may legally arrive in
+//
+// The two guards below refuse a Trust carrying one of Keyring / KeyringRaw
+// without the other, because each field holds a half the other does not and
+// half-using one would silently drop the rest. What is left is three legal
+// shapes, and the third is easy to mistake for the second:
+//
+//	both fields set        A list this machine can act on. Its registrations
+//	                       and its revocations both join the union.
+//	neither field set,     Nothing from the list half at all.
+//	no revocations
+//	neither field set,     The cached list document is missing, damaged, or
+//	revocations present    would not assemble — but the revocations this machine
+//	                       has already recorded are still known, and still apply.
+//
+// The third shape is not a degraded version of the second. Trust.revocations is
+// a local file and does not depend on reaching the network; the whole reason it
+// exists is that revocations must not weaken when the list cannot be read. If a
+// missing trustlist.json also took this machine's accumulated revocations with
+// it, deleting one file would be a working way to un-revoke a key — no forgery
+// needed. So the revocations below are merged in whether or not the list half
+// brought a keyring along with them.
+//
 // A nil result means this deployment has no trust set at all. That is not
 // "signatures are not checked" — it is "no key is recognised", and every
 // package judged against it comes out unsigned.
@@ -229,11 +252,37 @@ func Merge(localRaw json.RawMessage, t Trust) (*sign.Keyring, map[sign.KeyID]str
 		}
 	}
 
-	// No keys means neither half was present: a half that IS present either
+	// The third legal shape (see the doc comment): the list half carries no
+	// keyring document, but the revocations this machine has recorded are
+	// known and still apply. They are added whatever t.Keyring holds — when it
+	// is non-nil the loop above has already contributed the same records and
+	// "first one seen wins" makes this a no-op, so there is one rule here and
+	// not two.
+	//
+	// A nil t.revocations is "this Trust carries no revocation record", NOT
+	// "this machine has none": Store.Current spells the latter as a non-nil
+	// empty set and refuses (ErrRevocationsUnknown) rather than hand back nil
+	// when it cannot tell. Nothing is inferred from the nil here.
+	if t.revocations != nil {
+		for _, e := range t.revocations.entries {
+			addRevocation(e)
+		}
+	}
+
+	// No keys means neither half registered one: a half that IS present either
 	// contributes at least one key or stops the merge with an error
 	// (keyEntriesOf refuses a document that registers none). So this is the
 	// "no trust set at all" case the doc comment describes, not a merge that
 	// quietly came out empty.
+	//
+	// Recorded revocations cannot change that verdict: sign.ParseKeyring
+	// refuses a keyring document that registers no keys, so with neither half
+	// registering one there is no trust set for them to be carried in. This is
+	// the one place a recorded revocation does not reach — a deployment that
+	// configured no local keyring and whose list is unreadable judges every
+	// package unsigned, including one signed by a key it has recorded as
+	// revoked. The caller is told: Store.Current returns its error alongside
+	// that Trust.
 	if len(keys) == 0 {
 		return nil, map[sign.KeyID]string{}, nil
 	}

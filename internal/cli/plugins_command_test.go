@@ -85,6 +85,12 @@ type pluginFixture struct {
 	configPath   string
 	application  *app.App
 	gate         *taskgate.TaskGate
+
+	// trustlist is the fetched trust list's Store the assembly is handed, the
+	// same field serve fills in (see pluginHostDeps.Trustlist). Nil is the
+	// deployment that configured no remote list, which is what every test in
+	// this file but the trust-list ones is; useTrustlistCache fills it in.
+	trustlist *trustlist.Store
 }
 
 // newPluginFixture writes a config with a plugins section pointing at a
@@ -521,10 +527,11 @@ func (f *pluginFixture) assembleTrustSet(logger *slog.Logger) (loader.TrustSet, 
 		f.t.Fatalf("load config %s: %v", f.configPath, err)
 	}
 	return assemblePlugins(context.Background(), f.application, cfg, pluginHostDeps{
-		Audit:  adapter.NewMemoryAuditLog(),
-		Events: adapter.NewMemoryEventBus(),
-		Logger: logger,
-		Gate:   f.gate,
+		Audit:     adapter.NewMemoryAuditLog(),
+		Events:    adapter.NewMemoryEventBus(),
+		Logger:    logger,
+		Gate:      f.gate,
+		Trustlist: f.trustlist,
 	})
 }
 
@@ -6798,5 +6805,294 @@ func TestServeStopsTheTrustlistRefreshLoopWithItsContext(t *testing.T) {
 		t.Errorf("the loop logged %d further round(s) a second after serve's context ended (%d -> %d); "+
 			"it is not running on serve's context, so it outlives the serve that started it",
 			grew-settled, settled, grew)
+	}
+}
+
+// --- 清单不可用时，本机的撤销累积集仍然生效（真机装配路径） ---------------------
+//
+// 规格 §三③ / §八 与产品拍板 #1 的后半句：清单拉不到时按安装期记下的结论挂载，
+// 但撤销仍硬拒。撤销累积集（revoked-ever.json）是本地文件，不依赖联网，也不该
+// 随着一个缺失或损坏的 trustlist.json 一起消失——否则删掉一个文件就是一个能用的
+// 「解除撤销」手段，而伪造正是 S1 花大力气防住的那件事。
+//
+// 下面这些用例走的是**真机装配路径**（newPluginFixture -> assemble ->
+// newPluginLoader -> 装配自己建出来的那个 TrustSet 闭包），不是给 loader 夹具直接
+// 塞一个 manifest.TrustInput：会丢掉撤销的正是装配这一段。
+
+// trustlistCacheFixtureReason 是这些用例写进 revoked-ever.json 的理由。断言状态行
+// 里出现它，才证明拒绝所依据的那条撤销来自磁盘上那份累积记录。
+const trustlistCacheFixtureReason = "recorded on this machine months ago"
+
+// seedRecordedRevocation 在 cacheDir 里写一份只有 revoked-ever.json 的缓存：撤销
+// keyID，没有 trustlist.json，也没有 trustlist.sig。
+//
+// 这正是复审实证二里那个形态，也是 cache.go 自己列成真实可能的那个（「一次首写
+// 崩溃、一次磁盘损坏，或者任何能写这个目录的东西删掉一个文件」）。
+func seedRecordedRevocation(t *testing.T, cacheDir string, keyID sign.KeyID) {
+	t.Helper()
+
+	data, err := json.Marshal(map[string]any{"revoked": []map[string]string{{
+		"key_id":     string(keyID),
+		"revoked_at": "2026-08-29T10:00:00Z",
+		"reason":     trustlistCacheFixtureReason,
+	}}})
+	if err != nil {
+		t.Fatalf("encode revoked-ever.json: %v", err)
+	}
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		t.Fatalf("create trustlist cache dir %s: %v", cacheDir, err)
+	}
+	if err := os.WriteFile(filepath.Join(cacheDir, "revoked-ever.json"), data, 0o600); err != nil {
+		t.Fatalf("write revoked-ever.json: %v", err)
+	}
+}
+
+// damageCachedTrustlist 往 cacheDir 里写一份读得出来但通不过验签的清单，也就是
+// trustlist.Store 归到「缓存损坏」（而不是「还没取过」）的那一支。
+func damageCachedTrustlist(t *testing.T, cacheDir string) {
+	t.Helper()
+
+	for name, body := range map[string]string{
+		"trustlist.json": `{"serial":1}`,
+		"trustlist.sig":  "this is not a signature",
+	} {
+		if err := os.WriteFile(filepath.Join(cacheDir, name), []byte(body), 0o600); err != nil {
+			t.Fatalf("damage cache %s: %v", name, err)
+		}
+	}
+}
+
+// useTrustlistCache 把一个远程信任清单配进 fixture 的 agent.json，并按 serve 的
+// 做法建出那个 Store 交给装配：serve 走的是 resolvePluginTrustlist，然后把结果放进
+// pluginHostDeps.Trustlist（command.go），这里一字照做。
+//
+// 地址落在 .invalid 之下（RFC 2606 保证不解析），并且这些用例都不跑刷新循环，
+// 所以取回从不发生——考的是缓存这一侧。
+func (f *pluginFixture) useTrustlistCache(policy signaturePolicy, cacheDir string) {
+	f.t.Helper()
+
+	f.writeSignatureConfig(30_000, policy, fmt.Sprintf(
+		`"trustlist": {"url": %s, "cache": %s, "refresh_interval_ms": 3600000}`,
+		jsonString(trustlistNeverFetchedURL), jsonString(cacheDir)))
+
+	store, _, err := resolvePluginTrustlist(config.PluginsConfig{
+		Trustlist: config.PluginTrustlistConfig{
+			URL:               trustlistNeverFetchedURL,
+			Cache:             cacheDir,
+			RefreshIntervalMs: 3_600_000,
+		},
+	})
+	if err != nil {
+		f.t.Fatalf("resolvePluginTrustlist: %v", err)
+	}
+	if store == nil {
+		f.t.Fatal("resolvePluginTrustlist returned no Store for a configured trustlist")
+	}
+	f.trustlist = store
+}
+
+// writeLocalKeyringRegistering 写一份只**登记**（不撤销任何东西）的本地 keyring：
+// 签名用的那把，外加一把无关的 spare。
+//
+// spare 不是装饰：sign.ParseKeyring 拒绝「每把钥匙都被撤销」的信任集，只登记签名
+// 那一把的话，合并会卡在解析那一步，用例就会因为别的原因而通过。
+//
+// 撤销刻意不写进这份文件：这些用例要证明的是那条撤销**只**存在于 revoked-ever.json
+// 时仍然生效，写进本地 keyring 就等于让另一条通道替它把话说了。
+func writeLocalKeyringRegistering(t *testing.T, dir string) (ed25519.PrivateKey, string) {
+	t.Helper()
+
+	signingPub, signingPriv, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	sparePub, _, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	path := filepath.Join(dir, "keyring.json")
+	writeKeyringDoc(t, path, []map[string]string{
+		{"id": string(testPluginKeyID), "algorithm": "ed25519",
+			"public_key": base64.StdEncoding.EncodeToString(signingPub)},
+		{"id": "spare", "algorithm": "ed25519",
+			"public_key": base64.StdEncoding.EncodeToString(sparePub)},
+	}, nil)
+	return signingPriv, path
+}
+
+// TestAssembleRefusesAKeyRevokedOnlyInTheRecordWhenTheTrustlistIsUnavailable 是
+// 复审 Critical-1 的必红用例：撤销只存在于 revoked-ever.json，清单文件缺失或损坏，
+// require_signature 用默认值（true）。
+//
+// 三个子用例把拍板 #1 的两半各钉一次：撤销那一半在清单不可用时**不降级**（前两
+// 条），登记那一半照常降级到只剩本地 keyring、包照常挂载（第三条）。少了第三条，
+// 一个「清单读不出来就全线拒绝」的实现也能让前两条变绿，而那违反拍板 #1 的前半句。
+func TestAssembleRefusesAKeyRevokedOnlyInTheRecordWhenTheTrustlistIsUnavailable(t *testing.T) {
+	cases := []struct {
+		name string
+		// damage 在缓存目录上再动一次手，模拟清单不可用的另一种形态。
+		damage func(t *testing.T, cacheDir string)
+		// revoke 是写进 revoked-ever.json 的那个 key id。
+		revoke      sign.KeyID
+		wantMounted bool
+	}{
+		{
+			name:   "清单文件缺失",
+			damage: func(t *testing.T, cacheDir string) { t.Helper() },
+			revoke: testPluginKeyID,
+		},
+		{
+			name:   "清单文件损坏",
+			damage: damageCachedTrustlist,
+			revoke: testPluginKeyID,
+		},
+		{
+			// 累积集里那条撤销与这个包无关：登记那一半降级成只剩本地 keyring，
+			// 包照常挂载。这是拍板 #1 的前半句。
+			name:        "清单文件缺失但撤销与这个包无关",
+			damage:      func(t *testing.T, cacheDir string) { t.Helper() },
+			revoke:      "some-other-publisher",
+			wantMounted: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newPluginFixture(t, 30_000)
+			signingPriv, keyringPath := writeLocalKeyringRegistering(t, f.dir)
+			cacheDir := filepath.Join(f.dir, "trustlist-cache")
+			seedRecordedRevocation(t, cacheDir, tc.revoke)
+			tc.damage(t, cacheDir)
+			// requireSignature 留 nil：走配置的默认值（要求背书），也就是复审
+			// 实证二用的那个策略。
+			f.useTrustlistCache(signaturePolicy{keyring: keyringPath}, cacheDir)
+
+			f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+			f.signPackage("echo", signingPriv)
+			f.writeManifest(manifestEntry{
+				name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool},
+			})
+
+			if err := f.assemble(); err != nil {
+				t.Fatalf("assemblePlugins() error = %v, want nil：一个被拒的条目不等于一次被拒的启动", err)
+			}
+			if got := toolauth.IsGateable(testEchoTool); got != tc.wantMounted {
+				if tc.wantMounted {
+					t.Fatalf("IsGateable(%q) = false, want true：清单不可用只该让登记那一半"+
+						"降级到本地 keyring，不该连一个没被撤销的包也拒掉", testEchoTool)
+				}
+				t.Fatalf("IsGateable(%q) = true, want false：这台机器已经记下这把钥匙被撤销，"+
+					"而一个缺失或损坏的 trustlist.json 把那条记录一起丢了——删掉一个文件"+
+					"就成了解除撤销的办法", testEchoTool)
+			}
+			if !tc.wantMounted {
+				f.requireStatusExplains("被撤销钥匙签名的包被拒之后", "revoked")
+				f.requireStatusExplains("被撤销钥匙签名的包被拒之后", trustlistCacheFixtureReason)
+			}
+		})
+	}
+}
+
+// TestResolvePluginTrustInputRefusesWhenTheRevocationRecordCannotBeRead 守的是
+// 「降级」与「判不了」的分界。
+//
+// 清单读不出来时降级是对的：登记那一半只剩本地 keyring，而撤销那一半仍然成立。
+// 撤销累积集自己读不出来时那个前提没了——继续走等于替这台机器回答「没有撤销」，
+// 正是这份记录存在要挡的 fail-open。所以这里必须返回错误，且**不得**走
+// reportUnavailable 那条降级路径。
+func TestResolvePluginTrustInputRefusesWhenTheRevocationRecordCannotBeRead(t *testing.T) {
+	cacheDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cacheDir, "revoked-ever.json"),
+		[]byte(`{"revoked":"this is not an array"}`), 0o600); err != nil {
+		t.Fatalf("write revoked-ever.json: %v", err)
+	}
+	damageCachedTrustlist(t, cacheDir)
+
+	store, _, err := resolvePluginTrustlist(config.PluginsConfig{
+		Trustlist: config.PluginTrustlistConfig{
+			URL:               trustlistNeverFetchedURL,
+			Cache:             cacheDir,
+			RefreshIntervalMs: 3_600_000,
+		},
+	})
+	if err != nil {
+		t.Fatalf("resolvePluginTrustlist: %v", err)
+	}
+
+	degraded := 0
+	_, err = resolvePluginTrustInput(nil, store, func(error) { degraded++ })
+	if err == nil {
+		t.Fatal("撤销累积集读不出来，信任集却照样装出来了")
+	}
+	if !errors.Is(err, trustlist.ErrRevocationsUnknown) {
+		t.Errorf("err = %v, want 裹着 trustlist.ErrRevocationsUnknown", err)
+	}
+	if degraded != 0 {
+		t.Errorf("走了 %d 次降级路径，want 0：「判不了撤销」被当成了「清单不可用」，"+
+			"于是这次挂载会在一个没人能判撤销的信任集上继续", degraded)
+	}
+}
+
+// TestTheAssemblysTrustSetIsReadAgainOnEveryMount 是复审 Important-1：拍板 #4
+// 「信任集动态读，下一次挂载即生效」在**生产装配层**有人守。
+//
+// loader 包里已有的 TestTrustSetIsReadOnEveryMount 注入的是它自己的 TrustSet，
+// 证的是 Loader 会调用提供者，与装配建出来的那个提供者无关。缺的正是这一段接线：
+// 把 pluginTrustSet 改成第一次调用后缓存答案，整棵树没有一条用例会红——serve 建
+// 出来的提供者就此把答案冻在第一次挂载上，后台刷到的紧急撤销再也到不了任何一次
+// 收敛。
+//
+// 用例拿的是 assemblePlugins 交回来的那个 TrustSet（serve 也是把它转交给面板的
+// 那一个），两次调用之间改动缓存目录：第二次的答案必须变。
+func TestTheAssemblysTrustSetIsReadAgainOnEveryMount(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	_, keyringPath := writeLocalKeyringRegistering(t, f.dir)
+	cacheDir := filepath.Join(f.dir, "trustlist-cache")
+	// 起步时这台机器一条撤销都没记过（空数组是合法状态：见过清单，但没有撤销）。
+	if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+		t.Fatalf("create trustlist cache dir: %v", err)
+	}
+	recordPath := filepath.Join(cacheDir, "revoked-ever.json")
+	if err := os.WriteFile(recordPath, []byte(`{"revoked":[]}`), 0o600); err != nil {
+		t.Fatalf("write revoked-ever.json: %v", err)
+	}
+	f.useTrustlistCache(signaturePolicy{keyring: keyringPath}, cacheDir)
+	f.writeManifest()
+
+	trustSet, err := f.assembleTrustSet(slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("assemblePlugins: %v", err)
+	}
+	if trustSet == nil {
+		t.Fatal("assemblePlugins 没有交回 TrustSet")
+	}
+
+	first, err := trustSet()
+	if err != nil {
+		t.Fatalf("第一次读信任集：%v", err)
+	}
+	if first.Keyring == nil {
+		t.Fatal("第一次读到的信任集是空的，可本地 keyring 登记了两把钥匙")
+	}
+	if _, revoked := first.Keyring.Revoked(testPluginKeyID); revoked {
+		t.Fatalf("%q 在第一次读时就已是撤销状态，用例考不到「答案变了」", testPluginKeyID)
+	}
+
+	// 这一步就是后台刷新落盘的那件事：磁盘上的撤销记录变了。
+	seedRecordedRevocation(t, cacheDir, testPluginKeyID)
+
+	second, err := trustSet()
+	if err != nil {
+		t.Fatalf("第二次读信任集：%v", err)
+	}
+	if second.Keyring == nil {
+		t.Fatal("第二次读到的信任集是空的")
+	}
+	rev, revoked := second.Keyring.Revoked(testPluginKeyID)
+	if !revoked {
+		t.Fatalf("%q 在磁盘上的记录改过之后仍然不是撤销状态：这个提供者把答案冻在了"+
+			"第一次调用上，后台刷到的紧急撤销再也到不了任何一次收敛", testPluginKeyID)
+	}
+	if rev.Reason != trustlistCacheFixtureReason {
+		t.Errorf("撤销理由 = %q, want %q", rev.Reason, trustlistCacheFixtureReason)
 	}
 }
