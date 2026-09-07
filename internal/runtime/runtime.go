@@ -255,10 +255,13 @@ type loopState struct {
 	started    time.Time
 	basePrompt string
 	round      int
-	// stopReason is why the tool loop ended. It is set at each of the loop's
-	// terminal points and read by finishRun, alongside the token counters that
-	// accumulate the same way. It replaced a loopCut bool that could only tell
-	// "the model repeated itself" from "everything else".
+	// stopReason is why the tool loop ended. It is set once, at whichever of
+	// the loop's terminal points is reached, and read by finishRun -- unlike
+	// the token counters alongside it, which accumulate across every round.
+	// It replaced a loopCut bool that grouped the per-tool-name cap and the
+	// repeat guard into a single true, so it could not tell those two apart
+	// from each other -- only the pair of them from a plain round-budget
+	// exhaustion.
 	stopReason domain.StopReason
 	// convo is the append-only multi-turn exchange sent to the model each round
 	// (see messages.go). It replaced a single re-sent prompt string whose tool
@@ -1254,6 +1257,13 @@ func (r *Runtime) checkSuspend(ctx context.Context, task domain.Task, st loopSta
 // finishRun emits completion events/audit, deletes any checkpoint (the task is
 // done, not suspended), and returns the assembled TaskRun.
 func (r *Runtime) finishRun(ctx context.Context, requestID string, agent domain.Agent, task domain.Task, st loopState) (domain.TaskRun, error) {
+	// A successful TaskRun is assembled only here, so this is the one place the
+	// invariant can be checked. An empty reason is not a kind of ending; it is a
+	// terminal path that forgot to name itself, and letting it through would
+	// report that run as a clean completion.
+	if st.stopReason == "" {
+		panic("runtime: finishRun reached with no stop reason recorded for task " + task.ID)
+	}
 	if err := r.events.Publish(ctx, domain.RuntimeEvent{
 		Type:      "inference_completed",
 		TaskID:    task.ID,

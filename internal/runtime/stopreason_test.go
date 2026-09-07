@@ -3,7 +3,9 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
@@ -108,4 +110,28 @@ func TestStopReasonToolLoopCapWhenOneToolNameExhaustsItsAllowance(t *testing.T) 
 		t.Errorf("run.StopReason = %q, want %q: read_file exhausted its per-name allowance (%d)",
 			run.StopReason, domain.StopReasonToolLoopCap, toolLoopCap)
 	}
+}
+
+// 零值不是一种结局，是「没人填」。成功的 TaskRun 只从 finishRun 出来，所以
+// 断言放在那里；它炸掉的是「加了字段但某条路径忘了填」这个形状。
+func TestFinishRunPanicsWhenNoStopReasonWasRecorded(t *testing.T) {
+	t.Parallel()
+	rt := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Maas: &recordingRoundsMaas{
+		responses: []port.InferenceResponse{{Text: "done"}},
+	}, Tools: unchangingReadRegistry(t)})
+
+	defer func() {
+		recovered := recover()
+		if recovered == nil {
+			t.Fatal("finishRun() did not panic on an unrecorded stop reason; an empty reason must never pass for completed")
+		}
+		message, ok := recovered.(string)
+		if !ok || !strings.Contains(message, "stop reason") {
+			t.Fatalf("panic value = %v, want a message naming the missing stop reason", recovered)
+		}
+	}()
+
+	//nolint:errcheck // the call panics before it can return
+	_, _ = rt.finishRun(context.Background(), "req-1", domain.Agent{ID: "a"},
+		domain.Task{ID: "t1"}, loopState{started: time.Now()})
 }
