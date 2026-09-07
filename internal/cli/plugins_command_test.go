@@ -5617,6 +5617,178 @@ func TestPluginsReloadRefusesAfterAKeyIsRevoked(t *testing.T) {
 	}
 }
 
+// revocableKeyringFixture writes a keyring document holding two keys into the
+// fixture directory and returns the private half of the first one along with
+// the document's path and the key list it was written from, so a test can
+// rewrite the same document with a revocation added.
+//
+// TWO keys, always: sign.ParseKeyring refuses a document whose every registered
+// key is revoked, so a one-key keyring would stop parsing the moment a test
+// revoked it and the test would fail for a reason it is not about.
+func revocableKeyringFixture(t *testing.T, dir string) (ed25519.PrivateKey, string, []map[string]string) {
+	t.Helper()
+
+	signingPub, signingPriv, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	sparePub, _, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	keys := []map[string]string{
+		{"id": string(testPluginKeyID), "algorithm": "ed25519",
+			"public_key": base64.StdEncoding.EncodeToString(signingPub)},
+		{"id": "spare", "algorithm": "ed25519",
+			"public_key": base64.StdEncoding.EncodeToString(sparePub)},
+	}
+	path := filepath.Join(dir, "keyring.json")
+	writeKeyringDoc(t, path, keys, nil)
+	return signingPriv, path, keys
+}
+
+// TestPluginsReloadRefusesAfterAKeyIsRevokedWithSignaturesOff closes C1, and it
+// is the same guard TestPluginsReloadRefusesAfterAKeyIsRevoked pins one policy
+// over: a revocation added to the local keyring document must stop a reload,
+// under "require_signature": false exactly as under the strict default.
+//
+// That policy used to be the hole. The comparison was computed over the
+// POLICY-ENFORCED keyring, which is nil whenever no endorsement is required, so
+// both sides were the zero policy and compared equal however the document had
+// changed. A reload then converged the new manifest under the keyring frozen at
+// startup, printed "loaded", and mounted a package signed by a key the operator
+// had just revoked.
+//
+// The manifest entry starts DISABLED and is enabled only after the revocation
+// is written, so the package's first chance to mount is the reload under test.
+// A test that mounted it beforehand could only observe the refusal, never the
+// mount the refusal prevents.
+//
+// The keyring's trusted ids are IDENTICAL before and after: only a revocation
+// is added. A comparison that noticed the key list alone would pass this test
+// while leaving revocations out of the policy entirely.
+func TestPluginsReloadRefusesAfterAKeyIsRevokedWithSignaturesOff(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	signingPriv, keyringPath, keys := revocableKeyringFixture(t, f.dir)
+
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(false)})
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.signPackage("echo", signingPriv)
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+	if toolauth.IsGateable(testEchoTool) {
+		t.Fatalf("IsGateable(%q) = true after an assembly of a disabled entry, want false", testEchoTool)
+	}
+
+	// The operator revokes the signing key, then enables the entry.
+	writeKeyringDoc(t, keyringPath, keys,
+		[]map[string]string{{"key_id": string(testPluginKeyID), "reason": "laptop stolen"}})
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+
+	out, err := f.run("reload")
+	if err == nil {
+		t.Fatalf("plugins reload after a revocation under \"require_signature\": false = nil error, want a "+
+			"refusal: this process still trusts the revoked key.\nreload output = %q", out)
+	}
+	if !strings.Contains(err.Error(), "restart") {
+		t.Errorf("plugins reload error = %v, want it to say serve must be restarted", err)
+	}
+	if !strings.Contains(err.Error(), string(testPluginKeyID)) {
+		t.Errorf("plugins reload error = %v, want it to name the revoked key", err)
+	}
+	// The point of the refusal, and not a restatement of it: the package signed
+	// by the revoked key did not mount.
+	if toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = true, want false: the reload mounted a package signed by a key this "+
+			"operator had already revoked.\nreload output = %q", testEchoTool, out)
+	}
+}
+
+// TestPluginsReloadConvergesWithSignaturesOffWhenTheKeyringIsUnchanged is the
+// other direction, and it is not optional. A guard that refuses a reload the
+// keyring did not change is a guard operators learn to route around, and the
+// fix that closed C1 -- comparing over the keyring document as read rather than
+// over the policy-filtered one -- is exactly the kind of change that turns a
+// silent guard into a permanently-firing one: computing the two sides from
+// different keyrings would make every reload of this deployment fail.
+//
+// Same shape as the test above, minus the revocation.
+func TestPluginsReloadConvergesWithSignaturesOffWhenTheKeyringIsUnchanged(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	signingPriv, keyringPath, _ := revocableKeyringFixture(t, f.dir)
+
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(false)})
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.signPackage("echo", signingPriv)
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+	if _, err := f.run("reload"); err != nil {
+		t.Fatalf("plugins reload error = %v, want nil: the keyring document and the requirement are both "+
+			"exactly what this process was assembled with", err)
+	}
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = false after a reload that was allowed through, want true: the entry the "+
+			"reload was supposed to converge onto never mounted", testEchoTool)
+	}
+}
+
+// TestPluginsReloadRefusesWhenTheEndorsementRequirementIsTurnedOff pins the
+// half of the signature policy that no keyring comparison can reach.
+//
+// The keyring document is BYTE-IDENTICAL on both sides; only
+// "require_signature" moves, from its strict default to false. That is a
+// relaxation -- every package that needed an endorsement stops needing one --
+// and a reload cannot apply it, because the requirement is frozen when serve
+// assembles the Loader. Without the requirement in the compared policy the two
+// sides are the same keyring and compare equal, so the reload would converge
+// and report success while the running process went on requiring endorsements
+// the config no longer asks for.
+func TestPluginsReloadRefusesWhenTheEndorsementRequirementIsTurnedOff(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	signingPriv, keyringPath, _ := revocableKeyringFixture(t, f.dir)
+
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath})
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.2.0", nil, []string{testEchoTool})
+	f.signPackage("echo", signingPriv)
+	f.writeManifest(manifestEntry{name: testEchoPlugin, source: "echo", enabled: true, tools: []string{testEchoTool}})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Fatalf("IsGateable(%q) = false after startup apply, want true", testEchoTool)
+	}
+
+	// Same keyring file, untouched; only the requirement is relaxed.
+	f.writeSignatureConfig(30_000, signaturePolicy{keyring: keyringPath, requireSignature: boolPtr(false)})
+
+	out, err := f.run("reload")
+	if err == nil {
+		t.Fatalf("plugins reload after \"require_signature\" was turned off = nil error, want a refusal: the "+
+			"requirement this process enforces is frozen at assembly.\nreload output = %q", out)
+	}
+	if !strings.Contains(err.Error(), "restart") {
+		t.Errorf("plugins reload error = %v, want it to say serve must be restarted", err)
+	}
+	// The refusal has to SHOW what moved. Both renderings in one message is
+	// what tells an operator which direction the change went; a message that
+	// printed the same keyring twice would report a difference it does not name.
+	msg := err.Error()
+	if !strings.Contains(msg, "no endorsement is required") || !strings.Contains(msg, "an endorsement is required") {
+		t.Errorf("plugins reload error = %v, want it to render both the requirement the config now asks for "+
+			"and the one this process was built with", err)
+	}
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Errorf("IsGateable(%q) = false, want true: a refused reload must leave the running deployment alone",
+			testEchoTool)
+	}
+}
+
 // writeKeyringDoc writes a keyring document with the given keys and (optional)
 // revocations.
 func writeKeyringDoc(t *testing.T, path string, keys []map[string]string, revoked []map[string]string) {

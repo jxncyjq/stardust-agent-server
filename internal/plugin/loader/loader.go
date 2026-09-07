@@ -293,13 +293,20 @@ type Config struct {
 	TrustSet TrustSet
 
 	// LocalKeyring is the deployment's LOCAL keyring configuration — the
-	// keyring document on this machine, as opposed to whatever TrustSet
-	// answers with on a given mount.
+	// keyring document on this machine, as read, as opposed to whatever
+	// TrustSet answers with on a given mount.
 	//
 	// It decides nothing about whether a package may mount; that judgement
 	// reads TrustSet. Its whole job is to be reported through SignaturePolicy,
 	// which is why "no keyring file is configured" is an ordinary nil here
 	// rather than a policy statement.
+	//
+	// A nil here therefore says one thing only: no keyring document is
+	// configured. It is NOT the place to express RequireSignature, which has a
+	// field of its own — a nil standing in for "no endorsement is required"
+	// would make SignaturePolicy the zero policy for every such deployment, and
+	// a policy that is the zero value however the keyring document reads cannot
+	// report a change to it.
 	LocalKeyring *sign.Keyring
 
 	// RequireSignature is whether a package no registered publisher endorses
@@ -639,25 +646,30 @@ func validateRemote(remote RemoteConfig) error {
 	return nil
 }
 
-// SignaturePolicy is a Loader's LOCAL KEYRING CONFIGURATION in comparable
-// form: whether a local keyring is configured at all, and exactly which keys
-// are in it.
+// SignaturePolicy is a Loader's SIGNATURE POLICY in comparable form: the local
+// keyring configuration — whether one is configured at all and exactly which
+// keys are in it, trusted and revoked — together with whether an endorsement is
+// required at all.
 //
-// It exists for one caller: a command that re-reads the deployment config
-// while a Loader is already running (`agent plugins reload` does) has to be
-// able to tell whether the policy it just read is the policy the running
-// Loader was BUILT with. The keyring is frozen when serve assembles the
-// Loader, so converging a new manifest without that comparison would apply the
-// operator's new manifest under their old trust set — a signature policy that
-// looks applied and is not.
+// It exists so that a deployment config re-read while a Loader is already
+// running can be compared against the policy that Loader was BUILT with. Both
+// halves are frozen when the Loader is constructed and neither can be replaced
+// under a running one, so converging a new manifest without that comparison
+// would apply it under the OLD policy — a signature policy that looks applied
+// and is not.
+//
+// Both halves are in it because either one alone leaves a change invisible. Drop
+// the requirement and a deployment that turns endorsements off over an unchanged
+// keyring compares equal — a RELAXATION converging silently. Drop the keyring
+// and a revocation added to the keyring document compares equal, which is the
+// exact silence a revocation exists to break.
 //
 // # What it does NOT describe
 //
-// It covers only the local keyring (Config.LocalKeyring). It says nothing
-// about what Config.TrustSet answers with, and it does not need to: TrustSet is
-// read afresh on every mount, so there is no "converged under the old trust
-// set" to catch there — a trust set that changed a second ago is already in
-// force for the next mount, with or without a reload.
+// It says nothing about what Config.TrustSet answers with, and it does not need
+// to: TrustSet is read afresh on every mount, so there is no "converged under
+// the old trust set" to catch there — a trust set that changed a second ago is
+// already in force for the next mount, with or without a reload.
 //
 // Putting what TrustSet answers in here would make things worse rather than
 // more complete. A TrustSet is free to give a different answer on every call —
@@ -665,17 +677,14 @@ func validateRemote(remote RemoteConfig) error {
 // fail whenever a reload happened to land just after it changed: a guard that
 // refuses at random is worse than no guard at all, because people learn to
 // pass it by reflex and stop reading what it says.
-//
-// It says nothing about Config.RequireSignature either, which is a separate
-// statement about what may mount rather than about which keys are known.
 type SignaturePolicy struct {
 	// KeyringConfigured is whether a local keyring is configured at all. False
 	// means Config.LocalKeyring was nil.
 	//
 	// It is NOT "endorsements are enforced". Whether a package no registered
-	// publisher endorses may mount is Config.RequireSignature's answer, and
-	// this type does not carry that field — a deployment may configure a
-	// keyring and still not require an endorsement.
+	// publisher endorses may mount is RequireSignature's answer, and the two are
+	// independent — a deployment may configure a keyring and still not require
+	// an endorsement.
 	KeyringConfigured bool
 
 	// KeyIDs are the ids of the trusted keys, sorted (sign.Keyring.IDs). It is
@@ -695,30 +704,52 @@ type SignaturePolicy struct {
 	// succeeded" on screen. That is the exact silence a revocation exists to
 	// break.
 	RevokedIDs []sign.KeyID
+
+	// RequireSignature is Config.RequireSignature: whether a package no
+	// registered publisher endorses needs an install-time acceptance before it
+	// may mount.
+	//
+	// It is part of the policy because the keyring half cannot stand in for it.
+	// A deployment that turns the requirement off while keeping its keyring
+	// changes no key id at all, so without this field that edit compares equal
+	// and converges with nothing said — and it is a RELAXATION, the direction
+	// that must never pass unnoticed.
+	RequireSignature bool
 }
 
-// SignaturePolicyOf describes the local keyring configuration a Loader built
-// with keyring reports. A nil keyring — no keyring file configured — is the
-// policy that has no local keyring.
+// SignaturePolicyOf describes the signature policy of a Loader built with
+// keyring and requireSignature. A nil keyring — no keyring file configured — is
+// the policy that has no local keyring.
 //
-// It is exported so that a caller which has resolved a keyring from a config
-// but has not built a Loader from it (reload does exactly that) computes the
-// policy through the same function Loader.SignaturePolicy uses, rather than
-// growing a second, drifting idea of what a policy is.
-func SignaturePolicyOf(keyring *sign.Keyring) SignaturePolicy {
+// keyring must be the local keyring configuration AS READ, never one the
+// requirement has already been applied to. A keyring that is nil whenever no
+// endorsement is required yields the zero policy for every such deployment —
+// equal to itself however the keyring document changes — so a revocation added
+// under that requirement would compare unchanged, which is the one thing this
+// type exists to notice.
+//
+// It is exported so that a policy resolved from a config with no Loader built
+// from it is computed through the same function Loader.SignaturePolicy uses,
+// rather than growing a second, drifting idea of what a policy is.
+func SignaturePolicyOf(keyring *sign.Keyring, requireSignature bool) SignaturePolicy {
 	if keyring == nil {
-		return SignaturePolicy{}
+		return SignaturePolicy{RequireSignature: requireSignature}
 	}
-	return SignaturePolicy{KeyringConfigured: true, KeyIDs: keyring.IDs(), RevokedIDs: keyring.RevokedIDs()}
+	return SignaturePolicy{
+		KeyringConfigured: true,
+		KeyIDs:            keyring.IDs(),
+		RevokedIDs:        keyring.RevokedIDs(),
+		RequireSignature:  requireSignature,
+	}
 }
 
-// Equal reports whether p and other are the same policy: a local keyring is
-// configured on both sides or on neither, over the same trusted and revoked key
-// ids. Key order does not matter in principle, but both sides come from
-// sign.Keyring.IDs, which sorts — so this compares element by element rather
-// than paying for a set.
+// Equal reports whether p and other are the same policy: the same endorsement
+// requirement, a local keyring configured on both sides or on neither, over the
+// same trusted and revoked key ids. Key order does not matter in principle, but
+// both sides come from sign.Keyring.IDs, which sorts — so this compares element
+// by element rather than paying for a set.
 func (p SignaturePolicy) Equal(other SignaturePolicy) bool {
-	if p.KeyringConfigured != other.KeyringConfigured {
+	if p.KeyringConfigured != other.KeyringConfigured || p.RequireSignature != other.RequireSignature {
 		return false
 	}
 	return sameKeyIDs(p.KeyIDs, other.KeyIDs) && sameKeyIDs(p.RevokedIDs, other.RevokedIDs)
@@ -741,23 +772,29 @@ func sameKeyIDs(a, b []sign.KeyID) bool {
 // String renders p for an operator reading an error message: whether a local
 // keyring is configured at all first, because a policy that has none has no
 // ids to print, then the key ids in it so a changed keyring is visible rather
-// than merely asserted.
+// than merely asserted, and last whether an endorsement is required.
 //
-// It says nothing about whether an endorsement is REQUIRED, because p does not
-// carry that (see the type comment). Rendering "signatures required" off a
-// configured keyring would be an answer to a question p was never asked, and it
-// would be a false one for the deployment that configures a keyring while
-// Config.RequireSignature is false.
+// The requirement is rendered because p carries it, and it is rendered in BOTH
+// directions rather than only when it is on. Two policies that differ only
+// there compare unequal, so a rendering that left it out would print the same
+// sentence twice at an operator who has just been told the policy changed. The
+// rendering states what RequireSignature says and nothing more: a configured
+// keyring is not by itself a requirement, and neither is the absence of one a
+// statement that endorsements are off.
 func (p SignaturePolicy) String() string {
+	requirement := "no endorsement is required"
+	if p.RequireSignature {
+		requirement = "an endorsement is required"
+	}
 	if !p.KeyringConfigured {
-		return "no local keyring"
+		return "no local keyring, and " + requirement
 	}
 	ids := make([]string, 0, len(p.KeyIDs))
 	for _, id := range p.KeyIDs {
 		ids = append(ids, string(id))
 	}
 	if len(p.RevokedIDs) == 0 {
-		return fmt.Sprintf("a local keyring with trusted keys [%s]", strings.Join(ids, " "))
+		return fmt.Sprintf("a local keyring with trusted keys [%s], and %s", strings.Join(ids, " "), requirement)
 	}
 	// Revocations are rendered separately rather than by subtracting them from
 	// the trusted list: an operator comparing two policies in an error message
@@ -767,19 +804,19 @@ func (p SignaturePolicy) String() string {
 	for _, id := range p.RevokedIDs {
 		revoked = append(revoked, string(id))
 	}
-	return fmt.Sprintf("a local keyring with trusted keys [%s], revoked keys [%s]",
-		strings.Join(ids, " "), strings.Join(revoked, " "))
+	return fmt.Sprintf("a local keyring with trusted keys [%s], revoked keys [%s], and %s",
+		strings.Join(ids, " "), strings.Join(revoked, " "), requirement)
 }
 
-// SignaturePolicy returns this Loader's local keyring configuration, in the
-// comparable form SignaturePolicy documents.
+// SignaturePolicy returns this Loader's signature policy, in the comparable
+// form SignaturePolicy documents.
 //
-// No lock is taken: localKeyring is written once in New and never again, so
-// there is nothing here for a concurrent Apply to race with. The returned
-// KeyIDs slice is freshly built by sign.Keyring.IDs on every call, so a caller
-// cannot reach into the Loader's keyring through it.
+// No lock is taken: localKeyring and requireSignature are each written once in
+// New and never again, so there is nothing here for a concurrent Apply to race
+// with. The returned KeyIDs slice is freshly built by sign.Keyring.IDs on every
+// call, so a caller cannot reach into the Loader's keyring through it.
 func (l *Loader) SignaturePolicy() SignaturePolicy {
-	return SignaturePolicyOf(l.localKeyring)
+	return SignaturePolicyOf(l.localKeyring, l.requireSignature)
 }
 
 // RemotePolicy is a Loader's remote-source policy in comparable form: where

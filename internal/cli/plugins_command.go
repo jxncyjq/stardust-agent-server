@@ -344,16 +344,18 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 
 	// The keyring document this deployment configured, read once and used for
 	// two different questions below: the trust set a package's provenance is
-	// judged against (localRaw, which the policy does not reach), and the
-	// signature policy itself (keyring, which is nil exactly when the
-	// deployment does not require an endorsement). Anything else -- a keyring
-	// that would not read, a requirement with nothing to check against --
-	// fails here rather than mounting plugins nobody judged.
+	// judged against (localRaw), and the signature policy this loader reports
+	// (localKeyring, the document as read). Anything else -- a keyring that
+	// would not read, a requirement with nothing to check against -- fails here
+	// rather than mounting plugins nobody judged.
 	localKeyring, localRaw, err := resolvePluginLocalKeyring(cfg.Plugins)
 	if err != nil {
 		return nil, err
 	}
-	keyring, unenforcedKeyring, err := enforcedPluginKeyring(cfg.Plugins, localKeyring)
+	// enforcedPluginKeyring is called for its POLICY rule and its warning, not
+	// for the keyring it returns: a deployment that requires an endorsement
+	// while naming no keyring is refused here rather than started.
+	_, unenforcedKeyring, err := enforcedPluginKeyring(cfg.Plugins, localKeyring)
 	if err != nil {
 		return nil, err
 	}
@@ -406,20 +408,22 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 		Gate:                 deps.Gate,
 		ApplyWait:            time.Duration(cfg.Plugins.ApplyWaitMs) * time.Millisecond,
 		MaxConsecutiveFaults: cfg.Plugins.Health.MaxConsecutiveFaults,
-		LocalKeyring:         keyring,
+		// The keyring document AS READ, not one the requirement has been
+		// applied to: this field is what loader.SignaturePolicy reports, and a
+		// keyring that went nil whenever no endorsement is required would make
+		// that policy the zero value for every such deployment -- a revocation
+		// added to the document would then compare unchanged, and converge (see
+		// loader.SignaturePolicyOf).
+		LocalKeyring: localKeyring,
 		// The trust set is built from the keyring document this deployment
 		// configured merged with the fetched trust list, and it is built
 		// whatever the signature policy says -- see resolvePluginTrustInput for
 		// why a deployment that requires no endorsement still needs one.
-		//
-		// RequireSignature is derived from the enforced keyring rather than
-		// read separately because enforcedPluginKeyring already collapses the
-		// two: it returns a non-nil keyring only for a deployment whose config
-		// requires an endorsement, and nil for one that does not. Reading
-		// cfg.Plugins.SignatureRequired() here as well would be a second,
-		// drifting answer to a question that function has already answered.
-		TrustSet:         pluginTrustSet(localRaw, deps.Trustlist, logger),
-		RequireSignature: keyring != nil,
+		TrustSet: pluginTrustSet(localRaw, deps.Trustlist, logger),
+		// The requirement is read from the config directly, because it is now a
+		// separate field of the policy rather than something a nil keyring
+		// stands in for.
+		RequireSignature: cfg.Plugins.SignatureRequired(),
 		Remote:           remote,
 	})
 }
@@ -597,12 +601,15 @@ func resolvePluginLocalKeyring(cfg config.PluginsConfig) (*sign.Keyring, json.Ra
 // resolvePluginLocalKeyring already read, and is the only place a nil keyring
 // may be produced for a deployment that configured one.
 //
-// What "enforced" means here is narrow, and narrower than it used to be: this
-// is the keyring reported through loader.SignaturePolicy and the one
-// loader.Config.RequireSignature is derived from — the answer to "does an
-// unendorsed package need an install-time acceptance". It is NOT the trust set
-// a package's provenance is judged against; that one is built by
-// pluginTrustSet, which does not consult the policy at all.
+// What "enforced" means here is narrow: the keyring the POLICY keeps, which is
+// the configured document when an endorsement is required and nil when none is.
+//
+// It is NOT the signature policy in comparable form. That one is built from the
+// keyring document as read, with the requirement as a field of its own, because
+// a keyring that goes nil under a relaxed requirement cannot report a change to
+// itself — see loader.SignaturePolicyOf. It is NOT the trust set a package's
+// provenance is judged against either; that one is built by pluginTrustSet,
+// which does not consult the policy at all.
 //
 // The two rules:
 //
@@ -641,13 +648,13 @@ func enforcedPluginKeyring(cfg config.PluginsConfig, local *sign.Keyring) (*sign
 }
 
 // resolvePluginKeyring is resolvePluginLocalKeyring followed by
-// enforcedPluginKeyring: the keyring this deployment's signature POLICY keeps.
-// Every caller that fills loader.Config.LocalKeyring, or compares a signature
-// policy, must obtain its keyring from here.
+// enforcedPluginKeyring in one step: the keyring this deployment's signature
+// POLICY keeps, read from disk and then filtered by that policy.
 //
-// A caller that also needs the trust set a package is judged against calls the
-// two halves itself, so that the keyring document is read from disk exactly
-// once (newPluginLoader and runPluginsInstall both do).
+// It returns the policy's answer alone, so the raw keyring bytes the merged
+// trust set is assembled out of (resolvePluginTrustInput) do not survive it.
+// Needing both answers means calling the two halves directly instead, which
+// reads the keyring document from disk exactly once for the pair.
 func resolvePluginKeyring(cfg config.PluginsConfig) (*sign.Keyring, string, error) {
 	local, _, err := resolvePluginLocalKeyring(cfg)
 	if err != nil {
@@ -718,14 +725,15 @@ const pluginTrustlistUnavailableMsg = "plugin trust list is unavailable; only th
 // function rather than a value.
 //
 // The asymmetry has a consequence worth naming. A keyring edited on disk
-// reaches a running process only when one is assembled again.
-// loader.SignaturePolicy is what makes `agent plugins reload` refuse to
-// converge across such an edit, and it is computed over the ENFORCED keyring —
-// which is nil under "require_signature": false (enforcedPluginKeyring), and
-// loader.SignaturePolicyOf(nil) is the zero policy, equal to itself. So under
-// that policy a revocation added to the local keyring takes effect at the next
-// serve start rather than at a reload. A revocation arriving through the trust
-// list has no such delay, which is what that half is for.
+// reaches a running process only when one is assembled again, so a revocation
+// added to the local keyring document takes effect at the next serve start
+// rather than at a reload. What a reload does with such an edit is REFUSE:
+// loader.SignaturePolicy carries the local keyring's revocations and the
+// endorsement requirement, and `agent plugins reload` compares the config's
+// policy against the running one and stops rather than converging under the old
+// keyring — under "require_signature": false exactly as under the default. A
+// revocation arriving through the trust list has neither the delay nor the
+// refusal, which is what that half is for.
 //
 // logger must be non-nil: a trust list this process cannot read is exactly the
 // thing that must not pass unrecorded.
@@ -914,20 +922,32 @@ func runTrustlistRefreshLoop(ctx context.Context, refresher trustlistRefresher, 
 // pluginSignaturePolicy is the signature policy cfg asks for, in the comparable
 // form a running Loader reports through Loader.SignaturePolicy.
 //
-// It resolves the keyring through resolvePluginKeyring, so it applies exactly
-// the rules serve assembly applies: a keyring that will not read still fails
-// here, and a config that requires an endorsement while naming no keyring still
-// fails here. A leniently computed policy would be worse than none — it could
-// report "unchanged" for a config serve would refuse to start on.
+// The policy is computed from the keyring document AS READ and from
+// cfg.SignatureRequired() — the same two values an assembly puts into
+// loader.Config. Computing it from the POLICY-ENFORCED keyring instead (nil
+// whenever no endorsement is required) is what made this comparison vacuous for
+// every deployment with the requirement off: two zero policies, equal to each
+// other however the keyring document had changed in between, so a revocation
+// added to it converged with "loaded" on screen.
+//
+// The rules serve assembly applies still apply here, because a leniently
+// computed policy would be worse than none — it could report "unchanged" for a
+// config serve would refuse to start on. A keyring that will not read fails
+// here, and so does a config that requires an endorsement while naming no
+// keyring: enforcedPluginKeyring is called for that second rule alone, and the
+// keyring it hands back is deliberately not what the policy is built from.
 func pluginSignaturePolicy(cfg config.PluginsConfig) (loader.SignaturePolicy, error) {
-	// The "configured but not enforced" note belongs to whoever ASSEMBLES a
-	// loader; startup already logged it, and repeating it on every reload of an
-	// unchanged policy would say nothing new.
-	keyring, _, err := resolvePluginKeyring(cfg)
+	local, _, err := resolvePluginLocalKeyring(cfg)
 	if err != nil {
 		return loader.SignaturePolicy{}, err
 	}
-	return loader.SignaturePolicyOf(keyring), nil
+	// The "configured while no endorsement is required" note belongs to whoever
+	// ASSEMBLES a loader; startup already logged it, and repeating it on every
+	// reload of an unchanged policy would say nothing new.
+	if _, _, err := enforcedPluginKeyring(cfg, local); err != nil {
+		return loader.SignaturePolicy{}, err
+	}
+	return loader.SignaturePolicyOf(local, cfg.SignatureRequired()), nil
 }
 
 // pluginRemotePolicy is the remote-source policy cfg asks for, in the

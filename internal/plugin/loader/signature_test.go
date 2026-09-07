@@ -302,61 +302,106 @@ func TestSignaturePolicyDistinguishesADifferentTrustSet(t *testing.T) {
 	_, keyring := newTestKey(t)
 	_, rotated := newTestKeyWithID(t, sign.KeyID("rotated-key"))
 
-	if off := SignaturePolicyOf(nil); off.KeyringConfigured || len(off.KeyIDs) != 0 {
-		t.Errorf("SignaturePolicyOf(nil) = %+v, want the policy with no local keyring and no keys", off)
+	// The endorsement requirement is held at true on every side below, so each
+	// comparison here is about the KEYRING half alone.
+	if off := SignaturePolicyOf(nil, true); off.KeyringConfigured || len(off.KeyIDs) != 0 {
+		t.Errorf("SignaturePolicyOf(nil, true) = %+v, want the policy with no local keyring and no keys", off)
 	}
-	on := SignaturePolicyOf(keyring)
+	on := SignaturePolicyOf(keyring, true)
 	if !on.KeyringConfigured || len(on.KeyIDs) != 1 || on.KeyIDs[0] != testKeyID {
-		t.Fatalf("SignaturePolicyOf(keyring) = %+v, want a configured keyring holding exactly %q", on, testKeyID)
+		t.Fatalf("SignaturePolicyOf(keyring, true) = %+v, want a configured keyring holding exactly %q", on, testKeyID)
 	}
-	if !on.Equal(SignaturePolicyOf(keyring)) {
-		t.Errorf("SignaturePolicyOf(keyring).Equal(itself) = false, want true")
+	if !on.Equal(SignaturePolicyOf(keyring, true)) {
+		t.Errorf("SignaturePolicyOf(keyring, true).Equal(itself) = false, want true")
 	}
-	if on.Equal(SignaturePolicyOf(nil)) {
+	if on.Equal(SignaturePolicyOf(nil, true)) {
 		t.Errorf("a configured keyring compares equal to no keyring at all; reload would apply a policy change silently")
 	}
-	if on.Equal(SignaturePolicyOf(rotated)) {
+	if on.Equal(SignaturePolicyOf(rotated, true)) {
 		t.Errorf("two trust sets of the same size but different key ids compare equal; a key rotation would look like no change")
 	}
-	if got := SignaturePolicyOf(rotated).String(); !strings.Contains(got, "rotated-key") {
+	if got := SignaturePolicyOf(rotated, true).String(); !strings.Contains(got, "rotated-key") {
 		t.Errorf("SignaturePolicy.String() = %q, want it to name the trusted key so a changed trust set is visible", got)
 	}
 }
 
-// TestSignaturePolicyStringDescribesTheKeyringAndNotTheRequirement is the
-// task-4 review's Important #1: the type was narrowed to cover only the LOCAL
-// KEYRING, but its rendering still spoke about whether signatures are
-// "required" — a sentence about Config.RequireSignature, which this type does
-// not carry.
+// TestSignaturePolicyDistinguishesTheEndorsementRequirement is the other half
+// of the same guard, and it is the half a keyring comparison cannot reach.
 //
-// The two come apart in exactly one deployment: a keyring is configured and
-// endorsements are not required. Rendering "signatures required" there puts a
-// false statement in front of the operator of a `plugins reload` refusal, which
-// is the one place they have to be able to believe what they read. So the
-// rendering must name the keyring and must NOT claim anything about the
-// requirement, in either direction.
-func TestSignaturePolicyStringDescribesTheKeyringAndNotTheRequirement(t *testing.T) {
+// Turning "require_signature" off over an UNCHANGED keyring changes no key id
+// at all. Without the requirement in the policy, `agent plugins reload` would
+// find the two sides equal and converge — a deployment relaxed from "every
+// package needs an endorsement" to "none does", applied with "reload succeeded"
+// on screen and nothing anywhere saying the requirement moved.
+func TestSignaturePolicyDistinguishesTheEndorsementRequirement(t *testing.T) {
 	_, keyring := newTestKey(t)
 
-	configured := SignaturePolicyOf(keyring).String()
-	if !strings.Contains(configured, "keyring") {
-		t.Errorf("SignaturePolicy.String() = %q for a configured keyring, want it to say a local keyring is "+
-			"what it describes", configured)
+	requiring := SignaturePolicyOf(keyring, true)
+	relaxed := SignaturePolicyOf(keyring, false)
+
+	if !requiring.RequireSignature || relaxed.RequireSignature {
+		t.Fatalf("SignaturePolicyOf(keyring, true).RequireSignature = %t and (keyring, false) = %t, want true and false",
+			requiring.RequireSignature, relaxed.RequireSignature)
 	}
-	if strings.Contains(configured, "required") {
-		t.Errorf("SignaturePolicy.String() = %q, want it NOT to speak about a signature REQUIREMENT: this type "+
-			"holds no Config.RequireSignature, and a deployment may configure a keyring without requiring an "+
-			"endorsement", configured)
+	if requiring.Equal(relaxed) {
+		t.Error("a policy requiring an endorsement compares equal to one that does not over the same keyring; " +
+			"reload would converge a relaxed requirement and report success")
+	}
+	// And with no keyring on either side, where the keyring half has nothing at
+	// all to say: this is the deployment the comparison used to be blind to.
+	if SignaturePolicyOf(nil, true).Equal(SignaturePolicyOf(nil, false)) {
+		t.Error("with no local keyring, a policy requiring an endorsement compares equal to one that does not")
+	}
+}
+
+// TestSignaturePolicyStringDescribesTheKeyringAndTheRequirementSeparately keeps
+// what the task-4 review's Important #1 was actually about: the rendering must
+// never derive the endorsement requirement from the keyring. Back then the type
+// carried no requirement at all, so the only honest rendering was one that said
+// nothing about it; now it carries the field, so the only honest rendering is
+// the one that reports THAT field.
+//
+// The two still come apart in exactly one deployment: a keyring is configured
+// and endorsements are not required. Rendering "an endorsement is required"
+// there puts a false statement in front of the operator of a `plugins reload`
+// refusal, which is the one place they have to be able to believe what they
+// read.
+//
+// Both directions are pinned, because a rendering that omitted the requirement
+// would print two policies that differ only there identically — and those two
+// compare unequal, so that is precisely the refusal an operator would be left
+// staring at.
+func TestSignaturePolicyStringDescribesTheKeyringAndTheRequirementSeparately(t *testing.T) {
+	_, keyring := newTestKey(t)
+
+	configuredAndOff := SignaturePolicyOf(keyring, false).String()
+	if !strings.Contains(configuredAndOff, "keyring") {
+		t.Errorf("SignaturePolicy.String() = %q for a configured keyring, want it to say a local keyring is "+
+			"what it describes", configuredAndOff)
+	}
+	if !strings.Contains(configuredAndOff, "no endorsement is required") {
+		t.Errorf("SignaturePolicy.String() = %q for a configured keyring with the requirement OFF, want it to "+
+			"say no endorsement is required: a keyring is not by itself a requirement", configuredAndOff)
 	}
 
-	none := SignaturePolicyOf(nil).String()
+	configuredAndOn := SignaturePolicyOf(keyring, true).String()
+	if !strings.Contains(configuredAndOn, "an endorsement is required") {
+		t.Errorf("SignaturePolicy.String() = %q for a configured keyring with the requirement ON, want it to "+
+			"say an endorsement is required", configuredAndOn)
+	}
+	if configuredAndOn == configuredAndOff {
+		t.Errorf("SignaturePolicy.String() = %q for both requirement settings over the same keyring; the two "+
+			"policies compare unequal, so a reload refusal would print the same sentence twice", configuredAndOn)
+	}
+
+	none := SignaturePolicyOf(nil, true).String()
 	if !strings.Contains(none, "no local keyring") {
 		t.Errorf("SignaturePolicy.String() = %q for no keyring, want it to say there is no local keyring", none)
 	}
-	if strings.Contains(none, "required") {
-		t.Errorf("SignaturePolicy.String() = %q, want it NOT to say signatures are or are not required: a "+
-			"deployment with no local keyring may still set Config.RequireSignature, and it is that field "+
-			"rather than the keyring that decides whether an unendorsed package mounts", none)
+	if !strings.Contains(none, "an endorsement is required") {
+		t.Errorf("SignaturePolicy.String() = %q for no keyring with the requirement ON, want it to say so: a "+
+			"deployment with no local keyring may still require an endorsement, and the absence of a keyring is "+
+			"not a statement that endorsements are off", none)
 	}
 }
 
@@ -367,9 +412,15 @@ func TestLoaderReportsThePolicyItWasBuiltWith(t *testing.T) {
 	_, keyring := newTestKey(t)
 	verifying := newHarnessWith(t, defaultTestApplyWait, keyring)
 
-	if got := verifying.loader.SignaturePolicy(); !got.Equal(SignaturePolicyOf(keyring)) {
+	// staticTrust makes a non-nil keyring a deployment that requires an
+	// endorsement, so that is the requirement this harness was built with.
+	if got := verifying.loader.SignaturePolicy(); !got.Equal(SignaturePolicyOf(keyring, true)) {
 		t.Errorf("Loader.SignaturePolicy() = %+v, want the policy of the keyring it was built with %+v",
-			got, SignaturePolicyOf(keyring))
+			got, SignaturePolicyOf(keyring, true))
+	}
+	if !verifying.loader.SignaturePolicy().RequireSignature {
+		t.Error("Loader.SignaturePolicy().RequireSignature = false for a Loader built with RequireSignature " +
+			"true; a policy that does not report the requirement it was built with cannot notice it changing")
 	}
 
 	if got := newHarness(t).loader.SignaturePolicy(); got.KeyringConfigured {
@@ -425,23 +476,43 @@ func TestSignaturePolicyDistinguishesARevocation(t *testing.T) {
 	revokedID := sign.KeyID("leaked-key")
 	withRevocation := newTestKeyringWithRevocation(t, revokedID)
 
-	policy := SignaturePolicyOf(withRevocation)
+	policy := SignaturePolicyOf(withRevocation, true)
 	if len(policy.RevokedIDs) != 1 || policy.RevokedIDs[0] != revokedID {
 		t.Fatalf("SignaturePolicyOf(...).RevokedIDs = %v, want [%s]", policy.RevokedIDs, revokedID)
 	}
 
-	// A keyring on both sides, same trusted ids, different revocations: this
-	// MUST compare unequal, or the reload guard never fires.
+	// A keyring on both sides, same trusted ids, same requirement, different
+	// revocations: this MUST compare unequal, or the reload guard never fires.
 	sameKeysNoRevocation := SignaturePolicy{
 		KeyringConfigured: true,
 		KeyIDs:            policy.KeyIDs,
+		RequireSignature:  true,
 	}
 	if policy.Equal(sameKeysNoRevocation) {
 		t.Error("a policy with a revocation compares equal to one without; reload would converge " +
 			"under the old trust set and report success")
 	}
-	if !policy.Equal(SignaturePolicyOf(withRevocation)) {
+	if !policy.Equal(SignaturePolicyOf(withRevocation, true)) {
 		t.Error("a policy does not compare equal to itself")
+	}
+
+	// The same revocation under a deployment that requires NO endorsement. This
+	// is the shape the policy used to be blind to end to end: the keyring the
+	// policy was computed from went nil under that requirement, so every such
+	// policy was the zero value and every revocation added to the document
+	// compared unchanged.
+	relaxed := SignaturePolicyOf(withRevocation, false)
+	if len(relaxed.RevokedIDs) != 1 || relaxed.RevokedIDs[0] != revokedID {
+		t.Fatalf("SignaturePolicyOf(..., false).RevokedIDs = %v, want [%s]: a revocation is not a statement "+
+			"about whether endorsements are required", relaxed.RevokedIDs, revokedID)
+	}
+	relaxedNoRevocation := SignaturePolicy{
+		KeyringConfigured: true,
+		KeyIDs:            relaxed.KeyIDs,
+	}
+	if relaxed.Equal(relaxedNoRevocation) {
+		t.Error(`with "require_signature": false, a policy with a revocation compares equal to one without; ` +
+			"reload would mount a package signed by a key the operator had just revoked and report success")
 	}
 }
 
@@ -449,7 +520,7 @@ func TestSignaturePolicyDistinguishesARevocation(t *testing.T) {
 // an operator acts on, and "the policies differ" without saying HOW leaves
 // them to diff two files by hand.
 func TestSignaturePolicyStringNamesRevocations(t *testing.T) {
-	got := SignaturePolicyOf(newTestKeyringWithRevocation(t, sign.KeyID("leaked-key"))).String()
+	got := SignaturePolicyOf(newTestKeyringWithRevocation(t, sign.KeyID("leaked-key")), true).String()
 
 	if !strings.Contains(got, "revoked") || !strings.Contains(got, "leaked-key") {
 		t.Errorf("SignaturePolicy.String() = %q, want it to name the revoked key", got)
