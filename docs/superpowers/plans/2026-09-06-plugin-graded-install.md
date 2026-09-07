@@ -1575,3 +1575,43 @@ Plan complete and saved to `docs/superpowers/plans/2026-09-06-plugin-graded-inst
 **1. Subagent-Driven（推荐）** —— 每个任务派一个新的 subagent，任务之间做 review，迭代快
 
 **2. Inline Execution** —— 在当前会话里按 executing-plans 批量执行，带检查点
+
+---
+
+## 端到端验证记录
+
+**执行时间**：2026-09-07。**起点 commit**：`0fa5437`。**二进制**：`go build -o <tmp>/bin/agent.exe ./cmd/agent`（真实构建产物，未用 `go test` 夹具替代）。完整记录（含每条命令的完整输出）在 `.superpowers/sdd/task-7-report.md`。
+
+### 夹具
+
+5 把真钥匙（`agent plugins keygen`）：`dev-registered`（清单里已登记，显示名 `Stardust Studio`）、`dev-revoked`（清单里已撤销）、`dev-unknown`（不在任何信任集 → 判定 `unsigned`）、`local-only`（本地 keyring 唯一那把）、`spare-2026`（备用；撤销 `dev-registered` 后若清单里钥匙全被撤销，`sign.ParseKeyring` 会整份拒绝）。三个包分别用真实 `agent plugins sign` 签，打 tar.gz 经 `http://127.0.0.1:18410` 提供（配置开 `allow_insecure_sources`）。`require_signature` 不写 → 默认 true。
+
+**一处与「完全真机」的偏差**：清单的**取回**没走网络。`trustlist.fetchBytes` 硬性要求 https，本机没有 Go 的 Windows 平台校验器会接受的 https 站点，而把自签 CA 装进系统根存储属于修改系统安全设置，未做。替代做法是**直接写缓存目录的三个文件**（`trustlist.json` / `trustlist.sig` / `revoked-ever.json`）——那正是 `Store.Current()` 每次读的三个文件，而 `cache.read` 对它们走的是与网络路径**完全相同**的 `VerifyDocument`（内嵌 root 公钥验签）。清单本身用真实 root 私钥经 `agent plugins trustlist sign` 签，并用 `agent plugins trustlist show --cache` 复核被本仓验签路径接受。所以「信任集每次挂载动态读」这一段是真验的；没验的是 fetch/serial 比较那一段（S1 已验）。
+
+### 七步结果
+
+| 步骤 | 结果 |
+|---|---|
+| 1 造三个包 | 如预期（+发现 A） |
+| 2 逐个 install（四种行为） | **四条全中**（+发现 B） |
+| 3 核 `plugins.json` | 如预期 |
+| 4 起 serve 看挂载日志 | 如预期 |
+| 5 改一个字节再起一次 | 如预期 |
+| 6 撤销一把正在用的钥匙，不重启 serve | **部分如预期**（+发现 C，本次唯一的实现缺陷） |
+| 7 写进计划 | 本节 |
+
+**Step 2** 四条实际输出的要点：已登记的包报 `endorsed by "Stardust Studio" (key "dev-registered")`（显示名只可能来自清单那一半，所以这一行同时证明并集信任集与 publishers 名录都接上了）；未签名不带 flag 被拒且给出 `--accept-unsigned` 与摘要 `sha256:e42d35cc…`；带 flag 装上并说明记了哪份摘要；被撤销的钥匙签的包硬拒，带撤销时间 `2026-09-01T08:00:00Z` 与理由，并明说「`--accept-unsigned` 不适用」。
+
+**Step 3**：`accepted_unsigned` 确实写进了未签名那条，且**逐字等于**对同一目录 `plugin.json` 独立复算的 `sha256:e42d35cc…`；已登记那条**没有**这个字段。「读得回但写不出」没有复发。
+
+**Step 4**：三条日志齐全 —— `plugin package is endorsed by a registered publisher`（带 key_id 与 publisher）、`plugin package is unendorsed and is admitted on an install-time acceptance`（带 accepted_digest）、`plugin activation failed … signed by key "dev-revoked", which this deployment revoked at … : plugin package is signed by a revoked key`。拒绝粒度按 §4.3：一个条目失败，另两个照常挂上。`GET /v1/plugins` 三个信任字段全部有值，**`trust_publisher` 不是死字段**（`"Stardust Studio"`）。
+
+**Step 5**：改缓存里 `plugin.json` 的一个字符（长度不变，`sha256` 字段未动，wasm 校验仍通过），重启后错误主句是 `changed since it was accepted: the acceptance on record covers sha256:e42d35cc…, and the package in … hashes to sha256:758c339e… These are not the bytes anyone approved` —— **说的是「这个包变了」，两个摘要都印出来了**，不是「没人认过它」。
+
+**Step 6 —— 怎么在不重启 serve 的前提下触发收敛**：`agent plugins reload` 需要**本进程**的 loader（`requirePluginLoader`），另起一个进程只会得到 "no plugin loader in this process"，不能用来收敛已在跑的 serve。可用触发点是 HTTP 侧：`POST /v1/plugins/{name}/grant` 会走 `PluginConsentService.applyAndReport` → `Loader.Apply`，即一次完整收敛；而 `prepare` 里 `trustSet()` 与 `admit()` 都在指纹比较**之前**，所以未变更的条目也会被重新判定。触发对象选**另一个**插件（`legion-e2e-plugin`），观察对象是 `legion-test-plugin`，两者分开。先做了**对照实验**（清单不变时同样的 grant 不改变任何判定）排除触发动作本身。serve 全程同一 pid。
+
+### 三条计划外发现
+
+- **A（跨包接缝，中）**：**「真·未签名」的包经 `plugins install` 不可达**。`install` 只装远端包，而 `fetch.Unpack` 的 layout 契约要求归档里恰好有 `plugin.json`/`plugin.wasm`/`plugin.sig` 三个文件，缺 `plugin.sig` 在**解包**就被拒（实测 `archive is missing required file "plugin.sig"`），走不到三态判定。于是 `ProvenanceUnsigned` 文档里说的两种输入，经 install 只有「签了但钥匙不在信任集」这一种可达。又因为 `AcceptedUnsigned` 只有 `install` 会写，一个真正没签名的**本地**包在 `require_signature: true` 下永远拿不到接受记录、永远挂不上。不是 S2 引入的缺陷，但 install 帮助文本与 spec §二 的「未签名」措辞盖住了一个不可达的形状。**只记录，未改**，待判断：改措辞 / 放宽 unpack 契约 / 记为已知边界。
+- **B（次要）**：**被硬拒的包，字节仍留在缓存里**。`install` 的顺序是 `Fetch` → `Cache.Put` → `LoadPackage` → `admitInstalledProvenance`，撤销判定在落盘之后且没有清理；`loader.prepare` 侧的 `fetch.EvictUntrusted` 只覆盖 `ErrUntrustedPackage`，同样不覆盖 `ErrRevokedPublisher`。没有任何路径会挂载它（`plugins.json` 里没有条目），但被撤销的代码留在了一个部署会去读的目录里。**只记录，未改**。
+- **C（实现缺陷，本次最值钱的一条）**：**撤销到达时，已经挂载的实例不会下线**。Step 6 里 `legion-test-plugin` 的判定确实变成了 `revoked`（日志带撤销时间与理由，动态读成立），但 `GET /v1/plugins` 仍然是 `state: "loaded"`、`tools: ["echo_tool"]` —— `Loader.Status()` 的 `StateLoaded` 唯一来源是 `l.instances`，所以那个 wasm 实例真的还在，工具还在注册表里。根因在 `converge` pass 2：`prepare` 失败的条目不产生 plan，`planFor[name] == nil` 且该条目仍是 `desired`，于是命中 `case desired[name]: continue`，既不替换也不卸载。`prepare` 的注释把这条解释成「新包坏了不该拆掉正在跑的旧实例」——那个理由对「包坏了」成立，对「信任被撤回了」不成立。与本 spec 直接冲突两处：§4.3 写「它自己的工具消失」（实测没消失）；§5.1 写撤销「无需重启 serve」即生效（对未挂载的成立，对**已经在跑的**不成立，实际要等 serve 重启——而紧急撤销要救的恰恰是正在跑的那个）。§九「明确不做」里没有列这一条。附带症状：`PluginView` 自相矛盾（`state: loaded` 同时挂着一句解释为什么被拒绝的 `detail`），GUI 上会同时显示「运行中」与「已撤销」。**按任务约束只记录未修**：修法有分歧点（是否打断正在用该工具的任务、复用 `suspend` 还是硬 unload、`unload` 失败怎么办），需先拍板。
