@@ -33,6 +33,7 @@ import (
 	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/app"
 	"github.com/stardust/legion-agent/internal/config"
+	"github.com/stardust/legion-agent/internal/plugin/fetch"
 	"github.com/stardust/legion-agent/internal/plugin/loader"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
 	"github.com/stardust/legion-agent/internal/plugin/sign"
@@ -224,6 +225,16 @@ func (f *pluginFixture) signPackage(source string, priv ed25519.PrivateKey) {
 // plugin.sig file physically present: archivePackage requires all three
 // files fetch.Unpack insists an archive holds, plugin.sig among them,
 // regardless of whether the deployment ever checks it.
+//
+// A package signed this way is ProvenanceUnsigned to every deployment: no
+// keyring registers the key, so nobody it recognises stands behind the bytes.
+// That is why every `agent plugins install` test built on this helper passes
+// --accept-unsigned -- install refuses an unendorsed package without it,
+// whatever "require_signature" says. The refusal itself is pinned by
+// TestPluginsInstallRefusesAnUnsignedPackageWithoutTheFlag; the tests that
+// merely pass the flag are about grants, duplicate names and concurrent edits,
+// and each of them has to get past the endorsement gate first, exactly as an
+// operator would.
 func (f *pluginFixture) signPackageWithAnyKey(source string) {
 	f.t.Helper()
 
@@ -3743,7 +3754,7 @@ func TestPluginsInstallWithoutGrantRegistersWithNoCapabilitiesAndStaysDisabled(t
 	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
 	f.writeManifest()
 
-	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest)
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--accept-unsigned")
 	if err != nil {
 		t.Fatalf("plugins install error = %v, want nil", err)
 	}
@@ -3792,6 +3803,295 @@ func TestPluginsInstallWithoutGrantRegistersWithNoCapabilitiesAndStaysDisabled(t
 	}
 }
 
+// TestPluginsInstallRefusesAnUnsignedPackageWithoutTheFlag is the graded
+// install's middle grade: a package no registered publisher endorses is not
+// refused outright and is not installed silently either -- it is refused with
+// the one flag that changes the answer named in the refusal. An error that only
+// said "no" would leave an operator guessing at a flag they have never seen.
+//
+// The deployment here sets "require_signature": false, deliberately. That
+// switch answers what may MOUNT; it is not an answer to "may install register a
+// package nobody stands behind", which is a decision a person is present for.
+// Reading the switch here instead would collapse the middle grade to nothing in
+// exactly the deployments that opted out of endorsements.
+func TestPluginsInstallRefusesAnUnsignedPackageWithoutTheFlag(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.signPackageWithAnyKey("staging")
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
+	f.writeManifest()
+	before, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json before install: %v", err)
+	}
+
+	_, refusal := f.run("install", srv.URL+"/echo.tgz", "--digest", digest)
+	if refusal == nil {
+		t.Fatal("plugins install of an unendorsed package = nil error, want a refusal")
+	}
+	if !errors.Is(refusal, manifest.ErrUnsignedNotAccepted) {
+		t.Errorf("plugins install error = %v, want it to wrap manifest.ErrUnsignedNotAccepted", refusal)
+	}
+	if !strings.Contains(refusal.Error(), "--accept-unsigned") {
+		t.Errorf("plugins install error = %v, want it to name the flag that would change the answer", refusal)
+	}
+	// The refusal has to show the digest it is talking about: that string is
+	// what an operator compares against whatever they were told to expect, and
+	// it is the exact value --accept-unsigned would record.
+	cache, err := fetch.NewCache(cacheDir)
+	if err != nil {
+		t.Fatalf("open plugin cache: %v", err)
+	}
+	wantDigest, err := manifest.ManifestDigest(cache.Dir(digest))
+	if err != nil {
+		t.Fatalf("ManifestDigest: %v", err)
+	}
+	if !strings.Contains(refusal.Error(), wantDigest) {
+		t.Errorf("plugins install error = %v, want it to show the plugin.json digest %s", refusal, wantDigest)
+	}
+
+	after, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json after install: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("plugins.json changed on a refused install:\nbefore = %s\nafter  = %s", before, after)
+	}
+}
+
+// TestPluginsInstallRecordsTheAcceptedDigest is this task's wiring guard, and
+// the assertion that matters is the one comparing against
+// manifest.ManifestDigest: the digest install writes into plugins.json must be
+// the value that function computes over the same package directory -- the same
+// function the loader judges an acceptance with.
+//
+// Two sides each hashing "the package" their own way is how an acceptance comes
+// to be written and never read back: install would report success, and every
+// later mount would refuse the entry as changed since somebody approved it,
+// with both sides individually defensible.
+func TestPluginsInstallRecordsTheAcceptedDigest(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.signPackageWithAnyKey("staging")
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	cacheDir := filepath.Join(f.dir, "plugin-cache")
+	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
+	f.writeManifest()
+
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--accept-unsigned")
+	if err != nil {
+		t.Fatalf("plugins install --accept-unsigned error = %v, want nil", err)
+	}
+
+	cache, err := fetch.NewCache(cacheDir)
+	if err != nil {
+		t.Fatalf("open plugin cache: %v", err)
+	}
+	want, err := manifest.ManifestDigest(cache.Dir(digest))
+	if err != nil {
+		t.Fatalf("ManifestDigest: %v", err)
+	}
+	entry := f.requireEntry(f.readDeployment(), testEchoPlugin)
+	if entry.AcceptedUnsigned == "" {
+		t.Fatalf("entry.AcceptedUnsigned is empty after --accept-unsigned: nothing recorded what was accepted, "+
+			"so every later mount refuses this entry as unendorsed (want %s)", want)
+	}
+	if entry.AcceptedUnsigned != want {
+		t.Errorf("entry.AcceptedUnsigned = %q, want %q: install and the loader must hash the same bytes",
+			entry.AcceptedUnsigned, want)
+	}
+	// The written shape too, not only the parsed field: an acceptance that does
+	// not survive MarshalDeployment is an acceptance nobody can read back.
+	raw, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json after install: %v", err)
+	}
+	if !strings.Contains(string(raw), want) {
+		t.Errorf("plugins.json = %s, want the accepted digest %s written into it", raw, want)
+	}
+	if !strings.Contains(out, want) {
+		t.Errorf("plugins install output = %q, want it to say which bytes were accepted (%s)", out, want)
+	}
+}
+
+// TestAnInstallTimeAcceptanceMountsUnderAStrictPolicy is the acceptance's whole
+// point, end to end and through the commands an operator types: `agent plugins
+// install --accept-unsigned` writes a record, and the loader READS THAT RECORD
+// BACK and mounts on it -- under "require_signature" left at its strict
+// default, which is the only policy under which an acceptance decides anything.
+//
+// TestPluginsInstallRecordsTheAcceptedDigest pins the two sides computing the
+// same digest; this pins that the digest is enough. An entry whose acceptance
+// is written correctly and rejected anyway is still an entry nobody can run,
+// and neither side's own tests can see that.
+func TestAnInstallTimeAcceptanceMountsUnderAStrictPolicy(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	// A keyring is configured and the strict default policy stands, so an
+	// unendorsed package mounts on an acceptance and on nothing else.
+	//
+	// The key it registers is deliberately NOT the id signPackageWithAnyKey
+	// signs under: an unknown id is ProvenanceUnsigned (nobody this deployment
+	// recognises stands behind the bytes), while the same id signed by another
+	// key pair would be a signature that does not verify -- a tampering report,
+	// which no acceptance may lift and which this test is not about.
+	registeredPub, _, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	keyringPath := filepath.Join(f.dir, "keyring.json")
+	writeKeyringDoc(t, keyringPath, []map[string]string{{
+		"id": "ops-2026", "algorithm": "ed25519",
+		"public_key": base64.StdEncoding.EncodeToString(registeredPub),
+	}}, nil)
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.signPackageWithAnyKey("staging")
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	f.writeInstallConfig(signaturePolicy{keyring: keyringPath}, filepath.Join(f.dir, "plugin-cache"))
+	f.writeManifest()
+
+	if _, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest,
+		"--grant", "log", "--accept-unsigned"); err != nil {
+		t.Fatalf("plugins install --accept-unsigned error = %v, want nil", err)
+	}
+	entry := f.requireEntry(f.readDeployment(), testEchoPlugin)
+	if entry.AcceptedUnsigned == "" {
+		t.Fatalf("entry.AcceptedUnsigned is empty after --accept-unsigned; nothing was recorded to mount on")
+	}
+
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+	if !toolauth.IsGateable(testEchoTool) {
+		t.Fatalf("IsGateable(%q) = false, want true: the acceptance install wrote (%s) did not admit the "+
+			"package it was written for", testEchoTool, entry.AcceptedUnsigned)
+	}
+}
+
+// TestPluginsInstallRefusesARevokedPackageEvenWithTheFlag is the grade
+// --accept-unsigned does not reach. The flag's name is unsigned, and a
+// revocation is not an absence of a signature: it is an endorsement that was
+// given and then withdrawn. One flag that waved both through would be two
+// decisions behind one switch, and only one of them was ever put to the
+// operator.
+func TestPluginsInstallRefusesARevokedPackageEvenWithTheFlag(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+
+	signingPub, signingPriv, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	// A second, unrelated key: sign.ParseKeyring refuses a document whose every
+	// registered key is revoked, so a one-key keyring would never parse and this
+	// test would refuse the install for the wrong reason.
+	sparePub, _, err := sign.GenerateKey()
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	keyringPath := filepath.Join(f.dir, "keyring.json")
+	writeKeyringDoc(t, keyringPath, []map[string]string{
+		{"id": string(testPluginKeyID), "algorithm": "ed25519",
+			"public_key": base64.StdEncoding.EncodeToString(signingPub)},
+		{"id": "spare", "algorithm": "ed25519",
+			"public_key": base64.StdEncoding.EncodeToString(sparePub)},
+	}, []map[string]string{{"key_id": string(testPluginKeyID), "reason": "laptop stolen"}})
+
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.signPackage("staging", signingPriv)
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	f.writeInstallConfig(signaturePolicy{keyring: keyringPath}, filepath.Join(f.dir, "plugin-cache"))
+	f.writeManifest()
+	before, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json before install: %v", err)
+	}
+
+	_, err = f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--accept-unsigned")
+	if err == nil {
+		t.Fatal("plugins install --accept-unsigned of a revoked-key package = nil error, want a refusal: " +
+			"the flag accepts a package nobody endorsed, not one whose endorsement was withdrawn")
+	}
+	if !errors.Is(err, manifest.ErrRevokedPublisher) {
+		t.Errorf("plugins install error = %v, want it to wrap manifest.ErrRevokedPublisher", err)
+	}
+	if errors.Is(err, manifest.ErrUnsignedNotAccepted) {
+		t.Errorf("plugins install error = %v, want it NOT to wrap manifest.ErrUnsignedNotAccepted: a revoked "+
+			"key is not an unsigned package, and a caller that cannot tell them apart offers the wrong remedy", err)
+	}
+	if !strings.Contains(err.Error(), string(testPluginKeyID)) {
+		t.Errorf("plugins install error = %v, want it to name the revoked key", err)
+	}
+	if !strings.Contains(err.Error(), "laptop stolen") {
+		t.Errorf("plugins install error = %v, want it to carry what the operator wrote down about the revocation", err)
+	}
+	if !strings.Contains(err.Error(), "--accept-unsigned") {
+		t.Errorf("plugins install error = %v, want it to say, in so many words, that --accept-unsigned does not "+
+			"apply here -- an operator who just typed that flag will otherwise try it again", err)
+	}
+
+	after, err := os.ReadFile(f.manifestPath)
+	if err != nil {
+		t.Fatalf("read plugins.json after install: %v", err)
+	}
+	if !bytes.Equal(before, after) {
+		t.Errorf("plugins.json changed on a refused install:\nbefore = %s\nafter  = %s", before, after)
+	}
+}
+
+// TestPluginsInstallShowsThePublisherForARegisteredPackage is the top grade:
+// an endorsed package installs with no flag at all, and install says who
+// endorsed it. Without that line the two grades that DO install are
+// indistinguishable on screen, and "it installed fine" stops carrying any
+// information about who stands behind the code.
+//
+// The key id is what this deployment can name. A display name lives in the
+// fetched trust list's publisher records (trustlist.Merge carries them into
+// TrustInput.Publishers); a local keyring document registers ids and public
+// keys and no names at all, so a deployment with only a local keyring has no
+// name to print, and the id is the whole of what it knows.
+func TestPluginsInstallShowsThePublisherForARegisteredPackage(t *testing.T) {
+	f := newPluginFixture(t, 30_000)
+	priv, keyringPath := f.newKeyring("keyring.json")
+	f.writePackage("staging", testEchoWasm, testEchoPlugin, "1.0.0", []string{"log"}, []string{testEchoTool})
+	f.signPackage("staging", priv)
+	archive := f.archivePackage("staging")
+	digest := digestOfArchive(archive)
+	srv := serveArchive(t, archive)
+	f.writeInstallConfig(signaturePolicy{keyring: keyringPath}, filepath.Join(f.dir, "plugin-cache"))
+	f.writeManifest()
+
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest)
+	if err != nil {
+		t.Fatalf("plugins install of an endorsed package error = %v, want nil: no flag is needed for a package "+
+			"a registered publisher signed", err)
+	}
+	if !strings.Contains(out, string(testPluginKeyID)) {
+		t.Errorf("plugins install output = %q, want it to name the key that endorsed the package (%s)",
+			out, testPluginKeyID)
+	}
+	if !strings.Contains(out, "endorsed") {
+		t.Errorf("plugins install output = %q, want it to say the package is endorsed", out)
+	}
+
+	// An endorsed package records NO acceptance: an acceptance is the thing an
+	// operator writes down in place of an endorsement, and writing one here
+	// would pin the entry to today's bytes for a publisher who is free to
+	// re-sign a new version.
+	entry := f.requireEntry(f.readDeployment(), testEchoPlugin)
+	if entry.AcceptedUnsigned != "" {
+		t.Errorf("entry.AcceptedUnsigned = %q for an endorsed package, want empty", entry.AcceptedUnsigned)
+	}
+}
+
 // TestPluginsInstallRefusesAGrantForAnUndeclaredCapability is rule 5:
 // granting a capability the plugin's own plugin.json never declared is a
 // config error, not generosity, and it must be refused by name — with
@@ -3813,7 +4113,7 @@ func TestPluginsInstallRefusesAGrantForAnUndeclaredCapability(t *testing.T) {
 		t.Fatalf("read plugins.json before install: %v", err)
 	}
 
-	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "http")
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "http", "--accept-unsigned")
 	if err == nil {
 		t.Fatalf("plugins install output = %q, error = nil, want an error: the plugin only declares \"log\"", out)
 	}
@@ -3867,7 +4167,7 @@ func TestPluginsInstallRefusesAPartialGrantThatCanNeverMount(t *testing.T) {
 		t.Fatalf("read plugins.json before install: %v", err)
 	}
 
-	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "log")
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "log", "--accept-unsigned")
 	if err == nil {
 		t.Fatalf("plugins install output = %q, error = nil, want an error: the plugin declares log AND http, "+
 			"--grant only named log", out)
@@ -3909,7 +4209,7 @@ func TestPluginsInstallWithACompleteGrantAuthorizesTheEntryImmediately(t *testin
 	f.writeInstallConfig(signaturePolicy{requireSignature: boolPtr(false)}, cacheDir)
 	f.writeManifest()
 
-	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "log,http")
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "log,http", "--accept-unsigned")
 	if err != nil {
 		t.Fatalf("plugins install error = %v, want nil", err)
 	}
@@ -3981,7 +4281,7 @@ func TestPluginsInstallRefusesAnExplicitlyEmptyGrant(t *testing.T) {
 				t.Fatalf("read plugins.json before install: %v", err)
 			}
 
-			out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", grantValue)
+			out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", grantValue, "--accept-unsigned")
 			if err == nil {
 				t.Fatalf("plugins install output = %q, error = nil, want an error: --grant was explicitly "+
 					"given but empty", out)
@@ -4024,7 +4324,7 @@ func TestPluginsInstallRefusesADuplicateName(t *testing.T) {
 		t.Fatalf("read plugins.json before install: %v", err)
 	}
 
-	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest)
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--accept-unsigned")
 	if err == nil {
 		t.Fatalf("plugins install output = %q, error = nil, want an error: %q is already in plugins.json",
 			out, testEchoPlugin)
@@ -4188,7 +4488,7 @@ func TestPluginsInstallRefusesAConcurrentEditDuringTheDownload(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest)
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--accept-unsigned")
 	if err == nil {
 		t.Fatalf("plugins install output = %q, error = nil, want an error: plugins.json changed while this "+
 			"package was downloading", out)
@@ -4915,7 +5215,7 @@ func TestPluginsInstallRefusesADuplicateGrantCapability(t *testing.T) {
 		t.Fatalf("read plugins.json before install: %v", err)
 	}
 
-	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "log,log")
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "log,log", "--accept-unsigned")
 	if err == nil {
 		t.Fatalf("plugins install output = %q, error = nil, want an error: \"log\" is named twice", out)
 	}
@@ -4991,7 +5291,7 @@ func TestPluginsInstallRefusesAnHTTPGrantWithoutAllowedHosts(t *testing.T) {
 		t.Fatalf("read plugins.json before install: %v", err)
 	}
 
-	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "http")
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "http", "--accept-unsigned")
 	if err == nil {
 		t.Fatalf("plugins install output = %q, error = nil, want an error: --grant names \"http\" but names no "+
 			"allowed hosts, and the plugin declares some", out)
@@ -5032,7 +5332,7 @@ func TestPluginsInstallRefusesAnFSGrantWithoutAllowedPaths(t *testing.T) {
 		t.Fatalf("read plugins.json before install: %v", err)
 	}
 
-	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "fs")
+	out, err := f.run("install", srv.URL+"/echo.tgz", "--digest", digest, "--grant", "fs", "--accept-unsigned")
 	if err == nil {
 		t.Fatalf("plugins install output = %q, error = nil, want an error: --grant names \"fs\" but names no "+
 			"allowed paths, and the plugin declares some", out)
