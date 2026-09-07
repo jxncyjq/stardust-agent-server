@@ -25,6 +25,24 @@ import (
 	"github.com/stardust/legion-agent/internal/server"
 )
 
+// noConsentTrustSet is the loader.TrustSet of a deployment that recognises no
+// signing key at all: a zero manifest.TrustInput, which makes every package
+// manifest.ProvenanceUnsigned. It is what the majority of the fixtures below
+// want -- they are about declarations, grants and convergence, not provenance.
+func noConsentTrustSet() (manifest.TrustInput, error) { return manifest.TrustInput{}, nil }
+
+// consentTrustSetOf is the loader.TrustSet of a deployment whose trust set is
+// exactly keyring, with publishers as the display names that go with its key
+// ids. A nil publishers map is the deployment whose trust set came from a local
+// keyring document alone: those register key ids and public keys and carry no
+// names (see trustlist.Merge, which takes the names from the fetched list
+// half).
+func consentTrustSetOf(keyring *sign.Keyring, publishers map[sign.KeyID]string) loader.TrustSet {
+	return func() (manifest.TrustInput, error) {
+		return manifest.TrustInput{Keyring: keyring, Publishers: publishers}, nil
+	}
+}
+
 // TestPluginConsentServiceListReturnsDeclaredAndGrantedSeparately pins the
 // whole reason PluginView carries two sets of fields: a plugin.json that
 // declares more than the deployment currently grants must show up as two
@@ -48,7 +66,7 @@ func TestPluginConsentServiceListReturnsDeclaredAndGrantedSeparately(t *testing.
 		t.Fatalf("assemblePlugins() error = %v, want nil", err)
 	}
 
-	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins, func() *sign.Keyring { return nil }, loader.RemoteConfig{}, testConsentLogger())
+	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins, noConsentTrustSet, loader.RemoteConfig{}, testConsentLogger())
 	views, err := svc.List(context.Background())
 	if err != nil {
 		t.Fatalf("List() error = %v, want nil", err)
@@ -90,7 +108,7 @@ func TestPluginConsentServiceListReturnsDeclaredAndGrantedSeparately(t *testing.
 // Loader.
 func TestPluginConsentServiceListErrorsWithoutALoader(t *testing.T) {
 	svc := NewPluginConsentService("does-not-matter.json", "root",
-		func() *loader.Loader { return nil }, func() *sign.Keyring { return nil }, loader.RemoteConfig{}, testConsentLogger())
+		func() *loader.Loader { return nil }, noConsentTrustSet, loader.RemoteConfig{}, testConsentLogger())
 	_, err := svc.List(context.Background())
 	if err == nil {
 		t.Fatal("List() error = nil, want an error naming the missing loader")
@@ -114,7 +132,7 @@ func TestPluginConsentServiceListErrorsWhenManifestUnreadable(t *testing.T) {
 	// the read failure from the loader (which assembled fine against the
 	// fixture's real, empty manifest).
 	svc := NewPluginConsentService(filepath.Join(f.dir, "missing-plugins.json"), f.root,
-		f.application.Plugins, func() *sign.Keyring { return nil }, loader.RemoteConfig{}, testConsentLogger())
+		f.application.Plugins, noConsentTrustSet, loader.RemoteConfig{}, testConsentLogger())
 	if _, err := svc.List(context.Background()); err == nil {
 		t.Fatal("List() error = nil, want an error naming the unreadable manifest")
 	}
@@ -152,7 +170,7 @@ func TestPluginConsentServiceListReportsBrokenLocalPackagePerRow(t *testing.T) {
 		t.Fatalf("corrupt plugin.json: %v", err)
 	}
 
-	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins, func() *sign.Keyring { return nil }, loader.RemoteConfig{}, testConsentLogger())
+	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins, noConsentTrustSet, loader.RemoteConfig{}, testConsentLogger())
 	views, err := svc.List(context.Background())
 	if err != nil {
 		t.Fatalf("List() error = %v, want nil: one broken package must not fail the whole list", err)
@@ -234,7 +252,7 @@ func TestPluginConsentServiceListSeparatesNoCacheFromCacheMiss(t *testing.T) {
 		t.Fatalf("fixture remote.Cache = %v, want nil: this test needs a deployment with no configured plugin cache", remote.Cache)
 	}
 	svc := NewPluginConsentService(noCache.manifestPath, noCache.root, noCache.application.Plugins,
-		func() *sign.Keyring { return nil }, remote, testConsentLogger())
+		noConsentTrustSet, remote, testConsentLogger())
 	views, err := svc.List(context.Background())
 	if err != nil {
 		t.Fatalf("List() error = %v, want nil", err)
@@ -311,7 +329,7 @@ func TestPluginConsentServiceListResolvesRemoteEntryOnCacheHit(t *testing.T) {
 	srv.Close()
 
 	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
-		func() *sign.Keyring { return nil }, f.resolveFixtureRemote(), testConsentLogger())
+		noConsentTrustSet, f.resolveFixtureRemote(), testConsentLogger())
 	views, err := svc.List(context.Background())
 	if err != nil {
 		t.Fatalf("List() error = %v, want nil", err)
@@ -363,7 +381,7 @@ func TestPluginConsentServiceListReportsUnresolvedForRemoteCacheMiss(t *testing.
 	}
 
 	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
-		func() *sign.Keyring { return nil }, f.resolveFixtureRemote(), testConsentLogger())
+		noConsentTrustSet, f.resolveFixtureRemote(), testConsentLogger())
 	views, err := svc.List(context.Background())
 	if err != nil {
 		t.Fatalf("List() error = %v, want nil: a cache miss must be reported, not fail the whole call", err)
@@ -391,7 +409,7 @@ func TestPluginConsentServiceListReportsUnresolvedForRemoteCacheMiss(t *testing.
 // the same way every List test above wires it.
 func (f *pluginFixture) newGrantTestService() *PluginConsentService {
 	return NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
-		func() *sign.Keyring { return nil }, loader.RemoteConfig{}, testConsentLogger())
+		noConsentTrustSet, loader.RemoteConfig{}, testConsentLogger())
 }
 
 // TestPluginConsentServiceGrantRefusesAStrictCapabilitySubset is rule 2 of
@@ -516,7 +534,7 @@ func TestPluginConsentServiceGrantRefusesAConcurrentEditDuringTheDownload(t *tes
 	}
 
 	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
-		func() *sign.Keyring { return nil }, f.resolveFixtureRemote(), testConsentLogger())
+		noConsentTrustSet, f.resolveFixtureRemote(), testConsentLogger())
 	_, err := svc.Grant(context.Background(), testEchoPlugin, server.GrantRequest{Capabilities: []string{"log"}})
 	if err == nil {
 		t.Fatal("Grant() error = nil, want an error: plugins.json changed while the package was downloading")
@@ -721,7 +739,8 @@ func TestPluginConsentServiceGrantReportsFailedNotPendingWhenEntryFailsToActivat
 		t.Fatalf("fixture setup: Status() = %+v, want empty before Grant(): the entry starts disabled", status)
 	}
 
-	// keyringFn returns nil -- the same "skip signature verification" input
+	// The trust set provider answers with a nil keyring -- the same "skip
+	// signature verification" input
 	// List's own declaration-reading uses -- so Grant's own LoadPackage
 	// (step 3) can still read the plugin's declared capabilities even though
 	// this package carries no valid signature; only the loader's later,
@@ -861,7 +880,7 @@ func TestPluginConsentServiceGrantReportsFailedNotPendingWhenConvergenceFetchTim
 
 	logger, logged := newCapturingConsentLogger()
 	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
-		func() *sign.Keyring { return nil }, f.resolveFixtureRemote(), logger)
+		noConsentTrustSet, f.resolveFixtureRemote(), logger)
 	result, err := svc.Grant(context.Background(), testEchoPlugin, server.GrantRequest{})
 	if err != nil {
 		t.Fatalf("Grant() error = %v, want nil: the write already landed, so this is a ConsentResult not an error", err)
@@ -995,8 +1014,8 @@ func (b *grantBarrier) arrive() {
 // both requests reporting success. A silent rollback on an authorization
 // boundary is worse than a crash.
 //
-// keyringFn is called from inside Grant, after the snapshot read and before
-// the write, which makes it the barrier point: both goroutines are held
+// The trust set provider is called from inside Grant, after the snapshot read
+// and before the write, which makes it the barrier point: both goroutines are held
 // there together, so without s.mu both hold a snapshot that predates the
 // other's write. The run then ends one of three ways and ALL of them are
 // failures this test catches: the compare-and-swap notices and one Grant
@@ -1024,9 +1043,9 @@ func TestPluginConsentServiceConcurrentGrantsDoNotRevertEachOther(t *testing.T) 
 
 	barrier := newGrantBarrier(time.Second)
 	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
-		func() *sign.Keyring {
+		func() (manifest.TrustInput, error) {
 			barrier.arrive()
-			return nil
+			return manifest.TrustInput{}, nil
 		}, loader.RemoteConfig{}, testConsentLogger())
 
 	errs := make(chan error, 2)
@@ -1179,7 +1198,7 @@ func TestPluginConsentServiceReportsUnknownPluginAsNotFound(t *testing.T) {
 // rather than "your request is wrong".
 func TestPluginConsentServiceReportsAMissingLoaderAsUnavailable(t *testing.T) {
 	svc := NewPluginConsentService("does-not-matter.json", "root",
-		func() *loader.Loader { return nil }, func() *sign.Keyring { return nil },
+		func() *loader.Loader { return nil }, noConsentTrustSet,
 		loader.RemoteConfig{}, testConsentLogger())
 
 	if _, err := svc.Grant(context.Background(), "any", server.GrantRequest{}); !errors.Is(err, server.ErrPluginUnavailable) {
@@ -1207,8 +1226,8 @@ type consentFixture struct {
 
 // newConsentFixture builds a consentFixture around a healthy, unsigned-but-
 // untrusted-doesn't-matter package: the deployment does not require
-// signatures (requireSignature: false) and the service's own keyringFn
-// returns nil, exactly like every List/Grant test fixture above -- signature
+// signatures (requireSignature: false) and the service's own trust set is
+// noConsentTrustSet, exactly like every List/Grant test fixture above -- signature
 // verification is exercised separately, by
 // newConsentFixtureWithUntrustedPackage.
 func newConsentFixture(t *testing.T) *consentFixture {
@@ -1233,12 +1252,12 @@ func newConsentFixture(t *testing.T) *consentFixture {
 	}
 
 	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
-		func() *sign.Keyring { return nil }, f.resolveFixtureRemote(), testConsentLogger())
+		noConsentTrustSet, f.resolveFixtureRemote(), testConsentLogger())
 	return &consentFixture{pluginFixture: f, svc: svc, pluginName: testEchoPlugin, origin: srv}
 }
 
 // newConsentFixtureWithUntrustedPackage is newConsentFixture, except the
-// service's own keyringFn returns a REAL keyring that trusts a different key
+// service's own trust set holds a REAL keyring that trusts a different key
 // than the one the package is signed with -- the "signature does not verify"
 // path manifest.ErrUntrustedPackage marks (see that sentinel's own doc
 // comment). The deployment's own assembly-time signature policy is left off
@@ -1279,7 +1298,7 @@ func newConsentFixtureWithUntrustedPackage(t *testing.T) *consentFixture {
 	}
 
 	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
-		func() *sign.Keyring { return keyring }, f.resolveFixtureRemote(), testConsentLogger())
+		consentTrustSetOf(keyring, nil), f.resolveFixtureRemote(), testConsentLogger())
 	return &consentFixture{pluginFixture: f, svc: svc, pluginName: testEchoPlugin, origin: srv}
 }
 
@@ -1343,7 +1362,7 @@ func TestPluginConsentServiceResolveDoesNotRefetchOnACacheHit(t *testing.T) {
 
 // TestPluginConsentServiceResolveReportsAnUntrustedPackage is Resolve's new
 // error class: a package whose signature does not verify against the
-// service's keyring must come back with manifest.ErrUntrustedPackage on the
+// service's trust set must come back with manifest.ErrUntrustedPackage on the
 // error chain, so a caller can tell "not trustworthy" apart from "could not
 // be obtained" and refrain from offering a pointless retry -- and, like every
 // other Resolve failure, must leave plugins.json untouched.
@@ -1406,7 +1425,7 @@ func TestNewPluginConsentServicePanicsOnANilLogger(t *testing.T) {
 		}
 	}()
 	NewPluginConsentService("m.json", "root", func() *loader.Loader { return nil },
-		func() *sign.Keyring { return nil }, loader.RemoteConfig{}, nil)
+		noConsentTrustSet, loader.RemoteConfig{}, nil)
 }
 
 // TestPluginConsentServiceResolveEvictsAnUntrustedPackageFromTheCache: a
@@ -1641,7 +1660,7 @@ func TestListDoesNotCallAnUntrustedPackageMerelyUncached(t *testing.T) {
 		t.Fatalf("resolvePluginKeyring: %v", err)
 	}
 	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
-		func() *sign.Keyring { return keyring }, f.resolveFixtureRemote(), testConsentLogger())
+		consentTrustSetOf(keyring, nil), f.resolveFixtureRemote(), testConsentLogger())
 
 	views, err := svc.List(context.Background())
 	if err != nil {
@@ -1703,7 +1722,7 @@ func TestTheAPIDoesNotShipLogfmtLabelsToPeople(t *testing.T) {
 	}
 
 	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
-		func() *sign.Keyring { return nil }, f.resolveFixtureRemote(), testConsentLogger())
+		noConsentTrustSet, f.resolveFixtureRemote(), testConsentLogger())
 	views, err := svc.List(context.Background())
 	if err != nil {
 		t.Fatalf("List() error = %v, want nil", err)
@@ -1772,7 +1791,7 @@ func TestGrantsResponseCarriesNoLogfmtLabelsEither(t *testing.T) {
 	}
 
 	svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
-		func() *sign.Keyring { return nil }, f.resolveFixtureRemote(), testConsentLogger())
+		noConsentTrustSet, f.resolveFixtureRemote(), testConsentLogger())
 	result, err := svc.Deny(context.Background(), testEchoPlugin)
 	if err != nil {
 		t.Fatalf("Deny() error = %v, want nil", err)
@@ -1859,7 +1878,7 @@ func TestPluginViewCarriesTheTrustState(t *testing.T) {
 	t.Run("List", func(t *testing.T) {
 		f, keyring := newRevokedTrustFixture(t)
 		svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
-			func() *sign.Keyring { return keyring }, loader.RemoteConfig{}, testConsentLogger())
+			consentTrustSetOf(keyring, nil), loader.RemoteConfig{}, testConsentLogger())
 
 		views, err := svc.List(context.Background())
 		if err != nil {
@@ -1880,7 +1899,7 @@ func TestPluginViewCarriesTheTrustState(t *testing.T) {
 	t.Run("Grant", func(t *testing.T) {
 		f, keyring := newRevokedTrustFixture(t)
 		svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
-			func() *sign.Keyring { return keyring }, loader.RemoteConfig{}, testConsentLogger())
+			consentTrustSetOf(keyring, nil), loader.RemoteConfig{}, testConsentLogger())
 
 		result, err := svc.Grant(context.Background(), testEchoPlugin, server.GrantRequest{})
 		if err != nil {
@@ -1898,7 +1917,7 @@ func TestPluginViewCarriesTheTrustState(t *testing.T) {
 	t.Run("Resolve", func(t *testing.T) {
 		f, keyring := newRevokedTrustFixture(t)
 		svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
-			func() *sign.Keyring { return keyring }, loader.RemoteConfig{}, testConsentLogger())
+			consentTrustSetOf(keyring, nil), loader.RemoteConfig{}, testConsentLogger())
 
 		view, err := svc.Resolve(context.Background(), testEchoPlugin)
 		if err != nil {
@@ -1916,12 +1935,13 @@ func TestPluginViewCarriesTheTrustState(t *testing.T) {
 // TestTrustFieldsForRegisteredCarriesThePublisherName exercises the one
 // PluginView.TrustPublisher-populating branch of trustFieldsFor directly
 // against a synthetic manifest.Provenance, rather than through a real signed
-// package: PluginConsentService's own TrustInput never carries a Publishers
-// map (see NewPluginConsentService's own doc comment), so a Provenance that
-// actually reaches ProvenanceRegistered through this service's LoadPackage
-// calls always has an empty Publisher today. That gap belongs to a later
-// task's wiring, not to trustFieldsFor's own translation, which this test
-// pins independently of it.
+// package. It is the unit half of a pair: this one pins the translation
+// itself -- a registered verdict carries its Publisher across and nothing
+// else -- while TestPluginViewCarriesThePublisherName drives the same branch
+// end to end, through a real package, a real keyring and a real trust set, on
+// each of List, Grant and Resolve. Neither subsumes the other: a mapping that
+// is correct in isolation is still worth nothing if no path reaches it, and a
+// path that reaches it is still worth nothing if the mapping drops the name.
 func TestTrustFieldsForRegisteredCarriesThePublisherName(t *testing.T) {
 	prov := manifest.Provenance{State: manifest.ProvenanceRegistered, Publisher: "Acme Corp"}
 	state, publisher, detail := trustFieldsFor(prov)
@@ -1952,4 +1972,238 @@ func TestTrustFieldsForUnsignedCarriesNeitherPublisherNorDetail(t *testing.T) {
 	if detail != "" {
 		t.Errorf("detail = %q, want empty: ProvenanceUnsigned is not a refusal to explain", detail)
 	}
+}
+
+// --- publishers reach the consent service ------------------------------------
+
+// registeredTrustFixturePublisher is the display name registeredTrustSet puts
+// against testPluginKeyID, so every assertion below names the same string.
+//
+// A local keyring document could not supply it: it registers key ids and
+// public keys and carries no names at all (see trustlist.Merge, which takes
+// the names from the fetched trust list half). The name therefore enters
+// through the trust set provider, which is exactly the seam these tests hold.
+const registeredTrustFixturePublisher = "星尘工作室"
+
+// registeredTrustSet is the trust set every subtest of
+// TestPluginViewCarriesThePublisherName runs against: keyring, plus the one
+// display name that turns a bare key id into something a person can read.
+//
+// It is ONE function for all three paths on purpose. The question those
+// subtests ask is whether List, Grant and Resolve each carry the provider's
+// publishers through to the view they return, and a provider spelled out
+// separately in each of them could be emptied in one place and still leave
+// the other two green.
+func registeredTrustSet(keyring *sign.Keyring) loader.TrustSet {
+	return consentTrustSetOf(keyring, map[sign.KeyID]string{testPluginKeyID: registeredTrustFixturePublisher})
+}
+
+// newRegisteredTrustFixture is newRevokedTrustFixture's opposite number: a
+// single local, disabled plugin entry signed with a key this deployment's
+// keyring registers and has NOT revoked, so a manifest.LoadPackage call
+// against it comes back manifest.ProvenanceRegistered with the publisher name
+// registeredTrustSet carries for that key.
+//
+// registered is the only state that populates PluginView.TrustPublisher (see
+// trustFieldsFor), so it is the only state under which "did the publishers
+// map survive the trip from the provider to the view" can be asked at all.
+//
+// The entry is left disabled (enabled: false, omitGrant: true) for the reason
+// newRevokedTrustFixture leaves its own disabled: assemble() resolves its OWN
+// trust set from the fixture's config file, separately from the one handed to
+// NewPluginConsentService, and a disabled entry keeps the two from
+// interacting.
+func newRegisteredTrustFixture(t *testing.T) (*pluginFixture, loader.TrustSet) {
+	t.Helper()
+
+	f := newPluginFixture(t, 30_000)
+	priv, keyringPath := f.newKeyring("keyring.json")
+	keyringData, err := os.ReadFile(keyringPath)
+	if err != nil {
+		t.Fatalf("read keyring %s: %v", keyringPath, err)
+	}
+	keyring, err := sign.ParseKeyring(keyringData)
+	if err != nil {
+		t.Fatalf("parse keyring %s: %v", keyringPath, err)
+	}
+
+	f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.0.0", nil, []string{testEchoTool})
+	f.signPackage("echo", priv)
+	f.writeManifest(manifestEntry{
+		name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+	})
+	if err := f.assemble(); err != nil {
+		t.Fatalf("assemblePlugins() error = %v, want nil", err)
+	}
+	return f, registeredTrustSet(keyring)
+}
+
+// TestPluginViewCarriesThePublisherName is the end-to-end half of
+// PluginView.TrustPublisher: with a package a registered publisher really
+// signed, and a trust set that really carries that publisher's display name,
+// List, Grant and Resolve must each report the name rather than a bare
+// verdict. "Registered" with no name beside it is the whole of what the panel
+// would otherwise show, which answers "is this endorsed" and leaves "by whom"
+// unanswerable.
+//
+// TestPluginViewCarriesTheTrustState covers the same three paths under a
+// REVOKED verdict, where publishers play no part; this one is the registered
+// counterpart, and the two together are why neither a state-only nor a
+// publisher-only regression can hide.
+func TestPluginViewCarriesThePublisherName(t *testing.T) {
+	wantState := manifest.ProvenanceRegistered.String()
+
+	t.Run("List", func(t *testing.T) {
+		f, trust := newRegisteredTrustFixture(t)
+		svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
+			trust, loader.RemoteConfig{}, testConsentLogger())
+
+		views, err := svc.List(context.Background())
+		if err != nil {
+			t.Fatalf("List() error = %v, want nil", err)
+		}
+		if len(views) != 1 {
+			t.Fatalf("len(views) = %d, want 1: %+v", len(views), views)
+		}
+		got := views[0]
+		if got.TrustState != wantState {
+			t.Fatalf("List() TrustState = %q, want %q: the rest of this subtest only means something "+
+				"for a registered verdict", got.TrustState, wantState)
+		}
+		if got.TrustPublisher != registeredTrustFixturePublisher {
+			t.Errorf("List() TrustPublisher = %q, want %q", got.TrustPublisher, registeredTrustFixturePublisher)
+		}
+	})
+
+	t.Run("Grant", func(t *testing.T) {
+		f, trust := newRegisteredTrustFixture(t)
+		svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
+			trust, loader.RemoteConfig{}, testConsentLogger())
+
+		result, err := svc.Grant(context.Background(), testEchoPlugin, server.GrantRequest{})
+		if err != nil {
+			t.Fatalf("Grant() error = %v, want nil", err)
+		}
+		if result.View.TrustState != wantState {
+			t.Fatalf("Grant() View.TrustState = %q, want %q: the rest of this subtest only means something "+
+				"for a registered verdict", result.View.TrustState, wantState)
+		}
+		if result.View.TrustPublisher != registeredTrustFixturePublisher {
+			t.Errorf("Grant() View.TrustPublisher = %q, want %q",
+				result.View.TrustPublisher, registeredTrustFixturePublisher)
+		}
+	})
+
+	t.Run("Resolve", func(t *testing.T) {
+		f, trust := newRegisteredTrustFixture(t)
+		svc := NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
+			trust, loader.RemoteConfig{}, testConsentLogger())
+
+		view, err := svc.Resolve(context.Background(), testEchoPlugin)
+		if err != nil {
+			t.Fatalf("Resolve() error = %v, want nil", err)
+		}
+		if view.TrustState != wantState {
+			t.Fatalf("Resolve() TrustState = %q, want %q: the rest of this subtest only means something "+
+				"for a registered verdict", view.TrustState, wantState)
+		}
+		if view.TrustPublisher != registeredTrustFixturePublisher {
+			t.Errorf("Resolve() TrustPublisher = %q, want %q",
+				view.TrustPublisher, registeredTrustFixturePublisher)
+		}
+	})
+}
+
+// errConsentTrustSetUnavailable is what failingConsentTrustSet reports, so the
+// assertions below can match that exact error rather than any error.
+var errConsentTrustSetUnavailable = errors.New("the trust list cache cannot be read")
+
+// failingConsentTrustSet is the provider of a deployment that does not KNOW
+// what it trusts -- loader.TrustSet's documented third answer, distinct from
+// both "no trust set" and a usable one.
+func failingConsentTrustSet() (manifest.TrustInput, error) {
+	return manifest.TrustInput{}, errConsentTrustSetUnavailable
+}
+
+// TestConsentPathsRefuseAnUnreadableTrustSet is the fail-loud half of the same
+// wiring: a provider that returns an error must stop List, Grant and Resolve
+// with that error on the chain, never be read as an empty trust set. The two
+// are not interchangeable -- an empty set reports every package as
+// ProvenanceUnsigned, which is a verdict about the packages, and no verdict is
+// available while the set itself cannot be assembled.
+//
+// Grant is additionally checked to have written nothing: it reads the trust
+// set before its compare-and-swap, so an authorization must not be half
+// applied on this path.
+func TestConsentPathsRefuseAnUnreadableTrustSet(t *testing.T) {
+	newSvc := func(t *testing.T) (*pluginFixture, *PluginConsentService) {
+		t.Helper()
+		f := newPluginFixture(t, 30_000)
+		f.writePackage("echo", testEchoWasm, testEchoPlugin, "1.0.0", nil, []string{testEchoTool})
+		f.writeManifest(manifestEntry{
+			name: testEchoPlugin, source: "echo", enabled: false, tools: []string{testEchoTool}, omitGrant: true,
+		})
+		if err := f.assemble(); err != nil {
+			t.Fatalf("assemblePlugins() error = %v, want nil", err)
+		}
+		return f, NewPluginConsentService(f.manifestPath, f.root, f.application.Plugins,
+			failingConsentTrustSet, loader.RemoteConfig{}, testConsentLogger())
+	}
+
+	t.Run("List", func(t *testing.T) {
+		_, svc := newSvc(t)
+		views, err := svc.List(context.Background())
+		if !errors.Is(err, errConsentTrustSetUnavailable) {
+			t.Fatalf("List() error = %v, want it to wrap the provider's own error", err)
+		}
+		if views != nil {
+			t.Errorf("List() views = %+v, want nil: a list judged against no trust set is not a list", views)
+		}
+	})
+
+	t.Run("Grant", func(t *testing.T) {
+		f, svc := newSvc(t)
+		before, err := os.ReadFile(f.manifestPath)
+		if err != nil {
+			t.Fatalf("read plugins.json: %v", err)
+		}
+		_, err = svc.Grant(context.Background(), testEchoPlugin, server.GrantRequest{})
+		if !errors.Is(err, errConsentTrustSetUnavailable) {
+			t.Fatalf("Grant() error = %v, want it to wrap the provider's own error", err)
+		}
+		after, err := os.ReadFile(f.manifestPath)
+		if err != nil {
+			t.Fatalf("re-read plugins.json: %v", err)
+		}
+		if !bytes.Equal(before, after) {
+			t.Errorf("plugins.json changed while Grant was refusing an unreadable trust set:\nbefore: %s\nafter:  %s",
+				before, after)
+		}
+	})
+
+	t.Run("Resolve", func(t *testing.T) {
+		_, svc := newSvc(t)
+		if _, err := svc.Resolve(context.Background(), testEchoPlugin); !errors.Is(err, errConsentTrustSetUnavailable) {
+			t.Fatalf("Resolve() error = %v, want it to wrap the provider's own error", err)
+		}
+	})
+}
+
+// TestNewPluginConsentServicePanicsOnANilTrustSet is the constructor's other
+// fail-loud refusal: a nil provider has no trust set to judge any package
+// against, and every path in the service would nil-dereference on its first
+// request instead of naming the wiring mistake.
+func TestNewPluginConsentServicePanicsOnANilTrustSet(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("NewPluginConsentService(nil trust set) did not panic, want a panic naming the nil provider")
+		}
+		if msg, ok := r.(string); !ok || !strings.Contains(msg, "trustFn") {
+			t.Errorf("panic value = %v, want a message naming trustFn", r)
+		}
+	}()
+
+	NewPluginConsentService("m.json", "root", func() *loader.Loader { return nil },
+		nil, loader.RemoteConfig{}, testConsentLogger())
 }

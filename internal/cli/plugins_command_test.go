@@ -507,12 +507,13 @@ func (f *pluginFixture) assembleWithLogger(logger *slog.Logger) error {
 	if err != nil {
 		f.t.Fatalf("load config %s: %v", f.configPath, err)
 	}
-	return assemblePlugins(context.Background(), f.application, cfg, pluginHostDeps{
+	_, err = assemblePlugins(context.Background(), f.application, cfg, pluginHostDeps{
 		Audit:  adapter.NewMemoryAuditLog(),
 		Events: adapter.NewMemoryEventBus(),
 		Logger: logger,
 		Gate:   f.gate,
 	})
+	return err
 }
 
 // run executes one `agent plugins ...` invocation against the fixture's App and
@@ -2235,7 +2236,7 @@ func TestAssemblePluginsReportsAConfiguredKeyringWhilePluginsAreOff(t *testing.T
 	}
 
 	logs := &bytes.Buffer{}
-	if err := assemblePlugins(context.Background(), app.New(), cfg, pluginHostDeps{
+	if _, err := assemblePlugins(context.Background(), app.New(), cfg, pluginHostDeps{
 		Audit:  adapter.NewMemoryAuditLog(),
 		Events: adapter.NewMemoryEventBus(),
 		Logger: slog.New(slog.NewTextHandler(logs, nil)),

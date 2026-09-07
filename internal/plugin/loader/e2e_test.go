@@ -3534,8 +3534,8 @@ type e2eConsentAdapter struct {
 	// else. It is the barrier TestE2EHTTPGrantRefusesAConcurrentEditWithoutRevertingIt
 	// uses to land a second writer's edit deterministically, in the same
 	// single-goroutine spot internal/cli's
-	// TestPluginConsentServiceConcurrentGrantsDoNotRevertEachOther uses
-	// keyringFn for. A nil hook (every other test in this section) changes
+	// TestPluginConsentServiceConcurrentGrantsDoNotRevertEachOther uses its
+	// trust set provider for. A nil hook (every other test in this section) changes
 	// nothing.
 	afterSnapshot func()
 }
@@ -4257,8 +4257,8 @@ func TestE2EHTTPGrantRefusesHTTPCapabilityWithNoAllowedHostsWhenThePluginDeclare
 // vulnerable to a second writer (another process, or the same operator's
 // second browser tab) landing an edit in the window between the snapshot
 // read and the write — the same "barrier point" pattern internal/cli's
-// TestPluginConsentServiceConcurrentGrantsDoNotRevertEachOther uses keyringFn
-// for, and TestPluginConsentServiceGrantRefusesAConcurrentEditDuringTheDownload
+// TestPluginConsentServiceConcurrentGrantsDoNotRevertEachOther uses its trust
+// set provider for, and TestPluginConsentServiceGrantRefusesAConcurrentEditDuringTheDownload
 // uses a blocked-on httptest.Server handler for.
 //
 // Bound: no goroutine, no channel, no loop — the concurrent edit is written

@@ -11,7 +11,6 @@ import (
 	"github.com/stardust/legion-agent/internal/plugin/fetch"
 	"github.com/stardust/legion-agent/internal/plugin/loader"
 	"github.com/stardust/legion-agent/internal/plugin/manifest"
-	"github.com/stardust/legion-agent/internal/plugin/sign"
 	"github.com/stardust/legion-agent/internal/server"
 	"github.com/stardust/legion-agent/internal/taskgate"
 )
@@ -33,7 +32,7 @@ type PluginConsentService struct {
 	manifestPath string
 	root         string
 	pluginsFn    func() *loader.Loader
-	keyringFn    func() *sign.Keyring
+	trustFn      loader.TrustSet
 	remote       loader.RemoteConfig
 	logger       *slog.Logger
 
@@ -72,37 +71,43 @@ type PluginConsentService struct {
 // pluginsFn is a closure rather than a plain value so that a caller which
 // re-assembles serve in the same process (drainPlugins, then a fresh
 // assemblePlugins) is read through to the CURRENT loader, not the one that
-// existed when NewPluginConsentService was first called. keyringFn is a
-// closure for signature symmetry with pluginsFn, but it is NOT similarly
-// live: it is wired by the caller to return a keyring resolved once, up
-// front (see BuildServeService), so it reflects the trust set this
-// deployment started with (nil when this deployment does not require
-// signatures, see resolvePluginKeyring), not a per-call re-resolution of
-// cfg.Plugins.Keyring.
+// existed when NewPluginConsentService was first called.
 //
-// It is also the POLICY-ENFORCED keyring, which is NOT the trust set a mount or
-// an `agent plugins install` judges a package against: that one is the local
-// keyring document merged with the fetched trust list, publishers included (see
-// resolvePluginTrustInput). So a package endorsed by a key only the fetched list
-// registers is, to this service, endorsed by nobody it recognises. Every
-// manifest.LoadPackage call in this file now surfaces the Provenance it
-// returns through PluginView's TrustState/TrustPublisher/TrustDetail (see
-// trustFieldsFor) -- but this TrustInput never carries a Publishers map, so
-// TrustPublisher stays empty through this service regardless of state; a
-// display name is all that gap costs, never the verdict itself, which is
-// TrustState and comes from Provenance.State alone. An unrecognised key id on
-// a well-formed plugin.sig comes back as ProvenanceUnsigned rather than as an
-// error, so on that one path the two trust sets already agree today. They do
-// NOT agree when plugin.sig is malformed or fails verification:
-// assessProvenance wraps that in manifest.ErrUntrustedPackage whenever its
-// TrustInput carries a non-nil Keyring, but it never reads plugin.sig at all
-// when the Keyring is nil, which is exactly what keyringFn returns for a
-// deployment with require_signature: false (see resolvePluginKeyring). Under
-// that policy, a plugin.sig a mount or install would refuse as untrusted
-// instead loads through this service with no error at all, reported now as
-// TrustState "unsigned" -- the same verdict a package that never carried a
-// plugin.sig would get, because to a nil-Keyring TrustInput the two cases are
-// indistinguishable.
+// trustFn is the trust set every manifest.LoadPackage call in this file judges
+// a package against. It is loader.TrustSet -- the same type, and it MUST be the
+// same provider, a mount reads on every convergence. Sharing one provider is
+// the requirement, not an optimisation: two trust sets assembled separately
+// from one config are not one set, because either half of the merge can move
+// under one copy and not the other, and the first thing an operator would see
+// of that is a package this panel calls endorsed and a mount calls unsigned.
+// What the provider merges is the local keyring document and whatever the
+// fetched trust list currently holds, publishers included (see
+// resolvePluginTrustInput), which is also where TrustPublisher's display names
+// come from.
+//
+// Its two halves therefore refresh here exactly as they do for a mount: the
+// fetched list is re-read on every call, so a revocation that arrives after
+// this process started is in force without a restart, while the local keyring
+// document is captured when the provider is built and an edit to it takes
+// effect at the next assembly instead (see pluginTrustSet).
+//
+// A trust set is NOT the deployment's signature POLICY. Whether a package no
+// registered publisher endorses may MOUNT is answered against this set rather
+// than by leaving keys out of it (see resolvePluginTrustInput), and no path in
+// this file turns a Provenance verdict into a refusal at all -- Grant
+// authorizes a package whatever its provenance says, and the one refusal here
+// that concerns trust at all, Resolve's, keys on manifest.ErrUntrustedPackage,
+// which is an error and not a verdict. What the set buys here is the verdict
+// itself, surfaced through PluginView's TrustState/TrustPublisher/TrustDetail
+// (see trustFieldsFor).
+//
+// A deployment holding neither a keyring document nor a fetched list still
+// yields a nil Keyring, and every package is then ProvenanceUnsigned -- see
+// manifest.TrustInput for why that is not the same as unchecked. A provider
+// that cannot ANSWER is a third state again, and List, Grant and Resolve each
+// report it as an error rather than reading it as an empty set: "this
+// deployment does not know what it trusts" must not be rendered as "this
+// deployment recognises nobody".
 //
 // remote is the resolved remote-source policy (config.PluginsConfig's Cache,
 // HTTP client and fetch/unpack limits, see resolvePluginRemote) this
@@ -118,15 +123,22 @@ type PluginConsentService struct {
 // changed nothing indistinguishable from one that worked. A nil logger is a
 // wiring mistake at the call site, not a state to tolerate, so it panics
 // rather than silently discarding those records.
-func NewPluginConsentService(manifestPath, root string, pluginsFn func() *loader.Loader, keyringFn func() *sign.Keyring, remote loader.RemoteConfig, logger *slog.Logger) *PluginConsentService {
+func NewPluginConsentService(manifestPath, root string, pluginsFn func() *loader.Loader, trustFn loader.TrustSet, remote loader.RemoteConfig, logger *slog.Logger) *PluginConsentService {
 	if logger == nil {
 		panic("cli: NewPluginConsentService: logger is nil; a convergence that reported errors would be recorded nowhere")
+	}
+	if trustFn == nil {
+		// Not deferrable to the first request: a nil provider means this
+		// service has no trust set to judge anything against, which is a
+		// wiring mistake at the call site rather than a state to report per
+		// request.
+		panic("cli: NewPluginConsentService: trustFn is nil; there would be no trust set to judge plugin packages against")
 	}
 	return &PluginConsentService{
 		manifestPath: manifestPath,
 		root:         root,
 		pluginsFn:    pluginsFn,
-		keyringFn:    keyringFn,
+		trustFn:      trustFn,
 		remote:       remote,
 		logger:       logger,
 	}
@@ -197,9 +209,11 @@ func trustFieldsFor(prov manifest.Provenance) (state, publisher, detail string) 
 // unreachable, defeating that guarantee two files away. Every OTHER row
 // still renders normally, and the entry's own State/Detail (from
 // mergePluginStatus, set above regardless of how this loop ends) is
-// unaffected. Only a failure that breaks every row alike -- reading or
-// parsing plugins.json itself -- fails List outright; see
-// TestPluginConsentServiceListErrorsWhenManifestUnreadable.
+// unaffected. Only a failure that breaks every row alike fails List outright:
+// reading or parsing plugins.json itself (see
+// TestPluginConsentServiceListErrorsWhenManifestUnreadable), and a trust set
+// this process cannot assemble, which would leave every row's provenance
+// unjudgeable rather than any one row unreadable.
 //
 // ctx is accepted for symmetry with server.PluginConsent and future
 // cancellation; every operation List performs today is local disk I/O (a
@@ -214,7 +228,14 @@ func (s *PluginConsentService) List(ctx context.Context) ([]server.PluginView, e
 	if err != nil {
 		return nil, err
 	}
-	keyring := s.keyringFn()
+	// Read once for the whole list rather than per row: every row is judged
+	// against the same set, and a provider that cannot answer breaks all of
+	// them alike, which is this method's own criterion for failing outright
+	// (see its doc comment) rather than degrading row by row.
+	trust, err := s.trustFn()
+	if err != nil {
+		return nil, fmt.Errorf("plugin consent: read the trust set to judge these plugin packages against: %w", err)
+	}
 
 	rows := mergePluginStatus(deployment, pluginLoader.Status())
 	views := make([]server.PluginView, 0, len(rows))
@@ -278,7 +299,7 @@ func (s *PluginConsentService) List(ctx context.Context) ([]server.PluginView, e
 		// prov is translated into view.TrustState/TrustPublisher/TrustDetail by
 		// trustFieldsFor below -- see that function's own doc comment for why
 		// TrustState comes from prov.State.String() and nowhere else.
-		pm, _, prov, loadErr := manifest.LoadPackage(dir, manifest.TrustInput{Keyring: keyring})
+		pm, _, prov, loadErr := manifest.LoadPackage(dir, trust)
 		if loadErr != nil {
 			view.DeclaredUnresolved = true
 			view.DeclaredUnresolvedReason = server.DeclaredUnresolvedLoadFailed
@@ -427,11 +448,19 @@ func (s *PluginConsentService) Grant(ctx context.Context, name string, req serve
 	if err != nil {
 		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w", name, err)
 	}
+	// Read inside step 3, before the package's own declaration and well before
+	// step 6 writes anything: a trust set that cannot be assembled stops the
+	// authorization with the manifest untouched, rather than letting it finish
+	// and report a provenance verdict nothing stood behind.
+	trust, err := s.trustFn()
+	if err != nil {
+		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: read the trust set to judge "+
+			"the package against: %w", name, err)
+	}
 	// prov is reported back to the caller in the response below, via
 	// trustFieldsFor -- this design deliberately does not gate the grant on
-	// it (see this method's own doc comment for why), so the operator sees
-	// the verdict here rather than nowhere at all.
-	pm, _, prov, err := manifest.LoadPackage(dir, manifest.TrustInput{Keyring: s.keyringFn()})
+	// it, so the operator sees the verdict here rather than nowhere at all.
+	pm, _, prov, err := manifest.LoadPackage(dir, trust)
 	if err != nil {
 		return server.ConsentResult{}, fmt.Errorf("plugin consent: grant %q: %w", name, err)
 	}
@@ -555,13 +584,22 @@ func (s *PluginConsentService) Resolve(ctx context.Context, name string) (server
 	if err != nil {
 		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: %w", name, err)
 	}
+	// A trust set that cannot be assembled is reported rather than stood in
+	// for: judging this package against an empty set would report it as
+	// endorsed by nobody, which is a verdict, and no verdict is available
+	// while the set itself is unreadable.
+	trust, err := s.trustFn()
+	if err != nil {
+		return server.PluginView{}, fmt.Errorf("plugin consent: resolve %q: read the trust set to judge "+
+			"the package against: %w", name, err)
+	}
 	// prov is reported through the returned PluginView's trust fields (via
 	// trustFieldsFor) on the success path below. The ErrUntrustedPackage
 	// branch just below only ever fires for a signature that does not
 	// verify -- a missing signature and an unrecognised key id are verdicts
 	// (ProvenanceUnsigned), not errors, so they fall through to that success
 	// path instead.
-	pm, _, prov, err := manifest.LoadPackage(dir, manifest.TrustInput{Keyring: s.keyringFn()})
+	pm, _, prov, err := manifest.LoadPackage(dir, trust)
 	if err != nil {
 		if errors.Is(err, manifest.ErrUntrustedPackage) {
 			// The bytes just failed signature verification, so they do not

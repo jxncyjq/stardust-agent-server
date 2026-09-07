@@ -163,9 +163,20 @@ type pluginHostDeps struct {
 // that cancels on shutdown releases it. In practice the wait is not spent:
 // this runs before the service starts, with no task in flight, so there is no
 // path here that parks a goroutine on a gate nobody will release.
-func assemblePlugins(ctx context.Context, application *app.App, cfg config.Config, deps pluginHostDeps) error {
+//
+// The loader.TrustSet returned is the provider the loader it built judges every
+// mount against (newPluginLoader). It is handed back rather than kept private
+// so that anything else in this process which has to judge the same packages
+// judges them against the SAME set: a second provider assembled from the same
+// config is not the same set, because each half of the merge can move under one
+// copy and not the other, and the first symptom of that is one plugin reported
+// as endorsed in one place and unsigned in another. It is nil, together with a
+// nil error, on exactly the "plugins are not enabled" return described above --
+// nothing was built, so there is no set to judge anything against.
+func assemblePlugins(ctx context.Context, application *app.App, cfg config.Config,
+	deps pluginHostDeps) (loader.TrustSet, error) {
 	if application == nil {
-		return errors.New("assemble plugins: application is nil; there is no lifecycle ledger to file activations under")
+		return nil, errors.New("assemble plugins: application is nil; there is no lifecycle ledger to file activations under")
 	}
 	if strings.TrimSpace(cfg.Plugins.Manifest) == "" {
 		if strings.TrimSpace(cfg.Plugins.Keyring) != "" {
@@ -176,7 +187,7 @@ func assemblePlugins(ctx context.Context, application *app.App, cfg config.Confi
 			// because nothing is mounted here, but the operator gets to hear
 			// that the file they configured is doing nothing.
 			if deps.Logger == nil {
-				return errors.New("assemble plugins: Logger is nil; a configured keyring that is not in use would go unreported")
+				return nil, errors.New("assemble plugins: Logger is nil; a configured keyring that is not in use would go unreported")
 			}
 			deps.Logger.Warn("plugin trust keyring is configured but plugins are not enabled",
 				"component", "cli",
@@ -184,22 +195,22 @@ func assemblePlugins(ctx context.Context, application *app.App, cfg config.Confi
 				"consequence", `no "plugins.manifest" is configured, so nothing is loaded and this keyring is never read or validated`,
 				"remedy", `configure "plugins.manifest" to enable plugins, or remove "plugins.keyring"`)
 		}
-		return nil
+		return nil, nil
 	}
 	switch {
 	case deps.Audit == nil:
-		return errors.New("assemble plugins: Audit is nil; a plugin's tool calls would be recorded nowhere")
+		return nil, errors.New("assemble plugins: Audit is nil; a plugin's tool calls would be recorded nowhere")
 	case deps.Events == nil:
-		return errors.New("assemble plugins: Events is nil; a convergence that published nothing would be invisible")
+		return nil, errors.New("assemble plugins: Events is nil; a convergence that published nothing would be invisible")
 	case deps.Logger == nil:
-		return errors.New("assemble plugins: Logger is nil; a convergence that logged nothing would be unexplainable")
+		return nil, errors.New("assemble plugins: Logger is nil; a convergence that logged nothing would be unexplainable")
 	case deps.Gate == nil:
-		return errors.New("assemble plugins: Gate is nil; a convergence with no task-boundary gate would land in the middle of a running task")
+		return nil, errors.New("assemble plugins: Gate is nil; a convergence with no task-boundary gate would land in the middle of a running task")
 	}
 
 	deployment, err := readPluginDeployment(cfg.Plugins.Manifest)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// The deployment's remote entries are checked against the deployment's
 	// remote POLICY before a loader exists: both failures here are statements
@@ -207,16 +218,16 @@ func assemblePlugins(ctx context.Context, application *app.App, cfg config.Confi
 	// put it", "you named a plaintext source and did not turn plaintext on"),
 	// and neither is repairable by letting the rest of the manifest converge.
 	if err := checkRemoteSources(deployment, cfg.Plugins, deps.Logger); err != nil {
-		return err
+		return nil, err
 	}
-	pluginLoader, err := newPluginLoader(application, cfg, deps)
+	pluginLoader, trustSet, err := newPluginLoader(application, cfg, deps)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	// Attached before the convergence, not after: an Apply that fails outright
 	// must still leave a loader whose Status answers "why is nothing mounted?".
 	if err := application.SetPlugins(pluginLoader); err != nil {
-		return err
+		return nil, err
 	}
 	if err := pluginLoader.Apply(ctx, deployment, cfg.Plugins.Root); err != nil {
 		// Loud, and startup continues. The alternative — refusing to serve at
@@ -230,7 +241,7 @@ func assemblePlugins(ctx context.Context, application *app.App, cfg config.Confi
 			"consequence", "the failed entries stay visible in `agent plugins status`",
 			"error", err)
 	}
-	return nil
+	return trustSet, nil
 }
 
 // drainPlugins unmounts every plugin the loader attached to application has
@@ -316,11 +327,17 @@ func drainPlugins(application *app.App, root string, logger *slog.Logger) {
 // The link is a reference, so `plugins reload` reaches task registries that
 // already exist; and a task registry's OWN registrations shadow same-named
 // inherited ones, so a plugin cannot silently replace write_file.
-func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDeps) (*loader.Loader, error) {
+//
+// The second return value is the loader.TrustSet the Loader was built with,
+// returned so the same provider -- not a second one built from the same config
+// -- can be read by anything else that has to judge these packages. See
+// assemblePlugins, which passes it on for the same reason.
+func newPluginLoader(application *app.App, cfg config.Config,
+	deps pluginHostDeps) (*loader.Loader, loader.TrustSet, error) {
 	toolRoot := cfg.ContextFiles.Root
 	absRoot, err := filepath.Abs(toolRoot)
 	if err != nil {
-		return nil, fmt.Errorf("resolve plugin workspace root %q: %w", toolRoot, err)
+		return nil, nil, fmt.Errorf("resolve plugin workspace root %q: %w", toolRoot, err)
 	}
 	registry := deps.PluginTools
 	if registry == nil {
@@ -339,7 +356,7 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 		// Logger -- but the signature policy is reported through this logger
 		// below, and a policy decision made with nowhere to report it is the
 		// silent degradation this whole path exists to prevent.
-		return nil, errors.New("new plugin loader: Logger is nil; the signature policy would be decided with no record of it")
+		return nil, nil, errors.New("new plugin loader: Logger is nil; the signature policy would be decided with no record of it")
 	}
 
 	// The keyring document this deployment configured, read once and used for
@@ -350,14 +367,14 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 	// rather than mounting plugins nobody judged.
 	localKeyring, localRaw, err := resolvePluginLocalKeyring(cfg.Plugins)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	// enforcedPluginKeyring is called for its POLICY rule and its warning, not
 	// for the keyring it returns: a deployment that requires an endorsement
 	// while naming no keyring is refused here rather than started.
 	_, unenforcedKeyring, err := enforcedPluginKeyring(cfg.Plugins, localKeyring)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if unenforcedKeyring != "" {
 		// Deliberately NOT a second "this deployment verifies nothing": that
@@ -377,10 +394,16 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 
 	remote, err := resolvePluginRemote(cfg.Plugins)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
-	return loader.New(loader.Config{
+	// Built once and handed out twice: the Loader below reads it on every
+	// mount, and it is also this function's second return value. Building a
+	// second provider for the second reader would be two trust sets rather
+	// than one -- see this function's own doc comment.
+	trustSet := pluginTrustSet(localRaw, deps.Trustlist, logger)
+
+	pluginLoader, err := loader.New(loader.Config{
 		Ledger: application.PluginLedger(),
 		Deps: func(name string, pluginConfig json.RawMessage) host.Deps {
 			if len(pluginConfig) == 0 {
@@ -419,13 +442,17 @@ func newPluginLoader(application *app.App, cfg config.Config, deps pluginHostDep
 		// configured merged with the fetched trust list, and it is built
 		// whatever the signature policy says -- see resolvePluginTrustInput for
 		// why a deployment that requires no endorsement still needs one.
-		TrustSet: pluginTrustSet(localRaw, deps.Trustlist, logger),
+		TrustSet: trustSet,
 		// The requirement is read from the config directly, because it is now a
 		// separate field of the policy rather than something a nil keyring
 		// stands in for.
 		RequireSignature: cfg.Plugins.SignatureRequired(),
 		Remote:           remote,
 	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return pluginLoader, trustSet, nil
 }
 
 // The bounds one fetched plugin package is unpacked under. They bound the
