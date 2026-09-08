@@ -110,16 +110,22 @@ func (r *Runtime) handleDelegateTask(ctx context.Context, call domain.ToolCall) 
 	if err != nil {
 		return domain.ToolResult{}, fmt.Errorf("delegate_task: %w", err)
 	}
-	return delegateJSON(call.ID, map[string]any{"mode": "single", "task_id": res.TaskID, "summary": res.Summary})
+	return delegateJSON(call.ID, map[string]any{
+		"mode":        "single",
+		"task_id":     res.TaskID,
+		"summary":     res.Summary,
+		"stop_reason": string(res.StopReason),
+	})
 }
 
 func delegateResultsView(results []SubTaskResult) []map[string]any {
 	view := make([]map[string]any, 0, len(results))
 	for _, res := range results {
 		view = append(view, map[string]any{
-			"task_id": res.TaskID,
-			"summary": res.Summary,
-			"error":   res.Err,
+			"task_id":     res.TaskID,
+			"summary":     res.Summary,
+			"error":       res.Err,
+			"stop_reason": string(res.StopReason),
 		})
 	}
 	return view

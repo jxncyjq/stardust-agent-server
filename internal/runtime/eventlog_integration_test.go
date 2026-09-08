@@ -415,7 +415,7 @@ func TestParallelCallsSharingAProviderIDGetDistinctCallIDs(t *testing.T) {
 // 每条 step/end 都必须对得上一条同 turn/step 的 step/start（spec §5 的事件表），
 // 反过来也一样：一次执行不该留下开着的 step。
 //
-// 盯的是 loopCut/capHit 这两条中断路径——重复调用守卫与 per-tool 上限，2026-07-23
+// 盯的是重复调用守卫与 per-tool 上限（capHit）这两条中断路径——2026-07-23
 // 那次 152 轮事故之后专门加的两道闸，生产上真的会走到。循环体在 break 之前已经把
 // 这一步关掉了，退出后的「预算耗尽」分支若不看有没有开着的 step 就再关一次，
 // 就会写出一条没有 start 的 end，还顺手偷走下一个 step 号。

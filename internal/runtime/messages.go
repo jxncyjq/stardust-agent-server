@@ -277,8 +277,9 @@ const (
 	// key on callsKey (name+arguments), so "same tool, different args" retries
 	// slip past them — the failure that ran task …955100 to 60 fetch_url calls.
 	// This caps the tool regardless of argument variation; hitting it cuts the
-	// loop via the same loopCut→closing path as the signature guard. It is a hard
-	// ceiling (no config toggle): a runaway loop must stop.
+	// loop through the same step-closing point the signature guard's break also
+	// goes through. It is a hard ceiling (no config toggle): a runaway loop must
+	// stop.
 	toolLoopCap = 30
 	// toolSameFailWarn is how many times ONE tool (by NAME) may FAIL across a task
 	// before the model is warned to stop retrying it and answer with what it has.

@@ -44,6 +44,10 @@ type SubTaskResult struct {
 	TaskID  string
 	Summary string
 	Err     string
+	// StopReason is why the child's tool loop ended. Without it a Summary is
+	// just text: a child that answered and a child that was cut off mid-work
+	// read the same.
+	StopReason domain.StopReason
 }
 
 // SubTaskHandle references a background sub-task whose completion is delivered
@@ -186,7 +190,7 @@ func (r *Runtime) runChild(ctx context.Context, child *Runtime, subTaskID string
 	if err != nil {
 		return SubTaskResult{}, fmt.Errorf("run sub task %q: %w", subTaskID, err)
 	}
-	return SubTaskResult{TaskID: subTaskID, Summary: run.Result}, nil
+	return SubTaskResult{TaskID: subTaskID, Summary: run.Result, StopReason: run.StopReason}, nil
 }
 
 // RunSubTasks delegates a batch concurrently, bounded by maxConcurrent. Results
