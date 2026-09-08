@@ -255,6 +255,14 @@ type loopState struct {
 	started    time.Time
 	basePrompt string
 	round      int
+	// stopReason is why the tool loop ended. It is set once, at whichever of
+	// the loop's terminal points is reached -- unlike the token counters
+	// alongside it, which accumulate across every round.
+	// It replaced a loopCut bool that grouped the per-tool-name cap and the
+	// repeat guard into a single true, so it could not tell those two apart
+	// from each other -- only the pair of them from a plain round-budget
+	// exhaustion.
+	stopReason domain.StopReason
 	// convo is the append-only multi-turn exchange sent to the model each round
 	// (see messages.go). It replaced a single re-sent prompt string whose tool
 	// results were deduplicated by (name, arguments), which hid the model's own
@@ -889,6 +897,35 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	return r.runToolLoop(ctx, requestID, agent, task, st)
 }
 
+// closingInstructionForStopReason names, for the model, the reason its tool
+// loop was cut off. Each terminal reason gets its own sentence: telling a task
+// that exhausted one tool's allowance that it was "repeating the same call"
+// describes something that did not happen.
+func closingInstructionForStopReason(reason domain.StopReason) string {
+	switch reason {
+	case domain.StopReasonRepeatLoopBroken:
+		return "[系统] 检测到你在重复同一个工具调用，已停止工具循环。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。"
+	case domain.StopReasonToolLoopCap:
+		return "[系统] 单个工具的调用次数已达上限，已停止工具循环。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。"
+	case domain.StopReasonMaxRounds:
+		return "[系统] 工具调用轮数已达上限。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。"
+	default:
+		// This function is only reached from the one call site (below, in the
+		// branch that still has pending tool calls) where st.stopReason is never
+		// StopReasonCompleted -- that value is assigned only in the sibling
+		// branch that skips this call entirely, once the loop ends with nothing
+		// pending. So StopReasonCompleted has no sentence of its own, but that is
+		// not license to add "case domain.StopReasonCompleted: return \"\"" here:
+		// if Completed ever did reach this switch, that would itself be the
+		// programming error, and a case that quietly returns "" would swallow a
+		// call this function should never receive. Any other unmapped reason is
+		// a new terminal path that forgot to teach this switch about itself.
+		// Either way, do not answer with an empty instruction that lets it slip
+		// through unexplained -- panic instead.
+		panic("runtime: no closing instruction for stop reason " + string(reason))
+	}
+}
+
 // runToolLoop advances the tool-execution loop from st until the model stops
 // requesting tools (or the round budget is exhausted), then finalises the run.
 // Before executing each round's tool calls it consults the ToolGate: if the gate
@@ -900,10 +937,6 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 	// call, so the exchange the model sees grows monotonically and its repeated
 	// calls stay visible to it.
 	//
-	// loopCut records that the loop ended because the model kept repeating one
-	// call rather than because it ran out of rounds; the two need different
-	// closing instructions.
-	loopCut := false
 	// stepOpen tracks whether a step is currently open -- a step/start with no
 	// step/end yet. On entry one always is: whoever produced st.resp (RunTask's
 	// initial generateStep, the resumed step, or an earlier iteration's
@@ -1035,9 +1068,10 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// generateStep call below), and every one of its tool calls, if any,
 		// was just dispatched above with its own tool/call+tool/result pair.
 		// Close it now, before deciding whether the loop continues, breaks
-		// (loopCut/capHit), or falls through to the budget-exhausted branch --
-		// all three paths share this one closing point so the step is never
-		// left open regardless of which one the guards below choose.
+		// (the repeat guard or the per-tool-name cap), or falls through to the
+		// budget-exhausted branch -- all three paths share this one closing
+		// point so the step is never left open regardless of which one the
+		// guards below choose.
 		rec.recordStepEnd(domain.StepEndReasonCompleted)
 		stepOpen = false
 		if err := rec.barrier(ctx, "before next step"); err != nil {
@@ -1061,7 +1095,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 			}
 			r.logger.Warn("tool loop broken: per-tool call cap reached",
 				"task_id", task.ID, "tool", capHit, "cap", toolLoopCap)
-			loopCut = true
+			st.stopReason = domain.StopReasonToolLoopCap
 			break
 		}
 		if streak >= repeatAbortStreak || repeatCount >= repeatAbortCount {
@@ -1085,7 +1119,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 			}
 			r.logger.Warn("tool loop broken: identical call repeated",
 				"task_id", task.ID, "streak", streak, "repeat_count", repeatCount, "calls", callsKey(calls))
-			loopCut = true
+			st.stopReason = domain.StopReasonRepeatLoopBroken
 			break
 		}
 		if streak >= repeatWarnStreak || repeatCount >= repeatWarnCount {
@@ -1119,6 +1153,11 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		}
 	}
 	if len(st.resp.ToolCalls) > 0 {
+		// Both breaks above and a plain round-budget exhaustion arrive here.
+		// The breaks already named their reason; an unnamed one is the budget.
+		if st.stopReason == "" {
+			st.stopReason = domain.StopReasonMaxRounds
+		}
 		// Two different situations reach here with pending calls, and only one
 		// of them has a step to close.
 		//
@@ -1130,11 +1169,12 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// recorded. That step closes as "cancelled" rather than "completed":
 		// the tool loop stopped it, it did not finish.
 		//
-		// loopCut/capHit break: st.resp's calls WERE dispatched (they are the
-		// round the body just executed, tool/call+tool/result and all) and the
-		// body already closed that step as "completed". Nothing is open, so
-		// nothing is closed here -- emitting a step/end anyway is exactly the
-		// unmatched end this branch used to produce.
+		// Repeat-guard or per-tool-name-cap break: st.resp's calls WERE
+		// dispatched (they are the round the body just executed, tool/call+
+		// tool/result and all) and the body already closed that step as
+		// "completed". Nothing is open, so nothing is closed here -- emitting
+		// a step/end anyway is exactly the unmatched end this branch used to
+		// produce.
 		if stepOpen {
 			rec.recordStepEnd(domain.StepEndReasonCancelled)
 			stepOpen = false
@@ -1149,10 +1189,7 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		// the model to answer rather than narrate another tool call —
 		// otherwise it tends to emit text like "list_files 参数: {...}" instead
 		// of a real answer when it is cut off mid-exploration.
-		closing := "[系统] 工具调用已达上限。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。"
-		if loopCut {
-			closing = "[系统] 检测到你在重复同一个工具调用，已停止工具循环。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。"
-		}
+		closing := closingInstructionForStopReason(st.stopReason)
 		st.convo.appendUser(closing)
 		final, err := r.generateFinalStep(ctx, rec, requestID, task.ID, st.convo, st.generatedFiles)
 		if err != nil {
@@ -1167,6 +1204,9 @@ func (r *Runtime) runToolLoop(ctx context.Context, requestID string, agent domai
 		st.cachedTokens += final.CachedTokens
 		st.totalTokens += final.TotalTokens
 		st.resp = final
+	} else {
+		// The loop ended with nothing pending: the model gave its answer.
+		st.stopReason = domain.StopReasonCompleted
 	}
 	// Whatever step is currently open at this point -- the loop's normal-exit
 	// trailing response (no more tool calls requested), the step this function
@@ -1238,6 +1278,13 @@ func (r *Runtime) checkSuspend(ctx context.Context, task domain.Task, st loopSta
 // finishRun emits completion events/audit, deletes any checkpoint (the task is
 // done, not suspended), and returns the assembled TaskRun.
 func (r *Runtime) finishRun(ctx context.Context, requestID string, agent domain.Agent, task domain.Task, st loopState) (domain.TaskRun, error) {
+	// A successful TaskRun is assembled only here, so this is the one place the
+	// invariant can be checked. An empty reason is not a kind of ending; it is a
+	// terminal path that forgot to name itself, and letting it through would
+	// report that run as a clean completion.
+	if st.stopReason == "" {
+		panic("runtime: finishRun reached with no stop reason recorded for task " + task.ID)
+	}
 	if err := r.events.Publish(ctx, domain.RuntimeEvent{
 		Type:      "inference_completed",
 		TaskID:    task.ID,
@@ -1269,6 +1316,7 @@ func (r *Runtime) finishRun(ctx context.Context, requestID string, agent domain.
 		StartedAt:        st.started,
 		EndedAt:          ended,
 		Result:           st.resp.Text,
+		StopReason:       st.stopReason,
 		ReasoningSummary: st.resp.ReasoningSummary,
 		PromptTokens:     st.promptTokens,
 		CompletionTokens: st.completionTokens,

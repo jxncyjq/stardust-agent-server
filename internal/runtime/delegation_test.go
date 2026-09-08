@@ -2,6 +2,7 @@ package runtime
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -12,11 +13,15 @@ import (
 	"github.com/stardust/legion-agent/internal/testsupport"
 )
 
-// recordingSubMaas returns a fixed summary and records every prompt it sees, so
-// tests can assert what context a delegated child was actually given.
+// recordingSubMaas records every prompt it sees, so tests can assert what
+// context a delegated child was actually given. It answers with summary,
+// except for the one prompt that contains failOn.
 type recordingSubMaas struct {
 	mu      sync.Mutex
 	summary string
+	// failOn 非空时，prompt 里含这个子串的那次推理返回错误，用来制造「这条子任务
+	// 确实跑起来了、但跑失败了」。零值即：所有推理都成功。
+	failOn  string
 	prompts []string
 }
 
@@ -24,9 +29,13 @@ func (m *recordingSubMaas) Generate(ctx context.Context, req port.InferenceReque
 	if err := ctx.Err(); err != nil {
 		return port.InferenceResponse{}, err
 	}
+	text := testsupport.RequestText(req)
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.prompts = append(m.prompts, testsupport.RequestText(req))
+	m.prompts = append(m.prompts, text)
+	if m.failOn != "" && strings.Contains(text, m.failOn) {
+		return port.InferenceResponse{}, fmt.Errorf("recordingSubMaas: 推理失败，prompt 含 %q", m.failOn)
+	}
 	return port.InferenceResponse{Text: m.summary}, nil
 }
 
@@ -89,15 +98,18 @@ func TestRunSubTaskDepthLimitFailsLoud(t *testing.T) {
 	}
 }
 
+// 批量的既有契约：结果按输入顺序对齐，某条子代理「跑起来了但失败了」只报进该条
+// 的 Err，不拖垮整批。这条 Err 的含义与「这条根本没资格启动」不同——后者是调度
+// 层失败，由整批预检返回整体 error。
 func TestRunSubTasksBatchStableOrderAndReportsFailure(t *testing.T) {
 	t.Parallel()
 
-	maas := &recordingSubMaas{summary: "batch summary"}
+	maas := &recordingSubMaas{summary: "batch summary", failOn: "boom"}
 	parent := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Maas: maas})
 
 	specs := []SubTaskSpec{
 		{ParentTaskID: "p", Goal: "a"},
-		{ParentTaskID: "p", Goal: ""}, // invalid goal → reported per-entry, not fatal
+		{ParentTaskID: "p", Goal: "boom"}, // 子代理跑起来后推理失败 → 报进该条 Err，不是整批失败
 		{ParentTaskID: "p", Goal: "c"},
 	}
 	results, err := parent.RunSubTasks(context.Background(), specs)
@@ -111,7 +123,7 @@ func TestRunSubTasksBatchStableOrderAndReportsFailure(t *testing.T) {
 		t.Fatalf("RunSubTasks() results[0,2] = %q,%q, want batch summary", results[0].Summary, results[2].Summary)
 	}
 	if results[1].Err == "" {
-		t.Fatalf("RunSubTasks() results[1].Err empty, want reported goal error")
+		t.Fatalf("RunSubTasks() results[1].Err empty, want the failed child's error reported")
 	}
 }
 

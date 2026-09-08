@@ -44,6 +44,10 @@ type SubTaskResult struct {
 	TaskID  string
 	Summary string
 	Err     string
+	// StopReason is why the child's tool loop ended. Without it a Summary is
+	// just text: a child that answered and a child that was cut off mid-work
+	// read the same.
+	StopReason domain.StopReason
 }
 
 // SubTaskHandle references a background sub-task whose completion is delivered
@@ -62,6 +66,57 @@ func (r *Runtime) canDelegate() bool {
 		return false
 	}
 	return r.role == roleOrchestrator
+}
+
+// validateSubTaskSpec decides whether one delegation request may be admitted,
+// without creating anything: a request rejected here starts no child and has
+// no side effect.
+//
+// It requires spec.Goal to be non-empty, then checks against state this
+// runtime already holds: the two role constants declared at the top of this
+// file, the depth a spawned child would land at (this runtime's own depth
+// plus one) against maxSpawnDepth, and -- for each requested toolset name --
+// whether this runtime's tool registry exposes that name. A nil registry
+// exposes nothing, so it rejects every requested name.
+//
+// Exposure is asked of tool.Registry.Descriptors(), which resolves along the
+// parent chain and applies each view's filter. tool.Registry.HasTool answers a
+// different question -- it counts only a registry's OWN registrations -- and
+// the two disagree exactly where delegation lives: a plugin's tool reaches a
+// task registry by inheritance, and a child narrowed by Toolsets runs on a
+// Subset view that registers nothing of its own. Under HasTool both of those
+// genuinely reachable tools would be refused, and the refusal would say the
+// agent does not have a tool it can in fact execute.
+func (r *Runtime) validateSubTaskSpec(spec SubTaskSpec) error {
+	if strings.TrimSpace(spec.Goal) == "" {
+		return fmt.Errorf("validate sub task: goal is required")
+	}
+	switch spec.Role {
+	case "", roleLeaf, roleOrchestrator:
+	default:
+		return fmt.Errorf("validate sub task: role %q is not %q or %q", spec.Role, roleOrchestrator, roleLeaf)
+	}
+	if r.depth+1 > r.maxSpawnDepth {
+		return fmt.Errorf("validate sub task: delegation depth %d exceeds max spawn depth %d", r.depth+1, r.maxSpawnDepth)
+	}
+	// Subset NARROWS, so a name it does not recognise is dropped in silence and
+	// the child ends up with fewer tools than the caller asked for -- possibly
+	// none. (Without, which widens, may ignore unknown names: removing a tool an
+	// agent never had is a real no-op.)
+	if len(spec.Toolsets) > 0 {
+		exposed := make(map[string]bool)
+		if r.tools != nil {
+			for _, descriptor := range r.tools.Descriptors() {
+				exposed[descriptor.Name] = true
+			}
+		}
+		for _, name := range spec.Toolsets {
+			if !exposed[name] {
+				return fmt.Errorf("validate sub task: toolset name %q is not a tool this agent exposes", name)
+			}
+		}
+	}
+	return nil
 }
 
 // newSubRuntime clones this runtime for a child at depth+1, sharing the inference
@@ -148,8 +203,8 @@ func (r *Runtime) RunSubTask(ctx context.Context, spec SubTaskSpec) (SubTaskResu
 	if err := ctx.Err(); err != nil {
 		return SubTaskResult{}, err
 	}
-	if strings.TrimSpace(spec.Goal) == "" {
-		return SubTaskResult{}, fmt.Errorf("run sub task: goal is required")
+	if err := r.validateSubTaskSpec(spec); err != nil {
+		return SubTaskResult{}, err
 	}
 	if !r.canDelegate() {
 		return SubTaskResult{}, fmt.Errorf("run sub task: delegation not permitted for role %q at depth %d", r.role, r.depth)
@@ -186,14 +241,19 @@ func (r *Runtime) runChild(ctx context.Context, child *Runtime, subTaskID string
 	if err != nil {
 		return SubTaskResult{}, fmt.Errorf("run sub task %q: %w", subTaskID, err)
 	}
-	return SubTaskResult{TaskID: subTaskID, Summary: run.Result}, nil
+	return SubTaskResult{TaskID: subTaskID, Summary: run.Result, StopReason: run.StopReason}, nil
 }
 
 // RunSubTasks delegates a batch concurrently, bounded by maxConcurrent. Results
-// preserve input order. A single sub-task that fails does not abort the batch:
-// its error is reported in that entry's Err field so the model sees it, matching
-// the "report each result, swallow nothing" contract. Only a scheduling-level
-// failure (delegation not permitted) fails the whole call loud.
+// preserve input order. A single sub-task that fails during execution does not
+// abort the batch: its error is reported in that entry's Err field so the model
+// sees it, matching the "report each result, swallow nothing" contract.
+//
+// Several conditions short-circuit that and fail the whole call loud instead,
+// with no per-entry results at all: an already-cancelled context, an empty
+// batch, delegation not permitted for this runtime (a scheduling-level
+// failure), and any entry failing validateSubTaskSpec during the batch
+// pre-flight below.
 func (r *Runtime) RunSubTasks(ctx context.Context, specs []SubTaskSpec) ([]SubTaskResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -203,6 +263,16 @@ func (r *Runtime) RunSubTasks(ctx context.Context, specs []SubTaskSpec) ([]SubTa
 	}
 	if !r.canDelegate() {
 		return nil, fmt.Errorf("run sub tasks: delegation not permitted for role %q at depth %d", r.role, r.depth)
+	}
+	// Pre-flight the whole batch before starting any of it. A child has side
+	// effects of its own, so discovering entry 4 is malformed after entries 0-3
+	// are already running is not a refusal, it is a partial execution. (Entries
+	// are numbered from 0 here, matching the "entry %d" below and the index i
+	// ranges over.)
+	for i, spec := range specs {
+		if err := r.validateSubTaskSpec(spec); err != nil {
+			return nil, fmt.Errorf("run sub tasks: entry %d: %w", i, err)
+		}
 	}
 	results := make([]SubTaskResult, len(specs))
 	sem := make(chan struct{}, r.maxConcurrent)
@@ -238,8 +308,8 @@ func (r *Runtime) RunSubTaskAsync(ctx context.Context, spec SubTaskSpec) (SubTas
 	if err := ctx.Err(); err != nil {
 		return SubTaskHandle{}, err
 	}
-	if strings.TrimSpace(spec.Goal) == "" {
-		return SubTaskHandle{}, fmt.Errorf("run sub task async: goal is required")
+	if err := r.validateSubTaskSpec(spec); err != nil {
+		return SubTaskHandle{}, err
 	}
 	if !r.canDelegate() {
 		return SubTaskHandle{}, fmt.Errorf("run sub task async: delegation not permitted for role %q at depth %d", r.role, r.depth)
