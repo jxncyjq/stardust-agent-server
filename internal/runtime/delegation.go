@@ -29,8 +29,11 @@ const (
 //
 // A non-empty AgentID is mutually exclusive with Role "orchestrator": a named
 // agent's own runtime never registers delegate_task (see ResolveDelegate), so
-// it could never act on that role, and ResolveDelegate refuses the combination
-// rather than silently ignoring one side. A non-empty Toolsets is NOT refused
+// it could never act on that role, and the combination is refused rather than
+// one side being silently ignored. validateSubTaskSpec refuses it, which is
+// what puts the refusal inside RunSubTasks' whole-batch pre-flight;
+// ResolveDelegate refuses it again as a last line of defence for callers that
+// reach it directly. A non-empty Toolsets is NOT refused
 // together with AgentID -- see the Toolsets field doc below and
 // DelegationContext.Toolsets for how the two combine.
 type SubTaskSpec struct {
@@ -102,8 +105,11 @@ func (r *Runtime) canDelegate() bool {
 // genuinely reachable tools would be refused, and the refusal would say the
 // agent does not have a tool it can in fact execute.
 //
-// A non-empty spec.AgentID is checked last, against r.delegationAgents: a nil
-// resolver or an unrecognised name are both refused rather than silently
+// A non-empty spec.AgentID is checked last. First against spec.Role alone --
+// a named agent combined with roleOrchestrator is refused here rather than
+// only in ResolveDelegate, so RunSubTasks' whole-batch pre-flight can refuse
+// the batch before any entry starts -- then against r.delegationAgents, where
+// a nil resolver or an unrecognised name are both refused rather than silently
 // falling back to a plain clone of this runtime under someone else's label.
 func (r *Runtime) validateSubTaskSpec(spec SubTaskSpec) error {
 	if strings.TrimSpace(spec.Goal) == "" {
@@ -139,6 +145,23 @@ func (r *Runtime) validateSubTaskSpec(spec SubTaskSpec) error {
 	// cannot either; both refuse rather than quietly running the parent's clone
 	// under someone else's label.
 	if spec.AgentID != "" {
+		// This combination is decidable from the spec alone, so it is decided
+		// here, where RunSubTasks' whole-batch pre-flight can reach it. Deciding
+		// it only in ResolveDelegate would let the pre-flight admit a batch it
+		// must refuse, and entry 0 would already be running (with side effects
+		// of its own) by the time entry 1 was rejected -- a partial execution,
+		// which is precisely what that pre-flight exists to prevent.
+		//
+		// Exactly two places refuse the combination, and that is deliberate:
+		// ResolveDelegate keeps its own copy as a last line of defence, because
+		// it is an exported DelegationAgents method whose contract has to hold
+		// on its own rather than on this function having run first. Same
+		// reasoning as newSubRuntime, which re-checks the depth ceiling this
+		// function has already checked.
+		if spec.Role == roleOrchestrator {
+			return fmt.Errorf("validate sub task: role %q cannot be combined with agent_id %q; a named agent's runtime never registers delegate_task, so it could never act as an orchestrator; delegate by name as a leaf, or delegate by role without a name",
+				roleOrchestrator, spec.AgentID)
+		}
 		if r.delegationAgents == nil {
 			return fmt.Errorf("validate sub task: agent_id %q was requested but this deployment has no configured agents", spec.AgentID)
 		}
@@ -307,6 +330,16 @@ func (r *Runtime) childFor(ctx context.Context, spec SubTaskSpec, subTaskID stri
 		Action:      "subtask_delegated_to_agent",
 		Hash:        spec.Goal,
 		CreatedAt:   time.Now(),
+		// Without this the row would be stored with a blank origin, and
+		// internal/storage's auditOrigin normalises a blank to
+		// domain.OriginAgent ("agent"). The one event written specifically to
+		// answer "who handed this work to whom" would then read back as the
+		// agent's own work -- the audit actively misleading, not merely
+		// silent. The depth is the CHILD's (r.depth+1, the same value handed
+		// to ResolveDelegate above), because the delegated sub-run is what
+		// this event is about; lazytools.go attributes a runtime's own tool
+		// calls with its own r.depth for the same reason.
+		Origin: domain.DelegateOrigin(r.depth + 1),
 	}); auditErr != nil {
 		// Fail-loud does not mean fail-the-caller here: the target agent has
 		// already been resolved and is about to do real work on the parent's

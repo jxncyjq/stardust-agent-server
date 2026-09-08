@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -16,6 +17,7 @@ import (
 	"github.com/stardust/legion-agent/internal/config"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/storage"
 	"github.com/stardust/legion-agent/internal/taskgate"
 )
 
@@ -139,13 +141,13 @@ func TestValidateStillAcceptsADelegationWithoutAnAgentID(t *testing.T) {
 // 完全绕过了 schema——所以这条必须单独断言 schema 本身。
 func TestDelegateTaskDescriptorAdvertisesAgentID(t *testing.T) {
 	t.Parallel()
-	schema := delegateTaskDescriptor().InputSchema
+	schema := delegateTaskDescriptor(nil).InputSchema
 	properties, ok := schema["properties"].(map[string]any)
 	if !ok {
-		t.Fatalf("delegateTaskDescriptor().InputSchema[\"properties\"] = %v (%T), want a map[string]any", schema["properties"], schema["properties"])
+		t.Fatalf("delegateTaskDescriptor(nil).InputSchema[\"properties\"] = %v (%T), want a map[string]any", schema["properties"], schema["properties"])
 	}
 	if _, ok := properties["agent_id"]; !ok {
-		t.Error(`delegateTaskDescriptor().InputSchema["properties"] has no "agent_id" entry: ` +
+		t.Error(`delegateTaskDescriptor(nil).InputSchema["properties"] has no "agent_id" entry: ` +
 			"a model reading only the schema can never discover the field, no matter how strict validateSubTaskSpec is")
 	}
 }
@@ -231,6 +233,12 @@ func TestNamedDelegationChildIsBornBelowItsParent(t *testing.T) {
 
 // 两个 role 同名不同义：SubTaskSpec.Role 管「能不能再委派」，
 // AgentConfig.Role 管「能调什么工具」。传下去的必须是前者。
+//
+// 这里用 roleLeaf 而不是 roleOrchestrator：具名委派 + orchestrator 已经被
+// validateSubTaskSpec 硬拒（见 TestBatchRefusesANamedOrchestratorBeforeStartingAnything），
+// 根本到不了 ResolveDelegate，所以 leaf 是这条接缝上唯一还能被具名委派携带的值。
+// 断言仍然有载荷：假解析器返回的 agent 身份 Role 是 "researcher-role"，与 leaf
+// 完全不同，一旦有人把 agentCfg.Role 接到 dc.Role 上就会红。
 func TestNamedDelegationPassesTheDelegationRoleNotTheAgentRole(t *testing.T) {
 	t.Parallel()
 	agents := &recordingDelegationAgents{fakeDelegationAgents: fakeDelegationAgents{names: []string{"researcher"}}}
@@ -245,14 +253,39 @@ func TestNamedDelegationPassesTheDelegationRoleNotTheAgentRole(t *testing.T) {
 		ParentTaskID: "t1",
 		Goal:         "dig",
 		AgentID:      "researcher",
-		Role:         roleOrchestrator,
+		Role:         roleLeaf,
 	}); err != nil {
 		t.Fatalf("RunSubTask() error = %v, want nil", err)
 	}
 
-	if agents.lastContext.Role != roleOrchestrator {
+	if agents.lastContext.Role != roleLeaf {
 		t.Errorf("resolved child Role = %q, want %q: this field carries the DELEGATION role (leaf/orchestrator), not the agent's tool-permission role",
-			agents.lastContext.Role, roleOrchestrator)
+			agents.lastContext.Role, roleLeaf)
+	}
+}
+
+// 具名委派 + orchestrator 必须在单条路径上也被 validateSubTaskSpec 拒掉，而不是
+// 等到 ResolveDelegate 才拒：把判定放在这里，批量预检才拦得住（上面那条批量用例）。
+// 这条盯的是单条路径同样走这一判定 —— 假解析器不会拒任何东西，所以一旦判定只剩
+// ResolveDelegate 那一份，这条就会绿着放行。
+func TestNamedOrchestratorIsRefusedBeforeTheResolverIsConsulted(t *testing.T) {
+	t.Parallel()
+	agents := &recordingDelegationAgents{fakeDelegationAgents: fakeDelegationAgents{names: []string{"researcher"}}}
+	parent := NewRuntime(Config{
+		Gate:             taskgate.NewTaskGate(),
+		Maas:             &recordingSubMaas{summary: "ok"},
+		DelegationAgents: agents,
+		MaxSpawnDepth:    3,
+	})
+
+	err := parent.validateSubTaskSpec(SubTaskSpec{Goal: "dig", AgentID: "researcher", Role: roleOrchestrator})
+	if err == nil {
+		t.Fatal("validateSubTaskSpec() error = nil for agent_id + orchestrator, want a refusal here rather than only inside ResolveDelegate")
+	}
+	for _, want := range []string{"researcher", roleOrchestrator} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error = %v, want it to mention %q", err, want)
+		}
 	}
 }
 
@@ -469,6 +502,14 @@ func offeredToolNames(t *testing.T, rt *Runtime, agent domain.Agent, maas *recor
 // ("researcher"), wired to maas so the caller can inspect what tools a
 // ResolveDelegate-built runtime actually offers the model. disabledTools is
 // the target agent's own agentregistry.AgentConfig.DisabledTools.
+//
+// Web.Enabled is on deliberately. buildAgentRuntime registers the web family
+// (and the ledger/message/browser ones) ON the registry rather than inheriting
+// them, and tool.Registry.resolve lets a registry's OWN registrations bypass a
+// view's filter -- so whether dc.Toolsets narrowing reaches those families
+// depends entirely on Subset running AFTER they are registered. With Web off,
+// a test asserting "fetch_url is absent after narrowing" passes for the wrong
+// reason (it was never registered) and the ordering goes unguarded.
 func newToolsetIntersectionResolver(t *testing.T, disabledTools []string, maas *recordingRoundsMaas) *AgentRuntimeResolver {
 	t.Helper()
 	return NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
@@ -479,6 +520,7 @@ func newToolsetIntersectionResolver(t *testing.T, disabledTools []string, maas *
 		RootConfig: config.Config{
 			ContextFiles: config.ContextFilesConfig{Root: t.TempDir()},
 			Runtime:      config.RuntimeConfig{MaxToolRounds: 1},
+			Web:          config.WebToolConfig{Enabled: true},
 		},
 		Audit:  adapter.NewMemoryAuditLog(),
 		Events: adapter.NewMemoryEventBus(),
@@ -519,8 +561,37 @@ func TestResolveDelegateKeepsTheAgentsOwnDenyList(t *testing.T) {
 // that subset when the target agent disables nothing of its own -- this is
 // the behaviour Task 3 hard-refused and Task 4 is meant to turn into a real
 // intersection.
+//
+// The narrowing has to cover the SELF-REGISTERED tool families too, not only
+// the file family the base registry inherits. tool.Registry.Subset returns a
+// filtered VIEW, and tool.Registry.resolve lets a registry's own registrations
+// bypass that filter, so a web/ledger/message/browser tool registered on the
+// view instead of on the registry it wraps escapes the narrowing entirely --
+// a caller asking for "read_file only" would silently keep two outbound
+// network tools. Only the ORDER of the two steps in buildAgentRuntime prevents
+// that, which is why the assertions below read fetch_url and web_extract, and
+// why the wide control above them exists: with the web family absent, "absent
+// after narrowing" would hold no matter what order the two steps ran in.
 func TestResolveDelegateAlsoAppliesTheCallersNarrowing(t *testing.T) {
 	t.Parallel()
+
+	// 阳性对照：不收窄时，自注册的 web 工具族确实在。没有这一步，下面「收窄后缺席」
+	// 的断言就可能因为它们压根没注册而恒真。
+	wideMaas := &recordingRoundsMaas{responses: []port.InferenceResponse{{Text: "done"}}}
+	wideResolver := newToolsetIntersectionResolver(t, nil, wideMaas)
+	wideAgent, wideChild, err := wideResolver.ResolveDelegate(context.Background(), "researcher", DelegationContext{
+		Depth: 1, MaxSpawnDepth: 3,
+	})
+	if err != nil {
+		t.Fatalf("ResolveDelegate() (no narrowing) error = %v, want nil", err)
+	}
+	wide := offeredToolNames(t, wideChild, wideAgent, wideMaas)
+	for _, present := range []string{"read_file", "fetch_url", "web_extract"} {
+		if !wide[present] {
+			t.Fatalf("offered tools without narrowing = %v, want %q present: the narrowing assertions below prove nothing unless this tool is actually registered", wide, present)
+		}
+	}
+
 	maas := &recordingRoundsMaas{responses: []port.InferenceResponse{{Text: "done"}}}
 	resolver := newToolsetIntersectionResolver(t, nil, maas)
 
@@ -538,6 +609,11 @@ func TestResolveDelegateAlsoAppliesTheCallersNarrowing(t *testing.T) {
 	for _, absent := range []string{"write_file", "search_content", "list_files"} {
 		if names[absent] {
 			t.Errorf("offered tools = %v, want %q absent: the caller's toolsets narrowing must exclude everything not named", names, absent)
+		}
+	}
+	for _, absent := range []string{"fetch_url", "web_extract"} {
+		if names[absent] {
+			t.Errorf("offered tools = %v, want %q absent: the narrowing must also reach the tool families buildAgentRuntime registers itself, or a sub-agent narrowed to read_file still gets outbound network access", names, absent)
 		}
 	}
 }
@@ -663,5 +739,104 @@ func TestDelegationWithoutAgentIDStillClonesTheParent(t *testing.T) {
 	}
 	if got := agents.recorded(); len(got) != 0 {
 		t.Fatalf("ResolveDelegate was called %d times for delegations with no agent_id, want 0: %v", len(got), got)
+	}
+}
+
+// TestBatchRefusesANamedOrchestratorBeforeStartingAnything guards RunSubTasks'
+// own pre-flight contract against the agent_id + orchestrator refusal: "a child
+// has side effects of its own, so discovering entry 4 is malformed after
+// entries 0-3 are already running is not a refusal, it is a partial execution."
+//
+// The combination is decidable from the spec alone, so it belongs in
+// validateSubTaskSpec, which the pre-flight loop runs over every entry.
+// Deciding it only in ResolveDelegate -- reached per entry, after the batch has
+// already fanned out -- lets entry 0 run to completion before entry 1 is
+// rejected. Hence the assertion below is on the number of children actually
+// started, not merely on an error being returned: the buggy shape returns an
+// error too, just one entry too late.
+func TestBatchRefusesANamedOrchestratorBeforeStartingAnything(t *testing.T) {
+	t.Parallel()
+	agents := &concurrentAgentRecorder{fakeDelegationAgents: fakeDelegationAgents{names: []string{"researcher", "reviewer"}}}
+	parent := NewRuntime(Config{
+		Gate:             taskgate.NewTaskGate(),
+		Maas:             &recordingSubMaas{summary: "ok"},
+		DelegationAgents: agents,
+		MaxSpawnDepth:    3,
+	})
+
+	results, err := parent.RunSubTasks(context.Background(), []SubTaskSpec{
+		{ParentTaskID: "p", Goal: "dig", AgentID: "researcher"},
+		{ParentTaskID: "p", Goal: "check", AgentID: "reviewer", Role: roleOrchestrator},
+	})
+	if err == nil {
+		t.Fatalf("RunSubTasks() error = nil (results = %v), want the whole batch refused: agent_id with role %q is illegal", results, roleOrchestrator)
+	}
+	if !strings.Contains(err.Error(), "entry 1") {
+		t.Errorf("error = %v, want it to name entry 1 as the offending one", err)
+	}
+	if results != nil {
+		t.Errorf("RunSubTasks() results = %v, want nil: a refused batch reports no per-entry results", results)
+	}
+	if started := agents.recorded(); len(started) != 0 {
+		t.Fatalf("ResolveDelegate was called for %v (%d children started), want 0: one illegal entry must refuse the batch before ANY entry runs, not after its siblings already have",
+			started, len(started))
+	}
+}
+
+// TestNamedDelegationAuditEventCarriesADelegateOrigin reads the delegation
+// audit event back out of the real SQLite store, because the misattribution it
+// guards against only exists on the way back: internal/storage's auditOrigin
+// normalises a blank Origin to domain.OriginAgent, so an event appended with an
+// empty one is indistinguishable, once stored, from work the agent did itself.
+// This is the one event written specifically to answer "who handed this work to
+// whom" (spec §4.3-2), so reading it back as the agent's own work makes the
+// audit trail misleading rather than merely incomplete. A memory audit log
+// would keep the blank verbatim and never show the problem.
+func TestNamedDelegationAuditEventCarriesADelegateOrigin(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	repo, err := storage.OpenSQLite(ctx, filepath.Join(t.TempDir(), "agent.db"))
+	if err != nil {
+		t.Fatalf("OpenSQLite() error = %v, want nil", err)
+	}
+	t.Cleanup(func() {
+		if err := repo.Close(); err != nil {
+			t.Errorf("Close() error = %v, want nil", err)
+		}
+	})
+	audit := storage.NewSQLiteAuditLog(repo)
+	parent := NewRuntime(Config{
+		Gate:             taskgate.NewTaskGate(),
+		Maas:             &recordingSubMaas{summary: "ok"},
+		Audit:            audit,
+		DelegationAgents: &concurrentAgentRecorder{fakeDelegationAgents: fakeDelegationAgents{names: []string{"researcher"}}},
+		MaxSpawnDepth:    3,
+	})
+
+	if _, err := parent.RunSubTask(ctx, SubTaskSpec{ParentTaskID: "t1", Goal: "dig", AgentID: "researcher"}); err != nil {
+		t.Fatalf("RunSubTask() error = %v, want nil", err)
+	}
+
+	events, err := audit.Events()
+	if err != nil {
+		t.Fatalf("Events() error = %v, want nil", err)
+	}
+	var found bool
+	for _, event := range events {
+		if event.Action != "subtask_delegated_to_agent" {
+			continue
+		}
+		found = true
+		if event.Origin == domain.OriginAgent {
+			t.Errorf("stored Origin = %q, want a delegate origin: the event that records a delegation must not read back as the agent's own work", event.Origin)
+		}
+		// The child's depth, not the parent's: this event is about the
+		// delegated sub-run, and the parent here is the root (depth 0).
+		if want := domain.DelegateOrigin(1); event.Origin != want {
+			t.Errorf("stored Origin = %q, want %q", event.Origin, want)
+		}
+	}
+	if !found {
+		t.Fatalf("no %q audit event was stored; events = %v", "subtask_delegated_to_agent", events)
 	}
 }

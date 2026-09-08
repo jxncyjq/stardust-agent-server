@@ -284,6 +284,15 @@ func (r *AgentRuntimeResolver) ResolveDelegate(ctx context.Context, id string, d
 	// roleOrchestrator here would set canDelegate() to true on a child that has
 	// no delegate_task to call — a silently inert grant. Refuse it outright
 	// instead of applying it and leaving it dead.
+	//
+	// This is the SECOND of two refusals, not the only one: the primary lives
+	// in validateSubTaskSpec, which is what puts it inside RunSubTasks'
+	// whole-batch pre-flight, so a batch containing this combination refuses
+	// before any entry starts instead of failing halfway through. This copy
+	// stays because ResolveDelegate is an exported DelegationAgents method
+	// whose contract has to hold on its own rather than on validateSubTaskSpec
+	// having run first — the same reason newSubRuntime re-checks a depth
+	// ceiling validateSubTaskSpec already checked.
 	if dc.Role == roleOrchestrator {
 		return domain.Agent{}, nil, fmt.Errorf(
 			"resolve delegate %q: delegation role %q cannot be combined with a named agent; a named agent's runtime never registers delegate_task, so it could never act as an orchestrator; delegate by name as a leaf, or delegate by role without a name",

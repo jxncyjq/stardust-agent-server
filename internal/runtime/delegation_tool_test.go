@@ -3,6 +3,8 @@ package runtime
 import (
 	"context"
 	"encoding/json"
+	"sort"
+	"strings"
 	"testing"
 
 	"github.com/stardust/legion-agent/internal/domain"
@@ -147,4 +149,123 @@ func decodeDelegate(t *testing.T, result domain.ToolResult) map[string]any {
 		t.Fatalf("decode delegate_task output %q: %v", result.Output, err)
 	}
 	return payload
+}
+
+// delegateTaskDescriptorFrom pulls the delegate_task descriptor back out of a
+// registry it was registered on. Reading it from the registry rather than
+// calling delegateTaskDescriptor directly is the point: what a model sees is
+// whatever RegisterDelegateTaskTool chose to build, so a test that called the
+// builder itself would still pass if the wiring between the runtime's agent
+// list and the descriptor were cut.
+func delegateTaskDescriptorFrom(t *testing.T, registry *tool.Registry) tool.Descriptor {
+	t.Helper()
+	for _, descriptor := range registry.Descriptors() {
+		if descriptor.Name == "delegate_task" {
+			return descriptor
+		}
+	}
+	t.Fatal("registry exposes no delegate_task descriptor")
+	return tool.Descriptor{}
+}
+
+// agentIDDescriptionOf returns the agent_id property description a model would
+// read off descriptor.
+func agentIDDescriptionOf(t *testing.T, descriptor tool.Descriptor) string {
+	t.Helper()
+	properties, ok := descriptor.InputSchema["properties"].(map[string]any)
+	if !ok {
+		t.Fatalf("InputSchema[\"properties\"] = %v (%T), want a map[string]any", descriptor.InputSchema["properties"], descriptor.InputSchema["properties"])
+	}
+	entry, ok := properties["agent_id"].(map[string]any)
+	if !ok {
+		t.Fatalf("InputSchema properties[\"agent_id\"] = %v (%T), want a map[string]any", properties["agent_id"], properties["agent_id"])
+	}
+	description, ok := entry["description"].(string)
+	if !ok {
+		t.Fatalf("agent_id description = %v (%T), want a string", entry["description"], entry["description"])
+	}
+	return description
+}
+
+// TestDelegateTaskDescriptionListsTheDelegatableAgentNames guards spec §3.1's
+// second half. Spec §2 declined a list_agents tool specifically because the
+// tool description would carry the names instead, so the tool description is
+// the ONLY channel through which a model can learn which ids agent_id accepts.
+// Without them it has to guess, and it only ever sees the list inside
+// validateSubTaskSpec's refusal -- a wasted round per guess.
+func TestDelegateTaskDescriptionListsTheDelegatableAgentNames(t *testing.T) {
+	t.Parallel()
+	runtime := NewRuntime(Config{
+		Gate:             taskgate.NewTaskGate(),
+		Maas:             &recordingSubMaas{summary: "ok"},
+		DelegationAgents: &fakeDelegationAgents{names: []string{"reviewer", "researcher"}},
+	})
+	registry := tool.NewRegistry(nil, nil, nil)
+	runtime.RegisterDelegateTaskTool(registry)
+
+	description := agentIDDescriptionOf(t, delegateTaskDescriptorFrom(t, registry))
+	for _, name := range []string{"researcher", "reviewer"} {
+		if !strings.Contains(description, name) {
+			t.Errorf("agent_id description = %q, want it to name the configured agent %q: a model that cannot read the list has to guess ids and burn a round on the refusal to see them", description, name)
+		}
+	}
+}
+
+// TestDelegateTaskDescriptionSaysWhenNoAgentsAreConfigured is the other half:
+// a deployment with no agent directory is a legitimate state, and the
+// description must say so rather than advertise a menu with nothing on it.
+// Every agent_id is refused there (validateSubTaskSpec refuses a nil resolver
+// outright, and a resolver that knows no names refuses every id), so promising
+// the field works would be a lie the model pays a round to discover.
+func TestDelegateTaskDescriptionSaysWhenNoAgentsAreConfigured(t *testing.T) {
+	t.Parallel()
+	runtime := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Maas: &recordingSubMaas{summary: "ok"}})
+	registry := tool.NewRegistry(nil, nil, nil)
+	runtime.RegisterDelegateTaskTool(registry)
+
+	description := agentIDDescriptionOf(t, delegateTaskDescriptorFrom(t, registry))
+	if !strings.Contains(description, "no configured agents") {
+		t.Errorf("agent_id description = %q, want it to state that this deployment has no configured agents", description)
+	}
+	if strings.Contains(description, "may be named here") {
+		t.Errorf("agent_id description = %q, want no list of nameable agents when none are configured", description)
+	}
+}
+
+// TestBatchDelegateTaskToolCallMapsEachEntrysAgentID closes the seam
+// TestBatchDelegationHonoursEachEntrysAgentID could not reach: that test hands
+// RunSubTasks a hand-built []SubTaskSpec, so the JSON -> SubTaskSpec mapping in
+// handleDelegateTask's batch branch is never crossed, and the end-to-end guard
+// in internal/cli only exercises single mode. Deleting the per-entry AgentID
+// mapping there compiles, vets clean and leaves every other test green while
+// every batch entry silently degrades to a clone of the parent.
+func TestBatchDelegateTaskToolCallMapsEachEntrysAgentID(t *testing.T) {
+	t.Parallel()
+	agents := &concurrentAgentRecorder{fakeDelegationAgents: fakeDelegationAgents{names: []string{"researcher", "reviewer"}}}
+	parent := NewRuntime(Config{
+		Gate:             taskgate.NewTaskGate(),
+		Maas:             &recordingSubMaas{summary: "ok"},
+		DelegationAgents: agents,
+		MaxSpawnDepth:    3,
+	})
+
+	result, err := parent.handleDelegateTask(context.Background(), domain.ToolCall{
+		ID: "call-batch-agents",
+		Arguments: map[string]string{
+			"tasks": `[{"goal":"dig","agent_id":"researcher"},{"goal":"check","agent_id":"reviewer"}]`,
+		},
+	})
+	if err != nil {
+		t.Fatalf("handleDelegateTask(batch) error = %v, want nil", err)
+	}
+	if payload := decodeDelegate(t, result); payload["mode"] != "batch" {
+		t.Fatalf("payload mode = %v, want batch", payload["mode"])
+	}
+
+	got := agents.recorded()
+	sort.Strings(got)
+	want := []string{"researcher", "reviewer"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("ResolveDelegate was called with ids %v, want each batch entry's OWN agent_id %v to survive the JSON -> SubTaskSpec mapping; an empty list means every entry fell back to cloning the parent", got, want)
+	}
 }

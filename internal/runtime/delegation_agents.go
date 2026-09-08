@@ -18,10 +18,12 @@ type DelegationContext struct {
 	MaxSpawnDepth int
 	// Role is the DELEGATION role (roleLeaf or roleOrchestrator): whether this
 	// child may delegate further. It is not the agent's tool-permission role,
-	// which comes from that agent's own configuration. ResolveDelegate refuses
-	// roleOrchestrator outright: a named agent's own runtime never registers
-	// delegate_task, so canDelegate() reading true off it would be a grant with
-	// nothing to act on.
+	// which comes from that agent's own configuration. roleOrchestrator is
+	// refused outright for a named agent: that agent's own runtime never
+	// registers delegate_task, so canDelegate() reading true off it would be a
+	// grant with nothing to act on. validateSubTaskSpec refuses it first, so a
+	// batch containing the combination is refused whole before any entry runs;
+	// ResolveDelegate refuses it again for callers that reach it directly.
 	Role string
 	// Toolsets is the tool-name narrowing the delegation request asked for,
 	// empty when it asked for none. The names are the DELEGATING runtime's tool
