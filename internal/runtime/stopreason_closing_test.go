@@ -68,8 +68,13 @@ func TestClosingInstructionForARepeatCutNamesTheRepetition(t *testing.T) {
 }
 
 // 三个被截断的原因各有一句话术，第四个 StopReasonCompleted 没有——模型是自己
-// 停下的，没有什么要打断。除这四个之外的任何值，都是新的终止路径忘了教会这个
-// switch；静默返回一句空话术会让它悄悄溜过去，必须 panic。
+// 停下的，没有什么要打断。但这不是在邀请给 default 加一条
+// `case domain.StopReasonCompleted: return ""`：closingInstructionForStopReason
+// 唯一的调用点在仍有 pending 工具调用的分支里，st.stopReason 走到那条分支时
+// 从来不会是 Completed（Completed 只在跳过这次调用的兄弟分支里被赋值）——如果
+// Completed 真的撞进了这个 switch，那本身就是编程错误，加一条静默返回空串的
+// case 只会把这个本不该发生的调用吞掉。除四个已知值之外的任何值，同样是新的
+// 终止路径忘了教会这个 switch；两种情况都不能返回空话术让它溜过去，必须 panic。
 func TestClosingInstructionForStopReasonPanicsOnAnUnknownReason(t *testing.T) {
 	t.Parallel()
 	defer func() {

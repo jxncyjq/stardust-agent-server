@@ -29,6 +29,29 @@ func TestRunSubTaskRefusesAToolsetNameThatDoesNotExist(t *testing.T) {
 	}
 }
 
+// validateSubTaskSpec 的文档写明"a nil registry exposes nothing, so it rejects
+// every requested name"，但这条分支此前没有任何用例守着：把守卫从
+// `len(spec.Toolsets) > 0` 改成 `len(spec.Toolsets) > 0 && r.tools != nil`，
+// go vet 干净、其余用例照样全绿——nil 注册表会悄悄放行所有请求的工具名，而不是
+// 文档承诺的"拒绝每一个"。这条用例专守 r.tools 为 nil 这一路径。
+func TestRunSubTaskRefusesEveryToolsetNameWhenRegistryIsNil(t *testing.T) {
+	t.Parallel()
+	// 故意不传 Tools：r.tools 保持 nil。也不传 Maas——校验在触碰 maas 之前就必须
+	// 拒绝，走不到需要它的那一步。
+	parent := NewRuntime(Config{Gate: taskgate.NewTaskGate()})
+	_, err := parent.RunSubTask(context.Background(), SubTaskSpec{
+		ParentTaskID: "t1",
+		Goal:         "read it",
+		Toolsets:     []string{"read_file"},
+	})
+	if err == nil {
+		t.Fatal("RunSubTask() error = nil with a nil tool registry, want a refusal: a nil registry exposes nothing")
+	}
+	if !strings.Contains(err.Error(), "read_file") {
+		t.Errorf("error = %v, want it to name the tool it does not recognise", err)
+	}
+}
+
 // 三个入口共用同一个判定：async 这条路也必须拒。
 func TestRunSubTaskAsyncRefusesAToolsetNameThatDoesNotExist(t *testing.T) {
 	t.Parallel()

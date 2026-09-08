@@ -910,11 +910,18 @@ func closingInstructionForStopReason(reason domain.StopReason) string {
 	case domain.StopReasonMaxRounds:
 		return "[系统] 工具调用轮数已达上限。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。"
 	default:
-		// StopReasonCompleted has no sentence of its own: it means the model
-		// stopped asking for tools by itself, so there is nothing to cut short.
-		// Any other reason is a new terminal path that forgot to teach this
-		// switch about itself, and answering it with an empty instruction would
-		// let it slip through unexplained.
+		// This function is only reached from the one call site (below, in the
+		// branch that still has pending tool calls) where st.stopReason is never
+		// StopReasonCompleted -- that value is assigned only in the sibling
+		// branch that skips this call entirely, once the loop ends with nothing
+		// pending. So StopReasonCompleted has no sentence of its own, but that is
+		// not license to add "case domain.StopReasonCompleted: return \"\"" here:
+		// if Completed ever did reach this switch, that would itself be the
+		// programming error, and a case that quietly returns "" would swallow a
+		// call this function should never receive. Any other unmapped reason is
+		// a new terminal path that forgot to teach this switch about itself.
+		// Either way, do not answer with an empty instruction that lets it slip
+		// through unexplained -- panic instead.
 		panic("runtime: no closing instruction for stop reason " + string(reason))
 	}
 }
