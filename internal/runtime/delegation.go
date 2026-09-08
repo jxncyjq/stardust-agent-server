@@ -72,10 +72,14 @@ func (r *Runtime) canDelegate() bool {
 // without creating anything: a request rejected here starts no child and has
 // no side effect.
 //
-// It checks only against state this runtime already holds: the two role
-// constants declared at the top of this file, its own depth against
-// maxSpawnDepth, and whether its tool registry has a handler registered under
-// each requested toolset name (tool.Registry.HasTool).
+// It requires spec.Goal to be non-empty, then checks against state this
+// runtime already holds: the two role constants declared at the top of this
+// file, the depth a spawned child would land at (this runtime's own depth
+// plus one) against maxSpawnDepth, and -- for each requested toolset name --
+// whether this runtime has a tool registry at all and, if so, whether that
+// registry has a handler registered under that name (tool.Registry.HasTool);
+// a nil registry rejects every requested name just as a registry missing that
+// one name would.
 func (r *Runtime) validateSubTaskSpec(spec SubTaskSpec) error {
 	if strings.TrimSpace(spec.Goal) == "" {
 		return fmt.Errorf("validate sub task: goal is required")
@@ -226,10 +230,13 @@ func (r *Runtime) runChild(ctx context.Context, child *Runtime, subTaskID string
 }
 
 // RunSubTasks delegates a batch concurrently, bounded by maxConcurrent. Results
-// preserve input order. A single sub-task that fails does not abort the batch:
-// its error is reported in that entry's Err field so the model sees it, matching
-// the "report each result, swallow nothing" contract. Only a scheduling-level
-// failure (delegation not permitted) fails the whole call loud.
+// preserve input order. A single sub-task that fails during execution does not
+// abort the batch: its error is reported in that entry's Err field so the model
+// sees it, matching the "report each result, swallow nothing" contract. Two
+// failure modes short-circuit that and fail the whole call loud instead, with no
+// per-entry results: delegation not permitted for this runtime (a
+// scheduling-level failure), and any entry failing validateSubTaskSpec during
+// the batch pre-flight below.
 func (r *Runtime) RunSubTasks(ctx context.Context, specs []SubTaskSpec) ([]SubTaskResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -241,8 +248,10 @@ func (r *Runtime) RunSubTasks(ctx context.Context, specs []SubTaskSpec) ([]SubTa
 		return nil, fmt.Errorf("run sub tasks: delegation not permitted for role %q at depth %d", r.role, r.depth)
 	}
 	// Pre-flight the whole batch before starting any of it. A child has side
-	// effects of its own, so discovering entry 5 is malformed after entries 1-4
-	// are already running is not a refusal, it is a partial execution.
+	// effects of its own, so discovering entry 4 is malformed after entries 0-3
+	// are already running is not a refusal, it is a partial execution. (Entries
+	// are numbered from 0 here, matching the "entry %d" below and the index i
+	// ranges over.)
 	for i, spec := range specs {
 		if err := r.validateSubTaskSpec(spec); err != nil {
 			return nil, fmt.Errorf("run sub tasks: entry %d: %w", i, err)
