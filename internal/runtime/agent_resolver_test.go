@@ -72,6 +72,56 @@ func TestResolverInjectsCheckpointsAndGate(t *testing.T) {
 	}
 }
 
+// TestResolverInjectsTheDelegationAgents 守 Task 1 复审 Important-1：
+// ResolveTaskRunner 组装的 per-agent Runtime 必须真的拿到这个 resolver 本身
+// 作为 Config.DelegationAgents，而不只是"这个字段存在"。
+// TestSubRuntimeInheritsTheDelegationAgents（delegation_agents_test.go）只守住
+// 了"Config 字段 → Runtime 字段 → 子 Runtime 字段"这一段结构性传递，从未验证
+// ResolveTaskRunner 这个装配点本身接的是不是真的 resolver——把 agent_resolver.go
+// 里的 `DelegationAgents: r,` 改成 nil 或删掉，go vet/go build/go test 全部保持
+// 干净/绿色，不会有任何测试变红，这正是本仓反复出现的"接口实现了但没接到 runtime
+// 上"那种缺陷形状。
+func TestResolverInjectsTheDelegationAgents(t *testing.T) {
+	t.Parallel()
+
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{Gate: taskgate.NewTaskGate(),
+		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
+			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep"},
+		}),
+		RootConfig: config.Config{Runtime: config.RuntimeConfig{MaxToolRounds: 1}},
+		Audit:      adapter.NewMemoryAuditLog(),
+		Events:     adapter.NewMemoryEventBus(),
+		MaasFactory: func(string) (MaasRunnerFactoryResult, error) {
+			return MaasRunnerFactoryResult{Client: &resolverCaptureMaas{response: "ok"}}, nil
+		},
+	})
+
+	_, runner, ok, err := resolver.ResolveTaskRunner(context.Background(), domain.Task{
+		ID:      "task-delegation-agents",
+		AgentID: "researcher",
+	})
+	if err != nil {
+		t.Fatalf("ResolveTaskRunner error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatalf("ResolveTaskRunner ok = false, want true")
+	}
+	rt, isRuntime := runner.(*Runtime)
+	if !isRuntime {
+		t.Fatalf("runner type = %T, want *Runtime", runner)
+	}
+	if rt.delegationAgents == nil {
+		t.Fatal("resolver runtime missing delegationAgents, want the resolver itself " +
+			"(a per-agent runner that cannot resolve agent names can never delegate by name)")
+	}
+	if rt.delegationAgents != DelegationAgents(resolver) {
+		t.Fatalf("resolver runtime delegationAgents = %v, want the resolver itself %v", rt.delegationAgents, resolver)
+	}
+	if !rt.delegationAgents.HasAgent("researcher") {
+		t.Error("resolver runtime's delegationAgents does not see the agent registered on this resolver's own registry")
+	}
+}
+
 // TestResolverInjectsTheModelProfile 守 per-agent 路径的 model_profile
 // （final-review.md I-3）。
 //

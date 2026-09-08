@@ -112,8 +112,10 @@ type Config struct {
 	Role          string
 	Depth         int
 	MaxSpawnDepth int
-	// DelegationAgents lets delegate_task name a configured agent. Nil means
-	// this deployment has no agent directory; naming one is then refused.
+	// DelegationAgents is the set of agents this deployment has configured, for
+	// delegate_task to name. Nil means this deployment has no agent directory —
+	// a legitimate deployment shape, not a fallback (see the DelegationAgents
+	// interface doc).
 	DelegationAgents DelegationAgents
 	MaxConcurrent    int
 	// Checkpoints persists suspended tool-loop state so a task can resume after

@@ -2303,9 +2303,7 @@ func buildDefaultRunnerConfig(
 		Debug:            runtimeSettings.Debug,
 		// The resolver built above (agentruntime.NewAgentRuntimeResolver) already
 		// wraps this deployment's agent registry; the default runner's tasks share
-		// that one registry rather than inventing a second lookup, so a
-		// delegate_task issued from a default-agent task can name any configured
-		// agent the resolver path can.
+		// that one registry rather than inventing a second lookup.
 		DelegationAgents: delegationAgents,
 		// Compaction must be enabled here as well as on the resolver path: this
 		// config serves default-agent tasks, so wiring it only on the resolver
