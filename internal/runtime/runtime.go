@@ -112,7 +112,10 @@ type Config struct {
 	Role          string
 	Depth         int
 	MaxSpawnDepth int
-	MaxConcurrent int
+	// DelegationAgents lets delegate_task name a configured agent. Nil means
+	// this deployment has no agent directory; naming one is then refused.
+	DelegationAgents DelegationAgents
+	MaxConcurrent    int
 	// Checkpoints persists suspended tool-loop state so a task can resume after
 	// its goroutine is released (and after a process restart). Nil disables
 	// suspend/resume (the loop runs straight through, legacy behaviour).
@@ -204,23 +207,27 @@ const (
 )
 
 type Runtime struct {
-	maas                  port.MaasInferenceClient
-	audit                 port.AuditLog
-	events                port.EventBus
-	contextBuilder        ContextBuilder
-	contextPrefix         string
-	tools                 *tool.Registry
-	maxToolRounds         int
-	maxToolResultChars    int
-	maxPromptChars        int
-	toolRoot              string
-	lazyTools             bool
-	conversationTurns     []domain.ConversationTurn
-	historyTranscript     []port.InferenceMessage
-	interrupted           atomic.Bool
-	role                  string
-	depth                 int
-	maxSpawnDepth         int
+	maas               port.MaasInferenceClient
+	audit              port.AuditLog
+	events             port.EventBus
+	contextBuilder     ContextBuilder
+	contextPrefix      string
+	tools              *tool.Registry
+	maxToolRounds      int
+	maxToolResultChars int
+	maxPromptChars     int
+	toolRoot           string
+	lazyTools          bool
+	conversationTurns  []domain.ConversationTurn
+	historyTranscript  []port.InferenceMessage
+	interrupted        atomic.Bool
+	role               string
+	depth              int
+	maxSpawnDepth      int
+	// delegationAgents is Config.DelegationAgents, carried to every child by
+	// newSubRuntime like tools and the deny-list. Nil is the legal
+	// no-agent-directory deployment shape (see DelegationAgents' doc).
+	delegationAgents      DelegationAgents
 	maxConcurrent         int
 	subTaskSeq            atomic.Uint64
 	checkpoints           *sessionstate.Store
@@ -414,6 +421,7 @@ func NewRuntime(cfg Config) *Runtime {
 		role:                  role,
 		depth:                 cfg.Depth,
 		maxSpawnDepth:         normalizePositive(cfg.MaxSpawnDepth, defaultMaxSpawnDepth),
+		delegationAgents:      cfg.DelegationAgents,
 		maxConcurrent:         normalizePositive(cfg.MaxConcurrent, defaultMaxConcurrent),
 		checkpoints:           cfg.Checkpoints,
 		toolGate:              cfg.ToolGate,

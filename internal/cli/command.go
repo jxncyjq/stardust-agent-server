@@ -2284,6 +2284,7 @@ func buildDefaultRunnerConfig(
 	gate *taskgate.TaskGate,
 	sessionEvents port.SessionEventStore,
 	modelProfile string,
+	delegationAgents agentruntime.DelegationAgents,
 ) agentruntime.Config {
 	return agentruntime.Config{
 		Maas:             maas,
@@ -2300,6 +2301,12 @@ func buildDefaultRunnerConfig(
 		EpisodeRecorder:  episodeRecorder,
 		DisabledTools:    runtimeSettings.DisabledTools,
 		Debug:            runtimeSettings.Debug,
+		// The resolver built above (agentruntime.NewAgentRuntimeResolver) already
+		// wraps this deployment's agent registry; the default runner's tasks share
+		// that one registry rather than inventing a second lookup, so a
+		// delegate_task issued from a default-agent task can name any configured
+		// agent the resolver path can.
+		DelegationAgents: delegationAgents,
 		// Compaction must be enabled here as well as on the resolver path: this
 		// config serves default-agent tasks, so wiring it only on the resolver
 		// left a configured threshold doing nothing for the GUI.
@@ -3087,6 +3094,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 			// serve 没有命令行档位开关，默认 agent 一律跑在 default_profile 上
 			// （defaultMaas 也是这么建的），两者必须同源。
 			cfg.Maas.ResolveProfileName(""),
+			resolver,
 		),
 		contextRoot:     cfg.ContextFiles.Root,
 		audit:           auditLog,

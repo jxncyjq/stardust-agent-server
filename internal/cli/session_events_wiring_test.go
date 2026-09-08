@@ -40,6 +40,7 @@ func TestTheSessionEventStoreReachesTheDefaultRunnerRuntimeConfig(t *testing.T) 
 		taskgate.NewTaskGate(),
 		store,
 		"",
+		nil,
 	)
 
 	if cfg.SessionEvents == nil {

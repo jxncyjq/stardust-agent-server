@@ -36,6 +36,7 @@ func TestBuildDefaultRunnerConfigWiresSkillUsage(t *testing.T) {
 		taskgate.NewTaskGate(),
 		nil,
 		"",
+		nil,
 	)
 
 	if cfg.SkillUsage == nil {
@@ -82,6 +83,7 @@ func TestBuildDefaultRunnerConfigWiresEpisodeRecorder(t *testing.T) {
 		taskgate.NewTaskGate(),
 		nil,
 		"",
+		nil,
 	)
 
 	if cfg.EpisodeRecorder == nil {

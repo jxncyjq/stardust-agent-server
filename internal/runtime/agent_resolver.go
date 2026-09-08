@@ -359,6 +359,12 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		EpisodeRecorder:   r.episodeRecorder,
 		Gate:              r.gate,
 		SessionEvents:     r.sessionEvents,
+		// The per-agent runtime this resolver builds can itself delegate, and it
+		// must resolve names against the same registry this resolver already
+		// wraps -- passing itself here (AgentRuntimeResolver implements
+		// DelegationAgents via AgentNames/HasAgent, defined in this file) backs
+		// that delegation without a second registry reference anywhere.
+		DelegationAgents: r,
 		// 这个 agent 跑在哪个档位上，与上面 r.maasFactory(agentCfg.MaasProfile) 选
 		// 客户端用的是同一个解析顺序，所以轨迹里记的名字与真正被调用的客户端一致。
 		ModelProfile: r.rootConfig.Maas.ResolveProfileName(agentCfg.MaasProfile),
@@ -447,6 +453,19 @@ func sortedKeys(names map[string]bool) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// AgentNames implements DelegationAgents.
+func (r *AgentRuntimeResolver) AgentNames() []string {
+	names := r.registry.Names()
+	sort.Strings(names)
+	return names
+}
+
+// HasAgent implements DelegationAgents.
+func (r *AgentRuntimeResolver) HasAgent(id string) bool {
+	_, ok := r.registry.Get(id)
+	return ok
 }
 
 func firstNonEmptyAgentRuntimeResolver(values ...string) string {

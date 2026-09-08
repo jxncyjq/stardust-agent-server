@@ -157,6 +157,9 @@ func (r *Runtime) newSubRuntime(role string, toolsets []string) (*Runtime, error
 		depth:              depth,
 		maxSpawnDepth:      r.maxSpawnDepth,
 		maxConcurrent:      r.maxConcurrent,
+		// Carried like tools and the deny-list: a child that lost it could not
+		// resolve an agent name its parent could.
+		delegationAgents: r.delegationAgents,
 		// The child is built as a struct literal, bypassing NewRuntime and its
 		// nil-logger fallback, so the parent's logger must be carried over
 		// explicitly: a child left with a nil logger would panic the first time
