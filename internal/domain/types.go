@@ -82,8 +82,7 @@ type Task struct {
 	Images []string `json:"images,omitempty"`
 }
 
-// StopReason says why a task's tool loop stopped. It is recorded at the one
-// place a successful TaskRun is assembled, so every finished run carries one.
+// StopReason says why a task's tool loop stopped.
 //
 // The empty string is NOT a reason: it means nobody set one, which is a
 // programming error rather than a kind of ending. It must never be read as
@@ -111,8 +110,8 @@ type TaskRun struct {
 	StartedAt time.Time `json:"started_at"`
 	EndedAt   time.Time `json:"ended_at"`
 	Result    string    `json:"result"`
-	// StopReason is why this run's tool loop stopped. Always set on a run that
-	// was assembled successfully; see StopReason for why empty is not a value.
+	// StopReason is why this run's tool loop stopped. The empty string is not
+	// one of its values; see StopReason for why.
 	StopReason       StopReason `json:"stop_reason,omitempty"`
 	ReasoningSummary string     `json:"reasoning_summary,omitempty"`
 	PromptTokens     int        `json:"prompt_tokens,omitempty"`

@@ -256,8 +256,8 @@ type loopState struct {
 	basePrompt string
 	round      int
 	// stopReason is why the tool loop ended. It is set once, at whichever of
-	// the loop's terminal points is reached, and read by finishRun -- unlike
-	// the token counters alongside it, which accumulate across every round.
+	// the loop's terminal points is reached -- unlike the token counters
+	// alongside it, which accumulate across every round.
 	// It replaced a loopCut bool that grouped the per-tool-name cap and the
 	// repeat guard into a single true, so it could not tell those two apart
 	// from each other -- only the pair of them from a plain round-budget
@@ -910,9 +910,11 @@ func closingInstructionForStopReason(reason domain.StopReason) string {
 	case domain.StopReasonMaxRounds:
 		return "[系统] 工具调用轮数已达上限。请勿再调用、规划或描述任何工具调用，直接基于以上已获取的信息，用自然语言给出对用户问题的最终回答。"
 	default:
-		// StopReasonCompleted never reaches here (the only caller invokes this
-		// with calls still pending), and an unknown reason is a new terminal
-		// path that forgot to teach this switch about itself.
+		// StopReasonCompleted has no sentence of its own: it means the model
+		// stopped asking for tools by itself, so there is nothing to cut short.
+		// Any other reason is a new terminal path that forgot to teach this
+		// switch about itself, and answering it with an empty instruction would
+		// let it slip through unexplained.
 		panic("runtime: no closing instruction for stop reason " + string(reason))
 	}
 }

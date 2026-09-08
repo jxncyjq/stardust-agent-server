@@ -135,7 +135,7 @@ for st.round < r.maxToolRounds && len(st.resp.ToolCalls) > 0 {
 | `goal` | 非空 | 已有，收进共用函数 |
 | `role` | ∈ {`leaf`, `orchestrator`}（空串按 `leaf`） | 已有，收进共用函数 |
 | 深度 | `depth + 1 <= maxSpawnDepth` | 已有，收进共用函数 |
-| `toolsets` | **每个名字都必须存在于父的有效注册表**，用 `Registry.HasTool`（`registry.go:224`） | **新增** |
+| `toolsets` | **每个名字都必须存在于父的有效注册表**，用 `Registry.Descriptors()`（`registry.go:311`，沿 parent 链解析并按视图过滤）；**不能用 `Registry.HasTool`**，它只认本层自己注册的名字，会把继承来的插件工具与 `Subset` 视图里真实可调用的工具误拒 | **新增** |
 | `background` | 必须是可识别的布尔字面量 | **新增** |
 
 ### 4.4 批量整批预检

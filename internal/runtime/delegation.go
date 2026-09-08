@@ -76,10 +76,17 @@ func (r *Runtime) canDelegate() bool {
 // runtime already holds: the two role constants declared at the top of this
 // file, the depth a spawned child would land at (this runtime's own depth
 // plus one) against maxSpawnDepth, and -- for each requested toolset name --
-// whether this runtime has a tool registry at all and, if so, whether that
-// registry has a handler registered under that name (tool.Registry.HasTool);
-// a nil registry rejects every requested name just as a registry missing that
-// one name would.
+// whether this runtime's tool registry exposes that name. A nil registry
+// exposes nothing, so it rejects every requested name.
+//
+// Exposure is asked of tool.Registry.Descriptors(), which resolves along the
+// parent chain and applies each view's filter. tool.Registry.HasTool answers a
+// different question -- it counts only a registry's OWN registrations -- and
+// the two disagree exactly where delegation lives: a plugin's tool reaches a
+// task registry by inheritance, and a child narrowed by Toolsets runs on a
+// Subset view that registers nothing of its own. Under HasTool both of those
+// genuinely reachable tools would be refused, and the refusal would say the
+// agent does not have a tool it can in fact execute.
 func (r *Runtime) validateSubTaskSpec(spec SubTaskSpec) error {
 	if strings.TrimSpace(spec.Goal) == "" {
 		return fmt.Errorf("validate sub task: goal is required")
@@ -96,9 +103,17 @@ func (r *Runtime) validateSubTaskSpec(spec SubTaskSpec) error {
 	// the child ends up with fewer tools than the caller asked for -- possibly
 	// none. (Without, which widens, may ignore unknown names: removing a tool an
 	// agent never had is a real no-op.)
-	for _, name := range spec.Toolsets {
-		if r.tools == nil || !r.tools.HasTool(name) {
-			return fmt.Errorf("validate sub task: toolset name %q is not a tool this agent has", name)
+	if len(spec.Toolsets) > 0 {
+		exposed := make(map[string]bool)
+		if r.tools != nil {
+			for _, descriptor := range r.tools.Descriptors() {
+				exposed[descriptor.Name] = true
+			}
+		}
+		for _, name := range spec.Toolsets {
+			if !exposed[name] {
+				return fmt.Errorf("validate sub task: toolset name %q is not a tool this agent exposes", name)
+			}
 		}
 	}
 	return nil
@@ -232,11 +247,13 @@ func (r *Runtime) runChild(ctx context.Context, child *Runtime, subTaskID string
 // RunSubTasks delegates a batch concurrently, bounded by maxConcurrent. Results
 // preserve input order. A single sub-task that fails during execution does not
 // abort the batch: its error is reported in that entry's Err field so the model
-// sees it, matching the "report each result, swallow nothing" contract. Two
-// failure modes short-circuit that and fail the whole call loud instead, with no
-// per-entry results: delegation not permitted for this runtime (a
-// scheduling-level failure), and any entry failing validateSubTaskSpec during
-// the batch pre-flight below.
+// sees it, matching the "report each result, swallow nothing" contract.
+//
+// Several conditions short-circuit that and fail the whole call loud instead,
+// with no per-entry results at all: an already-cancelled context, an empty
+// batch, delegation not permitted for this runtime (a scheduling-level
+// failure), and any entry failing validateSubTaskSpec during the batch
+// pre-flight below.
 func (r *Runtime) RunSubTasks(ctx context.Context, specs []SubTaskSpec) ([]SubTaskResult, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
