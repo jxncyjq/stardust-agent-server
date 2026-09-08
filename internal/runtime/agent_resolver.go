@@ -276,6 +276,20 @@ func (r *AgentRuntimeResolver) ResolveDelegate(ctx context.Context, id string, d
 	default:
 		return domain.Agent{}, nil, fmt.Errorf("resolve delegate %q: delegation role %q is not %q or %q", id, dc.Role, roleOrchestrator, roleLeaf)
 	}
+	// A named agent's own runtime never gets delegate_task registered on it:
+	// buildAgentRuntime below assembles the tool registry itself, tool by tool,
+	// and that assembly never calls RegisterDelegateTaskTool, which this
+	// codebase calls exactly once, on the default runner's own root runtime
+	// (internal/cli/command.go's defaultTaskRunner.RunTask). Accepting
+	// roleOrchestrator here would set canDelegate() to true on a child that has
+	// no delegate_task to call — a silently inert grant, the same shape the
+	// Toolsets refusal below exists to prevent. Refuse it outright instead of
+	// applying it and leaving it dead.
+	if dc.Role == roleOrchestrator {
+		return domain.Agent{}, nil, fmt.Errorf(
+			"resolve delegate %q: delegation role %q cannot be combined with a named agent; a named agent's runtime never registers delegate_task, so it could never act as an orchestrator; delegate by name as a leaf, or delegate by role without a name",
+			id, roleOrchestrator)
+	}
 	// dc.Toolsets names tools of the delegating runtime's registry; this child
 	// runs on a registry built from its own agent's configuration, where those
 	// names may mean a different tool or no tool at all. Refusing says so;
@@ -415,9 +429,16 @@ func (r *AgentRuntimeResolver) buildAgentRuntime(ctx context.Context, agentCfg a
 	// outside this run holds and can come back to. A sub-task's id is minted
 	// per delegation inside the parent's own call, so a checkpoint written
 	// under it is one nothing ever loads, and a suspension ends the delegation
-	// with no path back into it. The two drop together because checkSuspend
-	// needs both to do anything at all, and because a cloned child carries
-	// neither — a named child answers this the same way rather than a third
+	// with no path back into it. checkSuspend needs both checkpoints and
+	// toolGate to do anything at all, so dropping either one already disarms
+	// it; the dispatch-time gate call in lazytools.go's dispatchToolCall needs
+	// only toolGate, but that path is harmless to drop too, because
+	// r.toolGate.Resolve's ManualToolGate implementation returns allow=true on
+	// its first line whenever task.Mode is not domain.ModeManual, and
+	// delegation.go's runChild never sets Mode on the domain.Task it builds —
+	// a delegated child is always Auto (see the invariant comment on that
+	// check in runtime.go's RunTask). A cloned child carries neither field
+	// either — a named child answers this the same way rather than a third
 	// way. The ask arbiter set on the tool registry above is a different thing
 	// and is unaffected.
 	checkpoints, toolGate := r.checkpoints, r.toolGate
@@ -445,9 +466,20 @@ func (r *AgentRuntimeResolver) buildAgentRuntime(ctx context.Context, agentCfg a
 		// 是为了让「开关选了哪一边」在这里没有第二次做主的机会。
 		ConversationTurns: history.Turns,
 		HistoryTranscript: history.Transcript,
-		EpisodeRecorder:   r.episodeRecorder,
-		Gate:              r.gate,
-		SessionEvents:     r.sessionEvents,
+		// Deliberate, not an oversight: every runtime this resolver builds off
+		// agentCfg -- a top-level per-agent task as much as a named delegate --
+		// runs AS that agent, and writing one episodic-memory record per finished
+		// task is part of what running as a configured agent means here. This is
+		// the one field where a named delegate and a cloned delegate (newSubRuntime
+		// in delegation.go, which carries no episodeRecorder at all) genuinely
+		// diverge: a named sub-task's one-off id still gets its own episode, a
+		// cloned sub-task's does not. See
+		// TestResolveDelegateCarriesTheResolverEpisodeRecorder and
+		// TestClonedSubRuntimeCarriesNoEpisodeRecorder, which lock both halves of
+		// that asymmetry down.
+		EpisodeRecorder: r.episodeRecorder,
+		Gate:            r.gate,
+		SessionEvents:   r.sessionEvents,
 		// The per-agent runtime this resolver builds can itself delegate, and it
 		// must resolve names against the same registry this resolver already
 		// wraps -- passing itself here (AgentRuntimeResolver implements

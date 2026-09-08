@@ -1160,10 +1160,18 @@ func TestResolveDelegateAppliesTheDelegationContextAndTheAgentsOwnRole(t *testin
 	t.Parallel()
 	resolver := newDelegateResolver(t)
 
+	// Role is roleLeaf here, not roleOrchestrator: ResolveDelegate refuses
+	// roleOrchestrator outright for a named agent (see the "orchestrator role
+	// cannot combine with a named agent" case in TestResolveDelegateRefusals),
+	// so it cannot be used to exercise this test's actual point, which is that
+	// dc.Role reaches child.role unchanged and distinct from agent.Role below --
+	// a mix-up this test still catches regardless of which of the two valid
+	// values is used, because agent.Role comes from a completely different
+	// string ("researcher").
 	agent, child, err := resolver.ResolveDelegate(context.Background(), "researcher", DelegationContext{
 		Depth:         1,
 		MaxSpawnDepth: 3,
-		Role:          roleOrchestrator,
+		Role:          roleLeaf,
 	})
 	if err != nil {
 		t.Fatalf("ResolveDelegate() error = %v, want nil", err)
@@ -1177,8 +1185,8 @@ func TestResolveDelegateAppliesTheDelegationContextAndTheAgentsOwnRole(t *testin
 	if child.maxSpawnDepth != 3 {
 		t.Errorf("child.maxSpawnDepth = %d, want the delegator's 3", child.maxSpawnDepth)
 	}
-	if child.role != roleOrchestrator {
-		t.Errorf("child.role = %q, want %q: this is the DELEGATION role the delegator chose", child.role, roleOrchestrator)
+	if child.role != roleLeaf {
+		t.Errorf("child.role = %q, want %q: this is the DELEGATION role the delegator chose", child.role, roleLeaf)
 	}
 	if agent.Role != "researcher" {
 		t.Errorf("agent.Role = %q, want the target agent config's %q: this is the tool-permission role, and it must not be crossed with the delegation role",
@@ -1189,6 +1197,30 @@ func TestResolveDelegateAppliesTheDelegationContextAndTheAgentsOwnRole(t *testin
 	}
 	if child.delegationAgents != DelegationAgents(resolver) {
 		t.Error("child.delegationAgents is not the resolver: a named child that may delegate further must resolve names against the same registry")
+	}
+}
+
+// M-3 复审：具名子代理带走了解析器的 EpisodeRecorder（buildAgentRuntime 的
+// Config 字面量里 EpisodeRecorder: r.episodeRecorder），克隆子代理
+// （newSubRuntime）则不带——见 TestClonedSubRuntimeCarriesNoEpisodeRecorder。
+// 这条钉住具名这一半：每次具名委派都会以子任务 id 写一条情景记忆，这是有意为之
+// 的行为，不是未讨论的副作用。
+func TestResolveDelegateCarriesTheResolverEpisodeRecorder(t *testing.T) {
+	t.Parallel()
+	recorder := &fakeEpisodeRecorder{}
+	resolver := newDelegateResolver(t, func(cfg *AgentRuntimeResolverConfig) {
+		cfg.EpisodeRecorder = recorder
+	})
+
+	_, child, err := resolver.ResolveDelegate(context.Background(), "researcher", DelegationContext{Depth: 1, MaxSpawnDepth: 3})
+	if err != nil {
+		t.Fatalf("ResolveDelegate() error = %v, want nil", err)
+	}
+	if child.episodeRecorder == nil {
+		t.Fatal("child.episodeRecorder is nil: a named delegation must run as the target agent's configuration, and that includes its episodic-memory wiring")
+	}
+	if child.episodeRecorder != EpisodeRecorder(recorder) {
+		t.Errorf("child.episodeRecorder = %v, want the same recorder %v", child.episodeRecorder, recorder)
 	}
 }
 
@@ -1255,6 +1287,16 @@ func TestResolveDelegateRefusals(t *testing.T) {
 			id:      "researcher",
 			dc:      DelegationContext{Depth: 1, MaxSpawnDepth: 3, Toolsets: []string{"read_file"}},
 			wantMsg: "cannot narrow a named agent",
+		},
+		{
+			// I-1 复审：role=orchestrator + agent_id 曾被静默接受且完全无效——
+			// canDelegate() 读到 true，但 buildAgentRuntime 装配的注册表里从来没
+			// 有 delegate_task 可调（RegisterDelegateTaskTool 全仓只被默认
+			// runner 调用一次）。现在与 toolsets 同等对待：硬拒。
+			name:    "orchestrator role cannot combine with a named agent",
+			id:      "researcher",
+			dc:      DelegationContext{Depth: 1, MaxSpawnDepth: 3, Role: roleOrchestrator},
+			wantMsg: "cannot be combined with a named agent",
 		},
 	}
 	for _, tc := range cases {

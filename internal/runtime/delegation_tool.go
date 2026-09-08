@@ -53,10 +53,10 @@ func delegateTaskDescriptor() tool.Descriptor {
 			"properties": map[string]any{
 				"goal":       map[string]any{"type": "string", "description": "The sub-task objective (single mode)."},
 				"context":    map[string]any{"type": "string", "description": "Optional supporting context for the sub-task."},
-				"role":       map[string]any{"type": "string", "description": "\"leaf\" (default) or \"orchestrator\"."},
+				"role":       map[string]any{"type": "string", "description": "\"leaf\" (default) or \"orchestrator\". \"orchestrator\" is refused together with agent_id: a named agent's own runtime never carries delegate_task, so it could never act on it."},
 				"background": map[string]any{"type": "string", "description": "When \"true\", run asynchronously and return a handle."},
-				"toolsets":   map[string]any{"type": "string", "description": "Optional comma-separated tool names narrowing the sub-agent to a subset of the parent tools (single mode). Empty inherits all."},
-				"agent_id":   map[string]any{"type": "string", "description": "Optional id of a configured agent to run this sub-task as: the sub-task then runs with that agent's own tool-permission role, tool authorisation, model profile and workspace, while role above still decides whether it may delegate further. An id that names no configured agent is refused, and so is combining it with toolsets, whose names are this agent's tools rather than the named agent's. Omit to run as a plain clone of this agent."},
+				"toolsets":   map[string]any{"type": "string", "description": "Optional comma-separated tool names narrowing the sub-agent to a subset of the parent tools (single mode). Empty inherits all. Refused together with agent_id: a named agent's tools come from its own configuration, not this list."},
+				"agent_id":   map[string]any{"type": "string", "description": "Optional id of a configured agent to run this sub-task as: the sub-task then runs with that agent's own tool-permission role, tool authorisation, model profile and workspace. An id that names no configured agent is refused, and so is combining it with role \"orchestrator\" or with toolsets — both describe capabilities a named agent's own configuration decides instead. Omit to run as a plain clone of this agent."},
 				"tasks":      map[string]any{"type": "string", "description": "Batch mode: JSON array of {goal, context, role, toolsets, agent_id} objects run in parallel."},
 			},
 		},

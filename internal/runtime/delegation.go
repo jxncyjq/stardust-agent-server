@@ -26,6 +26,11 @@ const (
 // configured agent to run the child as, so the child runs with that agent's own
 // tool-permission role, tool authorisation, model profile and workspace; empty
 // runs a clone of the delegating runtime under a derived id.
+//
+// A non-empty AgentID is mutually exclusive with Role "orchestrator" and with a
+// non-empty Toolsets: both describe capabilities the named agent's own
+// configuration decides instead, and ResolveDelegate refuses either combination
+// rather than silently ignoring one side.
 type SubTaskSpec struct {
 	ParentTaskID string
 	AgentID      string
@@ -35,7 +40,8 @@ type SubTaskSpec struct {
 	// Toolsets, when non-empty, narrows the child runtime to only these tool
 	// names (a subset of the parent registry). Empty inherits the full parent
 	// tool set. This is the token-optimization knob: a focused sub-agent is
-	// offered only the tools its goal needs.
+	// offered only the tools its goal needs. Refused together with a non-empty
+	// AgentID -- see the type doc above.
 	Toolsets []string
 }
 
