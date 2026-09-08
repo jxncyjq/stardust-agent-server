@@ -87,6 +87,10 @@ func (r *Runtime) canDelegate() bool {
 // Subset view that registers nothing of its own. Under HasTool both of those
 // genuinely reachable tools would be refused, and the refusal would say the
 // agent does not have a tool it can in fact execute.
+//
+// A non-empty spec.AgentID is checked last, against r.delegationAgents: a nil
+// resolver or an unrecognised name are both refused rather than silently
+// falling back to a plain clone of this runtime under someone else's label.
 func (r *Runtime) validateSubTaskSpec(spec SubTaskSpec) error {
 	if strings.TrimSpace(spec.Goal) == "" {
 		return fmt.Errorf("validate sub task: goal is required")
@@ -114,6 +118,19 @@ func (r *Runtime) validateSubTaskSpec(spec SubTaskSpec) error {
 			if !exposed[name] {
 				return fmt.Errorf("validate sub task: toolset name %q is not a tool this agent exposes", name)
 			}
+		}
+	}
+	// Naming an agent is a request to run as THAT agent's configuration. A
+	// deployment with no agent directory cannot honour it, and an unknown name
+	// cannot either; both refuse rather than quietly running the parent's clone
+	// under someone else's label.
+	if spec.AgentID != "" {
+		if r.delegationAgents == nil {
+			return fmt.Errorf("validate sub task: agent_id %q was requested but this deployment has no configured agents", spec.AgentID)
+		}
+		if !r.delegationAgents.HasAgent(spec.AgentID) {
+			return fmt.Errorf("validate sub task: agent_id %q is not a configured agent; configured agents are %v",
+				spec.AgentID, r.delegationAgents.AgentNames())
 		}
 	}
 	return nil

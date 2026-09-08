@@ -56,7 +56,8 @@ func delegateTaskDescriptor() tool.Descriptor {
 				"role":       map[string]any{"type": "string", "description": "\"leaf\" (default) or \"orchestrator\"."},
 				"background": map[string]any{"type": "string", "description": "When \"true\", run asynchronously and return a handle."},
 				"toolsets":   map[string]any{"type": "string", "description": "Optional comma-separated tool names narrowing the sub-agent to a subset of the parent tools (single mode). Empty inherits all."},
-				"tasks":      map[string]any{"type": "string", "description": "Batch mode: JSON array of {goal, context, role, toolsets} objects run in parallel."},
+				"agent_id":   map[string]any{"type": "string", "description": "Optional id of a configured agent to run this sub-task as; it then runs with that agent's own role, tool authorisation, model profile and workspace. Omit to run as a plain clone of this agent."},
+				"tasks":      map[string]any{"type": "string", "description": "Batch mode: JSON array of {goal, context, role, toolsets, agent_id} objects run in parallel."},
 			},
 		},
 	}
