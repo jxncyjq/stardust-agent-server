@@ -83,6 +83,8 @@ for st.round < r.maxToolRounds && len(st.resp.ToolCalls) > 0 {
 - 补进 `sqlite.go:1133` 的 `INSERT INTO task_runs (...)` 列表与读取侧（`sqlite.go:1151` 的 `SELECT ... FROM task_runs`）。
 - 老数据 `stop_reason` 为空串，**读出来是空值，不报错**。只有新任务有值。空值在**读取**侧是合法的历史状态，与 3.3 里「写入侧零值即 bug」不冲突：写入侧的断言拦的是新写入，读取侧要容忍旧行。
 
+**注意这条落盘今天在生产上到不了**：`SaveTaskRun` / `ListTaskRuns`（`internal/storage/sqlite.go`）**没有任何生产调用方**，`internal/server/http.go` 的 `handleGetTaskResult` 注释自陈 "TaskRun is not persisted"。本 spec 只保证「这一列存在、写得进去、读得回来、老行不报错」，**不接生产写入路径**——让 `finishRun` 去调 `SaveTaskRun` 是新增行为与新的失败模式（写库失败该终止任务还是记日志继续？），属独立决策，留给 Spec C 作为前置。
+
 ### 3.5 出口
 
 - `runtime.SubTaskResult`（`internal/runtime/delegation.go:41`）增加 `StopReason`。
@@ -100,7 +102,9 @@ for st.round < r.maxToolRounds && len(st.resp.ToolCalls) > 0 {
 
 ### 3.7 受益面与风险
 
-改的是所有任务共用的主循环，**所有任务都受益**，不只子代理：`/v1` 与审计从此答得出「为什么停」。
+改的是所有任务共用的主循环，所以终止原因对**所有任务**都被记录下来，不只子代理。今天它的实际出口是 `SubTaskResult` 与 `delegate_task` 的工具输出（3.5）——父 agent 由此能分清子代理是答完了还是被截断了。
+
+**`/v1` 与审计今天还答不出「为什么停」**：那需要先把 `TaskRun` 的生产写入路径接上（见 3.4 的注意事项），不在本 spec 范围内。
 
 风险缓解：`StopReason` 只做**新增记录**，**不改变任何一条既有控制流分支**——哪条 `break`、什么时候 `break`，一律不动。唯一的行为变更是 3.6 那句收尾话术，且单独有用例。
 
