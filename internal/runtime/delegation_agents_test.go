@@ -8,8 +8,12 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stardust/legion-agent/internal/adapter"
+	"github.com/stardust/legion-agent/internal/agentregistry"
 	"github.com/stardust/legion-agent/internal/cognitive"
+	"github.com/stardust/legion-agent/internal/config"
 	"github.com/stardust/legion-agent/internal/domain"
+	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/taskgate"
 )
 
@@ -332,5 +336,108 @@ func TestUnnamedDelegationStillRunsAsTheDerivedDeveloperIdentity(t *testing.T) {
 	}
 	if !strings.Contains(joined, "Role: developer") {
 		t.Errorf("child prompt does not carry Role: developer, want the unnamed path unchanged:\n%s", joined)
+	}
+}
+
+// offeredToolNames runs task on rt and collects the tool names actually
+// offered to the model in the first inference request -- the same
+// black-box check TestResolverAppliesDisabledTools and
+// TestEffectiveToolsRemovesDisabledTool use, because DisabledTools is never
+// baked into Runtime.tools itself: it is applied fresh on every call by
+// Runtime.effectiveTools (tools.Without(r.disabledTools...)), so inspecting
+// the stored tools field would miss it entirely. Asking what the model was
+// actually offered exercises both DisabledTools and any Toolsets narrowing
+// baked into tools at construction, together, exactly as a real dispatch
+// would see them.
+func offeredToolNames(t *testing.T, rt *Runtime, agent domain.Agent, maas *recordingRoundsMaas) map[string]bool {
+	t.Helper()
+	task := domain.Task{ID: "sub-task-tools", Input: "go"}
+	if _, err := rt.RunTask(context.Background(), agent, task); err != nil {
+		t.Fatalf("RunTask() error = %v, want nil", err)
+	}
+	if len(maas.requests) == 0 {
+		t.Fatal("no inference request captured; nothing to read the offered tools from")
+	}
+	names := make(map[string]bool)
+	for _, tl := range maas.requests[0].Tools {
+		names[tl.Name] = true
+	}
+	return names
+}
+
+// newToolsetIntersectionResolver builds a resolver with one configured agent
+// ("researcher"), wired to maas so the caller can inspect what tools a
+// ResolveDelegate-built runtime actually offers the model. disabledTools is
+// the target agent's own agentregistry.AgentConfig.DisabledTools.
+func newToolsetIntersectionResolver(t *testing.T, disabledTools []string, maas *recordingRoundsMaas) *AgentRuntimeResolver {
+	t.Helper()
+	return NewAgentRuntimeResolver(AgentRuntimeResolverConfig{
+		Gate: taskgate.NewTaskGate(),
+		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
+			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep", DisabledTools: disabledTools},
+		}),
+		RootConfig: config.Config{
+			ContextFiles: config.ContextFilesConfig{Root: t.TempDir()},
+			Runtime:      config.RuntimeConfig{MaxToolRounds: 1},
+		},
+		Audit:  adapter.NewMemoryAuditLog(),
+		Events: adapter.NewMemoryEventBus(),
+		MaasFactory: func(string) (MaasRunnerFactoryResult, error) {
+			return MaasRunnerFactoryResult{Client: maas}, nil
+		},
+	})
+}
+
+// TestResolveDelegateKeepsTheAgentsOwnDenyList guards Task 4 half 1: a named
+// agent's own agentCfg.DisabledTools must still apply to a delegated child
+// even now that ResolveDelegate accepts a non-empty dc.Toolsets for a named
+// agent -- accepting Toolsets must not come at the cost of silently dropping
+// the target's own standing deny-list.
+func TestResolveDelegateKeepsTheAgentsOwnDenyList(t *testing.T) {
+	t.Parallel()
+	maas := &recordingRoundsMaas{responses: []port.InferenceResponse{{Text: "done"}}}
+	resolver := newToolsetIntersectionResolver(t, []string{"write_file"}, maas)
+
+	agent, child, err := resolver.ResolveDelegate(context.Background(), "researcher", DelegationContext{
+		Depth: 1, MaxSpawnDepth: 3,
+	})
+	if err != nil {
+		t.Fatalf("ResolveDelegate() error = %v, want nil", err)
+	}
+
+	names := offeredToolNames(t, child, agent, maas)
+	if names["write_file"] {
+		t.Errorf("offered tools = %v, want write_file absent: the target agent's own DisabledTools must still deny it", names)
+	}
+	if !names["read_file"] {
+		t.Errorf("offered tools = %v, want read_file present: the deny-list must remove only the named tool, not everything", names)
+	}
+}
+
+// TestResolveDelegateAlsoAppliesTheCallersNarrowing guards Task 4 half 2: a
+// parent's dc.Toolsets must narrow a named delegate's tools down to exactly
+// that subset when the target agent disables nothing of its own -- this is
+// the behaviour Task 3 hard-refused and Task 4 is meant to turn into a real
+// intersection.
+func TestResolveDelegateAlsoAppliesTheCallersNarrowing(t *testing.T) {
+	t.Parallel()
+	maas := &recordingRoundsMaas{responses: []port.InferenceResponse{{Text: "done"}}}
+	resolver := newToolsetIntersectionResolver(t, nil, maas)
+
+	agent, child, err := resolver.ResolveDelegate(context.Background(), "researcher", DelegationContext{
+		Depth: 1, MaxSpawnDepth: 3, Toolsets: []string{"read_file"},
+	})
+	if err != nil {
+		t.Fatalf("ResolveDelegate() error = %v, want nil", err)
+	}
+
+	names := offeredToolNames(t, child, agent, maas)
+	if !names["read_file"] {
+		t.Errorf("offered tools = %v, want read_file present: it is the one name the caller asked for", names)
+	}
+	for _, absent := range []string{"write_file", "search_content", "list_files"} {
+		if names[absent] {
+			t.Errorf("offered tools = %v, want %q absent: the caller's toolsets narrowing must exclude everything not named", names, absent)
+		}
 	}
 }

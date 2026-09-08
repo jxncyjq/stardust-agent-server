@@ -26,11 +26,14 @@ type DelegationContext struct {
 	// Toolsets is the tool-name narrowing the delegation request asked for,
 	// empty when it asked for none. The names are the DELEGATING runtime's tool
 	// names — validateSubTaskSpec checks them against that runtime's registry —
-	// and a named agent runs on a registry of its own, so a resolver either maps
-	// them onto that registry or refuses; narrowing to whatever happens to match
-	// would hand the child a silently different tool set than was asked for.
-	// ResolveDelegate refuses a non-empty Toolsets outright, the same way it
-	// refuses roleOrchestrator above.
+	// and a named agent runs on a registry of its own, where those names may
+	// resolve to a different tool or none at all. Unlike Role above,
+	// ResolveDelegate does NOT refuse a non-empty Toolsets: it maps the names
+	// onto the named agent's own registry via tool.Registry.Subset, layered on
+	// top of that agent's own DisabledTools deny-list (buildAgentRuntime) so
+	// the two narrow together rather than either replacing the other (spec
+	// §4.4). A name Subset does not recognise is silently dropped, which can
+	// only narrow the child further, never widen it past its own configuration.
 	Toolsets []string
 }
 

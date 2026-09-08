@@ -282,25 +282,21 @@ func (r *AgentRuntimeResolver) ResolveDelegate(ctx context.Context, id string, d
 	// codebase calls exactly once, on the default runner's own root runtime
 	// (internal/cli/command.go's defaultTaskRunner.RunTask). Accepting
 	// roleOrchestrator here would set canDelegate() to true on a child that has
-	// no delegate_task to call — a silently inert grant, the same shape the
-	// Toolsets refusal below exists to prevent. Refuse it outright instead of
-	// applying it and leaving it dead.
+	// no delegate_task to call — a silently inert grant. Refuse it outright
+	// instead of applying it and leaving it dead.
 	if dc.Role == roleOrchestrator {
 		return domain.Agent{}, nil, fmt.Errorf(
 			"resolve delegate %q: delegation role %q cannot be combined with a named agent; a named agent's runtime never registers delegate_task, so it could never act as an orchestrator; delegate by name as a leaf, or delegate by role without a name",
 			id, roleOrchestrator)
 	}
-	// dc.Toolsets names tools of the delegating runtime's registry; this child
-	// runs on a registry built from its own agent's configuration, where those
-	// names may mean a different tool or no tool at all. Refusing says so;
-	// narrowing by whatever matched would hand the child a tool set nobody
-	// chose, and dropping the request would hand it the tools the delegator
-	// was trying to withhold.
-	if len(dc.Toolsets) > 0 {
-		return domain.Agent{}, nil, fmt.Errorf(
-			"resolve delegate %q: toolsets %v cannot narrow a named agent, whose tools come from its own configuration; delegate by name or by toolsets, not both",
-			id, dc.Toolsets)
-	}
+	// dc.Toolsets, unlike Role above, is NOT refused for a named agent: it is
+	// the delegating caller's one-time narrowing for this one delegation, and
+	// buildAgentRuntime applies it on top of the named agent's own
+	// agentCfg.DisabledTools deny-list rather than in place of it (spec §4.4) —
+	// see the comment there. A name that does not match anything in the named
+	// agent's own registry is silently dropped by tool.Registry.Subset, which
+	// only narrows the child further; it can never widen it past what
+	// buildAgentRuntime already assembled from agentCfg.
 	return r.buildAgentRuntime(ctx, agentCfg, domain.Task{AgentID: id}, dc)
 }
 
@@ -406,6 +402,33 @@ func (r *AgentRuntimeResolver) buildAgentRuntime(ctx context.Context, agentCfg a
 		tool.WithAgentsInjection(r.rootConfig.ContextFiles.MaxFileChars, r.resolveHomeDir(ctx)),
 		tool.WithProjectRoot(toolRoot),
 		tool.WithPluginTools(r.pluginTools))
+	tool.RegisterTaskLedgerTools(tools, r.taskLedger)
+	tool.RegisterAgentMessageTools(tools, r.messageStore)
+	tool.RegisterWebTools(tools, webToolOptions(r.rootConfig.Web))
+	if r.browserRuntime != nil {
+		// Shared runtime injected at serve assembly; no per-task browser launch.
+		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: r.browserRuntime, ToolRoot: toolRoot})
+	}
+	// dc.Toolsets is the delegating caller's one-time narrowing for THIS
+	// delegation (spec §4.4); agentCfg.DisabledTools, passed to Config below,
+	// is this agent's own standing deny-list, applied separately on every call
+	// by Runtime.effectiveTools (tools.Without(r.disabledTools...)). The two
+	// stack rather than either replacing the other: baking Toolsets in here,
+	// ahead of a DisabledTools filter that runs later on whatever this
+	// produces, means the tools this runtime ever offers are the caller's
+	// requested subset MINUS the agent's own denials -- neither side can widen
+	// past what the other already narrowed. Subset drops any name it does not
+	// recognise rather than erroring, so this step can only ever narrow the
+	// registry built above, never widen it.
+	//
+	// This must run before SetAskArbiter below: Subset returns a NEW view that
+	// does not carry the base registry's askArbiter field (tool.Registry.view
+	// copies policy/enforcer/guards/audit/sanitizer but not askArbiter), so
+	// setting the arbiter first would leave it stranded on a registry this
+	// runtime no longer uses once Toolsets narrows tools to the view.
+	if len(dc.Toolsets) > 0 {
+		tools = tools.Subset(dc.Toolsets...)
+	}
 	// A plugin granted the decide extension may answer "ask", and the ticket
 	// that answers it is read at DISPATCH time, in this registry. The gate that
 	// opens those tickets is the only thing that can read them back, so it is
@@ -413,13 +436,6 @@ func (r *AgentRuntimeResolver) buildAgentRuntime(ctx context.Context, agentCfg a
 	// including the ones a human already approved.
 	if arbiter, ok := r.toolGate.(tool.AskArbiter); ok {
 		tools.SetAskArbiter(arbiter)
-	}
-	tool.RegisterTaskLedgerTools(tools, r.taskLedger)
-	tool.RegisterAgentMessageTools(tools, r.messageStore)
-	tool.RegisterWebTools(tools, webToolOptions(r.rootConfig.Web))
-	if r.browserRuntime != nil {
-		// Shared runtime injected at serve assembly; no per-task browser launch.
-		tool.RegisterBrowserTools(tools, tool.BrowserToolOptions{Enabled: true, Runtime: r.browserRuntime, ToolRoot: toolRoot})
 	}
 	history, err := r.sessionHistoryForTask(ctx, task)
 	if err != nil {

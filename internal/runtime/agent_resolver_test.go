@@ -1283,12 +1283,6 @@ func TestResolveDelegateRefusals(t *testing.T) {
 			wantMsg: "is not \"orchestrator\" or \"leaf\"",
 		},
 		{
-			name:    "toolsets cannot narrow a named agent",
-			id:      "researcher",
-			dc:      DelegationContext{Depth: 1, MaxSpawnDepth: 3, Toolsets: []string{"read_file"}},
-			wantMsg: "cannot narrow a named agent",
-		},
-		{
 			// I-1 复审：role=orchestrator + agent_id 曾被静默接受且完全无效——
 			// canDelegate() 读到 true，但 buildAgentRuntime 装配的注册表里从来没
 			// 有 delegate_task 可调（RegisterDelegateTaskTool 全仓只被默认

@@ -27,10 +27,12 @@ const (
 // tool-permission role, tool authorisation, model profile and workspace; empty
 // runs a clone of the delegating runtime under a derived id.
 //
-// A non-empty AgentID is mutually exclusive with Role "orchestrator" and with a
-// non-empty Toolsets: both describe capabilities the named agent's own
-// configuration decides instead, and ResolveDelegate refuses either combination
-// rather than silently ignoring one side.
+// A non-empty AgentID is mutually exclusive with Role "orchestrator": a named
+// agent's own runtime never registers delegate_task (see ResolveDelegate), so
+// it could never act on that role, and ResolveDelegate refuses the combination
+// rather than silently ignoring one side. A non-empty Toolsets is NOT refused
+// together with AgentID -- see the Toolsets field doc below and
+// DelegationContext.Toolsets for how the two combine.
 type SubTaskSpec struct {
 	ParentTaskID string
 	AgentID      string
@@ -38,10 +40,14 @@ type SubTaskSpec struct {
 	Context      string
 	Role         string
 	// Toolsets, when non-empty, narrows the child runtime to only these tool
-	// names (a subset of the parent registry). Empty inherits the full parent
-	// tool set. This is the token-optimization knob: a focused sub-agent is
-	// offered only the tools its goal needs. Refused together with a non-empty
-	// AgentID -- see the type doc above.
+	// names. Empty inherits the full parent tool set. This is the
+	// token-optimization knob: a focused sub-agent is offered only the tools
+	// its goal needs. validateSubTaskSpec always checks these names against
+	// THIS runtime's own registry (the delegating side), regardless of
+	// AgentID. Combined with a non-empty AgentID, ResolveDelegate then maps
+	// the same names onto the named agent's own registry, layered on top of
+	// (not replacing) that agent's own DisabledTools deny-list -- see
+	// DelegationContext.Toolsets.
 	Toolsets []string
 }
 
