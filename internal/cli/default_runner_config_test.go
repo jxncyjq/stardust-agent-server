@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/stardust/legion-agent/internal/config"
@@ -102,6 +104,10 @@ type fakeDelegationAgents struct{}
 func (fakeDelegationAgents) AgentNames() []string { return nil }
 
 func (fakeDelegationAgents) HasAgent(string) bool { return false }
+
+func (fakeDelegationAgents) ResolveDelegate(context.Context, string, agentruntime.DelegationContext) (domain.Agent, *agentruntime.Runtime, error) {
+	return domain.Agent{}, nil, errors.New("fakeDelegationAgents does not resolve")
+}
 
 // TestBuildDefaultRunnerConfigWiresDelegationAgents guards the default-runner
 // half of Task 1's delegation-by-name wiring (specB-task-1-report.md,

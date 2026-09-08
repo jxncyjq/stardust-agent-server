@@ -22,8 +22,10 @@ const (
 
 // SubTaskSpec describes one delegated unit of work. Goal is required; Context is
 // optional supporting detail. Role selects the child's delegation capability
-// ("orchestrator" to allow further nesting, otherwise "leaf"). AgentID labels the
-// child agent; empty defaults to a derived id.
+// ("orchestrator" to allow further nesting, otherwise "leaf"). AgentID names a
+// configured agent to run the child as, so the child runs with that agent's own
+// tool-permission role, tool authorisation, model profile and workspace; empty
+// runs a clone of the delegating runtime under a derived id.
 type SubTaskSpec struct {
 	ParentTaskID string
 	AgentID      string
@@ -229,16 +231,46 @@ func (r *Runtime) RunSubTask(ctx context.Context, spec SubTaskSpec) (SubTaskResu
 	if !r.canDelegate() {
 		return SubTaskResult{}, fmt.Errorf("run sub task: delegation not permitted for role %q at depth %d", r.role, r.depth)
 	}
-	child, err := r.newSubRuntime(spec.Role, spec.Toolsets)
+	subTaskID := r.nextSubTaskID(spec.ParentTaskID)
+	agent, child, err := r.childFor(ctx, spec, subTaskID)
 	if err != nil {
 		return SubTaskResult{}, err
 	}
-	return r.runChild(ctx, child, r.nextSubTaskID(spec.ParentTaskID), spec)
+	return r.runChild(ctx, agent, child, subTaskID, spec)
+}
+
+// childFor builds the runtime that will run one sub-task: the named agent's own
+// runtime when spec names one, otherwise a clone of this runtime. It returns the
+// domain.Agent to run as alongside it, because a named child runs as that
+// agent's configured role rather than the fixed one an unnamed child uses.
+//
+// A resolution failure is wrapped and returned. It is never turned into a clone
+// of this runtime: the caller asked for a specific agent, and a clone wearing
+// that agent's name would run with this runtime's tools and model instead of
+// the ones the name selects.
+func (r *Runtime) childFor(ctx context.Context, spec SubTaskSpec, subTaskID string) (domain.Agent, *Runtime, error) {
+	if spec.AgentID == "" {
+		child, err := r.newSubRuntime(spec.Role, spec.Toolsets)
+		if err != nil {
+			return domain.Agent{}, nil, err
+		}
+		return domain.Agent{ID: subTaskID, Role: "developer"}, child, nil
+	}
+	agent, child, err := r.delegationAgents.ResolveDelegate(ctx, spec.AgentID, DelegationContext{
+		Depth:         r.depth + 1,
+		MaxSpawnDepth: r.maxSpawnDepth,
+		Role:          spec.Role,
+		Toolsets:      spec.Toolsets,
+	})
+	if err != nil {
+		return domain.Agent{}, nil, fmt.Errorf("resolve delegate agent %q: %w", spec.AgentID, err)
+	}
+	return agent, child, nil
 }
 
 // runChild executes a prepared child runtime against spec and maps its run to a
-// SubTaskResult. A child run error is wrapped and returned.
-func (r *Runtime) runChild(ctx context.Context, child *Runtime, subTaskID string, spec SubTaskSpec) (SubTaskResult, error) {
+// SubTaskResult, running it as agent. A child run error is wrapped and returned.
+func (r *Runtime) runChild(ctx context.Context, agent domain.Agent, child *Runtime, subTaskID string, spec SubTaskSpec) (SubTaskResult, error) {
 	agentID := spec.AgentID
 	if agentID == "" {
 		agentID = subTaskID
@@ -256,7 +288,6 @@ func (r *Runtime) runChild(ctx context.Context, child *Runtime, subTaskID string
 		Input:     composeSubTaskInput(spec),
 		CreatedAt: time.Now(),
 	}
-	agent := domain.Agent{ID: agentID, Role: "developer"}
 	run, err := child.RunTask(ctx, agent, task)
 	if err != nil {
 		return SubTaskResult{}, fmt.Errorf("run sub task %q: %w", subTaskID, err)
@@ -334,11 +365,11 @@ func (r *Runtime) RunSubTaskAsync(ctx context.Context, spec SubTaskSpec) (SubTas
 	if !r.canDelegate() {
 		return SubTaskHandle{}, fmt.Errorf("run sub task async: delegation not permitted for role %q at depth %d", r.role, r.depth)
 	}
-	child, err := r.newSubRuntime(spec.Role, spec.Toolsets)
+	subTaskID := r.nextSubTaskID(spec.ParentTaskID)
+	agent, child, err := r.childFor(ctx, spec, subTaskID)
 	if err != nil {
 		return SubTaskHandle{}, err
 	}
-	subTaskID := r.nextSubTaskID(spec.ParentTaskID)
 
 	// The background sub-task keeps running after the tool call that started it
 	// returns, and so possibly after the parent task itself has ended and
@@ -362,7 +393,7 @@ func (r *Runtime) RunSubTaskAsync(ctx context.Context, spec SubTaskSpec) (SubTas
 	go func() {
 		defer endBackground()
 		bg := context.WithoutCancel(ctx)
-		res, err := r.runChild(bg, child, subTaskID, spec)
+		res, err := r.runChild(bg, agent, child, subTaskID, spec)
 		event := domain.RuntimeEvent{
 			Type:      "subtask_completed",
 			TaskID:    subTaskID,

@@ -667,10 +667,11 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	//
 	// Depth is what tells the two apart. A runtime at depth 0 is where a task
 	// ARRIVES, so it is the one that can be turned away; every deeper runtime is
-	// built by newSubRuntime for a child of a task whose Begin is still held, so
-	// it registers with BeginChild and is admitted unconditionally. (Depth above
-	// 0 is only ever reached through that delegation path — no production
-	// construction site sets Config.Depth.)
+	// built for a child of a task whose Begin is still held, so it registers
+	// with BeginChild and is admitted unconditionally. (Depth above 0 belongs
+	// to the delegation path: a child carries its delegating runtime's depth
+	// plus one, whether newSubRuntime cloned it or a DelegationAgents built it
+	// for a named agent.)
 	//
 	// The refusal is wrapped, not flattened: it carries ErrApplyPending, so a
 	// caller can tell "the plugin set is switching, retry in a moment" from

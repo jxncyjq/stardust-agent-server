@@ -227,6 +227,82 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 	if !ok {
 		return domain.Agent{}, nil, false, nil
 	}
+	// The zero DelegationContext is a task that arrives on its own rather than
+	// under a parent: depth 0, the default spawn ceiling, and an empty
+	// delegation role, which NewRuntime reads at depth 0 as the root
+	// orchestrator. Everything past this line is shared with ResolveDelegate,
+	// which passes the context its delegating runtime handed down instead.
+	agent, runner, err := r.buildAgentRuntime(ctx, agentCfg, task, DelegationContext{})
+	if err != nil {
+		return domain.Agent{}, nil, false, err
+	}
+	return agent, runner, true, nil
+}
+
+// ResolveDelegate implements DelegationAgents: it builds the runtime a named
+// sub-task runs on. The named agent's own configuration decides the
+// tool-permission role, the disabled_tools deny-list, the MaaS profile, the
+// context files and the tool sandbox; dc decides the delegation position, which
+// is the delegating runtime's to decide and nothing the agent's configuration
+// can override.
+//
+// A sub-task has no session, company or working directory of its own at this
+// point, so the task it is built for carries only the agent id: the child gets
+// that agent's configured workspace and starts with no session history, both of
+// which are states the assembly below already treats as legitimate.
+func (r *AgentRuntimeResolver) ResolveDelegate(ctx context.Context, id string, dc DelegationContext) (domain.Agent, *Runtime, error) {
+	if r == nil || r.registry == nil {
+		return domain.Agent{}, nil, fmt.Errorf("resolve delegate %q: this resolver has no agent registry", id)
+	}
+	agentCfg, ok := r.registry.Get(id)
+	if !ok {
+		return domain.Agent{}, nil, fmt.Errorf("resolve delegate %q: not a configured agent; configured agents are %v", id, r.AgentNames())
+	}
+	// A delegate is by definition below a parent. Depth 0 would make this child
+	// the root of a delegation tree of its own: it would run its whole subtree
+	// inside the ceiling budget its parent has already partly spent, and it
+	// would register with the task-boundary gate as an arriving task instead of
+	// as a child of one.
+	if dc.Depth < 1 {
+		return domain.Agent{}, nil, fmt.Errorf("resolve delegate %q: delegation depth %d is not below a parent", id, dc.Depth)
+	}
+	// normalizePositive, matching what NewRuntime does with the same field, so
+	// the ceiling this refuses against is the ceiling the child would run under.
+	if ceiling := normalizePositive(dc.MaxSpawnDepth, defaultMaxSpawnDepth); dc.Depth > ceiling {
+		return domain.Agent{}, nil, fmt.Errorf("resolve delegate %q: delegation depth %d exceeds max spawn depth %d", id, dc.Depth, ceiling)
+	}
+	switch dc.Role {
+	case "", roleLeaf, roleOrchestrator:
+	default:
+		return domain.Agent{}, nil, fmt.Errorf("resolve delegate %q: delegation role %q is not %q or %q", id, dc.Role, roleOrchestrator, roleLeaf)
+	}
+	// dc.Toolsets names tools of the delegating runtime's registry; this child
+	// runs on a registry built from its own agent's configuration, where those
+	// names may mean a different tool or no tool at all. Refusing says so;
+	// narrowing by whatever matched would hand the child a tool set nobody
+	// chose, and dropping the request would hand it the tools the delegator
+	// was trying to withhold.
+	if len(dc.Toolsets) > 0 {
+		return domain.Agent{}, nil, fmt.Errorf(
+			"resolve delegate %q: toolsets %v cannot narrow a named agent, whose tools come from its own configuration; delegate by name or by toolsets, not both",
+			id, dc.Toolsets)
+	}
+	return r.buildAgentRuntime(ctx, agentCfg, domain.Task{AgentID: id}, dc)
+}
+
+// buildAgentRuntime assembles one per-agent runtime. The split it enforces is
+// the point of the function: agentCfg decides what running AS this agent means
+// (tool-permission role, disabled_tools, MaaS profile, context files, skills
+// root), task decides what this particular run is about (the working directory
+// that becomes the tool sandbox root, the session whose history is injected,
+// the company the returned domain.Agent belongs to), and dc decides where in a
+// delegation tree the runtime sits.
+//
+// One function rather than one per caller: validating disabled_tools against
+// the gateable set, resolving the MaaS profile and loading the context files
+// are the same decisions however the runtime was asked for, and a second copy
+// of them would be a second answer to them.
+func (r *AgentRuntimeResolver) buildAgentRuntime(ctx context.Context, agentCfg agentregistry.AgentConfig, task domain.Task, dc DelegationContext) (domain.Agent, *Runtime, error) {
 	// Fail-loud assembly-time validation (CLAUDE.md §0): a disabled_tools entry
 	// that does not name a known gateable tool is a config error, not an inert
 	// no-op — a typo would otherwise silently disable nothing. gateableNames is
@@ -235,21 +311,21 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 	gateableNames := toolauth.GateableToolNames()
 	for _, name := range agentCfg.DisabledTools {
 		if !gateableNames[name] {
-			return domain.Agent{}, nil, false, fmt.Errorf(
+			return domain.Agent{}, nil, fmt.Errorf(
 				"agent %q disabled_tools names unknown tool %q (gateable: %v)",
 				agentCfg.ID, name, sortedKeys(gateableNames))
 		}
 	}
 	if r.maasFactory == nil {
-		return domain.Agent{}, nil, false, fmt.Errorf("maas runner factory is nil")
+		return domain.Agent{}, nil, fmt.Errorf("maas runner factory is nil")
 	}
 	maas, err := r.maasFactory(agentCfg.MaasProfile)
 	if err != nil {
-		return domain.Agent{}, nil, false, fmt.Errorf("create maas runner for profile %q: %w", agentCfg.MaasProfile, err)
+		return domain.Agent{}, nil, fmt.Errorf("create maas runner for profile %q: %w", agentCfg.MaasProfile, err)
 	}
 	contextBlock, err := loadAgentContextFiles(ctx, r.rootConfig, agentCfg.ContextFiles, agentToolRoot(r.rootConfig, agentCfg, task))
 	if err != nil {
-		return domain.Agent{}, nil, false, fmt.Errorf("load agent context files for %q: %w", task.AgentID, err)
+		return domain.Agent{}, nil, fmt.Errorf("load agent context files for %q: %w", task.AgentID, err)
 	}
 	contextBuilder := cognitive.NewCore(cognitive.NoopCompressor{}).
 		WithContextFiles(contextBlock).
@@ -333,7 +409,20 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 	}
 	history, err := r.sessionHistoryForTask(ctx, task)
 	if err != nil {
-		return domain.Agent{}, nil, false, err
+		return domain.Agent{}, nil, err
+	}
+	// Suspend/resume is wiring for a task that ARRIVED under an id something
+	// outside this run holds and can come back to. A sub-task's id is minted
+	// per delegation inside the parent's own call, so a checkpoint written
+	// under it is one nothing ever loads, and a suspension ends the delegation
+	// with no path back into it. The two drop together because checkSuspend
+	// needs both to do anything at all, and because a cloned child carries
+	// neither — a named child answers this the same way rather than a third
+	// way. The ask arbiter set on the tool registry above is a different thing
+	// and is unaffected.
+	checkpoints, toolGate := r.checkpoints, r.toolGate
+	if dc.Depth > 0 {
+		checkpoints, toolGate = nil, nil
 	}
 	runner := NewRuntime(Config{
 		Maas:                  maas.Client,
@@ -346,8 +435,8 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		LazyTools:             r.rootConfig.Runtime.LazyTools,
 		Debug:                 r.rootConfig.Runtime.Debug,
 		CompactTokenThreshold: r.rootConfig.Runtime.CompactTokenThreshold,
-		Checkpoints:           r.checkpoints,
-		ToolGate:              r.toolGate,
+		Checkpoints:           checkpoints,
+		ToolGate:              toolGate,
 		Logger:                r.logger,
 		CapabilitySkills:      capabilitySkills,
 		SkillUsage:            r.skillUsage,
@@ -362,14 +451,23 @@ func (r *AgentRuntimeResolver) ResolveTaskRunner(ctx context.Context, task domai
 		// The per-agent runtime this resolver builds can itself delegate, and it
 		// must resolve names against the same registry this resolver already
 		// wraps -- passing itself here (AgentRuntimeResolver implements
-		// DelegationAgents via AgentNames/HasAgent, defined in this file) backs
-		// that delegation without a second registry reference anywhere.
+		// DelegationAgents, whose three methods are all defined in this file)
+		// backs that delegation without a second registry reference anywhere.
 		DelegationAgents: r,
+		// Where this runtime sits in a delegation tree is dc's to say, and only
+		// dc's: an agent's configuration says what running AS that agent means,
+		// and the same agent can be both a top-level task's runner and someone
+		// else's child. Note Role here is the DELEGATION role (may this runtime
+		// delegate further), a different question from agent.Role above, which
+		// is the tool-permission role agentCfg carries.
+		Role:          dc.Role,
+		Depth:         dc.Depth,
+		MaxSpawnDepth: dc.MaxSpawnDepth,
 		// 这个 agent 跑在哪个档位上，与上面 r.maasFactory(agentCfg.MaasProfile) 选
 		// 客户端用的是同一个解析顺序，所以轨迹里记的名字与真正被调用的客户端一致。
 		ModelProfile: r.rootConfig.Maas.ResolveProfileName(agentCfg.MaasProfile),
 	})
-	return agent, runner, true, nil
+	return agent, runner, nil
 }
 
 // webToolOptions maps the web config block onto the tool package options.
