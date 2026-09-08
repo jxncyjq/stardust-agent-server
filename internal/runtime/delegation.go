@@ -72,8 +72,10 @@ func (r *Runtime) canDelegate() bool {
 // without creating anything: a request rejected here starts no child and has
 // no side effect.
 //
-// It checks only what this deployment actually has. There is no provider
-// descriptor to negotiate against because there is one transport.
+// It checks only against state this runtime already holds: the two role
+// constants declared at the top of this file, its own depth against
+// maxSpawnDepth, and whether its tool registry has a handler registered under
+// each requested toolset name (tool.Registry.HasTool).
 func (r *Runtime) validateSubTaskSpec(spec SubTaskSpec) error {
 	if strings.TrimSpace(spec.Goal) == "" {
 		return fmt.Errorf("validate sub task: goal is required")
@@ -237,6 +239,14 @@ func (r *Runtime) RunSubTasks(ctx context.Context, specs []SubTaskSpec) ([]SubTa
 	}
 	if !r.canDelegate() {
 		return nil, fmt.Errorf("run sub tasks: delegation not permitted for role %q at depth %d", r.role, r.depth)
+	}
+	// Pre-flight the whole batch before starting any of it. A child has side
+	// effects of its own, so discovering entry 5 is malformed after entries 1-4
+	// are already running is not a refusal, it is a partial execution.
+	for i, spec := range specs {
+		if err := r.validateSubTaskSpec(spec); err != nil {
+			return nil, fmt.Errorf("run sub tasks: entry %d: %w", i, err)
+		}
 	}
 	results := make([]SubTaskResult, len(specs))
 	sem := make(chan struct{}, r.maxConcurrent)
