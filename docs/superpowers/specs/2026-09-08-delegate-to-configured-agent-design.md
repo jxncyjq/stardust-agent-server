@@ -138,14 +138,10 @@ Legion 今天有**两套互不相干的「agent」系统**：
 | `internal/runtime/coordinator.go` | `TaskRunner` / `TaskRunnerResolver` 接口若需扩展 |
 | Runtime 装配处 | 把 resolver 接给委派路径（今天 Runtime 不持有它） |
 
-## 十、实施前必须先定的一件事：分支基点
+## 十、分支基点（已定）
 
-Spec A（PR #159）**尚未合并**，而它大改过本 spec 要动的同一批函数（`delegateTaskDescriptor` / `handleDelegateTask` / `runChild`，并新增了 `validateSubTaskSpec` 与批量整批预检）。
+Spec A 已 squash 合入 master（`c5d6661`，PR #159）。**本 spec 从 master 开分支实施**，无冲突、无 stacked PR。
 
-三条路：
+因此实施时 `internal/runtime/delegation.go` / `delegation_tool.go` 里已经有 Spec A 的成果：`SubTaskResult.StopReason`、共用纯校验函数 `validateSubTaskSpec`（三入口共用）、批量整批预检、`background` 严格解析、`toolsets` 走解析链校验。**本 spec 要在这些之上改，不是替换它们。**
 
-1. **先合 A，再从 master 开 B**（推荐）——无冲突、无 stacked PR。
-2. 从 A 的分支开 B——stacked PR。本仓吃过亏：下层 squash 合并并删分支后，上层 PR 会被 GitHub **自动关闭且无法重开或改 base**，必须 `rebase --onto origin/master` 后新开 PR。
-3. 从 master 开 B——B 要在「没有 `validateSubTaskSpec`」的前提下实现校验，A 合并时**大概率严重冲突**。
-
-**这条要人拍板，不能由实施者自行决定。**
+特别地：`agent_id` 的校验应当**并入既有的 `validateSubTaskSpec`**，而不是另起一处判断——理由与 §5.3 同源：各写一遍就是第二套真相。
