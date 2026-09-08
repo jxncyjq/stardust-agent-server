@@ -277,6 +277,50 @@ func (r *Runtime) childFor(ctx context.Context, spec SubTaskSpec, subTaskID stri
 	if err != nil {
 		return domain.Agent{}, nil, fmt.Errorf("resolve delegate agent %q: %w", spec.AgentID, err)
 	}
+	// A named delegation is the one channel through which the choice of which
+	// configured agent runs a sub-task is made by the MODEL rather than an
+	// operator (spec §4.2): a restricted agent can name an unrestricted one and
+	// inherit its role, tool authorisation, model profile and workspace. That
+	// channel is intentional and is exactly as wide as the deployment's agent
+	// directory -- the audit event below does not gate it, it only makes the
+	// choice answerable after the fact: which task asked, which agent it named,
+	// and what for. It is appended only here, after ResolveDelegate has already
+	// succeeded: a resolution failure is returned above and starts no child, so
+	// there is nothing yet worth recording.
+	//
+	// RequestID carries subTaskID, not spec.ParentTaskID directly, matching how
+	// RunSubTaskAsync's own audit record below fills the same field: nextSubTaskID
+	// mints subTaskID as "<parentTaskID>:sub-N" (defaulting an empty parent to
+	// "task"), and ParentTaskIDForSubTask in this same file exists precisely to
+	// recover the parent id from it. This runtime carries no agent identity of
+	// its own -- Config has no such field, because a Runtime is generic and only
+	// learns which domain.Agent it is running as through RunTask's own parameter,
+	// which this function never receives -- so the parent TASK id is the most
+	// specific caller-side identity actually available at this call site, and
+	// Hash is free to carry the one piece of content that has no field of its
+	// own: the goal the parent asked the named agent to do.
+	if auditErr := r.audit.Append(ctx, domain.AuditEvent{
+		ID:          subTaskID + ":delegated-to-agent",
+		RequestID:   subTaskID,
+		SubjectType: "agent",
+		SubjectID:   spec.AgentID,
+		Action:      "subtask_delegated_to_agent",
+		Hash:        spec.Goal,
+		CreatedAt:   time.Now(),
+	}); auditErr != nil {
+		// Fail-loud does not mean fail-the-caller here: the target agent has
+		// already been resolved and is about to do real work on the parent's
+		// behalf, and refusing to run it because the audit store had a hiccup
+		// would trade a forensic record for the very delegation that record was
+		// meant to describe. So the failure is not swallowed -- it is logged,
+		// structured, at Warn -- and the delegation proceeds regardless.
+		r.logger.WarnContext(ctx, "record named delegation audit event failed",
+			"component", "runtime",
+			"sub_task_id", subTaskID,
+			"parent_task_id", spec.ParentTaskID,
+			"agent_id", spec.AgentID,
+			"error", auditErr)
+	}
 	return agent, child, nil
 }
 

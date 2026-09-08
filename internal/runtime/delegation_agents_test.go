@@ -1,6 +1,7 @@
 package runtime
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -336,6 +337,104 @@ func TestUnnamedDelegationStillRunsAsTheDerivedDeveloperIdentity(t *testing.T) {
 	}
 	if !strings.Contains(joined, "Role: developer") {
 		t.Errorf("child prompt does not carry Role: developer, want the unnamed path unchanged:\n%s", joined)
+	}
+}
+
+// TestNamedDelegationAuditRecordsParentTargetAndGoal is Task 5 (spec §4.2): a
+// named delegation lets a model, not an operator, choose which configured
+// agent a sub-task runs as, and that choice must be answerable after the
+// fact -- which task asked, which agent it named, and what for.
+//
+// This runtime carries no agent identity of its own (Config has no AgentID
+// field: a Runtime is generic and only learns which domain.Agent it is
+// running as through RunTask's parameter, which childFor's named branch
+// never receives), so the caller-side identity actually available here is
+// the PARENT TASK id, not a parent agent id. That id is recovered from the
+// audit event's RequestID via ParentTaskIDForSubTask, the same helper this
+// file already exports for exactly this purpose.
+func TestNamedDelegationAuditRecordsParentTargetAndGoal(t *testing.T) {
+	t.Parallel()
+	audit := adapter.NewMemoryAuditLog()
+	agents := &recordingDelegationAgents{fakeDelegationAgents: fakeDelegationAgents{names: []string{"researcher"}}}
+	parent := NewRuntime(Config{
+		Gate:             taskgate.NewTaskGate(),
+		Maas:             &recordingSubMaas{summary: "ok"},
+		DelegationAgents: agents,
+		Audit:            audit,
+		MaxSpawnDepth:    3,
+	})
+
+	if _, err := parent.RunSubTask(context.Background(), SubTaskSpec{
+		ParentTaskID: "t1",
+		Goal:         "dig up the thing",
+		AgentID:      "researcher",
+	}); err != nil {
+		t.Fatalf("RunSubTask() error = %v, want nil", err)
+	}
+
+	events := mustAuditEvents(t, audit)
+	event, ok := findAuditEvent(events, "subtask_delegated_to_agent")
+	if !ok {
+		t.Fatalf("audit events missing subtask_delegated_to_agent: %#v", events)
+	}
+	if event.SubjectID != "researcher" {
+		t.Errorf("audit SubjectID = %q, want the target agent %q", event.SubjectID, "researcher")
+	}
+	parentTaskID, ok := ParentTaskIDForSubTask(event.RequestID)
+	if !ok || parentTaskID != "t1" {
+		t.Errorf("ParentTaskIDForSubTask(%q) = (%q, %v), want (\"t1\", true): the audit trail must be able to answer which task asked for this delegation",
+			event.RequestID, parentTaskID, ok)
+	}
+	if event.Hash != "dig up the thing" {
+		t.Errorf("audit Hash = %q, want the delegated goal %q", event.Hash, "dig up the thing")
+	}
+}
+
+// writeFailingAuditLog fails every Append and succeeds every Events read,
+// standing in for an audit store that rejects a write (naming mirrors
+// server/events_read_failure_test.go's write/read-direction failingAuditLog
+// pair, per the hardening spec's note on that same-name collision).
+type writeFailingAuditLog struct{ err error }
+
+func (w writeFailingAuditLog) Append(context.Context, domain.AuditEvent) error { return w.err }
+
+func (w writeFailingAuditLog) Events() ([]domain.AuditEvent, error) { return nil, nil }
+
+var _ port.AuditLog = writeFailingAuditLog{}
+
+// TestNamedDelegationAuditFailureIsLoggedNotSwallowed guards the fail-loud
+// half of Task 5: an audit write failure must not be silently discarded (no
+// bare `if err != nil { }`), but it also must not fail an otherwise-legitimate
+// delegation -- the target agent has already been resolved and is about to do
+// real work, and losing that work to an audit-store hiccup would be worse than
+// losing the audit record itself. So the delegation proceeds and the failure
+// is recorded through the runtime's own structured logger instead.
+func TestNamedDelegationAuditFailureIsLoggedNotSwallowed(t *testing.T) {
+	t.Parallel()
+	var logs bytes.Buffer
+	agents := &recordingDelegationAgents{fakeDelegationAgents: fakeDelegationAgents{names: []string{"researcher"}}}
+	parent := NewRuntime(Config{
+		Gate:             taskgate.NewTaskGate(),
+		Maas:             &recordingSubMaas{summary: "ok"},
+		DelegationAgents: agents,
+		Audit:            writeFailingAuditLog{err: errors.New("audit store unavailable")},
+		Logger:           slog.New(slog.NewTextHandler(&logs, nil)),
+		MaxSpawnDepth:    3,
+	})
+
+	if _, err := parent.RunSubTask(context.Background(), SubTaskSpec{
+		ParentTaskID: "t1",
+		Goal:         "dig",
+		AgentID:      "researcher",
+	}); err != nil {
+		t.Fatalf("RunSubTask() error = %v, want nil: a dropped audit write must not fail a legitimate delegation", err)
+	}
+
+	got := logs.String()
+	for _, want := range []string{"WARN", "researcher", "t1", "audit store unavailable"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("logger output = %q, want it to contain %q: an audit write failure must be logged, not silently discarded", got, want)
+		}
 	}
 }
 
