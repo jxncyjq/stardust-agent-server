@@ -99,7 +99,11 @@ func (r *Runtime) handleDelegateTask(ctx context.Context, call domain.ToolCall) 
 		Role:         strings.TrimSpace(call.Arguments["role"]),
 		Toolsets:     parseToolsetsCSV(call.Arguments["toolsets"]),
 	}
-	if parseDelegateBool(call.Arguments["background"]) {
+	background, err := parseDelegateBool(call.Arguments["background"])
+	if err != nil {
+		return domain.ToolResult{CallID: call.ID, Success: false, Error: err.Error()}, nil
+	}
+	if background {
 		handle, err := r.RunSubTaskAsync(ctx, spec)
 		if err != nil {
 			return domain.ToolResult{}, fmt.Errorf("delegate_task background: %w", err)
@@ -143,12 +147,17 @@ func parseToolsetsCSV(value string) []string {
 	return names
 }
 
-func parseDelegateBool(value string) bool {
+// parseDelegateBool reads the background flag. An unrecognised value is an
+// error rather than false: a typo must not quietly turn a background
+// delegation into a blocking one.
+func parseDelegateBool(value string) (bool, error) {
 	switch strings.TrimSpace(strings.ToLower(value)) {
+	case "", "0", "false", "no", "n":
+		return false, nil
 	case "1", "true", "yes", "y":
-		return true
+		return true, nil
 	default:
-		return false
+		return false, fmt.Errorf("background %q is not a recognised boolean", value)
 	}
 }
 

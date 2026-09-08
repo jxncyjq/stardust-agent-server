@@ -68,6 +68,36 @@ func (r *Runtime) canDelegate() bool {
 	return r.role == roleOrchestrator
 }
 
+// validateSubTaskSpec decides whether one delegation request may be admitted,
+// without creating anything: a request rejected here starts no child and has
+// no side effect.
+//
+// It checks only what this deployment actually has. There is no provider
+// descriptor to negotiate against because there is one transport.
+func (r *Runtime) validateSubTaskSpec(spec SubTaskSpec) error {
+	if strings.TrimSpace(spec.Goal) == "" {
+		return fmt.Errorf("validate sub task: goal is required")
+	}
+	switch spec.Role {
+	case "", roleLeaf, roleOrchestrator:
+	default:
+		return fmt.Errorf("validate sub task: role %q is not %q or %q", spec.Role, roleOrchestrator, roleLeaf)
+	}
+	if r.depth+1 > r.maxSpawnDepth {
+		return fmt.Errorf("validate sub task: delegation depth %d exceeds max spawn depth %d", r.depth+1, r.maxSpawnDepth)
+	}
+	// Subset NARROWS, so a name it does not recognise is dropped in silence and
+	// the child ends up with fewer tools than the caller asked for -- possibly
+	// none. (Without, which widens, may ignore unknown names: removing a tool an
+	// agent never had is a real no-op.)
+	for _, name := range spec.Toolsets {
+		if r.tools == nil || !r.tools.HasTool(name) {
+			return fmt.Errorf("validate sub task: toolset name %q is not a tool this agent has", name)
+		}
+	}
+	return nil
+}
+
 // newSubRuntime clones this runtime for a child at depth+1, sharing the inference
 // client, tools, context builder, and audit/event sinks but starting with an
 // empty conversation history so the child gets an independent context. It fails
@@ -152,8 +182,8 @@ func (r *Runtime) RunSubTask(ctx context.Context, spec SubTaskSpec) (SubTaskResu
 	if err := ctx.Err(); err != nil {
 		return SubTaskResult{}, err
 	}
-	if strings.TrimSpace(spec.Goal) == "" {
-		return SubTaskResult{}, fmt.Errorf("run sub task: goal is required")
+	if err := r.validateSubTaskSpec(spec); err != nil {
+		return SubTaskResult{}, err
 	}
 	if !r.canDelegate() {
 		return SubTaskResult{}, fmt.Errorf("run sub task: delegation not permitted for role %q at depth %d", r.role, r.depth)
@@ -242,8 +272,8 @@ func (r *Runtime) RunSubTaskAsync(ctx context.Context, spec SubTaskSpec) (SubTas
 	if err := ctx.Err(); err != nil {
 		return SubTaskHandle{}, err
 	}
-	if strings.TrimSpace(spec.Goal) == "" {
-		return SubTaskHandle{}, fmt.Errorf("run sub task async: goal is required")
+	if err := r.validateSubTaskSpec(spec); err != nil {
+		return SubTaskHandle{}, err
 	}
 	if !r.canDelegate() {
 		return SubTaskHandle{}, fmt.Errorf("run sub task async: delegation not permitted for role %q at depth %d", r.role, r.depth)
