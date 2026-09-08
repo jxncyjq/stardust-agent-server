@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stardust/legion-agent/internal/adapter"
@@ -538,5 +539,129 @@ func TestResolveDelegateAlsoAppliesTheCallersNarrowing(t *testing.T) {
 		if names[absent] {
 			t.Errorf("offered tools = %v, want %q absent: the caller's toolsets narrowing must exclude everything not named", names, absent)
 		}
+	}
+}
+
+// concurrentAgentRecorder is a thread-safe ResolveDelegate recorder for the
+// two Task 6 tests below. RunSubTasks fans a batch out onto one goroutine per
+// entry (see RunSubTasks in delegation.go), so more than one entry can call
+// ResolveDelegate at the same time; recordingDelegationAgents above stores
+// only the LAST call's lastContext/lastEpisodes in unguarded fields, which a
+// concurrent batch would race on and could silently overwrite. This recorder
+// instead appends every id it is asked to resolve under a mutex, so a batch
+// of N concurrent calls loses none of them and none are torn.
+type concurrentAgentRecorder struct {
+	fakeDelegationAgents
+	mu  sync.Mutex
+	ids []string
+}
+
+func (r *concurrentAgentRecorder) ResolveDelegate(_ context.Context, id string, dc DelegationContext) (domain.Agent, *Runtime, error) {
+	r.mu.Lock()
+	r.ids = append(r.ids, id)
+	r.mu.Unlock()
+	// Struct literal bypasses NewRuntime, so the sinks NewRuntime would
+	// otherwise default (audit/events/logger) must be filled here, exactly as
+	// recordingDelegationAgents.ResolveDelegate above does, or the child's own
+	// RunTask nil-derefs the moment it tries to use one.
+	child := &Runtime{
+		maas:          &recordingSubMaas{summary: "ok"},
+		audit:         noopAuditLog{},
+		events:        noopEventBus{},
+		gate:          taskgate.NewTaskGate(),
+		logger:        slog.Default(),
+		role:          dc.Role,
+		depth:         dc.Depth,
+		maxSpawnDepth: dc.MaxSpawnDepth,
+	}
+	return domain.Agent{ID: id, Role: id + "-role"}, child, nil
+}
+
+func (r *concurrentAgentRecorder) recorded() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.ids...)
+}
+
+// TestBatchDelegationHonoursEachEntrysAgentID is Task 6's pin for the shape a
+// prior spec left untested: the batch exit (RunSubTasks / delegateResultsView)
+// was never exercised with per-entry agent_id, only single-mode was, and the
+// gap was only caught by mutation at the time. RunSubTasks starts one
+// goroutine per spec (delegation.go); a closure-capture bug there would have
+// every goroutine resolve the SAME (e.g. the first) entry's agent_id instead
+// of its own. This asserts each entry reaches ResolveDelegate with the id
+// spec.AgentID it was actually given -- not the first entry's for both, and
+// not the unnamed clone path (which would call ResolveDelegate zero times)
+// either.
+func TestBatchDelegationHonoursEachEntrysAgentID(t *testing.T) {
+	t.Parallel()
+	agents := &concurrentAgentRecorder{fakeDelegationAgents: fakeDelegationAgents{names: []string{"researcher", "reviewer"}}}
+	parent := NewRuntime(Config{
+		Gate:             taskgate.NewTaskGate(),
+		Maas:             &recordingSubMaas{summary: "ok"},
+		DelegationAgents: agents,
+		MaxSpawnDepth:    3,
+	})
+
+	results, err := parent.RunSubTasks(context.Background(), []SubTaskSpec{
+		{ParentTaskID: "p", Goal: "dig", AgentID: "researcher"},
+		{ParentTaskID: "p", Goal: "check", AgentID: "reviewer"},
+	})
+	if err != nil {
+		t.Fatalf("RunSubTasks() error = %v, want nil", err)
+	}
+	if len(results) != 2 {
+		t.Fatalf("RunSubTasks() len = %d, want 2", len(results))
+	}
+
+	got := agents.recorded()
+	sort.Strings(got)
+	want := []string{"researcher", "reviewer"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("ResolveDelegate was called with ids %v, want each entry resolved with its OWN agent_id %v -- not both the first entry's id, and not the unnamed default path",
+			got, want)
+	}
+}
+
+// TestDelegationWithoutAgentIDStillClonesTheParent is Task 6's regression pin
+// for the other half of the same seam: a delegation that names no agent at
+// all must still behave exactly as it did before named delegation existed,
+// in BOTH RunSubTask (single) and RunSubTasks (batch) -- the child still runs
+// as the derived "developer" identity (same prompt-inspection technique as
+// TestUnnamedDelegationStillRunsAsTheDerivedDeveloperIdentity above), and the
+// resolver -- though wired and available on this runtime -- is never
+// consulted for a spec with no AgentID.
+func TestDelegationWithoutAgentIDStillClonesTheParent(t *testing.T) {
+	t.Parallel()
+	agents := &concurrentAgentRecorder{fakeDelegationAgents: fakeDelegationAgents{names: []string{"researcher"}}}
+	maas := &recordingSubMaas{summary: "ok"}
+	parent := NewRuntime(Config{
+		Gate:             taskgate.NewTaskGate(),
+		Maas:             maas,
+		ContextBuilder:   cognitive.NewCore(cognitive.NoopCompressor{}),
+		DelegationAgents: agents,
+		MaxSpawnDepth:    3,
+	})
+
+	if _, err := parent.RunSubTask(context.Background(), SubTaskSpec{ParentTaskID: "t1", Goal: "solo"}); err != nil {
+		t.Fatalf("RunSubTask() error = %v, want nil", err)
+	}
+	batchResults, err := parent.RunSubTasks(context.Background(), []SubTaskSpec{
+		{ParentTaskID: "t1", Goal: "one"},
+		{ParentTaskID: "t1", Goal: "two"},
+	})
+	if err != nil {
+		t.Fatalf("RunSubTasks() error = %v, want nil", err)
+	}
+	if len(batchResults) != 2 {
+		t.Fatalf("RunSubTasks() len = %d, want 2", len(batchResults))
+	}
+
+	joined := strings.Join(maas.recorded(), "\n")
+	if count := strings.Count(joined, "Role: developer"); count != 3 {
+		t.Fatalf("children identified as Role: developer = %d occurrences, want 3 (1 single + 2 batch):\n%s", count, joined)
+	}
+	if got := agents.recorded(); len(got) != 0 {
+		t.Fatalf("ResolveDelegate was called %d times for delegations with no agent_id, want 0: %v", len(got), got)
 	}
 }
