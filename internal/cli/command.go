@@ -1013,15 +1013,15 @@ func persistentRunPorts(ctx context.Context, cfg config.Config) (runPorts, func(
 		return runPorts{}, func() {}, err
 	}
 	return runPorts{
-			events:        storage.NewSQLiteEventBus(repo),
-			audit:         storage.NewSQLiteAuditLog(repo),
-			taskSink:      repo,
-			sessionStore:  repo,
-			messageStore:  repo,
-			sessionEvents: repo,
-		}, func() {
-			closeRepositoryLogging(slog.Default(), repo, "persistent-run")
-		}, nil
+		events:        storage.NewSQLiteEventBus(repo),
+		audit:         storage.NewSQLiteAuditLog(repo),
+		taskSink:      repo,
+		sessionStore:  repo,
+		messageStore:  repo,
+		sessionEvents: repo,
+	}, func() {
+		closeRepositoryLogging(slog.Default(), repo, "persistent-run")
+	}, nil
 }
 
 type conversationStore interface {
