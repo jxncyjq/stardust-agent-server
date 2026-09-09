@@ -28,6 +28,7 @@ func TestTheModelProfileReachesTheDefaultRunnerRuntimeConfig(t *testing.T) {
 		taskgate.NewTaskGate(),
 		nil,
 		"deep",
+		nil,
 	)
 
 	if cfg.ModelProfile != "deep" {

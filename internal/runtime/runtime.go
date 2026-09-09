@@ -112,7 +112,12 @@ type Config struct {
 	Role          string
 	Depth         int
 	MaxSpawnDepth int
-	MaxConcurrent int
+	// DelegationAgents is the set of agents this deployment has configured, for
+	// delegate_task to name. Nil means this deployment has no agent directory —
+	// a legitimate deployment shape, not a fallback (see the DelegationAgents
+	// interface doc).
+	DelegationAgents DelegationAgents
+	MaxConcurrent    int
 	// Checkpoints persists suspended tool-loop state so a task can resume after
 	// its goroutine is released (and after a process restart). Nil disables
 	// suspend/resume (the loop runs straight through, legacy behaviour).
@@ -204,23 +209,27 @@ const (
 )
 
 type Runtime struct {
-	maas                  port.MaasInferenceClient
-	audit                 port.AuditLog
-	events                port.EventBus
-	contextBuilder        ContextBuilder
-	contextPrefix         string
-	tools                 *tool.Registry
-	maxToolRounds         int
-	maxToolResultChars    int
-	maxPromptChars        int
-	toolRoot              string
-	lazyTools             bool
-	conversationTurns     []domain.ConversationTurn
-	historyTranscript     []port.InferenceMessage
-	interrupted           atomic.Bool
-	role                  string
-	depth                 int
-	maxSpawnDepth         int
+	maas               port.MaasInferenceClient
+	audit              port.AuditLog
+	events             port.EventBus
+	contextBuilder     ContextBuilder
+	contextPrefix      string
+	tools              *tool.Registry
+	maxToolRounds      int
+	maxToolResultChars int
+	maxPromptChars     int
+	toolRoot           string
+	lazyTools          bool
+	conversationTurns  []domain.ConversationTurn
+	historyTranscript  []port.InferenceMessage
+	interrupted        atomic.Bool
+	role               string
+	depth              int
+	maxSpawnDepth      int
+	// delegationAgents is Config.DelegationAgents, carried to every child by
+	// newSubRuntime like tools and the deny-list. Nil is the legal
+	// no-agent-directory deployment shape (see DelegationAgents' doc).
+	delegationAgents      DelegationAgents
 	maxConcurrent         int
 	subTaskSeq            atomic.Uint64
 	checkpoints           *sessionstate.Store
@@ -414,6 +423,7 @@ func NewRuntime(cfg Config) *Runtime {
 		role:                  role,
 		depth:                 cfg.Depth,
 		maxSpawnDepth:         normalizePositive(cfg.MaxSpawnDepth, defaultMaxSpawnDepth),
+		delegationAgents:      cfg.DelegationAgents,
 		maxConcurrent:         normalizePositive(cfg.MaxConcurrent, defaultMaxConcurrent),
 		checkpoints:           cfg.Checkpoints,
 		toolGate:              cfg.ToolGate,
@@ -657,10 +667,11 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	//
 	// Depth is what tells the two apart. A runtime at depth 0 is where a task
 	// ARRIVES, so it is the one that can be turned away; every deeper runtime is
-	// built by newSubRuntime for a child of a task whose Begin is still held, so
-	// it registers with BeginChild and is admitted unconditionally. (Depth above
-	// 0 is only ever reached through that delegation path — no production
-	// construction site sets Config.Depth.)
+	// built for a child of a task whose Begin is still held, so it registers
+	// with BeginChild and is admitted unconditionally. (Depth above 0 belongs
+	// to the delegation path: a child carries its delegating runtime's depth
+	// plus one, whether newSubRuntime cloned it or a DelegationAgents built it
+	// for a named agent.)
 	//
 	// The refusal is wrapped, not flattened: it carries ErrApplyPending, so a
 	// caller can tell "the plugin set is switching, retry in a moment" from

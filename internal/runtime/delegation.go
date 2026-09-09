@@ -22,8 +22,20 @@ const (
 
 // SubTaskSpec describes one delegated unit of work. Goal is required; Context is
 // optional supporting detail. Role selects the child's delegation capability
-// ("orchestrator" to allow further nesting, otherwise "leaf"). AgentID labels the
-// child agent; empty defaults to a derived id.
+// ("orchestrator" to allow further nesting, otherwise "leaf"). AgentID names a
+// configured agent to run the child as, so the child runs with that agent's own
+// tool-permission role, tool authorisation, model profile and workspace; empty
+// runs a clone of the delegating runtime under a derived id.
+//
+// A non-empty AgentID is mutually exclusive with Role "orchestrator": a named
+// agent's own runtime never registers delegate_task (see ResolveDelegate), so
+// it could never act on that role, and the combination is refused rather than
+// one side being silently ignored. validateSubTaskSpec refuses it, which is
+// what puts the refusal inside RunSubTasks' whole-batch pre-flight;
+// ResolveDelegate refuses it again as a last line of defence for callers that
+// reach it directly. A non-empty Toolsets is NOT refused
+// together with AgentID -- see the Toolsets field doc below and
+// DelegationContext.Toolsets for how the two combine.
 type SubTaskSpec struct {
 	ParentTaskID string
 	AgentID      string
@@ -31,9 +43,14 @@ type SubTaskSpec struct {
 	Context      string
 	Role         string
 	// Toolsets, when non-empty, narrows the child runtime to only these tool
-	// names (a subset of the parent registry). Empty inherits the full parent
-	// tool set. This is the token-optimization knob: a focused sub-agent is
-	// offered only the tools its goal needs.
+	// names. Empty inherits the full parent tool set. This is the
+	// token-optimization knob: a focused sub-agent is offered only the tools
+	// its goal needs. validateSubTaskSpec always checks these names against
+	// THIS runtime's own registry (the delegating side), regardless of
+	// AgentID. Combined with a non-empty AgentID, ResolveDelegate then maps
+	// the same names onto the named agent's own registry, layered on top of
+	// (not replacing) that agent's own DisabledTools deny-list -- see
+	// DelegationContext.Toolsets.
 	Toolsets []string
 }
 
@@ -87,6 +104,13 @@ func (r *Runtime) canDelegate() bool {
 // Subset view that registers nothing of its own. Under HasTool both of those
 // genuinely reachable tools would be refused, and the refusal would say the
 // agent does not have a tool it can in fact execute.
+//
+// A non-empty spec.AgentID is checked last. First against spec.Role alone --
+// a named agent combined with roleOrchestrator is refused here rather than
+// only in ResolveDelegate, so RunSubTasks' whole-batch pre-flight can refuse
+// the batch before any entry starts -- then against r.delegationAgents, where
+// a nil resolver or an unrecognised name are both refused rather than silently
+// falling back to a plain clone of this runtime under someone else's label.
 func (r *Runtime) validateSubTaskSpec(spec SubTaskSpec) error {
 	if strings.TrimSpace(spec.Goal) == "" {
 		return fmt.Errorf("validate sub task: goal is required")
@@ -114,6 +138,36 @@ func (r *Runtime) validateSubTaskSpec(spec SubTaskSpec) error {
 			if !exposed[name] {
 				return fmt.Errorf("validate sub task: toolset name %q is not a tool this agent exposes", name)
 			}
+		}
+	}
+	// Naming an agent is a request to run as THAT agent's configuration. A
+	// deployment with no agent directory cannot honour it, and an unknown name
+	// cannot either; both refuse rather than quietly running the parent's clone
+	// under someone else's label.
+	if spec.AgentID != "" {
+		// This combination is decidable from the spec alone, so it is decided
+		// here, where RunSubTasks' whole-batch pre-flight can reach it. Deciding
+		// it only in ResolveDelegate would let the pre-flight admit a batch it
+		// must refuse, and entry 0 would already be running (with side effects
+		// of its own) by the time entry 1 was rejected -- a partial execution,
+		// which is precisely what that pre-flight exists to prevent.
+		//
+		// Exactly two places refuse the combination, and that is deliberate:
+		// ResolveDelegate keeps its own copy as a last line of defence, because
+		// it is an exported DelegationAgents method whose contract has to hold
+		// on its own rather than on this function having run first. Same
+		// reasoning as newSubRuntime, which re-checks the depth ceiling this
+		// function has already checked.
+		if spec.Role == roleOrchestrator {
+			return fmt.Errorf("validate sub task: role %q cannot be combined with agent_id %q; a named agent's runtime never registers delegate_task, so it could never act as an orchestrator; delegate by name as a leaf, or delegate by role without a name",
+				roleOrchestrator, spec.AgentID)
+		}
+		if r.delegationAgents == nil {
+			return fmt.Errorf("validate sub task: agent_id %q was requested but this deployment has no configured agents", spec.AgentID)
+		}
+		if !r.delegationAgents.HasAgent(spec.AgentID) {
+			return fmt.Errorf("validate sub task: agent_id %q is not a configured agent; configured agents are %v",
+				spec.AgentID, r.delegationAgents.AgentNames())
 		}
 	}
 	return nil
@@ -157,6 +211,9 @@ func (r *Runtime) newSubRuntime(role string, toolsets []string) (*Runtime, error
 		depth:              depth,
 		maxSpawnDepth:      r.maxSpawnDepth,
 		maxConcurrent:      r.maxConcurrent,
+		// Carried like tools and the deny-list: a child that lost it could not
+		// resolve an agent name its parent could.
+		delegationAgents: r.delegationAgents,
 		// The child is built as a struct literal, bypassing NewRuntime and its
 		// nil-logger fallback, so the parent's logger must be carried over
 		// explicitly: a child left with a nil logger would panic the first time
@@ -209,16 +266,100 @@ func (r *Runtime) RunSubTask(ctx context.Context, spec SubTaskSpec) (SubTaskResu
 	if !r.canDelegate() {
 		return SubTaskResult{}, fmt.Errorf("run sub task: delegation not permitted for role %q at depth %d", r.role, r.depth)
 	}
-	child, err := r.newSubRuntime(spec.Role, spec.Toolsets)
+	subTaskID := r.nextSubTaskID(spec.ParentTaskID)
+	agent, child, err := r.childFor(ctx, spec, subTaskID)
 	if err != nil {
 		return SubTaskResult{}, err
 	}
-	return r.runChild(ctx, child, r.nextSubTaskID(spec.ParentTaskID), spec)
+	return r.runChild(ctx, agent, child, subTaskID, spec)
+}
+
+// childFor builds the runtime that will run one sub-task: the named agent's own
+// runtime when spec names one, otherwise a clone of this runtime. It returns the
+// domain.Agent to run as alongside it, because a named child runs as that
+// agent's configured role rather than the fixed one an unnamed child uses.
+//
+// A resolution failure is wrapped and returned. It is never turned into a clone
+// of this runtime: the caller asked for a specific agent, and a clone wearing
+// that agent's name would run with this runtime's tools and model instead of
+// the ones the name selects.
+func (r *Runtime) childFor(ctx context.Context, spec SubTaskSpec, subTaskID string) (domain.Agent, *Runtime, error) {
+	if spec.AgentID == "" {
+		child, err := r.newSubRuntime(spec.Role, spec.Toolsets)
+		if err != nil {
+			return domain.Agent{}, nil, err
+		}
+		return domain.Agent{ID: subTaskID, Role: "developer"}, child, nil
+	}
+	agent, child, err := r.delegationAgents.ResolveDelegate(ctx, spec.AgentID, DelegationContext{
+		Depth:         r.depth + 1,
+		MaxSpawnDepth: r.maxSpawnDepth,
+		Role:          spec.Role,
+		Toolsets:      spec.Toolsets,
+	})
+	if err != nil {
+		return domain.Agent{}, nil, fmt.Errorf("resolve delegate agent %q: %w", spec.AgentID, err)
+	}
+	// A named delegation is the one channel through which the choice of which
+	// configured agent runs a sub-task is made by the MODEL rather than an
+	// operator (spec §4.2): a restricted agent can name an unrestricted one and
+	// inherit its role, tool authorisation, model profile and workspace. That
+	// channel is intentional and is exactly as wide as the deployment's agent
+	// directory -- the audit event below does not gate it, it only makes the
+	// choice answerable after the fact: which task asked, which agent it named,
+	// and what for. It is appended only here, after ResolveDelegate has already
+	// succeeded: a resolution failure is returned above and starts no child, so
+	// there is nothing yet worth recording.
+	//
+	// RequestID carries subTaskID, not spec.ParentTaskID directly, matching how
+	// RunSubTaskAsync's own audit record below fills the same field: nextSubTaskID
+	// mints subTaskID as "<parentTaskID>:sub-N" (defaulting an empty parent to
+	// "task"), and ParentTaskIDForSubTask in this same file exists precisely to
+	// recover the parent id from it. This runtime carries no agent identity of
+	// its own -- Config has no such field, because a Runtime is generic and only
+	// learns which domain.Agent it is running as through RunTask's own parameter,
+	// which this function never receives -- so the parent TASK id is the most
+	// specific caller-side identity actually available at this call site, and
+	// Hash is free to carry the one piece of content that has no field of its
+	// own: the goal the parent asked the named agent to do.
+	if auditErr := r.audit.Append(ctx, domain.AuditEvent{
+		ID:          subTaskID + ":delegated-to-agent",
+		RequestID:   subTaskID,
+		SubjectType: "agent",
+		SubjectID:   spec.AgentID,
+		Action:      "subtask_delegated_to_agent",
+		Hash:        spec.Goal,
+		CreatedAt:   time.Now(),
+		// Without this the row would be stored with a blank origin, and
+		// internal/storage's auditOrigin normalises a blank to
+		// domain.OriginAgent ("agent"). The one event written specifically to
+		// answer "who handed this work to whom" would then read back as the
+		// agent's own work -- the audit actively misleading, not merely
+		// silent. The depth is the CHILD's (r.depth+1, the same value handed
+		// to ResolveDelegate above), because the delegated sub-run is what
+		// this event is about; lazytools.go attributes a runtime's own tool
+		// calls with its own r.depth for the same reason.
+		Origin: domain.DelegateOrigin(r.depth + 1),
+	}); auditErr != nil {
+		// Fail-loud does not mean fail-the-caller here: the target agent has
+		// already been resolved and is about to do real work on the parent's
+		// behalf, and refusing to run it because the audit store had a hiccup
+		// would trade a forensic record for the very delegation that record was
+		// meant to describe. So the failure is not swallowed -- it is logged,
+		// structured, at Warn -- and the delegation proceeds regardless.
+		r.logger.WarnContext(ctx, "record named delegation audit event failed",
+			"component", "runtime",
+			"sub_task_id", subTaskID,
+			"parent_task_id", spec.ParentTaskID,
+			"agent_id", spec.AgentID,
+			"error", auditErr)
+	}
+	return agent, child, nil
 }
 
 // runChild executes a prepared child runtime against spec and maps its run to a
-// SubTaskResult. A child run error is wrapped and returned.
-func (r *Runtime) runChild(ctx context.Context, child *Runtime, subTaskID string, spec SubTaskSpec) (SubTaskResult, error) {
+// SubTaskResult, running it as agent. A child run error is wrapped and returned.
+func (r *Runtime) runChild(ctx context.Context, agent domain.Agent, child *Runtime, subTaskID string, spec SubTaskSpec) (SubTaskResult, error) {
 	agentID := spec.AgentID
 	if agentID == "" {
 		agentID = subTaskID
@@ -236,7 +377,6 @@ func (r *Runtime) runChild(ctx context.Context, child *Runtime, subTaskID string
 		Input:     composeSubTaskInput(spec),
 		CreatedAt: time.Now(),
 	}
-	agent := domain.Agent{ID: agentID, Role: "developer"}
 	run, err := child.RunTask(ctx, agent, task)
 	if err != nil {
 		return SubTaskResult{}, fmt.Errorf("run sub task %q: %w", subTaskID, err)
@@ -314,11 +454,11 @@ func (r *Runtime) RunSubTaskAsync(ctx context.Context, spec SubTaskSpec) (SubTas
 	if !r.canDelegate() {
 		return SubTaskHandle{}, fmt.Errorf("run sub task async: delegation not permitted for role %q at depth %d", r.role, r.depth)
 	}
-	child, err := r.newSubRuntime(spec.Role, spec.Toolsets)
+	subTaskID := r.nextSubTaskID(spec.ParentTaskID)
+	agent, child, err := r.childFor(ctx, spec, subTaskID)
 	if err != nil {
 		return SubTaskHandle{}, err
 	}
-	subTaskID := r.nextSubTaskID(spec.ParentTaskID)
 
 	// The background sub-task keeps running after the tool call that started it
 	// returns, and so possibly after the parent task itself has ended and
@@ -342,7 +482,7 @@ func (r *Runtime) RunSubTaskAsync(ctx context.Context, spec SubTaskSpec) (SubTas
 	go func() {
 		defer endBackground()
 		bg := context.WithoutCancel(ctx)
-		res, err := r.runChild(bg, child, subTaskID, spec)
+		res, err := r.runChild(bg, agent, child, subTaskID, spec)
 		event := domain.RuntimeEvent{
 			Type:      "subtask_completed",
 			TaskID:    subTaskID,

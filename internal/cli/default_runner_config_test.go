@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"github.com/stardust/legion-agent/internal/config"
@@ -36,6 +38,7 @@ func TestBuildDefaultRunnerConfigWiresSkillUsage(t *testing.T) {
 		taskgate.NewTaskGate(),
 		nil,
 		"",
+		nil,
 	)
 
 	if cfg.SkillUsage == nil {
@@ -82,6 +85,7 @@ func TestBuildDefaultRunnerConfigWiresEpisodeRecorder(t *testing.T) {
 		taskgate.NewTaskGate(),
 		nil,
 		"",
+		nil,
 	)
 
 	if cfg.EpisodeRecorder == nil {
@@ -89,5 +93,52 @@ func TestBuildDefaultRunnerConfigWiresEpisodeRecorder(t *testing.T) {
 	}
 	if cfg.EpisodeRecorder != agentruntime.EpisodeRecorder(rec) {
 		t.Fatalf("buildDefaultRunnerConfig().EpisodeRecorder = %v, want %v", cfg.EpisodeRecorder, rec)
+	}
+}
+
+// fakeDelegationAgents is a minimal agentruntime.DelegationAgents test double
+// used only to prove the field flows through buildDefaultRunnerConfig; its
+// methods are never invoked by this test.
+type fakeDelegationAgents struct{}
+
+func (fakeDelegationAgents) AgentNames() []string { return nil }
+
+func (fakeDelegationAgents) HasAgent(string) bool { return false }
+
+func (fakeDelegationAgents) ResolveDelegate(context.Context, string, agentruntime.DelegationContext) (domain.Agent, *agentruntime.Runtime, error) {
+	return domain.Agent{}, nil, errors.New("fakeDelegationAgents does not resolve")
+}
+
+// TestBuildDefaultRunnerConfigWiresDelegationAgents guards the default-runner
+// half of Task 1's delegation-by-name wiring (specB-task-1-report.md,
+// "Task 1 复审" Important-1): the AgentRuntimeResolver built in
+// BuildServeService must reach defaultTaskRunner.runtimeCfg as
+// Config.DelegationAgents too, or a delegate_task issued from a default-agent
+// task (the GUI's primary path, since it carries no agent_id of its own) can
+// never resolve a named agent — with no build or test failure signalling the
+// gap. Before this test, deleting the DelegationAgents field from
+// buildDefaultRunnerConfig's return value left go build/go vet/go test fully
+// green.
+func TestBuildDefaultRunnerConfigWiresDelegationAgents(t *testing.T) {
+	t.Parallel()
+
+	agents := fakeDelegationAgents{}
+	cfg := buildDefaultRunnerConfig(
+		nil, nil, nil, nil,
+		config.RuntimeConfig{},
+		nil, nil, nil, nil,
+		nil,
+		nil,
+		taskgate.NewTaskGate(),
+		nil,
+		"",
+		agents,
+	)
+
+	if cfg.DelegationAgents == nil {
+		t.Fatal("buildDefaultRunnerConfig().DelegationAgents = nil, want the shared resolver")
+	}
+	if cfg.DelegationAgents != agentruntime.DelegationAgents(agents) {
+		t.Fatalf("buildDefaultRunnerConfig().DelegationAgents = %v, want %v", cfg.DelegationAgents, agents)
 	}
 }

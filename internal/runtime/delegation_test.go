@@ -87,6 +87,33 @@ func TestRunSubTaskLeafCannotDelegate(t *testing.T) {
 	}
 }
 
+// M-3 复审：克隆子代理（newSubRuntime）不带走父的 EpisodeRecorder，与具名子代理
+// （AgentRuntimeResolver.buildAgentRuntime，见
+// TestResolveDelegateCarriesTheResolverEpisodeRecorder）形成对照——两条委派路径
+// 在这一个字段上本来就该不一样：具名子代理跑的是「目标 agent 自己的配置」，克隆
+// 子代理跑的是「这个运行时自己的克隆」，newSubRuntime 的结构体字面量压根不列
+// episodeRecorder 这一项。这条钉住克隆这一半，不是未讨论的副作用。
+func TestClonedSubRuntimeCarriesNoEpisodeRecorder(t *testing.T) {
+	t.Parallel()
+
+	parent := NewRuntime(Config{
+		Gate:            taskgate.NewTaskGate(),
+		Maas:            &recordingSubMaas{summary: "ok"},
+		EpisodeRecorder: &fakeEpisodeRecorder{},
+	})
+	if parent.episodeRecorder == nil {
+		t.Fatal("parent.episodeRecorder is nil: the fixture is broken, this test proves nothing")
+	}
+
+	child, err := parent.newSubRuntime(roleLeaf, nil)
+	if err != nil {
+		t.Fatalf("newSubRuntime() error = %v, want nil", err)
+	}
+	if child.episodeRecorder != nil {
+		t.Error("child.episodeRecorder is non-nil: a cloned sub-task has no episodic-memory wiring of its own to carry, unlike a named delegate")
+	}
+}
+
 func TestRunSubTaskDepthLimitFailsLoud(t *testing.T) {
 	t.Parallel()
 

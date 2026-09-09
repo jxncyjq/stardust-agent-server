@@ -3176,6 +3176,7 @@ func TestBuildDefaultRunnerConfigCarriesCompactThreshold(t *testing.T) {
 		taskgate.NewTaskGate(),
 		nil,
 		"",
+		nil,
 	)
 	if cfg.CompactTokenThreshold != 4321 {
 		t.Fatalf("CompactTokenThreshold = %d, want 4321", cfg.CompactTokenThreshold)

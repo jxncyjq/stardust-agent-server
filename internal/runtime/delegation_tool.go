@@ -31,12 +31,44 @@ func (r *Runtime) RegisterDelegateTaskTool(registry *tool.Registry) {
 	if registry == nil || !r.canDelegate() {
 		return
 	}
-	registry.RegisterDescriptor(delegateTaskDescriptor(), tool.HandlerFunc(func(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
+	// The delegatable names are runtime state, not a package constant, so they
+	// are read here and handed to the descriptor builder below. A nil
+	// delegationAgents is a legitimate deployment state — no agent directory
+	// was configured, see the DelegationAgents doc — and yields an empty list,
+	// which the descriptor renders as "there are none" rather than as an empty
+	// menu. The snapshot is taken once, at registration: agentregistry.Registry
+	// is built by New and thereafter only read (Get/Names), so the list cannot
+	// go stale under a running process.
+	var agentNames []string
+	if r.delegationAgents != nil {
+		agentNames = r.delegationAgents.AgentNames()
+	}
+	registry.RegisterDescriptor(delegateTaskDescriptor(agentNames), tool.HandlerFunc(func(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
 		return r.handleDelegateTask(ctx, call)
 	}))
 }
 
-func delegateTaskDescriptor() tool.Descriptor {
+// delegateTaskDescriptor builds the delegate_task descriptor, naming agentNames
+// as the ids agent_id will accept. An empty agentNames means this deployment has
+// no configured agents, and the agent_id description then says exactly that
+// instead of advertising a menu it cannot fill.
+//
+// The names have to be in the description because it is the only place a model
+// can read them: spec §2 declined a list_agents tool on the grounds that the
+// tool description would carry them instead. A descriptor without them leaves
+// the model guessing and spending a whole round on validateSubTaskSpec's
+// refusal just to see the list.
+func delegateTaskDescriptor(agentNames []string) tool.Descriptor {
+	agentIDDescription := "Optional id of a configured agent to run this sub-task as: the sub-task then runs with " +
+		"that agent's own tool-permission role, tool authorisation, model profile and workspace. An id that names " +
+		"no configured agent is refused, and so is combining it with role \"orchestrator\" — a named agent's own " +
+		"runtime never registers delegate_task. Combining it with toolsets is allowed: see toolsets above. Omit to " +
+		"run as a plain clone of this agent. "
+	if len(agentNames) == 0 {
+		agentIDDescription += "This deployment has no configured agents, so every agent_id is refused: omit it."
+	} else {
+		agentIDDescription += "Configured agents that may be named here: " + strings.Join(agentNames, ", ") + "."
+	}
 	return tool.Descriptor{
 		Name: "delegate_task",
 		Description: "Delegate work to a sub-agent with its own independent context; only the sub-agent's " +
@@ -53,10 +85,11 @@ func delegateTaskDescriptor() tool.Descriptor {
 			"properties": map[string]any{
 				"goal":       map[string]any{"type": "string", "description": "The sub-task objective (single mode)."},
 				"context":    map[string]any{"type": "string", "description": "Optional supporting context for the sub-task."},
-				"role":       map[string]any{"type": "string", "description": "\"leaf\" (default) or \"orchestrator\"."},
+				"role":       map[string]any{"type": "string", "description": "\"leaf\" (default) or \"orchestrator\". \"orchestrator\" is refused together with agent_id: a named agent's own runtime never carries delegate_task, so it could never act on it."},
 				"background": map[string]any{"type": "string", "description": "When \"true\", run asynchronously and return a handle."},
-				"toolsets":   map[string]any{"type": "string", "description": "Optional comma-separated tool names narrowing the sub-agent to a subset of the parent tools (single mode). Empty inherits all."},
-				"tasks":      map[string]any{"type": "string", "description": "Batch mode: JSON array of {goal, context, role, toolsets} objects run in parallel."},
+				"toolsets":   map[string]any{"type": "string", "description": "Optional comma-separated tool names narrowing the sub-agent to a subset of its tools (single mode). Empty inherits all. With agent_id, this narrows the named agent's own tools to this subset, on top of (not instead of) that agent's own disabled-tools list — the two combine rather than either overriding the other."},
+				"agent_id":   map[string]any{"type": "string", "description": agentIDDescription},
+				"tasks":      map[string]any{"type": "string", "description": "Batch mode: JSON array of {goal, context, role, toolsets, agent_id} objects run in parallel."},
 			},
 		},
 	}

@@ -72,6 +72,56 @@ func TestResolverInjectsCheckpointsAndGate(t *testing.T) {
 	}
 }
 
+// TestResolverInjectsTheDelegationAgents 守 Task 1 复审 Important-1：
+// ResolveTaskRunner 组装的 per-agent Runtime 必须真的拿到这个 resolver 本身
+// 作为 Config.DelegationAgents，而不只是"这个字段存在"。
+// TestSubRuntimeInheritsTheDelegationAgents（delegation_agents_test.go）只守住
+// 了"Config 字段 → Runtime 字段 → 子 Runtime 字段"这一段结构性传递，从未验证
+// ResolveTaskRunner 这个装配点本身接的是不是真的 resolver——把 agent_resolver.go
+// 里的 `DelegationAgents: r,` 改成 nil 或删掉，go vet/go build/go test 全部保持
+// 干净/绿色，不会有任何测试变红，这正是本仓反复出现的"接口实现了但没接到 runtime
+// 上"那种缺陷形状。
+func TestResolverInjectsTheDelegationAgents(t *testing.T) {
+	t.Parallel()
+
+	resolver := NewAgentRuntimeResolver(AgentRuntimeResolverConfig{Gate: taskgate.NewTaskGate(),
+		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
+			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep"},
+		}),
+		RootConfig: config.Config{Runtime: config.RuntimeConfig{MaxToolRounds: 1}},
+		Audit:      adapter.NewMemoryAuditLog(),
+		Events:     adapter.NewMemoryEventBus(),
+		MaasFactory: func(string) (MaasRunnerFactoryResult, error) {
+			return MaasRunnerFactoryResult{Client: &resolverCaptureMaas{response: "ok"}}, nil
+		},
+	})
+
+	_, runner, ok, err := resolver.ResolveTaskRunner(context.Background(), domain.Task{
+		ID:      "task-delegation-agents",
+		AgentID: "researcher",
+	})
+	if err != nil {
+		t.Fatalf("ResolveTaskRunner error = %v, want nil", err)
+	}
+	if !ok {
+		t.Fatalf("ResolveTaskRunner ok = false, want true")
+	}
+	rt, isRuntime := runner.(*Runtime)
+	if !isRuntime {
+		t.Fatalf("runner type = %T, want *Runtime", runner)
+	}
+	if rt.delegationAgents == nil {
+		t.Fatal("resolver runtime missing delegationAgents, want the resolver itself " +
+			"(a per-agent runner that cannot resolve agent names can never delegate by name)")
+	}
+	if rt.delegationAgents != DelegationAgents(resolver) {
+		t.Fatalf("resolver runtime delegationAgents = %v, want the resolver itself %v", rt.delegationAgents, resolver)
+	}
+	if !rt.delegationAgents.HasAgent("researcher") {
+		t.Error("resolver runtime's delegationAgents does not see the agent registered on this resolver's own registry")
+	}
+}
+
 // TestResolverInjectsTheModelProfile 守 per-agent 路径的 model_profile
 // （final-review.md I-3）。
 //
@@ -1078,5 +1128,185 @@ func TestRecentTurnsForTaskNormalisesZeroMaxTurnChars(t *testing.T) {
 	}
 	if len([]rune(got[0].Content)) >= len([]rune(huge)) {
 		t.Fatalf("MaxTurnChars=0 must fall back to the default cap, got %d runes", len([]rune(got[0].Content)))
+	}
+}
+
+// newDelegateResolver 造一个只带一个具名 agent 的 resolver，供下面几条
+// ResolveDelegate 用例共用。opts 可以再往 config 上加东西（比如 checkpoint store）。
+func newDelegateResolver(t *testing.T, opts ...func(*AgentRuntimeResolverConfig)) *AgentRuntimeResolver {
+	t.Helper()
+	cfg := AgentRuntimeResolverConfig{
+		Gate: taskgate.NewTaskGate(),
+		Registry: agentregistry.New(map[string]agentregistry.AgentConfig{
+			"researcher": {ID: "agent-researcher", Role: "researcher", MaasProfile: "deep"},
+		}),
+		RootConfig: config.Config{Runtime: config.RuntimeConfig{MaxToolRounds: 1}},
+		Audit:      adapter.NewMemoryAuditLog(),
+		Events:     adapter.NewMemoryEventBus(),
+		MaasFactory: func(string) (MaasRunnerFactoryResult, error) {
+			return MaasRunnerFactoryResult{Client: &resolverCaptureMaas{response: "ok"}}, nil
+		},
+	}
+	for _, opt := range opts {
+		opt(&cfg)
+	}
+	return NewAgentRuntimeResolver(cfg)
+}
+
+// 真解析器这一侧的两条硬约束一起验：委派上下文原样落到子运行时（尤其 depth，
+// 顶层装配出生即 0），而 domain.Agent.Role 来自目标 agent 自己的配置。
+// delegation_agents_test.go 里那几条走的是假解析器，够不到这段真装配。
+func TestResolveDelegateAppliesTheDelegationContextAndTheAgentsOwnRole(t *testing.T) {
+	t.Parallel()
+	resolver := newDelegateResolver(t)
+
+	// Role is roleLeaf here, not roleOrchestrator: ResolveDelegate refuses
+	// roleOrchestrator outright for a named agent (see the "orchestrator role
+	// cannot combine with a named agent" case in TestResolveDelegateRefusals),
+	// so it cannot be used to exercise this test's actual point, which is that
+	// dc.Role reaches child.role unchanged and distinct from agent.Role below --
+	// a mix-up this test still catches regardless of which of the two valid
+	// values is used, because agent.Role comes from a completely different
+	// string ("researcher").
+	agent, child, err := resolver.ResolveDelegate(context.Background(), "researcher", DelegationContext{
+		Depth:         1,
+		MaxSpawnDepth: 3,
+		Role:          roleLeaf,
+	})
+	if err != nil {
+		t.Fatalf("ResolveDelegate() error = %v, want nil", err)
+	}
+	if child == nil {
+		t.Fatal("ResolveDelegate() child = nil, want a runtime")
+	}
+	if child.depth != 1 {
+		t.Errorf("child.depth = %d, want 1: a child born at depth 0 defeats the recursion guard", child.depth)
+	}
+	if child.maxSpawnDepth != 3 {
+		t.Errorf("child.maxSpawnDepth = %d, want the delegator's 3", child.maxSpawnDepth)
+	}
+	if child.role != roleLeaf {
+		t.Errorf("child.role = %q, want %q: this is the DELEGATION role the delegator chose", child.role, roleLeaf)
+	}
+	if agent.Role != "researcher" {
+		t.Errorf("agent.Role = %q, want the target agent config's %q: this is the tool-permission role, and it must not be crossed with the delegation role",
+			agent.Role, "researcher")
+	}
+	if agent.ID != "agent-researcher" {
+		t.Errorf("agent.ID = %q, want agent-researcher", agent.ID)
+	}
+	if child.delegationAgents != DelegationAgents(resolver) {
+		t.Error("child.delegationAgents is not the resolver: a named child that may delegate further must resolve names against the same registry")
+	}
+}
+
+// M-3 复审：具名子代理带走了解析器的 EpisodeRecorder（buildAgentRuntime 的
+// Config 字面量里 EpisodeRecorder: r.episodeRecorder），克隆子代理
+// （newSubRuntime）则不带——见 TestClonedSubRuntimeCarriesNoEpisodeRecorder。
+// 这条钉住具名这一半：每次具名委派都会以子任务 id 写一条情景记忆，这是有意为之
+// 的行为，不是未讨论的副作用。
+func TestResolveDelegateCarriesTheResolverEpisodeRecorder(t *testing.T) {
+	t.Parallel()
+	recorder := &fakeEpisodeRecorder{}
+	resolver := newDelegateResolver(t, func(cfg *AgentRuntimeResolverConfig) {
+		cfg.EpisodeRecorder = recorder
+	})
+
+	_, child, err := resolver.ResolveDelegate(context.Background(), "researcher", DelegationContext{Depth: 1, MaxSpawnDepth: 3})
+	if err != nil {
+		t.Fatalf("ResolveDelegate() error = %v, want nil", err)
+	}
+	if child.episodeRecorder == nil {
+		t.Fatal("child.episodeRecorder is nil: a named delegation must run as the target agent's configuration, and that includes its episodic-memory wiring")
+	}
+	if child.episodeRecorder != EpisodeRecorder(recorder) {
+		t.Errorf("child.episodeRecorder = %v, want the same recorder %v", child.episodeRecorder, recorder)
+	}
+}
+
+// 具名子代理不能带走挂起/恢复那套线：子任务的 id 是每次委派现编的，没有任何外部
+// 东西握着它回来恢复，checkpoint 写了也没人读；而在 Windows 上这个 id 里的冒号
+// 直接让 checkpoint 路径非法，第一次具名委派就整条失败。
+// 克隆出来的子代理（newSubRuntime）本来就两样都不带，具名的这条必须一致。
+func TestResolveDelegateLeavesASubTaskWithoutSuspendResumeWiring(t *testing.T) {
+	t.Parallel()
+	store := sessionstate.NewStore(t.TempDir())
+	gate := manualgate.New(approval.NewToolGateStore(t.TempDir()))
+	resolver := newDelegateResolver(t, func(cfg *AgentRuntimeResolverConfig) {
+		cfg.Checkpoints = store
+		cfg.ToolGate = gate
+	})
+
+	_, child, err := resolver.ResolveDelegate(context.Background(), "researcher", DelegationContext{Depth: 1, MaxSpawnDepth: 3})
+	if err != nil {
+		t.Fatalf("ResolveDelegate() error = %v, want nil", err)
+	}
+	if child.checkpoints != nil {
+		t.Error("child.checkpoints is non-nil: a sub-task id is minted per delegation, so a checkpoint under it is one nothing ever loads")
+	}
+	if child.toolGate != nil {
+		t.Error("child.toolGate is non-nil: a suspended sub-task has no path back into the delegation that started it")
+	}
+}
+
+// 解析器自己的拒绝面：每一条都必须报错，不能返回一个「差不多」的运行时。
+func TestResolveDelegateRefusals(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name    string
+		id      string
+		dc      DelegationContext
+		wantMsg string
+	}{
+		{
+			name:    "unknown agent",
+			id:      "resercher",
+			dc:      DelegationContext{Depth: 1, MaxSpawnDepth: 3},
+			wantMsg: "not a configured agent",
+		},
+		{
+			name:    "depth is not below a parent",
+			id:      "researcher",
+			dc:      DelegationContext{Depth: 0, MaxSpawnDepth: 3},
+			wantMsg: "not below a parent",
+		},
+		{
+			name:    "depth exceeds the ceiling",
+			id:      "researcher",
+			dc:      DelegationContext{Depth: 4, MaxSpawnDepth: 3},
+			wantMsg: "exceeds max spawn depth",
+		},
+		{
+			name:    "delegation role is neither leaf nor orchestrator",
+			id:      "researcher",
+			dc:      DelegationContext{Depth: 1, MaxSpawnDepth: 3, Role: "developer"},
+			wantMsg: "is not \"orchestrator\" or \"leaf\"",
+		},
+		{
+			// I-1 复审：role=orchestrator + agent_id 曾被静默接受且完全无效——
+			// canDelegate() 读到 true，但 buildAgentRuntime 装配的注册表里从来没
+			// 有 delegate_task 可调（RegisterDelegateTaskTool 全仓只被默认
+			// runner 调用一次）。现在与 toolsets 同等对待：硬拒。
+			name:    "orchestrator role cannot combine with a named agent",
+			id:      "researcher",
+			dc:      DelegationContext{Depth: 1, MaxSpawnDepth: 3, Role: roleOrchestrator},
+			wantMsg: "cannot be combined with a named agent",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			resolver := newDelegateResolver(t)
+			_, child, err := resolver.ResolveDelegate(context.Background(), tc.id, tc.dc)
+			if err == nil {
+				t.Fatalf("ResolveDelegate(%q, %+v) error = nil, want a refusal", tc.id, tc.dc)
+			}
+			if child != nil {
+				t.Error("ResolveDelegate() returned a runtime alongside its error; a refused delegation must build nothing")
+			}
+			if !strings.Contains(err.Error(), tc.wantMsg) {
+				t.Errorf("error = %v, want it to contain %q", err, tc.wantMsg)
+			}
+		})
 	}
 }
