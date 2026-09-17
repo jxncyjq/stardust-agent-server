@@ -745,7 +745,7 @@ func resolvePluginTrustInput(localRaw json.RawMessage, store *trustlist.Store,
 		// say least about what was actually missing.
 		panic("cli: resolvePluginTrustInput: reportUnavailable is nil; a trust list that cannot be read would go unrecorded")
 	}
-	var listed trustlist.Trust
+	listed := trustlist.WithoutList()
 	if store != nil {
 		current, err := store.Current()
 		if err != nil {
