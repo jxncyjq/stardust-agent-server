@@ -414,3 +414,27 @@ func (c *cache) lock() (func() error, error) {
 		time.Sleep(lockPoll)
 	}
 }
+
+// RecordedRevocationCount 报告缓存目录 dir 的撤销累积集里记下了几条撤销。它只读：
+// 不建目录、不取缓存锁、不碰清单文件。
+//
+// 目录或 revoked-ever.json 不存在时返回 0 与 nil——这台机器没有在这里记下过任何
+// 撤销。记录在却读不懂时返回的错误裹 ErrRevocationsUnknown：把它数成 0，就是让
+// 「删不掉就弄坏」成为丢掉撤销的办法。
+//
+// 它为没有配置远端清单、却仍指着一个缓存目录的部署而存在：那样的部署不建 Store，
+// 也就不会读这份记录，而记录里的撤销对它就此失效（见 WithoutList）。
+func RecordedRevocationCount(dir string) (int, error) {
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		return 0, fmt.Errorf("resolve trustlist cache dir %s: %w", dir, err)
+	}
+	revoked, err := (&cache{dir: abs}).readRevoked()
+	if err != nil {
+		if errors.Is(err, errNoRevocationRecord) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("%w: %w", ErrRevocationsUnknown, err)
+	}
+	return revoked.len(), nil
+}

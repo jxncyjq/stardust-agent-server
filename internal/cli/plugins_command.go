@@ -852,6 +852,40 @@ const (
 		"started; a failed round is not evidence that the cache on disk is unchanged"
 )
 
+// refuseOrphanedRevocations fails a deployment that configured no remote trust
+// list but still points plugins.trustlist.cache at a directory whose revocation
+// record holds at least one revocation.
+//
+// Without a url no Store is built, so nothing reads that record: the merge
+// runs with trustlist.WithoutList, and a key this machine recorded as revoked
+// is trusted again whenever the local keyring registers it. Clearing the url
+// is an ordinary configuration change, and it must not double as a way to
+// forget revocations, so it stops startup and says how to proceed. A record
+// that cannot be read stops it too (the error wraps
+// trustlist.ErrRevocationsUnknown): counting it as empty would make damaging
+// the file the way to drop them. An empty cache setting, a missing directory
+// and an empty record all start normally -- nothing is being forgotten.
+//
+// It cannot see a deployment that removed the cache setting as well: with no
+// path configured, there is no directory to look in.
+func refuseOrphanedRevocations(cfg config.PluginTrustlistConfig) error {
+	if strings.TrimSpace(cfg.Cache) == "" {
+		return nil
+	}
+	n, err := trustlist.RecordedRevocationCount(cfg.Cache)
+	if err != nil {
+		return fmt.Errorf("plugins.trustlist.url is empty but plugins.trustlist.cache (%s) still holds a "+
+			"revocation record that cannot be read; refusing to start without it: %w", cfg.Cache, err)
+	}
+	if n > 0 {
+		return fmt.Errorf("plugins.trustlist.url is empty but plugins.trustlist.cache (%s) records %d "+
+			"revoked key(s); with no trust list configured nothing reads that record, and a revoked key the "+
+			"local keyring registers would be trusted again. Restore plugins.trustlist.url, or, if dropping "+
+			"those revocations is intended, remove the record from that directory", cfg.Cache, n)
+	}
+	return nil
+}
+
 // trustlistRefresher is the single operation runTrustlistRefreshLoop performs:
 // refresh the trustlist once, and report both the trust state that comes out of
 // it and whether the round itself worked.
@@ -892,6 +926,9 @@ type trustlistRefresher interface {
 // through it.
 func resolvePluginTrustlist(cfg config.PluginsConfig) (*trustlist.Store, time.Duration, error) {
 	if !cfg.Trustlist.Enabled() {
+		if err := refuseOrphanedRevocations(cfg.Trustlist); err != nil {
+			return nil, 0, err
+		}
 		return nil, 0, nil
 	}
 	if cfg.Trustlist.RefreshIntervalMs <= 0 {

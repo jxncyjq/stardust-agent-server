@@ -671,3 +671,59 @@ func TestWriteRefusesANilRevokedSet(t *testing.T) {
 		t.Errorf("错误没告诉调用方该传什么：%v", err)
 	}
 }
+
+// TestRecordedRevocationCount 覆盖「只读地数一个缓存目录里记下了几条撤销」的三种
+// 结果：目录或记录不在是 0（这台机器在这里没记过任何撤销）；记录在就如实计数；
+// 记录读不懂必须报错——把它数成 0 正是「删不掉就弄坏」绕过撤销的那条路。
+func TestRecordedRevocationCount(t *testing.T) {
+	t.Parallel()
+
+	t.Run("目录不存在", func(t *testing.T) {
+		t.Parallel()
+		dir := filepath.Join(t.TempDir(), "never-created")
+		n, err := RecordedRevocationCount(dir)
+		if err != nil || n != 0 {
+			t.Fatalf("RecordedRevocationCount = %d, %v; want 0, nil", n, err)
+		}
+		if _, statErr := os.Stat(dir); !errors.Is(statErr, os.ErrNotExist) {
+			t.Errorf("只读计数却把目录建出来了：stat err = %v", statErr)
+		}
+	})
+
+	t.Run("记录不存在", func(t *testing.T) {
+		t.Parallel()
+		n, err := RecordedRevocationCount(t.TempDir())
+		if err != nil || n != 0 {
+			t.Fatalf("RecordedRevocationCount = %d, %v; want 0, nil", n, err)
+		}
+	})
+
+	t.Run("记录在", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		seedRecordedRevocations(t, dir, "dev-abc", "dev-def")
+		n, err := RecordedRevocationCount(dir)
+		if err != nil {
+			t.Fatalf("RecordedRevocationCount: %v", err)
+		}
+		if n != 2 {
+			t.Errorf("n = %d, want 2", n)
+		}
+	})
+
+	t.Run("记录读不懂", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		path := filepath.Join(dir, revokedFileName)
+		if err := os.WriteFile(path, []byte(`{"revoked":"这不是一个数组"}`), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		n, err := RecordedRevocationCount(dir)
+		if err == nil {
+			t.Fatalf("读不懂的撤销记录被数成了 %d 而没有报错", n)
+		}
+		if !errors.Is(err, ErrRevocationsUnknown) {
+			t.Errorf("err = %v, want 裹着 ErrRevocationsUnknown", err)
+		}
+	})
+}
