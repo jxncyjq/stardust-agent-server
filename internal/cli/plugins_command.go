@@ -883,15 +883,18 @@ func refuseOrphanedRevocations(cfg config.PluginTrustlistConfig) error {
 	n, err := trustlist.RecordedRevocationCount(cfg.Cache)
 	if err != nil {
 		return fmt.Errorf("plugins.trustlist.url is empty but plugins.trustlist.cache (%s) cannot be shown "+
-			"to hold no revocations; refusing to start: %w", cfg.Cache, err)
+			"to hold no revocations; refusing to start. Restoring plugins.trustlist.url does not repair this "+
+			"cache: remove revoked-ever.json, trustlist.json and trustlist.sig from that directory, or clear "+
+			"plugins.trustlist.cache: %w", cfg.Cache, err)
 	}
 	if n > 0 {
 		return fmt.Errorf("plugins.trustlist.url is empty but plugins.trustlist.cache (%s) records %d "+
 			"revoked key(s); with no trust list configured nothing reads that record, and a revoked key the "+
-			"local keyring registers would be trusted again. Restore plugins.trustlist.url; or, if dropping "+
-			"those revocations is intended, remove revoked-ever.json, trustlist.json and trustlist.sig from "+
-			"that directory (removing only the record leaves a cache a restored url cannot refresh); or clear "+
-			"plugins.trustlist.cache", cfg.Cache, n)
+			"local keyring registers would be trusted again. Restore plugins.trustlist.url. If dropping those "+
+			"revocations on this deployment is intended, either remove revoked-ever.json, trustlist.json and "+
+			"trustlist.sig from that directory (removing only the record leaves a cache a restored url cannot "+
+			"refresh), or clear plugins.trustlist.cache (the files stay on disk and apply again once url and "+
+			"cache are both restored)", cfg.Cache, n)
 	}
 	return nil
 }

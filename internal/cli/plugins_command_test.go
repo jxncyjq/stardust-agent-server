@@ -6232,6 +6232,14 @@ func TestResolveTrustlistRefusesRevocationsLeftBehindByAnUnconfiguredList(t *tes
 			t.Fatalf("err = %v, want one wrapping trustlist.ErrRevocationsUnknown: a list whose record is "+
 				"gone is not evidence that nothing was revoked", err)
 		}
+		// Restoring the url does not repair this cache, so the error has to point at
+		// the ways that do.
+		for _, want := range []string{"revoked-ever.json", "trustlist.json", "trustlist.sig",
+			"plugins.trustlist.cache"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error does not name %q: %v", want, err)
+			}
+		}
 	})
 
 	t.Run("an unreadable record refuses", func(t *testing.T) {
