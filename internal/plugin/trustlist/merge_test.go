@@ -527,8 +527,8 @@ func TestMergeRefusesATrustThatCarriesNoRevocationRecord(t *testing.T) {
 
 	local := keyringWith(t, []sign.KeyID{"k", "live"}, nil)
 	// 带着完整 keyring 的那一例不是重复：只拿 Keyring 为 nil 的 Trust 考的话，把
-	// 拒绝条件收窄成「revocations 与 Keyring 都为 nil」照样全绿，而清单那一侧
-	// 带着 keyring 却没带累积记录，正是 Refresh 的 fallback 曾经可能交出的形状。
+	// 拒绝条件收窄成「revocations 与 Keyring 都为 nil」照样全绿。带着 keyring 却
+	// 没带累积记录，是包外用 sign.ParseKeyring 自己拼一份 Trust 时得到的形状。
 	withKeyring := trustFrom(t, keyringWith(t, []sign.KeyID{"k", "live"}, nil), nil)
 	withKeyring.revocations = nil
 	cases := map[string]Trust{

@@ -104,8 +104,10 @@ func sortedIDs[V any](m map[sign.KeyID]V) []sign.KeyID {
 // "this Trust does not know what this machine has revoked", and merging it as
 // though the list half were merely empty is how a path that forgot to carry
 // the record would turn a deleted trustlist.json back into a way to un-revoke
-// a key. Every Trust built outside this package has a nil record, so what gets
-// through is only what this package built — a Store's, or WithoutList. That
+// a key. The record's pointer is unexported, so only a record this package
+// built gets through — a Store's, or WithoutList's. That guards against
+// forgetting the record, not against grafting: a caller can still take such a
+// Trust and overwrite Keyring / KeyringRaw, and nothing here can tell. That
 // leaves two legal shapes:
 //
 //	both fields set        A list this machine can act on. Its registrations
