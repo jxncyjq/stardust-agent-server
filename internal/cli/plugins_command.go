@@ -860,11 +860,19 @@ const (
 // runs with trustlist.WithoutList, and a key this machine recorded as revoked
 // is trusted again whenever the local keyring registers it. Clearing the url
 // is an ordinary configuration change, and it must not double as a way to
-// forget revocations, so it stops startup and says how to proceed. A record
-// that cannot be read stops it too (the error wraps
-// trustlist.ErrRevocationsUnknown): counting it as empty would make damaging
-// the file the way to drop them. An empty cache setting, a missing directory
-// and an empty record all start normally -- nothing is being forgotten.
+// forget revocations, so it stops startup and says how to proceed. Whatever
+// trustlist.RecordedRevocationCount cannot vouch for stops it too -- a record
+// that cannot be read, a cached list whose record is gone -- with the error
+// wrapping trustlist.ErrRevocationsUnknown. An empty cache setting, a missing
+// directory, and a directory holding neither a record nor a list start
+// normally, as does an empty record: nothing is being forgotten.
+//
+// The check runs whether or not plugins.manifest is set, because this section
+// is resolved independently of it; a deployment with plugins off but a stale
+// cache setting clears plugins.trustlist.cache to start.
+//
+// The remedy names all three cache files. Removing only the record would leave
+// a cached list without one, which a Store refuses once the url is restored.
 //
 // It cannot see a deployment that removed the cache setting as well: with no
 // path configured, there is no directory to look in.
@@ -874,14 +882,16 @@ func refuseOrphanedRevocations(cfg config.PluginTrustlistConfig) error {
 	}
 	n, err := trustlist.RecordedRevocationCount(cfg.Cache)
 	if err != nil {
-		return fmt.Errorf("plugins.trustlist.url is empty but plugins.trustlist.cache (%s) still holds a "+
-			"revocation record that cannot be read; refusing to start without it: %w", cfg.Cache, err)
+		return fmt.Errorf("plugins.trustlist.url is empty but plugins.trustlist.cache (%s) cannot be shown "+
+			"to hold no revocations; refusing to start: %w", cfg.Cache, err)
 	}
 	if n > 0 {
 		return fmt.Errorf("plugins.trustlist.url is empty but plugins.trustlist.cache (%s) records %d "+
 			"revoked key(s); with no trust list configured nothing reads that record, and a revoked key the "+
-			"local keyring registers would be trusted again. Restore plugins.trustlist.url, or, if dropping "+
-			"those revocations is intended, remove the record from that directory", cfg.Cache, n)
+			"local keyring registers would be trusted again. Restore plugins.trustlist.url; or, if dropping "+
+			"those revocations is intended, remove revoked-ever.json, trustlist.json and trustlist.sig from "+
+			"that directory (removing only the record leaves a cache a restored url cannot refresh); or clear "+
+			"plugins.trustlist.cache", cfg.Cache, n)
 	}
 	return nil
 }

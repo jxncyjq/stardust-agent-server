@@ -132,8 +132,8 @@ type Trust struct {
 // revoked-ever.json 不会再被读。若被撤销的钥匙同时登记在本地 keyring，它签的包会
 // 重新可信。不要把这里的空集合读成「这台机器确实没有撤销」。
 //
-// 装配方在拿它之前用 RecordedRevocationCount 查一次仍然配着的缓存目录，有记录就
-// 拒绝启动。连缓存目录的配置也一并删掉的部署，这里无从得知那个目录在哪。
+// WithoutList 不读任何缓存目录，因此不能用来代表一台缓存目录里仍记着撤销的机器；
+// 判断一个目录里有没有记着撤销，见 RecordedRevocationCount。
 func WithoutList() Trust {
 	return Trust{Status: StatusUnavailable, revocations: newRevokedSet()}
 }

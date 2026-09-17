@@ -416,25 +416,52 @@ func (c *cache) lock() (func() error, error) {
 }
 
 // RecordedRevocationCount 报告缓存目录 dir 的撤销累积集里记下了几条撤销。它只读：
-// 不建目录、不取缓存锁、不碰清单文件。
+// 不建目录、不取缓存锁、不改动任何文件。
 //
-// 目录或 revoked-ever.json 不存在时返回 0 与 nil——这台机器没有在这里记下过任何
-// 撤销。记录在却读不懂时返回的错误裹 ErrRevocationsUnknown：把它数成 0，就是让
-// 「删不掉就弄坏」成为丢掉撤销的办法。
+// 返回 0 与 nil 只有两种情况：dir 不存在；或者 dir 里既没有 revoked-ever.json 也
+// 没有 trustlist.json——与 cache.read 归到「从头重建是安全的」那一支是同一个判定。
 //
-// 它为没有配置远端清单、却仍指着一个缓存目录的部署而存在：那样的部署不建 Store，
-// 也就不会读这份记录，而记录里的撤销对它就此失效（见 WithoutList）。
+// 其余一律报错，且错误裹 ErrRevocationsUnknown 的情况与 cache.read 判为「撤销
+// 不可知」的形态一致：
+//
+//   - 记录在却读不懂：数成 0 就是让「删不掉就弄坏」成为丢掉撤销的办法；
+//   - 清单在而记录不在：write 总是先写记录再发布清单，所以这个形态只能是记录丢了，
+//     不是「这台机器从没撤销过任何东西」。
+//
+// dir 存在却不是目录时也报错（不裹哨兵，它是配置错误）：不这样的话，同一个指错了
+// 的路径在把 dir/revoked-ever.json 报成「不存在」的平台上会被数成 0，在别的平台上
+// 却报错。
 func RecordedRevocationCount(dir string) (int, error) {
 	abs, err := filepath.Abs(dir)
 	if err != nil {
 		return 0, fmt.Errorf("resolve trustlist cache dir %s: %w", dir, err)
 	}
-	revoked, err := (&cache{dir: abs}).readRevoked()
+	info, err := os.Stat(abs)
 	if err != nil {
-		if errors.Is(err, errNoRevocationRecord) {
+		if errors.Is(err, os.ErrNotExist) {
 			return 0, nil
 		}
+		return 0, fmt.Errorf("stat trustlist cache dir %s: %w", abs, err)
+	}
+	if !info.IsDir() {
+		return 0, fmt.Errorf("trustlist cache dir %s exists but is not a directory", abs)
+	}
+	c := &cache{dir: abs}
+	revoked, err := c.readRevoked()
+	if err == nil {
+		return revoked.len(), nil
+	}
+	if !errors.Is(err, errNoRevocationRecord) {
 		return 0, fmt.Errorf("%w: %w", ErrRevocationsUnknown, err)
 	}
-	return revoked.len(), nil
+	_, listErr := os.Lstat(c.path(listFileName))
+	switch {
+	case listErr == nil:
+		return 0, fmt.Errorf("%w: %s holds a cached trustlist but no revocation record; the record was "+
+			"lost, which is not evidence that nothing was revoked", ErrRevocationsUnknown, abs)
+	case errors.Is(listErr, os.ErrNotExist):
+		return 0, nil
+	default:
+		return 0, fmt.Errorf("stat cached trustlist %s: %w", c.path(listFileName), listErr)
+	}
 }

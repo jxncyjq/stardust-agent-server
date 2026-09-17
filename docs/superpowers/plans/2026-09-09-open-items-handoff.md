@@ -26,7 +26,7 @@
 
 复审分诊为**修复前就有、本次只如实写进注释**的两条缺口（`store.go` `WithoutList` / `Trust.revocations` 注释里有写）：
 
-- **清空 url 的部署不再读缓存里的撤销**：「没配清单」只看 url，曾配过清单、累积过撤销、后来清空 url 的部署走 `WithoutList`，`revoked-ever.json` 不再被读；被撤销钥匙若同时登记在本地 keyring，它签的包重新可信。非回归、非提权。**需要拍板**：url 为空而 cache 目录里有 `revoked-ever.json` 时，报错启动失败，还是只读地并进来。→ **已拍板：直接报错（2026-09-17，分支 `fix/trustlist-orphaned-revocations`）**：`resolvePluginTrustlist` 在 url 为空、cache 仍配着且记录里 ≥1 条撤销（或记录读不懂，裹 `ErrRevocationsUnknown`）时拒绝启动；空记录/目录不在照常启动。**残留**：连 `cache` 配置也删掉的部署无从得知旧目录在哪。
+- **清空 url 的部署不再读缓存里的撤销**：「没配清单」只看 url，曾配过清单、累积过撤销、后来清空 url 的部署走 `WithoutList`，`revoked-ever.json` 不再被读；被撤销钥匙若同时登记在本地 keyring，它签的包重新可信。非回归、非提权。**需要拍板**：url 为空而 cache 目录里有 `revoked-ever.json` 时，报错启动失败，还是只读地并进来。→ **已拍板：直接报错（2026-09-17，分支 `fix/trustlist-orphaned-revocations`）**：`resolvePluginTrustlist` 在 url 为空、cache 仍配着且记录里 ≥1 条撤销，或撤销不可知（记录读不懂 / **清单在而记录缺失**，裹 `ErrRevocationsUnknown`）时拒绝启动；空记录、目录不在、记录与清单都不在照常启动。补救文案要求删掉**全部三个**缓存文件——复审实测只删记录会留下「清单在而记录缺失」，恢复 url 后缓存刷不动。没启用插件（无 manifest）也会检查。**残留**：连 `cache` 配置也删掉的部署无从得知旧目录在哪。
 - **嫁接挡不住**：包外可拿一份带记录的 Trust 改写导出字段 `Keyring`/`KeyringRaw`。守的是「忘了带」，不是「故意拼」；要彻底挡住得改 API（如 `MergeLocal(localRaw)` + 不导出那两个字段）。
 
 以下为原文存档：

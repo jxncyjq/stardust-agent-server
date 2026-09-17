@@ -6210,10 +6210,27 @@ func TestResolveTrustlistRefusesRevocationsLeftBehindByAnUnconfiguredList(t *tes
 		if store != nil {
 			t.Error("a Store was returned alongside the refusal")
 		}
-		for _, want := range []string{"plugins.trustlist.url", dir} {
+		// The remedy has to name every file it asks an operator to remove: removing
+		// only the record leaves a list without one, which a later Store refuses.
+		for _, want := range []string{"plugins.trustlist.url", "plugins.trustlist.cache", dir,
+			"revoked-ever.json", "trustlist.json", "trustlist.sig"} {
 			if !strings.Contains(err.Error(), want) {
 				t.Errorf("error does not name %q, so an operator cannot tell what to fix: %v", want, err)
 			}
+		}
+	})
+
+	t.Run("a cached list without its record refuses", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "trustlist.json"), []byte(`{"serial":1}`), 0o600); err != nil {
+			t.Fatalf("seed trustlist.json: %v", err)
+		}
+		_, _, err := resolvePluginTrustlist(config.PluginsConfig{
+			Trustlist: config.PluginTrustlistConfig{Cache: dir},
+		})
+		if !errors.Is(err, trustlist.ErrRevocationsUnknown) {
+			t.Fatalf("err = %v, want one wrapping trustlist.ErrRevocationsUnknown: a list whose record is "+
+				"gone is not evidence that nothing was revoked", err)
 		}
 	})
 
@@ -6225,6 +6242,11 @@ func TestResolveTrustlistRefusesRevocationsLeftBehindByAnUnconfiguredList(t *tes
 		})
 		if !errors.Is(err, trustlist.ErrRevocationsUnknown) {
 			t.Fatalf("err = %v, want one wrapping trustlist.ErrRevocationsUnknown", err)
+		}
+		for _, want := range []string{"plugins.trustlist.cache", dir} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error does not name %q: %v", want, err)
+			}
 		}
 	})
 
