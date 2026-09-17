@@ -4038,7 +4038,7 @@ func TestResolvePluginTrustInputHandsBackTheMergesPublishers(t *testing.T) {
 		t.Fatalf("read keyring %s: %v", keyringPath, err)
 	}
 
-	_, wantPublishers, err := trustlist.Merge(localRaw, trustlist.Trust{})
+	_, wantPublishers, err := trustlist.Merge(localRaw, trustlist.WithoutList())
 	if err != nil {
 		t.Fatalf("trustlist.Merge: %v", err)
 	}

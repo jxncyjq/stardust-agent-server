@@ -95,22 +95,27 @@ func sortedIDs[V any](m map[sign.KeyID]V) []sign.KeyID {
 // key_id is present, unique and that revoked_at, when given, is RFC 3339), and
 // dropping it would make "delete the public key" an antidote to revoking it.
 //
-// # Three shapes the list half may legally arrive in
+// # Two shapes the list half may legally arrive in
 //
 // The two guards below refuse a Trust carrying one of Keyring / KeyringRaw
 // without the other, because each field holds a half the other does not and
-// half-using one would silently drop the rest. What is left is three legal
-// shapes, and the third is easy to mistake for the second:
+// half-using one would silently drop the rest. A Trust carrying no revocation
+// record at all is refused too, wrapping ErrRevocationsUnknown: nil there means
+// "this Trust does not know what this machine has revoked", and merging it as
+// though the list half were merely empty is how a path that forgot to carry
+// the record would turn a deleted trustlist.json back into a way to un-revoke
+// a key. Every Trust built outside this package has a nil record, so what gets
+// through is only what this package built — a Store's, or WithoutList. That
+// leaves two legal shapes:
 //
 //	both fields set        A list this machine can act on. Its registrations
 //	                       and its revocations both join the union.
-//	neither field set,     Nothing from the list half at all.
-//	no revocations
-//	neither field set,     The cached list document is missing, damaged, or
-//	revocations present    would not assemble — but the revocations this machine
-//	                       has already recorded are still known, and still apply.
+//	neither field set      No list document — none configured (WithoutList),
+//	                       or the cached one is missing, damaged, or would not
+//	                       assemble. The revocations this machine has recorded
+//	                       (possibly none) are still known, and still apply.
 //
-// The third shape is not a degraded version of the second. Trust.revocations is
+// The second shape is not "nothing from the list half". Trust.revocations is
 // a local file and does not depend on reaching the network; the whole reason it
 // exists is that revocations must not weaken when the list cannot be read. If a
 // missing trustlist.json also took this machine's accumulated revocations with
@@ -184,6 +189,11 @@ func Merge(localRaw json.RawMessage, t Trust) (*sign.Keyring, map[sign.KeyID]str
 		return nil, nil, fmt.Errorf("merge trust sets: the trust list half has a parsed keyring but no " +
 			"keyring document; its public keys live only in the document, so merging from the parsed " +
 			"keyring alone would silently drop every key it registers")
+	case t.revocations == nil:
+		return nil, nil, fmt.Errorf("merge trust sets: the trust list half carries no revocation record, so "+
+			"there is no way to tell which keys this machine has seen revoked; merging it as an empty list "+
+			"half would un-revoke them (a deployment with no trust list passes trustlist.WithoutList): %w",
+			ErrRevocationsUnknown)
 	}
 
 	// Local first, list second, first one seen wins — for registrations and
@@ -252,21 +262,13 @@ func Merge(localRaw json.RawMessage, t Trust) (*sign.Keyring, map[sign.KeyID]str
 		}
 	}
 
-	// The third legal shape (see the doc comment): the list half carries no
-	// keyring document, but the revocations this machine has recorded are
-	// known and still apply. They are added whatever t.Keyring holds — when it
-	// is non-nil the loop above has already contributed the same records and
-	// "first one seen wins" makes this a no-op, so there is one rule here and
-	// not two.
-	//
-	// A nil t.revocations is "this Trust carries no revocation record", NOT
-	// "this machine has none": Store.Current spells the latter as a non-nil
-	// empty set and refuses (ErrRevocationsUnknown) rather than hand back nil
-	// when it cannot tell. Nothing is inferred from the nil here.
-	if t.revocations != nil {
-		for _, e := range t.revocations.entries {
-			addRevocation(e)
-		}
+	// The revocations this machine has recorded apply whatever t.Keyring holds
+	// (see the doc comment's second shape). When it is non-nil the loop above
+	// has already contributed the same records and "first one seen wins" makes
+	// this a no-op, so there is one rule here and not two. t.revocations is
+	// non-nil here: the switch at the top refused the nil record.
+	for _, e := range t.revocations.entries {
+		addRevocation(e)
 	}
 
 	// No keys means neither half registered one: a half that IS present either

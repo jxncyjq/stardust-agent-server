@@ -1239,3 +1239,98 @@ func TestCurrentKeepsRecordedRevocationsWhenTheTrustSetWillNotAssemble(t *testin
 	}
 	requireRecordedRevocationSurvives(t, "信任集装不出来", trust)
 }
+
+// TestRefreshKeepsRecordedRevocationsInTheTrustItFallsBackTo 是 Current 那三条用例
+// 在 Refresh 上的对应物：刷新失败时交回的那份「手上仍然可用的」Trust，同样必须带着
+// 这台机器已经记下的撤销。
+//
+// 它单独成立而不是被 Current 那几条顺带覆盖，是因为 Refresh 自己造 fallback，不经过
+// Current。两条路曾经各写一遍，只修了 Current 那条——Refresh 这条交回的 Trust 一旦
+// 被送进 Merge，删掉 trustlist.json 就又能让被撤销的钥匙重新可信。
+func TestRefreshKeepsRecordedRevocationsInTheTrustItFallsBackTo(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, cacheDir string)
+	}{
+		{
+			// errNoCache 那一支：清单文件不在，撤销记录在。这一轮会去取回，
+			// 而服务端已经关了，于是落到 fetch 失败的 fail。
+			name:  "trustlist.json 缺失且取回失败",
+			setup: func(t *testing.T, cacheDir string) { t.Helper() },
+		},
+		{
+			// 损坏那一支：Refresh 在取回之前就停下。
+			name:  "trustlist.json 损坏",
+			setup: damageCachedList,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cur := newServeList(nil, nil)
+			srv := newListServer(t, cur)
+			cacheDir := t.TempDir()
+			seedRecordedRevocations(t, cacheDir, "dev-abc")
+			tc.setup(t, cacheDir)
+			store := newTestStore(t, srv, cacheDir, fixedNow)
+			srv.Close()
+
+			trust, err := store.Refresh(context.Background())
+			if err == nil {
+				t.Fatal("没有可用清单、也取不回新的，Refresh 却成功了")
+			}
+			if errors.Is(err, ErrRevocationsUnknown) {
+				t.Fatalf("err = %v；撤销记录读得出来，这里不是「判不了」", err)
+			}
+			requireRecordedRevocationSurvives(t, tc.name, trust)
+		})
+	}
+}
+
+// TestRefreshRefusesWhenTheRevocationRecordCannotBeRead：缓存损坏，而撤销累积集
+// 自己也读不出来。Refresh 交回的错误必须裹 ErrRevocationsUnknown，Trust 的
+// revocations 必须是 nil——与 Current 在同一形态下的回答一致。
+func TestRefreshRefusesWhenTheRevocationRecordCannotBeRead(t *testing.T) {
+	cur := newServeList(nil, nil)
+	srv := newListServer(t, cur)
+	cacheDir := t.TempDir()
+	path := filepath.Join(cacheDir, revokedFileName)
+	if err := os.WriteFile(path, []byte(`{"revoked":"这不是一个数组"}`), 0o600); err != nil {
+		t.Fatalf("seed %s: %v", revokedFileName, err)
+	}
+	damageCachedList(t, cacheDir)
+	store := newTestStore(t, srv, cacheDir, fixedNow)
+
+	trust, err := store.Refresh(context.Background())
+	if err == nil {
+		t.Fatal("缓存损坏且撤销累积集读不出来，Refresh 却没有报错")
+	}
+	if !errors.Is(err, ErrRevocationsUnknown) {
+		t.Fatalf("err = %v, want 裹着 ErrRevocationsUnknown", err)
+	}
+	if trust.revocations != nil {
+		t.Error("判不了撤销的那份 Trust 却带回了一个撤销集合")
+	}
+}
+
+// TestRefreshSaysKnownEmptyOnAnEmptyCacheItCannotFill：全新安装、第一次取回就失败。
+// 这台机器确实没记过撤销，所以 fallback 带的是非 nil 的空集合，Merge 收得下它。
+func TestRefreshSaysKnownEmptyOnAnEmptyCacheItCannotFill(t *testing.T) {
+	cur := newServeList(nil, nil)
+	srv := newListServer(t, cur)
+	store := newTestStore(t, srv, t.TempDir(), fixedNow)
+	srv.Close()
+
+	trust, err := store.Refresh(context.Background())
+	if err == nil {
+		t.Fatal("既无缓存又无网络时 Refresh 却成功了")
+	}
+	if errors.Is(err, ErrRevocationsUnknown) {
+		t.Fatalf("err = %v；全新安装不是「判不了」", err)
+	}
+	if trust.revocations == nil {
+		t.Fatal("全新安装的 fallback 里 revocations 是 nil，want 一个空集合")
+	}
+	if n := trust.revocations.len(); n != 0 {
+		t.Errorf("全新安装却读出了 %d 条撤销", n)
+	}
+}

@@ -98,12 +98,31 @@ type Trust struct {
 	// 这一侧读到撤销的地方。
 	//
 	// nil 说的是「这份 Trust 不携带任何撤销记录」，**不是**「这台机器没有撤销」。
-	// 后者的表达是一个非 nil 的空集合。Current 只在裹 ErrRevocationsUnknown 硬错
-	// 的时候交回一份 revocations 为 nil 的 Trust（见 Current）。
+	// 后者的表达是一个非 nil 的空集合。Current 与 Refresh 只在裹
+	// ErrRevocationsUnknown 硬错的时候交回一份 revocations 为 nil 的 Trust。
+	//
+	// Merge 拒绝 revocations 为 nil 的 Trust。这是这个字段不导出的第二个理由：包外
+	// 造不出一份非 nil 的，所以能进 Merge 的 Trust 只有本包造出来的那几种——Store
+	// 交回的，与 WithoutList。「某条路径忘了带上撤销记录」因此不再是一个能悄悄走通
+	// 的形状，而是一次合并失败。
 	//
 	// 它不导出：这个集合的语义（只增不减、并集时先见到的胜出、空与 nil 有别）
 	// 由本包持有，而包外唯一需要它的地方是 Merge，就在本包内。
 	revocations *revokedSet
+}
+
+// WithoutList 是没有配置远端清单的部署交给 Merge 的那份 Trust：清单那一侧什么
+// 都没有，撤销记录是已知的空集合。
+//
+// 空集合而不是 nil，是因为这里是知道的：撤销累积集只存在于 Store 的缓存目录里，
+// 没有配置清单就没有那个目录，也就没有任何一条被记下的撤销可以漏掉。本地 keyring
+// 自己写下的撤销不经过这里，Merge 从本地那一半读它们。
+//
+// 它存在，是因为 Merge 拒绝 revocations 为 nil 的 Trust（见 Trust.revocations），
+// 而零值 Trust 恰恰是 nil。有了它，「这台部署没有清单」与「某条路径忘了带上撤销
+// 记录」在值上就分得开了。
+func WithoutList() Trust {
+	return Trust{Status: StatusUnavailable, revocations: newRevokedSet()}
 }
 
 // Config 是造一个 Store 需要的东西。
@@ -274,6 +293,7 @@ func (s *Store) Refresh(ctx context.Context) (Trust, error) {
 		// 而一份新清单带进一把新钥匙就能重新装得出来。
 
 	case errors.Is(cacheErr, errNoCache):
+		fallback, fallbackErr = s.unavailableFallback(cachedRevoked, cacheErr)
 		// 清单文件不在。这既可能是全新安装，也可能是一次首写崩溃或有人删了一个
 		// 文件，两者都由 cache.read 归到 errNoCache——它的语义是「从头重建是安全
 		// 的」。但重建不等于从空的撤销累积集起步：cache.read 在这一支仍然会把磁盘
@@ -291,6 +311,7 @@ func (s *Store) Refresh(ctx context.Context) (Trust, error) {
 		// 损坏要人来看一眼，不能靠一次成功的取回悄悄「修好」。这条与 errNoCache
 		// 的分界也是为此：全新安装（以及首写崩溃留下的残局）必须能正常起步，否则
 		// 缓存会变成一块修不好的砖。
+		fallback, fallbackErr = s.unavailableFallback(cachedRevoked, cacheErr)
 		return fail(fmt.Errorf("trustlist cache at %s is unusable; refusing to refresh over it, because "+
 			"this round would have no serial to compare against and publishing over the damaged files "+
 			"would erase the only evidence of what happened: %w", s.cache.dir, cacheErr))
@@ -344,6 +365,22 @@ func (s *Store) Refresh(ctx context.Context) (Trust, error) {
 		return fail(fmt.Errorf("cache trustlist serial %d from %s: %w", doc.Serial, s.url, err))
 	}
 	return s.assemble(doc, written)
+}
+
+// unavailableFallback 是 Refresh 在缓存里没有可装配的清单时要交回的那份 Trust：
+// unavailable，但带着这台机器已经记下的撤销。fromRead 与 cause 是 cache.read 这一
+// 次的第二、第三个返回值。
+//
+// 它与 Current 走同一个 knownRevocations，理由也相同（见 Current）：Refresh 失败
+// 时交回的 Trust 是「手上仍然可用的状态」，调用方可以把它送进 Merge；它若不带撤销，
+// 删掉 trustlist.json 就又成了解除撤销的办法。撤销记录读不出来时返回的错误裹
+// ErrRevocationsUnknown，Trust 的 revocations 为 nil，Merge 会拒绝它。
+func (s *Store) unavailableFallback(fromRead *revokedSet, cause error) (Trust, error) {
+	known, err := s.knownRevocations(fromRead, cause)
+	if err != nil {
+		return Trust{Status: StatusUnavailable}, err
+	}
+	return Trust{Status: StatusUnavailable, revocations: known}, nil
 }
 
 // assemble 把一份文档与撤销累积集装配成 Trust，并按当前时间判定 fresh/stale。

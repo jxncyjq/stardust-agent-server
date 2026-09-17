@@ -3,6 +3,7 @@ package trustlist
 import (
 	"crypto/ed25519"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -30,12 +31,19 @@ func trustFrom(t *testing.T, keyringRaw json.RawMessage, names map[sign.KeyID]st
 	for id, name := range names {
 		publishers[id] = Publisher{KeyID: id, DisplayName: name}
 	}
+	// revocations 也按 Store 的形状来：累积集至少含这份清单自己写下的撤销（Refresh
+	// 落盘前先 mergeFrom 它），而 Merge 拒绝一份不带撤销记录的 Trust。
+	revocations := newRevokedSet()
+	if err := revocations.mergeFrom(keyringRaw); err != nil {
+		t.Fatalf("mergeFrom: %v", err)
+	}
 	return Trust{
-		Keyring:    keyring,
-		KeyringRaw: keyringRaw,
-		Publishers: publishers,
-		Status:     StatusFresh,
-		Serial:     7,
+		Keyring:     keyring,
+		KeyringRaw:  keyringRaw,
+		Publishers:  publishers,
+		Status:      StatusFresh,
+		Serial:      7,
+		revocations: revocations,
 	}
 }
 
@@ -132,7 +140,7 @@ func TestMergeSurvivesEitherSideBeingAbsent(t *testing.T) {
 		t.Parallel()
 
 		local := keyringWith(t, []sign.KeyID{"ops"}, nil)
-		merged, _, err := Merge(local, Trust{Status: StatusUnavailable})
+		merged, _, err := Merge(local, WithoutList())
 		if err != nil {
 			t.Fatalf("Merge: %v", err)
 		}
@@ -157,7 +165,7 @@ func TestMergeSurvivesEitherSideBeingAbsent(t *testing.T) {
 	t.Run("两边都没有", func(t *testing.T) {
 		t.Parallel()
 
-		merged, publishers, err := Merge(nil, Trust{Status: StatusUnavailable})
+		merged, publishers, err := Merge(nil, WithoutList())
 		if err != nil {
 			t.Fatalf("Merge: %v", err)
 		}
@@ -178,7 +186,7 @@ func TestMergeRefusesInputItCannotAccountFor(t *testing.T) {
 	t.Run("本地文档不是合法 JSON", func(t *testing.T) {
 		t.Parallel()
 
-		if _, _, err := Merge(json.RawMessage("{"), Trust{Status: StatusUnavailable}); err == nil {
+		if _, _, err := Merge(json.RawMessage("{"), WithoutList()); err == nil {
 			t.Fatal("坏掉的本地 keyring 文档被接受了")
 		}
 	})
@@ -186,7 +194,7 @@ func TestMergeRefusesInputItCannotAccountFor(t *testing.T) {
 	t.Run("本地文档一把钥匙都没登记", func(t *testing.T) {
 		t.Parallel()
 
-		if _, _, err := Merge(json.RawMessage(`{"keys":[]}`), Trust{Status: StatusUnavailable}); err == nil {
+		if _, _, err := Merge(json.RawMessage(`{"keys":[]}`), WithoutList()); err == nil {
 			t.Fatal("空的 keys 被接受了")
 		}
 	})
@@ -292,7 +300,7 @@ func TestMergeKeepsARevocationThisMachineAccumulatedThatTheListNoLongerNames(t *
 		t.Fatalf("夹具坏了：累积集里的 old 没有进到 Keyring 里，撤销集是 %v", keyring.RevokedIDs())
 	}
 
-	merged, _, err := Merge(nil, Trust{Keyring: keyring, KeyringRaw: current, Status: StatusFresh})
+	merged, _, err := Merge(nil, Trust{Keyring: keyring, KeyringRaw: current, Status: StatusFresh, revocations: ever})
 	if err != nil {
 		t.Fatalf("Merge: %v", err)
 	}
@@ -389,7 +397,7 @@ func TestMergeNamesTheLocalDocumentWhenItsRevocationIsMalformed(t *testing.T) {
 		{id: "k", at: "上周二", reason: "私钥泄漏"},
 	})
 
-	_, _, err := Merge(local, Trust{Status: StatusUnavailable})
+	_, _, err := Merge(local, WithoutList())
 	if err == nil {
 		t.Fatal("坏掉的 revoked_at 被接受了")
 	}
@@ -484,5 +492,62 @@ func TestMergePrefersTheListsRevocationRecordOverTheRecordedOne(t *testing.T) {
 	}
 	if rev.Reason != "私钥泄漏" {
 		t.Errorf("撤销理由 = %q, want 清单那一侧先见到的那条（私钥泄漏）", rev.Reason)
+	}
+}
+
+// TestMergeRefusesATrustThatCarriesNoRevocationRecord：一份 revocations 为 nil 的
+// Trust 不得进入合并。
+//
+// nil 的意思是「这份 Trust 不知道这台机器记下了哪些撤销」。以前 Merge 把它读成
+// 「清单那一侧什么都没有」接着合并，于是任何一条忘了带上撤销记录的路径（Refresh
+// 的 fallback 就曾经是）都能让删掉一个 trustlist.json 变成解除撤销的办法。现在
+// 这件事在入口处被拒：能进来的 Trust 只有本包造出来的那几种。
+//
+// 它裹 ErrRevocationsUnknown，因为对调用方而言这正是那种「判不了撤销」——必须拒绝、
+// 不能降级的失败，而调用方已经认得这个哨兵。
+func TestMergeRefusesATrustThatCarriesNoRevocationRecord(t *testing.T) {
+	t.Parallel()
+
+	local := keyringWith(t, []sign.KeyID{"k", "live"}, nil)
+	cases := map[string]Trust{
+		"零值":                  {},
+		"unavailable 却没带撤销记录": {Status: StatusUnavailable},
+	}
+	for name, trust := range cases {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+
+			merged, _, err := Merge(local, trust)
+			if err == nil {
+				t.Fatalf("不带撤销记录的 Trust 被接受了，合并出 %v", merged.IDs())
+			}
+			if !errors.Is(err, ErrRevocationsUnknown) {
+				t.Errorf("err = %v, want 裹着 ErrRevocationsUnknown", err)
+			}
+		})
+	}
+}
+
+// TestWithoutListMergesAsTheLocalHalfAlone：没配远端清单的部署走 WithoutList，
+// 合并结果只有本地那一半，且不报错。
+func TestWithoutListMergesAsTheLocalHalfAlone(t *testing.T) {
+	t.Parallel()
+
+	local := keyringWith(t, []sign.KeyID{"ops"}, []sign.KeyID{"gone"})
+	merged, publishers, err := Merge(local, WithoutList())
+	if err != nil {
+		t.Fatalf("Merge: %v", err)
+	}
+	if ids := merged.IDs(); len(ids) != 1 || ids[0] != "ops" {
+		t.Errorf("IDs = %v, want [ops]", ids)
+	}
+	if _, gone := merged.Revoked("gone"); !gone {
+		t.Error("本地 keyring 自己写的撤销在合并后消失了")
+	}
+	if publishers == nil || len(publishers) != 0 {
+		t.Errorf("publishers = %#v, want 非 nil 的空 map", publishers)
+	}
+	if got := WithoutList().Status; got != StatusUnavailable {
+		t.Errorf("WithoutList().Status = %v, want StatusUnavailable", got)
 	}
 }
