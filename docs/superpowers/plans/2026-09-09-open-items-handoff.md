@@ -4,6 +4,8 @@
 
 **三仓 tip**：`stardust-agent-server` master `7dd05b8` / `stardust-agent-gui` `f6f60bf` / `docs` `8c9202d`。工作树均干净，**三仓零开放 PR**。
 
+> **2026-09-17 更新**：两仓已升到 Go 1.27（server [#162](https://github.com/jxncyjq/stardust-agent-server/pull/162) `7fc7984`；GUI 同步把 Wails 库与 CI 里的 wails CLI 一起升到 v2.15.0——v2.12.0 自带的 x/tools 读不懂 Go 1.27 的 export data，**库和 CLI 是两条独立的线，必须一起升**）。真机走查通过（绑定、事件、端到端一轮对话），唯 WebView2 窗口内交互未逐项点。§〇 A 已修，§一 两项已拍板，§四 S3 暂缓。
+
 **上一份**：[2026-09-07-open-items-handoff.md](2026-09-07-open-items-handoff.md)。那份里 §一/§二/§三/§四/§五 仍然有效，本文接着往下记，**不重复搬运**——但 §〇 那颗雷已经升级，见本文 §〇。
 
 ## 本轮合入 master 的三件
@@ -18,7 +20,9 @@
 
 ## 〇、先读这两条
 
-### A. 那颗雷还在，而且现在更容易被踩
+### A. ~~那颗雷还在，而且现在更容易被踩~~ —— **已修（2026-09-17，分支 `fix/trustlist-refresh-fallback-revocations`）**
+
+修法按下面推荐的「类型上」做：`Refresh` 的两条 fallback 经 `unavailableFallback` 走与 `Current` 同一个 `knownRevocations`；`Merge` 入口拒绝 `revocations` 为 nil 的 `Trust`（裹 `ErrRevocationsUnknown`），字段不导出所以包外只能交 Store 造的或新增的 `WithoutList()`；`resolvePluginTrustInput` 的 `store == nil` 改传 `WithoutList()`。8 条变异（含空变异与已知红对照）全部转红。以下为原文存档：
 
 `Store.Refresh` 失败时的 fallback Trust **仍然不携带撤销记录**（`internal/plugin/trustlist/store.go:256` 一带）。
 
@@ -45,7 +49,12 @@ deepseek-harness 的对应物是「可续后台子代理」：**落盘 Session +
 **前置**：§〇 B（`TaskRun` 生产写入路径）。
 **依赖已满足**：Spec A 的终止原因已合入，落盘时能存「为什么停」。
 
-**需要拍板**：写库失败时终止任务还是记日志继续；冷恢复的边界（恢复到哪一步算恢复）；后台子任务要不要外部可寻址的 id。
+**已拍板（2026-09-17）**：
+
+- **写库失败 → 终止任务**。不记日志继续：一个声称可续的后台任务，状态没落盘就等于撒谎。
+- **后台子任务要外部可寻址的 id**（进程重启后仍能按 id 查询/续跑）。
+
+**仍待拍板**：冷恢复的边界（恢复到哪一步算恢复）。
 
 ---
 
@@ -69,7 +78,7 @@ deepseek-harness 的对应物是「可续后台子代理」：**落盘 Session +
 - **§一** S2 的三条验证缺口（真机 `agent serve` + 真联网清单从没跑过；损坏的 `revoked-ever.json` 是让插件挂不上还是让 serve 起不来未实测；GUI 仓是否真渲染三个 trust 字段跨仓未验）
 - **§二** S2 的 11 条 Minor（全部「可留」，其中 Minor-8 是**改规格文字不是改代码**）
 - **§三** S1 遗留（`trust/` 等第一位真实开发者——**已拍板，照办即可**；`ErrUntrustedList` 拆哨兵；两条不变量护栏；三条硬约束）
-- **§四** S3 开发者申请流程未开工——**需要拍板**：申请走什么通道、审什么、清单怎么发布
+- **§四** S3 开发者申请流程未开工——**暂缓（2026-09-17 标记，后面再定）**：申请走什么通道、审什么、清单怎么发布，均不在近期范围
 - **§五** 机器状态：判据只有 WHEA 计数一直是 7
 
 ---
