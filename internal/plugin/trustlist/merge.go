@@ -145,12 +145,14 @@ func sortedIDs[V any](m map[sign.KeyID]V) []sign.KeyID {
 //
 // The list half needs both of Trust's keyring fields because each carries a
 // half the other does not: t.KeyringRaw is the only place the list's public
-// keys survive as bytes, while t.Keyring is the only place this machine's
-// accumulated revocation record appears (assembleKeyring unions it into the
-// keyring it builds; the raw document holds only what that one list wrote
-// down). Reading revocations off the raw document instead would drop every
-// revocation this machine has recorded since — exactly the weakening the
-// union above exists to prevent. A Trust carrying one field without the other
+// keys survive as bytes, while t.Keyring carries this machine's accumulated
+// revocation record alongside them (assembleKeyring unions it into the keyring
+// it builds; the raw document holds only what that one list wrote down). The
+// same record also travels on its own in the Trust's unexported revocation
+// field, which is the only carrier when there is no keyring. Reading
+// revocations off the raw document instead would drop every revocation this
+// machine has recorded since — exactly the weakening the union above exists to
+// prevent. A Trust carrying one field without the other
 // is refused rather than half-used, for the same reason.
 //
 // # localRaw must already have been through sign.ParseKeyring
@@ -172,8 +174,9 @@ func sortedIDs[V any](m map[sign.KeyID]V) []sign.KeyID {
 //
 // sign.ParseKeyring refuses a trust set in which every registered key is
 // revoked. The union taken here can produce exactly that: the revocations
-// reaching this function are cumulative — t.Keyring carries every revocation
-// this machine has recorded, not only the ones the current list names — while
+// reaching this function are cumulative — t.Keyring and the Trust's revocation
+// record carry every revocation this machine has recorded, not only the ones
+// the current list names — while
 // the keys are whatever the two documents register today, so the revoked side
 // can come to cover all of them. Merge returns that error rather than
 // swallowing it. The error must not be read as the nil result above: nil means
@@ -283,8 +286,8 @@ func Merge(localRaw json.RawMessage, t Trust) (*sign.Keyring, map[sign.KeyID]str
 	// the one place a recorded revocation does not reach — a deployment that
 	// configured no local keyring and whose list is unreadable judges every
 	// package unsigned, including one signed by a key it has recorded as
-	// revoked. The caller is told: Store.Current returns its error alongside
-	// that Trust.
+	// revoked. The caller is told: Store.Current and Store.Refresh return their
+	// error alongside that Trust.
 	if len(keys) == 0 {
 		return nil, map[sign.KeyID]string{}, nil
 	}

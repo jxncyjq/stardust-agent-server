@@ -22,7 +22,14 @@
 
 ### A. ~~那颗雷还在，而且现在更容易被踩~~ —— **已修（2026-09-17，分支 `fix/trustlist-refresh-fallback-revocations`）**
 
-修法按下面推荐的「类型上」做：`Refresh` 的两条 fallback 经 `unavailableFallback` 走与 `Current` 同一个 `knownRevocations`；`Merge` 入口拒绝 `revocations` 为 nil 的 `Trust`（裹 `ErrRevocationsUnknown`），字段不导出所以包外只能交 Store 造的或新增的 `WithoutList()`；`resolvePluginTrustInput` 的 `store == nil` 改传 `WithoutList()`。8 条变异（含空变异与已知红对照）全部转红。以下为原文存档：
+修法按下面推荐的「类型上」做：`Refresh` 的两条 fallback 经 `unavailableFallback` 走与 `Current` 同一个 `knownRevocations`；`Merge` 入口拒绝 `revocations` 为 nil 的 `Trust`（裹 `ErrRevocationsUnknown`），字段不导出所以包外只能交 Store 造的或新增的 `WithoutList()`；`resolvePluginTrustInput` 的 `store == nil` 改传 `WithoutList()`。8 条变异（含空变异与已知红对照）全部转红；独立复审补抓一条存活变异（拒绝条件收窄成「且 Keyring 为 nil」照样全绿），已补用例。
+
+复审分诊为**修复前就有、本次只如实写进注释**的两条缺口（`store.go` `WithoutList` / `Trust.revocations` 注释里有写）：
+
+- **清空 url 的部署不再读缓存里的撤销**：「没配清单」只看 url，曾配过清单、累积过撤销、后来清空 url 的部署走 `WithoutList`，`revoked-ever.json` 不再被读；被撤销钥匙若同时登记在本地 keyring，它签的包重新可信。非回归、非提权。**需要拍板**：url 为空而 cache 目录里有 `revoked-ever.json` 时，报错启动失败，还是只读地并进来。
+- **嫁接挡不住**：包外可拿一份带记录的 Trust 改写导出字段 `Keyring`/`KeyringRaw`。守的是「忘了带」，不是「故意拼」；要彻底挡住得改 API（如 `MergeLocal(localRaw)` + 不导出那两个字段）。
+
+以下为原文存档：
 
 `Store.Refresh` 失败时的 fallback Trust **仍然不携带撤销记录**（`internal/plugin/trustlist/store.go:256` 一带）。
 
