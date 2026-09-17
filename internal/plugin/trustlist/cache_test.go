@@ -1,6 +1,7 @@
 package trustlist
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -669,5 +670,125 @@ func TestWriteRefusesANilRevokedSet(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "newRevokedSet()") {
 		t.Errorf("错误没告诉调用方该传什么：%v", err)
+	}
+}
+
+// TestRecordedRevocationCount 覆盖「只读地数一个缓存目录里记下了几条撤销」的三种
+// 结果：目录或记录不在是 0（这台机器在这里没记过任何撤销）；记录在就如实计数；
+// 记录读不懂必须报错——把它数成 0 正是「删不掉就弄坏」绕过撤销的那条路。
+func TestRecordedRevocationCount(t *testing.T) {
+	t.Parallel()
+
+	t.Run("目录不存在", func(t *testing.T) {
+		t.Parallel()
+		dir := filepath.Join(t.TempDir(), "never-created")
+		n, err := RecordedRevocationCount(dir)
+		if err != nil || n != 0 {
+			t.Fatalf("RecordedRevocationCount = %d, %v; want 0, nil", n, err)
+		}
+		if _, statErr := os.Stat(dir); !errors.Is(statErr, os.ErrNotExist) {
+			t.Errorf("只读计数却把目录建出来了：stat err = %v", statErr)
+		}
+	})
+
+	t.Run("记录不存在", func(t *testing.T) {
+		t.Parallel()
+		n, err := RecordedRevocationCount(t.TempDir())
+		if err != nil || n != 0 {
+			t.Fatalf("RecordedRevocationCount = %d, %v; want 0, nil", n, err)
+		}
+	})
+
+	t.Run("记录在", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		seedRecordedRevocations(t, dir, "dev-abc", "dev-def")
+		n, err := RecordedRevocationCount(dir)
+		if err != nil {
+			t.Fatalf("RecordedRevocationCount: %v", err)
+		}
+		if n != 2 {
+			t.Errorf("n = %d, want 2", n)
+		}
+	})
+
+	t.Run("清单在而记录不在", func(t *testing.T) {
+		t.Parallel()
+		// write 总是先写 revoked-ever.json 再发布清单，所以清单在而记录不在只能是
+		// 记录丢了。cache.read 把这个形态判成缓存不可用，这里不能另判成「没有撤销」。
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, listFileName), []byte(`{"serial":1}`), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		n, err := RecordedRevocationCount(dir)
+		if err == nil {
+			t.Fatalf("清单在而撤销记录不在，却被数成了 %d 条撤销", n)
+		}
+		if !errors.Is(err, ErrRevocationsUnknown) {
+			t.Errorf("err = %v, want 裹着 ErrRevocationsUnknown", err)
+		}
+	})
+
+	t.Run("路径是普通文件", func(t *testing.T) {
+		t.Parallel()
+		// 不能因为平台把 file/revoked-ever.json 报成「不存在」（Windows）就数成 0：
+		// 一个指错了的缓存配置应当在每个平台上都响亮地失败。
+		file := filepath.Join(t.TempDir(), "not-a-dir")
+		if err := os.WriteFile(file, []byte("x"), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		if n, err := RecordedRevocationCount(file); err == nil {
+			t.Fatalf("缓存路径是普通文件，却数出 %d 且没有报错", n)
+		}
+	})
+
+	t.Run("记录读不懂", func(t *testing.T) {
+		t.Parallel()
+		dir := t.TempDir()
+		path := filepath.Join(dir, revokedFileName)
+		if err := os.WriteFile(path, []byte(`{"revoked":"这不是一个数组"}`), 0o600); err != nil {
+			t.Fatalf("seed: %v", err)
+		}
+		n, err := RecordedRevocationCount(dir)
+		if err == nil {
+			t.Fatalf("读不懂的撤销记录被数成了 %d 而没有报错", n)
+		}
+		if !errors.Is(err, ErrRevocationsUnknown) {
+			t.Errorf("err = %v, want 裹着 ErrRevocationsUnknown", err)
+		}
+	})
+}
+
+// TestClearingTheWholeCacheLeavesAStoreThatRefreshes 把「清空 url 却留着撤销记录」
+// 那条启动报错给出的补救办法走一遍：删掉缓存目录里的撤销记录、清单与签名之后，
+// 这个目录既不再被数出撤销，恢复 url 后 Refresh 也能在上面照常起步。
+//
+// 它存在是因为补救办法与缓存状态机脱过节：只删记录会留下「清单在而记录不在」，
+// 那个形态在恢复 url 之后被 cache.read 判为损坏，缓存从此刷不动。
+func TestClearingTheWholeCacheLeavesAStoreThatRefreshes(t *testing.T) {
+	signer := newSigner(t)
+	list, sig := signer(7, withSecondKeyRevoking(t, "dev-abc"))
+	cur := newServeList(list, sig)
+	srv := newListServer(t, cur)
+	cacheDir := t.TempDir()
+	store := newTestStore(t, srv, cacheDir, fixedNow)
+	if _, err := store.Refresh(context.Background()); err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if n, err := RecordedRevocationCount(cacheDir); err != nil || n == 0 {
+		t.Fatalf("前提不成立：RecordedRevocationCount = %d, %v; want 至少 1 条撤销", n, err)
+	}
+
+	for _, name := range []string{revokedFileName, listFileName, sigFileName} {
+		if err := os.Remove(filepath.Join(cacheDir, name)); err != nil {
+			t.Fatalf("remove %s: %v", name, err)
+		}
+	}
+
+	if n, err := RecordedRevocationCount(cacheDir); err != nil || n != 0 {
+		t.Fatalf("清空之后 RecordedRevocationCount = %d, %v; want 0, nil", n, err)
+	}
+	if _, err := store.Refresh(context.Background()); err != nil {
+		t.Fatalf("按补救办法清空缓存之后 Refresh 失败，缓存成了修不好的砖：%v", err)
 	}
 }

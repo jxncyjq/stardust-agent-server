@@ -6184,6 +6184,102 @@ func TestResolveTrustlistIsNilWhenNotConfigured(t *testing.T) {
 	}
 }
 
+// TestResolveTrustlistRefusesRevocationsLeftBehindByAnUnconfiguredList: a
+// deployment that once fetched a trust list, accumulated revocations in its
+// cache, and then cleared plugins.trustlist.url would otherwise judge packages
+// by the local keyring alone -- and a key it has recorded as revoked, if the
+// local keyring also registers it, would be trusted again. That is a startup
+// error, not a quiet return to "no remote list".
+func TestResolveTrustlistRefusesRevocationsLeftBehindByAnUnconfiguredList(t *testing.T) {
+	writeRecord := func(t *testing.T, dir, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(dir, "revoked-ever.json"), []byte(body), 0o600); err != nil {
+			t.Fatalf("seed revoked-ever.json: %v", err)
+		}
+	}
+
+	t.Run("recorded revocations refuse", func(t *testing.T) {
+		dir := t.TempDir()
+		writeRecord(t, dir, `{"revoked":[{"key_id":"dev-abc","revoked_at":"2026-08-29T10:00:00Z","reason":"leaked"}]}`)
+		store, _, err := resolvePluginTrustlist(config.PluginsConfig{
+			Trustlist: config.PluginTrustlistConfig{Cache: dir},
+		})
+		if err == nil {
+			t.Fatal("an unconfigured trust list with revocations left in its cache started anyway")
+		}
+		if store != nil {
+			t.Error("a Store was returned alongside the refusal")
+		}
+		// The remedy has to name every file it asks an operator to remove: removing
+		// only the record leaves a list without one, which a later Store refuses.
+		for _, want := range []string{"plugins.trustlist.url", "plugins.trustlist.cache", dir,
+			"revoked-ever.json", "trustlist.json", "trustlist.sig"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error does not name %q, so an operator cannot tell what to fix: %v", want, err)
+			}
+		}
+	})
+
+	t.Run("a cached list without its record refuses", func(t *testing.T) {
+		dir := t.TempDir()
+		if err := os.WriteFile(filepath.Join(dir, "trustlist.json"), []byte(`{"serial":1}`), 0o600); err != nil {
+			t.Fatalf("seed trustlist.json: %v", err)
+		}
+		_, _, err := resolvePluginTrustlist(config.PluginsConfig{
+			Trustlist: config.PluginTrustlistConfig{Cache: dir},
+		})
+		if !errors.Is(err, trustlist.ErrRevocationsUnknown) {
+			t.Fatalf("err = %v, want one wrapping trustlist.ErrRevocationsUnknown: a list whose record is "+
+				"gone is not evidence that nothing was revoked", err)
+		}
+		// Restoring the url does not repair this cache, so the error has to point at
+		// the ways that do.
+		for _, want := range []string{"revoked-ever.json", "trustlist.json", "trustlist.sig",
+			"plugins.trustlist.cache"} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error does not name %q: %v", want, err)
+			}
+		}
+	})
+
+	t.Run("an unreadable record refuses", func(t *testing.T) {
+		dir := t.TempDir()
+		writeRecord(t, dir, `{"revoked":"not an array"}`)
+		_, _, err := resolvePluginTrustlist(config.PluginsConfig{
+			Trustlist: config.PluginTrustlistConfig{Cache: dir},
+		})
+		if !errors.Is(err, trustlist.ErrRevocationsUnknown) {
+			t.Fatalf("err = %v, want one wrapping trustlist.ErrRevocationsUnknown", err)
+		}
+		for _, want := range []string{"plugins.trustlist.cache", dir} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("error does not name %q: %v", want, err)
+			}
+		}
+	})
+
+	t.Run("an empty record starts", func(t *testing.T) {
+		dir := t.TempDir()
+		writeRecord(t, dir, `{"revoked":[]}`)
+		store, _, err := resolvePluginTrustlist(config.PluginsConfig{
+			Trustlist: config.PluginTrustlistConfig{Cache: dir},
+		})
+		if err != nil || store != nil {
+			t.Fatalf("resolvePluginTrustlist = %v, %v; want nil, nil: no revocation is being dropped", store, err)
+		}
+	})
+
+	t.Run("a missing cache dir starts", func(t *testing.T) {
+		dir := filepath.Join(t.TempDir(), "never-created")
+		store, _, err := resolvePluginTrustlist(config.PluginsConfig{
+			Trustlist: config.PluginTrustlistConfig{Cache: dir},
+		})
+		if err != nil || store != nil {
+			t.Fatalf("resolvePluginTrustlist = %v, %v; want nil, nil", store, err)
+		}
+	})
+}
+
 // TestResolveTrustlistFailsLoudOnABadCacheDir: configured but unable to land is
 // a startup error, not a downgrade to "no remote list".
 //

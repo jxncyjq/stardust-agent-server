@@ -121,18 +121,19 @@ type Trust struct {
 // 空集合说的是「这份 Trust 不从任何缓存目录读撤销」，本地 keyring 自己写下的
 // 撤销不经过这里，Merge 从本地那一半读它们。
 //
-// # 一个它不覆盖的缺口
-//
-// 撤销累积集存在 Store 的缓存目录里，而「没配清单」只看 url：一台曾经配过清单、
-// 在缓存里累积了撤销、后来清空了 url 的部署，走的也是这里，缓存里那份
-// revoked-ever.json 不会再被读。那些撤销对这台部署就此失效——若被撤销的钥匙同时
-// 登记在本地 keyring，它签的包会重新可信。这不是本函数引入的（它替换的零值 Trust
-// 行为相同），也不是提权（能改配置的人本就能关掉签名要求），但它是一条真实缺口，
-// 不要把这里的空集合读成「这台机器确实没有撤销」。
-//
 // 它存在，是因为 Merge 拒绝 revocations 为 nil 的 Trust（见 Trust.revocations），
 // 而零值 Trust 恰恰是 nil。有了它，「这台部署没有清单」与「某条路径忘了带上撤销
 // 记录」在值上就分得开了。
+//
+// # 一个它自己不覆盖的缺口
+//
+// 撤销累积集存在 Store 的缓存目录里，而「没配清单」只看 url：一台曾经配过清单、
+// 在缓存里累积了撤销、后来清空了 url 的部署，走的也是这里，缓存里那份
+// revoked-ever.json 不会再被读。若被撤销的钥匙同时登记在本地 keyring，它签的包会
+// 重新可信。不要把这里的空集合读成「这台机器确实没有撤销」。
+//
+// WithoutList 不读任何缓存目录，因此不能用来代表一台缓存目录里仍记着撤销的机器；
+// 判断一个目录里有没有记着撤销，见 RecordedRevocationCount。
 func WithoutList() Trust {
 	return Trust{Status: StatusUnavailable, revocations: newRevokedSet()}
 }
