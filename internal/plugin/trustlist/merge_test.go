@@ -178,6 +178,19 @@ func TestMergeSurvivesEitherSideBeingAbsent(t *testing.T) {
 	})
 }
 
+// requireLocalDocumentBlamed 断言这次失败怪的是本地文档，而不是清单那一侧不带撤销
+// 记录。只断言「有错」的话，WithoutList 一旦退化成不带记录，入口那条拒绝会顶替
+// 本该考到的本地文档校验，用例照样绿。
+func requireLocalDocumentBlamed(t *testing.T, err error) {
+	t.Helper()
+	if errors.Is(err, ErrRevocationsUnknown) {
+		t.Fatalf("err = %v；失败原因是清单那一侧不带撤销记录，本地文档的校验根本没被考到", err)
+	}
+	if !strings.Contains(err.Error(), "local keyring") {
+		t.Errorf("错误没指向本地 keyring 文档：%v", err)
+	}
+}
+
 // TestMergeRefusesInputItCannotAccountFor：坏输入必须响亮地失败，不能悄悄合成
 // 一个少了一半的信任集——少掉的那一半可能正是撤销。
 func TestMergeRefusesInputItCannotAccountFor(t *testing.T) {
@@ -186,17 +199,21 @@ func TestMergeRefusesInputItCannotAccountFor(t *testing.T) {
 	t.Run("本地文档不是合法 JSON", func(t *testing.T) {
 		t.Parallel()
 
-		if _, _, err := Merge(json.RawMessage("{"), WithoutList()); err == nil {
+		_, _, err := Merge(json.RawMessage("{"), WithoutList())
+		if err == nil {
 			t.Fatal("坏掉的本地 keyring 文档被接受了")
 		}
+		requireLocalDocumentBlamed(t, err)
 	})
 
 	t.Run("本地文档一把钥匙都没登记", func(t *testing.T) {
 		t.Parallel()
 
-		if _, _, err := Merge(json.RawMessage(`{"keys":[]}`), WithoutList()); err == nil {
+		_, _, err := Merge(json.RawMessage(`{"keys":[]}`), WithoutList())
+		if err == nil {
 			t.Fatal("空的 keys 被接受了")
 		}
+		requireLocalDocumentBlamed(t, err)
 	})
 
 	t.Run("Trust 的两个 keyring 字段对不上", func(t *testing.T) {
