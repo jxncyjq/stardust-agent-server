@@ -32,3 +32,43 @@ func TestStopReasonConstantsKeepTheirContractValues(t *testing.T) {
 		t.Error("the zero StopReason equals StopReasonCompleted; an unrecorded reason would read as a finished run")
 	}
 }
+
+// TestParseRunStatusRefusesAnUnknownValue：未知值必须报错。
+//
+// 这个枚举的四个值是「一次运行可能处在的全部状态」的完整清单，而它要从数据库的
+// TEXT 列读回来——那一列的内容可以被手改，也可能是更新的二进制写下的。猜一个默认
+// 值（比如当成 running）会让一行来历不明的记录被下一次启动扫成 interrupted，
+// 也就是拿一个编造的状态覆盖掉真实的那个。
+func TestParseRunStatusRefusesAnUnknownValue(t *testing.T) {
+	t.Parallel()
+
+	for _, in := range []string{"", "RUNNING", "done", "interupted"} {
+		if got, err := ParseRunStatus(in); err == nil {
+			t.Errorf("ParseRunStatus(%q) = %q, want an error", in, got)
+		}
+	}
+}
+
+// TestParseRunStatusRoundTripsEveryValue：四个值都认得，且 String 与解析互逆。
+func TestParseRunStatusRoundTripsEveryValue(t *testing.T) {
+	t.Parallel()
+
+	all := []RunStatus{RunStatusRunning, RunStatusCompleted, RunStatusFailed, RunStatusInterrupted}
+	for _, want := range all {
+		got, err := ParseRunStatus(want.String())
+		if err != nil {
+			t.Fatalf("ParseRunStatus(%q): %v", want, err)
+		}
+		if got != want {
+			t.Errorf("ParseRunStatus(%q) = %q", want, got)
+		}
+	}
+	// 四个值两两不同：复制粘贴写重了一个字面量，这里会响。
+	seen := map[RunStatus]bool{}
+	for _, s := range all {
+		if seen[s] {
+			t.Fatalf("两个常量的字面值都是 %q", s)
+		}
+		seen[s] = true
+	}
+}

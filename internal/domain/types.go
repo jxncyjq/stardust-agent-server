@@ -103,6 +103,46 @@ const (
 	StopReasonRepeatLoopBroken StopReason = "repeat_loop_broken"
 )
 
+// RunStatus 是一次任务运行所处的生命周期状态。空串不是它的取值。
+//
+// 四个值的分界是「谁写得出它」：running 由运行开始时写；completed 与 failed 由
+// 那一次运行自己收尾时写；interrupted 只由启动扫描写——它的含义是「写 running 的
+// 那个进程没了，没人知道它跑到哪」，运行期的代码永远不处在能说这句话的位置上。
+type RunStatus string
+
+const (
+	// RunStatusRunning 是插入时的状态。它只有两种正当结局：被同一个进程改成终态，
+	// 或被下一次启动扫成 RunStatusInterrupted。
+	RunStatusRunning RunStatus = "running"
+	// RunStatusCompleted 是这一次运行走完了它的工具循环。此时 StopReason 必非空。
+	RunStatusCompleted RunStatus = "completed"
+	// RunStatusFailed 是这一次运行以错误结束：它跑到了一个失败的结论。
+	RunStatusFailed RunStatus = "failed"
+	// RunStatusInterrupted 是进程消失在这次运行中间。与 RunStatusFailed 分开，
+	// 因为「跑出了失败」与「没人知道它跑到哪」对读的人是两件事。
+	RunStatusInterrupted RunStatus = "interrupted"
+)
+
+// String 返回这个状态的字面值。
+func (s RunStatus) String() string { return string(s) }
+
+// ParseRunStatus 把一个字面值解析成 RunStatus，不认得就报错。
+func ParseRunStatus(s string) (RunStatus, error) {
+	switch RunStatus(s) {
+	case RunStatusRunning:
+		return RunStatusRunning, nil
+	case RunStatusCompleted:
+		return RunStatusCompleted, nil
+	case RunStatusFailed:
+		return RunStatusFailed, nil
+	case RunStatusInterrupted:
+		return RunStatusInterrupted, nil
+	default:
+		return "", fmt.Errorf("unknown run status %q; the four values are %q, %q, %q and %q",
+			s, RunStatusRunning, RunStatusCompleted, RunStatusFailed, RunStatusInterrupted)
+	}
+}
+
 type TaskRun struct {
 	ID        string    `json:"id"`
 	TaskID    string    `json:"task_id"`
@@ -121,6 +161,19 @@ type TaskRun struct {
 	// GeneratedFiles are workspace-relative paths of files the task produced via
 	// write_file. Empty when the task wrote no files.
 	GeneratedFiles []string `json:"generated_files,omitempty"`
+	// Status 是这次运行所处的状态。零值空串不是合法状态；每个造出 TaskRun 的
+	// 地方都要显式填它。
+	Status RunStatus `json:"status,omitempty"`
+	// ParentTaskID 是派出这次运行的父任务；空串表示它不是子任务。父子关系存在
+	// 这里而不编码进 ID，是因为 ID 要能换成 UUID 而关系要能被查询。
+	ParentTaskID string `json:"parent_task_id,omitempty"`
+	// Background 报告这次运行是不是后台子任务（RunSubTaskAsync 起的）。
+	Background bool `json:"background,omitempty"`
+	// Goal 是子任务的目标原文，用来让一条中断记录读起来知道它在干什么。它不是
+	// 重跑用的输入：重跑不在本设计范围内。
+	Goal string `json:"goal,omitempty"`
+	// Error 是 Status 为 RunStatusFailed 时的错误摘要，其余状态为空。
+	Error string `json:"error,omitempty"`
 }
 
 type ToolCall struct {
