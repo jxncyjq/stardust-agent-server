@@ -20,6 +20,7 @@ func TestTaskRunStopReasonSurvivesTheRoundTrip(t *testing.T) {
 		EndedAt:    time.Now(),
 		Result:     "done",
 		StopReason: domain.StopReasonToolLoopCap,
+		Status:     domain.RunStatusCompleted,
 	}
 	if err := repo.SaveTaskRun(context.Background(), run); err != nil {
 		t.Fatalf("SaveTaskRun() error = %v, want nil", err)
