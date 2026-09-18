@@ -259,6 +259,87 @@ func TestFinishTaskRunRefusesInterrupted(t *testing.T) {
 	}
 }
 
+// TestFinishTaskRunAcceptsSuspended：挂起等审批是这条腿的终态，收尾写得进去。
+//
+// 挂起以前不写终态，于是那一行永远停在 running：活进程里它与真正在飞的记录一个字节
+// 都分不出来，重启后又被扫成 interrupted——一次「人批准过、恢复腿跑完了」的任务却
+// 留着一条「进程没了」的记录。
+func TestFinishTaskRunAcceptsSuspended(t *testing.T) {
+	t.Parallel()
+
+	repo := newTaskRunRepo(t)
+	ctx := context.Background()
+	if err := repo.StartTaskRun(ctx, domain.TaskRun{
+		ID: "run-1", TaskID: "task-1", AgentID: "a", StartedAt: time.Now().UTC(),
+		Status: domain.RunStatusRunning,
+	}); err != nil {
+		t.Fatalf("StartTaskRun: %v", err)
+	}
+	endedAt := time.Date(2026, 9, 18, 10, 0, 0, 0, time.UTC)
+	if err := repo.FinishTaskRun(ctx, domain.TaskRun{
+		ID: "run-1", Status: domain.RunStatusSuspended, EndedAt: endedAt,
+	}); err != nil {
+		t.Fatalf("FinishTaskRun(suspended): %v", err)
+	}
+	run, found, err := repo.TaskRunByID(ctx, "run-1")
+	if err != nil {
+		t.Fatalf("TaskRunByID: %v", err)
+	}
+	if !found {
+		t.Fatal("挂起收尾之后记录不见了")
+	}
+	if run.Status != domain.RunStatusSuspended {
+		t.Errorf("status = %q, want suspended", run.Status)
+	}
+}
+
+// TestSweepRunningLeavesSuspendedRowsAlone：启动扫描一行 suspended 都不许动。
+//
+// 扫描今天按 status='running' 过滤，所以这条自然成立——这个用例钉的正是「以后有人
+// 把那个过滤条件放宽」。挂起的腿是自己收的尾，把它改写成 interrupted 等于拿「进程
+// 没了」覆盖掉一件确凿发生过的事。
+func TestSweepRunningLeavesSuspendedRowsAlone(t *testing.T) {
+	t.Parallel()
+
+	repo := newTaskRunRepo(t)
+	ctx := context.Background()
+	for _, id := range []string{"r1", "r2"} {
+		if err := repo.StartTaskRun(ctx, domain.TaskRun{
+			ID: id, TaskID: "t", AgentID: "a", StartedAt: time.Now().UTC(),
+			Status: domain.RunStatusRunning,
+		}); err != nil {
+			t.Fatalf("StartTaskRun(%s): %v", id, err)
+		}
+	}
+	suspendedAt := time.Date(2026, 9, 18, 10, 0, 0, 0, time.UTC)
+	if err := repo.FinishTaskRun(ctx, domain.TaskRun{
+		ID: "r2", Status: domain.RunStatusSuspended, EndedAt: suspendedAt,
+	}); err != nil {
+		t.Fatalf("FinishTaskRun(suspended): %v", err)
+	}
+
+	n, err := repo.SweepRunning(ctx, time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("SweepRunning: %v", err)
+	}
+	if n != 1 {
+		t.Errorf("SweepRunning 报了 %d 条, want 1——只有那条 running 该被扫", n)
+	}
+	run, found, err := repo.TaskRunByID(ctx, "r2")
+	if err != nil {
+		t.Fatalf("TaskRunByID: %v", err)
+	}
+	if !found {
+		t.Fatal("挂起那一行不见了")
+	}
+	if run.Status != domain.RunStatusSuspended {
+		t.Errorf("挂起那一行被扫成了 %q；它是自己收的尾，不是进程没了", run.Status)
+	}
+	if !run.EndedAt.Equal(suspendedAt) {
+		t.Errorf("挂起那一行的 ended_at 被改成了 %s, want %s", run.EndedAt, suspendedAt)
+	}
+}
+
 // TestStartTaskRunRefusesANonRunningStatus：开始那一步只能写 running。
 func TestStartTaskRunRefusesANonRunningStatus(t *testing.T) {
 	t.Parallel()

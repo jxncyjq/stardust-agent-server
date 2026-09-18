@@ -88,6 +88,13 @@ type Task struct {
 	Background bool `json:"background,omitempty"`
 	// Goal 是子任务的目标原文，落进运行记录让人读得懂它在干什么；直连任务为空。
 	Goal string `json:"goal,omitempty"`
+	// RunID 是这条腿的运行记录 id。谁已经写下了开始那一行，谁就在这里填上它的 id
+	// （今天是后台子任务的派发路径：那一刻是父任务确凿还在飞的唯一时刻）；为空表示
+	// 没人写过，运行时自己 mint 一个。
+	//
+	// 它存在是为了让 run id 只有一个出处：运行时若总是自己 mint，收口就会拿一个从没
+	// 插过库的 id 去写终态，而派发方开的那一行永远没人再碰。
+	RunID string `json:"run_id,omitempty"`
 }
 
 // StopReason says why a task's tool loop stopped.
@@ -113,19 +120,28 @@ const (
 
 // RunStatus 是一次任务运行所处的生命周期状态。空串不是它的取值。
 //
-// 四个值的分界是「谁写得出它」：running 由运行开始时写；completed 与 failed 由
-// 那一次运行自己收尾时写；interrupted 只由启动扫描写——它的含义是「写 running 的
-// 那个进程没了，没人知道它跑到哪」，运行期的代码永远不处在能说这句话的位置上。
+// 五个值的分界是「谁写得出它」：running 由运行开始时写；completed、failed 与
+// suspended 由那一次运行自己收尾时写；interrupted 只由启动扫描写——它的含义是
+// 「写 running 的那个进程没了，没人知道它跑到哪」，运行期的代码永远不处在能说这句
+// 话的位置上。
 type RunStatus string
 
 const (
-	// RunStatusRunning 是插入时的状态。它只有两种正当结局：被同一个进程改成终态，
-	// 或被下一次启动扫成 RunStatusInterrupted。
+	// RunStatusRunning 是插入时的状态。它只有两种正当结局：被同一个进程改成终态
+	// （RunStatusCompleted / RunStatusFailed / RunStatusSuspended 三者之一），或
+	// 被下一次启动扫成 RunStatusInterrupted。
 	RunStatusRunning RunStatus = "running"
 	// RunStatusCompleted 是这一次运行走完了它的工具循环。此时 StopReason 必非空。
 	RunStatusCompleted RunStatus = "completed"
 	// RunStatusFailed 是这一次运行以错误结束：它跑到了一个失败的结论。
 	RunStatusFailed RunStatus = "failed"
+	// RunStatusSuspended 是这一次运行停在半路等人审批。它是这条腿的终态：人批准之后
+	// 跑的是另一条运行记录（各有各的 id）。
+	//
+	// 与 RunStatusFailed 分开，因为「等人」不是「跑挂了」。启动扫描也不碰它：进程
+	// 事后死掉不改变「这条腿当时确实是挂起收尾的」这个事实，把它改写成 interrupted
+	// 会把一次正常挂起报成一次进程消失。
+	RunStatusSuspended RunStatus = "suspended"
 	// RunStatusInterrupted 是进程消失在这次运行中间。与 RunStatusFailed 分开，
 	// 因为「跑出了失败」与「没人知道它跑到哪」对读的人是两件事。
 	RunStatusInterrupted RunStatus = "interrupted"
@@ -143,11 +159,13 @@ func ParseRunStatus(s string) (RunStatus, error) {
 		return RunStatusCompleted, nil
 	case RunStatusFailed:
 		return RunStatusFailed, nil
+	case RunStatusSuspended:
+		return RunStatusSuspended, nil
 	case RunStatusInterrupted:
 		return RunStatusInterrupted, nil
 	default:
-		return "", fmt.Errorf("unknown run status %q; the four values are %q, %q, %q and %q",
-			s, RunStatusRunning, RunStatusCompleted, RunStatusFailed, RunStatusInterrupted)
+		return "", fmt.Errorf("unknown run status %q; the five values are %q, %q, %q, %q and %q",
+			s, RunStatusRunning, RunStatusCompleted, RunStatusFailed, RunStatusSuspended, RunStatusInterrupted)
 	}
 }
 

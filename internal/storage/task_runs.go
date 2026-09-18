@@ -55,15 +55,19 @@ func (r *SQLiteRepository) StartTaskRun(ctx context.Context, run domain.TaskRun)
 // 开头的记录抹平。
 //
 // 找不到那一行时报错而不是无声返回：这个方法的前提是 StartTaskRun 已经成功过一次，
-// 前提不成立说明两个写入点之间断了，而那正是这份记录要防的事。interrupted 也报错，
-// 理由见 domain.RunStatus。
+// 前提不成立说明两个写入点之间断了，而那正是这份记录要防的事。
+//
+// 三个终态放行：completed、failed 与 suspended——挂起等审批同样是这条腿走到了头，
+// 人批准之后跑的是另一条记录。interrupted 报错，理由见 domain.RunStatus：运行期的
+// 代码说不出「没人知道它跑到哪」这句话。
 func (r *SQLiteRepository) FinishTaskRun(ctx context.Context, run domain.TaskRun) error {
 	switch run.Status {
-	case domain.RunStatusCompleted, domain.RunStatusFailed:
+	case domain.RunStatusCompleted, domain.RunStatusFailed, domain.RunStatusSuspended:
 	default:
-		return fmt.Errorf("finish task run %q: status is %q; only %q and %q end a run here (%q is written "+
+		return fmt.Errorf("finish task run %q: status is %q; only %q, %q and %q end a run here (%q is written "+
 			"only by the startup sweep)", run.ID, run.Status,
-			domain.RunStatusCompleted, domain.RunStatusFailed, domain.RunStatusInterrupted)
+			domain.RunStatusCompleted, domain.RunStatusFailed, domain.RunStatusSuspended,
+			domain.RunStatusInterrupted)
 	}
 	files, err := marshalGeneratedFiles(run.GeneratedFiles)
 	if err != nil {
@@ -104,6 +108,10 @@ func (r *SQLiteRepository) FinishTaskRun(ctx context.Context, run domain.TaskRun
 // 它是「写 running 的那个进程没了」这句话唯一的出口，所以只在启动时、开始接任务
 // 之前调用一次。它按状态扫全表，不区分是哪个进程写的：本部署假定一个 agent.db
 // 只有一个 serve 进程在写（见规格第六节的取舍）。
+//
+// 过滤条件只认 running，这一条不许放宽：另外四个状态都是某条腿自己写下的结论，
+// suspended 尤其——它是「这条腿停在这里等人」，改写成 interrupted 等于拿「进程没了」
+// 覆盖掉一件确凿发生过的事（TestSweepRunningLeavesSuspendedRowsAlone 钉住这一点）。
 func (r *SQLiteRepository) SweepRunning(ctx context.Context, at time.Time) (int, error) {
 	res, err := r.db.ExecContext(ctx, `
 		UPDATE task_runs SET status = ?, ended_at = ?

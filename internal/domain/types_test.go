@@ -49,11 +49,11 @@ func TestParseRunStatusRefusesAnUnknownValue(t *testing.T) {
 	}
 }
 
-// TestParseRunStatusRoundTripsEveryValue：四个值都认得，且 String 与解析互逆。
+// TestParseRunStatusRoundTripsEveryValue：五个值都认得，且 String 与解析互逆。
 func TestParseRunStatusRoundTripsEveryValue(t *testing.T) {
 	t.Parallel()
 
-	all := []RunStatus{RunStatusRunning, RunStatusCompleted, RunStatusFailed, RunStatusInterrupted}
+	all := []RunStatus{RunStatusRunning, RunStatusCompleted, RunStatusFailed, RunStatusSuspended, RunStatusInterrupted}
 	for _, want := range all {
 		got, err := ParseRunStatus(want.String())
 		if err != nil {
@@ -63,7 +63,7 @@ func TestParseRunStatusRoundTripsEveryValue(t *testing.T) {
 			t.Errorf("ParseRunStatus(%q) = %q", want, got)
 		}
 	}
-	// 四个值两两不同：复制粘贴写重了一个字面量，这里会响。
+	// 五个值两两不同：复制粘贴写重了一个字面量，这里会响。
 	seen := map[RunStatus]bool{}
 	for _, s := range all {
 		if seen[s] {
@@ -73,7 +73,7 @@ func TestParseRunStatusRoundTripsEveryValue(t *testing.T) {
 	}
 }
 
-// TestRunStatusConstantsKeepTheirContractValues：这四个字面值是对外契约——它们要
+// TestRunStatusConstantsKeepTheirContractValues：这五个字面值是对外契约——它们要
 // 落进 SQLite 的运行状态列。改常量名可以，改值会悄悄改掉已落盘数据的含义：库里
 // 那些 "running" 会突然变成 ParseRunStatus 不认得的值。
 //
@@ -88,6 +88,7 @@ func TestRunStatusConstantsKeepTheirContractValues(t *testing.T) {
 		{"running", RunStatusRunning, "running"},
 		{"completed", RunStatusCompleted, "completed"},
 		{"failed", RunStatusFailed, "failed"},
+		{"suspended", RunStatusSuspended, "suspended"},
 		{"interrupted", RunStatusInterrupted, "interrupted"},
 	} {
 		if string(tc.got) != tc.want {

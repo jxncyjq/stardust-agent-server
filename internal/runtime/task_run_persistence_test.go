@@ -3,6 +3,7 @@ package runtime
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -281,6 +282,14 @@ func TestRunTaskWithoutATaskRunStoreStillRuns(t *testing.T) {
 	if run.Result != "OK" {
 		t.Errorf("run.Result = %q, want %q", run.Result, "OK")
 	}
+	// 没有落点也要给出这条腿的 id：返回值的形状不许随部署而变，否则同一个字段在
+	// 一种部署里能查到记录、在另一种里是个编出来的字符串。
+	if run.ID == "" {
+		t.Error("run.ID 是空串；没有落点不等于这条腿没有 id")
+	}
+	if strings.Contains(run.ID, ":run-1") {
+		t.Errorf("run.ID = %q 还是老形状；id 只许有一个出处", run.ID)
+	}
 }
 
 // TestClonedSubRuntimeCarriesTheTaskRunStore：克隆出来的子运行时必须带着运行记录
@@ -340,11 +349,13 @@ func TestRunTaskStillRecordsTheEndingWhenTheContextIsCancelled(t *testing.T) {
 	}
 }
 
-// TestRunTaskLeavesASuspendedRunOpen：挂起等审批不是一次运行的结束。
+// TestRunTaskRecordsASuspendedEnding：挂起等审批是这条腿自己的终态，写 suspended。
 //
-// 它停在半路等人决定，既没有失败也没有完成；写成 failed 会把「等人」说成「跑挂
-// 了」。那一行留在 running，恢复腿是另一条记录。
-func TestRunTaskLeavesASuspendedRunOpen(t *testing.T) {
+// 写成 failed 会把「等人」说成「跑挂了」；而什么都不写会把那一行留在 running——活
+// 进程里它与真正在飞的记录分不出来，重启后又被扫成 interrupted，于是一次「人批准
+// 过、恢复腿跑完了」的任务留着一条「进程没了」的记录。恢复腿是另一条记录（各有
+// 各的 id），所以这一行到此为止。
+func TestRunTaskRecordsASuspendedEnding(t *testing.T) {
 	t.Parallel()
 
 	runs := &recordingTaskRuns{}
@@ -366,8 +377,17 @@ func TestRunTaskLeavesASuspendedRunOpen(t *testing.T) {
 	if len(started) != 1 {
 		t.Fatalf("开始写入 %d 次, want 1", len(started))
 	}
-	if len(finished) != 0 {
-		t.Fatalf("挂起却写了终态：%+v", finished)
+	if len(finished) != 1 {
+		t.Fatalf("终态写入 %d 次, want 恰好 1 次——挂起也要收尾", len(finished))
+	}
+	if finished[0].Status != domain.RunStatusSuspended {
+		t.Errorf("终态 status = %q, want suspended", finished[0].Status)
+	}
+	if finished[0].ID != started[0].ID {
+		t.Errorf("终态写的是另一条记录：start=%q finish=%q", started[0].ID, finished[0].ID)
+	}
+	if finished[0].Error != "" {
+		t.Errorf("挂起那一行带了错误摘要 %q；等人不是出错", finished[0].Error)
 	}
 }
 
@@ -406,5 +426,173 @@ func TestEachRunLegGetsItsOwnID(t *testing.T) {
 		if run.TaskID != "task-1" {
 			t.Errorf("run %q 的 task id = %q", run.ID, run.TaskID)
 		}
+	}
+}
+
+// TestBackgroundRunFinishesTheRunIDItWasGiven：后台子任务的终态要写回派发方开的
+// 那一行，不是 RunTask 另起的一条。
+//
+// 后台子任务的开始行由派发那一刻写下（那是父任务确凿还在飞的唯一时刻），RunTask
+// 不写第二次。run id 因此必须由 task.RunID 带进来：让 RunTask 自己 mint 一个，收口
+// 就会拿一个从没插过库的 id 去 FinishTaskRun——真实存储在这里硬失败（no such run
+// was started），而派发方插的那一行没有任何人再碰它，永远停在 running。
+func TestBackgroundRunFinishesTheRunIDItWasGiven(t *testing.T) {
+	t.Parallel()
+
+	const dispatched = "dispatched-run-1"
+	runs := &recordingTaskRuns{}
+	// 派发方在派发那一刻已经把开始行写下了。
+	opening := testTask("task-bg")
+	runs.started = append(runs.started, domain.TaskRun{
+		ID: dispatched, TaskID: opening.ID, AgentID: "agent-1",
+		StartedAt: time.Now(), Status: domain.RunStatusRunning, Background: true,
+	})
+
+	task := testTask("task-bg")
+	task.Background = true
+	task.RunID = dispatched
+	rt := newTaskRunRuntime(runs)
+	if _, err := rt.RunTask(context.Background(), testAgent(), task); err != nil {
+		t.Fatalf("RunTask: %v", err)
+	}
+	started, finished := runs.snapshot()
+	if len(started) != 1 {
+		t.Fatalf("开始写入 %d 条, want 1——后台子任务的开始行不由 RunTask 写", len(started))
+	}
+	if len(finished) != 1 {
+		t.Fatalf("终态写入 %d 次, want 恰好 1 次", len(finished))
+	}
+	if finished[0].ID != dispatched {
+		t.Errorf("终态写去了 %q，而派发方开的那一行是 %q——那一行永远停在 running",
+			finished[0].ID, dispatched)
+	}
+}
+
+// TestRunTaskReturnsTheIDItPersisted：返回给调用方的 run.ID 就是落盘那一行的 id。
+//
+// 两者一旦分叉不会有任何报错：接口把 run.ID 回给前端，前端拿它查 TaskRunByID 只会
+// 得到 found=false。id 只许有一个出处。
+func TestRunTaskReturnsTheIDItPersisted(t *testing.T) {
+	t.Parallel()
+
+	runs := &recordingTaskRuns{}
+	rt := newTaskRunRuntime(runs)
+	run, err := rt.RunTask(context.Background(), testAgent(), testTask("task-1"))
+	if err != nil {
+		t.Fatalf("RunTask: %v", err)
+	}
+	started, finished := runs.snapshot()
+	if len(started) != 1 || len(finished) != 1 {
+		t.Fatalf("写入 %d 开始 / %d 终态, want 1 / 1", len(started), len(finished))
+	}
+	if run.ID != started[0].ID {
+		t.Errorf("返回的 run.ID = %q，落盘那一行是 %q", run.ID, started[0].ID)
+	}
+	if run.ID != finished[0].ID {
+		t.Errorf("返回的 run.ID = %q，终态那一行是 %q", run.ID, finished[0].ID)
+	}
+}
+
+// blockingTaskRuns 让前 blockFinishes 次终态写入一直阻塞到它自己的 ctx 结束。
+//
+// 它模仿的是「连接池只有一条连接、而这条连接被别人占着」：database/sql 取连接的
+// 等待没有别的逃生口，只有 ctx。
+type blockingTaskRuns struct {
+	recordingTaskRuns
+	blockFinishes int
+}
+
+func (b *blockingTaskRuns) FinishTaskRun(ctx context.Context, run domain.TaskRun) error {
+	b.mu.Lock()
+	blocked := b.blockFinishes > 0
+	if blocked {
+		b.blockFinishes--
+	}
+	b.mu.Unlock()
+	if blocked {
+		<-ctx.Done()
+		return fmt.Errorf("finish task run %q: %w", run.ID, ctx.Err())
+	}
+	return b.recordingTaskRuns.FinishTaskRun(ctx, run)
+}
+
+var _ port.TaskRunStore = (*blockingTaskRuns)(nil)
+
+// TestRunTaskFailsWhenTheClosingWriteOverrunsItsBudget：收尾写入卡住时，RunTask
+// 带着一条说明「这次运行的结束没能记上」的错误返回，而不是挂死。
+//
+// 收尾脱离了调用方的取消（否则用户一中断，那一行就永远停在 running），于是它自己
+// 必须有个预算：没有预算的话，一次卡住的收尾写入会同时卡住这条任务的 goroutine
+// （用户中断也叫不醒它）和所有等这条任务边界的插件 apply。
+//
+// 两条收尾路径各测一次：成功那条走 completeRun，出错那条走收口 defer。
+func TestRunTaskFailsWhenTheClosingWriteOverrunsItsBudget(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name    string
+		opt     func(*Config)
+		wantMsg string
+	}{
+		// 只阻塞第一次：completeRun 卡满预算后失败，收口 defer 随即补写 failed
+		// （第二次不再阻塞），用例因此只等一个预算。
+		{"成功路径的收尾", nil, "record the completion of task task-1"},
+		{"出错路径的收尾", func(cfg *Config) { cfg.Maas = failingMaas{} }, "record the end of task task-1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			runs := &blockingTaskRuns{blockFinishes: 1}
+			opts := []func(*Config){}
+			if tc.opt != nil {
+				opts = append(opts, tc.opt)
+			}
+			rt := newTaskRunRuntime(runs, opts...)
+			done := make(chan error, 1)
+			go func() {
+				_, err := rt.RunTask(context.Background(), testAgent(), testTask("task-1"))
+				done <- err
+			}()
+			select {
+			case err := <-done:
+				if err == nil {
+					t.Fatal("收尾写入卡满了预算，RunTask 却成功了")
+				}
+				if !errors.Is(err, context.DeadlineExceeded) {
+					t.Errorf("错误链里没有超时：%v", err)
+				}
+				if !strings.Contains(err.Error(), tc.wantMsg) {
+					t.Errorf("错误没说清是哪一次写入没记上：%v", err)
+				}
+			case <-time.After(closingWriteBudget + 10*time.Second):
+				t.Fatal("RunTask 挂死了：收尾写入没有预算")
+			}
+		})
+	}
+}
+
+// TestFinishRunLeavesTheRunIDToItsCaller：finishRun 组装成功的 TaskRun 时不填 id。
+//
+// 这条腿的 run id 只有 RunTask 知道（开始那一行是它插的，或是派发方经 task.RunID
+// 交给它的）。finishRun 在这里另编一个，就又多出一种 id 形状；今天 completeRun 会把
+// 它盖掉，所以盖不掉的那天——比如有人让 finishRun 的返回值走别的出口——才会发现。
+func TestFinishRunLeavesTheRunIDToItsCaller(t *testing.T) {
+	t.Parallel()
+
+	rt := NewRuntime(Config{
+		Gate:   taskgate.NewTaskGate(),
+		Maas:   adapter.NewRecordingMaas("OK"),
+		Audit:  adapter.NewMemoryAuditLog(),
+		Events: adapter.NewMemoryEventBus(),
+	})
+	run, err := rt.finishRun(context.Background(), "req-1", domain.Agent{ID: "agent-1"},
+		domain.Task{ID: "task-1"},
+		loopState{started: time.Now(), stopReason: domain.StopReasonCompleted})
+	if err != nil {
+		t.Fatalf("finishRun: %v", err)
+	}
+	if run.ID != "" {
+		t.Errorf("finishRun 自己编了一个 run id %q；id 只许有一个出处", run.ID)
 	}
 }

@@ -45,6 +45,20 @@ var (
 
 const defaultMaxToolRounds = 4
 
+// closingWriteBudget 是「这次运行结束了」那一次写入的时间预算。
+//
+// 收尾写入刻意脱离了调用方的取消（context.WithoutCancel）：用户一中断，ctx 就已经
+// Done，而这次写入正是这条腿结束的唯一记录，跟着一起失败那一行就永远停在 running。
+// 代价是它失去了唯一的逃生口，所以必须自己带一个：storage 的连接池上限是一条连接
+// （sqlite.go 的 SetMaxOpenConns(1)），取连接是一个队列，而这个队列除了 ctx 没有
+// 别的出口——busy_timeout 只管语句执行撞锁，管不到取连接的等待。没有预算的话，一次
+// 卡住的收尾写入会同时卡死这条任务的 goroutine（此时 taskgate 的 end 还没跑）和所有
+// 等这条任务边界的插件 apply。
+//
+// 取 5s 与 storage 的 busy_timeout 同量级：一次排队等待撞满锁等待仍应落在预算内，
+// 超过它就不是「忙」而是「卡住了」，此时报错比无限等更诚实。
+const closingWriteBudget = 5 * time.Second
+
 type ContextBuilder interface {
 	BuildContext(ctx context.Context, req cognitive.Request) (cognitive.BuiltContext, error)
 }
@@ -706,11 +720,19 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 
 	// 运行记录先落盘，再干活。反过来先跑后记，崩在中间就什么都不剩；而落盘失败
 	// 时任务不开始——一个状态没落盘的任务没有资格自称可续（规格第五节）。
+	// run id 只有一个出处：谁写下了开始那一行，谁就说了算。task.RunID 非空表示开始
+	// 行已经由别人（今天是后台子任务的派发路径）插好了，这条腿就用那个 id 收尾；
+	// 为空才自己 mint。
+	//
+	// mint 出来的必须是每条腿一个新 id：一个任务可以跑不止一次（挂起等审批之后的
+	// 恢复腿就是第二次），而 "<任务>:run-1" 会让第二条腿拿同一个主键去插，恢复根本
+	// 起不来。父子关系与归属由 TaskID / ParentTaskID 两列回答，不靠 id 的形状。
+	runID := task.RunID
+	if runID == "" {
+		runID = uuid.NewString()
+	}
 	runRecord := domain.TaskRun{
-		// 每条腿一个新 id：一个任务可以跑不止一次（挂起等审批之后的恢复腿就是
-		// 第二次），而 "<任务>:run-1" 会让第二条腿拿同一个主键去插，恢复根本起不来。
-		// 父子关系与归属由 TaskID / ParentTaskID 两列回答，不靠 id 的形状。
-		ID:           uuid.NewString(),
+		ID:           runID,
 		TaskID:       task.ID,
 		AgentID:      agent.ID,
 		StartedAt:    started,
@@ -739,28 +761,31 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		if r.taskRuns == nil || finished {
 			return
 		}
-		// 挂起不是结束：这条腿停在半路等人决定，既没失败也没完成。写成 failed 会把
-		// 「等人」说成「跑挂了」，而恢复腿是另一条记录（各有各的 id）。这一行留在
-		// running；进程真在等待期间死掉，下一次启动把它扫成 interrupted，对这条腿
-		// 而言那是实话。
-		if errors.Is(runErr, ErrSuspended) {
-			return
-		}
 		ending := runRecord
 		ending.EndedAt = time.Now()
-		ending.Status = domain.RunStatusFailed
-		if runErr != nil {
+		switch {
+		case errors.Is(runErr, ErrSuspended):
+			// 挂起不是失败：这条腿停在半路等人决定。写成 failed 会把「等人」说成
+			// 「跑挂了」，而什么都不写会把这一行留在 running——活进程里它与真正在飞
+			// 的记录分不出来，重启后又被扫成 interrupted。它是这条腿自己的终态，人
+			// 批准之后跑的是另一条记录（各有各的 id）。
+			ending.Status = domain.RunStatusSuspended
+		case runErr != nil:
+			ending.Status = domain.RunStatusFailed
 			ending.Error = runErr.Error()
-		} else {
+		default:
 			// 没有错误却走到这里，说明有一条出口既没报错也没写终态——一种接线
 			// 缺口。记成 failed 并说明，比留下一行 running 强：后者会在下一次
 			// 启动被扫成 interrupted，把一个代码缺陷伪装成一次进程消失。
+			ending.Status = domain.RunStatusFailed
 			ending.Error = "task run ended without an error and without a recorded completion"
 		}
-		// 收尾脱离取消：ctx 继承调用方，用户一中断它就已经 Done，而这次写入正是
-		// 「这条腿结束了」的唯一记录。跟着一起失败，那一行就永远停在 running，下次
-		// 启动被扫成 interrupted——这份设计要消灭的症状换了个触发条件。
-		if err := r.taskRuns.FinishTaskRun(context.WithoutCancel(ctx), ending); err != nil {
+		// 收尾脱离取消、但带自己的预算：ctx 继承调用方，用户一中断它就已经 Done，而
+		// 这次写入正是「这条腿结束了」的唯一记录，跟着一起失败那一行就永远停在
+		// running。脱离取消之后它就没有别的逃生口了，预算见 closingWriteBudget。
+		writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), closingWriteBudget)
+		defer cancelWrite()
+		if err := r.taskRuns.FinishTaskRun(writeCtx, ending); err != nil {
 			runErr = errors.Join(runErr, fmt.Errorf("record the end of task %s: %w", task.ID, err))
 		}
 	}()
@@ -775,20 +800,26 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	//
 	// 它是闭包而不是方法，因为 RunTask 有两处成功出口（恢复那条与首跑那条，都以
 	// runToolLoop 收尾），两处要共用同一份 runRecord 与同一个 finished。
-	completeRun := func(run domain.TaskRun) error {
+	completeRun := func(run *domain.TaskRun) error {
+		// 返回给调用方的那份与落盘那一行共用同一个 id。finishRun 不再自己编 id：
+		// 两者一旦分叉不会有任何报错，只会让拿着返回值去查库的人得到 found=false。
+		// 这一句在 taskRuns == nil 之前，那种部署返回的也是同一个形状。
+		run.ID = runRecord.ID
 		if r.taskRuns == nil {
 			finished = true
 			return nil
 		}
-		completion := run
-		// 终态按这条腿自己的 id 写回：finishRun 组装的那份仍然用老形状的 id，而
-		// 开始那一行是用 runRecord.ID 插的。
-		completion.ID = runRecord.ID
+		completion := *run
 		completion.Status = domain.RunStatusCompleted
+		// 这三列 storage.FinishTaskRun 的 UPDATE 并不写（它们在开始那一行就已定型），
+		// 抄过来是给别的 TaskRunStore 实现用的：端口不保证落点一定是那份 SQLite。
 		completion.ParentTaskID = runRecord.ParentTaskID
 		completion.Background = runRecord.Background
 		completion.Goal = runRecord.Goal
-		if err := r.taskRuns.FinishTaskRun(context.WithoutCancel(ctx), completion); err != nil {
+		// 收尾同样脱离取消并带预算，理由与收口 defer 一致，见 closingWriteBudget。
+		writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), closingWriteBudget)
+		defer cancelWrite()
+		if err := r.taskRuns.FinishTaskRun(writeCtx, completion); err != nil {
 			return fmt.Errorf("record the completion of task %s: %w", task.ID, err)
 		}
 		finished = true
@@ -935,7 +966,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 			if err != nil {
 				return domain.TaskRun{}, err
 			}
-			if err := completeRun(run); err != nil {
+			if err := completeRun(&run); err != nil {
 				return domain.TaskRun{}, err
 			}
 			return run, nil
@@ -1020,7 +1051,7 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	if err != nil {
 		return domain.TaskRun{}, err
 	}
-	if err := completeRun(run); err != nil {
+	if err := completeRun(&run); err != nil {
 		return domain.TaskRun{}, err
 	}
 	return run, nil
@@ -1439,7 +1470,9 @@ func (r *Runtime) finishRun(ctx context.Context, requestID string, agent domain.
 	}
 	ended := time.Now()
 	run := domain.TaskRun{
-		ID:               task.ID + ":run-1",
+		// ID 留空：这条腿的 run id 由 RunTask 持有（它才知道开始那一行是用哪个 id
+		// 插的），在 completeRun 里统一赋。在这里另编一个，返回值与落盘行就会是两个
+		// 不同的东西，而这种分歧不会有任何报错。
 		TaskID:           task.ID,
 		AgentID:          agent.ID,
 		StartedAt:        st.started,
