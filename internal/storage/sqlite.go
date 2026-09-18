@@ -1163,7 +1163,7 @@ func (r *SQLiteRepository) SaveTaskRun(ctx context.Context, run domain.TaskRun) 
 			total_tokens = excluded.total_tokens,
 			generated_files = excluded.generated_files
 	`, run.ID, run.TaskID, run.AgentID, formatTime(run.StartedAt), formatTime(run.EndedAt), run.Result,
-		string(run.StopReason), string(run.Status), run.ParentTaskID, run.Background, run.Goal, run.Error,
+		string(run.StopReason), string(run.Status), run.ParentTaskID, boolToInt(run.Background), run.Goal, run.Error,
 		run.ReasoningSummary, run.PromptTokens, run.CompletionTokens, run.CachedTokens, run.TotalTokens, files)
 	if err != nil {
 		return fmt.Errorf("save task run %q: %w", run.ID, err)
@@ -1196,6 +1196,11 @@ func unmarshalGeneratedFiles(s string) ([]string, error) {
 	var files []string
 	if err := json.Unmarshal([]byte(s), &files); err != nil {
 		return nil, fmt.Errorf("decode generated files %q: %w", s, err)
+	}
+	if len(files) == 0 {
+		// 落盘的 "[]" 与空串说的是同一件事：这次运行没有生成文件。两种来源收敛到
+		// 同一个返回值，免得「空」在内存里有两种长相。
+		return nil, nil
 	}
 	return files, nil
 }
@@ -1237,8 +1242,11 @@ type taskRunScanner interface {
 func scanTaskRun(sc taskRunScanner) (domain.TaskRun, error) {
 	var run domain.TaskRun
 	var startedAt, endedAt, stopReason, status, files string
+	// background 经 int 往返，与 agent_sessions.archived 同一写法：这一列在库里是
+	// INTEGER，让驱动去隐式转 bool 是这份文件里唯一的例外。
+	var background int
 	if err := sc.Scan(&run.ID, &run.TaskID, &run.AgentID, &startedAt, &endedAt, &run.Result, &stopReason,
-		&status, &run.ParentTaskID, &run.Background, &run.Goal, &run.Error,
+		&status, &run.ParentTaskID, &background, &run.Goal, &run.Error,
 		&run.ReasoningSummary, &run.PromptTokens, &run.CompletionTokens, &run.CachedTokens, &run.TotalTokens,
 		&files); err != nil {
 		return domain.TaskRun{}, fmt.Errorf("scan task run: %w", err)
@@ -1264,6 +1272,7 @@ func scanTaskRun(sc taskRunScanner) (domain.TaskRun, error) {
 	run.StopReason = domain.StopReason(stopReason)
 	run.Status = parsedStatus
 	run.GeneratedFiles = parsedFiles
+	run.Background = background != 0
 	return run, nil
 }
 

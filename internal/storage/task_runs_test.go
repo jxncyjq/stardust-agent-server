@@ -149,3 +149,25 @@ func TestColumnMigrationsAreIdempotent(t *testing.T) {
 		t.Errorf("老行的 status = %q, want completed", runs[0].Status)
 	}
 }
+
+// TestTaskRunRefusesACorruptedGeneratedFilesColumn：生成文件清单读不懂时报错，不
+// 退化成空清单。
+//
+// 复审实测：把 unmarshalGeneratedFiles 的解码错误改成吞掉返回 nil，go vet 干净、
+// 全仓测试全绿——这条 fail-loud 规则此前没有任何用例守着。读成「这次运行没有生成
+// 文件」与「这一列坏了」是两句完全不同的话。
+func TestTaskRunRefusesACorruptedGeneratedFilesColumn(t *testing.T) {
+	t.Parallel()
+
+	repo := newTaskRunRepo(t)
+	ctx := context.Background()
+	if err := repo.SaveTaskRun(ctx, fullTaskRun()); err != nil {
+		t.Fatalf("SaveTaskRun: %v", err)
+	}
+	if _, err := repo.db.ExecContext(ctx, `UPDATE task_runs SET generated_files = 'not-json'`); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if runs, err := repo.ListTaskRuns(ctx, "task-1"); err == nil {
+		t.Fatalf("坏掉的 generated_files 被读成了 %v", runs[0].GeneratedFiles)
+	}
+}
