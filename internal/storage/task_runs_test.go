@@ -373,3 +373,52 @@ func TestStartTaskRunRefusesEmptyIDs(t *testing.T) {
 		}
 	}
 }
+
+// TestFinishTaskRunDoesNotRefuseASecondTerminalWrite：结束一条**已经是终态**的
+// 记录不会被拒——第二次写回照样落地，并把第一次的终态覆盖掉。
+//
+// 这条用例钉的不是一个想要的能力，而是一个必须被别处补上的空缺：FinishTaskRun 的
+// UPDATE 只按 id 匹配，不看当前 status，所以存储这一层不提供任何「只许结束一次」的
+// 保证。于是「一次运行恰好落一次终态」只能由调用方保证——runtime.RunTask 的收口
+// defer 用 finished 标记做到这件事（见 TestTheClosingWriteIsIdempotentBecauseTheStoreIsNot）。
+//
+// 哪天这里改成拒绝第二次写回，这条用例会红，那是提醒：runtime 那边的幂等论证要跟着改。
+func TestFinishTaskRunDoesNotRefuseASecondTerminalWrite(t *testing.T) {
+	t.Parallel()
+
+	repo := newTaskRunRepo(t)
+	ctx := context.Background()
+	if err := repo.StartTaskRun(ctx, domain.TaskRun{
+		ID:        "run-1",
+		TaskID:    "task-1",
+		AgentID:   "agent-1",
+		StartedAt: time.Date(2026, 9, 18, 10, 0, 0, 0, time.UTC),
+		Status:    domain.RunStatusRunning,
+	}); err != nil {
+		t.Fatalf("StartTaskRun: %v", err)
+	}
+	if err := repo.FinishTaskRun(ctx, domain.TaskRun{
+		ID:         "run-1",
+		EndedAt:    time.Date(2026, 9, 18, 10, 1, 0, 0, time.UTC),
+		Result:     "答案",
+		StopReason: domain.StopReasonCompleted,
+		Status:     domain.RunStatusCompleted,
+	}); err != nil {
+		t.Fatalf("第一次 FinishTaskRun: %v", err)
+	}
+	if err := repo.FinishTaskRun(ctx, domain.TaskRun{
+		ID:      "run-1",
+		EndedAt: time.Date(2026, 9, 18, 10, 2, 0, 0, time.UTC),
+		Status:  domain.RunStatusFailed,
+		Error:   "第二次写回",
+	}); err != nil {
+		t.Fatalf("第二次 FinishTaskRun 被拒了；若这是有意加的守卫，runtime 侧的幂等论证要跟着改：%v", err)
+	}
+	got, found, err := repo.TaskRunByID(ctx, "run-1")
+	if err != nil || !found {
+		t.Fatalf("TaskRunByID = %v, %v, %v", got, found, err)
+	}
+	if got.Status != domain.RunStatusFailed || got.Error != "第二次写回" {
+		t.Errorf("第二次写回没有覆盖第一次的终态：%+v", got)
+	}
+}

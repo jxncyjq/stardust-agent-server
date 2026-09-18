@@ -180,6 +180,11 @@ type Config struct {
 	// 构造），不是兜底：那时整个记录是 no-op，三个屏障永远放行。它与「配了但写不进去」
 	// 是两回事——后者由屏障 fail-closed 挡住。
 	SessionEvents port.SessionEventStore
+	// TaskRuns 是任务运行记录的落点。nil 表示这个部署不落盘运行记录（CLI 的
+	// 一次性执行、以及绝大多数测试就是这个形状），此时 RunTask 不写任何记录，
+	// 也不因此失败——这是契约里写明的可选，不是接线漏了。serve 装配一定给它
+	// 一个非 nil 值。
+	TaskRuns port.TaskRunStore
 	// ModelProfile 是这次运行使用的模型档位名，会话事件的 assistant/message 用它
 	// 填 spec §4.1 的 model_profile 字段（P3 的轨迹里「这一步用的是哪个模型」那一栏）。
 	//
@@ -251,6 +256,10 @@ type Runtime struct {
 	// leaving the recorder field itself nil -- see eventRecorder's type doc on
 	// why a literal nil recorder is refused, not tolerated.
 	sessionEvents port.SessionEventStore
+	// taskRuns 是任务运行记录的落点（Config.TaskRuns）。nil 是契约声明的合法部署
+	// 形态，不是接线缺口：那时 RunTask 一条记录都不写。newSubRuntime 必须把它带给
+	// 子运行时，否则后台子任务那条路上的落盘会整条消失。
+	taskRuns port.TaskRunStore
 	// modelProfile is the model profile name this runtime runs under, recorded
 	// on every assistant/message event (spec §4.1's model_profile). See
 	// Config.ModelProfile for why it has to come from assembly.
@@ -436,6 +445,7 @@ func NewRuntime(cfg Config) *Runtime {
 		episodeRecorder:       cfg.EpisodeRecorder,
 		gate:                  cfg.Gate,
 		sessionEvents:         cfg.SessionEvents,
+		taskRuns:              cfg.TaskRuns,
 		modelProfile:          cfg.ModelProfile,
 	}
 }
@@ -658,7 +668,7 @@ func (r *Runtime) closeTurnOnError(ctx context.Context, task domain.Task, rec *e
 // for hours, and counting it as in flight would let one unanswered approval
 // block every plugin reload indefinitely — a worse failure than one
 // prompt-cache miss on resume. See TaskGate's doc for the full reasoning.
-func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.Task) (domain.TaskRun, error) {
+func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.Task) (runResult domain.TaskRun, runErr error) {
 	// The task is registered with the task-boundary gate before anything else
 	// happens, and retired when it is over however it ends. That is both halves
 	// of the contract in one place: while this task runs a plugin change waits
@@ -691,6 +701,82 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	defer end()
 
 	started := time.Now()
+
+	// 运行记录先落盘，再干活。反过来先跑后记，崩在中间就什么都不剩；而落盘失败
+	// 时任务不开始——一个状态没落盘的任务没有资格自称可续（规格第五节）。
+	runRecord := domain.TaskRun{
+		ID:           task.ID + ":run-1",
+		TaskID:       task.ID,
+		AgentID:      agent.ID,
+		StartedAt:    started,
+		Status:       domain.RunStatusRunning,
+		ParentTaskID: task.ParentTaskID,
+		Background:   task.Background,
+		Goal:         task.Goal,
+	}
+	// 后台子任务的开始记录已经由 RunSubTaskAsync 在派发那一刻写下（那是父任务确凿
+	// 还在飞的唯一时刻），这里不写第二次——同一条 run id 再插一次会撞主键。终态
+	// 收口对两者一视同仁。
+	if r.taskRuns != nil && !task.Background {
+		if err := r.taskRuns.StartTaskRun(ctx, runRecord); err != nil {
+			return domain.TaskRun{}, fmt.Errorf("record the start of task %s: %w", task.ID, err)
+		}
+	}
+
+	// 终态写入收口在这一处。RunTask 有二十多条错误出口，逐条去记得写一次终态是
+	// 守不住的；这里用具名返回值 + defer，让「无论从哪条路出去都恰好落一次终态」
+	// 由控制流本身保证。
+	//
+	// finished 由成功路径置位：那条路自己写 completed（它手里那份 TaskRun 带着
+	// 结果与 usage，这里没有），于是这个 defer 对它是空操作。
+	var finished bool
+	defer func() {
+		if r.taskRuns == nil || finished {
+			return
+		}
+		ending := runRecord
+		ending.EndedAt = time.Now()
+		ending.Status = domain.RunStatusFailed
+		if runErr != nil {
+			ending.Error = runErr.Error()
+		} else {
+			// 没有错误却走到这里，说明有一条出口既没报错也没写终态——一种接线
+			// 缺口。记成 failed 并说明，比留下一行 running 强：后者会在下一次
+			// 启动被扫成 interrupted，把一个代码缺陷伪装成一次进程消失。
+			ending.Error = "task run ended without an error and without a recorded completion"
+		}
+		if err := r.taskRuns.FinishTaskRun(ctx, ending); err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("record the end of task %s: %w", task.ID, err))
+		}
+	}()
+
+	// completeRun 是成功那条路的终态写入。它落一条 completed 并置位 finished，于是
+	// 上面那个 defer 对它变成空操作——「恰好一次」就是这么来的，不是靠存储去重
+	// （storage.FinishTaskRun 按 id 更新，不看当前状态，第二次照写）。
+	//
+	// 写失败时 finished 仍为 false，于是 defer 会再写一次 failed：结果没能落盘，
+	// 这一次运行对外就不是 completed。第二次写入若也失败，两条错误由 errors.Join
+	// 一起带出。
+	//
+	// 它是闭包而不是方法，因为 RunTask 有两处成功出口（恢复那条与首跑那条，都以
+	// runToolLoop 收尾），两处要共用同一份 runRecord 与同一个 finished。
+	completeRun := func(run domain.TaskRun) error {
+		if r.taskRuns == nil {
+			finished = true
+			return nil
+		}
+		completion := run
+		completion.Status = domain.RunStatusCompleted
+		completion.ParentTaskID = runRecord.ParentTaskID
+		completion.Background = runRecord.Background
+		completion.Goal = runRecord.Goal
+		if err := r.taskRuns.FinishTaskRun(ctx, completion); err != nil {
+			return fmt.Errorf("record the completion of task %s: %w", task.ID, err)
+		}
+		finished = true
+		return nil
+	}
+
 	requestID := task.ID + ":run"
 	if err := r.events.Publish(ctx, domain.RuntimeEvent{
 		Type:      "task_started",
@@ -827,7 +913,14 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 				r.closeTurnOnError(ctx, task, rec, err)
 				return domain.TaskRun{}, fmt.Errorf("run task %s: %w", task.ID, err)
 			}
-			return r.runToolLoop(ctx, requestID, agent, task, st)
+			run, err := r.runToolLoop(ctx, requestID, agent, task, st)
+			if err != nil {
+				return domain.TaskRun{}, err
+			}
+			if err := completeRun(run); err != nil {
+				return domain.TaskRun{}, err
+			}
+			return run, nil
 		}
 	}
 
@@ -905,7 +998,14 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		catalog:          catalog,
 		events:           rec,
 	}
-	return r.runToolLoop(ctx, requestID, agent, task, st)
+	run, err := r.runToolLoop(ctx, requestID, agent, task, st)
+	if err != nil {
+		return domain.TaskRun{}, err
+	}
+	if err := completeRun(run); err != nil {
+		return domain.TaskRun{}, err
+	}
+	return run, nil
 }
 
 // closingInstructionForStopReason names, for the model, the reason its tool

@@ -80,6 +80,14 @@ type Task struct {
 	// (e.g. "data:image/png;base64,..."). It is a task-level input visible to
 	// every inference round. Empty when the task is text-only.
 	Images []string `json:"images,omitempty"`
+	// ParentTaskID 是派出这条任务的父任务；直连任务为空。由委派路径填写。
+	ParentTaskID string `json:"parent_task_id,omitempty"`
+	// Background 报告这条任务是不是后台子任务。它决定运行记录的开始那一行由谁写：
+	// 后台子任务的那一行在派发的那一刻就写了（见 RunSubTaskAsync），因为只有那一刻
+	// 还能保证父任务在飞。
+	Background bool `json:"background,omitempty"`
+	// Goal 是子任务的目标原文，落进运行记录让人读得懂它在干什么；直连任务为空。
+	Goal string `json:"goal,omitempty"`
 }
 
 // StopReason says why a task's tool loop stopped.

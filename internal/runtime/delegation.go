@@ -244,6 +244,9 @@ func (r *Runtime) newSubRuntime(role string, toolsets []string) (*Runtime, error
 		// "the seam exists but nothing reaches it" failure shape this repo has
 		// hit twice before with per-agent tool/approval wiring.
 		sessionEvents: r.sessionEvents,
+		// 子运行时必须继承运行记录的落点：没有它，后台子任务的 RunTask 拿到的是
+		// nil，落盘在子任务这条路上整条消失——而那正是本设计的目标场景。
+		taskRuns: r.taskRuns,
 		// The child runs on the parent's inference client, so it runs under the
 		// parent's model profile; without this its own session log would record
 		// an empty model_profile on every assistant/message (spec §4.1).
