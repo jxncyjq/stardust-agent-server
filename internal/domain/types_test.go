@@ -72,3 +72,26 @@ func TestParseRunStatusRoundTripsEveryValue(t *testing.T) {
 		seen[s] = true
 	}
 }
+
+// TestRunStatusConstantsKeepTheirContractValues：这四个字面值是对外契约——它们要
+// 落进 SQLite 的运行状态列。改常量名可以，改值会悄悄改掉已落盘数据的含义：库里
+// 那些 "running" 会突然变成 ParseRunStatus 不认得的值。
+//
+// 所以这里的断言写死字面量，不能引用常量本身，否则改常量等于同时改了断言。与
+// TestStopReasonConstantsKeepTheirContractValues 同理。
+func TestRunStatusConstantsKeepTheirContractValues(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		got  RunStatus
+		want string
+	}{
+		{"running", RunStatusRunning, "running"},
+		{"completed", RunStatusCompleted, "completed"},
+		{"failed", RunStatusFailed, "failed"},
+		{"interrupted", RunStatusInterrupted, "interrupted"},
+	} {
+		if string(tc.got) != tc.want {
+			t.Errorf("%s run status = %q, want %q", tc.name, string(tc.got), tc.want)
+		}
+	}
+}
