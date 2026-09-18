@@ -214,10 +214,9 @@ package storage
 import (
 	"context"
 	"path/filepath"
+	"reflect"
 	"testing"
 	"time"
-
-	"github.com/google/go-cmp/cmp"
 
 	"github.com/stardust/legion-agent/internal/domain"
 )
@@ -281,8 +280,15 @@ func TestTaskRunRoundTripsEveryField(t *testing.T) {
 	if len(runs) != 1 {
 		t.Fatalf("ListTaskRuns 返回 %d 条，want 1", len(runs))
 	}
-	if diff := cmp.Diff(want, runs[0]); diff != "" {
-		t.Errorf("往返之后字段不一致 (-want +got):\n%s", diff)
+	// 用 reflect.DeepEqual 而不是 go-cmp：这仓没有 go-cmp 依赖，为一条断言引进一个
+	// 新依赖不值得。时间字段先归一到 UTC 再比——parseTime 读回来的是 UTC。
+	want.StartedAt = want.StartedAt.UTC()
+	want.EndedAt = want.EndedAt.UTC()
+	got := runs[0]
+	got.StartedAt = got.StartedAt.UTC()
+	got.EndedAt = got.EndedAt.UTC()
+	if !reflect.DeepEqual(want, got) {
+		t.Errorf("往返之后字段不一致：\nwant %+v\ngot  %+v", want, got)
 	}
 }
 
@@ -1198,7 +1204,10 @@ Expected: FAIL，`withTaskRuns undefined` 或 `Config has no field TaskRuns`
 		Background:   task.Background,
 		Goal:         task.Goal,
 	}
-	if r.taskRuns != nil {
+	// 后台子任务的开始记录已经由 RunSubTaskAsync 在派发那一刻写下（那是父任务确凿
+	// 还在飞的唯一时刻），这里不写第二次——同一条 run id 再插一次会撞主键。终态
+	// 收口对两者一视同仁。
+	if r.taskRuns != nil && !task.Background {
 		if err := r.taskRuns.StartTaskRun(ctx, runRecord); err != nil {
 			return domain.TaskRun{}, fmt.Errorf("record the start of task %s: %w", task.ID, err)
 		}
@@ -1265,7 +1274,18 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 
 > **注意**：`FinishTaskRun` 失败时 `finished` 仍为 false，于是上面那个 `defer` 会再写一次 `failed`——这是刻意的：结果没能落盘，这一次运行对外就不是 completed。第二次写入若也失败，两条错误由 `errors.Join` 一起带出。
 
-3e. `domain.Task` 加 `ParentTaskID` / `Background` / `Goal` 三个字段（若 `Task` 尚无它们），在 `internal/domain/types.go` 的 `Task` 结构体里，注释写明「由委派路径填写，直连任务为空」。
+3e. `domain.Task`（`internal/domain/types.go:64-83`）**今天没有**这三个字段，加上：
+
+```go
+	// ParentTaskID 是派出这条任务的父任务；直连任务为空。由委派路径填写。
+	ParentTaskID string `json:"parent_task_id,omitempty"`
+	// Background 报告这条任务是不是后台子任务。它决定运行记录的开始那一行由谁写：
+	// 后台子任务的那一行在派发的那一刻就写了（见 RunSubTaskAsync），因为只有那一刻
+	// 还能保证父任务在飞。
+	Background bool `json:"background,omitempty"`
+	// Goal 是子任务的目标原文，落进运行记录让人读得懂它在干什么；直连任务为空。
+	Goal string `json:"goal,omitempty"`
+```
 
 - [ ] **Step 4: 跑测试确认通过**
 
@@ -1467,9 +1487,9 @@ func (r *Runtime) nextSubTaskID() string { return uuid.NewString() }
 		...
 ```
 
-> 子任务自己的 `RunTask` 随后还会再插一次同 id 的行吗？**不会**：`RunTask` 用 `task.ID + ":run-1"` 作 run id，与这里写的是同一条主键，`StartTaskRun` 的 INSERT 会因主键冲突报错。所以 **`RunSubTaskAsync` 这里不自己插行，改为把 `background=true` 经 `domain.Task` 交给 `RunTask` 去插**——但那就回到「写在 goroutine 里」了。两者取其一：
+> **与 Task 4 的分工**：`RunTask` 用 `task.ID + ":run-1"` 作 run id，与这里写的是同一条主键，两处都插会撞主键。所以 Task 4 的开始写入带着 `&& !task.Background` 分支：后台子任务的开始记录**只由这里写**，`RunTask` 跳过它，终态收口对两者一视同仁。
 >
-> **采用的做法**：`RunSubTaskAsync` 插的这一行就是那一条记录；`runChild` 调 `child.RunTask` 时，`RunTask` 检测到 `task.Background` 为真则**跳过开始插入**（记录已经在了），终态收口照常。在 `RunTask` 的开始写入处加这个分支，并在注释里写明：后台子任务的开始记录由派发那一刻写下，因为只有那一刻还能保证父任务在飞。
+> 这条分工要有用例守着：本任务的 `TestBackgroundSubTaskIsRecordedBeforeItStarts` 断言「返回时恰好一条」，去掉 Task 4 那个分支会让它变成两条（或主键冲突报错）而转红。
 
 3d. `SubTaskHandle` 的文档改写：
 
@@ -1499,6 +1519,7 @@ Expected: ok（`internal/cli` 里依赖旧 id 形态的用例若失败，**不�
 2. `Background: true` 改成 `false` → 同一条用例必须红。
 3. `nextSubTaskID` 改回 `fmt.Sprintf("%s:sub-%d", ...)` → `TestSubTaskIDsAreUUIDs` 必须红。
 4. Task 4 第 5 条变异（`newSubRuntime` 不搬 `taskRuns`）在这里复跑一次 → 本任务用例必须红。
+5. Task 4 开始写入处的 `&& !task.Background` 去掉 → `TestBackgroundSubTaskIsRecordedBeforeItStarts` 必须红。
 
 - [ ] **Step 6: 提交**
 
