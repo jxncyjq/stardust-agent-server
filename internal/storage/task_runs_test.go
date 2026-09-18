@@ -332,3 +332,44 @@ func TestSweepRunningOnlyTouchesRunningRows(t *testing.T) {
 		t.Errorf("第二次扫描报了 %d 条, want 0", again)
 	}
 }
+
+// TestTaskRunByIDReportsNotFoundWithoutError：查一条不存在的记录是「没有它」，不是
+// 一次失败。
+//
+// 端口契约把这两件事分开写着，而复审实测：把 sql.ErrNoRows 那条分支去掉、让不存在
+// 也包装成 error，go vet 干净、全仓全绿——这条分流此前没有任何用例守着。调用方据此
+// 判「这条运行记录还在不在」，混起来会把一次正常的查不到报成存储故障。
+func TestTaskRunByIDReportsNotFoundWithoutError(t *testing.T) {
+	t.Parallel()
+
+	repo := newTaskRunRepo(t)
+	run, found, err := repo.TaskRunByID(context.Background(), "never-written")
+	if err != nil {
+		t.Fatalf("TaskRunByID = %v, %v, %v; want 零值, false, nil", run, found, err)
+	}
+	if found {
+		t.Errorf("一条从没写过的 id 被报成了找得到：%+v", run)
+	}
+}
+
+// TestStartTaskRunRefusesEmptyIDs：id 与 task_id 都不许为空。
+//
+// 两列在库里都是 NOT NULL，但空串通得过 NOT NULL：一条 id 为空的记录会占掉主键的
+// 空串槽位，而它属于哪次运行无从得知。
+func TestStartTaskRunRefusesEmptyIDs(t *testing.T) {
+	t.Parallel()
+
+	repo := newTaskRunRepo(t)
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name string
+		run  domain.TaskRun
+	}{
+		{"id 为空", domain.TaskRun{TaskID: "task-1", AgentID: "a", StartedAt: time.Now().UTC(), Status: domain.RunStatusRunning}},
+		{"task id 为空", domain.TaskRun{ID: "run-1", AgentID: "a", StartedAt: time.Now().UTC(), Status: domain.RunStatusRunning}},
+	} {
+		if err := repo.StartTaskRun(ctx, tc.run); err == nil {
+			t.Errorf("%s：StartTaskRun 却成功了", tc.name)
+		}
+	}
+}
