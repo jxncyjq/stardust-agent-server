@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/stardust/legion-agent/internal/capability"
 	"github.com/stardust/legion-agent/internal/cognitive"
 	"github.com/stardust/legion-agent/internal/domain"
@@ -705,7 +707,10 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	// 运行记录先落盘，再干活。反过来先跑后记，崩在中间就什么都不剩；而落盘失败
 	// 时任务不开始——一个状态没落盘的任务没有资格自称可续（规格第五节）。
 	runRecord := domain.TaskRun{
-		ID:           task.ID + ":run-1",
+		// 每条腿一个新 id：一个任务可以跑不止一次（挂起等审批之后的恢复腿就是
+		// 第二次），而 "<任务>:run-1" 会让第二条腿拿同一个主键去插，恢复根本起不来。
+		// 父子关系与归属由 TaskID / ParentTaskID 两列回答，不靠 id 的形状。
+		ID:           uuid.NewString(),
 		TaskID:       task.ID,
 		AgentID:      agent.ID,
 		StartedAt:    started,
@@ -734,6 +739,13 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		if r.taskRuns == nil || finished {
 			return
 		}
+		// 挂起不是结束：这条腿停在半路等人决定，既没失败也没完成。写成 failed 会把
+		// 「等人」说成「跑挂了」，而恢复腿是另一条记录（各有各的 id）。这一行留在
+		// running；进程真在等待期间死掉，下一次启动把它扫成 interrupted，对这条腿
+		// 而言那是实话。
+		if errors.Is(runErr, ErrSuspended) {
+			return
+		}
 		ending := runRecord
 		ending.EndedAt = time.Now()
 		ending.Status = domain.RunStatusFailed
@@ -745,7 +757,10 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 			// 启动被扫成 interrupted，把一个代码缺陷伪装成一次进程消失。
 			ending.Error = "task run ended without an error and without a recorded completion"
 		}
-		if err := r.taskRuns.FinishTaskRun(ctx, ending); err != nil {
+		// 收尾脱离取消：ctx 继承调用方，用户一中断它就已经 Done，而这次写入正是
+		// 「这条腿结束了」的唯一记录。跟着一起失败，那一行就永远停在 running，下次
+		// 启动被扫成 interrupted——这份设计要消灭的症状换了个触发条件。
+		if err := r.taskRuns.FinishTaskRun(context.WithoutCancel(ctx), ending); err != nil {
 			runErr = errors.Join(runErr, fmt.Errorf("record the end of task %s: %w", task.ID, err))
 		}
 	}()
@@ -766,11 +781,14 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 			return nil
 		}
 		completion := run
+		// 终态按这条腿自己的 id 写回：finishRun 组装的那份仍然用老形状的 id，而
+		// 开始那一行是用 runRecord.ID 插的。
+		completion.ID = runRecord.ID
 		completion.Status = domain.RunStatusCompleted
 		completion.ParentTaskID = runRecord.ParentTaskID
 		completion.Background = runRecord.Background
 		completion.Goal = runRecord.Goal
-		if err := r.taskRuns.FinishTaskRun(ctx, completion); err != nil {
+		if err := r.taskRuns.FinishTaskRun(context.WithoutCancel(ctx), completion); err != nil {
 			return fmt.Errorf("record the completion of task %s: %w", task.ID, err)
 		}
 		finished = true

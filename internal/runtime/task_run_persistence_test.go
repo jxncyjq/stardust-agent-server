@@ -11,6 +11,7 @@ import (
 	"github.com/stardust/legion-agent/internal/adapter"
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
+	"github.com/stardust/legion-agent/internal/sessionstate"
 	"github.com/stardust/legion-agent/internal/taskgate"
 )
 
@@ -28,7 +29,12 @@ type recordingTaskRuns struct {
 	failEnd   error
 }
 
-func (r *recordingTaskRuns) StartTaskRun(_ context.Context, run domain.TaskRun) error {
+func (r *recordingTaskRuns) StartTaskRun(ctx context.Context, run domain.TaskRun) error {
+	// 尊重 ctx：真实的 SQLite 写入走 ExecContext，ctx 一取消就失败。假存储若忽略它，
+	// 「取消之后还写不写得进去」这条用例就恒绿，测不到任何东西。
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.failStart != nil {
@@ -38,7 +44,10 @@ func (r *recordingTaskRuns) StartTaskRun(_ context.Context, run domain.TaskRun) 
 	return nil
 }
 
-func (r *recordingTaskRuns) FinishTaskRun(_ context.Context, run domain.TaskRun) error {
+func (r *recordingTaskRuns) FinishTaskRun(ctx context.Context, run domain.TaskRun) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.failEnd != nil {
@@ -292,5 +301,110 @@ func TestClonedSubRuntimeCarriesTheTaskRunStore(t *testing.T) {
 	}
 	if child.taskRuns != port.TaskRunStore(runs) {
 		t.Errorf("child.taskRuns = %v, want 父运行时那一个 %v", child.taskRuns, runs)
+	}
+}
+
+// cancellingMaas 在第一次推理时把 ctx 取消掉，模拟「任务跑到一半被用户中断」。
+type cancellingMaas struct{ cancel context.CancelFunc }
+
+func (m *cancellingMaas) Generate(context.Context, port.InferenceRequest) (port.InferenceResponse, error) {
+	m.cancel()
+	return port.InferenceResponse{}, context.Canceled
+}
+
+// TestRunTaskStillRecordsTheEndingWhenTheContextIsCancelled：任务跑到一半被取消，
+// 终态照样落盘。
+//
+// 收口写入若跟着调用方的 ctx 一起被取消，那一行就永远停在 running，下一次启动把它
+// 扫成 interrupted——正是这份设计要消灭的症状换了个触发条件。这仓有前科：中断路径
+// 的收尾必须脱离取消。
+func TestRunTaskStillRecordsTheEndingWhenTheContextIsCancelled(t *testing.T) {
+	t.Parallel()
+
+	runs := &recordingTaskRuns{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	rt := newTaskRunRuntime(runs, func(cfg *Config) { cfg.Maas = &cancellingMaas{cancel: cancel} })
+	if _, err := rt.RunTask(ctx, testAgent(), testTask("task-1")); err == nil {
+		t.Fatal("ctx 中途被取消，RunTask 却成功了")
+	}
+	started, finished := runs.snapshot()
+	if len(started) != 1 {
+		t.Fatalf("开始写入 %d 次, want 1", len(started))
+	}
+	if len(finished) != 1 {
+		t.Fatalf("终态写入 %d 次, want 1——取消不该让这一行停在 running", len(finished))
+	}
+	if finished[0].Status != domain.RunStatusFailed {
+		t.Errorf("终态 status = %q, want failed", finished[0].Status)
+	}
+}
+
+// TestRunTaskLeavesASuspendedRunOpen：挂起等审批不是一次运行的结束。
+//
+// 它停在半路等人决定，既没有失败也没有完成；写成 failed 会把「等人」说成「跑挂
+// 了」。那一行留在 running，恢复腿是另一条记录。
+func TestRunTaskLeavesASuspendedRunOpen(t *testing.T) {
+	t.Parallel()
+
+	runs := &recordingTaskRuns{}
+	rt := NewRuntime(Config{
+		Gate:        taskgate.NewTaskGate(),
+		Maas:        &scriptedMaas{},
+		Audit:       adapter.NewMemoryAuditLog(),
+		Events:      adapter.NewMemoryEventBus(),
+		Tools:       echoRegistry(t),
+		Checkpoints: sessionstate.NewStore(t.TempDir()),
+		ToolGate:    &gateOnce{},
+		TaskRuns:    runs,
+	})
+	task := domain.Task{ID: "task-1", SessionID: "sess-1", AgentID: "agent-1", Status: domain.TaskRunning, Input: "go"}
+	if _, err := rt.RunTask(context.Background(), domain.Agent{ID: "agent-1"}, task); !errors.Is(err, ErrSuspended) {
+		t.Fatalf("RunTask err = %v, want ErrSuspended", err)
+	}
+	started, finished := runs.snapshot()
+	if len(started) != 1 {
+		t.Fatalf("开始写入 %d 次, want 1", len(started))
+	}
+	if len(finished) != 0 {
+		t.Fatalf("挂起却写了终态：%+v", finished)
+	}
+}
+
+// TestEachRunLegGetsItsOwnID：同一个任务跑两条腿（挂起 + 恢复），两条记录的 id 不同。
+//
+// id 曾经硬编码成 "<任务>:run-1"，于是恢复腿会拿同一个主键再插一次——insert 冲突，
+// 恢复根本起不来。而 ListTaskRuns 按 task_id 返回多条，本来就预期一个任务有多条腿。
+func TestEachRunLegGetsItsOwnID(t *testing.T) {
+	t.Parallel()
+
+	runs := &recordingTaskRuns{}
+	store := sessionstate.NewStore(t.TempDir())
+	gate := taskgate.NewTaskGate()
+	newLeg := func(g ToolGate) *Runtime {
+		return NewRuntime(Config{
+			Gate: gate, Maas: &scriptedMaas{},
+			Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
+			Tools: echoRegistry(t), Checkpoints: store, ToolGate: g, TaskRuns: runs,
+		})
+	}
+	task := domain.Task{ID: "task-1", SessionID: "sess-1", AgentID: "agent-1", Status: domain.TaskRunning, Input: "go"}
+	if _, err := newLeg(&gateOnce{}).RunTask(context.Background(), domain.Agent{ID: "agent-1"}, task); !errors.Is(err, ErrSuspended) {
+		t.Fatalf("第一条腿 err = %v, want ErrSuspended", err)
+	}
+	if _, err := newLeg(allowAllGate{}).RunTask(context.Background(), domain.Agent{ID: "agent-1"}, task); err != nil {
+		t.Fatalf("恢复腿: %v", err)
+	}
+	started, _ := runs.snapshot()
+	if len(started) != 2 {
+		t.Fatalf("开始写入 %d 次, want 2（挂起一条、恢复一条）", len(started))
+	}
+	if started[0].ID == started[1].ID {
+		t.Errorf("两条腿共用同一个 run id %q；恢复腿会撞主键", started[0].ID)
+	}
+	for _, run := range started {
+		if run.TaskID != "task-1" {
+			t.Errorf("run %q 的 task id = %q", run.ID, run.TaskID)
+		}
 	}
 }
