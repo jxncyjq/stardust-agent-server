@@ -164,6 +164,10 @@ type recordingDelegationAgents struct {
 	fakeDelegationAgents
 	resolveErr  error
 	lastContext DelegationContext
+	// childTaskRuns 是造出来的子运行时写运行记录的落点。真正的
+	// AgentRuntimeResolver 今天一个都不传（Config 里没有 TaskRuns 这一项），所以零值
+	// nil 正是具名委派在生产上的形状；用例要检验「两边是同一个 store」时才显式塞一个。
+	childTaskRuns port.TaskRunStore
 	// lastEpisodes 挂在最近一次造出来的子运行时上，用来看清「子任务到底以谁的身份
 	// 跑起来的」——RunTask 把 domain.Agent 原样交给 EpisodeRecorder。
 	lastEpisodes *capturingEpisodeRecorder
@@ -196,6 +200,7 @@ func (r *recordingDelegationAgents) ResolveDelegate(ctx context.Context, id stri
 		depth:           dc.Depth,
 		maxSpawnDepth:   dc.MaxSpawnDepth,
 		episodeRecorder: r.lastEpisodes,
+		taskRuns:        r.childTaskRuns,
 	}
 	return domain.Agent{ID: id, Role: "researcher-role"}, child, nil
 }

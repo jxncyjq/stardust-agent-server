@@ -241,7 +241,15 @@ type ToolResult struct {
 }
 
 type AuditEvent struct {
-	ID          string    `json:"id"`
+	ID string `json:"id"`
+	// RequestID 把同一次操作产生的多条事件串起来：它回答的是「这条事件属于哪一次动
+	// 作」，而 SubjectID 回答「这条事件说的是谁」。取什么值由 Action 决定，每一类事件
+	// 在自己的写入处交代（推理类写推理请求 id "<任务 id>:run"，工具类写工具调用 id，
+	// 安装类写 "<技能 id>:<版本>"）；它不是一个跨 Action 统一的主键，也不保证唯一。
+	//
+	// 委派类（subtask_*）一律写发起这次委派的那条父任务的 id：这一族事件存在的理由就
+	// 是日后回答「哪条任务把活派了出去」，两条写不同的东西就等于没有答案。子任务自己
+	// 的 id 在 ID 与 SubjectID 里，不靠这个字段带。
 	RequestID   string    `json:"request_id"`
 	SubjectType string    `json:"subject_type"`
 	SubjectID   string    `json:"subject_id"`

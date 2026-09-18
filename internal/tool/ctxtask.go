@@ -32,3 +32,23 @@ func ChatSessionFromContext(ctx context.Context) string {
 	}
 	return ""
 }
+
+type taskIDKey struct{}
+
+// WithTaskID 把当前正在跑的那条任务的 id 放进 ctx。工具只从这里知道「是哪条任务在调
+// 用我」：domain.ToolCall 上没有这个字段，工具调用 id 也不是任务 id。
+func WithTaskID(ctx context.Context, id string) context.Context {
+	return context.WithValue(ctx, taskIDKey{}, id)
+}
+
+// TaskIDFromContext 取任务 id；不存在返回空串。
+//
+// 空串是「没人注入」，不是「顶层任务」——两者在 domain.Task.ParentTaskID 的契约里是
+// 完全不同的两件事。把任务 id 写进落盘状态的调用方必须把空串当成接线缺口硬失败，不
+// 许就地编一个。
+func TaskIDFromContext(ctx context.Context) string {
+	if v, ok := ctx.Value(taskIDKey{}).(string); ok {
+		return v
+	}
+	return ""
+}

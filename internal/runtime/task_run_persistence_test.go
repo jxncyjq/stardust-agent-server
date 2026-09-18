@@ -145,6 +145,11 @@ func TestRunTaskDoesNotStartWhenTheOpeningWriteFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "disk full") {
 		t.Errorf("错误链里没有写库失败的原因：%v", err)
 	}
+	// 「标识」那一半也要守：裸 return err 里同样有 "disk full"，只断言原因是放过它的。
+	// 全局约束要的是 fmt.Errorf("<动作> <标识>: %w", err)——动作与是哪条任务都得在。
+	if !strings.Contains(err.Error(), "record the start of task task-1") {
+		t.Errorf("错误 %v 没有说清失败的是哪个动作、哪条任务", err)
+	}
 	if n := model.CallCount(); n != 0 {
 		t.Errorf("模型被调用了 %d 次；开始没落盘就不该开跑", n)
 	}

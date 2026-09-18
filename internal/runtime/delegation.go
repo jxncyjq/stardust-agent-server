@@ -316,8 +316,12 @@ func (r *Runtime) childFor(ctx context.Context, spec SubTaskSpec, subTaskID stri
 	// succeeded: a resolution failure is returned above and starts no child, so
 	// there is nothing yet worth recording.
 	//
-	// RequestID 直接写 spec.ParentTaskID，回答的就是「哪条任务发起了这次委派」。它
-	// 以前写的是 subTaskID，靠 ParentTaskIDForSubTask 从 "<父>:sub-N" 里再解析回来；
+	// RequestID 直接写 spec.ParentTaskID，回答的就是「哪条任务发起了这次委派」——见
+	// domain.AuditEvent.RequestID 的字段契约。spec.ParentTaskID 的唯一来源是
+	// handleDelegateTask 从 ctx 读到的、当时真正在跑的那条任务的 id（拿不到就拒绝派
+	// 发），所以这句话在生产上也成立，而不只是在喂字面量的用例里成立。
+	//
+	// 它以前写的是 subTaskID，靠 ParentTaskIDForSubTask 从 "<父>:sub-N" 里再解析回来；
 	// 子任务 id 现在是 UUID，那条解析路不存在了，而父子关系本来就该存成字段、不该编
 	// 码进 id。子任务自己的 id 仍在这条事件的 ID 里（subTaskID +
 	// ":delegated-to-agent"），两头都没丢。
@@ -479,6 +483,23 @@ func (r *Runtime) RunSubTaskAsync(ctx context.Context, spec SubTaskSpec) (SubTas
 		return SubTaskHandle{}, err
 	}
 
+	// 开始那一行由派发方写、终态由子运行时写，所以两边必须是同一个 store。不是的话
+	// 那一行永远停在 running：下一次启动的 SweepRunning 会把一条正常跑完的子任务扫成
+	// interrupted——比不落盘更坏，因为它给出的是一个确信的错误答案。
+	//
+	// 这不是假想：克隆路径（newSubRuntime）显式抄了 taskRuns，具名路径
+	// （DelegationAgents.ResolveDelegate）组 Config 时根本没有 TaskRuns 这一项。校验放
+	// 在这里，是为了让「不一致」只能表现为一次响亮的拒绝，而不是一条孤儿行。把
+	// TaskRuns 接进 resolver 是另一件事；接上之后这条校验自然通过，不必删。
+	//
+	// 只在派发方自己要插行时才校验：r.taskRuns 为 nil 时下面什么都不写、RunID 传空串，
+	// 子运行时自己开自己的行，两边各写各的没有分歧。
+	if r.taskRuns != nil && child.taskRuns != r.taskRuns {
+		return SubTaskHandle{}, fmt.Errorf(
+			"delegate background sub-task %s: the child runtime records its runs in a different store, so the opening row this dispatcher writes would never be finished",
+			subTaskID)
+	}
+
 	// The background sub-task keeps running after the tool call that started it
 	// returns, and so possibly after the parent task itself has ended and
 	// retired its Begin. Depth alone would not cover that: the child's own
@@ -504,11 +525,22 @@ func (r *Runtime) RunSubTaskAsync(ctx context.Context, spec SubTaskSpec) (SubTas
 	// 插不进去就不起这个子任务，边界票也要还回去：票不还，插件变更会永远等一条从来
 	// 没跑起来的子任务。
 	//
-	// run id 在这里铸、并经 task.RunID 带给 RunTask：谁写下了开始那一行，谁就说了算。
-	// RunTask 以 task.RunID 非空判断「已经有人插过行了」，于是它不再插第二次，收尾
-	// 写回的正是这一行。
-	openingRunID := uuid.NewString()
+	// run id 只在真的要插行时铸、并经 task.RunID 带给 RunTask：谁写下了开始那一行，谁
+	// 就说了算。RunTask 以 task.RunID 非空判断「已经有人插过行了」，于是它不再插第二
+	// 次，收尾写回的正是这一行。反过来，不铸就是空串，RunTask 自己开自己的行。
+	//
+	// 不变量：task.RunID 非空 ⟺ 确实有人插过那一行。无条件铸一个会让 RunTask 以为行
+	// 已经有了而跳过插行，收尾却写向一条从未插入的行——真实的 FinishTaskRun 找不到它
+	// 会报错，于是一条正常跑完的子任务被记成 failed。
+	//
+	// 顺序：这次预插排在 childFor 里那条 subtask_delegated_to_agent 审计之后，是刻意
+	// 的。预插要的 agent 身份与「两边同一个 store」这两件事都由 childFor 产出，排到它
+	// 前面就得先写一条还不知道派给谁的行。于是预插失败时，审计里会留下一条没有运行记
+	// 录的委派——那不是两份记录互相矛盾，而是各自说着实话：确实做出过一次选择（审计
+	// 的事），而那条子任务确实一次都没有跑起来（运行记录的事，下面失败就直接返回）。
+	var openingRunID string
 	if r.taskRuns != nil {
+		openingRunID = uuid.NewString()
 		if err := r.taskRuns.StartTaskRun(ctx, domain.TaskRun{
 			ID:           openingRunID,
 			TaskID:       subTaskID,
@@ -546,9 +578,12 @@ func (r *Runtime) RunSubTaskAsync(ctx context.Context, spec SubTaskSpec) (SubTas
 			// sub-task's outcome is gone and the parent waits forever, so the log,
 			// which depends on no database, is the actual last resort. It ends the
 			// work unit rather than looping.
+			// RequestID 与上面那条委派事件写同一个东西：发起委派的父任务 id。两条
+			// subtask_* 事件对「这条事件属于哪一次动作」给出两个不同的答案，就等于
+			// 谁都回答不了。子任务自己的 id 在 ID 与 SubjectID 里。
 			if auditErr := r.audit.Append(bg, domain.AuditEvent{
 				ID:          subTaskID + ":subtask-publish-failed",
-				RequestID:   subTaskID,
+				RequestID:   spec.ParentTaskID,
 				SubjectType: "runtime",
 				SubjectID:   subTaskID,
 				Action:      "subtask_event_publish_failed",

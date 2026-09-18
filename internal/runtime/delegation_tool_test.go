@@ -47,7 +47,7 @@ func TestHandleDelegateTaskSingleMode(t *testing.T) {
 
 	maas := &recordingSubMaas{summary: "single summary"}
 	parent := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Maas: maas})
-	result, err := parent.handleDelegateTask(context.Background(), domain.ToolCall{
+	result, err := parent.handleDelegateTask(tool.WithTaskID(context.Background(), "task-parent"), domain.ToolCall{
 		ID: "call-1", Arguments: map[string]string{"goal": "do a thing"},
 	})
 	if err != nil {
@@ -64,7 +64,7 @@ func TestHandleDelegateTaskBatchMode(t *testing.T) {
 
 	maas := &recordingSubMaas{summary: "batch item"}
 	parent := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Maas: maas})
-	result, err := parent.handleDelegateTask(context.Background(), domain.ToolCall{
+	result, err := parent.handleDelegateTask(tool.WithTaskID(context.Background(), "task-parent"), domain.ToolCall{
 		ID: "call-1", Arguments: map[string]string{"tasks": `[{"goal":"a"},{"goal":"b"}]`},
 	})
 	if err != nil {
@@ -85,7 +85,7 @@ func TestHandleDelegateTaskInvalidBatchJSONFailsSoft(t *testing.T) {
 
 	maas := &recordingSubMaas{summary: "x"}
 	parent := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Maas: maas})
-	result, err := parent.handleDelegateTask(context.Background(), domain.ToolCall{
+	result, err := parent.handleDelegateTask(tool.WithTaskID(context.Background(), "task-parent"), domain.ToolCall{
 		ID: "call-1", Arguments: map[string]string{"tasks": "{not json"},
 	})
 	if err != nil {
@@ -249,7 +249,7 @@ func TestBatchDelegateTaskToolCallMapsEachEntrysAgentID(t *testing.T) {
 		MaxSpawnDepth:    3,
 	})
 
-	result, err := parent.handleDelegateTask(context.Background(), domain.ToolCall{
+	result, err := parent.handleDelegateTask(tool.WithTaskID(context.Background(), "task-parent"), domain.ToolCall{
 		ID: "call-batch-agents",
 		Arguments: map[string]string{
 			"tasks": `[{"goal":"dig","agent_id":"researcher"},{"goal":"check","agent_id":"reviewer"}]`,

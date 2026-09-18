@@ -7,6 +7,7 @@ import (
 
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/taskgate"
+	"github.com/stardust/legion-agent/internal/tool"
 )
 
 // 子代理撞了熔断，父必须看得出来 —— 裸 Summary 分不清「答完了」和「被截断了」。
@@ -31,7 +32,7 @@ func TestDelegateTaskOutputCarriesTheStopReason(t *testing.T) {
 	t.Parallel()
 	maas := &recordingSubMaas{summary: "子任务摘要：完成"}
 	parent := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Maas: maas})
-	out, err := parent.handleDelegateTask(context.Background(), domain.ToolCall{
+	out, err := parent.handleDelegateTask(tool.WithTaskID(context.Background(), "task-parent"), domain.ToolCall{
 		ID:        "call-1",
 		Name:      "delegate_task",
 		Arguments: map[string]string{"goal": "read it"},
@@ -55,7 +56,7 @@ func TestDelegateTaskBatchOutputCarriesTheStopReason(t *testing.T) {
 	t.Parallel()
 	maas := &recordingSubMaas{summary: "子任务摘要：完成"}
 	parent := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Maas: maas})
-	out, err := parent.handleDelegateTask(context.Background(), domain.ToolCall{
+	out, err := parent.handleDelegateTask(tool.WithTaskID(context.Background(), "task-parent"), domain.ToolCall{
 		ID:        "call-1",
 		Name:      "delegate_task",
 		Arguments: map[string]string{"tasks": `[{"goal":"a"},{"goal":"b"}]`},

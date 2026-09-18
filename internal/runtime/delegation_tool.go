@@ -95,10 +95,20 @@ func delegateTaskDescriptor(agentNames []string) tool.Descriptor {
 	}
 }
 
+// handleDelegateTask 把一次 delegate_task 工具调用翻译成这个运行时的委派方法。
+//
+// 父任务 id 只有一个出处：ctx（lazytools.go 的 dispatchToolCall 用 tool.WithTaskID 注
+// 入正在跑的那条任务）。它会一路写进 task_runs.parent_task_id 与委派审计事件，也就是
+// 「哪条任务派出了这条子任务」这个问题日后唯一的答案，所以拿不到就拒绝这次调用：退回
+// 工具调用 id 会让那个答案在生产上恒为一条不存在的任务，而且不报错。
+//
+// 参数里没有 parent_task_id 这一项，delegate_task 的 InputSchema 里也没有——模型没有
+// 办法传它，代码也不该假装它会来。
 func (r *Runtime) handleDelegateTask(ctx context.Context, call domain.ToolCall) (domain.ToolResult, error) {
-	parentTaskID := strings.TrimSpace(call.Arguments["parent_task_id"])
+	parentTaskID := strings.TrimSpace(tool.TaskIDFromContext(ctx))
 	if parentTaskID == "" {
-		parentTaskID = strings.TrimSpace(call.ID)
+		return domain.ToolResult{}, fmt.Errorf(
+			"delegate_task call %s: no running task id in context (tool.WithTaskID was never injected)", call.ID)
 	}
 
 	if raw := strings.TrimSpace(call.Arguments["tasks"]); raw != "" {
