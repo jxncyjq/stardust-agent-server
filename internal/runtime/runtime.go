@@ -53,7 +53,9 @@ const defaultMaxToolRounds = 4
 // （sqlite.go 的 SetMaxOpenConns(1)），取连接是一个队列，而这个队列除了 ctx 没有
 // 别的出口——busy_timeout 只管语句执行撞锁，管不到取连接的等待。没有预算的话，一次
 // 卡住的收尾写入会同时卡死这条任务的 goroutine（此时 taskgate 的 end 还没跑）和所有
-// 等这条任务边界的插件 apply。
+// 等这条任务边界的插件 apply。成功那条路还多一层：它的收尾跑在会话锁之内（收口 defer
+// 注册得比 releaseSession 早，LIFO 下后跑），所以同一会话上排队的任务都会多等这一次
+// 写入，封顶就是这个预算。
 //
 // 取 5s 与 storage 的 busy_timeout 同量级：一次排队等待撞满锁等待仍应落在预算内，
 // 超过它就不是「忙」而是「卡住了」，此时报错比无限等更诚实。
@@ -727,6 +729,9 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	// mint 出来的必须是每条腿一个新 id：一个任务可以跑不止一次（挂起等审批之后的
 	// 恢复腿就是第二次），而 "<任务>:run-1" 会让第二条腿拿同一个主键去插，恢复根本
 	// 起不来。父子关系与归属由 TaskID / ParentTaskID 两列回答，不靠 id 的形状。
+	// openingRowWritten 记住的是「进来时 RunID 就有值」，必须在 mint 之前取——mint
+	// 之后 runID 一律非空，再问就问不出这件事了。
+	openingRowWritten := task.RunID != ""
 	runID := task.RunID
 	if runID == "" {
 		runID = uuid.NewString()
@@ -741,10 +746,11 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		Background:   task.Background,
 		Goal:         task.Goal,
 	}
-	// 后台子任务的开始记录已经由 RunSubTaskAsync 在派发那一刻写下（那是父任务确凿
-	// 还在飞的唯一时刻），这里不写第二次——同一条 run id 再插一次会撞主键。终态
-	// 收口对两者一视同仁。
-	if r.taskRuns != nil && !task.Background {
+	// 开始那一行只写一次，判据是「有没有人已经写过」——也就是 task.RunID 是否非空，
+	// 与收尾用哪个 id 读的是同一个字段。读 Background 会把一件事拆给两个字段：派发方
+	// 漏设 RunID，这里就再插一行、收尾写去一个没人插过的 id（那一行永远停在 running）；
+	// 漏设 Background，这里就拿派发方的 id 再插一次、撞主键让整条子任务起不来。
+	if r.taskRuns != nil && !openingRowWritten {
 		if err := r.taskRuns.StartTaskRun(ctx, runRecord); err != nil {
 			return domain.TaskRun{}, fmt.Errorf("record the start of task %s: %w", task.ID, err)
 		}

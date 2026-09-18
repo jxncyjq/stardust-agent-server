@@ -531,13 +531,14 @@ func TestRunTaskFailsWhenTheClosingWriteOverrunsItsBudget(t *testing.T) {
 
 	cases := []struct {
 		name    string
+		taskID  string
 		opt     func(*Config)
 		wantMsg string
 	}{
 		// 只阻塞第一次：completeRun 卡满预算后失败，收口 defer 随即补写 failed
 		// （第二次不再阻塞），用例因此只等一个预算。
-		{"成功路径的收尾", nil, "record the completion of task task-1"},
-		{"出错路径的收尾", func(cfg *Config) { cfg.Maas = failingMaas{} }, "record the end of task task-1"},
+		{"成功路径的收尾", "budget-complete", nil, "record the completion of task budget-complete"},
+		{"出错路径的收尾", "budget-fail", func(cfg *Config) { cfg.Maas = failingMaas{} }, "record the end of task budget-fail"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -551,7 +552,7 @@ func TestRunTaskFailsWhenTheClosingWriteOverrunsItsBudget(t *testing.T) {
 			rt := newTaskRunRuntime(runs, opts...)
 			done := make(chan error, 1)
 			go func() {
-				_, err := rt.RunTask(context.Background(), testAgent(), testTask("task-1"))
+				_, err := rt.RunTask(context.Background(), testAgent(), testTask(tc.taskID))
 				done <- err
 			}()
 			select {
@@ -595,4 +596,218 @@ func TestFinishRunLeavesTheRunIDToItsCaller(t *testing.T) {
 	if run.ID != "" {
 		t.Errorf("finishRun 自己编了一个 run id %q；id 只许有一个出处", run.ID)
 	}
+}
+
+// TestOnlyRunIDDecidesWhoWritesTheOpeningRow：只设一半的两个方向都不许出洞。
+//
+// 「谁写开始行」与「用哪个 id 收尾」必须读同一个字段。读 Background 的话：派发方
+// 漏设 RunID，RunTask 会再插一行、把终态写去一个没人插过的 id，派发方那一行永远
+// 停在 running；漏设 Background，RunTask 会拿派发方的 id 再插一次、撞主键让整条
+// 子任务起不来。两个方向都用真实形状的假存储（主键唯一、结束时找不到行即报错）考。
+func TestOnlyRunIDDecidesWhoWritesTheOpeningRow(t *testing.T) {
+	t.Parallel()
+
+	t.Run("设了 RunID 没设 Background", func(t *testing.T) {
+		t.Parallel()
+
+		runs := newStrictTaskRuns()
+		if err := runs.StartTaskRun(context.Background(), domain.TaskRun{
+			ID: "dispatched-1", TaskID: "task-1", AgentID: "agent-1",
+			StartedAt: time.Now(), Status: domain.RunStatusRunning,
+		}); err != nil {
+			t.Fatalf("派发方插行: %v", err)
+		}
+		task := testTask("task-1")
+		task.RunID = "dispatched-1"
+		rt := newTaskRunRuntime(runs)
+		if _, err := rt.RunTask(context.Background(), testAgent(), task); err != nil {
+			t.Fatalf("RunTask: %v", err)
+		}
+		row, ok := runs.row("dispatched-1")
+		if !ok {
+			t.Fatal("派发方那一行不见了")
+		}
+		if row.Status != domain.RunStatusCompleted {
+			t.Errorf("派发方那一行的 status = %q, want completed", row.Status)
+		}
+		if n := runs.count(); n != 1 {
+			t.Errorf("库里 %d 行, want 1——RunTask 又插了一行", n)
+		}
+	})
+
+	t.Run("设了 Background 没设 RunID", func(t *testing.T) {
+		t.Parallel()
+
+		runs := newStrictTaskRuns()
+		task := testTask("task-2")
+		task.Background = true
+		rt := newTaskRunRuntime(runs)
+		if _, err := rt.RunTask(context.Background(), testAgent(), task); err != nil {
+			t.Fatalf("RunTask: %v", err)
+		}
+		if n := runs.count(); n != 1 {
+			t.Fatalf("库里 %d 行, want 1", n)
+		}
+		for _, row := range runs.rows() {
+			if row.Status == domain.RunStatusRunning {
+				t.Errorf("run %q 停在 running——没人写过它的开始行，收尾却写去了别处", row.ID)
+			}
+		}
+	})
+}
+
+// TestASuccessfulRunSurvivesACancelAtTheFinishLine：模型答完之后立刻被取消，那一次
+// 运行仍然记成 completed。
+//
+// 成功那条路的收尾若跟着取消一起失败，finished 就留在 false，收口 defer 会把它改写
+// 成 failed——一次真正跑完的运行被记成失败，而且没有任何东西会报错。
+func TestASuccessfulRunSurvivesACancelAtTheFinishLine(t *testing.T) {
+	t.Parallel()
+
+	runs := &recordingTaskRuns{}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	// 事件与审计换成忽略 ctx 的版本：内存实现同样尊重取消，不换的话这条用例会先
+	// 撞在事件发布上，断言就压不到收尾写入这条规则上。
+	rt := newTaskRunRuntime(runs, func(cfg *Config) {
+		cfg.Maas = &cancelAfterAnswerMaas{cancel: cancel}
+		cfg.Events = ctxIgnoringEvents{adapter.NewMemoryEventBus()}
+		cfg.Audit = ctxIgnoringAudit{adapter.NewMemoryAuditLog()}
+	})
+	if _, err := rt.RunTask(ctx, testAgent(), testTask("task-1")); err != nil {
+		t.Fatalf("RunTask: %v", err)
+	}
+	_, finished := runs.snapshot()
+	if len(finished) != 1 {
+		t.Fatalf("终态写入 %d 次, want 1", len(finished))
+	}
+	if finished[0].Status != domain.RunStatusCompleted {
+		t.Errorf("终态 status = %q, want completed——它确实跑完了", finished[0].Status)
+	}
+}
+
+// cancelAfterAnswerMaas 先给出答案，再把 ctx 取消掉：模型答完、用户随即中断的时序。
+type cancelAfterAnswerMaas struct{ cancel context.CancelFunc }
+
+func (m *cancelAfterAnswerMaas) Generate(context.Context, port.InferenceRequest) (port.InferenceResponse, error) {
+	defer m.cancel()
+	return port.InferenceResponse{Text: "OK"}, nil
+}
+
+// TestTerminalRowsCarryAnEndedAt：终态行必须带结束时刻。
+//
+// suspended 行的 ended_at 就是挂起时刻，「挂了多久」「按时间排序」都读它；failed 行
+// 没有它就排不了序也算不了时长。
+func TestTerminalRowsCarryAnEndedAt(t *testing.T) {
+	t.Parallel()
+
+	runs := &recordingTaskRuns{}
+	rt := newTaskRunRuntime(runs, func(cfg *Config) { cfg.Maas = failingMaas{} })
+	if _, err := rt.RunTask(context.Background(), testAgent(), testTask("task-1")); err == nil {
+		t.Fatal("模型必败，RunTask 却成功了")
+	}
+	_, finished := runs.snapshot()
+	if len(finished) != 1 {
+		t.Fatalf("终态写入 %d 次, want 1", len(finished))
+	}
+	if finished[0].EndedAt.IsZero() {
+		t.Error("终态行没有 ended_at")
+	}
+}
+
+// strictTaskRuns 是一个按真实 SQLite 那两条硬规则办事的假存储：主键唯一，结束一条
+// 没插过的记录即报错。
+//
+// recordingTaskRuns 刻意不设防（好让「恰好落一次终态」只能由 RunTask 保证），但
+// 「谁写开始行」这条规则只有在插重复主键真的会失败时才考得出来。
+type strictTaskRuns struct {
+	mu   sync.Mutex
+	byID map[string]domain.TaskRun
+}
+
+func newStrictTaskRuns() *strictTaskRuns {
+	return &strictTaskRuns{byID: map[string]domain.TaskRun{}}
+}
+
+func (s *strictTaskRuns) StartTaskRun(ctx context.Context, run domain.TaskRun) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, dup := s.byID[run.ID]; dup {
+		return fmt.Errorf("start task run %q: UNIQUE constraint failed: task_runs.id", run.ID)
+	}
+	s.byID[run.ID] = run
+	return nil
+}
+
+func (s *strictTaskRuns) FinishTaskRun(ctx context.Context, run domain.TaskRun) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	existing, ok := s.byID[run.ID]
+	if !ok {
+		return fmt.Errorf("finish task run %q: no such run was started", run.ID)
+	}
+	existing.Status = run.Status
+	existing.Result = run.Result
+	existing.Error = run.Error
+	existing.EndedAt = run.EndedAt
+	s.byID[run.ID] = existing
+	return nil
+}
+
+func (s *strictTaskRuns) SweepRunning(context.Context, time.Time) (int, error) { return 0, nil }
+
+func (s *strictTaskRuns) TaskRunByID(_ context.Context, id string) (domain.TaskRun, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run, ok := s.byID[id]
+	return run, ok, nil
+}
+
+func (s *strictTaskRuns) ListTaskRuns(context.Context, string) ([]domain.TaskRun, error) {
+	return nil, nil
+}
+
+func (s *strictTaskRuns) row(id string) (domain.TaskRun, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	run, ok := s.byID[id]
+	return run, ok
+}
+
+func (s *strictTaskRuns) rows() []domain.TaskRun {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]domain.TaskRun, 0, len(s.byID))
+	for _, run := range s.byID {
+		out = append(out, run)
+	}
+	return out
+}
+
+func (s *strictTaskRuns) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.byID)
+}
+
+var _ port.TaskRunStore = (*strictTaskRuns)(nil)
+
+// ctxIgnoringEvents / ctxIgnoringAudit 把 ctx 挡在外面，好让「取消之后还剩哪条路会
+// 失败」这个问题只剩收尾写入一个答案。
+type ctxIgnoringEvents struct{ port.EventBus }
+
+func (e ctxIgnoringEvents) Publish(_ context.Context, event domain.RuntimeEvent) error {
+	return e.EventBus.Publish(context.WithoutCancel(context.Background()), event)
+}
+
+type ctxIgnoringAudit struct{ port.AuditLog }
+
+func (a ctxIgnoringAudit) Append(_ context.Context, event domain.AuditEvent) error {
+	return a.AuditLog.Append(context.Background(), event)
 }
