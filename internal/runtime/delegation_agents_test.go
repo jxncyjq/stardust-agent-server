@@ -383,9 +383,9 @@ func TestUnnamedDelegationStillRunsAsTheDerivedDeveloperIdentity(t *testing.T) {
 // field: a Runtime is generic and only learns which domain.Agent it is
 // running as through RunTask's parameter, which childFor's named branch
 // never receives), so the caller-side identity actually available here is
-// the PARENT TASK id, not a parent agent id. That id is recovered from the
-// audit event's RequestID via ParentTaskIDForSubTask, the same helper this
-// file already exports for exactly this purpose.
+// the PARENT TASK id, not a parent agent id. 它就存在事件的 RequestID 里：子任务
+// id 现在是 UUID，从 id 的形状里解析父任务的那条路已经没有了，而父子关系本来就该
+// 存成字段。
 func TestNamedDelegationAuditRecordsParentTargetAndGoal(t *testing.T) {
 	t.Parallel()
 	audit := adapter.NewMemoryAuditLog()
@@ -414,10 +414,9 @@ func TestNamedDelegationAuditRecordsParentTargetAndGoal(t *testing.T) {
 	if event.SubjectID != "researcher" {
 		t.Errorf("audit SubjectID = %q, want the target agent %q", event.SubjectID, "researcher")
 	}
-	parentTaskID, ok := ParentTaskIDForSubTask(event.RequestID)
-	if !ok || parentTaskID != "t1" {
-		t.Errorf("ParentTaskIDForSubTask(%q) = (%q, %v), want (\"t1\", true): the audit trail must be able to answer which task asked for this delegation",
-			event.RequestID, parentTaskID, ok)
+	if event.RequestID != "t1" {
+		t.Errorf("audit RequestID = %q, want the parent task %q: the audit trail must be able to answer which task asked for this delegation",
+			event.RequestID, "t1")
 	}
 	if event.Hash != "dig up the thing" {
 		t.Errorf("audit Hash = %q, want the delegated goal %q", event.Hash, "dig up the thing")

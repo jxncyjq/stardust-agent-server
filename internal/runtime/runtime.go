@@ -254,7 +254,6 @@ type Runtime struct {
 	// no-agent-directory deployment shape (see DelegationAgents' doc).
 	delegationAgents      DelegationAgents
 	maxConcurrent         int
-	subTaskSeq            atomic.Uint64
 	checkpoints           *sessionstate.Store
 	toolGate              ToolGate
 	logger                *slog.Logger
