@@ -37,7 +37,9 @@
 
 推荐修法不变：**在类型上让「不带撤销记录的 Trust」进不了 `Merge`**，而不是再修一次调用点。
 
-### B. `TaskRun` 生产上根本不落盘 —— 这是 Spec C 的前置
+### B. ~~`TaskRun` 生产上根本不落盘~~ —— **已解决（Spec C，PR #165 / `17a6f5e`）**
+
+`RunTask` 现在开始即落盘、终态收口到唯一一处 `defer`；`task_runs` 补齐了全部列；serve 启动扫描把残留的 `running` 摆成 `interrupted`。**落盘记录的拥有者是 serve**：`agent run` / `agent tui` 刻意不接，理由见规格 §九之二。以下为原文存档：
 
 `SaveTaskRun` / `ListTaskRuns`（`internal/storage/sqlite.go`）**没有任何生产调用方**，`internal/server/http.go` 的 `handleGetTaskResult` 注释自陈 "TaskRun is not persisted"。
 
@@ -47,7 +49,19 @@ Spec A 给 `task_runs` 加了 `stop_reason` 列并保证「写得进、读得回
 
 ---
 
-## 一、Spec C 未开工：后台子任务持久化
+## 一、~~Spec C 未开工~~：后台子任务持久化 —— **已交付（PR #165 / `17a6f5e`，22 提交）**
+
+规格 [2026-09-18-durable-background-subtasks-design.md](../specs/2026-09-18-durable-background-subtasks-design.md)（含九处实现期订正），计划 [2026-09-18-durable-background-subtasks.md](2026-09-18-durable-background-subtasks.md)。真机验证已做：`kill -9` 后重启，那行从 `running` 变 `interrupted`，审计零条那轮也记。
+
+**本轮新增的遗留**：
+
+- **启动扫描只摆正 `task_runs`，不管 `tasks` 表**。同一条任务在 `/v1/tasks/{id}/result` 上读出来是 `status: running` 配 `run_status: interrupted`，对外自相矛盾。真机验证时发现，不在 Spec C 范围内。
+- **取消仍被记成 `failed`**：任务表有 cancelled 语义，运行记录没有，两边对同一件事说法不同。
+- **回注的老数据分支没有退场时机**：`runtime_events` 没有保留期，也没有「库里已经没有老形态事件了」的判据。
+- **同步委派不发 `subtask_completed`**（既有设计），所以回注只覆盖异步那条路。
+- `child.taskRuns != r.taskRuns` 比较接口值：今天所有实现都是指针接收者，将来若有值类型实现会 panic。
+
+以下为原文存档：
 
 三条值得抄的里剩这一条。今天 `RunSubTaskAsync` 起的后台子任务是**进程内的**，父进程退出即丢（`SubTaskHandle` 的 doc 自己写着 "process-local and non-durable"）。
 
