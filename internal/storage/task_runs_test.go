@@ -78,14 +78,56 @@ func assertEveryFieldIsSet(t *testing.T, run domain.TaskRun) {
 		if value.Field(i).IsZero() {
 			t.Fatalf("domain.TaskRun.%s 在 fullTaskRun 里还是零值：新增字段必须同时补两处——"+
 				"internal/storage/sqlite.go 的 columnMigrations 里加一条列迁移（并把它加进 "+
-				"SaveTaskRun/StartTaskRun/FinishTaskRun/ListTaskRuns 的列清单），以及本文件 "+
+				"StartTaskRun/FinishTaskRun/ListTaskRuns 这三处列清单——生产就是这么写、"+
+				"这么读的，TestTaskRunRoundTripsEveryField 逐个比对它们），以及本文件 "+
 				"fullTaskRun 里给它一个非零取值。少了前者这个字段写进去就丢、读回来是零值，"+
 				"而少了后者这件事没有任何测试会红。", field.Name)
 		}
 	}
 }
 
-// TestTaskRunRoundTripsEveryField：写进去的每个字段都要读得回来。
+// openingOf 从一条完整的运行记录里取出「开始那一次写入负责的那些列」。
+//
+// 它与 FinishTaskRun 刻意不写的那四列（started_at / parent_task_id / background /
+// goal）是同一份清单的两面：一列只能由其中一次写入负责，两边都不写就永远是零值，
+// 两边都写就等于给结束那次覆盖开头的机会。
+func openingOf(run domain.TaskRun) domain.TaskRun {
+	return domain.TaskRun{
+		ID:           run.ID,
+		TaskID:       run.TaskID,
+		AgentID:      run.AgentID,
+		StartedAt:    run.StartedAt,
+		Status:       domain.RunStatusRunning,
+		ParentTaskID: run.ParentTaskID,
+		Background:   run.Background,
+		Goal:         run.Goal,
+	}
+}
+
+// seedFinishedRun 按生产的那条写路径落一条已结束的运行记录：StartTaskRun 开一行，
+// FinishTaskRun 写终态。
+//
+// 用例不再有第二条写路径可选：这仓曾经有一个 SaveTaskRun 能一次写全部列，它在生产
+// 里零调用方，却是唯一被往返测着的那条——于是 FinishTaskRun 的 UPDATE 漏一列谁都
+// 发现不了。那个方法已经删掉。
+func seedFinishedRun(t *testing.T, repo *SQLiteRepository, run domain.TaskRun) {
+	t.Helper()
+	ctx := context.Background()
+	if err := repo.StartTaskRun(ctx, openingOf(run)); err != nil {
+		t.Fatalf("StartTaskRun(%q): %v", run.ID, err)
+	}
+	if err := repo.FinishTaskRun(ctx, run); err != nil {
+		t.Fatalf("FinishTaskRun(%q): %v", run.ID, err)
+	}
+}
+
+// TestTaskRunRoundTripsEveryField：写进去的每个字段都要读得回来，而且走的是**生产
+// 的那条写路径**——StartTaskRun 开一行、FinishTaskRun 写终态。
+//
+// 走生产那对方法是这条用例的一半意义。它以前走 SaveTaskRun（一次写全部列），而那个
+// 方法在生产里零调用方：复审实测从 FinishTaskRun 的 UPDATE 里删掉 reasoning_summary
+// 一列，go vet 干净、全仓全绿——每一次真实运行的终态写入都把那一列落成零值，却没有
+// 任何用例在比对它。守卫当时盯着的是一条没人走的路。
 func TestTaskRunRoundTripsEveryField(t *testing.T) {
 	t.Parallel()
 
@@ -94,8 +136,20 @@ func TestTaskRunRoundTripsEveryField(t *testing.T) {
 	want := fullTaskRun()
 	// 先确认夹具本身是满的：字段没进夹具，下面的 DeepEqual 就看不见它缺列。
 	assertEveryFieldIsSet(t, want)
-	if err := repo.SaveTaskRun(ctx, want); err != nil {
-		t.Fatalf("SaveTaskRun: %v", err)
+	if err := repo.StartTaskRun(ctx, openingOf(want)); err != nil {
+		t.Fatalf("StartTaskRun: %v", err)
+	}
+	// 终态那一次把四个开头列一律留空：它们照样读得回来，就证明这四个值来自开始那次
+	// 写入，而不是结束这次顺手重申的（FinishTaskRun 刻意不写它们，
+	// TestFinishTaskRunDoesNotOverwriteTheOpeningFields 钉着这一点）。剩下的每一列
+	// 都是结束这次的责任，下面的 DeepEqual 逐个比对它们。
+	terminal := want
+	terminal.StartedAt = time.Time{}
+	terminal.ParentTaskID = ""
+	terminal.Background = false
+	terminal.Goal = ""
+	if err := repo.FinishTaskRun(ctx, terminal); err != nil {
+		t.Fatalf("FinishTaskRun: %v", err)
 	}
 	runs, err := repo.ListTaskRuns(ctx, want.TaskID)
 	if err != nil {
@@ -126,9 +180,7 @@ func TestTaskRunKeepsAFailedRunsError(t *testing.T) {
 	run.Status = domain.RunStatusFailed
 	run.Error = "模型调用超时"
 	run.Result = ""
-	if err := repo.SaveTaskRun(ctx, run); err != nil {
-		t.Fatalf("SaveTaskRun: %v", err)
-	}
+	seedFinishedRun(t, repo, run)
 	runs, err := repo.ListTaskRuns(ctx, run.TaskID)
 	if err != nil {
 		t.Fatalf("ListTaskRuns: %v", err)
@@ -145,9 +197,7 @@ func TestTaskRunRefusesAnUnknownStatusOnRead(t *testing.T) {
 
 	repo := newTaskRunRepo(t)
 	ctx := context.Background()
-	if err := repo.SaveTaskRun(ctx, fullTaskRun()); err != nil {
-		t.Fatalf("SaveTaskRun: %v", err)
-	}
+	seedFinishedRun(t, repo, fullTaskRun())
 	if _, err := repo.db.ExecContext(ctx, `UPDATE task_runs SET status = 'weird'`); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -196,9 +246,7 @@ func TestTaskRunRefusesACorruptedGeneratedFilesColumn(t *testing.T) {
 
 	repo := newTaskRunRepo(t)
 	ctx := context.Background()
-	if err := repo.SaveTaskRun(ctx, fullTaskRun()); err != nil {
-		t.Fatalf("SaveTaskRun: %v", err)
-	}
+	seedFinishedRun(t, repo, fullTaskRun())
 	if _, err := repo.db.ExecContext(ctx, `UPDATE task_runs SET generated_files = 'not-json'`); err != nil {
 		t.Fatalf("seed: %v", err)
 	}
@@ -407,9 +455,7 @@ func TestSweepRunningOnlyTouchesRunningRows(t *testing.T) {
 	done := fullTaskRun()
 	done.ID = "r3"
 	done.TaskID = "t"
-	if err := repo.SaveTaskRun(ctx, done); err != nil {
-		t.Fatalf("SaveTaskRun: %v", err)
-	}
+	seedFinishedRun(t, repo, done)
 
 	sweptAt := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
 	n, err := repo.SweepRunning(ctx, sweptAt)

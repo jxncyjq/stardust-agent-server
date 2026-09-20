@@ -1132,45 +1132,6 @@ func (r *SQLiteRepository) MarkAgentMessageRead(ctx context.Context, messageID s
 	return nil
 }
 
-func (r *SQLiteRepository) SaveTaskRun(ctx context.Context, run domain.TaskRun) error {
-	files, err := marshalGeneratedFiles(run.GeneratedFiles)
-	if err != nil {
-		return fmt.Errorf("save task run %q: %w", run.ID, err)
-	}
-	_, err = r.db.ExecContext(ctx, `
-		INSERT INTO task_runs (
-			id, task_id, agent_id, started_at, ended_at, result, stop_reason,
-			status, parent_task_id, background, goal, error,
-			reasoning_summary, prompt_tokens, completion_tokens, cached_tokens, total_tokens, generated_files
-		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			task_id = excluded.task_id,
-			agent_id = excluded.agent_id,
-			started_at = excluded.started_at,
-			ended_at = excluded.ended_at,
-			result = excluded.result,
-			stop_reason = excluded.stop_reason,
-			status = excluded.status,
-			parent_task_id = excluded.parent_task_id,
-			background = excluded.background,
-			goal = excluded.goal,
-			error = excluded.error,
-			reasoning_summary = excluded.reasoning_summary,
-			prompt_tokens = excluded.prompt_tokens,
-			completion_tokens = excluded.completion_tokens,
-			cached_tokens = excluded.cached_tokens,
-			total_tokens = excluded.total_tokens,
-			generated_files = excluded.generated_files
-	`, run.ID, run.TaskID, run.AgentID, formatTime(run.StartedAt), formatTime(run.EndedAt), run.Result,
-		string(run.StopReason), string(run.Status), run.ParentTaskID, boolToInt(run.Background), run.Goal, run.Error,
-		run.ReasoningSummary, run.PromptTokens, run.CompletionTokens, run.CachedTokens, run.TotalTokens, files)
-	if err != nil {
-		return fmt.Errorf("save task run %q: %w", run.ID, err)
-	}
-	return nil
-}
-
 // marshalGeneratedFiles 把生成文件清单编码成落盘用的 JSON 数组；空清单编码成空串。
 //
 // 空串与 "[]" 在读回时都还原成 nil，所以这里选前者只是为了让老行的默认值（空串）

@@ -22,9 +22,7 @@ func TestTaskRunStopReasonSurvivesTheRoundTrip(t *testing.T) {
 		StopReason: domain.StopReasonToolLoopCap,
 		Status:     domain.RunStatusCompleted,
 	}
-	if err := repo.SaveTaskRun(context.Background(), run); err != nil {
-		t.Fatalf("SaveTaskRun() error = %v, want nil", err)
-	}
+	seedFinishedRun(t, repo, run)
 
 	got, err := repo.ListTaskRuns(context.Background(), "task-1")
 	if err != nil {

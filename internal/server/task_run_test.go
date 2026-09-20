@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +19,23 @@ import (
 // company-1 的 done 任务。
 func newTaskRunFixture(t *testing.T, runs port.TaskRunStore) *HTTPServer {
 	t.Helper()
+	return NewHTTPServer(Config{Tasks: newTaskRunTasks(t), TaskRuns: runs})
+}
+
+// newFlakyTaskRunFixture 装的是与 newTaskRunFixture 同一台服务器，只是任务表外面
+// 套了一层可开可关的故障开关，并把开关交回给用例。
+//
+// 开关要能在同一台服务器上开关，是因为「任务表读失败」这条用例必须自带阳性对照：
+// 先在开关关着时读到 200，再打开读 500，否则一个恒 500 的装配也能让它绿。
+func newFlakyTaskRunFixture(t *testing.T, runs port.TaskRunStore) (*HTTPServer, *flakyTaskStore) {
+	t.Helper()
+	tasks := &flakyTaskStore{inner: newTaskRunTasks(t)}
+	return NewHTTPServer(Config{Tasks: tasks, TaskRuns: runs}), tasks
+}
+
+// newTaskRunTasks 造一张任务表，里面只有一条属于 company-1 的 done 任务。
+func newTaskRunTasks(t *testing.T) *task.Scheduler {
+	t.Helper()
 	scheduler := task.NewScheduler()
 	if err := scheduler.Add(context.Background(), domain.Task{
 		ID:        "task-1",
@@ -27,8 +45,34 @@ func newTaskRunFixture(t *testing.T, runs port.TaskRunStore) *HTTPServer {
 	}); err != nil {
 		t.Fatalf("scheduler.Add error = %v, want nil", err)
 	}
-	return NewHTTPServer(Config{Tasks: scheduler, TaskRuns: runs})
+	return scheduler
 }
+
+// flakyTaskStore 包着一张真的任务表，err 非空时让 Get 报错，其余方法原样转交。
+//
+// 只拦 Get：鉴权取 company 走的就是这一个方法，而这条用例要模拟的是 sqlite 被别的
+// 写者短暂锁住的那一刻。
+type flakyTaskStore struct {
+	inner TaskStore
+	err   error
+}
+
+func (s *flakyTaskStore) Add(ctx context.Context, task domain.Task) error {
+	return s.inner.Add(ctx, task)
+}
+
+func (s *flakyTaskStore) Get(ctx context.Context, taskID string) (domain.Task, bool, error) {
+	if s.err != nil {
+		return domain.Task{}, false, s.err
+	}
+	return s.inner.Get(ctx, taskID)
+}
+
+func (s *flakyTaskStore) List(ctx context.Context) ([]domain.Task, error) {
+	return s.inner.List(ctx)
+}
+
+var _ TaskStore = (*flakyTaskStore)(nil)
 
 // getTaskRunRaw 打一次 GET /v1/task-runs/{run_id}，返回状态码与原始响应体。
 // companyID 非空时带上 X-Company-ID，模拟一个真实租户的调用方。
@@ -232,5 +276,44 @@ func TestTaskRunRefusesAnotherCompany(t *testing.T) {
 				t.Errorf("别家公司读 %s 的状态码 = %d, want 403, body = %s", runID, code, body)
 			}
 		})
+	}
+}
+
+// TestTaskRunReportsATaskStoreFailure：鉴权要取 company 时任务表读失败报 500，
+// 绝不塌缩成「没有 company」。
+//
+// 塌缩的后果按部署形态相反：单机默认（RequireIdentity=false、调用方不带
+// X-Company-ID）会把这条运行记录**一次租户校验都不做地**发出去；同一次故障在开了
+// 身份强制的部署上却是 403。一次库故障在两种部署下给出相反的可见行为，比一个 500
+// 难查得多，而「无门读」正是这个端点最不该有的那一支。
+//
+// 复审实测：把 taskRunCompany 里那条 return error 换成 continue，go vet 干净、
+// server 与 cli 两包全绿——这条 fail-loud 此前没有任何用例守着。
+func TestTaskRunReportsATaskStoreFailure(t *testing.T) {
+	t.Parallel()
+
+	started := time.Date(2026, 9, 18, 10, 0, 0, 0, time.UTC)
+	runs := &stubTaskRuns{byID: map[string]domain.TaskRun{
+		"run-1": {
+			ID: "run-1", TaskID: "task-1", StartedAt: started, EndedAt: started.Add(time.Second),
+			Status: domain.RunStatusCompleted, Result: "答案",
+		},
+	}}
+	srv, tasks := newFlakyTaskRunFixture(t, runs)
+
+	// 阳性对照：任务表好着的时候同一条记录读得到 200。少了这一半，下面那个 500
+	// 可能来自任何地方，这条用例就挡不住它本该挡的那件事。
+	if code, body := getTaskRunRaw(t, srv, "run-1", ""); code != http.StatusOK {
+		t.Fatalf("任务表没故障时的状态码 = %d, want 200, body = %s", code, body)
+	}
+
+	tasks.err = errors.New("db is locked")
+	code, body := getTaskRunRaw(t, srv, "run-1", "")
+	if code != http.StatusInternalServerError {
+		t.Fatalf("任务表读失败时的状态码 = %d, want 500——这条记录被无租户校验地发了出去，body = %s",
+			code, body)
+	}
+	if !strings.Contains(body, "db is locked") {
+		t.Errorf("响应体里看不出故障原因：%s", body)
 	}
 }

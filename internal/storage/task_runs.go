@@ -19,9 +19,9 @@ var _ port.TaskRunStore = (*SQLiteRepository)(nil)
 
 // StartTaskRun 插入一条 running 记录。
 //
-// 它与 FinishTaskRun 分成两个方法，而不是一个 SaveTaskRun 用两次：两次写入要写的
-// 列不是一回事（见 FinishTaskRun），而一个能写全部列的方法在结束时被调用，就有机会
-// 拿结束时那份不全的快照覆盖开头写下的东西。
+// 它与 FinishTaskRun 分成两个方法，而不是一个能写全部列的方法用两次：两次写入要写
+// 的列不是一回事（见 FinishTaskRun），而一个能写全部列的方法在结束时被调用，就有
+// 机会拿结束时那份不全的快照覆盖开头写下的东西。
 //
 // status 不是 running 时报错：这个方法就是「运行开始了」这句话本身，用它说别的话
 // 意味着调用点接错了。
