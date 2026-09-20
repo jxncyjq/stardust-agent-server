@@ -369,6 +369,8 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleListTasks(rec, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/tasks/") && strings.HasSuffix(r.URL.Path, "/result"):
 		s.handleGetTaskResult(rec, r)
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/task-runs/"):
+		s.handleGetTaskRun(rec, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/tasks/") && strings.Contains(r.URL.Path, "/approvals/"):
 		s.handleDecideApproval(rec, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/tasks/") && strings.HasSuffix(r.URL.Path, "/interrupt"):
@@ -1220,6 +1222,42 @@ type taskResultResponse struct {
 	GeneratedFiles   []GeneratedFile `json:"generated_files"`
 }
 
+// taskRunResponse 是一条落盘运行记录（task_runs 的一行）的对外形状，
+// GET /v1/task-runs/{run_id} 的返回体。
+//
+// 它与 taskResultResponse 回答的不是同一个问题。后者按**任务** id 报「这条任务现在
+// 的答案是什么」，取的是最后开始的那条腿；这里按**运行** id 报「这一条腿自己是什么
+// 样子」——包括那些根本不进任务表、因而 taskResultResponse 永远够不着的后台子任务。
+//
+// RunStatus 取值是 domain.RunStatus 的五个之一，这里不会是空串：空串只用来在
+// taskResultResponse 里表示「这条任务在 task_runs 里没有记录」，而能走到这里就说明
+// 那一行确凿存在。
+//
+// EndedAt 为零值时间表示这条腿还没结束（running / 刚插进去的行）。不换成
+// elapsed_ms 是因为这个端点报的是记录原样，让读的人自己判断哪一半还没发生。
+//
+// GeneratedFiles 是 workspace 相对路径原文，不是 taskResultResponse 里那种带链接的
+// GeneratedFile：拼下载链接要一个会话 id，而运行记录不带会话。给一个猜出来的会话
+// id 就是凭空造一条会 404 的链接。
+type taskRunResponse struct {
+	RunID            string    `json:"run_id"`
+	TaskID           string    `json:"task_id"`
+	ParentTaskID     string    `json:"parent_task_id"`
+	Background       bool      `json:"background"`
+	Goal             string    `json:"goal"`
+	RunStatus        string    `json:"run_status"`
+	Result           string    `json:"result"`
+	Error            string    `json:"error"`
+	StopReason       string    `json:"stop_reason"`
+	PromptTokens     int       `json:"prompt_tokens"`
+	CompletionTokens int       `json:"completion_tokens"`
+	CachedTokens     int       `json:"cached_tokens"`
+	TotalTokens      int       `json:"total_tokens"`
+	GeneratedFiles   []string  `json:"generated_files"`
+	StartedAt        time.Time `json:"started_at"`
+	EndedAt          time.Time `json:"ended_at"`
+}
+
 // GeneratedFile is the linked view of a workspace-relative path a task wrote
 // via write_file. URL/DownloadURL are built fresh from fileURL on every
 // response rather than persisted, so a later FileBaseURL change is reflected
@@ -1337,6 +1375,100 @@ func (s *HTTPServer) handleGetTaskResult(w http.ResponseWriter, r *http.Request)
 		ElapsedMs:        usage.ElapsedMs,
 		GeneratedFiles:   s.generatedFilesDTO(task.SessionID, generatedFiles),
 	})
+}
+
+// handleGetTaskRun returns one persisted run record by its run id.
+// Path: GET /v1/task-runs/{run_id}. Read-only: it writes nothing.
+//
+// 它是「后台子任务要有一个外部寻址得到的 id」这条拍板在 HTTP 上的落点。
+// SubTaskHandle.TaskID 是一个 UUID，而后台子任务**从不进任务表**（runChild 就地造
+// 一个 domain.Task 直接喂给 RunTask，没有任何 scheduler.Add），所以
+// GET /v1/tasks/{id}/result 对它一律 404——它在查 task_runs 之前先查任务表。没有这个
+// 端点，一条中断的子任务「停在哪」就只能直连 sqlite 手查。
+//
+// 鉴权：运行记录自己不带 company，门从它指向的任务上取——直连任务取 TaskID 那条，
+// 后台子任务取 ParentTaskID 那条。两条都查不到时 company 取空串交给同一个门：单机
+// 默认（RequireIdentity=false）照常放行，而一旦部署开了身份强制，一个带
+// X-Company-ID 的调用方对空 company 是不匹配，于是被拒。这里不另造一套判断，就是
+// 为了让这个端点与 /v1/tasks/{id}/result 在同一个策略下收敛。
+func (s *HTTPServer) handleGetTaskRun(w http.ResponseWriter, r *http.Request) {
+	if s.taskRuns == nil {
+		writeError(w, http.StatusServiceUnavailable, "task run store is unavailable")
+		return
+	}
+	runID := strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/task-runs/"), "/")
+	if runID == "" {
+		writeError(w, http.StatusBadRequest, "run id is required")
+		return
+	}
+	run, found, err := s.taskRuns.TaskRunByID(r.Context(), runID)
+	if err != nil {
+		observability.WithRequestID(s.logger, requestIDFromContext(r.Context())).Error("read task run failed", "run_id", runID, "error", err)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("task run: %v", err))
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "task run not found")
+		return
+	}
+	companyID, err := s.taskRunCompany(r.Context(), run)
+	if err != nil {
+		observability.WithRequestID(s.logger, requestIDFromContext(r.Context())).Error("resolve task run company failed", "run_id", runID, "error", err)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("task run company: %v", err))
+		return
+	}
+	if !s.requireCompanyAccess(w, r, companyID, "task_run", run.ID) {
+		return
+	}
+	files := run.GeneratedFiles
+	if files == nil {
+		files = []string{}
+	}
+	writeJSON(w, http.StatusOK, taskRunResponse{
+		RunID:            run.ID,
+		TaskID:           run.TaskID,
+		ParentTaskID:     run.ParentTaskID,
+		Background:       run.Background,
+		Goal:             run.Goal,
+		RunStatus:        string(run.Status),
+		Result:           run.Result,
+		Error:            run.Error,
+		StopReason:       string(run.StopReason),
+		PromptTokens:     run.PromptTokens,
+		CompletionTokens: run.CompletionTokens,
+		CachedTokens:     run.CachedTokens,
+		TotalTokens:      run.TotalTokens,
+		GeneratedFiles:   files,
+		StartedAt:        run.StartedAt,
+		EndedAt:          run.EndedAt,
+	})
+}
+
+// taskRunCompany resolves the company that owns a run record: the run's own
+// task when that task is in the task store, otherwise its parent task. An
+// empty company means neither is there, which is what a background sub-task's
+// row looks like when its parent has already been evicted; handleGetTaskRun
+// hands that to requireCompanyAccess as-is rather than inventing an owner.
+//
+// A store failure is returned, never collapsed into "no company": that would
+// turn a database outage into a silently ungated read.
+func (s *HTTPServer) taskRunCompany(ctx context.Context, run domain.TaskRun) (string, error) {
+	if s.tasks == nil {
+		return "", nil
+	}
+	for _, taskID := range []string{run.TaskID, run.ParentTaskID} {
+		if taskID == "" {
+			continue
+		}
+		task, ok, err := s.tasks.Get(ctx, taskID)
+		if err != nil {
+			return "", fmt.Errorf("get task %s: %w", taskID, err)
+		}
+		if ok {
+			return task.CompanyID, nil
+		}
+	}
+	return "", nil
 }
 
 // taskResult scans the runtime event bus for the task_completed event of the

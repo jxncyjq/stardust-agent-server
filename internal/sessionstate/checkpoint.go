@@ -103,6 +103,24 @@ type Checkpoint struct {
 	// to locate this checkpoint's session directory rather than defaulting back
 	// to the workspace root.
 	WorkingDir string `json:"working_dir,omitempty"`
+	// ParentTaskID、Background、Goal 是这条任务在挂起那一刻的身世，随检查点过河，
+	// 由 Coordinator.RecoverSuspended 回填到重建出来的 domain.Task 上。
+	//
+	// 不带它们，恢复腿写进 task_runs 的那一行就是 parent_task_id='' /
+	// background=0 / goal=''：一条按自己的字段契约自称「直连任务」的孤儿行，父子树
+	// 到此断掉且不报任何错。父子关系存在列里（规格第三节），而这条路径是它唯一的
+	// 缺口。
+	//
+	// 三个字段都是可选的：直连任务本来就三个都空，按字段契约那正是它该有的样子，
+	// 所以缺席不是「读丢了」。这也是不 bump CheckpointSchemaVersion 的理由——Load
+	// 对版本做严格相等比较，bump 会让升级瞬间所有挂起中的检查点直接失效，包括正等
+	// 人审批的那些，代价远大于「升级窗口里那几条恢复腿丢了身世」。
+	//
+	// 这里刻意没有 RunID：恢复腿是另一条腿，它自己 mint 一个 id 插自己的行。把上一
+	// 条腿的 run id 带过河，恢复腿会去收尾一条早已写成 suspended 的记录。
+	ParentTaskID string `json:"parent_task_id,omitempty"`
+	Background   bool   `json:"background,omitempty"`
+	Goal         string `json:"goal,omitempty"`
 	// Loaded carries the capabilities whose full definitions the model pulled
 	// during this run (via load_capabilities), so a resumed task does not have
 	// to rediscover and reload them. An empty/absent Loaded is legitimate: a

@@ -54,11 +54,16 @@ func BuildOpenAPISpec() OpenAPISpec {
 			"/v1/sessions/{id}/turns": {Get: openAPIOperation("listSessionTurns", "List session conversation turns", true)},
 			"/v1/sessions/{id}/events": {Get: openAPIOperation("listSessionEvents",
 				"Read a session's raw event log from a sequence number, one page at a time", true, "404", "503")},
-			"/v1/agents":                          {Get: openAPIOperation("listAgents", "List configured sub-agents", true)},
-			"/v1/agents/{id}/messages":            {Get: openAPIOperation("listAgentMessages", "List agent messages", true), Post: openAPIOperation("sendAgentMessage", "Send agent message", true)},
-			"/v1/tasks":                           {Get: openAPIOperation("listTasks", "List tasks", true), Post: openAPIOperation("submitTask", "Submit task", true)},
-			"/v1/tasks/{id}":                      {Get: openAPIOperation("getTask", "Get task status", true)},
-			"/v1/tasks/{id}/result":               {Get: openAPIOperation("getTaskResult", "Get task status and answer text", true)},
+			"/v1/agents":               {Get: openAPIOperation("listAgents", "List configured sub-agents", true)},
+			"/v1/agents/{id}/messages": {Get: openAPIOperation("listAgentMessages", "List agent messages", true), Post: openAPIOperation("sendAgentMessage", "Send agent message", true)},
+			"/v1/tasks":                {Get: openAPIOperation("listTasks", "List tasks", true), Post: openAPIOperation("submitTask", "Submit task", true)},
+			"/v1/tasks/{id}":           {Get: openAPIOperation("getTask", "Get task status", true)},
+			"/v1/tasks/{id}/result":    {Get: openAPIOperation("getTaskResult", "Get task status and answer text", true)},
+			// 404 与 503 显式声明：这个端点按 run id 取一条落盘记录，「没有这条记录」
+			// 与「这个部署根本不落盘运行记录」是调用方必须分开处理的两件事，而
+			// 生成客户端只能从契约里知道它们存在。
+			"/v1/task-runs/{run_id}": {Get: openAPIOperation("getTaskRun",
+				"Get one persisted task run by its run id, including background sub-task runs that never enter the task table", true, "404", "503")},
 			"/v1/tasks/{id}/approvals/{ticketID}": {Post: openAPIOperation("decideApproval", "Approve or deny a Manual-mode approval ticket", true)},
 			"/v1/workflows":                       {Post: openAPIOperation("submitWorkflow", "Submit workflow", true)},
 			"/v1/workflows/{id}":                  {Get: openAPIOperation("getWorkflow", "Get workflow state", true)},

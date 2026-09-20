@@ -1440,6 +1440,11 @@ func (r *Runtime) checkSuspend(ctx context.Context, task domain.Task, st loopSta
 		Images:           st.images,
 		CreatedAt:        time.Now(),
 		WorkingDir:       task.WorkingDir,
+		// 身世随检查点过河：恢复腿除了这份检查点之外，对「这条任务是谁派出来的」
+		// 一无所知。见 sessionstate.Checkpoint.ParentTaskID。
+		ParentTaskID: task.ParentTaskID,
+		Background:   task.Background,
+		Goal:         task.Goal,
 	}
 	if err := r.checkpoints.Save(cp); err != nil {
 		return false, fmt.Errorf("save checkpoint for task %s: %w", task.ID, err)

@@ -13,6 +13,7 @@ import (
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/sessionstate"
+	"github.com/stardust/legion-agent/internal/task"
 	"github.com/stardust/legion-agent/internal/taskgate"
 )
 
@@ -171,6 +172,38 @@ func TestRunTaskFailsWhenTheClosingWriteFails(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "db is locked") {
 		t.Errorf("错误链里没有写库失败的原因：%v", err)
+	}
+}
+
+// TestRunTaskKeepsBothCausesWhenTheClosingWriteAlsoFails：任务自己失败、终态又写
+// 不进去时，返回的错误链里两条原因都要在。
+//
+// 这条用例守的是收口 defer 里的 errors.Join。复审实测：把它换成
+// runErr = fmt.Errorf("record the end of task %s: %w", ...) 这样一条直接赋值，go vet
+// 干净、整包全绿——因为在这之前唯一的守卫只断言错误串里含 "db is locked"，而那是
+// 写库那条错误自带的，丢掉原始错误照样含它。
+//
+// 丢掉的是什么：模型超时导致任务失败、同时库被锁住导致终态写不进去，运维今天看到
+// 的是「inference unavailable」加「record the end of task ...: db is locked」两条；
+// 一次无意的简化之后只剩后者，任务**为什么**失败这件事从错误链里永久消失。按本仓
+// fail-loud 铁律，传播时保留错误链不是风格问题。
+func TestRunTaskKeepsBothCausesWhenTheClosingWriteAlsoFails(t *testing.T) {
+	t.Parallel()
+
+	runs := &recordingTaskRuns{failEnd: errors.New("db is locked")}
+	rt := newTaskRunRuntime(runs, func(cfg *Config) { cfg.Maas = failingMaas{} })
+	_, err := rt.RunTask(context.Background(), testAgent(), testTask("task-1"))
+	if err == nil {
+		t.Fatal("模型失败、终态也写不进去，RunTask 却成功了")
+	}
+	if !strings.Contains(err.Error(), "inference unavailable") {
+		t.Errorf("错误链里没有任务自己失败的原因（模型那条）：%v", err)
+	}
+	if !strings.Contains(err.Error(), "db is locked") {
+		t.Errorf("错误链里没有终态写不进去的原因：%v", err)
+	}
+	if !strings.Contains(err.Error(), "record the end of task task-1") {
+		t.Errorf("错误 %v 没有说清写失败的是哪个动作、哪条任务", err)
 	}
 }
 
@@ -430,6 +463,89 @@ func TestEachRunLegGetsItsOwnID(t *testing.T) {
 	for _, run := range started {
 		if run.TaskID != "task-1" {
 			t.Errorf("run %q 的 task id = %q", run.ID, run.TaskID)
+		}
+	}
+}
+
+// TestARecoveredSuspendedSubTaskKeepsItsParentage：挂起的后台子任务活过一次重启
+// 之后，恢复腿写下的那一行仍然带着 parent_task_id / background / goal。
+//
+// 这条路整条都是可达的：具名委派同时接了 Checkpoints 与 ToolGate，而
+// ManualToolGate 的插件征询那半边在任何 Mode 下都跑（runChild 造的子任务 Mode 是
+// 空串）。于是一条具名后台子任务调用插件工具触发征询就会挂起。
+//
+// 断的地方在 RecoverSuspended：它从检查点重建 domain.Task 时只带
+// ID/AgentID/SessionKey/Status/Mode/WorkingDir，这三个字段一个都不带。恢复腿因此
+// 写出一行 parent_task_id=” / background=0 / goal=” —— 一条按自己的字段契约自称
+// 「直连任务」的孤儿行。父子树对这条任务断掉，而且不报任何错。规格第三节写的是
+// 「父子关系从此存在列里」，这条路径违反它。
+//
+// 这里刻意**不**带 RunID 过河：恢复腿是另一条腿，它该有自己的 run id 与自己的行。
+// 带过去会让它去收尾上一条腿早已写成 suspended 的那一行。
+func TestARecoveredSuspendedSubTaskKeepsItsParentage(t *testing.T) {
+	t.Parallel()
+
+	runs := &recordingTaskRuns{}
+	checkpoints := sessionstate.NewStore(t.TempDir())
+	gate := taskgate.NewTaskGate()
+	newLeg := func(g ToolGate) *Runtime {
+		return NewRuntime(Config{
+			Gate: gate, Maas: &scriptedMaas{},
+			Audit: adapter.NewMemoryAuditLog(), Events: adapter.NewMemoryEventBus(),
+			Tools: echoRegistry(t), Checkpoints: checkpoints, ToolGate: g, TaskRuns: runs,
+		})
+	}
+	const (
+		parentID = "task-parent"
+		goal     = "把 A 查清楚"
+	)
+	child := domain.Task{
+		ID: "task-child", SessionID: "sess-1", AgentID: "agent-1",
+		Status: domain.TaskRunning, Input: "go",
+		ParentTaskID: parentID, Background: true, Goal: goal,
+	}
+	ctx := context.Background()
+	if _, err := newLeg(&gateOnce{}).RunTask(ctx, domain.Agent{ID: "agent-1"}, child); !errors.Is(err, ErrSuspended) {
+		t.Fatalf("第一条腿 err = %v, want ErrSuspended", err)
+	}
+
+	// 重启：进程里那份 domain.Task 没了，恢复腿知道的全部只有盘上那份检查点。
+	suspended, err := checkpoints.ListSuspended()
+	if err != nil {
+		t.Fatalf("ListSuspended: %v", err)
+	}
+	scheduler := task.NewScheduler()
+	coordinator := newTestCoordinator(t, scheduler, 4)
+	if n, err := coordinator.RecoverSuspended(ctx, suspended); err != nil || n != 1 {
+		t.Fatalf("RecoverSuspended = %d, %v; want 1, nil", n, err)
+	}
+	recovered, found, err := scheduler.Get(ctx, "task-child")
+	if err != nil || !found {
+		t.Fatalf("scheduler.Get(task-child) = %+v, %v, %v", recovered, found, err)
+	}
+	if _, err := newLeg(allowAllGate{}).RunTask(ctx, domain.Agent{ID: "agent-1"}, recovered); err != nil {
+		t.Fatalf("恢复腿: %v", err)
+	}
+
+	started, finished := runs.snapshot()
+	if len(started) != 2 {
+		t.Fatalf("开始写入 %d 条, want 2（挂起一条、恢复一条）", len(started))
+	}
+	if len(finished) != 2 {
+		t.Fatalf("终态写入 %d 条, want 2", len(finished))
+	}
+	if started[0].ID == started[1].ID {
+		t.Errorf("两条腿共用同一个 run id %q；恢复腿该有自己的行", started[0].ID)
+	}
+	for _, run := range []domain.TaskRun{started[1], finished[1]} {
+		if run.ParentTaskID != parentID {
+			t.Errorf("恢复腿那一行的 parent_task_id = %q, want %q——它冒充了一条直连任务", run.ParentTaskID, parentID)
+		}
+		if !run.Background {
+			t.Errorf("恢复腿那一行的 background = false, want true")
+		}
+		if run.Goal != goal {
+			t.Errorf("恢复腿那一行的 goal = %q, want %q", run.Goal, goal)
 		}
 	}
 }

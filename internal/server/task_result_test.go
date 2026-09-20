@@ -19,7 +19,9 @@ import (
 // err 非 nil 时每一次查询都失败，用来把「库读不出来」这条路钉住。
 type stubTaskRuns struct {
 	byTask map[string][]domain.TaskRun
-	err    error
+	// byID 按 run id 给出单条运行记录，供 /v1/task-runs/{run_id} 那组用例使用。
+	byID map[string]domain.TaskRun
+	err  error
 }
 
 func (s *stubTaskRuns) StartTaskRun(context.Context, domain.TaskRun) error  { return nil }
@@ -27,8 +29,12 @@ func (s *stubTaskRuns) FinishTaskRun(context.Context, domain.TaskRun) error { re
 
 func (s *stubTaskRuns) SweepRunning(context.Context, time.Time) (int, error) { return 0, nil }
 
-func (s *stubTaskRuns) TaskRunByID(context.Context, string) (domain.TaskRun, bool, error) {
-	return domain.TaskRun{}, false, nil
+func (s *stubTaskRuns) TaskRunByID(_ context.Context, runID string) (domain.TaskRun, bool, error) {
+	if s.err != nil {
+		return domain.TaskRun{}, false, s.err
+	}
+	run, found := s.byID[runID]
+	return run, found, nil
 }
 
 func (s *stubTaskRuns) ListTaskRuns(_ context.Context, taskID string) ([]domain.TaskRun, error) {

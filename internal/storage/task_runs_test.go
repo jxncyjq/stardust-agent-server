@@ -28,7 +28,12 @@ func newTaskRunRepo(t *testing.T) *SQLiteRepository {
 
 // fullTaskRun 造一条**每个字段都非零**的运行记录。字段全满是这条用例的全部意义：
 // 表曾经只有 7 列而 TaskRun 有 12 个字段，多出来的那些写进去就丢，而丢的方式是
-// 静默的。
+// 静默的。assertEveryFieldIsSet 把「全满」从人的纪律变成一条断言。
+//
+// 它同时带着 completed 与非空 Error，这一点与 domain.TaskRun.Error 的字段契约
+// （「Status 为 failed 时的错误摘要，其余状态为空」）冲突，是故意的：这条夹具回答的
+// 是「每一列都往返得了吗」，不是「这条记录在业务上讲不讲得通」。存储层不解释这两列
+// 的关系，它只负责把写进去的东西原样读回来；契约那一半由运行时那边的用例守。
 func fullTaskRun() domain.TaskRun {
 	return domain.TaskRun{
 		ID:               "run-1",
@@ -48,7 +53,35 @@ func fullTaskRun() domain.TaskRun {
 		ParentTaskID:     "task-parent",
 		Background:       true,
 		Goal:             "把 A 查清楚",
-		Error:            "",
+		Error:            "上一次尝试报的错",
+	}
+}
+
+// assertEveryFieldIsSet 断言这条记录的每个导出字段都不是零值。
+//
+// 它守的是「TaskRun 每加一个字段，就要同时加一条列迁移」这条不变量。往返断言用
+// reflect.DeepEqual 比整个结构体，看起来已经够硬，但它比的是 fullTaskRun 给出的
+// 那些字段，而 fullTaskRun 是手工维护的：复审实测给 domain.TaskRun 加一个没有列
+// 的新字段，go vet 干净、全仓测试全绿——写进去丢、读回来是零值，正是这份设计开篇
+// 描述的、已经发生过一次的那个缺陷原样复现。
+//
+// 反射是这里唯一说得出「每个字段」的写法：新字段一出现就是零值，这条断言先逼人
+// 把它补进 fullTaskRun，补进去之后 DeepEqual 才有机会抓到缺的那一列。
+func assertEveryFieldIsSet(t *testing.T, run domain.TaskRun) {
+	t.Helper()
+	value := reflect.ValueOf(run)
+	for i := range value.NumField() {
+		field := value.Type().Field(i)
+		if !field.IsExported() {
+			continue
+		}
+		if value.Field(i).IsZero() {
+			t.Fatalf("domain.TaskRun.%s 在 fullTaskRun 里还是零值：新增字段必须同时补两处——"+
+				"internal/storage/sqlite.go 的 columnMigrations 里加一条列迁移（并把它加进 "+
+				"SaveTaskRun/StartTaskRun/FinishTaskRun/ListTaskRuns 的列清单），以及本文件 "+
+				"fullTaskRun 里给它一个非零取值。少了前者这个字段写进去就丢、读回来是零值，"+
+				"而少了后者这件事没有任何测试会红。", field.Name)
+		}
 	}
 }
 
@@ -59,6 +92,8 @@ func TestTaskRunRoundTripsEveryField(t *testing.T) {
 	repo := newTaskRunRepo(t)
 	ctx := context.Background()
 	want := fullTaskRun()
+	// 先确认夹具本身是满的：字段没进夹具，下面的 DeepEqual 就看不见它缺列。
+	assertEveryFieldIsSet(t, want)
 	if err := repo.SaveTaskRun(ctx, want); err != nil {
 		t.Fatalf("SaveTaskRun: %v", err)
 	}
