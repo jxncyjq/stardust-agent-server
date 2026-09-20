@@ -141,11 +141,13 @@ func (s *capturingTaskRunStore) count() int {
 
 var _ port.TaskRunStore = (*capturingTaskRunStore)(nil)
 
-// TestBuildTUITaskRunConfigCarriesTheTaskRunStore 守 `agent tui` 的构造点：
-// newTUICommand 把 persistent.taskRuns 塞进 tuiTaskRunConfig 那一行。
+// TestBuildTUITaskRunConfigLeavesTheTaskRunStoreUnset 守的是一条**刻意不接**：
+// `agent tui` 不往 task_runs 写。
 //
-// 断言的是**落盘的结果**（这次运行真的插了开始行），不是「代码里有那一行」。
-func TestBuildTUITaskRunConfigCarriesTheTaskRunStore(t *testing.T) {
+// serve 的启动扫描按状态扫全表、不区分是谁写的（规格第六节的取舍是「一个 agent.db
+// 一个写者」）。TUI 会话与 serve 共用一个库时，serve 起来会把 TUI 这边还在跑的那行
+// 摆成 interrupted——一次活着的运行被记成「进程没了」。落盘记录的拥有者是 serve。
+func TestBuildTUITaskRunConfigLeavesTheTaskRunStoreUnset(t *testing.T) {
 	t.Parallel()
 
 	runs := &capturingTaskRunStore{}
@@ -155,11 +157,15 @@ func TestBuildTUITaskRunConfigCarriesTheTaskRunStore(t *testing.T) {
 		nil, nil, nil, nil, nil, nil, nil, nil, nil,
 		nil, runs,
 	)
+	if runCfg.TaskRuns != nil {
+		t.Fatal("buildTUITaskRunConfig 把运行记录落点传了下去；扫描会把 TUI 活着的那行摆成 interrupted")
+	}
 	if _, err := runTUITask(context.Background(), app.New(), runCfg); err != nil {
 		t.Fatalf("runTUITask() error = %v, want nil", err)
 	}
-	if runs.count() != 1 {
-		t.Fatalf("开始行 %d 条, want 1：buildTUITaskRunConfig 没有把运行记录落点传下去", runs.count())
+	// 阳性对照：这条路确实跑完了一次任务，所以「没有记录」说的是没写，不是没跑。
+	if runs.count() != 0 {
+		t.Fatalf("开始行 %d 条, want 0", runs.count())
 	}
 }
 
@@ -190,12 +196,12 @@ func TestRunMentionedTUIAgentTaskCarriesTheTaskRunStore(t *testing.T) {
 	}
 }
 
-// TestRunCommandRecordsItsTaskRun 守 `agent run --prompt` 那条入口的转发
-// （newRunCommand 的 RunTaskOptions.TaskRuns 那一行）。
+// TestRunCommandRecordsNoTaskRun 守的是一条**刻意不接**：`agent run --prompt`
+// 不往 task_runs 写，理由同 TestBuildTUITaskRunConfigLeavesTheTaskRunStoreUnset。
 //
-// 它跑的是真命令 + 真 SQLite，断言的是**库里真的有这条运行记录**：这一行被删掉之后
-// 任务照跑照返回，只是 task_runs 表永远是空的。
-func TestRunCommandRecordsItsTaskRun(t *testing.T) {
+// 它跑的是真命令 + 真 SQLite，并且拿审计事件做阳性对照——那条路确实跑完了一次任务，
+// 所以「没有运行记录」说的是没写，不是没跑。
+func TestRunCommandRecordsNoTaskRun(t *testing.T) {
 	t.Parallel()
 
 	dbPath := filepath.Join(t.TempDir(), "agent.db")
@@ -236,12 +242,9 @@ func TestRunCommandRecordsItsTaskRun(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ListTaskRuns(%q) error = %v, want nil", audits[0].SubjectID, err)
 	}
-	if len(runs) != 1 {
-		t.Fatalf("task_runs 里这条任务有 %d 行, want 1：`agent run --prompt` 没有把 "+
-			"persistent.taskRuns 传进 RunTaskOptions", len(runs))
-	}
-	if runs[0].Status != domain.RunStatusCompleted {
-		t.Errorf("终态 = %q, want %q", runs[0].Status, domain.RunStatusCompleted)
+	if len(runs) != 0 {
+		t.Fatalf("task_runs 里这条任务有 %d 行, want 0：一次性执行不该往这张表写——"+
+			"serve 的启动扫描按状态扫全表，会把别的写者还在跑的那行摆成 interrupted", len(runs))
 	}
 }
 

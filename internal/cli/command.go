@@ -157,7 +157,11 @@ func newRunCommand(application *app.App, out io.Writer) *cobra.Command {
 					Browser:          cfg.Browser,
 					DisabledTools:    cfg.Runtime.DisabledTools,
 					SessionEvents:    persistent.sessionEvents,
-					TaskRuns:         persistent.taskRuns,
+					// 刻意不接 TaskRuns：serve 的启动扫描按状态扫全表、不区分写者
+					// （规格第六节的取舍是「一个 agent.db 一个写者」）。一次性执行
+					// 与 serve 共用同一个库时，serve 起来会把这边还在跑的那行摆成
+					// interrupted——一次活着的运行被记成「进程没了」。落盘记录的
+					// 拥有者是 serve。
 					// 与上面 maasClientFromConfig 选客户端同源的档位名。
 					ModelProfile: runModelProfile(cfg.Maas, maasProfile, maasURL),
 				})
@@ -357,7 +361,8 @@ func buildTUITaskRunConfig(
 		ToolGate:      toolGate,
 		Checkpoints:   checkpoints,
 		SessionEvents: sessionEvents,
-		TaskRuns:      taskRuns,
+		// 同 newRunCommand：不接 TaskRuns。TUI 会话比一次性执行活得更久，与 serve
+		// 共用一个库时被扫成 interrupted 的窗口只会更大。
 	}
 }
 
