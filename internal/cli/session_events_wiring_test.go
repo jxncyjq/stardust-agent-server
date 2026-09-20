@@ -41,6 +41,7 @@ func TestTheSessionEventStoreReachesTheDefaultRunnerRuntimeConfig(t *testing.T) 
 		store,
 		"",
 		nil,
+		nil,
 	)
 
 	if cfg.SessionEvents == nil {

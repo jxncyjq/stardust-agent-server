@@ -304,9 +304,10 @@ func waitForFinishedRuns(t *testing.T, runs *recordingTaskRuns, want int) {
 // TestNamedBackgroundDelegationIsRefusedWhenTheChildWritesToAnotherStore：派发方插
 // 开始那一行、子运行时写终态，两者必须是同一个 store；不是就拒绝这次委派。
 //
-// 具名委派（DelegationAgents.ResolveDelegate）今天组 Config 时根本不传 TaskRuns，于是
-// 派发方插下的那一行永远没人收尾：它停在 running，下一次启动的 SweepRunning 把一条正
-// 常跑完的子任务扫成 interrupted——比不落盘更坏，因为它给出的是一个确信的错误答案。
+// 两边不同源时，派发方插下的那一行永远没人收尾：它停在 running，下一次启动的
+// SweepRunning 把一条正常跑完的子任务扫成 interrupted——比不落盘更坏，因为它给出的是
+// 一个确信的错误答案。这里用假解析器把「不同源」直接造出来；真解析器接上 TaskRuns
+// 之后走的是另一条用例（agent_resolver_task_runs_test.go）。
 func TestNamedBackgroundDelegationIsRefusedWhenTheChildWritesToAnotherStore(t *testing.T) {
 	t.Parallel()
 

@@ -135,6 +135,16 @@ type RunTaskOptions struct {
 	// nil 是契约允许的部署形态（非持久化驱动、测试），那时整个记录是 no-op——
 	// 见 runtime.Config.SessionEvents 的文档注释，不是兜底。
 	SessionEvents port.SessionEventStore
+	// TaskRuns 是这次运行的任务运行记录落点，直接喂给 runtime.Config.TaskRuns。
+	//
+	// 它与 SessionEvents 同源、同理由：这条路（`agent run --prompt` 与 `agent tui`）
+	// 与 serve 是**两套独立的装配**，serve 在 BuildServeService 里解析仓储，这条在
+	// persistentRunPorts 里。只接一边的症状是「另一条路跑出来的任务一行记录都没有」，
+	// 而且不会报错。
+	//
+	// nil 是契约允许的部署形态（非持久化驱动、测试），那时这次运行不落记录——见
+	// runtime.Config.TaskRuns 的文档注释，不是兜底。
+	TaskRuns port.TaskRunStore
 	// ModelProfile 是这次运行使用的模型档位名，直接喂给 runtime.Config.ModelProfile
 	// （会话事件 assistant/message 的 model_profile，spec §4.1）。
 	//
@@ -233,7 +243,10 @@ func (a *App) ClearPlugins() {
 //
 // 它被从 RunDemo 里提出来，是为了让「这个构造点有没有漏接字段」可被直接断言——
 // 与 cli.buildDefaultRunnerConfig 提出来的理由一样。这条路全用内存适配器，作用域内
-// 没有任何持久化仓储，所以它**正确地**不接 SessionEvents（会话事件记录整体是 no-op）。
+// 没有任何持久化仓储，所以它**正确地**不接 SessionEvents（会话事件记录整体是 no-op），
+// 同样也不接 TaskRuns：没有可写的地方，这条路的运行整体不落记录。两者都由
+// task_runs_wiring_test.go / session_events_wiring_test.go 断言成刻意的 nil，好让
+// 「这处是判断过的」与「这处漏了」分得开。
 func demoRuntimeConfig(maas port.MaasInferenceClient, audit port.AuditLog, events port.EventBus) runtime.Config {
 	return runtime.Config{
 		Maas:     maas,
@@ -438,6 +451,9 @@ func (a *App) RunTask(ctx context.Context, opts RunTaskOptions) (DemoResult, err
 		// 这条路的会话事件落点。nil 是合法部署形态（非持久化驱动、测试），
 		// 那时整个记录是 no-op（见 runtime.Config.SessionEvents）。
 		SessionEvents: opts.SessionEvents,
+		// 这条路的任务运行记录落点。nil 是合法部署形态（非持久化驱动、测试），
+		// 那时 RunTask 不写任何记录也不因此失败（见 runtime.Config.TaskRuns）。
+		TaskRuns: opts.TaskRuns,
 		// 这次运行的模型档位。它与上面的 Maas 客户端必须同源，由调用方一起解出来
 		// （见 RunTaskOptions.ModelProfile）。
 		ModelProfile: opts.ModelProfile,

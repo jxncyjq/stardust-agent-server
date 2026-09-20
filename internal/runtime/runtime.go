@@ -198,10 +198,17 @@ type Config struct {
 	// 构造），不是兜底：那时整个记录是 no-op，三个屏障永远放行。它与「配了但写不进去」
 	// 是两回事——后者由屏障 fail-closed 挡住。
 	SessionEvents port.SessionEventStore
-	// TaskRuns 是任务运行记录的落点。nil 表示这个部署不落盘运行记录（CLI 的
-	// 一次性执行、以及绝大多数测试就是这个形状），此时 RunTask 不写任何记录，
-	// 也不因此失败——这是契约里写明的可选，不是接线漏了。serve 装配一定给它
-	// 一个非 nil 值。
+	// TaskRuns 是任务运行记录的落点。nil 表示这个部署不落盘运行记录（非持久化
+	// 驱动、`agent run --demo`、以及绝大多数测试就是这个形状），此时 RunTask 不写
+	// 任何记录，也不因此失败——这是契约里写明的可选，不是接线漏了。
+	//
+	// 配了持久化驱动的部署一律给它一个非 nil 值，四个生产装配点无一例外：serve 的
+	// 默认 runner（cli.buildDefaultRunnerConfig）、serve 的 per-agent 运行时
+	// （AgentRuntimeResolverConfig.TaskRuns）、`agent run --prompt` / `agent tui`
+	// （app.RunTaskOptions.TaskRuns），以及委派派生出来的子运行时（newSubRuntime
+	// 抄父运行时的，ResolveDelegate 从 resolver 拿）。每一处各有一条断言钉住它
+	// （见各自的 wiring 测试）——只接其中几处的症状是「有一部分任务从来没落过盘」，
+	// 而缺的那部分与「没发生过」在库里无法区分。
 	TaskRuns port.TaskRunStore
 	// ModelProfile 是这次运行使用的模型档位名，会话事件的 assistant/message 用它
 	// 填 spec §4.1 的 model_profile 字段（P3 的轨迹里「这一步用的是哪个模型」那一栏）。

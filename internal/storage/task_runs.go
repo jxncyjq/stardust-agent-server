@@ -107,7 +107,9 @@ func (r *SQLiteRepository) FinishTaskRun(ctx context.Context, run domain.TaskRun
 //
 // 它是「写 running 的那个进程没了」这句话唯一的出口，所以只在启动时、开始接任务
 // 之前调用一次。它按状态扫全表，不区分是哪个进程写的：本部署假定一个 agent.db
-// 只有一个 serve 进程在写（见规格第六节的取舍）。
+// 同一时刻只有一个进程在写运行记录（见规格第六节的取舍）。这个前提是真的前提，不是
+// 描述——`agent run --prompt` / `agent tui` 也往同一张表写 running，所以在一台 tui
+// 正跑着任务的时候起 serve，那条活着的行会被这次扫描摆成 interrupted。
 //
 // 过滤条件只认 running，这一条不许放宽：另外四个状态都是某条腿自己写下的结论，
 // suspended 尤其——它是「这条腿停在这里等人」，改写成 interrupted 等于拿「进程没了」

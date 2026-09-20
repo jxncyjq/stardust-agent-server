@@ -488,9 +488,11 @@ func (r *Runtime) RunSubTaskAsync(ctx context.Context, spec SubTaskSpec) (SubTas
 	// interrupted——比不落盘更坏，因为它给出的是一个确信的错误答案。
 	//
 	// 这不是假想：克隆路径（newSubRuntime）显式抄了 taskRuns，具名路径
-	// （DelegationAgents.ResolveDelegate）组 Config 时根本没有 TaskRuns 这一项。校验放
-	// 在这里，是为了让「不一致」只能表现为一次响亮的拒绝，而不是一条孤儿行。把
-	// TaskRuns 接进 resolver 是另一件事；接上之后这条校验自然通过，不必删。
+	// （DelegationAgents.ResolveDelegate）曾经组 Config 时根本没有 TaskRuns 这一项，
+	// 于是每一次具名后台委派都在这里被拒。AgentRuntimeResolverConfig.TaskRuns 接上
+	// 之后这条校验对同一部署自然通过（agent_resolver_task_runs_test.go 里那条端到端
+	// 用例钉住这一点），但校验留着：它挡的是「两边不是同一个 store」这件事本身，而不
+	// 是某一次具体的漏接。
 	//
 	// 只在派发方自己要插行时才校验：r.taskRuns 为 nil 时下面什么都不写、RunID 传空串，
 	// 子运行时自己开自己的行，两边各写各的没有分歧。

@@ -164,8 +164,8 @@ type recordingDelegationAgents struct {
 	fakeDelegationAgents
 	resolveErr  error
 	lastContext DelegationContext
-	// childTaskRuns 是造出来的子运行时写运行记录的落点。真正的
-	// AgentRuntimeResolver 今天一个都不传（Config 里没有 TaskRuns 这一项），所以零值
+	// childTaskRuns 是造出来的子运行时写运行记录的落点。这个假解析器刻意让它可以
+	// 与派发方的 store 不同，好单独检验那条「两边必须同源」的校验；零值
 	// nil 正是具名委派在生产上的形状；用例要检验「两边是同一个 store」时才显式塞一个。
 	childTaskRuns port.TaskRunStore
 	// lastEpisodes 挂在最近一次造出来的子运行时上，用来看清「子任务到底以谁的身份
