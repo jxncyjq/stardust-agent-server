@@ -3398,6 +3398,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		RequireIdentity:     cfg.Server.RequireIdentity,
 		RequestIDHeader:     cfg.Server.RequestIDHeader,
 		Audit:               auditLog,
+		TaskRuns:            taskRuns,
 		QualityEvals:        qualityEvals,
 		Sessions:            sessionStore,
 		Messages:            messageStore,
