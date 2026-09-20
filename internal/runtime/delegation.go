@@ -559,10 +559,13 @@ func (r *Runtime) RunSubTaskAsync(ctx context.Context, spec SubTaskSpec) (SubTas
 		defer endBackground()
 		bg := context.WithoutCancel(ctx)
 		res, err := r.runChild(bg, agent, child, subTaskID, spec, true, openingRunID)
+		// ParentTaskID 必须在这里填：子任务 id 是 UUID，回注方从它身上解析不出父任务，
+		// 而这一刻是父子关系唯一还在手边的地方。不填，父任务就永远等不到这条结果。
 		event := domain.RuntimeEvent{
-			Type:      "subtask_completed",
-			TaskID:    subTaskID,
-			CreatedAt: time.Now(),
+			Type:         "subtask_completed",
+			TaskID:       subTaskID,
+			ParentTaskID: spec.ParentTaskID,
+			CreatedAt:    time.Now(),
 		}
 		if err != nil {
 			event.Message = "sub-task failed: " + err.Error()
@@ -609,13 +612,14 @@ func (r *Runtime) RunSubTaskAsync(ctx context.Context, spec SubTaskSpec) (SubTas
 // 而不是要从字符串里解析出来的。
 func (r *Runtime) nextSubTaskID() string { return uuid.NewString() }
 
-// ParentTaskIDForSubTask 从老形态的子任务 id（"<父>:sub-<n>"）里解析出父任务 id。
-// ok 报告 s 是否带着那个后缀；为 false 时原样返回整串，好让调用方仍能关联而不是
-// 丢弃。
+// ParentTaskIDForSubTask 从老形态的子任务 id（"<父>:sub-<n>"）里解析出父任务。
+// ok 报告 s 是否真是那个形态；为 false 时原样返回整串，调用方不得把它当成父任务
+// 用——那会把结果回注给子任务自己。
 //
-// nextSubTaskID 已经不再铸这种 id（它现在铸 UUID），所以这个函数只认得那之前留下
-// 的数据。仍在用它做路由的消费方（internal/cli 的 subtask_completed 重注入）要改成
-// 读 domain.TaskRun.ParentTaskID——那是父子关系今天的存放处。
+// 今天铸出来的子任务 id 是 UUID（见 nextSubTaskID），解析不出任何东西；这个函数
+// 留着，是因为 runtime_events 里存着改造之前发布的事件，它们的父任务只剩这一条线索。
+// 新代码一律读 domain.RuntimeEvent.ParentTaskID（事件）与 domain.TaskRun.ParentTaskID
+// （运行记录）——那里父子关系是存着的，而不是要从字符串里解析出来的。
 func ParentTaskIDForSubTask(s string) (parentTaskID string, ok bool) {
 	idx := strings.LastIndex(s, ":sub-")
 	if idx < 0 {

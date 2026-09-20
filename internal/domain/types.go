@@ -289,8 +289,12 @@ type MemoryEntry struct {
 }
 
 type RuntimeEvent struct {
-	Type             string `json:"type"`
-	TaskID           string `json:"task_id"`
+	Type   string `json:"type"`
+	TaskID string `json:"task_id"`
+	// ParentTaskID 是派出这条子任务的父任务，只在 subtask_completed 事件上填写。
+	// 子任务 id 是 UUID，从中解析不出父任务，而回注要把结果送回父任务那条线程。
+	// 改造之前发布并落盘的事件没有这个字段，见回注处的老数据分支。
+	ParentTaskID     string `json:"parent_task_id,omitempty"`
 	Message          string `json:"message"`
 	PromptTokens     int    `json:"prompt_tokens,omitempty"`
 	CompletionTokens int    `json:"completion_tokens,omitempty"`
