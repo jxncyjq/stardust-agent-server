@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -156,6 +157,11 @@ func newRunCommand(application *app.App, out io.Writer) *cobra.Command {
 					Browser:          cfg.Browser,
 					DisabledTools:    cfg.Runtime.DisabledTools,
 					SessionEvents:    persistent.sessionEvents,
+					// 刻意不接 TaskRuns：serve 的启动扫描按状态扫全表、不区分写者
+					// （规格第六节的取舍是「一个 agent.db 一个写者」）。一次性执行
+					// 与 serve 共用同一个库时，serve 起来会把这边还在跑的那行摆成
+					// interrupted——一次活着的运行被记成「进程没了」。落盘记录的
+					// 拥有者是 serve。
 					// 与上面 maasClientFromConfig 选客户端同源的档位名。
 					ModelProfile: runModelProfile(cfg.Maas, maasProfile, maasURL),
 				})
@@ -253,7 +259,7 @@ func newTUICommand(application *app.App, out io.Writer) *cobra.Command {
 					cfg, registry, prompt, maas, contextPrefix, maasProfile, maasURL,
 					persistent.events, persistent.audit, persistent.taskSink, taskLedger,
 					persistent.messageStore, emit, session, approvalGate, checkpointStore,
-					persistent.sessionEvents,
+					persistent.sessionEvents, persistent.taskRuns,
 				))
 			}
 			colorProfile := parseTUIColorProfile(cfg.TUI.ColorProfile)
@@ -331,6 +337,7 @@ func buildTUITaskRunConfig(
 	toolGate agentruntime.ToolGate,
 	checkpoints *sessionstate.Store,
 	sessionEvents port.SessionEventStore,
+	taskRuns port.TaskRunStore,
 ) tuiTaskRunConfig {
 	return tuiTaskRunConfig{
 		Config:               cfg,
@@ -354,6 +361,8 @@ func buildTUITaskRunConfig(
 		ToolGate:      toolGate,
 		Checkpoints:   checkpoints,
 		SessionEvents: sessionEvents,
+		// 同 newRunCommand：不接 TaskRuns。TUI 会话比一次性执行活得更久，与 serve
+		// 共用一个库时被扫成 interrupted 的窗口只会更大。
 	}
 }
 
@@ -497,6 +506,10 @@ type tuiTaskRunConfig struct {
 	// runMentionedTUIAgentTask）**都要**接：只接一个的症状是「@某个 agent 提问就
 	// 没有轨迹」，而没有轨迹与没提问在库里长得一样。
 	SessionEvents port.SessionEventStore
+	// TaskRuns 是这条 TUI 路径的任务运行记录落点。两个 TUI 入口（runTUITask 与
+	// runMentionedTUIAgentTask）**都要**接：只接一个的症状是「@某个 agent 提问的那
+	// 次运行没有记录」，而没有记录与没提问在库里长得一样。
+	TaskRuns port.TaskRunStore
 	// ModelProfile 是这次 TUI 运行记进**会话事件**的模型档位名（spec §4.1 的
 	// model_profile），已经过 runModelProfile 归一，永不为空。
 	//
@@ -619,6 +632,7 @@ func runTUITask(ctx context.Context, application *app.App, cfg tuiTaskRunConfig)
 		Checkpoints:       cfg.Checkpoints,
 		DisabledTools:     cfg.Config.Runtime.DisabledTools,
 		SessionEvents:     cfg.SessionEvents,
+		TaskRuns:          cfg.TaskRuns,
 		ModelProfile:      cfg.ModelProfile,
 	})
 	if err != nil {
@@ -713,6 +727,7 @@ func runMentionedTUIAgentTask(ctx context.Context, application *app.App, cfg tui
 		Checkpoints:       cfg.Checkpoints,
 		DisabledTools:     cfg.Config.Runtime.DisabledTools,
 		SessionEvents:     cfg.SessionEvents,
+		TaskRuns:          cfg.TaskRuns,
 		// @提及路径的客户端是 maasFactoryFromConfig 按 agent 自己的档位建的，
 		// 完全不看 --maas-url，所以这里直接按那个档位解，与它同源。
 		ModelProfile: cfg.Config.Maas.ResolveProfileName(agentCfg.MaasProfile),
@@ -958,6 +973,11 @@ type runPorts struct {
 	// BuildServeService 里解析同一个仓储，这里在 persistentRunPorts 里。
 	// 非持久化驱动下为 nil，与上面几个字段同义（没有可写的地方，不是错误）。
 	sessionEvents port.SessionEventStore
+	// taskRuns 是这条路的任务运行记录落点（app.RunTaskOptions.TaskRuns）。它与
+	// sessionEvents 同源同理由：serve 的仓储解析在 BuildServeService 里，这条在
+	// persistentRunPorts 里，只接一边的症状是「另一条路跑出来的任务一行记录都没有」。
+	// 非持久化驱动下为 nil。
+	taskRuns port.TaskRunStore
 }
 
 type streamingEventBus struct {
@@ -1019,6 +1039,7 @@ func persistentRunPorts(ctx context.Context, cfg config.Config) (runPorts, func(
 		sessionStore:  repo,
 		messageStore:  repo,
 		sessionEvents: repo,
+		taskRuns:      repo,
 	}, func() {
 		closeRepositoryLogging(slog.Default(), repo, "persistent-run")
 	}, nil
@@ -2259,6 +2280,49 @@ type ServeResult struct {
 	Tokens *server.TokenStore
 }
 
+// sweepInterruptedRuns 把上一次进程留下的 running 运行记录摆成 interrupted，并把
+// 这一轮的结果记进审计与日志。
+//
+// 它在 serve 开始接任务之前跑一次，且只跑一次：此刻库里任何一条 running 都不可能
+// 属于本进程。扫描失败让 serve 起不来——扫不动意味着接下来每一条 running 记录的
+// 含义都是不确定的，而这份记录的全部价值就在于那个含义是确定的。记不下这一轮同样
+// 拦住启动：行已经被改过了，没有痕迹的改写与没发生过的改写一样说不清。
+//
+// 零条也记。一个「从来没扫到过东西」的扫描与一个根本没跑起来的扫描，只有日志能
+// 把它们分开。
+//
+// 它只认 running：另外四个状态都是某条腿自己写下的结论（suspended 尤其——那是「这条腿
+// 停在这里等人」），过滤条件由 port.TaskRunStore.SweepRunning 的实现负责，这里不再
+// 二次筛选。
+func sweepInterruptedRuns(ctx context.Context, store port.TaskRunStore, audit port.AuditLog, logger *slog.Logger) error {
+	if store == nil {
+		return errors.New("sweep interrupted task runs: the task run store is nil; serve assembly always " +
+			"provides one, so a nil here is a wiring gap rather than a deployment without run records")
+	}
+	at := time.Now()
+	swept, err := store.SweepRunning(ctx, at)
+	if err != nil {
+		return fmt.Errorf("sweep interrupted task runs: %w", err)
+	}
+	if err := audit.Append(ctx, domain.AuditEvent{
+		ID:          fmt.Sprintf("task-runs-swept:%d", at.UnixNano()),
+		RequestID:   "startup",
+		SubjectType: "runtime",
+		SubjectID:   "task_runs",
+		Action:      "task_runs_swept",
+		Hash:        strconv.Itoa(swept),
+		CreatedAt:   at,
+	}); err != nil {
+		return fmt.Errorf("record the task run sweep (%d swept): %w", swept, err)
+	}
+	logger.Info("swept interrupted task runs",
+		"component", "cli",
+		"swept", swept,
+		"consequence", "runs left running by a previous process are now recorded as interrupted; they are "+
+			"not restarted")
+	return nil
+}
+
 // buildDefaultRunnerConfig assembles the agentruntime.Config template for the
 // default task runner (defaultTaskRunner.runtimeCfg). It is extracted out of
 // BuildServeService so this wiring is directly unit-testable without the full
@@ -2285,6 +2349,7 @@ func buildDefaultRunnerConfig(
 	sessionEvents port.SessionEventStore,
 	modelProfile string,
 	delegationAgents agentruntime.DelegationAgents,
+	taskRuns port.TaskRunStore,
 ) agentruntime.Config {
 	return agentruntime.Config{
 		Maas:             maas,
@@ -2322,6 +2387,14 @@ func buildDefaultRunnerConfig(
 		// 默认 agent 跑在哪个档位上。Runtime 自己拿不到这个信息（它只拿到一个建好的
 		// 客户端），漏传的症状是轨迹里 model_profile 永远空白且不报错。
 		ModelProfile: modelProfile,
+		// 任务运行记录的落点。它必须与 resolver 路径接同一个 store：一条任务派给
+		// 具名 agent 还是默认 agent 取决于它的 AgentID 在不在注册表里，而两种任务在
+		// task_runs 表里长得一模一样——只接 resolver 会让绝大多数任务（GUI 那条路）
+		// 一行记录都不落，而缺的那一半与「没发生过」在库里无法区分。
+		//
+		// 它也是启动扫描能说清话的前提：扫描把每一条残留的 running 摆成 interrupted，
+		// 而一条从未被写下的运行，扫描也救不回来。
+		TaskRuns: taskRuns,
 	}
 }
 
@@ -2716,6 +2789,15 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	// append to, and Config.SessionEvents declares nil a legitimate deployment
 	// shape (the whole recording is a no-op), not a fallback.
 	var sessionEvents port.SessionEventStore
+	// taskRuns 是任务运行记录（task_runs 表）的落点，本次 serve 建出来的每一个运行时
+	// 都往它里写，启动扫描也扫它。它是**一个** store：默认 runner 与 resolver 建的
+	// 每一个 per-agent 运行时共用，理由与 sessionEvents 一模一样——一条任务落在哪条
+	// 路上取决于 AgentID 在不在注册表里，只接一边会让一半的任务从来不落盘，而缺的
+	// 那一半与「没发生过」在库里无法区分。
+	//
+	// 非 sqlite 驱动下保持 nil，与上面几个字段同义：没有可写的地方（见
+	// runtime.Config.TaskRuns 把 nil 声明为合法部署形态），此时也没有东西可扫。
+	var taskRuns port.TaskRunStore
 	// skillUsage is the shared usage sidecar: the skill System records activity on
 	// it as skills are selected into task context, and the Curator sweep reads it
 	// to age idle skills. Sharing one instance connects the two.
@@ -2728,6 +2810,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		taskSink = repo
 		conversationTurns = repo
 		sessionEvents = repo
+		taskRuns = repo
 		episodicStore = memory.NewPersistentEpisodicStore(repo)
 		curator, err := skill.NewCurator(skill.CuratorConfig{Repository: repo, Usage: skillUsage})
 		if err != nil {
@@ -2779,6 +2862,27 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 	if cfg.Storage.Driver != "" && cfg.Storage.Driver != "memory" && taskSink == nil {
 		closeStore()
 		return ServeResult{}, fmt.Errorf("storage driver %q provides no task sink: task state changes would never be persisted", cfg.Storage.Driver)
+	}
+	// 启动扫描：库里此刻每一条 running 都是上一次进程留下的——本次 serve 还没接过
+	// 任何任务。把它们摆成 interrupted 之后，「running」这个词在这份记录里才重新只
+	// 有一个意思：现在真的在跑。扫描失败拦住启动（见 sweepInterruptedRuns）。
+	//
+	// 必须在这里、在 HTTP 服务起来之前：晚一步就会把本进程自己刚开的行也扫掉。
+	//
+	// taskRuns 为 nil 是非持久化驱动这一种合法部署形态（上面那条不变量已经挡住了
+	// 「持久化驱动却没有落点」）。那时没有任何东西可扫，但这一轮仍要留下痕迹——
+	// 「没什么可扫」与「扫描根本没跑」必须分得开。
+	if taskRuns != nil {
+		if err := sweepInterruptedRuns(ctx, taskRuns, auditLog, logger); err != nil {
+			closeStore()
+			return ServeResult{}, err
+		}
+	} else {
+		logger.Info("skipped the interrupted task run sweep",
+			"component", "cli",
+			"driver", cfg.Storage.Driver,
+			"consequence", "this deployment records no task runs, so there is nothing a previous process "+
+				"could have left behind")
 	}
 	// One gate per serve, shared by every runtime this assembly builds: the
 	// default-agent runner below and every per-agent runtime the resolver
@@ -3025,6 +3129,10 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		// Same store the default runner gets below: one session's turns can be
 		// served by either path, so a log wired on only one of them has holes.
 		SessionEvents: sessionEvents,
+		// 同上，也是同一个 store：一条任务落具名 agent 还是默认 agent 取决于它的
+		// AgentID，只接一边会让一半的任务从来不落盘。它还是具名后台委派的前提——
+		// 派发方与子运行时不是同一个 store 时那次委派会被直接拒绝。
+		TaskRuns: taskRuns,
 	})
 	defaultDisplay := tuiDisplayConfig(cfg.Maas, "", "")
 	defaultContext, err := buildRunContextPrefix(ctx, cfg, false, defaultDisplay.ModelName)
@@ -3093,6 +3201,8 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 			// （defaultMaas 也是这么建的），两者必须同源。
 			cfg.Maas.ResolveProfileName(""),
 			resolver,
+			// 与 resolver 同一个 store，也正是上面启动扫描扫过的那一个。
+			taskRuns,
 		),
 		contextRoot:     cfg.ContextFiles.Root,
 		audit:           auditLog,
@@ -3288,6 +3398,7 @@ func BuildServeService(ctx context.Context, opts ServeOptions) (ServeResult, err
 		RequireIdentity:     cfg.Server.RequireIdentity,
 		RequestIDHeader:     cfg.Server.RequestIDHeader,
 		Audit:               auditLog,
+		TaskRuns:            taskRuns,
 		QualityEvals:        qualityEvals,
 		Sessions:            sessionStore,
 		Messages:            messageStore,

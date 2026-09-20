@@ -611,6 +611,13 @@ func (c *Coordinator) RecoverSuspended(ctx context.Context, checkpoints []sessio
 			Status:     domain.TaskSuspended,
 			Mode:       cp.Mode,
 			WorkingDir: cp.WorkingDir,
+			// 身世跟着任务一起恢复，否则恢复腿写进 task_runs 的那一行是
+			// parent_task_id='' / background=0 / goal=''——一条自称直连任务的孤儿行，
+			// 父子树对这条任务断掉且不报任何错。RunID 不在其中是故意的：恢复腿是另
+			// 一条腿，自己 mint id 插自己的行。
+			ParentTaskID: cp.ParentTaskID,
+			Background:   cp.Background,
+			Goal:         cp.Goal,
 		}); err != nil {
 			return recovered, fmt.Errorf("re-register suspended task %s: %w", cp.TaskID, err)
 		}

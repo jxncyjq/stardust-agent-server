@@ -7,6 +7,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/stardust/legion-agent/internal/domain"
 )
 
@@ -67,10 +69,10 @@ type SubTaskResult struct {
 	StopReason domain.StopReason
 }
 
-// SubTaskHandle references a background sub-task whose completion is delivered
-// later as a runtime event (Type "subtask_completed"). It is process-local and
-// non-durable: if the parent process exits, an in-flight background sub-task is
-// lost.
+// SubTaskHandle 指向一条后台子任务。TaskID 是它的 UUID，外部可以拿它查这条子任务
+// 的运行记录——包括进程重启之后（那时它的状态是 interrupted）。
+//
+// 完成仍然经运行时事件（Type "subtask_completed"）送达。句柄本身不等待、不轮询。
 type SubTaskHandle struct {
 	TaskID string
 }
@@ -244,6 +246,9 @@ func (r *Runtime) newSubRuntime(role string, toolsets []string) (*Runtime, error
 		// "the seam exists but nothing reaches it" failure shape this repo has
 		// hit twice before with per-agent tool/approval wiring.
 		sessionEvents: r.sessionEvents,
+		// 子运行时必须继承运行记录的落点：没有它，后台子任务的 RunTask 拿到的是
+		// nil，落盘在子任务这条路上整条消失——而那正是本设计的目标场景。
+		taskRuns: r.taskRuns,
 		// The child runs on the parent's inference client, so it runs under the
 		// parent's model profile; without this its own session log would record
 		// an empty model_profile on every assistant/message (spec §4.1).
@@ -266,12 +271,12 @@ func (r *Runtime) RunSubTask(ctx context.Context, spec SubTaskSpec) (SubTaskResu
 	if !r.canDelegate() {
 		return SubTaskResult{}, fmt.Errorf("run sub task: delegation not permitted for role %q at depth %d", r.role, r.depth)
 	}
-	subTaskID := r.nextSubTaskID(spec.ParentTaskID)
+	subTaskID := r.nextSubTaskID()
 	agent, child, err := r.childFor(ctx, spec, subTaskID)
 	if err != nil {
 		return SubTaskResult{}, err
 	}
-	return r.runChild(ctx, agent, child, subTaskID, spec)
+	return r.runChild(ctx, agent, child, subTaskID, spec, false, "")
 }
 
 // childFor builds the runtime that will run one sub-task: the named agent's own
@@ -311,20 +316,26 @@ func (r *Runtime) childFor(ctx context.Context, spec SubTaskSpec, subTaskID stri
 	// succeeded: a resolution failure is returned above and starts no child, so
 	// there is nothing yet worth recording.
 	//
-	// RequestID carries subTaskID, not spec.ParentTaskID directly, matching how
-	// RunSubTaskAsync's own audit record below fills the same field: nextSubTaskID
-	// mints subTaskID as "<parentTaskID>:sub-N" (defaulting an empty parent to
-	// "task"), and ParentTaskIDForSubTask in this same file exists precisely to
-	// recover the parent id from it. This runtime carries no agent identity of
-	// its own -- Config has no such field, because a Runtime is generic and only
-	// learns which domain.Agent it is running as through RunTask's own parameter,
-	// which this function never receives -- so the parent TASK id is the most
-	// specific caller-side identity actually available at this call site, and
-	// Hash is free to carry the one piece of content that has no field of its
-	// own: the goal the parent asked the named agent to do.
+	// RequestID 直接写 spec.ParentTaskID，回答的就是「哪条任务发起了这次委派」——见
+	// domain.AuditEvent.RequestID 的字段契约。spec.ParentTaskID 的唯一来源是
+	// handleDelegateTask 从 ctx 读到的、当时真正在跑的那条任务的 id（拿不到就拒绝派
+	// 发），所以这句话在生产上也成立，而不只是在喂字面量的用例里成立。
+	//
+	// 它以前写的是 subTaskID，靠 ParentTaskIDForSubTask 从 "<父>:sub-N" 里再解析回来；
+	// 子任务 id 现在是 UUID，那条解析路不存在了，而父子关系本来就该存成字段、不该编
+	// 码进 id。子任务自己的 id 仍在这条事件的 ID 里（subTaskID +
+	// ":delegated-to-agent"），两头都没丢。
+	//
+	// This runtime carries no agent identity of its own -- Config has no such
+	// field, because a Runtime is generic and only learns which domain.Agent it is
+	// running as through RunTask's own parameter, which this function never
+	// receives -- so the parent TASK id is the most specific caller-side identity
+	// actually available at this call site, and Hash is free to carry the one
+	// piece of content that has no field of its own: the goal the parent asked the
+	// named agent to do.
 	if auditErr := r.audit.Append(ctx, domain.AuditEvent{
 		ID:          subTaskID + ":delegated-to-agent",
-		RequestID:   subTaskID,
+		RequestID:   spec.ParentTaskID,
 		SubjectType: "agent",
 		SubjectID:   spec.AgentID,
 		Action:      "subtask_delegated_to_agent",
@@ -359,7 +370,12 @@ func (r *Runtime) childFor(ctx context.Context, spec SubTaskSpec, subTaskID stri
 
 // runChild executes a prepared child runtime against spec and maps its run to a
 // SubTaskResult, running it as agent. A child run error is wrapped and returned.
-func (r *Runtime) runChild(ctx context.Context, agent domain.Agent, child *Runtime, subTaskID string, spec SubTaskSpec) (SubTaskResult, error) {
+//
+// background 报告这条子任务是不是后台派发的；openingRunID 是派发方已经插好的那一行
+// 的 run id（同步委派两者分别是 false 与空串，开始那一行由 RunTask 自己插）。两者
+// 必须成对给：只给 background，RunTask 会自己 mint 一个 id 再插一行，派发方那一行
+// 永远停在 running；只给 openingRunID，这条运行记录会被标成一条直连任务。
+func (r *Runtime) runChild(ctx context.Context, agent domain.Agent, child *Runtime, subTaskID string, spec SubTaskSpec, background bool, openingRunID string) (SubTaskResult, error) {
 	agentID := spec.AgentID
 	if agentID == "" {
 		agentID = subTaskID
@@ -371,11 +387,18 @@ func (r *Runtime) runChild(ctx context.Context, agent domain.Agent, child *Runti
 	// into its parent's -- the parent's log keeps only the one tool/call +
 	// tool/result pair for RunSubTask itself, exactly the shape spec F1 wants.
 	// No extra code is needed here; this comment is the whole of the decision.
+	// ParentTaskID 与 Goal 必须填：parent_task_id 空串在那个字段的契约里是「顶层
+	// 任务」，不是「不知道」，漏填会让每一条子任务的运行记录都伪装成一条直连任务，
+	// 父子树整棵断掉且不报错。Goal 则是让一条中断记录读起来知道它在干什么。
 	task := domain.Task{
-		ID:        subTaskID,
-		AgentID:   agentID,
-		Input:     composeSubTaskInput(spec),
-		CreatedAt: time.Now(),
+		ID:           subTaskID,
+		AgentID:      agentID,
+		Input:        composeSubTaskInput(spec),
+		CreatedAt:    time.Now(),
+		ParentTaskID: spec.ParentTaskID,
+		Background:   background,
+		Goal:         spec.Goal,
+		RunID:        openingRunID,
 	}
 	run, err := child.RunTask(ctx, agent, task)
 	if err != nil {
@@ -454,10 +477,29 @@ func (r *Runtime) RunSubTaskAsync(ctx context.Context, spec SubTaskSpec) (SubTas
 	if !r.canDelegate() {
 		return SubTaskHandle{}, fmt.Errorf("run sub task async: delegation not permitted for role %q at depth %d", r.role, r.depth)
 	}
-	subTaskID := r.nextSubTaskID(spec.ParentTaskID)
+	subTaskID := r.nextSubTaskID()
 	agent, child, err := r.childFor(ctx, spec, subTaskID)
 	if err != nil {
 		return SubTaskHandle{}, err
+	}
+
+	// 开始那一行由派发方写、终态由子运行时写，所以两边必须是同一个 store。不是的话
+	// 那一行永远停在 running：下一次启动的 SweepRunning 会把一条正常跑完的子任务扫成
+	// interrupted——比不落盘更坏，因为它给出的是一个确信的错误答案。
+	//
+	// 这不是假想：克隆路径（newSubRuntime）显式抄了 taskRuns，具名路径
+	// （DelegationAgents.ResolveDelegate）曾经组 Config 时根本没有 TaskRuns 这一项，
+	// 于是每一次具名后台委派都在这里被拒。AgentRuntimeResolverConfig.TaskRuns 接上
+	// 之后这条校验对同一部署自然通过（agent_resolver_task_runs_test.go 里那条端到端
+	// 用例钉住这一点），但校验留着：它挡的是「两边不是同一个 store」这件事本身，而不
+	// 是某一次具体的漏接。
+	//
+	// 只在派发方自己要插行时才校验：r.taskRuns 为 nil 时下面什么都不写、RunID 传空串，
+	// 子运行时自己开自己的行，两边各写各的没有分歧。
+	if r.taskRuns != nil && child.taskRuns != r.taskRuns {
+		return SubTaskHandle{}, fmt.Errorf(
+			"delegate background sub-task %s: the child runtime records its runs in a different store, so the opening row this dispatcher writes would never be finished",
+			subTaskID)
 	}
 
 	// The background sub-task keeps running after the tool call that started it
@@ -476,17 +518,56 @@ func (r *Runtime) RunSubTaskAsync(ctx context.Context, spec SubTaskSpec) (SubTas
 	// Ownership passes to the goroutine and to nothing else: endBackground is
 	// captured by exactly one closure and retired by its first deferred call, so
 	// every way out — the child failing, the publish failing, a panic unwinding
-	// — releases it exactly once. Nothing between this line and the go statement
-	// can return or fail, so there is no path that takes the token and drops it.
+	// — releases it exactly once. 这一行与 go 语句之间只有一条会失败的路（下面那次
+	// 落盘），它自己在返回之前把票还掉；除此之外没有任何路径拿了票又把它丢掉。
 	endBackground := r.gate.BeginChild()
+
+	// 运行记录与边界票在同一处取得，理由相同：这一刻父任务确凿还在飞。放进下面的
+	// goroutine 里写，父进程紧接着退出就什么都没留下——而那正是这条记录要覆盖的场景。
+	// 插不进去就不起这个子任务，边界票也要还回去：票不还，插件变更会永远等一条从来
+	// 没跑起来的子任务。
+	//
+	// run id 只在真的要插行时铸、并经 task.RunID 带给 RunTask：谁写下了开始那一行，谁
+	// 就说了算。RunTask 以 task.RunID 非空判断「已经有人插过行了」，于是它不再插第二
+	// 次，收尾写回的正是这一行。反过来，不铸就是空串，RunTask 自己开自己的行。
+	//
+	// 不变量：task.RunID 非空 ⟺ 确实有人插过那一行。无条件铸一个会让 RunTask 以为行
+	// 已经有了而跳过插行，收尾却写向一条从未插入的行——真实的 FinishTaskRun 找不到它
+	// 会报错，于是一条正常跑完的子任务被记成 failed。
+	//
+	// 顺序：这次预插排在 childFor 里那条 subtask_delegated_to_agent 审计之后，是刻意
+	// 的。预插要的 agent 身份与「两边同一个 store」这两件事都由 childFor 产出，排到它
+	// 前面就得先写一条还不知道派给谁的行。于是预插失败时，审计里会留下一条没有运行记
+	// 录的委派——那不是两份记录互相矛盾，而是各自说着实话：确实做出过一次选择（审计
+	// 的事），而那条子任务确实一次都没有跑起来（运行记录的事，下面失败就直接返回）。
+	var openingRunID string
+	if r.taskRuns != nil {
+		openingRunID = uuid.NewString()
+		if err := r.taskRuns.StartTaskRun(ctx, domain.TaskRun{
+			ID:           openingRunID,
+			TaskID:       subTaskID,
+			AgentID:      agent.ID,
+			StartedAt:    time.Now(),
+			Status:       domain.RunStatusRunning,
+			ParentTaskID: spec.ParentTaskID,
+			Background:   true,
+			Goal:         spec.Goal,
+		}); err != nil {
+			endBackground()
+			return SubTaskHandle{}, fmt.Errorf("record the start of background sub-task %s: %w", subTaskID, err)
+		}
+	}
 	go func() {
 		defer endBackground()
 		bg := context.WithoutCancel(ctx)
-		res, err := r.runChild(bg, agent, child, subTaskID, spec)
+		res, err := r.runChild(bg, agent, child, subTaskID, spec, true, openingRunID)
+		// ParentTaskID 必须在这里填：子任务 id 是 UUID，回注方从它身上解析不出父任务，
+		// 而这一刻是父子关系唯一还在手边的地方。不填，父任务就永远等不到这条结果。
 		event := domain.RuntimeEvent{
-			Type:      "subtask_completed",
-			TaskID:    subTaskID,
-			CreatedAt: time.Now(),
+			Type:         "subtask_completed",
+			TaskID:       subTaskID,
+			ParentTaskID: spec.ParentTaskID,
+			CreatedAt:    time.Now(),
 		}
 		if err != nil {
 			event.Message = "sub-task failed: " + err.Error()
@@ -502,9 +583,12 @@ func (r *Runtime) RunSubTaskAsync(ctx context.Context, spec SubTaskSpec) (SubTas
 			// sub-task's outcome is gone and the parent waits forever, so the log,
 			// which depends on no database, is the actual last resort. It ends the
 			// work unit rather than looping.
+			// RequestID 与上面那条委派事件写同一个东西：发起委派的父任务 id。两条
+			// subtask_* 事件对「这条事件属于哪一次动作」给出两个不同的答案，就等于
+			// 谁都回答不了。子任务自己的 id 在 ID 与 SubjectID 里。
 			if auditErr := r.audit.Append(bg, domain.AuditEvent{
 				ID:          subTaskID + ":subtask-publish-failed",
-				RequestID:   subTaskID,
+				RequestID:   spec.ParentTaskID,
 				SubjectType: "runtime",
 				SubjectID:   subTaskID,
 				Action:      "subtask_event_publish_failed",
@@ -522,20 +606,22 @@ func (r *Runtime) RunSubTaskAsync(ctx context.Context, spec SubTaskSpec) (SubTas
 	return SubTaskHandle{TaskID: subTaskID}, nil
 }
 
-// nextSubTaskID mints a process-unique child task id from the parent id and a
-// monotonic counter, so batch and background sub-tasks never collide.
-func (r *Runtime) nextSubTaskID(parentTaskID string) string {
-	if parentTaskID == "" {
-		parentTaskID = "task"
-	}
-	return fmt.Sprintf("%s:sub-%d", parentTaskID, r.subTaskSeq.Add(1))
-}
+// nextSubTaskID 为一次委派铸一个新 id。
+//
+// 用 UUID 而不是「父任务 + 序号」：序号来自进程内计数器，重启之后从头数，于是重启
+// 前后两条不同的子任务会拿到同一个 id，而运行记录的全部意义就是按 id 找回它。父子
+// 关系改存 domain.Task.ParentTaskID 与 task_runs.parent_task_id，那里它是可查询的，
+// 而不是要从字符串里解析出来的。
+func (r *Runtime) nextSubTaskID() string { return uuid.NewString() }
 
-// ParentTaskIDForSubTask recovers the parent task id from a sub-task id minted by
-// nextSubTaskID ("<parent>:sub-<n>"). ok reports whether s carried the expected
-// suffix; when false the whole string is returned so callers can still associate
-// the result rather than drop it. It lets a subtask_completed consumer route a
-// background result back to its parent task.
+// ParentTaskIDForSubTask 从老形态的子任务 id（"<父>:sub-<n>"）里解析出父任务。
+// ok 报告 s 是否真是那个形态；为 false 时原样返回整串，调用方不得把它当成父任务
+// 用——那会把结果回注给子任务自己。
+//
+// 今天铸出来的子任务 id 是 UUID（见 nextSubTaskID），解析不出任何东西；这个函数
+// 留着，是因为 runtime_events 里存着改造之前发布的事件，它们的父任务只剩这一条线索。
+// 新代码一律读 domain.RuntimeEvent.ParentTaskID（事件）与 domain.TaskRun.ParentTaskID
+// （运行记录）——那里父子关系是存着的，而不是要从字符串里解析出来的。
 func ParentTaskIDForSubTask(s string) (parentTaskID string, ok bool) {
 	idx := strings.LastIndex(s, ":sub-")
 	if idx < 0 {

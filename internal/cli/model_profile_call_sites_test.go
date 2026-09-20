@@ -125,7 +125,7 @@ func TestBuildTUITaskRunConfigCarriesModelProfileIntoTheSessionEventLog(t *testi
 	runCfg := buildTUITaskRunConfig(
 		cfg, nil, "介绍一下这个运行时", maas, "", "", "",
 		nil, nil, nil, nil, nil, nil, nil, nil, nil,
-		store,
+		store, nil,
 	)
 
 	result, err := runTUITask(context.Background(), app.New(), runCfg)

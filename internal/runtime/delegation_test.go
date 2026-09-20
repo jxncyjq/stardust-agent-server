@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/taskgate"
@@ -63,8 +65,13 @@ func TestRunSubTaskReturnsSummaryOnly(t *testing.T) {
 	if res.Summary != "子任务摘要：完成" {
 		t.Fatalf("RunSubTask().Summary = %q, want child final result", res.Summary)
 	}
-	if res.TaskID != "parent-1:sub-1" {
-		t.Fatalf("RunSubTask().TaskID = %q, want parent-1:sub-1", res.TaskID)
+	// 子任务 id 是 UUID：父子关系存在 domain.Task.ParentTaskID / task_runs 里，
+	// 不编码进 id（见 nextSubTaskID）。这里钉住形状本身，顺带钉住它没退回老形态。
+	if _, err := uuid.Parse(res.TaskID); err != nil {
+		t.Fatalf("RunSubTask().TaskID = %q, 不是 UUID：%v", res.TaskID, err)
+	}
+	if strings.Contains(res.TaskID, ":sub-") {
+		t.Fatalf("RunSubTask().TaskID = %q, 仍然把父子关系编码进了 id", res.TaskID)
 	}
 	// (a) child ran on its own goal/context, not any parent tool history.
 	prompts := maas.recorded()

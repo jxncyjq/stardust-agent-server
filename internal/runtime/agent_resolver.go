@@ -128,6 +128,19 @@ type AgentRuntimeResolverConfig struct {
 	// nil 是契约允许的部署形态（非持久化驱动、测试构造），那时这些运行时整体不记
 	// 事件（见 Config.SessionEvents），不是兜底。
 	SessionEvents port.SessionEventStore
+	// TaskRuns 是任务运行记录的落点，镜像默认运行时的 Config.TaskRuns。
+	//
+	// 它必须与默认运行时接**同一个** store，理由与 SessionEvents 一样：一条任务派给
+	// 具名 agent 还是默认 agent，取决于它的 AgentID 在不在注册表里，而两种任务在
+	// task_runs 表里长得一模一样——只接一边的症状是「有一半任务从来没落过盘」，而
+	// 缺的那一半与「没发生过」在库里无法区分。
+	//
+	// 它还是具名后台委派能不能成立的前提：派发方插开始那一行、子运行时写终态，
+	// RunSubTaskAsync 要求两者是同一个 store，否则整次委派被拒（见 delegation.go）。
+	//
+	// nil 是契约允许的部署形态（非持久化驱动、测试构造），那时这些运行时不落运行
+	// 记录（见 Config.TaskRuns），不是兜底。
+	TaskRuns port.TaskRunStore
 }
 
 type AgentRuntimeResolver struct {
@@ -149,6 +162,7 @@ type AgentRuntimeResolver struct {
 	browserRuntime    browser.RuntimeAPI
 	gate              *taskgate.TaskGate
 	sessionEvents     port.SessionEventStore
+	taskRuns          port.TaskRunStore
 }
 
 func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolver {
@@ -178,6 +192,7 @@ func NewAgentRuntimeResolver(cfg AgentRuntimeResolverConfig) *AgentRuntimeResolv
 		browserRuntime:    cfg.BrowserRuntime,
 		gate:              cfg.Gate,
 		sessionEvents:     cfg.SessionEvents,
+		taskRuns:          cfg.TaskRuns,
 	}
 }
 
@@ -505,6 +520,11 @@ func (r *AgentRuntimeResolver) buildAgentRuntime(ctx context.Context, agentCfg a
 		EpisodeRecorder: r.episodeRecorder,
 		Gate:            r.gate,
 		SessionEvents:   r.sessionEvents,
+		// 这条路建出来的运行时既跑顶层的 per-agent 任务，也当具名委派的子运行时，
+		// 两种身份共用这一个落点。具名后台委派尤其依赖它：派发方插开始那一行、
+		// 子运行时写终态，RunSubTaskAsync 要求两边是同一个 store，不传等于让每一次
+		// 具名后台委派被拒。
+		TaskRuns: r.taskRuns,
 		// The per-agent runtime this resolver builds can itself delegate, and it
 		// must resolve names against the same registry this resolver already
 		// wraps -- passing itself here (AgentRuntimeResolver implements

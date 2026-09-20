@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/stardust/legion-agent/internal/domain"
 )
@@ -151,4 +152,21 @@ type AuditLog interface {
 	// slice — an audit trail that reads as empty because the query failed is
 	// worse than one that reads as broken.
 	Events() ([]domain.AuditEvent, error)
+}
+
+// TaskRunStore 是任务运行记录的落点：一次运行开始时插一行，结束时写回终态，
+// 启动时把上一次进程留下的 running 记录摆正。
+//
+// 它与 AuditLog、EventBus 并列而不是合并进去，因为三者回答的是不同的问题：审计
+// 记「发生过什么」，事件总线记「谁该被通知」，而这里记「这一次运行现在处在哪个
+// 状态」——只有第三个需要被就地改写。
+type TaskRunStore interface {
+	StartTaskRun(ctx context.Context, run domain.TaskRun) error
+	FinishTaskRun(ctx context.Context, run domain.TaskRun) error
+	// SweepRunning 把所有 running 记录改成 interrupted，返回改了几条。只在启动时
+	// 调用一次。
+	SweepRunning(ctx context.Context, at time.Time) (int, error)
+	// TaskRunByID 取一条运行记录；found 为 false 表示没有它，与查询失败分开。
+	TaskRunByID(ctx context.Context, runID string) (run domain.TaskRun, found bool, err error)
+	ListTaskRuns(ctx context.Context, taskID string) ([]domain.TaskRun, error)
 }

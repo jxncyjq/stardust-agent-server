@@ -50,10 +50,9 @@ func TestSQLiteRepositoryPersistsTaskRunAndAudit(t *testing.T) {
 		StartedAt: task.CreatedAt,
 		EndedAt:   task.CreatedAt.Add(time.Second),
 		Result:    "done",
+		Status:    domain.RunStatusCompleted,
 	}
-	if err := repo.SaveTaskRun(ctx, run); err != nil {
-		t.Fatalf("SaveTaskRun(%q) error = %v, want nil", run.ID, err)
-	}
+	seedFinishedRun(t, repo, run)
 	runs, err := repo.ListTaskRuns(ctx, task.ID)
 	if err != nil {
 		t.Fatalf("ListTaskRuns(%q) error = %v, want nil", task.ID, err)

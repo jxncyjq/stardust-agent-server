@@ -236,7 +236,7 @@ func TestDelegateTaskRefusesAnUnparseableBackgroundValue(t *testing.T) {
 	maas := &recordingSubMaas{summary: "ok"}
 	parent := NewRuntime(Config{Gate: taskgate.NewTaskGate(), Maas: maas, Tools: unchangingReadRegistry(t)})
 
-	res, err := parent.handleDelegateTask(context.Background(), domain.ToolCall{
+	res, err := parent.handleDelegateTask(tool.WithTaskID(context.Background(), "task-parent"), domain.ToolCall{
 		ID:   "c1",
 		Name: "delegate_task",
 		Arguments: map[string]string{

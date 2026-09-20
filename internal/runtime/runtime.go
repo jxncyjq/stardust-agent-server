@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/stardust/legion-agent/internal/capability"
 	"github.com/stardust/legion-agent/internal/cognitive"
 	"github.com/stardust/legion-agent/internal/domain"
@@ -42,6 +44,22 @@ var (
 )
 
 const defaultMaxToolRounds = 4
+
+// closingWriteBudget 是「这次运行结束了」那一次写入的时间预算。
+//
+// 收尾写入刻意脱离了调用方的取消（context.WithoutCancel）：用户一中断，ctx 就已经
+// Done，而这次写入正是这条腿结束的唯一记录，跟着一起失败那一行就永远停在 running。
+// 代价是它失去了唯一的逃生口，所以必须自己带一个：storage 的连接池上限是一条连接
+// （sqlite.go 的 SetMaxOpenConns(1)），取连接是一个队列，而这个队列除了 ctx 没有
+// 别的出口——busy_timeout 只管语句执行撞锁，管不到取连接的等待。没有预算的话，一次
+// 卡住的收尾写入会同时卡死这条任务的 goroutine（此时 taskgate 的 end 还没跑）和所有
+// 等这条任务边界的插件 apply。成功那条路还多一层：它的收尾跑在会话锁之内（收口 defer
+// 注册得比 releaseSession 早，LIFO 下后跑），所以同一会话上排队的任务都会多等这一次
+// 写入，封顶就是这个预算。
+//
+// 取 5s 与 storage 的 busy_timeout 同量级：一次排队等待撞满锁等待仍应落在预算内，
+// 超过它就不是「忙」而是「卡住了」，此时报错比无限等更诚实。
+const closingWriteBudget = 5 * time.Second
 
 type ContextBuilder interface {
 	BuildContext(ctx context.Context, req cognitive.Request) (cognitive.BuiltContext, error)
@@ -180,6 +198,18 @@ type Config struct {
 	// 构造），不是兜底：那时整个记录是 no-op，三个屏障永远放行。它与「配了但写不进去」
 	// 是两回事——后者由屏障 fail-closed 挡住。
 	SessionEvents port.SessionEventStore
+	// TaskRuns 是任务运行记录的落点。nil 表示这个部署不落盘运行记录（非持久化
+	// 驱动、`agent run --demo`、以及绝大多数测试就是这个形状），此时 RunTask 不写
+	// 任何记录，也不因此失败——这是契约里写明的可选，不是接线漏了。
+	//
+	// 配了持久化驱动的部署一律给它一个非 nil 值，四个生产装配点无一例外：serve 的
+	// 默认 runner（cli.buildDefaultRunnerConfig）、serve 的 per-agent 运行时
+	// （AgentRuntimeResolverConfig.TaskRuns）、`agent run --prompt` / `agent tui`
+	// （app.RunTaskOptions.TaskRuns），以及委派派生出来的子运行时（newSubRuntime
+	// 抄父运行时的，ResolveDelegate 从 resolver 拿）。每一处各有一条断言钉住它
+	// （见各自的 wiring 测试）——只接其中几处的症状是「有一部分任务从来没落过盘」，
+	// 而缺的那部分与「没发生过」在库里无法区分。
+	TaskRuns port.TaskRunStore
 	// ModelProfile 是这次运行使用的模型档位名，会话事件的 assistant/message 用它
 	// 填 spec §4.1 的 model_profile 字段（P3 的轨迹里「这一步用的是哪个模型」那一栏）。
 	//
@@ -231,7 +261,6 @@ type Runtime struct {
 	// no-agent-directory deployment shape (see DelegationAgents' doc).
 	delegationAgents      DelegationAgents
 	maxConcurrent         int
-	subTaskSeq            atomic.Uint64
 	checkpoints           *sessionstate.Store
 	toolGate              ToolGate
 	logger                *slog.Logger
@@ -251,6 +280,10 @@ type Runtime struct {
 	// leaving the recorder field itself nil -- see eventRecorder's type doc on
 	// why a literal nil recorder is refused, not tolerated.
 	sessionEvents port.SessionEventStore
+	// taskRuns 是任务运行记录的落点（Config.TaskRuns）。nil 是契约声明的合法部署
+	// 形态，不是接线缺口：那时 RunTask 一条记录都不写。newSubRuntime 必须把它带给
+	// 子运行时，否则后台子任务那条路上的落盘会整条消失。
+	taskRuns port.TaskRunStore
 	// modelProfile is the model profile name this runtime runs under, recorded
 	// on every assistant/message event (spec §4.1's model_profile). See
 	// Config.ModelProfile for why it has to come from assembly.
@@ -436,6 +469,7 @@ func NewRuntime(cfg Config) *Runtime {
 		episodeRecorder:       cfg.EpisodeRecorder,
 		gate:                  cfg.Gate,
 		sessionEvents:         cfg.SessionEvents,
+		taskRuns:              cfg.TaskRuns,
 		modelProfile:          cfg.ModelProfile,
 	}
 }
@@ -658,7 +692,7 @@ func (r *Runtime) closeTurnOnError(ctx context.Context, task domain.Task, rec *e
 // for hours, and counting it as in flight would let one unanswered approval
 // block every plugin reload indefinitely — a worse failure than one
 // prompt-cache miss on resume. See TaskGate's doc for the full reasoning.
-func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.Task) (domain.TaskRun, error) {
+func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.Task) (runResult domain.TaskRun, runErr error) {
 	// The task is registered with the task-boundary gate before anything else
 	// happens, and retired when it is over however it ends. That is both halves
 	// of the contract in one place: while this task runs a plugin change waits
@@ -691,6 +725,119 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 	defer end()
 
 	started := time.Now()
+
+	// 运行记录先落盘，再干活。反过来先跑后记，崩在中间就什么都不剩；而落盘失败
+	// 时任务不开始——一个状态没落盘的任务没有资格自称可续（规格第五节）。
+	// run id 只有一个出处：谁写下了开始那一行，谁就说了算。task.RunID 非空表示开始
+	// 行已经由别人（今天是后台子任务的派发路径）插好了，这条腿就用那个 id 收尾；
+	// 为空才自己 mint。
+	//
+	// mint 出来的必须是每条腿一个新 id：一个任务可以跑不止一次（挂起等审批之后的
+	// 恢复腿就是第二次），而 "<任务>:run-1" 会让第二条腿拿同一个主键去插，恢复根本
+	// 起不来。父子关系与归属由 TaskID / ParentTaskID 两列回答，不靠 id 的形状。
+	// openingRowWritten 记住的是「进来时 RunID 就有值」，必须在 mint 之前取——mint
+	// 之后 runID 一律非空，再问就问不出这件事了。
+	openingRowWritten := task.RunID != ""
+	runID := task.RunID
+	if runID == "" {
+		runID = uuid.NewString()
+	}
+	runRecord := domain.TaskRun{
+		ID:           runID,
+		TaskID:       task.ID,
+		AgentID:      agent.ID,
+		StartedAt:    started,
+		Status:       domain.RunStatusRunning,
+		ParentTaskID: task.ParentTaskID,
+		Background:   task.Background,
+		Goal:         task.Goal,
+	}
+	// 开始那一行只写一次，判据是「有没有人已经写过」——也就是 task.RunID 是否非空，
+	// 与收尾用哪个 id 读的是同一个字段。读 Background 会把一件事拆给两个字段：派发方
+	// 漏设 RunID，这里就再插一行、收尾写去一个没人插过的 id（那一行永远停在 running）；
+	// 漏设 Background，这里就拿派发方的 id 再插一次、撞主键让整条子任务起不来。
+	if r.taskRuns != nil && !openingRowWritten {
+		if err := r.taskRuns.StartTaskRun(ctx, runRecord); err != nil {
+			return domain.TaskRun{}, fmt.Errorf("record the start of task %s: %w", task.ID, err)
+		}
+	}
+
+	// 终态写入收口在这一处。RunTask 有二十多条错误出口，逐条去记得写一次终态是
+	// 守不住的；这里用具名返回值 + defer，让「无论从哪条路出去都恰好落一次终态」
+	// 由控制流本身保证。
+	//
+	// finished 由成功路径置位：那条路自己写 completed（它手里那份 TaskRun 带着
+	// 结果与 usage，这里没有），于是这个 defer 对它是空操作。
+	var finished bool
+	defer func() {
+		if r.taskRuns == nil || finished {
+			return
+		}
+		ending := runRecord
+		ending.EndedAt = time.Now()
+		switch {
+		case errors.Is(runErr, ErrSuspended):
+			// 挂起不是失败：这条腿停在半路等人决定。写成 failed 会把「等人」说成
+			// 「跑挂了」，而什么都不写会把这一行留在 running——活进程里它与真正在飞
+			// 的记录分不出来，重启后又被扫成 interrupted。它是这条腿自己的终态，人
+			// 批准之后跑的是另一条记录（各有各的 id）。
+			ending.Status = domain.RunStatusSuspended
+		case runErr != nil:
+			ending.Status = domain.RunStatusFailed
+			ending.Error = runErr.Error()
+		default:
+			// 没有错误却走到这里，说明有一条出口既没报错也没写终态——一种接线
+			// 缺口。记成 failed 并说明，比留下一行 running 强：后者会在下一次
+			// 启动被扫成 interrupted，把一个代码缺陷伪装成一次进程消失。
+			ending.Status = domain.RunStatusFailed
+			ending.Error = "task run ended without an error and without a recorded completion"
+		}
+		// 收尾脱离取消、但带自己的预算：ctx 继承调用方，用户一中断它就已经 Done，而
+		// 这次写入正是「这条腿结束了」的唯一记录，跟着一起失败那一行就永远停在
+		// running。脱离取消之后它就没有别的逃生口了，预算见 closingWriteBudget。
+		writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), closingWriteBudget)
+		defer cancelWrite()
+		if err := r.taskRuns.FinishTaskRun(writeCtx, ending); err != nil {
+			runErr = errors.Join(runErr, fmt.Errorf("record the end of task %s: %w", task.ID, err))
+		}
+	}()
+
+	// completeRun 是成功那条路的终态写入。它落一条 completed 并置位 finished，于是
+	// 上面那个 defer 对它变成空操作——「恰好一次」就是这么来的，不是靠存储去重
+	// （storage.FinishTaskRun 按 id 更新，不看当前状态，第二次照写）。
+	//
+	// 写失败时 finished 仍为 false，于是 defer 会再写一次 failed：结果没能落盘，
+	// 这一次运行对外就不是 completed。第二次写入若也失败，两条错误由 errors.Join
+	// 一起带出。
+	//
+	// 它是闭包而不是方法，因为 RunTask 有两处成功出口（恢复那条与首跑那条，都以
+	// runToolLoop 收尾），两处要共用同一份 runRecord 与同一个 finished。
+	completeRun := func(run *domain.TaskRun) error {
+		// 返回给调用方的那份与落盘那一行共用同一个 id。finishRun 不再自己编 id：
+		// 两者一旦分叉不会有任何报错，只会让拿着返回值去查库的人得到 found=false。
+		// 这一句在 taskRuns == nil 之前，那种部署返回的也是同一个形状。
+		run.ID = runRecord.ID
+		if r.taskRuns == nil {
+			finished = true
+			return nil
+		}
+		completion := *run
+		completion.Status = domain.RunStatusCompleted
+		// 这三列 storage.FinishTaskRun 的 UPDATE 并不写（它们在开始那一行就已定型），
+		// 抄过来是给别的 TaskRunStore 实现用的：端口不保证落点一定是那份 SQLite。
+		completion.ParentTaskID = runRecord.ParentTaskID
+		completion.Background = runRecord.Background
+		completion.Goal = runRecord.Goal
+		// 收尾同样脱离取消并带预算，理由与收口 defer 一致，见 closingWriteBudget。
+		writeCtx, cancelWrite := context.WithTimeout(context.WithoutCancel(ctx), closingWriteBudget)
+		defer cancelWrite()
+		if err := r.taskRuns.FinishTaskRun(writeCtx, completion); err != nil {
+			return fmt.Errorf("record the completion of task %s: %w", task.ID, err)
+		}
+		finished = true
+		return nil
+	}
+
 	requestID := task.ID + ":run"
 	if err := r.events.Publish(ctx, domain.RuntimeEvent{
 		Type:      "task_started",
@@ -827,7 +974,14 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 				r.closeTurnOnError(ctx, task, rec, err)
 				return domain.TaskRun{}, fmt.Errorf("run task %s: %w", task.ID, err)
 			}
-			return r.runToolLoop(ctx, requestID, agent, task, st)
+			run, err := r.runToolLoop(ctx, requestID, agent, task, st)
+			if err != nil {
+				return domain.TaskRun{}, err
+			}
+			if err := completeRun(&run); err != nil {
+				return domain.TaskRun{}, err
+			}
+			return run, nil
 		}
 	}
 
@@ -905,7 +1059,14 @@ func (r *Runtime) RunTask(ctx context.Context, agent domain.Agent, task domain.T
 		catalog:          catalog,
 		events:           rec,
 	}
-	return r.runToolLoop(ctx, requestID, agent, task, st)
+	run, err := r.runToolLoop(ctx, requestID, agent, task, st)
+	if err != nil {
+		return domain.TaskRun{}, err
+	}
+	if err := completeRun(&run); err != nil {
+		return domain.TaskRun{}, err
+	}
+	return run, nil
 }
 
 // closingInstructionForStopReason names, for the model, the reason its tool
@@ -1279,6 +1440,11 @@ func (r *Runtime) checkSuspend(ctx context.Context, task domain.Task, st loopSta
 		Images:           st.images,
 		CreatedAt:        time.Now(),
 		WorkingDir:       task.WorkingDir,
+		// 身世随检查点过河：恢复腿除了这份检查点之外，对「这条任务是谁派出来的」
+		// 一无所知。见 sessionstate.Checkpoint.ParentTaskID。
+		ParentTaskID: task.ParentTaskID,
+		Background:   task.Background,
+		Goal:         task.Goal,
 	}
 	if err := r.checkpoints.Save(cp); err != nil {
 		return false, fmt.Errorf("save checkpoint for task %s: %w", task.ID, err)
@@ -1321,7 +1487,9 @@ func (r *Runtime) finishRun(ctx context.Context, requestID string, agent domain.
 	}
 	ended := time.Now()
 	run := domain.TaskRun{
-		ID:               task.ID + ":run-1",
+		// ID 留空：这条腿的 run id 由 RunTask 持有（它才知道开始那一行是用哪个 id
+		// 插的），在 completeRun 里统一赋。在这里另编一个，返回值与落盘行就会是两个
+		// 不同的东西，而这种分歧不会有任何报错。
 		TaskID:           task.ID,
 		AgentID:          agent.ID,
 		StartedAt:        st.started,

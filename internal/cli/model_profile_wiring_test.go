@@ -29,6 +29,7 @@ func TestTheModelProfileReachesTheDefaultRunnerRuntimeConfig(t *testing.T) {
 		nil,
 		"deep",
 		nil,
+		nil,
 	)
 
 	if cfg.ModelProfile != "deep" {

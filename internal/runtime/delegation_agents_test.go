@@ -164,6 +164,10 @@ type recordingDelegationAgents struct {
 	fakeDelegationAgents
 	resolveErr  error
 	lastContext DelegationContext
+	// childTaskRuns 是造出来的子运行时写运行记录的落点。这个假解析器刻意让它可以
+	// 与派发方的 store 不同，好单独检验那条「两边必须同源」的校验；零值
+	// nil 正是具名委派在生产上的形状；用例要检验「两边是同一个 store」时才显式塞一个。
+	childTaskRuns port.TaskRunStore
 	// lastEpisodes 挂在最近一次造出来的子运行时上，用来看清「子任务到底以谁的身份
 	// 跑起来的」——RunTask 把 domain.Agent 原样交给 EpisodeRecorder。
 	lastEpisodes *capturingEpisodeRecorder
@@ -196,6 +200,7 @@ func (r *recordingDelegationAgents) ResolveDelegate(ctx context.Context, id stri
 		depth:           dc.Depth,
 		maxSpawnDepth:   dc.MaxSpawnDepth,
 		episodeRecorder: r.lastEpisodes,
+		taskRuns:        r.childTaskRuns,
 	}
 	return domain.Agent{ID: id, Role: "researcher-role"}, child, nil
 }
@@ -383,9 +388,9 @@ func TestUnnamedDelegationStillRunsAsTheDerivedDeveloperIdentity(t *testing.T) {
 // field: a Runtime is generic and only learns which domain.Agent it is
 // running as through RunTask's parameter, which childFor's named branch
 // never receives), so the caller-side identity actually available here is
-// the PARENT TASK id, not a parent agent id. That id is recovered from the
-// audit event's RequestID via ParentTaskIDForSubTask, the same helper this
-// file already exports for exactly this purpose.
+// the PARENT TASK id, not a parent agent id. 它就存在事件的 RequestID 里：子任务
+// id 现在是 UUID，从 id 的形状里解析父任务的那条路已经没有了，而父子关系本来就该
+// 存成字段。
 func TestNamedDelegationAuditRecordsParentTargetAndGoal(t *testing.T) {
 	t.Parallel()
 	audit := adapter.NewMemoryAuditLog()
@@ -414,10 +419,9 @@ func TestNamedDelegationAuditRecordsParentTargetAndGoal(t *testing.T) {
 	if event.SubjectID != "researcher" {
 		t.Errorf("audit SubjectID = %q, want the target agent %q", event.SubjectID, "researcher")
 	}
-	parentTaskID, ok := ParentTaskIDForSubTask(event.RequestID)
-	if !ok || parentTaskID != "t1" {
-		t.Errorf("ParentTaskIDForSubTask(%q) = (%q, %v), want (\"t1\", true): the audit trail must be able to answer which task asked for this delegation",
-			event.RequestID, parentTaskID, ok)
+	if event.RequestID != "t1" {
+		t.Errorf("audit RequestID = %q, want the parent task %q: the audit trail must be able to answer which task asked for this delegation",
+			event.RequestID, "t1")
 	}
 	if event.Hash != "dig up the thing" {
 		t.Errorf("audit Hash = %q, want the delegated goal %q", event.Hash, "dig up the thing")

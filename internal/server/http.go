@@ -119,8 +119,12 @@ type Config struct {
 	// nil 表示这个部署不轮换凭证：鉴权退回 AdminToken 的静态比较，行为与这个字段
 	// 出现之前完全一致。装配期（cli）在铸了 loopback token 或配了 AdminToken 时才
 	// 建一个。
-	Tokens       *TokenStore
-	Audit        port.AuditLog
+	Tokens *TokenStore
+	Audit  port.AuditLog
+	// TaskRuns 是任务运行记录（task_runs 表）的读出口：/v1/tasks/{id}/result 先
+	// 查它，查不到再回落事件日志。nil 表示这个部署不落盘运行记录（非 sqlite
+	// 驱动），此时那个端点只剩事件日志一个来源，行为与这个字段出现之前一致。
+	TaskRuns     port.TaskRunStore
 	QualityEvals QualityEvalStore
 	Sessions     SessionStore
 	Messages     MessageStore
@@ -182,6 +186,7 @@ type HTTPServer struct {
 	platformEvents      *observability.EventBus
 	browser             BrowserStreamer
 	audit               port.AuditLog
+	taskRuns            port.TaskRunStore
 	qualityEvals        QualityEvalStore
 	sessions            SessionStore
 	messages            MessageStore
@@ -240,6 +245,7 @@ func NewHTTPServer(cfg Config) *HTTPServer {
 		platformEvents:      cfg.PlatformEvents,
 		browser:             cfg.Browser,
 		audit:               cfg.Audit,
+		taskRuns:            cfg.TaskRuns,
 		qualityEvals:        cfg.QualityEvals,
 		sessions:            cfg.Sessions,
 		messages:            cfg.Messages,
@@ -363,6 +369,8 @@ func (s *HTTPServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		s.handleListTasks(rec, r)
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/tasks/") && strings.HasSuffix(r.URL.Path, "/result"):
 		s.handleGetTaskResult(rec, r)
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/v1/task-runs/"):
+		s.handleGetTaskRun(rec, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/tasks/") && strings.Contains(r.URL.Path, "/approvals/"):
 		s.handleDecideApproval(rec, r)
 	case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/v1/tasks/") && strings.HasSuffix(r.URL.Path, "/interrupt"):
@@ -1196,8 +1204,15 @@ func (s *HTTPServer) handleGetTask(w http.ResponseWriter, r *http.Request) {
 }
 
 type taskResultResponse struct {
-	TaskID           string          `json:"task_id"`
-	Status           string          `json:"status"`
+	TaskID string `json:"task_id"`
+	// Status 是任务自身的生命周期状态（domain.Task.Status）。它与 RunStatus 回答
+	// 的不是同一个问题，语义保持不变。
+	Status string `json:"status"`
+	// RunStatus 是落盘的那次运行所处的状态，取值是 domain.RunStatus 的五个之一。
+	// 空串表示这条任务在 task_runs 里没有记录——它是落盘之前跑完的老任务，答案来自
+	// 事件日志。空串不是 RunStatus 的取值，所以「没有记录」与任何一个真实状态都
+	// 分得开。
+	RunStatus        string          `json:"run_status"`
 	Result           string          `json:"result"`
 	PromptTokens     int             `json:"prompt_tokens"`
 	CompletionTokens int             `json:"completion_tokens"`
@@ -1205,6 +1220,42 @@ type taskResultResponse struct {
 	TotalTokens      int             `json:"total_tokens"`
 	ElapsedMs        int64           `json:"elapsed_ms"`
 	GeneratedFiles   []GeneratedFile `json:"generated_files"`
+}
+
+// taskRunResponse 是一条落盘运行记录（task_runs 的一行）的对外形状，
+// GET /v1/task-runs/{run_id} 的返回体。
+//
+// 它与 taskResultResponse 回答的不是同一个问题。后者按**任务** id 报「这条任务现在
+// 的答案是什么」，取的是最后开始的那条腿；这里按**运行** id 报「这一条腿自己是什么
+// 样子」——包括那些根本不进任务表、因而 taskResultResponse 永远够不着的后台子任务。
+//
+// RunStatus 取值是 domain.RunStatus 的五个之一，这里不会是空串：空串只用来在
+// taskResultResponse 里表示「这条任务在 task_runs 里没有记录」，而能走到这里就说明
+// 那一行确凿存在。
+//
+// EndedAt 为零值时间表示这条腿还没结束（running / 刚插进去的行）。不换成
+// elapsed_ms 是因为这个端点报的是记录原样，让读的人自己判断哪一半还没发生。
+//
+// GeneratedFiles 是 workspace 相对路径原文，不是 taskResultResponse 里那种带链接的
+// GeneratedFile：拼下载链接要一个会话 id，而运行记录不带会话。给一个猜出来的会话
+// id 就是凭空造一条会 404 的链接。
+type taskRunResponse struct {
+	RunID            string    `json:"run_id"`
+	TaskID           string    `json:"task_id"`
+	ParentTaskID     string    `json:"parent_task_id"`
+	Background       bool      `json:"background"`
+	Goal             string    `json:"goal"`
+	RunStatus        string    `json:"run_status"`
+	Result           string    `json:"result"`
+	Error            string    `json:"error"`
+	StopReason       string    `json:"stop_reason"`
+	PromptTokens     int       `json:"prompt_tokens"`
+	CompletionTokens int       `json:"completion_tokens"`
+	CachedTokens     int       `json:"cached_tokens"`
+	TotalTokens      int       `json:"total_tokens"`
+	GeneratedFiles   []string  `json:"generated_files"`
+	StartedAt        time.Time `json:"started_at"`
+	EndedAt          time.Time `json:"ended_at"`
 }
 
 // GeneratedFile is the linked view of a workspace-relative path a task wrote
@@ -1230,9 +1281,9 @@ type taskUsage struct {
 }
 
 // handleGetTaskResult returns the current task status together with the answer
-// text produced by the runtime. The answer is carried by the task_completed
-// runtime event (its Message field holds the model response), which is the only
-// place the result is exposed because TaskRun is not persisted.
+// text produced by the runtime. The answer comes from the persisted task run
+// (task_runs) when there is one, and from the task_completed runtime event when
+// there is not; see the two comments in the body for which wins and why.
 func (s *HTTPServer) handleGetTaskResult(w http.ResponseWriter, r *http.Request) {
 	if s.tasks == nil {
 		writeError(w, http.StatusServiceUnavailable, "task store is unavailable")
@@ -1255,11 +1306,56 @@ func (s *HTTPServer) handleGetTaskResult(w http.ResponseWriter, r *http.Request)
 	if !s.requireCompanyAccess(w, r, task.CompanyID, "task", task.ID) {
 		return
 	}
-	result, usage, generatedFiles, err := s.taskResult(taskID)
-	if err != nil {
-		observability.WithRequestID(s.logger, requestIDFromContext(r.Context())).Error("read task result failed", "task_id", taskID, "error", err)
-		writeError(w, http.StatusInternalServerError, fmt.Sprintf("task result: %v", err))
-		return
+	// 落盘的运行记录优先：它是唯一能报出 interrupted 的来源——事件总线里没有
+	// 「中断」这种事件，因为写下它的那个进程已经不在了。查不到再回落到事件，那是
+	// 落盘之前跑完的老任务仅剩的出处。
+	//
+	// 查表失败报 500 而不是回落：悄悄回落会把一次数据库故障渲染成「这条任务没有
+	// 落盘记录」，而那两件事对读的人完全不同。
+	var (
+		runStatus      domain.RunStatus
+		result         string
+		usage          taskUsage
+		generatedFiles []string
+		persisted      bool
+	)
+	if s.taskRuns != nil {
+		runs, err := s.taskRuns.ListTaskRuns(r.Context(), taskID)
+		if err != nil {
+			observability.WithRequestID(s.logger, requestIDFromContext(r.Context())).Error("read task runs failed", "task_id", taskID, "error", err)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("task runs: %v", err))
+			return
+		}
+		if len(runs) > 0 {
+			// 一条任务可以有好几条腿（ListTaskRuns 按 started_at, id 升序），报最后
+			// 开始的那一条：挂起等审批是一条腿，批准之后的续跑是另一条腿，后一条腿
+			// 要么是前一条的继续、要么是同一任务的重跑，两种情形里更早那条的答案都
+			// 已经被取代。最后一条腿停在 suspended 或 running 时它的 result 是空的，
+			// 这正是要报的事实：拿更早那条已完成的腿去填，会把一个还在半路的任务说成
+			// 已经有了答案。
+			last := runs[len(runs)-1]
+			persisted = true
+			runStatus = last.Status
+			// 结果与 usage 也以表为准；表里那条是这次运行自己写下的。
+			result = last.Result
+			usage = taskUsage{
+				PromptTokens:     last.PromptTokens,
+				CompletionTokens: last.CompletionTokens,
+				CachedTokens:     last.CachedTokens,
+				TotalTokens:      last.TotalTokens,
+				ElapsedMs:        runElapsedMs(last),
+			}
+			generatedFiles = last.GeneratedFiles
+		}
+	}
+	if !persisted {
+		var err error
+		result, usage, generatedFiles, err = s.taskResult(taskID)
+		if err != nil {
+			observability.WithRequestID(s.logger, requestIDFromContext(r.Context())).Error("read task result failed", "task_id", taskID, "error", err)
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("task result: %v", err))
+			return
+		}
 	}
 	// Nothing is persisted here any more. The assistant answer, its token usage
 	// and its generated files all reach the conversation through the session
@@ -1270,6 +1366,7 @@ func (s *HTTPServer) handleGetTaskResult(w http.ResponseWriter, r *http.Request)
 	writeJSON(w, http.StatusOK, taskResultResponse{
 		TaskID:           taskID,
 		Status:           string(task.Status),
+		RunStatus:        string(runStatus),
 		Result:           result,
 		PromptTokens:     usage.PromptTokens,
 		CompletionTokens: usage.CompletionTokens,
@@ -1280,14 +1377,112 @@ func (s *HTTPServer) handleGetTaskResult(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+// handleGetTaskRun returns one persisted run record by its run id.
+// Path: GET /v1/task-runs/{run_id}. Read-only: it writes nothing.
+//
+// 它是「后台子任务要有一个外部寻址得到的 id」这条拍板在 HTTP 上的落点。
+// SubTaskHandle.TaskID 是一个 UUID，而后台子任务**从不进任务表**（runChild 就地造
+// 一个 domain.Task 直接喂给 RunTask，没有任何 scheduler.Add），所以
+// GET /v1/tasks/{id}/result 对它一律 404——它在查 task_runs 之前先查任务表。没有这个
+// 端点，一条中断的子任务「停在哪」就只能直连 sqlite 手查。
+//
+// 鉴权：运行记录自己不带 company，门从它指向的任务上取——直连任务取 TaskID 那条，
+// 后台子任务取 ParentTaskID 那条。两条都查不到时 company 取空串交给同一个门：单机
+// 默认（RequireIdentity=false）照常放行，而一旦部署开了身份强制，一个带
+// X-Company-ID 的调用方对空 company 是不匹配，于是被拒。这里不另造一套判断，就是
+// 为了让这个端点与 /v1/tasks/{id}/result 在同一个策略下收敛。
+func (s *HTTPServer) handleGetTaskRun(w http.ResponseWriter, r *http.Request) {
+	if s.taskRuns == nil {
+		writeError(w, http.StatusServiceUnavailable, "task run store is unavailable")
+		return
+	}
+	runID := strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/task-runs/"), "/")
+	if runID == "" {
+		writeError(w, http.StatusBadRequest, "run id is required")
+		return
+	}
+	run, found, err := s.taskRuns.TaskRunByID(r.Context(), runID)
+	if err != nil {
+		observability.WithRequestID(s.logger, requestIDFromContext(r.Context())).Error("read task run failed", "run_id", runID, "error", err)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("task run: %v", err))
+		return
+	}
+	if !found {
+		writeError(w, http.StatusNotFound, "task run not found")
+		return
+	}
+	companyID, err := s.taskRunCompany(r.Context(), run)
+	if err != nil {
+		observability.WithRequestID(s.logger, requestIDFromContext(r.Context())).Error("resolve task run company failed", "run_id", runID, "error", err)
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("task run company: %v", err))
+		return
+	}
+	if !s.requireCompanyAccess(w, r, companyID, "task_run", run.ID) {
+		return
+	}
+	files := run.GeneratedFiles
+	if files == nil {
+		files = []string{}
+	}
+	writeJSON(w, http.StatusOK, taskRunResponse{
+		RunID:            run.ID,
+		TaskID:           run.TaskID,
+		ParentTaskID:     run.ParentTaskID,
+		Background:       run.Background,
+		Goal:             run.Goal,
+		RunStatus:        string(run.Status),
+		Result:           run.Result,
+		Error:            run.Error,
+		StopReason:       string(run.StopReason),
+		PromptTokens:     run.PromptTokens,
+		CompletionTokens: run.CompletionTokens,
+		CachedTokens:     run.CachedTokens,
+		TotalTokens:      run.TotalTokens,
+		GeneratedFiles:   files,
+		StartedAt:        run.StartedAt,
+		EndedAt:          run.EndedAt,
+	})
+}
+
+// taskRunCompany resolves the company that owns a run record: the run's own
+// task when that task is in the task store, otherwise its parent task. An
+// empty company means neither is there, which is what a background sub-task's
+// row looks like when its parent has already been evicted; handleGetTaskRun
+// hands that to requireCompanyAccess as-is rather than inventing an owner.
+//
+// A store failure is returned, never collapsed into "no company": that would
+// turn a database outage into a silently ungated read.
+func (s *HTTPServer) taskRunCompany(ctx context.Context, run domain.TaskRun) (string, error) {
+	if s.tasks == nil {
+		return "", nil
+	}
+	for _, taskID := range []string{run.TaskID, run.ParentTaskID} {
+		if taskID == "" {
+			continue
+		}
+		task, ok, err := s.tasks.Get(ctx, taskID)
+		if err != nil {
+			return "", fmt.Errorf("get task %s: %w", taskID, err)
+		}
+		if ok {
+			return task.CompanyID, nil
+		}
+	}
+	return "", nil
+}
+
 // taskResult scans the runtime event bus for the task_completed event of the
 // given task and returns its answer text, total token usage, elapsed time in
 // milliseconds, and the workspace-relative paths of any files the task wrote.
-// The task_completed event is the only place these values are exposed because
-// TaskRun is not persisted. A failure to read the event bus is returned rather
-// than reported as an empty result: an empty answer on a done task is
-// indistinguishable from "the task produced nothing", which would let a
-// backing-store outage surface to the GUI as a silently truncated answer.
+//
+// 它是老数据的回落路径：任务运行记录落盘之后，答案的正本在 task_runs 里，只有在
+// 落盘之前跑完的那些任务才在表里没有腿，而事件总线上的 task_completed 是它们仅剩
+// 的出处。新任务走不到这里。
+//
+// A failure to read the event bus is returned rather than reported as an empty
+// result: an empty answer on a done task is indistinguishable from "the task
+// produced nothing", which would let a backing-store outage surface to the GUI
+// as a silently truncated answer.
 func (s *HTTPServer) taskResult(taskID string) (result string, usage taskUsage, generatedFiles []string, err error) {
 	if s.workflowEvents == nil {
 		return "", taskUsage{}, nil, nil
@@ -1310,6 +1505,18 @@ func (s *HTTPServer) taskResult(taskID string) (result string, usage taskUsage, 
 		}
 	}
 	return result, usage, generatedFiles, nil
+}
+
+// runElapsedMs 是这条腿已经走过的耗时。
+//
+// 只有终态腿才写下 ended_at；running 的那一列在库里是空串，读出来是零值时间。拿
+// 零值去减开始时间会得到一个巨大的负数，并作为「耗时」报给调用方，所以没有
+// ended_at 时报 0——一条还没跑完的腿没有耗时可言。
+func runElapsedMs(run domain.TaskRun) int64 {
+	if run.EndedAt.IsZero() {
+		return 0
+	}
+	return run.EndedAt.Sub(run.StartedAt).Milliseconds()
 }
 
 // generatedFilesDTO maps workspace-relative paths to their linked DTO form,

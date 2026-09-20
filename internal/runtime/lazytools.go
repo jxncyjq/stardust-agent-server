@@ -109,6 +109,10 @@ func (r *Runtime) dispatchToolCall(ctx context.Context, agent domain.Agent, task
 	}
 	ctx = tool.WithLoopBudget(ctx, st.toolNameGuard)
 	ctx = tool.WithUserTask(ctx, task.Input)
+	// 哪条任务在调用这个工具。工具从 domain.ToolCall 上读不到它——那上面只有工具调用
+	// id——而 delegate_task 要把它写进 task_runs.parent_task_id 这样的权威状态，所以它
+	// 必须从这里来，而不是由工具层就地凑一个。
+	ctx = tool.WithTaskID(ctx, task.ID)
 	ctx = tool.WithChatSession(ctx, task.SessionID)
 	// Which run this call belongs to, so that whoever answers "did a human
 	// approve this?" at dispatch time can find the ticket the round boundary

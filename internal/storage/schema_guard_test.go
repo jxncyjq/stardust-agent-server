@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -50,7 +51,7 @@ func TestMigrateRefusesADatabaseNewerThanTheBinary(t *testing.T) {
 		t.Errorf("错误信息没说清是「库比程序新」，运维定位不到：%v", err)
 	}
 	// 两个版本号都要出现，否则运维不知道该升到哪一版。
-	if !strings.Contains(msg, "18") || !strings.Contains(msg, "11") {
+	if !strings.Contains(msg, fmt.Sprint(CurrentSchemaVersion+7)) || !strings.Contains(msg, fmt.Sprint(CurrentSchemaVersion)) {
 		t.Errorf("错误信息里没同时给出库的版本与本程序支持的版本：%v", err)
 	}
 }

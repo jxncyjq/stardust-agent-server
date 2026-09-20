@@ -60,7 +60,11 @@ var ErrAgentSessionNotFound = errors.New("agent session not found")
 // turns out of it and session_search reads session_events_fts. Existing
 // databases are not migrated (spec §3 取舍 B3): the two tables are simply no
 // longer created, no longer written, and no longer read.
-const CurrentSchemaVersion = 11
+// Version 12 gave task_runs the columns a domain.TaskRun actually has (its
+// reasoning summary, token counts and generated files were being dropped on
+// write) plus the run's lifecycle state: status, parent_task_id, background,
+// goal and error.
+const CurrentSchemaVersion = 12
 
 type WorkflowState struct {
 	Definition workflow.Definition `json:"definition"`
@@ -1128,27 +1132,45 @@ func (r *SQLiteRepository) MarkAgentMessageRead(ctx context.Context, messageID s
 	return nil
 }
 
-func (r *SQLiteRepository) SaveTaskRun(ctx context.Context, run domain.TaskRun) error {
-	_, err := r.db.ExecContext(ctx, `
-		INSERT INTO task_runs (id, task_id, agent_id, started_at, ended_at, result, stop_reason)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO UPDATE SET
-			task_id = excluded.task_id,
-			agent_id = excluded.agent_id,
-			started_at = excluded.started_at,
-			ended_at = excluded.ended_at,
-			result = excluded.result,
-			stop_reason = excluded.stop_reason
-	`, run.ID, run.TaskID, run.AgentID, formatTime(run.StartedAt), formatTime(run.EndedAt), run.Result, string(run.StopReason))
-	if err != nil {
-		return fmt.Errorf("save task run %q: %w", run.ID, err)
+// marshalGeneratedFiles 把生成文件清单编码成落盘用的 JSON 数组；空清单编码成空串。
+//
+// 空串与 "[]" 在读回时都还原成 nil，所以这里选前者只是为了让老行的默认值（空串）
+// 与新写的空清单在库里长得一样，不给一个「看得出是哪个版本写的」的痕迹留位置。
+func marshalGeneratedFiles(files []string) (string, error) {
+	if len(files) == 0 {
+		return "", nil
 	}
-	return nil
+	data, err := json.Marshal(files)
+	if err != nil {
+		return "", fmt.Errorf("encode generated files: %w", err)
+	}
+	return string(data), nil
+}
+
+// unmarshalGeneratedFiles 是 marshalGeneratedFiles 的逆。空串是「没有生成文件」，
+// 其余一律按 JSON 解；解不动就报错，不退化成空清单——那会把一次损坏读成「这次运行
+// 什么文件都没写」。
+func unmarshalGeneratedFiles(s string) ([]string, error) {
+	if s == "" {
+		return nil, nil
+	}
+	var files []string
+	if err := json.Unmarshal([]byte(s), &files); err != nil {
+		return nil, fmt.Errorf("decode generated files %q: %w", s, err)
+	}
+	if len(files) == 0 {
+		// 落盘的 "[]" 与空串说的是同一件事：这次运行没有生成文件。两种来源收敛到
+		// 同一个返回值，免得「空」在内存里有两种长相。
+		return nil, nil
+	}
+	return files, nil
 }
 
 func (r *SQLiteRepository) ListTaskRuns(ctx context.Context, taskID string) ([]domain.TaskRun, error) {
 	rows, err := r.db.QueryContext(ctx, `
-		SELECT id, task_id, agent_id, started_at, ended_at, result, stop_reason
+		SELECT id, task_id, agent_id, started_at, ended_at, result, stop_reason,
+		       status, parent_task_id, background, goal, error,
+		       reasoning_summary, prompt_tokens, completion_tokens, cached_tokens, total_tokens, generated_files
 		FROM task_runs
 		WHERE task_id = ?
 		ORDER BY started_at, id
@@ -1160,30 +1182,59 @@ func (r *SQLiteRepository) ListTaskRuns(ctx context.Context, taskID string) ([]d
 
 	var runs []domain.TaskRun
 	for rows.Next() {
-		var run domain.TaskRun
-		var startedAt string
-		var endedAt string
-		var stopReason string
-		if err := rows.Scan(&run.ID, &run.TaskID, &run.AgentID, &startedAt, &endedAt, &run.Result, &stopReason); err != nil {
-			return nil, fmt.Errorf("scan task run for %q: %w", taskID, err)
-		}
-		parsedStartedAt, err := parseTime(startedAt)
+		run, err := scanTaskRun(rows)
 		if err != nil {
-			return nil, fmt.Errorf("parse task run %q started_at: %w", run.ID, err)
+			return nil, fmt.Errorf("list task runs for %q: %w", taskID, err)
 		}
-		parsedEndedAt, err := parseTime(endedAt)
-		if err != nil {
-			return nil, fmt.Errorf("parse task run %q ended_at: %w", run.ID, err)
-		}
-		run.StartedAt = parsedStartedAt
-		run.EndedAt = parsedEndedAt
-		run.StopReason = domain.StopReason(stopReason)
 		runs = append(runs, run)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate task runs for %q: %w", taskID, err)
+		return nil, fmt.Errorf("list task runs for %q: %w", taskID, err)
 	}
 	return runs, nil
+}
+
+// taskRunScanner 是 *sql.Row 与 *sql.Rows 都满足的那一点点接口，让单行读与多行读
+// 共用同一个 scanTaskRun：列清单写两遍，迟早会有一遍漏掉新列。
+type taskRunScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanTaskRun(sc taskRunScanner) (domain.TaskRun, error) {
+	var run domain.TaskRun
+	var startedAt, endedAt, stopReason, status, files string
+	// background 经 int 往返，与 agent_sessions.archived 同一写法：这一列在库里是
+	// INTEGER，让驱动去隐式转 bool 是这份文件里唯一的例外。
+	var background int
+	if err := sc.Scan(&run.ID, &run.TaskID, &run.AgentID, &startedAt, &endedAt, &run.Result, &stopReason,
+		&status, &run.ParentTaskID, &background, &run.Goal, &run.Error,
+		&run.ReasoningSummary, &run.PromptTokens, &run.CompletionTokens, &run.CachedTokens, &run.TotalTokens,
+		&files); err != nil {
+		return domain.TaskRun{}, fmt.Errorf("scan task run: %w", err)
+	}
+	parsedStartedAt, err := parseTime(startedAt)
+	if err != nil {
+		return domain.TaskRun{}, fmt.Errorf("parse task run %q started_at: %w", run.ID, err)
+	}
+	parsedEndedAt, err := parseTime(endedAt)
+	if err != nil {
+		return domain.TaskRun{}, fmt.Errorf("parse task run %q ended_at: %w", run.ID, err)
+	}
+	parsedStatus, err := domain.ParseRunStatus(status)
+	if err != nil {
+		return domain.TaskRun{}, fmt.Errorf("task run %q: %w", run.ID, err)
+	}
+	parsedFiles, err := unmarshalGeneratedFiles(files)
+	if err != nil {
+		return domain.TaskRun{}, fmt.Errorf("task run %q: %w", run.ID, err)
+	}
+	run.StartedAt = parsedStartedAt
+	run.EndedAt = parsedEndedAt
+	run.StopReason = domain.StopReason(stopReason)
+	run.Status = parsedStatus
+	run.GeneratedFiles = parsedFiles
+	run.Background = background != 0
+	return run, nil
 }
 
 // AppendAuditEvent records an audit event, and does nothing if that exact event
@@ -1942,6 +1993,21 @@ var columnMigrations = []columnMigration{
 		column: "stop_reason",
 		stmt:   `ALTER TABLE task_runs ADD COLUMN stop_reason TEXT NOT NULL DEFAULT ''`,
 	},
+	// task_runs 的这一批列有两个来源：一半补上 domain.TaskRun 早就有、表里却没有
+	// 的字段（写进去会被静默丢掉），另一半是运行状态本身。status 的默认值是
+	// completed 而不是 running：老行都带着 ended_at，它们是已经结束的运行，默认成
+	// running 会让第一次启动扫描把全部历史数据标成中断。
+	{table: "task_runs", column: "status", stmt: `ALTER TABLE task_runs ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'`},
+	{table: "task_runs", column: "parent_task_id", stmt: `ALTER TABLE task_runs ADD COLUMN parent_task_id TEXT NOT NULL DEFAULT ''`},
+	{table: "task_runs", column: "background", stmt: `ALTER TABLE task_runs ADD COLUMN background INTEGER NOT NULL DEFAULT 0`},
+	{table: "task_runs", column: "goal", stmt: `ALTER TABLE task_runs ADD COLUMN goal TEXT NOT NULL DEFAULT ''`},
+	{table: "task_runs", column: "error", stmt: `ALTER TABLE task_runs ADD COLUMN error TEXT NOT NULL DEFAULT ''`},
+	{table: "task_runs", column: "reasoning_summary", stmt: `ALTER TABLE task_runs ADD COLUMN reasoning_summary TEXT NOT NULL DEFAULT ''`},
+	{table: "task_runs", column: "prompt_tokens", stmt: `ALTER TABLE task_runs ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0`},
+	{table: "task_runs", column: "completion_tokens", stmt: `ALTER TABLE task_runs ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0`},
+	{table: "task_runs", column: "cached_tokens", stmt: `ALTER TABLE task_runs ADD COLUMN cached_tokens INTEGER NOT NULL DEFAULT 0`},
+	{table: "task_runs", column: "total_tokens", stmt: `ALTER TABLE task_runs ADD COLUMN total_tokens INTEGER NOT NULL DEFAULT 0`},
+	{table: "task_runs", column: "generated_files", stmt: `ALTER TABLE task_runs ADD COLUMN generated_files TEXT NOT NULL DEFAULT ''`},
 }
 
 // applyColumnMigrations runs the additive ALTER TABLE migrations idempotently.

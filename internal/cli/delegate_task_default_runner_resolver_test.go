@@ -15,6 +15,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"github.com/stardust/legion-agent/internal/domain"
 	"github.com/stardust/legion-agent/internal/port"
 	"github.com/stardust/legion-agent/internal/testsupport"
@@ -72,7 +74,7 @@ func TestServeDefaultAgentTaskDelegatesByNameThroughTheRealResolver(t *testing.T
 
 	// agent_id 留空：这条任务必须落在 defaultTaskRunner 上，也就是 buildDefaultRunnerConfig
 	// 那份配置——resolver 是否被真的递给它，正是这条测试要守的东西。
-	const taskID = "delegate-resolver-guard-task"
+	const taskID = delegateResolverRootTaskID
 	createTask(t, baseURL, taskID, "")
 	waitForTaskDone(t, baseURL, taskID)
 
@@ -109,11 +111,51 @@ func TestServeDefaultAgentTaskDelegatesByNameThroughTheRealResolver(t *testing.T
 	if !fixture.offers.offered(taskID, "delegate_task") {
 		t.Error("默认任务没有被提供 delegate_task：这条任务没走默认 runner，判据的归属就错了")
 	}
+
+	// 被委派出去的子任务确实自己跟模型说上话了，而且它的 id 是一个新铸的 UUID。
+	// 这条断言接替了原来的 strings.Contains(req.RequestID, ":sub-")：那个形态已经
+	// 不再被铸出来，再按它认就是一条永不成立的判据——假模型会把子任务的请求当成
+	// 根任务的，于是子任务又发起一次委派，一层套一层直到轮数耗尽，而这条测试仍然
+	// 是绿的——它不再守得住任何东西。
+	subTaskIDs := fixture.subTaskRequests()
+	if len(subTaskIDs) == 0 {
+		t.Errorf("没有任何一次推理请求来自被委派的子任务："+
+			"delegate_task 被放行了，子任务却一次都没真的跑起来。offers=%v", fixture.offers.dump())
+	}
+	for _, id := range subTaskIDs {
+		if _, err := uuid.Parse(id); err != nil {
+			t.Errorf("子任务 id %q 不是 UUID（%v）：nextSubTaskID 的契约被改回去了", id, err)
+		}
+	}
 }
 
 // delegateResolverAgentName 是注册表里真实存在的 agent 名字，与假模型发起的
 // delegate_task 调用里的 agent_id 必须是同一个字符串。
 const delegateResolverAgentName = "researcher"
+
+// delegateResolverRootTaskID 是这条测试提交的那条根任务的 id。假模型靠它区分
+// 「这是根任务在说话」与「这是被委派出去的子任务在说话」，所以它必须是一个常量而
+// 不是测试函数里的局部字面量。
+const delegateResolverRootTaskID = "delegate-resolver-guard-task"
+
+// delegateResolverSubTaskID 从一次推理请求里认出「这是被委派出去的子任务自己的
+// 请求」，并给出那条子任务的 id。RequestID 的形态是 "<taskID>:run"（见
+// runtime.RunTask）。
+//
+// 判据是「task id 既不是根任务、又是一个 UUID」，而不是旧的「RequestID 里带
+// ":sub-"」：子任务 id 现在由 nextSubTaskID 铸成 UUID，"<父>:sub-<n>" 那个形态再也
+// 不会出现。要求它是 UUID而不只是「不等于根任务」，是为了把压缩、情景蒸馏、
+// coordinator 那些带着别的 RequestID 形态的请求排除在外。
+func delegateResolverSubTaskID(req port.InferenceRequest) (subTaskID string, ok bool) {
+	taskID := strings.TrimSuffix(req.RequestID, ":run")
+	if taskID == req.RequestID || taskID == delegateResolverRootTaskID {
+		return "", false
+	}
+	if _, err := uuid.Parse(taskID); err != nil {
+		return "", false
+	}
+	return taskID, true
+}
 
 // delegateResolverSuccessMarker 与 delegateResolverFailureMarker 是假模型用来判断
 // "delegate_task 是否已经跑过一轮"的信号：前者是 delegateJSON 成功输出里必然出现的
@@ -128,6 +170,37 @@ type delegateResolverFixture struct {
 	configPath string
 	dbPath     string
 	offers     *serveEventsToolOffers
+	subTasks   *delegateResolverSubTaskLog
+}
+
+// subTaskRequests 返回那些发出过推理请求的子任务 id（去重，按首次出现排序）。
+func (f delegateResolverFixture) subTaskRequests() []string { return f.subTasks.ids() }
+
+// delegateResolverSubTaskLog 记下哪些子任务真的向假模型发过请求。假模型在 httptest
+// 的 goroutine 里写、测试主 goroutine 读，所以带锁。
+type delegateResolverSubTaskLog struct {
+	mu    sync.Mutex
+	seen  map[string]bool
+	order []string
+}
+
+func (l *delegateResolverSubTaskLog) record(subTaskID string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.seen == nil {
+		l.seen = make(map[string]bool)
+	}
+	if l.seen[subTaskID] {
+		return
+	}
+	l.seen[subTaskID] = true
+	l.order = append(l.order, subTaskID)
+}
+
+func (l *delegateResolverSubTaskLog) ids() []string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]string(nil), l.order...)
 }
 
 func newDelegateResolverFixture(t *testing.T) delegateResolverFixture {
@@ -136,6 +209,7 @@ func newDelegateResolverFixture(t *testing.T) delegateResolverFixture {
 	workDir := t.TempDir()
 
 	offers := &serveEventsToolOffers{}
+	subTasks := &delegateResolverSubTaskLog{}
 	model := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req port.InferenceRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -143,6 +217,9 @@ func newDelegateResolverFixture(t *testing.T) delegateResolverFixture {
 			return
 		}
 		offers.record(req)
+		if subTaskID, ok := delegateResolverSubTaskID(req); ok {
+			subTasks.record(subTaskID)
+		}
 		resp := delegateResolverAnswer(req)
 		w.Header().Set("Content-Type", "application/json")
 		if err := json.NewEncoder(w).Encode(resp); err != nil {
@@ -172,7 +249,7 @@ func newDelegateResolverFixture(t *testing.T) delegateResolverFixture {
 		t.Fatalf("write config: %v", err)
 	}
 
-	return delegateResolverFixture{configPath: configPath, dbPath: dbPath, offers: offers}
+	return delegateResolverFixture{configPath: configPath, dbPath: dbPath, offers: offers, subTasks: subTasks}
 }
 
 // delegateResolverAnswer 决定假模型这一次怎么答——只看它被展示了什么：
@@ -180,8 +257,8 @@ func newDelegateResolverFixture(t *testing.T) delegateResolverFixture {
 //   - 没有工具可用：直接给一段文本（收尾的无工具请求、情景蒸馏、上下文压缩等）。
 //   - 请求文本里已经能看到 delegate_task 跑过一轮的信号（成功或失败的标记）：给最终
 //     答案，让任务收尾。
-//   - RequestID 里带 ":sub-"：这是被点名的 agent 派生出的子任务自己的第一次请求，
-//     子任务直接给出最终答案，不再嵌套委派。
+//   - RequestID 属于一条 UUID 形态的、不是根任务的 task：这是被点名的 agent 派生
+//     出的子任务自己的请求，子任务直接给出最终答案，不再嵌套委派。
 //   - 否则：这是根任务的第一次请求，发起一次点名 agent_id 的 delegate_task 调用。
 func delegateResolverAnswer(req port.InferenceRequest) port.InferenceResponse {
 	text := testsupport.RequestText(req)
@@ -190,7 +267,7 @@ func delegateResolverAnswer(req port.InferenceRequest) port.InferenceResponse {
 		strings.Contains(text, delegateResolverFailureMarker) {
 		return port.InferenceResponse{Text: "已完成。", PromptTokens: 5, CompletionTokens: 3, TotalTokens: 8}
 	}
-	if strings.Contains(req.RequestID, ":sub-") {
+	if _, ok := delegateResolverSubTaskID(req); ok {
 		return port.InferenceResponse{Text: "子任务完成。", PromptTokens: 4, CompletionTokens: 2, TotalTokens: 6}
 	}
 	return port.InferenceResponse{
